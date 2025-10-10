@@ -1,0 +1,9 @@
+[submodule "CXLSHMSWcoherence"]
+	path = CXLSHMSWcoherence
+	url = https://github.com/youkioh/CXLSHMSWcoherence.git
+[submodule "CXLSharedMemVM"]
+	path = CXLSharedMemVM
+	url = https://github.com/youkioh/CXLSharedMemVM.git
+[submodule "CXLSharedMemGPU"]
+	path = CXLSharedMemGPU
+	url = https://github.com/youkioh/CXLSharedMemGPU.git
