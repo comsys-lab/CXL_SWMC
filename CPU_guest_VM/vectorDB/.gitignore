@@ -1,0 +1,4 @@
+qdrant_files/
+*.bin
+build/
+*.arrow
