@@ -1,0 +1,30 @@
+2025-12-05 01:24:30,381 - INFO - ReqGen 시작: 서버=163.152.48.109:9000, 클라이언트=2, 시간=330초
+2025-12-05 01:24:30,381 - INFO - Hugging Face에서 'kroshan/BioASQ' 데이터셋을 로드합니다...
+2025-12-05 01:24:35,966 - INFO - 3266개의 질문을 로드했습니다.
+2025-12-05 01:24:35,966 - INFO - 부하 테스트 시작, client 수 = 2
+2025-12-05 01:24:35,966 - INFO - 클라이언트 0 시작
+2025-12-05 01:24:35,967 - INFO - 클라이언트 0 요청: 질문 인덱스 2901
+2025-12-05 01:24:35,967 - INFO - 클라이언트 1 시작
+2025-12-05 01:24:35,967 - INFO - 클라이언트 1 요청: 질문 인덱스 31
+2025-12-05 01:24:53,942 - INFO - 클라이언트 1 요청: 질문 인덱스 521
+2025-12-05 01:24:59,739 - INFO - 클라이언트 1 요청: 질문 인덱스 1249
+2025-12-05 01:25:06,091 - INFO - 클라이언트 0 요청: 질문 인덱스 2385
+2025-12-05 01:25:21,497 - INFO - 클라이언트 1 요청: 질문 인덱스 428
+2025-12-05 01:25:34,166 - INFO - 클라이언트 1 요청: 질문 인덱스 2492
+2025-12-05 01:25:37,092 - INFO - 클라이언트 0 요청: 질문 인덱스 363
+Traceback (most recent call last):
+  File "/home/comsys/sungsu/CXLSharedMemGPU/ReqGen/main.py", line 418, in <module>
+    main()
+  File "/home/comsys/sungsu/CXLSharedMemGPU/ReqGen/main.py", line 415, in main
+    asyncio.run(reqgen.run())
+  File "/usr/lib/python3.10/asyncio/runners.py", line 44, in run
+    return loop.run_until_complete(main)
+  File "/usr/lib/python3.10/asyncio/base_events.py", line 636, in run_until_complete
+    self.run_forever()
+  File "/usr/lib/python3.10/asyncio/base_events.py", line 603, in run_forever
+    self._run_once()
+  File "/usr/lib/python3.10/asyncio/base_events.py", line 1871, in _run_once
+    event_list = self._selector.select(timeout)
+  File "/usr/lib/python3.10/selectors.py", line 469, in select
+    fd_event_list = self._selector.poll(timeout, max_ev)
+KeyboardInterrupt

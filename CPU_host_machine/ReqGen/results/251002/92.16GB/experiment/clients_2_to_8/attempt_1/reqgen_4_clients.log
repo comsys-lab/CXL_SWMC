@@ -1,0 +1,34 @@
+2025-10-02 02:32:43,188 - INFO - ReqGen 시작: 서버=163.152.48.109:9000, 클라이언트=4, 시간=330초
+2025-10-02 02:32:43,188 - INFO - Hugging Face에서 'kroshan/BioASQ' 데이터셋을 로드합니다...
+2025-10-02 02:32:50,141 - INFO - 3266개의 질문을 로드했습니다.
+2025-10-02 02:32:50,142 - INFO - 부하 테스트 시작, client 수 = 4
+2025-10-02 02:32:50,142 - INFO - Zipf 값 1.2에서 상위 20%의 질문이 차지하는 비율: 91.82%
+Traceback (most recent call last):
+  File "/home/cloud_cxl/.local/lib/python3.10/site-packages/aiohttp/streams.py", line 315, in _wait
+    await waiter
+asyncio.exceptions.CancelledError
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "/home/cloud_cxl/CXLSharedMemGPU/ReqGen/main.py", line 404, in <module>
+    main()
+  File "/home/cloud_cxl/CXLSharedMemGPU/ReqGen/main.py", line 401, in main
+    asyncio.run(reqgen.run())
+  File "/usr/lib/python3.10/asyncio/runners.py", line 44, in run
+    return loop.run_until_complete(main)
+  File "/usr/lib/python3.10/asyncio/base_events.py", line 649, in run_until_complete
+    return future.result()
+  File "/home/cloud_cxl/CXLSharedMemGPU/ReqGen/main.py", line 380, in run
+    await asyncio.gather(*tasks)
+  File "/home/cloud_cxl/CXLSharedMemGPU/ReqGen/main.py", line 133, in _run_client
+    async for chunk in response.content.iter_any():
+  File "/home/cloud_cxl/.local/lib/python3.10/site-packages/aiohttp/streams.py", line 50, in __anext__
+    rv = await self.read_func()
+  File "/home/cloud_cxl/.local/lib/python3.10/site-packages/aiohttp/streams.py", line 408, in readany
+    await self._wait("readany")
+  File "/home/cloud_cxl/.local/lib/python3.10/site-packages/aiohttp/streams.py", line 314, in _wait
+    with self._timer:
+  File "/home/cloud_cxl/.local/lib/python3.10/site-packages/aiohttp/helpers.py", line 749, in __exit__
+    raise asyncio.TimeoutError from exc_val
+asyncio.exceptions.TimeoutError

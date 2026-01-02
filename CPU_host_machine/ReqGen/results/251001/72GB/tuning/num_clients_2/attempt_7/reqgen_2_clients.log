@@ -1,0 +1,67 @@
+2025-10-01 20:22:43,991 - INFO - ReqGen 시작: 서버=163.152.48.109:9000, 클라이언트=2, 시간=600초
+2025-10-01 20:22:43,991 - INFO - Hugging Face에서 'kroshan/BioASQ' 데이터셋을 로드합니다...
+2025-10-01 20:22:50,899 - INFO - 3266개의 질문을 로드했습니다.
+2025-10-01 20:22:50,899 - INFO - 부하 테스트 시작, client 수 = 2
+2025-10-01 20:22:50,900 - INFO - Zipf 값 1.2에서 상위 20%의 질문이 차지하는 비율: 91.82%
+/home/cloud_cxl/.local/lib/python3.10/site-packages/numpy/core/fromnumeric.py:3504: RuntimeWarning: Mean of empty slice.
+  return _methods._mean(a, axis=axis, dtype=dtype,
+/home/cloud_cxl/.local/lib/python3.10/site-packages/numpy/core/_methods.py:129: RuntimeWarning: invalid value encountered in scalar divide
+  ret = ret.dtype.type(ret / rcount)
+통계에 반영된 요청 인덱스 범위: 0 ~ 48 (총 48개 요청)
+통계 반영된 요청 수: 48, 통계 반영된 시간: 624.96 초
+
+==================================================
+ 실험 최종 결과 요약
+==================================================
+ 설정 실험 시간: 600 초
+ Clients 수: 2
+ 통계 반영 시간: 624.96 초
+ 총 시도된 요청: 48 개
+ 총 완료된 요청: 48 개
+ 총 실패한 요청: 0 개
+ 요청 성공률: 100.00%
+ 전체 Requests Per Second (RPS): 0.08
+--------------------------------------------------
+ Time to First Token (TTFT) Latency:
+  - 평균 (Mean): 17.5764 초
+  - 중간값 (50%ile): 12.6843 초
+  - 95%ile Tail: 31.0003 초
+  - 99%ile Tail: 31.0008 초
+--------------------------------------------------
+ Time Per Output Token (TPOT):
+  - 평균 (Mean): 17.50 ms/token
+--------------------------------------------------
+ Embedding Latency:
+  - 총 샘플 수: 20
+  - 평균 (Mean): 14.70 ms
+  - 중간값 (50%ile): 11.00 ms
+  - 95%ile Tail: 23.50 ms
+  - 99%ile Tail: 31.10 ms
+--------------------------------------------------
+ VectorDB Search Latency:
+  - 총 샘플 수: 0
+  - 평균 (Mean): nan ms
+Traceback (most recent call last):
+  File "/home/cloud_cxl/CXLSharedMemGPU/ReqGen/main.py", line 384, in <module>
+    main()
+  File "/home/cloud_cxl/CXLSharedMemGPU/ReqGen/main.py", line 381, in main
+    asyncio.run(reqgen.run())
+  File "/usr/lib/python3.10/asyncio/runners.py", line 44, in run
+    return loop.run_until_complete(main)
+  File "/usr/lib/python3.10/asyncio/base_events.py", line 649, in run_until_complete
+    return future.result()
+  File "/home/cloud_cxl/CXLSharedMemGPU/ReqGen/main.py", line 362, in run
+    self._print_final_summary()
+  File "/home/cloud_cxl/CXLSharedMemGPU/ReqGen/main.py", line 326, in _print_final_summary
+    print(f"  - 중간값 (50%ile): {np.percentile(vectordb_latencies, 50)*1000:.2f} ms")
+  File "/home/cloud_cxl/.local/lib/python3.10/site-packages/numpy/lib/function_base.py", line 4283, in percentile
+    return _quantile_unchecked(
+  File "/home/cloud_cxl/.local/lib/python3.10/site-packages/numpy/lib/function_base.py", line 4555, in _quantile_unchecked
+    return _ureduce(a,
+  File "/home/cloud_cxl/.local/lib/python3.10/site-packages/numpy/lib/function_base.py", line 3823, in _ureduce
+    r = func(a, **kwargs)
+  File "/home/cloud_cxl/.local/lib/python3.10/site-packages/numpy/lib/function_base.py", line 4722, in _quantile_ureduce_func
+    result = _quantile(arr,
+  File "/home/cloud_cxl/.local/lib/python3.10/site-packages/numpy/lib/function_base.py", line 4831, in _quantile
+    slices_having_nans = np.isnan(arr[-1, ...])
+IndexError: index -1 is out of bounds for axis 0 with size 0

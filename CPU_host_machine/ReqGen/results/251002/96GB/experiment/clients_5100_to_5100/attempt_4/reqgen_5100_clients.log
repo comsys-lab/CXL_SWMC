@@ -1,0 +1,75 @@
+2025-10-02 11:40:47,298 - INFO - ReqGen 시작: 서버=163.152.48.109:9000, 클라이언트=5100, 시간=330초
+2025-10-02 11:40:47,298 - INFO - Hugging Face에서 'kroshan/BioASQ' 데이터셋을 로드합니다...
+Traceback (most recent call last):
+  File "/home/cloud_cxl/CXLSharedMemGPU/ReqGen/main.py", line 404, in <module>
+    main()
+  File "/home/cloud_cxl/CXLSharedMemGPU/ReqGen/main.py", line 400, in main
+    reqgen = ReqGen(args)
+  File "/home/cloud_cxl/CXLSharedMemGPU/ReqGen/main.py", line 27, in __init__
+    self.questions = self._load_questions()
+  File "/home/cloud_cxl/CXLSharedMemGPU/ReqGen/main.py", line 55, in _load_questions
+    dataset = load_dataset(self.dataset_name, split='train', streaming=True)
+  File "/home/cloud_cxl/.local/lib/python3.10/site-packages/datasets/load.py", line 1392, in load_dataset
+    builder_instance = load_dataset_builder(
+  File "/home/cloud_cxl/.local/lib/python3.10/site-packages/datasets/load.py", line 1132, in load_dataset_builder
+    dataset_module = dataset_module_factory(
+  File "/home/cloud_cxl/.local/lib/python3.10/site-packages/datasets/load.py", line 1004, in dataset_module_factory
+    ).get_module()
+  File "/home/cloud_cxl/.local/lib/python3.10/site-packages/datasets/load.py", line 631, in get_module
+    patterns = get_data_patterns(base_path, download_config=self.download_config)
+  File "/home/cloud_cxl/.local/lib/python3.10/site-packages/datasets/data_files.py", line 473, in get_data_patterns
+    return _get_data_files_patterns(resolver)
+  File "/home/cloud_cxl/.local/lib/python3.10/site-packages/datasets/data_files.py", line 262, in _get_data_files_patterns
+    data_files = pattern_resolver(pattern)
+  File "/home/cloud_cxl/.local/lib/python3.10/site-packages/datasets/data_files.py", line 360, in resolve_pattern
+    for filepath, info in fs.glob(pattern, detail=True, **glob_kwargs).items()
+  File "/home/cloud_cxl/.local/lib/python3.10/site-packages/huggingface_hub/hf_file_system.py", line 516, in glob
+    return super().glob(path, **kwargs)
+  File "/home/cloud_cxl/.local/lib/python3.10/site-packages/fsspec/spec.py", line 609, in glob
+    allpaths = self.find(root, maxdepth=depth, withdirs=True, detail=True, **kwargs)
+  File "/home/cloud_cxl/.local/lib/python3.10/site-packages/huggingface_hub/hf_file_system.py", line 551, in find
+    return super().find(
+  File "/home/cloud_cxl/.local/lib/python3.10/site-packages/fsspec/spec.py", line 502, in find
+    for _, dirs, files in self.walk(path, maxdepth, detail=True, **kwargs):
+  File "/home/cloud_cxl/.local/lib/python3.10/site-packages/huggingface_hub/hf_file_system.py", line 500, in walk
+    yield from super().walk(path, *args, **kwargs)
+  File "/home/cloud_cxl/.local/lib/python3.10/site-packages/fsspec/spec.py", line 427, in walk
+    listing = self.ls(path, detail=True, **kwargs)
+  File "/home/cloud_cxl/.local/lib/python3.10/site-packages/huggingface_hub/hf_file_system.py", line 371, in ls
+    out = self._ls_tree(path, refresh=refresh, revision=revision, **kwargs)
+  File "/home/cloud_cxl/.local/lib/python3.10/site-packages/huggingface_hub/hf_file_system.py", line 462, in _ls_tree
+    for path_info in tree:
+  File "/home/cloud_cxl/.local/lib/python3.10/site-packages/huggingface_hub/hf_api.py", line 3188, in list_repo_tree
+    for path_info in paginate(path=tree_url, headers=headers, params={"recursive": recursive, "expand": expand}):
+  File "/home/cloud_cxl/.local/lib/python3.10/site-packages/huggingface_hub/utils/_pagination.py", line 36, in paginate
+    r = session.get(path, params=params, headers=headers)
+  File "/home/cloud_cxl/.local/lib/python3.10/site-packages/requests/sessions.py", line 602, in get
+    return self.request("GET", url, **kwargs)
+  File "/home/cloud_cxl/.local/lib/python3.10/site-packages/requests/sessions.py", line 589, in request
+    resp = self.send(prep, **send_kwargs)
+  File "/home/cloud_cxl/.local/lib/python3.10/site-packages/requests/sessions.py", line 703, in send
+    r = adapter.send(request, **kwargs)
+  File "/home/cloud_cxl/.local/lib/python3.10/site-packages/huggingface_hub/utils/_http.py", line 96, in send
+    return super().send(request, *args, **kwargs)
+  File "/home/cloud_cxl/.local/lib/python3.10/site-packages/requests/adapters.py", line 644, in send
+    resp = conn.urlopen(
+  File "/usr/lib/python3/dist-packages/urllib3/connectionpool.py", line 700, in urlopen
+    httplib_response = self._make_request(
+  File "/usr/lib/python3/dist-packages/urllib3/connectionpool.py", line 446, in _make_request
+    six.raise_from(e, None)
+  File "<string>", line 3, in raise_from
+  File "/usr/lib/python3/dist-packages/urllib3/connectionpool.py", line 441, in _make_request
+    httplib_response = conn.getresponse()
+  File "/usr/lib/python3.10/http/client.py", line 1375, in getresponse
+    response.begin()
+  File "/usr/lib/python3.10/http/client.py", line 318, in begin
+    version, status, reason = self._read_status()
+  File "/usr/lib/python3.10/http/client.py", line 279, in _read_status
+    line = str(self.fp.readline(_MAXLINE + 1), "iso-8859-1")
+  File "/usr/lib/python3.10/socket.py", line 705, in readinto
+    return self._sock.recv_into(b)
+  File "/usr/lib/python3.10/ssl.py", line 1303, in recv_into
+    return self.read(nbytes, buffer)
+  File "/usr/lib/python3.10/ssl.py", line 1159, in read
+    return self._sslobj.read(len, buffer)
+KeyboardInterrupt

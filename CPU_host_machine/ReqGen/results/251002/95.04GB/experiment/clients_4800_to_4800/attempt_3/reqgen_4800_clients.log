@@ -1,0 +1,162 @@
+2025-10-02 11:01:30,273 - INFO - ReqGen 시작: 서버=163.152.48.109:9000, 클라이언트=4800, 시간=330초
+2025-10-02 11:01:30,273 - INFO - Hugging Face에서 'kroshan/BioASQ' 데이터셋을 로드합니다...
+2025-10-02 11:01:37,143 - INFO - 3266개의 질문을 로드했습니다.
+2025-10-02 11:01:37,143 - INFO - 부하 테스트 시작, client 수 = 4800
+2025-10-02 11:01:37,144 - INFO - Zipf 값 1.2에서 상위 20%의 질문이 차지하는 비율: 91.82%
+2025-10-02 11:01:39,923 - INFO - [실시간] 요청 1000개 처리 | 현재까지의 RPS: 359.85최근 1000개 request의 p99 TTFT: 0.4924 초 | 
+2025-10-02 11:01:42,042 - INFO - [실시간] 요청 2000개 처리 | 현재까지의 RPS: 408.29최근 1000개 request의 p99 TTFT: 0.2455 초 | 
+2025-10-02 11:01:43,754 - INFO - [실시간] 요청 3000개 처리 | 현재까지의 RPS: 453.84최근 1000개 request의 p99 TTFT: 0.4891 초 | 
+2025-10-02 11:01:45,282 - INFO - [실시간] 요청 4000개 처리 | 현재까지의 RPS: 491.48최근 1000개 request의 p99 TTFT: 0.4302 초 | 
+2025-10-02 11:01:46,653 - INFO - [실시간] 요청 5000개 처리 | 현재까지의 RPS: 525.79최근 1000개 request의 p99 TTFT: 0.6918 초 | 
+2025-10-02 11:01:47,974 - INFO - [실시간] 요청 6000개 처리 | 현재까지의 RPS: 554.03최근 1000개 request의 p99 TTFT: 1.7478 초 | 
+2025-10-02 11:01:49,374 - INFO - [실시간] 요청 7000개 처리 | 현재까지의 RPS: 572.36최근 1000개 request의 p99 TTFT: 1.6617 초 | 
+2025-10-02 11:01:51,103 - INFO - [실시간] 요청 8000개 처리 | 현재까지의 RPS: 573.07최근 1000개 request의 p99 TTFT: 0.5403 초 | 
+2025-10-02 11:01:52,771 - INFO - [실시간] 요청 9000개 처리 | 현재까지의 RPS: 575.91최근 1000개 request의 p99 TTFT: 0.3774 초 | 
+2025-10-02 11:01:54,176 - INFO - [실시간] 요청 10000개 처리 | 현재까지의 RPS: 587.13최근 1000개 request의 p99 TTFT: 0.5158 초 | 
+2025-10-02 11:01:55,602 - INFO - [실시간] 요청 11000개 처리 | 현재까지의 RPS: 595.94최근 1000개 request의 p99 TTFT: 0.3689 초 | 
+2025-10-02 11:01:57,084 - INFO - [실시간] 요청 12000개 처리 | 현재까지의 RPS: 601.81최근 1000개 request의 p99 TTFT: 0.2317 초 | 
+2025-10-02 11:01:58,657 - INFO - [실시간] 요청 13000개 처리 | 현재까지의 RPS: 604.27최근 1000개 request의 p99 TTFT: 0.2431 초 | 
+2025-10-02 11:02:00,219 - INFO - [실시간] 요청 14000개 처리 | 현재까지의 RPS: 606.70최근 1000개 request의 p99 TTFT: 0.4937 초 | 
+2025-10-02 11:02:01,704 - INFO - [실시간] 요청 15000개 처리 | 현재까지의 RPS: 610.73최근 1000개 request의 p99 TTFT: 0.2509 초 | 
+2025-10-02 11:02:03,192 - INFO - [실시간] 요청 16000개 처리 | 현재까지의 RPS: 614.24최근 1000개 request의 p99 TTFT: 0.4177 초 | 
+2025-10-02 11:02:04,673 - INFO - [실시간] 요청 17000개 처리 | 현재까지의 RPS: 617.53최근 1000개 request의 p99 TTFT: 0.3242 초 | 
+2025-10-02 11:02:06,233 - INFO - [실시간] 요청 18000개 처리 | 현재까지의 RPS: 618.78최근 1000개 request의 p99 TTFT: 0.2650 초 | 
+2025-10-02 11:02:07,671 - INFO - [실시간] 요청 19000개 처리 | 현재까지의 RPS: 622.39최근 1000개 request의 p99 TTFT: 0.4927 초 | 
+2025-10-02 11:02:09,164 - INFO - [실시간] 요청 20000개 처리 | 현재까지의 RPS: 624.61최근 1000개 request의 p99 TTFT: 0.3061 초 | 
+2025-10-02 11:02:11,017 - INFO - [실시간] 요청 21000개 처리 | 현재까지의 RPS: 619.96최근 1000개 request의 p99 TTFT: 0.5225 초 | 
+2025-10-02 11:02:12,369 - INFO - [실시간] 요청 22000개 처리 | 현재까지의 RPS: 624.56최근 1000개 request의 p99 TTFT: 1.1859 초 | 
+2025-10-02 11:02:13,748 - INFO - [실시간] 요청 23000개 처리 | 현재까지의 RPS: 628.34최근 1000개 request의 p99 TTFT: 1.3390 초 | 
+2025-10-02 11:02:15,266 - INFO - [실시간] 요청 24000개 처리 | 현재까지의 RPS: 629.54최근 1000개 request의 p99 TTFT: 0.5458 초 | 
+2025-10-02 11:02:16,769 - INFO - [실시간] 요청 25000개 처리 | 현재까지의 RPS: 630.91최근 1000개 request의 p99 TTFT: 0.4045 초 | 
+2025-10-02 11:02:18,280 - INFO - [실시간] 요청 26000개 처리 | 현재까지의 RPS: 632.05최근 1000개 request의 p99 TTFT: 0.2393 초 | 
+2025-10-02 11:02:19,828 - INFO - [실시간] 요청 27000개 처리 | 현재까지의 RPS: 632.55최근 1000개 request의 p99 TTFT: 0.2681 초 | 
+2025-10-02 11:02:21,193 - INFO - [실시간] 요청 28000개 처리 | 현재까지의 RPS: 635.64최근 1000개 request의 p99 TTFT: 0.5213 초 | 
+2025-10-02 11:02:22,731 - INFO - [실시간] 요청 29000개 처리 | 현재까지의 RPS: 636.14최근 1000개 request의 p99 TTFT: 0.4275 초 | 
+2025-10-02 11:02:24,279 - INFO - [실시간] 요청 30000개 처리 | 현재까지의 RPS: 636.48최근 1000개 request의 p99 TTFT: 0.3964 초 | 
+2025-10-02 11:02:25,786 - INFO - [실시간] 요청 31000개 처리 | 현재까지의 RPS: 637.31최근 1000개 request의 p99 TTFT: 0.4687 초 | 
+2025-10-02 11:02:27,181 - INFO - [실시간] 요청 32000개 처리 | 현재까지의 RPS: 639.52최근 1000개 request의 p99 TTFT: 0.7987 초 | 
+2025-10-02 11:02:28,672 - INFO - [실시간] 요청 33000개 처리 | 현재까지의 RPS: 640.43최근 1000개 request의 p99 TTFT: 0.2840 초 | 
+2025-10-02 11:02:30,444 - INFO - [실시간] 요청 34000개 처리 | 현재까지의 RPS: 637.89최근 1000개 request의 p99 TTFT: 0.4718 초 | 
+2025-10-02 11:02:32,062 - INFO - [실시간] 요청 35000개 처리 | 현재까지의 RPS: 637.31최근 1000개 request의 p99 TTFT: 0.9089 초 | 
+2025-10-02 11:02:33,366 - INFO - [실시간] 요청 36000개 처리 | 현재까지의 RPS: 640.32최근 1000개 request의 p99 TTFT: 1.5547 초 | 
+2025-10-02 11:02:34,748 - INFO - [실시간] 요청 37000개 처리 | 현재까지의 RPS: 642.32최근 1000개 request의 p99 TTFT: 1.5964 초 | 
+2025-10-02 11:02:36,343 - INFO - [실시간] 요청 38000개 처리 | 현재까지의 RPS: 641.90최근 1000개 request의 p99 TTFT: 0.2556 초 | 
+2025-10-02 11:02:37,823 - INFO - [실시간] 요청 39000개 처리 | 현재까지의 RPS: 642.72최근 1000개 request의 p99 TTFT: 0.4449 초 | 
+2025-10-02 11:02:39,425 - INFO - [실시간] 요청 40000개 처리 | 현재까지의 RPS: 642.24최근 1000개 request의 p99 TTFT: 0.2489 초 | 
+2025-10-02 11:02:40,850 - INFO - [실시간] 요청 41000개 처리 | 현재까지의 RPS: 643.57최근 1000개 request의 p99 TTFT: 0.4404 초 | 
+2025-10-02 11:02:42,265 - INFO - [실시간] 요청 42000개 처리 | 현재까지의 RPS: 644.95최근 1000개 request의 p99 TTFT: 0.3417 초 | 
+2025-10-02 11:02:43,796 - INFO - [실시간] 요청 43000개 처리 | 현재까지의 RPS: 645.14최근 1000개 request의 p99 TTFT: 0.5662 초 | 
+2025-10-02 11:02:45,371 - INFO - [실시간] 요청 44000개 처리 | 현재까지의 RPS: 644.90최근 1000개 request의 p99 TTFT: 0.4688 초 | 
+2025-10-02 11:02:46,860 - INFO - [실시간] 요청 45000개 처리 | 현재까지의 RPS: 645.48최근 1000개 request의 p99 TTFT: 0.5137 초 | 
+2025-10-02 11:02:48,367 - INFO - [실시간] 요청 46000개 처리 | 현재까지의 RPS: 645.85최근 1000개 request의 p99 TTFT: 0.2712 초 | 
+2025-10-02 11:02:49,793 - INFO - [실시간] 요청 47000개 처리 | 현재까지의 RPS: 646.95최근 1000개 request의 p99 TTFT: 0.2261 초 | 
+2025-10-02 11:02:51,345 - INFO - [실시간] 요청 48000개 처리 | 현재까지의 RPS: 646.89최근 1000개 request의 p99 TTFT: 0.2648 초 | 
+2025-10-02 11:02:53,216 - INFO - [실시간] 요청 49000개 처리 | 현재까지의 RPS: 644.13최근 1000개 request의 p99 TTFT: 0.5722 초 | 
+2025-10-02 11:02:54,532 - INFO - [실시간] 요청 50000개 처리 | 현재까지의 RPS: 646.09최근 1000개 request의 p99 TTFT: 1.4682 초 | 
+2025-10-02 11:02:55,865 - INFO - [실시간] 요청 51000개 처리 | 현재까지의 RPS: 647.85최근 1000개 request의 p99 TTFT: 1.6331 초 | 
+2025-10-02 11:02:57,537 - INFO - [실시간] 요청 52000개 처리 | 현재까지의 RPS: 646.82최근 1000개 request의 p99 TTFT: 0.5686 초 | 
+2025-10-02 11:02:58,936 - INFO - [실시간] 요청 53000개 처리 | 현재까지의 RPS: 647.98최근 1000개 request의 p99 TTFT: 0.6721 초 | 
+2025-10-02 11:03:00,595 - INFO - [실시간] 요청 54000개 처리 | 현재까지의 RPS: 647.08최근 1000개 request의 p99 TTFT: 0.2591 초 | 
+2025-10-02 11:03:02,129 - INFO - [실시간] 요청 55000개 처리 | 현재까지의 RPS: 647.17최근 1000개 request의 p99 TTFT: 0.4626 초 | 
+2025-10-02 11:03:03,651 - INFO - [실시간] 요청 56000개 처리 | 현재까지의 RPS: 647.34최근 1000개 request의 p99 TTFT: 0.3772 초 | 
+2025-10-02 11:03:05,004 - INFO - [실시간] 요청 57000개 처리 | 현재까지의 RPS: 648.76최근 1000개 request의 p99 TTFT: 0.5156 초 | 
+2025-10-02 11:03:06,707 - INFO - [실시간] 요청 58000개 처리 | 현재까지의 RPS: 647.59최근 1000개 request의 p99 TTFT: 0.3801 초 | 
+2025-10-02 11:03:08,022 - INFO - [실시간] 요청 59000개 처리 | 현재까지의 RPS: 649.22최근 1000개 request의 p99 TTFT: 0.8730 초 | 
+2025-10-02 11:03:09,569 - INFO - [실시간] 요청 60000개 처리 | 현재까지의 RPS: 649.17최근 1000개 request의 p99 TTFT: 0.2350 초 | 
+2025-10-02 11:03:11,078 - INFO - [실시간] 요청 61000개 처리 | 현재까지의 RPS: 649.39최근 1000개 request의 p99 TTFT: 0.4764 초 | 
+2025-10-02 11:03:12,595 - INFO - [실시간] 요청 62000개 처리 | 현재까지의 RPS: 649.54최근 1000개 request의 p99 TTFT: 0.2810 초 | 
+2025-10-02 11:03:14,146 - INFO - [실시간] 요청 63000개 처리 | 현재까지의 RPS: 649.47최근 1000개 request의 p99 TTFT: 0.4064 초 | 
+2025-10-02 11:03:16,042 - INFO - [실시간] 요청 64000개 처리 | 현재까지의 RPS: 647.13최근 1000개 request의 p99 TTFT: 0.5753 초 | 
+2025-10-02 11:03:17,379 - INFO - [실시간] 요청 65000개 처리 | 현재까지의 RPS: 648.48최근 1000개 request의 p99 TTFT: 1.2793 초 | 
+2025-10-02 11:03:18,681 - INFO - [실시간] 요청 66000개 처리 | 현재까지의 RPS: 650.00최근 1000개 request의 p99 TTFT: 1.3490 초 | 
+2025-10-02 11:03:20,252 - INFO - [실시간] 요청 67000개 처리 | 현재까지의 RPS: 649.80최근 1000개 request의 p99 TTFT: 0.4213 초 | 
+2025-10-02 11:03:21,806 - INFO - [실시간] 요청 68000개 처리 | 현재까지의 RPS: 649.71최근 1000개 request의 p99 TTFT: 0.2627 초 | 
+2025-10-02 11:03:23,353 - INFO - [실시간] 요청 69000개 처리 | 현재까지의 RPS: 649.66최근 1000개 request의 p99 TTFT: 0.3169 초 | 
+2025-10-02 11:03:24,858 - INFO - [실시간] 요청 70000개 처리 | 현재까지의 RPS: 649.87최근 1000개 request의 p99 TTFT: 0.5602 초 | 
+2025-10-02 11:03:26,331 - INFO - [실시간] 요청 71000개 처리 | 현재까지의 RPS: 650.26최근 1000개 request의 p99 TTFT: 0.2738 초 | 
+2025-10-02 11:03:27,799 - INFO - [실시간] 요청 72000개 처리 | 현재까지의 RPS: 650.67최근 1000개 request의 p99 TTFT: 0.2669 초 | 
+2025-10-02 11:03:29,363 - INFO - [실시간] 요청 73000개 처리 | 현재까지의 RPS: 650.51최근 1000개 request의 p99 TTFT: 0.2507 초 | 
+2025-10-02 11:03:30,881 - INFO - [실시간] 요청 74000개 처리 | 현재까지의 RPS: 650.62최근 1000개 request의 p99 TTFT: 0.2393 초 | 
+2025-10-02 11:03:32,366 - INFO - [실시간] 요청 75000개 처리 | 현재까지의 RPS: 650.91최근 1000개 request의 p99 TTFT: 0.2997 초 | 
+2025-10-02 11:03:33,872 - INFO - [실시간] 요청 76000개 처리 | 현재까지의 RPS: 651.08최근 1000개 request의 p99 TTFT: 0.4702 초 | 
+2025-10-02 11:03:35,319 - INFO - [실시간] 요청 77000개 처리 | 현재까지의 RPS: 651.57최근 1000개 request의 p99 TTFT: 0.2623 초 | 
+2025-10-02 11:03:36,982 - INFO - [실시간] 요청 78000개 처리 | 현재까지의 RPS: 650.88최근 1000개 request의 p99 TTFT: 0.2388 초 | 
+2025-10-02 11:03:38,694 - INFO - [실시간] 요청 79000개 처리 | 현재까지의 RPS: 649.94최근 1000개 request의 p99 TTFT: 0.9340 초 | 
+2025-10-02 11:03:39,977 - INFO - [실시간] 요청 80000개 처리 | 현재까지의 RPS: 651.29최근 1000개 request의 p99 TTFT: 1.3224 초 | 
+2025-10-02 11:03:41,320 - INFO - [실시간] 요청 81000개 처리 | 현재까지의 RPS: 652.30최근 1000개 request의 p99 TTFT: 1.1916 초 | 
+2025-10-02 11:03:42,875 - INFO - [실시간] 요청 82000개 처리 | 현재까지의 RPS: 652.18최근 1000개 request의 p99 TTFT: 0.3042 초 | 
+2025-10-02 11:03:44,430 - INFO - [실시간] 요청 83000개 처리 | 현재까지의 RPS: 652.07최근 1000개 request의 p99 TTFT: 0.3327 초 | 
+2025-10-02 11:03:45,953 - INFO - [실시간] 요청 84000개 처리 | 현재까지의 RPS: 652.13최근 1000개 request의 p99 TTFT: 0.4555 초 | 
+2025-10-02 11:03:47,455 - INFO - [실시간] 요청 85000개 처리 | 현재까지의 RPS: 652.28최근 1000개 request의 p99 TTFT: 0.2758 초 | 
+2025-10-02 11:03:48,875 - INFO - [실시간] 요청 86000개 처리 | 현재까지의 RPS: 652.84최근 1000개 request의 p99 TTFT: 0.3968 초 | 
+2025-10-02 11:03:50,449 - INFO - [실시간] 요청 87000개 처리 | 현재까지의 RPS: 652.64최근 1000개 request의 p99 TTFT: 0.3219 초 | 
+Traceback (most recent call last):
+  File "/home/cloud_cxl/CXLSharedMemGPU/ReqGen/main.py", line 404, in <module>
+    main()
+  File "/home/cloud_cxl/CXLSharedMemGPU/ReqGen/main.py", line 401, in main
+    asyncio.run(reqgen.run())
+  File "/usr/lib/python3.10/asyncio/runners.py", line 47, in run
+    _cancel_all_tasks(loop)
+  File "/usr/lib/python3.10/asyncio/runners.py", line 63, in _cancel_all_tasks
+    loop.run_until_complete(tasks.gather(*to_cancel, return_exceptions=True))
+  File "/usr/lib/python3.10/asyncio/base_events.py", line 636, in run_until_complete
+    self.run_forever()
+  File "/usr/lib/python3.10/asyncio/base_events.py", line 603, in run_forever
+    self._run_once()
+  File "/usr/lib/python3.10/asyncio/base_events.py", line 1909, in _run_once
+    handle._run()
+  File "/usr/lib/python3.10/asyncio/events.py", line 80, in _run
+    self._context.run(self._callback, *self._args)
+  File "/home/cloud_cxl/CXLSharedMemGPU/ReqGen/main.py", line 380, in run
+    await asyncio.gather(*tasks)
+  File "/usr/lib/python3.10/asyncio/runners.py", line 44, in run
+    return loop.run_until_complete(main)
+  File "/usr/lib/python3.10/asyncio/base_events.py", line 636, in run_until_complete
+    self.run_forever()
+  File "/usr/lib/python3.10/asyncio/base_events.py", line 603, in run_forever
+    self._run_once()
+  File "/usr/lib/python3.10/asyncio/base_events.py", line 1909, in _run_once
+    handle._run()
+  File "/usr/lib/python3.10/asyncio/events.py", line 80, in _run
+    self._context.run(self._callback, *self._args)
+  File "/home/cloud_cxl/CXLSharedMemGPU/ReqGen/main.py", line 131, in _run_client
+    async with session.post(self.server_url, json={"client_id": client_id, "user_input": question}) as response:
+  File "/home/cloud_cxl/.local/lib/python3.10/site-packages/aiohttp/client.py", line 1161, in post
+    def post(
+KeyboardInterrupt
+2025-10-02 11:03:52,606 - ERROR - Task exception was never retrieved
+future: <Task finished name='Task-1' coro=<ReqGen.run() done, defined at /home/cloud_cxl/CXLSharedMemGPU/ReqGen/main.py:370> exception=KeyboardInterrupt()>
+Traceback (most recent call last):
+  File "/home/cloud_cxl/CXLSharedMemGPU/ReqGen/main.py", line 404, in <module>
+    main()
+  File "/home/cloud_cxl/CXLSharedMemGPU/ReqGen/main.py", line 401, in main
+    asyncio.run(reqgen.run())
+  File "/usr/lib/python3.10/asyncio/runners.py", line 47, in run
+    _cancel_all_tasks(loop)
+  File "/usr/lib/python3.10/asyncio/runners.py", line 63, in _cancel_all_tasks
+    loop.run_until_complete(tasks.gather(*to_cancel, return_exceptions=True))
+  File "/usr/lib/python3.10/asyncio/base_events.py", line 636, in run_until_complete
+    self.run_forever()
+  File "/usr/lib/python3.10/asyncio/base_events.py", line 603, in run_forever
+    self._run_once()
+  File "/usr/lib/python3.10/asyncio/base_events.py", line 1909, in _run_once
+    handle._run()
+  File "/usr/lib/python3.10/asyncio/events.py", line 80, in _run
+    self._context.run(self._callback, *self._args)
+  File "/home/cloud_cxl/CXLSharedMemGPU/ReqGen/main.py", line 380, in run
+    await asyncio.gather(*tasks)
+  File "/usr/lib/python3.10/asyncio/runners.py", line 44, in run
+    return loop.run_until_complete(main)
+  File "/usr/lib/python3.10/asyncio/base_events.py", line 636, in run_until_complete
+    self.run_forever()
+  File "/usr/lib/python3.10/asyncio/base_events.py", line 603, in run_forever
+    self._run_once()
+  File "/usr/lib/python3.10/asyncio/base_events.py", line 1909, in _run_once
+    handle._run()
+  File "/usr/lib/python3.10/asyncio/events.py", line 80, in _run
+    self._context.run(self._callback, *self._args)
+  File "/home/cloud_cxl/CXLSharedMemGPU/ReqGen/main.py", line 131, in _run_client
+    async with session.post(self.server_url, json={"client_id": client_id, "user_input": question}) as response:
+  File "/home/cloud_cxl/.local/lib/python3.10/site-packages/aiohttp/client.py", line 1161, in post
+    def post(
+KeyboardInterrupt

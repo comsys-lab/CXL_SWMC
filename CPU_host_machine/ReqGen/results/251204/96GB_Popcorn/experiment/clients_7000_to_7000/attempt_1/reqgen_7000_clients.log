@@ -1,0 +1,65 @@
+2025-12-04 22:35:19,270 - INFO - ReqGen 시작: 서버=163.152.48.109:9000, 클라이언트=7000, 시간=330초
+2025-12-04 22:35:19,270 - INFO - Hugging Face에서 'kroshan/BioASQ' 데이터셋을 로드합니다...
+2025-12-04 22:35:24,783 - INFO - 3266개의 질문을 로드했습니다.
+2025-12-04 22:35:24,784 - INFO - 부하 테스트 시작, client 수 = 7000
+2025-12-04 22:35:27,637 - INFO - [실시간] 요청 1000개 처리 | 현재까지의 RPS: 350.53최근 1000개 request의 p99 TTFT: 0.3116 초 | 
+2025-12-04 22:35:28,936 - INFO - [실시간] 요청 2000개 처리 | 현재까지의 RPS: 481.67최근 1000개 request의 p99 TTFT: 0.7596 초 | 
+2025-12-04 22:35:30,318 - INFO - [실시간] 요청 3000개 처리 | 현재까지의 RPS: 542.11최근 1000개 request의 p99 TTFT: 1.6391 초 | 
+2025-12-04 22:35:31,666 - INFO - [실시간] 요청 4000개 처리 | 현재까지의 RPS: 581.24최근 1000개 request의 p99 TTFT: 2.1632 초 | 
+2025-12-04 22:35:32,908 - INFO - [실시간] 요청 5000개 처리 | 현재까지의 RPS: 615.46최근 1000개 request의 p99 TTFT: 3.2161 초 | 
+2025-12-04 22:35:34,277 - INFO - [실시간] 요청 6000개 처리 | 현재까지의 RPS: 632.03최근 1000개 request의 p99 TTFT: 4.1522 초 | 
+2025-12-04 22:35:34,277 - WARNING - 최근 1000개의 p99 TTFT 4.1522 초가 SLO 의 4배 (4.0 초)를 초과했습니다. 부하 테스트를 조기 종료합니다.
+2025-12-04 22:35:35,459 - INFO - [실시간] 요청 7000개 처리 | 현재까지의 RPS: 655.71최근 1000개 request의 p99 TTFT: 4.8344 초 | 
+2025-12-04 22:35:36,625 - INFO - [실시간] 요청 8000개 처리 | 현재까지의 RPS: 675.63최근 1000개 request의 p99 TTFT: 5.6385 초 | 
+2025-12-04 22:35:37,902 - INFO - [실시간] 요청 9000개 처리 | 현재까지의 RPS: 686.05최근 1000개 request의 p99 TTFT: 6.4603 초 | 
+2025-12-04 22:35:39,254 - INFO - [실시간] 요청 10000개 처리 | 현재까지의 RPS: 691.06최근 1000개 request의 p99 TTFT: 6.6814 초 | 
+2025-12-04 22:35:40,744 - INFO - [실시간] 요청 11000개 처리 | 현재까지의 RPS: 689.21최근 1000개 request의 p99 TTFT: 7.1383 초 | 
+2025-12-04 22:35:43,147 - INFO - [실시간] 요청 12000개 처리 | 현재까지의 RPS: 653.48최근 1000개 request의 p99 TTFT: 6.8275 초 | 
+/home/comsys/.local/lib/python3.10/site-packages/numpy/core/fromnumeric.py:3504: RuntimeWarning: Mean of empty slice.
+  return _methods._mean(a, axis=axis, dtype=dtype,
+/home/comsys/.local/lib/python3.10/site-packages/numpy/core/_methods.py:129: RuntimeWarning: invalid value encountered in scalar divide
+  ret = ret.dtype.type(ret / rcount)
+통계에 반영된 요청 인덱스 범위: 7000 ~ 6000 (총 -1000개 요청)
+통계 반영된 요청 수: -1000, 통계 반영된 시간: -1.18 초
+
+==================================================
+ 실험 최종 결과 요약
+==================================================
+ 부하 테스트가 조기 종료되었습니다! (SLO 위반)
+ Client 수를 낮추어 다시 시도하세요.
+ 설정 실험 시간: 330 초
+ Clients 수: 7000
+ 통계 반영 시간: -1.18 초
+ 총 시도된 요청: 0 개
+ 총 완료된 요청: 0 개
+ 총 실패한 요청: 0 개
+ 완료 요청 중 retrieval이 실패한 요청: -12920 개
+ 요청 성공률: 0.00%
+ 전체 Requests Per Second (RPS): 845.90
+--------------------------------------------------
+ Time to First Token (TTFT) Latency:
+  - 평균 (Mean): nan 초
+Traceback (most recent call last):
+  File "/home/comsys/sungsu/CXLSharedMemGPU/ReqGen/main.py", line 418, in <module>
+    main()
+  File "/home/comsys/sungsu/CXLSharedMemGPU/ReqGen/main.py", line 415, in main
+    asyncio.run(reqgen.run())
+  File "/usr/lib/python3.10/asyncio/runners.py", line 44, in run
+    return loop.run_until_complete(main)
+  File "/usr/lib/python3.10/asyncio/base_events.py", line 649, in run_until_complete
+    return future.result()
+  File "/home/comsys/sungsu/CXLSharedMemGPU/ReqGen/main.py", line 395, in run
+    self._print_final_summary()
+  File "/home/comsys/sungsu/CXLSharedMemGPU/ReqGen/main.py", line 322, in _print_final_summary
+    print(f"  - 중간값 (50%ile): {np.percentile(ttfts, 50):.4f} 초")
+  File "/home/comsys/.local/lib/python3.10/site-packages/numpy/lib/function_base.py", line 4283, in percentile
+    return _quantile_unchecked(
+  File "/home/comsys/.local/lib/python3.10/site-packages/numpy/lib/function_base.py", line 4555, in _quantile_unchecked
+    return _ureduce(a,
+  File "/home/comsys/.local/lib/python3.10/site-packages/numpy/lib/function_base.py", line 3823, in _ureduce
+    r = func(a, **kwargs)
+  File "/home/comsys/.local/lib/python3.10/site-packages/numpy/lib/function_base.py", line 4722, in _quantile_ureduce_func
+    result = _quantile(arr,
+  File "/home/comsys/.local/lib/python3.10/site-packages/numpy/lib/function_base.py", line 4831, in _quantile
+    slices_having_nans = np.isnan(arr[-1, ...])
+IndexError: index -1 is out of bounds for axis 0 with size 0

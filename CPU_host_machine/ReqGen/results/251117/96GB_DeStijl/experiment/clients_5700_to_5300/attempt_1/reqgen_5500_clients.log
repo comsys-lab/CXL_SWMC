@@ -1,0 +1,104 @@
+2025-11-17 17:35:32,120 - INFO - ReqGen 시작: 서버=163.152.48.109:9000, 클라이언트=5500, 시간=330초
+2025-11-17 17:35:32,120 - INFO - Hugging Face에서 'kroshan/BioASQ' 데이터셋을 로드합니다...
+2025-11-17 17:35:39,524 - INFO - 3266개의 질문을 로드했습니다.
+2025-11-17 17:35:39,525 - INFO - 부하 테스트 시작, client 수 = 5500
+2025-11-17 17:35:39,525 - INFO - Zipf 값 1.2에서 상위 20%의 질문이 차지하는 비율: 91.82%
+2025-11-17 17:35:42,205 - INFO - [실시간] 요청 1000개 처리 | 현재까지의 RPS: 373.03최근 1000개 request의 p99 TTFT: 0.2081 초 | 
+2025-11-17 17:35:43,831 - INFO - [실시간] 요청 2000개 처리 | 현재까지의 RPS: 464.43최근 1000개 request의 p99 TTFT: 0.1838 초 | 
+2025-11-17 17:35:45,428 - INFO - [실시간] 요청 3000개 처리 | 현재까지의 RPS: 508.17최근 1000개 request의 p99 TTFT: 0.3230 초 | 
+2025-11-17 17:35:46,756 - INFO - [실시간] 요청 4000개 처리 | 현재까지의 RPS: 553.17최근 1000개 request의 p99 TTFT: 0.5393 초 | 
+2025-11-17 17:35:48,113 - INFO - [실시간] 요청 5000개 처리 | 현재까지의 RPS: 582.17최근 1000개 request의 p99 TTFT: 0.4036 초 | 
+2025-11-17 17:35:49,459 - INFO - [실시간] 요청 6000개 처리 | 현재까지의 RPS: 603.93최근 1000개 request의 p99 TTFT: 0.4601 초 | 
+2025-11-17 17:35:50,970 - INFO - [실시간] 요청 7000개 처리 | 현재까지의 RPS: 611.59최근 1000개 request의 p99 TTFT: 0.6127 초 | 
+2025-11-17 17:35:53,456 - INFO - [실시간] 요청 8000개 처리 | 현재까지의 RPS: 574.24최근 1000개 request의 p99 TTFT: 0.5107 초 | 
+2025-11-17 17:35:56,026 - INFO - [실시간] 요청 9000개 처리 | 현재까지의 RPS: 545.41최근 1000개 request의 p99 TTFT: 0.1918 초 | 
+2025-11-17 17:35:58,357 - INFO - [실시간] 요청 10000개 처리 | 현재까지의 RPS: 531.00최근 1000개 request의 p99 TTFT: 0.1809 초 | 
+2025-11-17 17:36:00,397 - INFO - [실시간] 요청 11000개 처리 | 현재까지의 RPS: 527.02최근 1000개 request의 p99 TTFT: 0.1812 초 | 
+2025-11-17 17:36:02,272 - INFO - [실시간] 요청 12000개 처리 | 현재까지의 RPS: 527.54최근 1000개 request의 p99 TTFT: 0.4279 초 | 
+2025-11-17 17:36:04,115 - INFO - [실시간] 요청 13000개 처리 | 현재까지의 RPS: 528.67최근 1000개 request의 p99 TTFT: 0.1966 초 | 
+2025-11-17 17:36:06,025 - INFO - [실시간] 요청 14000개 처리 | 현재까지의 RPS: 528.30최근 1000개 request의 p99 TTFT: 0.1836 초 | 
+2025-11-17 17:36:07,811 - INFO - [실시간] 요청 15000개 처리 | 현재까지의 RPS: 530.30최근 1000개 request의 p99 TTFT: 0.2046 초 | 
+2025-11-17 17:36:09,651 - INFO - [실시간] 요청 16000개 처리 | 현재까지의 RPS: 531.10최근 1000개 request의 p99 TTFT: 0.3161 초 | 
+2025-11-17 17:36:11,635 - INFO - [실시간] 요청 17000개 처리 | 현재까지의 RPS: 529.42최근 1000개 request의 p99 TTFT: 0.2190 초 | 
+Traceback (most recent call last):
+  File "/home/comsys/sungsu/CXLSharedMemGPU/ReqGen/main.py", line 406, in <module>
+    main()
+  File "/home/comsys/sungsu/CXLSharedMemGPU/ReqGen/main.py", line 403, in main
+    asyncio.run(reqgen.run())
+  File "/usr/lib/python3.10/asyncio/runners.py", line 47, in run
+    _cancel_all_tasks(loop)
+  File "/usr/lib/python3.10/asyncio/runners.py", line 63, in _cancel_all_tasks
+    loop.run_until_complete(tasks.gather(*to_cancel, return_exceptions=True))
+  File "/usr/lib/python3.10/asyncio/base_events.py", line 636, in run_until_complete
+    self.run_forever()
+  File "/usr/lib/python3.10/asyncio/base_events.py", line 603, in run_forever
+    self._run_once()
+  File "/usr/lib/python3.10/asyncio/base_events.py", line 1909, in _run_once
+    handle._run()
+  File "/usr/lib/python3.10/asyncio/events.py", line 80, in _run
+    self._context.run(self._callback, *self._args)
+  File "/home/comsys/sungsu/CXLSharedMemGPU/ReqGen/main.py", line 381, in run
+    await asyncio.gather(*tasks)
+  File "/usr/lib/python3.10/asyncio/runners.py", line 44, in run
+    return loop.run_until_complete(main)
+  File "/usr/lib/python3.10/asyncio/base_events.py", line 636, in run_until_complete
+    self.run_forever()
+  File "/usr/lib/python3.10/asyncio/base_events.py", line 603, in run_forever
+    self._run_once()
+  File "/usr/lib/python3.10/asyncio/base_events.py", line 1909, in _run_once
+    handle._run()
+  File "/usr/lib/python3.10/asyncio/events.py", line 80, in _run
+    self._context.run(self._callback, *self._args)
+  File "/home/comsys/sungsu/CXLSharedMemGPU/ReqGen/main.py", line 132, in _run_client
+    async with session.post(self.server_url, json={"client_id": client_id, "user_input": question}) as response:
+  File "/home/comsys/.local/lib/python3.10/site-packages/aiohttp/client.py", line 1197, in __aenter__
+    self._resp = await self._coro
+  File "/home/comsys/.local/lib/python3.10/site-packages/aiohttp/client.py", line 437, in _request
+    data = payload.JsonPayload(json, dumps=self._json_serialize)
+  File "/home/comsys/.local/lib/python3.10/site-packages/aiohttp/payload.py", line 396, in __init__
+    dumps(value).encode(encoding),
+  File "/usr/lib/python3.10/json/__init__.py", line 183, in dumps
+    def dumps(obj, *, skipkeys=False, ensure_ascii=True, check_circular=True,
+KeyboardInterrupt
+2025-11-17 17:36:13,916 - ERROR - Task exception was never retrieved
+future: <Task finished name='Task-1' coro=<ReqGen.run() done, defined at /home/comsys/sungsu/CXLSharedMemGPU/ReqGen/main.py:371> exception=KeyboardInterrupt()>
+Traceback (most recent call last):
+  File "/home/comsys/sungsu/CXLSharedMemGPU/ReqGen/main.py", line 406, in <module>
+    main()
+  File "/home/comsys/sungsu/CXLSharedMemGPU/ReqGen/main.py", line 403, in main
+    asyncio.run(reqgen.run())
+  File "/usr/lib/python3.10/asyncio/runners.py", line 47, in run
+    _cancel_all_tasks(loop)
+  File "/usr/lib/python3.10/asyncio/runners.py", line 63, in _cancel_all_tasks
+    loop.run_until_complete(tasks.gather(*to_cancel, return_exceptions=True))
+  File "/usr/lib/python3.10/asyncio/base_events.py", line 636, in run_until_complete
+    self.run_forever()
+  File "/usr/lib/python3.10/asyncio/base_events.py", line 603, in run_forever
+    self._run_once()
+  File "/usr/lib/python3.10/asyncio/base_events.py", line 1909, in _run_once
+    handle._run()
+  File "/usr/lib/python3.10/asyncio/events.py", line 80, in _run
+    self._context.run(self._callback, *self._args)
+  File "/home/comsys/sungsu/CXLSharedMemGPU/ReqGen/main.py", line 381, in run
+    await asyncio.gather(*tasks)
+  File "/usr/lib/python3.10/asyncio/runners.py", line 44, in run
+    return loop.run_until_complete(main)
+  File "/usr/lib/python3.10/asyncio/base_events.py", line 636, in run_until_complete
+    self.run_forever()
+  File "/usr/lib/python3.10/asyncio/base_events.py", line 603, in run_forever
+    self._run_once()
+  File "/usr/lib/python3.10/asyncio/base_events.py", line 1909, in _run_once
+    handle._run()
+  File "/usr/lib/python3.10/asyncio/events.py", line 80, in _run
+    self._context.run(self._callback, *self._args)
+  File "/home/comsys/sungsu/CXLSharedMemGPU/ReqGen/main.py", line 132, in _run_client
+    async with session.post(self.server_url, json={"client_id": client_id, "user_input": question}) as response:
+  File "/home/comsys/.local/lib/python3.10/site-packages/aiohttp/client.py", line 1197, in __aenter__
+    self._resp = await self._coro
+  File "/home/comsys/.local/lib/python3.10/site-packages/aiohttp/client.py", line 437, in _request
+    data = payload.JsonPayload(json, dumps=self._json_serialize)
+  File "/home/comsys/.local/lib/python3.10/site-packages/aiohttp/payload.py", line 396, in __init__
+    dumps(value).encode(encoding),
+  File "/usr/lib/python3.10/json/__init__.py", line 183, in dumps
+    def dumps(obj, *, skipkeys=False, ensure_ascii=True, check_circular=True,
+KeyboardInterrupt

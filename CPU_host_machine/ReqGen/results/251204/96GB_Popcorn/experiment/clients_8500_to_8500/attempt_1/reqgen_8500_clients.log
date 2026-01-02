@@ -1,0 +1,38 @@
+2025-12-04 22:34:40,051 - INFO - ReqGen 시작: 서버=163.152.48.109:9000, 클라이언트=8500, 시간=330초
+2025-12-04 22:34:40,051 - INFO - Hugging Face에서 'kroshan/BioASQ' 데이터셋을 로드합니다...
+2025-12-04 22:34:45,491 - INFO - 3266개의 질문을 로드했습니다.
+2025-12-04 22:34:45,492 - INFO - 부하 테스트 시작, client 수 = 8500
+2025-12-04 22:34:48,190 - INFO - [실시간] 요청 1000개 처리 | 현재까지의 RPS: 370.57최근 1000개 request의 p99 TTFT: 0.4907 초 | 
+2025-12-04 22:34:49,604 - INFO - [실시간] 요청 2000개 처리 | 현재까지의 RPS: 486.28최근 1000개 request의 p99 TTFT: 1.0252 초 | 
+2025-12-04 22:34:50,908 - INFO - [실시간] 요청 3000개 처리 | 현재까지의 RPS: 553.86최근 1000개 request의 p99 TTFT: 1.6694 초 | 
+2025-12-04 22:34:52,171 - INFO - [실시간] 요청 4000개 처리 | 현재까지의 RPS: 598.85최근 1000개 request의 p99 TTFT: 2.5887 초 | 
+2025-12-04 22:34:53,507 - INFO - [실시간] 요청 5000개 처리 | 현재까지의 RPS: 623.77최근 1000개 request의 p99 TTFT: 3.2814 초 | 
+2025-12-04 22:34:54,790 - INFO - [실시간] 요청 6000개 처리 | 현재까지의 RPS: 645.27최근 1000개 request의 p99 TTFT: 4.4854 초 | 
+2025-12-04 22:34:54,790 - WARNING - 최근 1000개의 p99 TTFT 4.4854 초가 SLO 의 4배 (4.0 초)를 초과했습니다. 부하 테스트를 조기 종료합니다.
+2025-12-04 22:34:56,043 - INFO - [실시간] 요청 7000개 처리 | 현재까지의 RPS: 663.39최근 1000개 request의 p99 TTFT: 5.7442 초 | 
+2025-12-04 22:34:57,201 - INFO - [실시간] 요청 8000개 처리 | 현재까지의 RPS: 683.24최근 1000개 request의 p99 TTFT: 6.5558 초 | 
+2025-12-04 22:34:58,435 - INFO - [실시간] 요청 9000개 처리 | 현재까지의 RPS: 695.36최근 1000개 request의 p99 TTFT: 6.9973 초 | 
+2025-12-04 22:34:59,745 - INFO - [실시간] 요청 10000개 처리 | 현재까지의 RPS: 701.57최근 1000개 request의 p99 TTFT: 7.8338 초 | 
+2025-12-04 22:35:01,021 - INFO - [실시간] 요청 11000개 처리 | 현재까지의 RPS: 708.36최근 1000개 request의 p99 TTFT: 8.3360 초 | 
+2025-12-04 22:35:02,285 - INFO - [실시간] 요청 12000개 처리 | 현재까지의 RPS: 714.57최근 1000개 request의 p99 TTFT: 8.3867 초 | 
+2025-12-04 22:35:03,928 - INFO - [실시간] 요청 13000개 처리 | 현재까지의 RPS: 705.12최근 1000개 request의 p99 TTFT: 8.2714 초 | 
+Traceback (most recent call last):
+  File "/home/comsys/sungsu/CXLSharedMemGPU/ReqGen/main.py", line 418, in <module>
+    main()
+  File "/home/comsys/sungsu/CXLSharedMemGPU/ReqGen/main.py", line 415, in main
+    asyncio.run(reqgen.run())
+  File "/usr/lib/python3.10/asyncio/runners.py", line 44, in run
+    return loop.run_until_complete(main)
+  File "/usr/lib/python3.10/asyncio/base_events.py", line 636, in run_until_complete
+    self.run_forever()
+  File "/usr/lib/python3.10/asyncio/base_events.py", line 603, in run_forever
+    self._run_once()
+  File "/usr/lib/python3.10/asyncio/base_events.py", line 1909, in _run_once
+    handle._run()
+  File "/usr/lib/python3.10/asyncio/events.py", line 80, in _run
+    self._context.run(self._callback, *self._args)
+  File "/usr/lib/python3.10/asyncio/selector_events.py", line 819, in _read_ready
+    self._read_ready_cb()
+  File "/usr/lib/python3.10/asyncio/selector_events.py", line 862, in _read_ready__data_received
+    data = self._sock.recv(self.max_size)
+KeyboardInterrupt

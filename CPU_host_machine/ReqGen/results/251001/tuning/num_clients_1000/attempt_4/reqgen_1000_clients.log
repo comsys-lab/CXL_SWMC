@@ -1,0 +1,79 @@
+2025-10-01 16:47:39,126 - INFO - ReqGen 시작: 서버=163.152.48.109:9000, 클라이언트=1000, 시간=60초
+2025-10-01 16:47:39,127 - INFO - Hugging Face에서 'kroshan/BioASQ' 데이터셋을 로드합니다...
+2025-10-01 16:47:46,488 - INFO - 3266개의 질문을 로드했습니다.
+2025-10-01 16:47:46,489 - INFO - 부하 테스트 시작, client 수 = 1000
+2025-10-01 16:47:46,489 - INFO - Zipf 값 1.0000000001에서 상위 20%의 질문이 차지하는 비율: 81.44%
+Traceback (most recent call last):
+  File "/home/cloud_cxl/CXLSharedMemGPU/ReqGen/main.py", line 380, in <module>
+    main()
+  File "/home/cloud_cxl/CXLSharedMemGPU/ReqGen/main.py", line 377, in main
+    asyncio.run(reqgen.run())
+  File "/usr/lib/python3.10/asyncio/runners.py", line 47, in run
+    _cancel_all_tasks(loop)
+  File "/usr/lib/python3.10/asyncio/runners.py", line 63, in _cancel_all_tasks
+    loop.run_until_complete(tasks.gather(*to_cancel, return_exceptions=True))
+  File "/usr/lib/python3.10/asyncio/base_events.py", line 636, in run_until_complete
+    self.run_forever()
+  File "/usr/lib/python3.10/asyncio/base_events.py", line 603, in run_forever
+    self._run_once()
+  File "/usr/lib/python3.10/asyncio/base_events.py", line 1909, in _run_once
+    handle._run()
+  File "/usr/lib/python3.10/asyncio/events.py", line 80, in _run
+    self._context.run(self._callback, *self._args)
+  File "/home/cloud_cxl/CXLSharedMemGPU/ReqGen/main.py", line 356, in run
+    await asyncio.gather(*tasks)
+  File "/usr/lib/python3.10/asyncio/runners.py", line 44, in run
+    return loop.run_until_complete(main)
+  File "/usr/lib/python3.10/asyncio/base_events.py", line 636, in run_until_complete
+    self.run_forever()
+  File "/usr/lib/python3.10/asyncio/base_events.py", line 603, in run_forever
+    self._run_once()
+  File "/usr/lib/python3.10/asyncio/base_events.py", line 1909, in _run_once
+    handle._run()
+  File "/usr/lib/python3.10/asyncio/events.py", line 80, in _run
+    self._context.run(self._callback, *self._args)
+  File "/home/cloud_cxl/CXLSharedMemGPU/ReqGen/main.py", line 111, in _run_client
+    question_idx = np.random.zipf(self.zipf_param) % len(self.questions)
+  File "numpy/random/mtrand.pyx", line 3770, in numpy.random.mtrand.RandomState.zipf
+  File "numpy/random/mtrand.pyx", line 114, in numpy.random.mtrand.int64_to_long
+  File "/home/cloud_cxl/.local/lib/python3.10/site-packages/numpy/core/numeric.py", line 1855, in isscalar
+    @set_module('numpy')
+KeyboardInterrupt
+2025-10-01 16:48:02,894 - ERROR - Task exception was never retrieved
+future: <Task finished name='Task-1' coro=<ReqGen.run() done, defined at /home/cloud_cxl/CXLSharedMemGPU/ReqGen/main.py:346> exception=KeyboardInterrupt()>
+Traceback (most recent call last):
+  File "/home/cloud_cxl/CXLSharedMemGPU/ReqGen/main.py", line 380, in <module>
+    main()
+  File "/home/cloud_cxl/CXLSharedMemGPU/ReqGen/main.py", line 377, in main
+    asyncio.run(reqgen.run())
+  File "/usr/lib/python3.10/asyncio/runners.py", line 47, in run
+    _cancel_all_tasks(loop)
+  File "/usr/lib/python3.10/asyncio/runners.py", line 63, in _cancel_all_tasks
+    loop.run_until_complete(tasks.gather(*to_cancel, return_exceptions=True))
+  File "/usr/lib/python3.10/asyncio/base_events.py", line 636, in run_until_complete
+    self.run_forever()
+  File "/usr/lib/python3.10/asyncio/base_events.py", line 603, in run_forever
+    self._run_once()
+  File "/usr/lib/python3.10/asyncio/base_events.py", line 1909, in _run_once
+    handle._run()
+  File "/usr/lib/python3.10/asyncio/events.py", line 80, in _run
+    self._context.run(self._callback, *self._args)
+  File "/home/cloud_cxl/CXLSharedMemGPU/ReqGen/main.py", line 356, in run
+    await asyncio.gather(*tasks)
+  File "/usr/lib/python3.10/asyncio/runners.py", line 44, in run
+    return loop.run_until_complete(main)
+  File "/usr/lib/python3.10/asyncio/base_events.py", line 636, in run_until_complete
+    self.run_forever()
+  File "/usr/lib/python3.10/asyncio/base_events.py", line 603, in run_forever
+    self._run_once()
+  File "/usr/lib/python3.10/asyncio/base_events.py", line 1909, in _run_once
+    handle._run()
+  File "/usr/lib/python3.10/asyncio/events.py", line 80, in _run
+    self._context.run(self._callback, *self._args)
+  File "/home/cloud_cxl/CXLSharedMemGPU/ReqGen/main.py", line 111, in _run_client
+    question_idx = np.random.zipf(self.zipf_param) % len(self.questions)
+  File "numpy/random/mtrand.pyx", line 3770, in numpy.random.mtrand.RandomState.zipf
+  File "numpy/random/mtrand.pyx", line 114, in numpy.random.mtrand.int64_to_long
+  File "/home/cloud_cxl/.local/lib/python3.10/site-packages/numpy/core/numeric.py", line 1855, in isscalar
+    @set_module('numpy')
+KeyboardInterrupt

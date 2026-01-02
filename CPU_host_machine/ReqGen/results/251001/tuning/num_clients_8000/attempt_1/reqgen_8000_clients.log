@@ -1,0 +1,28 @@
+2025-10-01 16:38:45,916 - INFO - ReqGen 시작: 서버=163.152.48.109:9000, 클라이언트=8000, 시간=60초
+2025-10-01 16:38:45,916 - INFO - Hugging Face에서 'kroshan/BioASQ' 데이터셋을 로드합니다...
+2025-10-01 16:38:52,885 - INFO - 3266개의 질문을 로드했습니다.
+2025-10-01 16:38:52,886 - INFO - 부하 테스트 시작, client 수 = 8000
+2025-10-01 16:38:52,887 - INFO - Zipf 값 1.05에서 상위 20%의 질문이 차지하는 비율: 84.55%
+2025-10-01 16:39:30,660 - INFO - [실시간] 요청 1000개 처리 | 현재까지의 RPS: 26.47최근 1000개 request의 p99 TTFT: 36.5751 초 | 
+2025-10-01 16:39:30,660 - WARNING - 최근 1000개의 p99 TTFT 36.5751 초가 SLO 2.0 초를 초과했습니다. 부하 테스트를 조기 종료합니다.
+2025-10-01 16:39:32,192 - INFO - [실시간] 요청 2000개 처리 | 현재까지의 RPS: 50.88최근 1000개 request의 p99 TTFT: 37.6303 초 | 
+2025-10-01 16:39:33,801 - INFO - [실시간] 요청 3000개 처리 | 현재까지의 RPS: 73.32최근 1000개 request의 p99 TTFT: 38.5509 초 | 
+2025-10-01 16:39:35,299 - INFO - [실시간] 요청 4000개 처리 | 현재까지의 RPS: 94.31최근 1000개 request의 p99 TTFT: 39.9807 초 | 
+2025-10-01 16:39:36,684 - INFO - [실시간] 요청 5000개 처리 | 현재까지의 RPS: 114.16최근 1000개 request의 p99 TTFT: 41.2158 초 | 
+2025-10-01 16:39:38,543 - INFO - [실시간] 요청 6000개 처리 | 현재까지의 RPS: 131.42최근 1000개 request의 p99 TTFT: 42.5863 초 | 
+2025-10-01 16:39:40,534 - INFO - [실시간] 요청 7000개 처리 | 현재까지의 RPS: 146.91최근 1000개 request의 p99 TTFT: 43.2214 초 | 
+2025-10-01 16:39:43,314 - INFO - [실시간] 요청 8000개 처리 | 현재까지의 RPS: 158.64최근 1000개 request의 p99 TTFT: 44.2708 초 | 
+Traceback (most recent call last):
+  File "/home/cloud_cxl/CXLSharedMemGPU/ReqGen/main.py", line 380, in <module>
+    main()
+  File "/home/cloud_cxl/CXLSharedMemGPU/ReqGen/main.py", line 377, in main
+    asyncio.run(reqgen.run())
+  File "/usr/lib/python3.10/asyncio/runners.py", line 44, in run
+    return loop.run_until_complete(main)
+  File "/usr/lib/python3.10/asyncio/base_events.py", line 649, in run_until_complete
+    return future.result()
+  File "/home/cloud_cxl/CXLSharedMemGPU/ReqGen/main.py", line 358, in run
+    self._print_final_summary()
+  File "/home/cloud_cxl/CXLSharedMemGPU/ReqGen/main.py", line 268, in _print_final_summary
+    self.embedding_latencies = self.embedding_latencie[start_index:end_index]
+AttributeError: 'ReqGen' object has no attribute 'embedding_latencie'. Did you mean: 'embedding_latencies'?

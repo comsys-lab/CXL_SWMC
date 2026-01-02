@@ -1,0 +1,29 @@
+2025-11-17 21:17:19,241 - INFO - ReqGen 시작: 서버=163.152.48.109:9000, 클라이언트=6000, 시간=80초
+2025-11-17 21:17:19,241 - INFO - Hugging Face에서 'kroshan/BioASQ' 데이터셋을 로드합니다...
+2025-11-17 21:17:28,504 - INFO - 3266개의 질문을 로드했습니다.
+2025-11-17 21:17:28,504 - INFO - 부하 테스트 시작, client 수 = 6000
+2025-11-17 21:17:28,505 - INFO - Zipf 값 1.2에서 상위 20%의 질문이 차지하는 비율: 91.82%
+2025-11-17 21:17:34,766 - INFO - [실시간] 요청 1000개 처리 | 현재까지의 RPS: 159.71최근 1000개 request의 p99 TTFT: 0.2329 초 | 
+2025-11-17 21:17:39,026 - INFO - [실시간] 요청 2000개 처리 | 현재까지의 RPS: 190.09최근 1000개 request의 p99 TTFT: 0.2453 초 | 
+2025-11-17 21:17:42,410 - INFO - [실시간] 요청 3000개 처리 | 현재까지의 RPS: 215.75최근 1000개 request의 p99 TTFT: 0.5056 초 | 
+2025-11-17 21:17:45,809 - INFO - [실시간] 요청 4000개 처리 | 현재까지의 RPS: 231.16최근 1000개 request의 p99 TTFT: 0.8813 초 | 
+2025-11-17 21:17:49,369 - INFO - [실시간] 요청 5000개 처리 | 현재까지의 RPS: 239.65최근 1000개 request의 p99 TTFT: 2.7146 초 | 
+2025-11-17 21:17:49,369 - WARNING - 최근 1000개의 p99 TTFT 2.7146 초가 SLO 의 2배 (2.0 초)를 초과했습니다. 부하 테스트를 조기 종료합니다.
+2025-11-17 21:18:33,939 - INFO - [실시간] 요청 6000개 처리 | 현재까지의 RPS: 91.70최근 1000개 request의 p99 TTFT: 3.4794 초 | 
+2025-11-17 21:18:42,777 - INFO - [실시간] 요청 7000개 처리 | 현재까지의 RPS: 94.25최근 1000개 request의 p99 TTFT: 0.1947 초 | 
+Traceback (most recent call last):
+  File "/home/comsys/sungsu/CXLSharedMemGPU/ReqGen/main.py", line 412, in <module>
+    main()
+  File "/home/comsys/sungsu/CXLSharedMemGPU/ReqGen/main.py", line 409, in main
+    asyncio.run(reqgen.run())
+  File "/usr/lib/python3.10/asyncio/runners.py", line 44, in run
+    return loop.run_until_complete(main)
+  File "/usr/lib/python3.10/asyncio/base_events.py", line 636, in run_until_complete
+    self.run_forever()
+  File "/usr/lib/python3.10/asyncio/base_events.py", line 603, in run_forever
+    self._run_once()
+  File "/usr/lib/python3.10/asyncio/base_events.py", line 1871, in _run_once
+    event_list = self._selector.select(timeout)
+  File "/usr/lib/python3.10/selectors.py", line 469, in select
+    fd_event_list = self._selector.poll(timeout, max_ev)
+KeyboardInterrupt

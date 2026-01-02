@@ -1,0 +1,80 @@
+2025-10-01 16:50:26,786 - INFO - ReqGen 시작: 서버=163.152.48.109:9000, 클라이언트=1100, 시간=60초
+2025-10-01 16:50:26,787 - INFO - Hugging Face에서 'kroshan/BioASQ' 데이터셋을 로드합니다...
+Traceback (most recent call last):
+  File "/home/cloud_cxl/.local/lib/python3.10/site-packages/huggingface_hub/utils/_http.py", line 409, in hf_raise_for_status
+    response.raise_for_status()
+  File "/home/cloud_cxl/.local/lib/python3.10/site-packages/requests/models.py", line 1026, in raise_for_status
+    raise HTTPError(http_error_msg, response=self)
+requests.exceptions.HTTPError: 404 Client Error: Not Found for url: https://huggingface.co/datasets/kroshan/BioASQ/resolve/d6b0152cab800446548aa0f9fcec972560cd903c/BioASQ.py
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "/home/cloud_cxl/.local/lib/python3.10/site-packages/datasets/load.py", line 982, in dataset_module_factory
+    api.hf_hub_download(
+  File "/home/cloud_cxl/.local/lib/python3.10/site-packages/huggingface_hub/utils/_validators.py", line 114, in _inner_fn
+    return fn(*args, **kwargs)
+  File "/home/cloud_cxl/.local/lib/python3.10/site-packages/huggingface_hub/hf_api.py", line 5539, in hf_hub_download
+    return hf_hub_download(
+  File "/home/cloud_cxl/.local/lib/python3.10/site-packages/huggingface_hub/utils/_validators.py", line 114, in _inner_fn
+    return fn(*args, **kwargs)
+  File "/home/cloud_cxl/.local/lib/python3.10/site-packages/huggingface_hub/file_download.py", line 1010, in hf_hub_download
+    return _hf_hub_download_to_cache_dir(
+  File "/home/cloud_cxl/.local/lib/python3.10/site-packages/huggingface_hub/file_download.py", line 1073, in _hf_hub_download_to_cache_dir
+    (url_to_download, etag, commit_hash, expected_size, xet_file_data, head_call_error) = _get_metadata_or_catch_error(
+  File "/home/cloud_cxl/.local/lib/python3.10/site-packages/huggingface_hub/file_download.py", line 1546, in _get_metadata_or_catch_error
+    metadata = get_hf_file_metadata(
+  File "/home/cloud_cxl/.local/lib/python3.10/site-packages/huggingface_hub/utils/_validators.py", line 114, in _inner_fn
+    return fn(*args, **kwargs)
+  File "/home/cloud_cxl/.local/lib/python3.10/site-packages/huggingface_hub/file_download.py", line 1463, in get_hf_file_metadata
+    r = _request_wrapper(
+  File "/home/cloud_cxl/.local/lib/python3.10/site-packages/huggingface_hub/file_download.py", line 286, in _request_wrapper
+    response = _request_wrapper(
+  File "/home/cloud_cxl/.local/lib/python3.10/site-packages/huggingface_hub/file_download.py", line 310, in _request_wrapper
+    hf_raise_for_status(response)
+  File "/home/cloud_cxl/.local/lib/python3.10/site-packages/huggingface_hub/utils/_http.py", line 420, in hf_raise_for_status
+    raise _format(EntryNotFoundError, message, response) from e
+huggingface_hub.errors.EntryNotFoundError: 404 Client Error. (Request ID: Root=1-68dcdd43-15c0665c550aeada219797ec;07dc0285-d2ed-4055-b4e3-1f5b8b2caf6f)
+
+Entry Not Found for url: https://huggingface.co/datasets/kroshan/BioASQ/resolve/d6b0152cab800446548aa0f9fcec972560cd903c/BioASQ.py.
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "/home/cloud_cxl/CXLSharedMemGPU/ReqGen/main.py", line 381, in <module>
+    main()
+  File "/home/cloud_cxl/CXLSharedMemGPU/ReqGen/main.py", line 377, in main
+    reqgen = ReqGen(args)
+  File "/home/cloud_cxl/CXLSharedMemGPU/ReqGen/main.py", line 23, in __init__
+    self.questions = self._load_questions()
+  File "/home/cloud_cxl/CXLSharedMemGPU/ReqGen/main.py", line 51, in _load_questions
+    dataset = load_dataset(self.dataset_name, split='train', streaming=True)
+  File "/home/cloud_cxl/.local/lib/python3.10/site-packages/datasets/load.py", line 1392, in load_dataset
+    builder_instance = load_dataset_builder(
+  File "/home/cloud_cxl/.local/lib/python3.10/site-packages/datasets/load.py", line 1132, in load_dataset_builder
+    dataset_module = dataset_module_factory(
+  File "/home/cloud_cxl/.local/lib/python3.10/site-packages/datasets/load.py", line 1004, in dataset_module_factory
+    ).get_module()
+  File "/home/cloud_cxl/.local/lib/python3.10/site-packages/datasets/load.py", line 632, in get_module
+    data_files = DataFilesDict.from_patterns(
+  File "/home/cloud_cxl/.local/lib/python3.10/site-packages/datasets/data_files.py", line 689, in from_patterns
+    else DataFilesList.from_patterns(
+  File "/home/cloud_cxl/.local/lib/python3.10/site-packages/datasets/data_files.py", line 592, in from_patterns
+    origin_metadata = _get_origin_metadata(data_files, download_config=download_config)
+  File "/home/cloud_cxl/.local/lib/python3.10/site-packages/datasets/data_files.py", line 506, in _get_origin_metadata
+    return thread_map(
+  File "/home/cloud_cxl/.local/lib/python3.10/site-packages/tqdm/contrib/concurrent.py", line 69, in thread_map
+    return _executor_map(ThreadPoolExecutor, fn, *iterables, **tqdm_kwargs)
+  File "/home/cloud_cxl/.local/lib/python3.10/site-packages/tqdm/contrib/concurrent.py", line 51, in _executor_map
+    return list(tqdm_class(ex.map(fn, *iterables, chunksize=chunksize), **kwargs))
+  File "/home/cloud_cxl/.local/lib/python3.10/site-packages/tqdm/std.py", line 1169, in __iter__
+    for obj in iterable:
+  File "/usr/lib/python3.10/concurrent/futures/_base.py", line 621, in result_iterator
+    yield _result_or_cancel(fs.pop())
+  File "/usr/lib/python3.10/concurrent/futures/_base.py", line 319, in _result_or_cancel
+    return fut.result(timeout)
+  File "/usr/lib/python3.10/concurrent/futures/_base.py", line 453, in result
+    self._condition.wait(timeout)
+  File "/usr/lib/python3.10/threading.py", line 320, in wait
+    waiter.acquire()
+KeyboardInterrupt

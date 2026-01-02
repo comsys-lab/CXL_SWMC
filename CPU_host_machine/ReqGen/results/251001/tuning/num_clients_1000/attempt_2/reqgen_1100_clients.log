@@ -1,0 +1,28 @@
+2025-10-01 16:47:02,588 - INFO - ReqGen 시작: 서버=163.152.48.109:9000, 클라이언트=1100, 시간=60초
+2025-10-01 16:47:02,589 - INFO - Hugging Face에서 'kroshan/BioASQ' 데이터셋을 로드합니다...
+Traceback (most recent call last):
+  File "/home/cloud_cxl/CXLSharedMemGPU/ReqGen/main.py", line 380, in <module>
+    main()
+  File "/home/cloud_cxl/CXLSharedMemGPU/ReqGen/main.py", line 376, in main
+    reqgen = ReqGen(args)
+  File "/home/cloud_cxl/CXLSharedMemGPU/ReqGen/main.py", line 23, in __init__
+    self.questions = self._load_questions()
+  File "/home/cloud_cxl/CXLSharedMemGPU/ReqGen/main.py", line 52, in _load_questions
+    questions = [item['question'] for item in dataset.take(5000) if 'question' in item and item['question']]
+  File "/home/cloud_cxl/CXLSharedMemGPU/ReqGen/main.py", line 52, in <listcomp>
+    questions = [item['question'] for item in dataset.take(5000) if 'question' in item and item['question']]
+  File "/home/cloud_cxl/.local/lib/python3.10/site-packages/datasets/iterable_dataset.py", line 2361, in __iter__
+    for key, example in ex_iterable:
+  File "/home/cloud_cxl/.local/lib/python3.10/site-packages/datasets/iterable_dataset.py", line 1882, in __iter__
+    for key, pa_table in self._iter_arrow():
+  File "/home/cloud_cxl/.local/lib/python3.10/site-packages/datasets/iterable_dataset.py", line 1907, in _iter_arrow
+    schema = self.features.arrow_schema
+  File "/home/cloud_cxl/.local/lib/python3.10/site-packages/datasets/features/features.py", line 1809, in arrow_schema
+    hf_metadata = {"info": {"features": self.to_dict()}}
+  File "/home/cloud_cxl/.local/lib/python3.10/site-packages/datasets/features/features.py", line 1876, in to_dict
+    return asdict(self)
+  File "/home/cloud_cxl/.local/lib/python3.10/site-packages/datasets/utils/py_utils.py", line 229, in asdict
+    return _asdict_inner(obj)
+  File "/home/cloud_cxl/.local/lib/python3.10/site-packages/datasets/utils/py_utils.py", line 213, in _asdict_inner
+    elif isinstance(obj, tuple) and hasattr(obj, "_fields"):
+KeyboardInterrupt

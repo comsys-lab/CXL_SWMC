@@ -1,0 +1,58 @@
+2025-11-17 19:44:01,467 - INFO - ReqGen 시작: 서버=163.152.48.109:9000, 클라이언트=8750, 시간=80초
+2025-11-17 19:44:01,467 - INFO - Hugging Face에서 'kroshan/BioASQ' 데이터셋을 로드합니다...
+2025-11-17 19:44:09,585 - INFO - 3266개의 질문을 로드했습니다.
+2025-11-17 19:44:09,585 - INFO - 부하 테스트 시작, client 수 = 8750
+2025-11-17 19:44:09,586 - INFO - Zipf 값 1.2에서 상위 20%의 질문이 차지하는 비율: 91.82%
+2025-11-17 19:44:14,449 - INFO - [실시간] 요청 1000개 처리 | 현재까지의 RPS: 205.61최근 1000개 request의 p99 TTFT: 0.3117 초 | 
+2025-11-17 19:44:17,727 - INFO - [실시간] 요청 2000개 처리 | 현재까지의 RPS: 245.66최근 1000개 request의 p99 TTFT: 0.2964 초 | 
+2025-11-17 19:44:20,639 - INFO - [실시간] 요청 3000개 처리 | 현재까지의 RPS: 271.42최근 1000개 request의 p99 TTFT: 0.3281 초 | 
+2025-11-17 19:44:23,104 - INFO - [실시간] 요청 4000개 처리 | 현재까지의 RPS: 295.90최근 1000개 request의 p99 TTFT: 0.4584 초 | 
+2025-11-17 19:44:25,380 - INFO - [실시간] 요청 5000개 처리 | 현재까지의 RPS: 316.57최근 1000개 request의 p99 TTFT: 0.5268 초 | 
+2025-11-17 19:44:27,335 - INFO - [실시간] 요청 6000개 처리 | 현재까지의 RPS: 338.04최근 1000개 request의 p99 TTFT: 0.7314 초 | 
+2025-11-17 19:44:29,385 - INFO - [실시간] 요청 7000개 처리 | 현재까지의 RPS: 353.55최근 1000개 request의 p99 TTFT: 0.6486 초 | 
+2025-11-17 19:44:31,355 - INFO - [실시간] 요청 8000개 처리 | 현재까지의 RPS: 367.48최근 1000개 request의 p99 TTFT: 1.4362 초 | 
+2025-11-17 19:44:33,582 - INFO - [실시간] 요청 9000개 처리 | 현재까지의 RPS: 375.06최근 1000개 request의 p99 TTFT: 1.3928 초 | 
+2025-11-17 19:44:36,214 - INFO - [실시간] 요청 10000개 처리 | 현재까지의 RPS: 375.54최근 1000개 request의 p99 TTFT: 0.2972 초 | 
+2025-11-17 19:44:38,716 - INFO - [실시간] 요청 11000개 처리 | 현재까지의 RPS: 377.61최근 1000개 request의 p99 TTFT: 0.1892 초 | 
+2025-11-17 19:44:41,161 - INFO - [실시간] 요청 12000개 처리 | 현재까지의 RPS: 380.04최근 1000개 request의 p99 TTFT: 0.1866 초 | 
+2025-11-17 19:44:43,577 - INFO - [실시간] 요청 13000개 처리 | 현재까지의 RPS: 382.45최근 1000개 request의 p99 TTFT: 0.1924 초 | 
+2025-11-17 19:44:45,890 - INFO - [실시간] 요청 14000개 처리 | 현재까지의 RPS: 385.62최근 1000개 request의 p99 TTFT: 0.1887 초 | 
+2025-11-17 19:44:48,330 - INFO - [실시간] 요청 15000개 처리 | 현재까지의 RPS: 387.15최근 1000개 request의 p99 TTFT: 0.1836 초 | 
+2025-11-17 19:44:51,179 - INFO - [실시간] 요청 16000개 처리 | 현재까지의 RPS: 384.67최근 1000개 request의 p99 TTFT: 0.7257 초 | 
+2025-11-17 19:44:53,272 - INFO - [실시간] 요청 17000개 처리 | 현재까지의 RPS: 389.14최근 1000개 request의 p99 TTFT: 0.9257 초 | 
+2025-11-17 19:44:55,765 - INFO - [실시간] 요청 18000개 처리 | 현재까지의 RPS: 389.78최근 1000개 request의 p99 TTFT: 0.1899 초 | 
+2025-11-17 19:44:58,212 - INFO - [실시간] 요청 19000개 처리 | 현재까지의 RPS: 390.73최근 1000개 request의 p99 TTFT: 0.1909 초 | 
+2025-11-17 19:45:00,853 - INFO - [실시간] 요청 20000개 처리 | 현재까지의 RPS: 390.11최근 1000개 request의 p99 TTFT: 0.2005 초 | 
+2025-11-17 19:45:03,240 - INFO - [실시간] 요청 21000개 처리 | 현재까지의 RPS: 391.39최근 1000개 request의 p99 TTFT: 0.2635 초 | 
+2025-11-17 19:45:05,727 - INFO - [실시간] 요청 22000개 처리 | 현재까지의 RPS: 391.87최근 1000개 request의 p99 TTFT: 0.1933 초 | 
+2025-11-17 19:45:08,231 - INFO - [실시간] 요청 23000개 처리 | 현재까지의 RPS: 392.19최근 1000개 request의 p99 TTFT: 0.1838 초 | 
+2025-11-17 19:45:10,605 - INFO - [실시간] 요청 24000개 처리 | 현재까지의 RPS: 393.32최근 1000개 request의 p99 TTFT: 0.1876 초 | 
+2025-11-17 19:45:13,199 - INFO - [실시간] 요청 25000개 처리 | 현재까지의 RPS: 393.00최근 1000개 request의 p99 TTFT: 0.1953 초 | 
+2025-11-17 19:45:15,697 - INFO - [실시간] 요청 26000개 처리 | 현재까지의 RPS: 393.27최근 1000개 request의 p99 TTFT: 0.1895 초 | 
+2025-11-17 19:45:18,171 - INFO - [실시간] 요청 27000개 처리 | 현재까지의 RPS: 393.67최근 1000개 request의 p99 TTFT: 0.2153 초 | 
+2025-11-17 19:45:20,597 - INFO - [실시간] 요청 28000개 처리 | 현재까지의 RPS: 394.30최근 1000개 request의 p99 TTFT: 0.1858 초 | 
+2025-11-17 19:45:23,030 - INFO - [실시간] 요청 29000개 처리 | 현재까지의 RPS: 394.86최근 1000개 request의 p99 TTFT: 0.1954 초 | 
+2025-11-17 19:45:25,501 - INFO - [실시간] 요청 30000개 처리 | 현재까지의 RPS: 395.17최근 1000개 request의 p99 TTFT: 0.1836 초 | 
+2025-11-17 19:45:28,053 - INFO - [실시간] 요청 31000개 처리 | 현재까지의 RPS: 395.07최근 1000개 request의 p99 TTFT: 0.1966 초 | 
+Traceback (most recent call last):
+  File "/home/comsys/sungsu/CXLSharedMemGPU/ReqGen/main.py", line 406, in <module>
+    main()
+  File "/home/comsys/sungsu/CXLSharedMemGPU/ReqGen/main.py", line 403, in main
+    asyncio.run(reqgen.run())
+  File "/usr/lib/python3.10/asyncio/runners.py", line 44, in run
+    return loop.run_until_complete(main)
+  File "/usr/lib/python3.10/asyncio/base_events.py", line 649, in run_until_complete
+    return future.result()
+  File "/home/comsys/sungsu/CXLSharedMemGPU/ReqGen/main.py", line 381, in run
+    await asyncio.gather(*tasks)
+  File "/home/comsys/sungsu/CXLSharedMemGPU/ReqGen/main.py", line 134, in _run_client
+    async for chunk in response.content.iter_any():
+  File "/home/comsys/.local/lib/python3.10/site-packages/aiohttp/streams.py", line 50, in __anext__
+    rv = await self.read_func()
+  File "/home/comsys/.local/lib/python3.10/site-packages/aiohttp/streams.py", line 405, in readany
+    await self._wait("readany")
+  File "/home/comsys/.local/lib/python3.10/site-packages/aiohttp/streams.py", line 311, in _wait
+    with self._timer:
+  File "/home/comsys/.local/lib/python3.10/site-packages/aiohttp/helpers.py", line 735, in __exit__
+    raise asyncio.TimeoutError from None
+asyncio.exceptions.TimeoutError

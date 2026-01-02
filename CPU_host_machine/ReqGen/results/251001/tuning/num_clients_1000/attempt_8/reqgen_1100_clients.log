@@ -1,0 +1,51 @@
+2025-10-01 16:54:18,653 - INFO - ReqGen 시작: 서버=163.152.48.109:9000, 클라이언트=1100, 시간=60초
+2025-10-01 16:54:18,653 - INFO - Hugging Face에서 'kroshan/BioASQ' 데이터셋을 로드합니다...
+Traceback (most recent call last):
+  File "/home/cloud_cxl/CXLSharedMemGPU/ReqGen/main.py", line 385, in <module>
+    main()
+  File "/home/cloud_cxl/CXLSharedMemGPU/ReqGen/main.py", line 381, in main
+    reqgen = ReqGen(args)
+  File "/home/cloud_cxl/CXLSharedMemGPU/ReqGen/main.py", line 23, in __init__
+    self.questions = self._load_questions()
+  File "/home/cloud_cxl/CXLSharedMemGPU/ReqGen/main.py", line 51, in _load_questions
+    dataset = load_dataset(self.dataset_name, split='train', streaming=True)
+  File "/home/cloud_cxl/.local/lib/python3.10/site-packages/datasets/load.py", line 1392, in load_dataset
+    builder_instance = load_dataset_builder(
+  File "/home/cloud_cxl/.local/lib/python3.10/site-packages/datasets/load.py", line 1132, in load_dataset_builder
+    dataset_module = dataset_module_factory(
+  File "/home/cloud_cxl/.local/lib/python3.10/site-packages/datasets/load.py", line 996, in dataset_module_factory
+    return HubDatasetModuleFactory(
+  File "/home/cloud_cxl/.local/lib/python3.10/site-packages/datasets/load.py", line 565, in __init__
+    increase_load_count(name)
+  File "/home/cloud_cxl/.local/lib/python3.10/site-packages/datasets/load.py", line 192, in increase_load_count
+    get_session().head(
+  File "/home/cloud_cxl/.local/lib/python3.10/site-packages/requests/sessions.py", line 624, in head
+    return self.request("HEAD", url, **kwargs)
+  File "/home/cloud_cxl/.local/lib/python3.10/site-packages/requests/sessions.py", line 589, in request
+    resp = self.send(prep, **send_kwargs)
+  File "/home/cloud_cxl/.local/lib/python3.10/site-packages/requests/sessions.py", line 703, in send
+    r = adapter.send(request, **kwargs)
+  File "/home/cloud_cxl/.local/lib/python3.10/site-packages/huggingface_hub/utils/_http.py", line 96, in send
+    return super().send(request, *args, **kwargs)
+  File "/home/cloud_cxl/.local/lib/python3.10/site-packages/requests/adapters.py", line 644, in send
+    resp = conn.urlopen(
+  File "/usr/lib/python3/dist-packages/urllib3/connectionpool.py", line 700, in urlopen
+    httplib_response = self._make_request(
+  File "/usr/lib/python3/dist-packages/urllib3/connectionpool.py", line 446, in _make_request
+    six.raise_from(e, None)
+  File "<string>", line 3, in raise_from
+  File "/usr/lib/python3/dist-packages/urllib3/connectionpool.py", line 441, in _make_request
+    httplib_response = conn.getresponse()
+  File "/usr/lib/python3.10/http/client.py", line 1375, in getresponse
+    response.begin()
+  File "/usr/lib/python3.10/http/client.py", line 318, in begin
+    version, status, reason = self._read_status()
+  File "/usr/lib/python3.10/http/client.py", line 279, in _read_status
+    line = str(self.fp.readline(_MAXLINE + 1), "iso-8859-1")
+  File "/usr/lib/python3.10/socket.py", line 705, in readinto
+    return self._sock.recv_into(b)
+  File "/usr/lib/python3.10/ssl.py", line 1303, in recv_into
+    return self.read(nbytes, buffer)
+  File "/usr/lib/python3.10/ssl.py", line 1159, in read
+    return self._sslobj.read(len, buffer)
+KeyboardInterrupt

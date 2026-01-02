@@ -1,0 +1,31 @@
+comsys@cloudcxl2:~/sungsu/CXLSharedMemGPU/ReqGen$ ./run_reqgen.sh 
+=== Tuning 모드 실행 ===
+최대 Client 수: 5000
+Tuning Duration: 80 초
+Tuning Accuracy: ±125 clients
+Zipf: 1.2
+SLO: 1 초
+=======================
+현재 Client 수: 5000
+Client 수: 5000, RPS: 342.82, p99 TTFT: 0.3978 초
+목표 정확도 미달성, client 수 증가
+현재 Client 수: 7500
+조기 종료 감지, client 수 감소
+현재 Client 수: 6250
+Client 수: 6250, RPS: 439.96, p99 TTFT: 0.5234 초
+목표 정확도 미달성, client 수 증가
+현재 Client 수: 6875
+Client 수: 6875, RPS: 479.46, p99 TTFT: 0.4736 초
+목표 정확도 미달성, client 수 증가
+현재 Client 수: 7187
+Client 수: 7187, RPS: 502.39, p99 TTFT: 0.6511 초
+목표 정확도 미달성, client 수 증가
+현재 Client 수: 7343
+조기 종료 감지, client 수 감소
+현재 Client 수: 7265
+Client 수: 7265, RPS: 501.65, p99 TTFT: 1.4151 초
+p99 TTFT가 SLO 초과, client 수 감소
+현재 Client 수: 7226
+Client 수: 7226, RPS: 480.07, p99 TTFT: 0.9168 초
+목표 정확도 달성, tuning 종료
+=== Tuning 모드 종료 ===

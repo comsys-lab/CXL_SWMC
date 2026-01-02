@@ -1,0 +1,8 @@
+#cloud-config
+network:
+  version: 2
+  ethernets:
+    enp1s0:          # ip link 에서 확인한 인터페이스 이름
+      dhcp4: true
+ssh_pwauth: True       # 패스워드 인증 사용
+disable_root: false      # root 계정 사용

@@ -1,0 +1,36 @@
+2025-11-17 19:54:19,482 - INFO - ReqGen 시작: 서버=163.152.48.109:9000, 클라이언트=9687, 시간=80초
+2025-11-17 19:54:19,482 - INFO - Hugging Face에서 'kroshan/BioASQ' 데이터셋을 로드합니다...
+2025-11-17 19:54:25,895 - INFO - 3266개의 질문을 로드했습니다.
+2025-11-17 19:54:25,896 - INFO - 부하 테스트 시작, client 수 = 9687
+2025-11-17 19:54:25,896 - INFO - Zipf 값 1.2에서 상위 20%의 질문이 차지하는 비율: 91.82%
+2025-11-17 19:54:30,394 - INFO - [실시간] 요청 1000개 처리 | 현재까지의 RPS: 222.32최근 1000개 request의 p99 TTFT: 0.4039 초 | 
+2025-11-17 19:54:33,398 - INFO - [실시간] 요청 2000개 처리 | 현재까지의 RPS: 266.59최근 1000개 request의 p99 TTFT: 0.3876 초 | 
+2025-11-17 19:54:35,939 - INFO - [실시간] 요청 3000개 처리 | 현재까지의 RPS: 298.70최근 1000개 request의 p99 TTFT: 0.3219 초 | 
+2025-11-17 19:54:38,274 - INFO - [실시간] 요청 4000개 처리 | 현재까지의 RPS: 323.16최근 1000개 request의 p99 TTFT: 0.5768 초 | 
+2025-11-17 19:54:40,555 - INFO - [실시간] 요청 5000개 처리 | 현재까지의 RPS: 341.09최근 1000개 request의 p99 TTFT: 0.6524 초 | 
+2025-11-17 19:54:42,515 - INFO - [실시간] 요청 6000개 처리 | 현재까지의 RPS: 361.03최근 1000개 request의 p99 TTFT: 0.7698 초 | 
+2025-11-17 19:54:44,495 - INFO - [실시간] 요청 7000개 처리 | 현재까지의 RPS: 376.36최근 1000개 request의 p99 TTFT: 1.1763 초 | 
+2025-11-17 19:54:46,267 - INFO - [실시간] 요청 8000개 처리 | 현재까지의 RPS: 392.71최근 1000개 request의 p99 TTFT: 2.0789 초 | 
+2025-11-17 19:54:46,267 - WARNING - 최근 1000개의 p99 TTFT 2.0789 초가 SLO 의 2배 (2.0 초)를 초과했습니다. 부하 테스트를 조기 종료합니다.
+Traceback (most recent call last):
+  File "/home/comsys/sungsu/CXLSharedMemGPU/ReqGen/main.py", line 406, in <module>
+    main()
+  File "/home/comsys/sungsu/CXLSharedMemGPU/ReqGen/main.py", line 403, in main
+    asyncio.run(reqgen.run())
+  File "/usr/lib/python3.10/asyncio/runners.py", line 44, in run
+    return loop.run_until_complete(main)
+  File "/usr/lib/python3.10/asyncio/base_events.py", line 649, in run_until_complete
+    return future.result()
+  File "/home/comsys/sungsu/CXLSharedMemGPU/ReqGen/main.py", line 381, in run
+    await asyncio.gather(*tasks)
+  File "/home/comsys/sungsu/CXLSharedMemGPU/ReqGen/main.py", line 134, in _run_client
+    async for chunk in response.content.iter_any():
+  File "/home/comsys/.local/lib/python3.10/site-packages/aiohttp/streams.py", line 50, in __anext__
+    rv = await self.read_func()
+  File "/home/comsys/.local/lib/python3.10/site-packages/aiohttp/streams.py", line 405, in readany
+    await self._wait("readany")
+  File "/home/comsys/.local/lib/python3.10/site-packages/aiohttp/streams.py", line 311, in _wait
+    with self._timer:
+  File "/home/comsys/.local/lib/python3.10/site-packages/aiohttp/helpers.py", line 735, in __exit__
+    raise asyncio.TimeoutError from None
+asyncio.exceptions.TimeoutError

@@ -1,0 +1,10 @@
+TextEmbeddingsInference/data/
+
+data/
+Data/
+Dataset/bioasq/
+Dataset/pubmed/
+Dataset/PubMed_bge/
+
+__pycache__/
+*.log

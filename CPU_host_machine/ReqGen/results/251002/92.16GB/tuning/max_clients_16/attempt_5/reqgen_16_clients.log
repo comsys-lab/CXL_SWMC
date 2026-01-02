@@ -1,0 +1,42 @@
+2025-10-02 02:16:29,786 - INFO - ReqGen 시작: 서버=163.152.48.109:9000, 클라이언트=16, 시간=60초
+2025-10-02 02:16:29,787 - INFO - Hugging Face에서 'kroshan/BioASQ' 데이터셋을 로드합니다...
+Traceback (most recent call last):
+  File "/home/cloud_cxl/CXLSharedMemGPU/ReqGen/main.py", line 404, in <module>
+    main()
+  File "/home/cloud_cxl/CXLSharedMemGPU/ReqGen/main.py", line 400, in main
+    reqgen = ReqGen(args)
+  File "/home/cloud_cxl/CXLSharedMemGPU/ReqGen/main.py", line 27, in __init__
+    self.questions = self._load_questions()
+  File "/home/cloud_cxl/CXLSharedMemGPU/ReqGen/main.py", line 55, in _load_questions
+    dataset = load_dataset(self.dataset_name, split='train', streaming=True)
+  File "/home/cloud_cxl/.local/lib/python3.10/site-packages/datasets/load.py", line 1392, in load_dataset
+    builder_instance = load_dataset_builder(
+  File "/home/cloud_cxl/.local/lib/python3.10/site-packages/datasets/load.py", line 1166, in load_dataset_builder
+    builder_instance: DatasetBuilder = builder_cls(
+  File "/home/cloud_cxl/.local/lib/python3.10/site-packages/datasets/builder.py", line 414, in __init__
+    extend_dataset_builder_for_streaming(self)
+  File "/home/cloud_cxl/.local/lib/python3.10/site-packages/datasets/streaming.py", line 118, in extend_dataset_builder_for_streaming
+    extend_module_for_streaming(builder.__module__, download_config=download_config)
+  File "/home/cloud_cxl/.local/lib/python3.10/site-packages/datasets/streaming.py", line 101, in extend_module_for_streaming
+    patch_submodule(module, "scipy.io.loadmat", wrap_auth(xsio_loadmat), attrs=["__version__"]).start()
+  File "/home/cloud_cxl/.local/lib/python3.10/site-packages/datasets/utils/patching.py", line 108, in start
+    self.__enter__()
+  File "/home/cloud_cxl/.local/lib/python3.10/site-packages/datasets/utils/patching.py", line 57, in __enter__
+    submodule = import_module(".".join(submodules[: i + 1]))
+  File "/usr/lib/python3.10/importlib/__init__.py", line 126, in import_module
+    return _bootstrap._gcd_import(name[level:], package, level)
+  File "<frozen importlib._bootstrap>", line 1050, in _gcd_import
+  File "<frozen importlib._bootstrap>", line 1027, in _find_and_load
+  File "<frozen importlib._bootstrap>", line 1006, in _find_and_load_unlocked
+  File "<frozen importlib._bootstrap>", line 688, in _load_unlocked
+  File "<frozen importlib._bootstrap_external>", line 883, in exec_module
+  File "<frozen importlib._bootstrap>", line 241, in _call_with_frames_removed
+  File "/home/cloud_cxl/.local/lib/python3.10/site-packages/scipy/io/__init__.py", line 110, in <module>
+    from . import arff, harwell_boeing, idl, mmio, netcdf, wavfile
+  File "/home/cloud_cxl/.local/lib/python3.10/site-packages/scipy/io/wavfile.py", line 30, in <module>
+    class WAVE_FORMAT(IntEnum):
+  File "/usr/lib/python3.10/enum.py", line 311, in __new__
+    setattr(enum_class, member_name, enum_member)
+  File "/usr/lib/python3.10/enum.py", line 479, in __setattr__
+    if name in member_map:
+KeyboardInterrupt

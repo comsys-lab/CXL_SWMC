@@ -1,0 +1,26 @@
+2025-11-17 21:10:38,287 - INFO - ReqGen 시작: 서버=163.152.48.109:9000, 클라이언트=1000, 시간=80초
+2025-11-17 21:10:38,287 - INFO - Hugging Face에서 'kroshan/BioASQ' 데이터셋을 로드합니다...
+2025-11-17 21:10:43,779 - INFO - 3266개의 질문을 로드했습니다.
+2025-11-17 21:10:43,780 - INFO - 부하 테스트 시작, client 수 = 1000
+2025-11-17 21:10:43,780 - INFO - Zipf 값 1.01에서 상위 20%의 질문이 차지하는 비율: 82.08%
+2025-11-17 21:11:02,597 - INFO - [실시간] 요청 1000개 처리 | 현재까지의 RPS: 53.14최근 1000개 request의 p99 TTFT: 0.1929 초 | 
+2025-11-17 21:11:18,724 - INFO - [실시간] 요청 2000개 처리 | 현재까지의 RPS: 57.23최근 1000개 request의 p99 TTFT: 0.2066 초 | 
+2025-11-17 21:11:33,831 - INFO - [실시간] 요청 3000개 처리 | 현재까지의 RPS: 59.94최근 1000개 request의 p99 TTFT: 0.2116 초 | 
+2025-11-17 21:11:48,653 - INFO - [실시간] 요청 4000개 처리 | 현재까지의 RPS: 61.66최근 1000개 request의 p99 TTFT: 0.1792 초 | 
+2025-11-17 21:12:01,208 - INFO - [실시간] 요청 5000개 처리 | 현재까지의 RPS: 64.58최근 1000개 request의 p99 TTFT: 0.1988 초 | 
+Traceback (most recent call last):
+  File "/home/comsys/sungsu/CXLSharedMemGPU/ReqGen/main.py", line 412, in <module>
+    main()
+  File "/home/comsys/sungsu/CXLSharedMemGPU/ReqGen/main.py", line 409, in main
+    asyncio.run(reqgen.run())
+  File "/usr/lib/python3.10/asyncio/runners.py", line 44, in run
+    return loop.run_until_complete(main)
+  File "/usr/lib/python3.10/asyncio/base_events.py", line 636, in run_until_complete
+    self.run_forever()
+  File "/usr/lib/python3.10/asyncio/base_events.py", line 603, in run_forever
+    self._run_once()
+  File "/usr/lib/python3.10/asyncio/base_events.py", line 1871, in _run_once
+    event_list = self._selector.select(timeout)
+  File "/usr/lib/python3.10/selectors.py", line 469, in select
+    fd_event_list = self._selector.poll(timeout, max_ev)
+KeyboardInterrupt

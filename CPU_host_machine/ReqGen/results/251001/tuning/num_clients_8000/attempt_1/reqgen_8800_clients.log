@@ -1,0 +1,52 @@
+2025-10-01 16:40:05,470 - INFO - ReqGen 시작: 서버=163.152.48.109:9000, 클라이언트=8800, 시간=60초
+2025-10-01 16:40:05,470 - INFO - Hugging Face에서 'kroshan/BioASQ' 데이터셋을 로드합니다...
+Traceback (most recent call last):
+  File "/home/cloud_cxl/CXLSharedMemGPU/ReqGen/main.py", line 380, in <module>
+    main()
+  File "/home/cloud_cxl/CXLSharedMemGPU/ReqGen/main.py", line 376, in main
+    reqgen = ReqGen(args)
+  File "/home/cloud_cxl/CXLSharedMemGPU/ReqGen/main.py", line 23, in __init__
+    self.questions = self._load_questions()
+  File "/home/cloud_cxl/CXLSharedMemGPU/ReqGen/main.py", line 51, in _load_questions
+    dataset = load_dataset(self.dataset_name, split='train', streaming=True)
+  File "/home/cloud_cxl/.local/lib/python3.10/site-packages/datasets/load.py", line 1409, in load_dataset
+    return builder_instance.as_streaming_dataset(split=split)
+  File "/home/cloud_cxl/.local/lib/python3.10/site-packages/datasets/builder.py", line 1235, in as_streaming_dataset
+    datasets = map_nested(
+  File "/home/cloud_cxl/.local/lib/python3.10/site-packages/datasets/utils/py_utils.py", line 493, in map_nested
+    mapped = function(data_struct)
+  File "/home/cloud_cxl/.local/lib/python3.10/site-packages/datasets/builder.py", line 1251, in _as_streaming_dataset_single
+    return IterableDataset(
+  File "/home/cloud_cxl/.local/lib/python3.10/site-packages/datasets/iterable_dataset.py", line 2033, in __init__
+    self._epoch: Union[int, "torch.Tensor"] = _maybe_share_with_torch_persistent_workers(0)
+  File "/home/cloud_cxl/.local/lib/python3.10/site-packages/datasets/iterable_dataset.py", line 1963, in _maybe_share_with_torch_persistent_workers
+    import torch
+  File "/home/cloud_cxl/.local/lib/python3.10/site-packages/torch/__init__.py", line 2240, in <module>
+    from torch import quantization as quantization  # usort: skip
+  File "/home/cloud_cxl/.local/lib/python3.10/site-packages/torch/quantization/__init__.py", line 2, in <module>
+    from .fake_quantize import *  # noqa: F403
+  File "/home/cloud_cxl/.local/lib/python3.10/site-packages/torch/quantization/fake_quantize.py", line 10, in <module>
+    from torch.ao.quantization.fake_quantize import (
+  File "/home/cloud_cxl/.local/lib/python3.10/site-packages/torch/ao/quantization/__init__.py", line 12, in <module>
+    from .pt2e._numeric_debugger import (  # noqa: F401
+  File "/home/cloud_cxl/.local/lib/python3.10/site-packages/torch/ao/quantization/pt2e/_numeric_debugger.py", line 9, in <module>
+    from torch.ao.quantization.pt2e.graph_utils import bfs_trace_with_node_process
+  File "/home/cloud_cxl/.local/lib/python3.10/site-packages/torch/ao/quantization/pt2e/graph_utils.py", line 9, in <module>
+    from torch.export import ExportedProgram
+  File "/home/cloud_cxl/.local/lib/python3.10/site-packages/torch/export/__init__.py", line 60, in <module>
+    from .decomp_utils import CustomDecompTable
+  File "/home/cloud_cxl/.local/lib/python3.10/site-packages/torch/export/decomp_utils.py", line 5, in <module>
+    from torch._export.utils import (
+  File "/home/cloud_cxl/.local/lib/python3.10/site-packages/torch/_export/__init__.py", line 48, in <module>
+    from .wrappers import _wrap_submodules
+  File "/home/cloud_cxl/.local/lib/python3.10/site-packages/torch/_export/wrappers.py", line 7, in <module>
+    from torch._higher_order_ops.strict_mode import strict_mode
+  File "/home/cloud_cxl/.local/lib/python3.10/site-packages/torch/_higher_order_ops/__init__.py", line 6, in <module>
+    from torch._higher_order_ops.aoti_call_delegate import aoti_call_delegate
+  File "<frozen importlib._bootstrap>", line 1024, in _find_and_load
+  File "<frozen importlib._bootstrap>", line 171, in __enter__
+  File "<frozen importlib._bootstrap>", line 110, in acquire
+KeyboardInterrupt
+2025-10-01 16:40:10,642 - INFO - FakeTensor cache stats:
+2025-10-01 16:40:10,642 - INFO -   cache_hits: 0
+2025-10-01 16:40:10,642 - INFO -   cache_misses: 0

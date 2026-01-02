@@ -1,0 +1,22 @@
+2025-10-01 16:49:19,908 - INFO - ReqGen 시작: 서버=163.152.48.109:9000, 클라이언트=1000, 시간=60초
+2025-10-01 16:49:19,908 - INFO - Hugging Face에서 'kroshan/BioASQ' 데이터셋을 로드합니다...
+2025-10-01 16:49:27,043 - INFO - 3266개의 질문을 로드했습니다.
+2025-10-01 16:49:27,044 - INFO - 부하 테스트 시작, client 수 = 1000
+2025-10-01 16:49:27,044 - INFO - Zipf 값 1.0에서 상위 20%의 질문이 차지하는 비율: 0.00%
+Traceback (most recent call last):
+  File "/home/cloud_cxl/CXLSharedMemGPU/ReqGen/main.py", line 380, in <module>
+    main()
+  File "/home/cloud_cxl/CXLSharedMemGPU/ReqGen/main.py", line 377, in main
+    asyncio.run(reqgen.run())
+  File "/usr/lib/python3.10/asyncio/runners.py", line 44, in run
+    return loop.run_until_complete(main)
+  File "/usr/lib/python3.10/asyncio/base_events.py", line 649, in run_until_complete
+    return future.result()
+  File "/home/cloud_cxl/CXLSharedMemGPU/ReqGen/main.py", line 356, in run
+    await asyncio.gather(*tasks)
+  File "/home/cloud_cxl/CXLSharedMemGPU/ReqGen/main.py", line 111, in _run_client
+    question_idx = np.random.zipf(self.zipf_param) % len(self.questions)
+  File "numpy/random/mtrand.pyx", line 3765, in numpy.random.mtrand.RandomState.zipf
+  File "_common.pyx", line 903, in numpy.random._common.disc
+  File "_common.pyx", line 439, in numpy.random._common.check_constraint
+ValueError: a <= 1 or a is NaN

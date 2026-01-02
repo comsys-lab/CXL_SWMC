@@ -1,0 +1,82 @@
+2025-12-04 21:53:36,832 - INFO - ReqGen 시작: 서버=163.152.48.109:9000, 클라이언트=2, 시간=330초
+2025-12-04 21:53:36,832 - INFO - Hugging Face에서 'kroshan/BioASQ' 데이터셋을 로드합니다...
+2025-12-04 21:53:42,388 - INFO - 3266개의 질문을 로드했습니다.
+2025-12-04 21:53:42,388 - INFO - 부하 테스트 시작, client 수 = 2
+Traceback (most recent call last):
+  File "/home/comsys/sungsu/CXLSharedMemGPU/ReqGen/main.py", line 418, in <module>
+    main()
+  File "/home/comsys/sungsu/CXLSharedMemGPU/ReqGen/main.py", line 415, in main
+    asyncio.run(reqgen.run())
+  File "/usr/lib/python3.10/asyncio/runners.py", line 47, in run
+    _cancel_all_tasks(loop)
+  File "/usr/lib/python3.10/asyncio/runners.py", line 63, in _cancel_all_tasks
+    loop.run_until_complete(tasks.gather(*to_cancel, return_exceptions=True))
+  File "/usr/lib/python3.10/asyncio/base_events.py", line 636, in run_until_complete
+    self.run_forever()
+  File "/usr/lib/python3.10/asyncio/base_events.py", line 603, in run_forever
+    self._run_once()
+  File "/usr/lib/python3.10/asyncio/base_events.py", line 1909, in _run_once
+    handle._run()
+  File "/usr/lib/python3.10/asyncio/events.py", line 80, in _run
+    self._context.run(self._callback, *self._args)
+  File "/home/comsys/sungsu/CXLSharedMemGPU/ReqGen/main.py", line 393, in run
+    await asyncio.gather(*tasks)
+  File "/usr/lib/python3.10/asyncio/runners.py", line 44, in run
+    return loop.run_until_complete(main)
+  File "/usr/lib/python3.10/asyncio/base_events.py", line 636, in run_until_complete
+    self.run_forever()
+  File "/usr/lib/python3.10/asyncio/base_events.py", line 603, in run_forever
+    self._run_once()
+  File "/usr/lib/python3.10/asyncio/base_events.py", line 1909, in _run_once
+    handle._run()
+  File "/usr/lib/python3.10/asyncio/events.py", line 80, in _run
+    self._context.run(self._callback, *self._args)
+  File "/home/comsys/sungsu/CXLSharedMemGPU/ReqGen/main.py", line 132, in _run_client
+    async with session.post(self.server_url, json={"client_id": client_id, "user_input": question}) as response:
+  File "/home/comsys/.local/lib/python3.10/site-packages/aiohttp/client.py", line 1197, in __aenter__
+    self._resp = await self._coro
+  File "/home/comsys/.local/lib/python3.10/site-packages/aiohttp/client.py", line 507, in _request
+    with timer:
+  File "/home/comsys/.local/lib/python3.10/site-packages/aiohttp/helpers.py", line 711, in __enter__
+    def __enter__(self) -> BaseTimerContext:
+KeyboardInterrupt
+2025-12-04 21:55:44,531 - ERROR - Task exception was never retrieved
+future: <Task finished name='Task-1' coro=<ReqGen.run() done, defined at /home/comsys/sungsu/CXLSharedMemGPU/ReqGen/main.py:382> exception=KeyboardInterrupt()>
+Traceback (most recent call last):
+  File "/home/comsys/sungsu/CXLSharedMemGPU/ReqGen/main.py", line 418, in <module>
+    main()
+  File "/home/comsys/sungsu/CXLSharedMemGPU/ReqGen/main.py", line 415, in main
+    asyncio.run(reqgen.run())
+  File "/usr/lib/python3.10/asyncio/runners.py", line 47, in run
+    _cancel_all_tasks(loop)
+  File "/usr/lib/python3.10/asyncio/runners.py", line 63, in _cancel_all_tasks
+    loop.run_until_complete(tasks.gather(*to_cancel, return_exceptions=True))
+  File "/usr/lib/python3.10/asyncio/base_events.py", line 636, in run_until_complete
+    self.run_forever()
+  File "/usr/lib/python3.10/asyncio/base_events.py", line 603, in run_forever
+    self._run_once()
+  File "/usr/lib/python3.10/asyncio/base_events.py", line 1909, in _run_once
+    handle._run()
+  File "/usr/lib/python3.10/asyncio/events.py", line 80, in _run
+    self._context.run(self._callback, *self._args)
+  File "/home/comsys/sungsu/CXLSharedMemGPU/ReqGen/main.py", line 393, in run
+    await asyncio.gather(*tasks)
+  File "/usr/lib/python3.10/asyncio/runners.py", line 44, in run
+    return loop.run_until_complete(main)
+  File "/usr/lib/python3.10/asyncio/base_events.py", line 636, in run_until_complete
+    self.run_forever()
+  File "/usr/lib/python3.10/asyncio/base_events.py", line 603, in run_forever
+    self._run_once()
+  File "/usr/lib/python3.10/asyncio/base_events.py", line 1909, in _run_once
+    handle._run()
+  File "/usr/lib/python3.10/asyncio/events.py", line 80, in _run
+    self._context.run(self._callback, *self._args)
+  File "/home/comsys/sungsu/CXLSharedMemGPU/ReqGen/main.py", line 132, in _run_client
+    async with session.post(self.server_url, json={"client_id": client_id, "user_input": question}) as response:
+  File "/home/comsys/.local/lib/python3.10/site-packages/aiohttp/client.py", line 1197, in __aenter__
+    self._resp = await self._coro
+  File "/home/comsys/.local/lib/python3.10/site-packages/aiohttp/client.py", line 507, in _request
+    with timer:
+  File "/home/comsys/.local/lib/python3.10/site-packages/aiohttp/helpers.py", line 711, in __enter__
+    def __enter__(self) -> BaseTimerContext:
+KeyboardInterrupt

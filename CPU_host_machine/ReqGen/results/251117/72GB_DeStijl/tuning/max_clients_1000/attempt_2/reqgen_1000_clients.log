@@ -1,0 +1,31 @@
+2025-11-17 19:30:39,535 - INFO - ReqGen 시작: 서버=163.152.48.109:9000, 클라이언트=1000, 시간=300초
+2025-11-17 19:30:39,535 - INFO - Hugging Face에서 'kroshan/BioASQ' 데이터셋을 로드합니다...
+2025-11-17 19:30:47,859 - INFO - 3266개의 질문을 로드했습니다.
+2025-11-17 19:30:47,860 - INFO - 부하 테스트 시작, client 수 = 1000
+2025-11-17 19:30:47,860 - INFO - Zipf 값 1.2에서 상위 20%의 질문이 차지하는 비율: 91.82%
+2025-11-17 19:31:06,062 - INFO - [실시간] 요청 1000개 처리 | 현재까지의 RPS: 54.94최근 1000개 request의 p99 TTFT: 0.2243 초 | 
+2025-11-17 19:31:20,731 - INFO - [실시간] 요청 2000개 처리 | 현재까지의 RPS: 60.84최근 1000개 request의 p99 TTFT: 0.2066 초 | 
+2025-11-17 19:31:35,628 - INFO - [실시간] 요청 3000개 처리 | 현재까지의 RPS: 62.80최근 1000개 request의 p99 TTFT: 0.1917 초 | 
+2025-11-17 19:31:50,613 - INFO - [실시간] 요청 4000개 처리 | 현재까지의 RPS: 63.74최근 1000개 request의 p99 TTFT: 0.2079 초 | 
+2025-11-17 19:32:06,319 - INFO - [실시간] 요청 5000개 처리 | 현재까지의 RPS: 63.73최근 1000개 request의 p99 TTFT: 0.2240 초 | 
+2025-11-17 19:32:22,175 - INFO - [실시간] 요청 6000개 처리 | 현재까지의 RPS: 63.62최근 1000개 request의 p99 TTFT: 0.2444 초 | 
+2025-11-17 19:32:37,380 - INFO - [실시간] 요청 7000개 처리 | 현재까지의 RPS: 63.92최근 1000개 request의 p99 TTFT: 0.2203 초 | 
+2025-11-17 19:32:52,862 - INFO - [실시간] 요청 8000개 처리 | 현재까지의 RPS: 64.00최근 1000개 request의 p99 TTFT: 0.2154 초 | 
+2025-11-17 19:33:08,537 - INFO - [실시간] 요청 9000개 처리 | 현재까지의 RPS: 63.98최근 1000개 request의 p99 TTFT: 0.2131 초 | 
+2025-11-17 19:33:24,710 - INFO - [실시간] 요청 10000개 처리 | 현재까지의 RPS: 63.75최근 1000개 request의 p99 TTFT: 0.1855 초 | 
+Traceback (most recent call last):
+  File "/home/comsys/sungsu/CXLSharedMemGPU/ReqGen/main.py", line 406, in <module>
+    main()
+  File "/home/comsys/sungsu/CXLSharedMemGPU/ReqGen/main.py", line 403, in main
+    asyncio.run(reqgen.run())
+  File "/usr/lib/python3.10/asyncio/runners.py", line 44, in run
+    return loop.run_until_complete(main)
+  File "/usr/lib/python3.10/asyncio/base_events.py", line 636, in run_until_complete
+    self.run_forever()
+  File "/usr/lib/python3.10/asyncio/base_events.py", line 603, in run_forever
+    self._run_once()
+  File "/usr/lib/python3.10/asyncio/base_events.py", line 1871, in _run_once
+    event_list = self._selector.select(timeout)
+  File "/usr/lib/python3.10/selectors.py", line 469, in select
+    fd_event_list = self._selector.poll(timeout, max_ev)
+KeyboardInterrupt

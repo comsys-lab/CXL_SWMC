@@ -1,0 +1,42 @@
+2025-12-05 05:47:24,278 - INFO - ReqGen 시작: 서버=163.152.48.109:9000, 클라이언트=100, 시간=330초
+2025-12-05 05:47:24,278 - INFO - Hugging Face에서 'kroshan/BioASQ' 데이터셋을 로드합니다...
+Traceback (most recent call last):
+  File "/home/comsys/sungsu/CXLSharedMemGPU/ReqGen/main.py", line 418, in <module>
+    main()
+  File "/home/comsys/sungsu/CXLSharedMemGPU/ReqGen/main.py", line 414, in main
+    reqgen = ReqGen(args)
+  File "/home/comsys/sungsu/CXLSharedMemGPU/ReqGen/main.py", line 28, in __init__
+    self.questions = self._load_questions()
+  File "/home/comsys/sungsu/CXLSharedMemGPU/ReqGen/main.py", line 56, in _load_questions
+    dataset = load_dataset(self.dataset_name, split='train', streaming=True)
+  File "/home/comsys/.local/lib/python3.10/site-packages/datasets/load.py", line 2613, in load_dataset
+    return builder_instance.as_streaming_dataset(split=split)
+  File "/home/comsys/.local/lib/python3.10/site-packages/datasets/builder.py", line 1416, in as_streaming_dataset
+    datasets = map_nested(
+  File "/home/comsys/.local/lib/python3.10/site-packages/datasets/utils/py_utils.py", line 484, in map_nested
+    mapped = function(data_struct)
+  File "/home/comsys/.local/lib/python3.10/site-packages/datasets/builder.py", line 1432, in _as_streaming_dataset_single
+    return IterableDataset(
+  File "/home/comsys/.local/lib/python3.10/site-packages/datasets/iterable_dataset.py", line 1541, in __init__
+    _maybe_add_torch_iterable_dataset_parent_class(self.__class__)
+  File "/home/comsys/.local/lib/python3.10/site-packages/datasets/iterable_dataset.py", line 1499, in _maybe_add_torch_iterable_dataset_parent_class
+    import torch.utils.data
+  File "/home/comsys/.local/lib/python3.10/site-packages/torch/__init__.py", line 1755, in <module>
+    from .functional import *  # noqa: F403
+  File "/home/comsys/.local/lib/python3.10/site-packages/torch/functional.py", line 1114, in <module>
+    def tensordot(a, b, dims: Tuple[List[int], List[int]], out: Optional[torch.Tensor] = None):  # noqa: F811
+  File "/home/comsys/.local/lib/python3.10/site-packages/torch/_jit_internal.py", line 899, in _overload
+    _check_overload_body(func)
+  File "/home/comsys/.local/lib/python3.10/site-packages/torch/_jit_internal.py", line 868, in _check_overload_body
+    parsed_def = parse_def(func)
+  File "/home/comsys/.local/lib/python3.10/site-packages/torch/_sources.py", line 121, in parse_def
+    sourcelines, file_lineno, filename = get_source_lines_and_file(
+  File "/home/comsys/.local/lib/python3.10/site-packages/torch/_sources.py", line 24, in get_source_lines_and_file
+    sourcelines, file_lineno = inspect.getsourcelines(obj)
+  File "/usr/lib/python3.10/inspect.py", line 1131, in getsourcelines
+    return getblock(lines[lnum:]), lnum + 1
+  File "/usr/lib/python3.10/inspect.py", line 1106, in getblock
+    for _token in tokens:
+  File "/usr/lib/python3.10/tokenize.py", line 527, in _tokenize
+    pseudomatch = _compile(PseudoToken).match(line, pos)
+KeyboardInterrupt

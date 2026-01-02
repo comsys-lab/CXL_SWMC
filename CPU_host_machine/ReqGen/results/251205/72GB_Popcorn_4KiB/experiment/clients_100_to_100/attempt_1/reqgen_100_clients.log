@@ -1,0 +1,54 @@
+2025-12-05 04:52:11,672 - INFO - ReqGen 시작: 서버=163.152.48.109:9000, 클라이언트=100, 시간=330초
+2025-12-05 04:52:11,672 - INFO - Hugging Face에서 'kroshan/BioASQ' 데이터셋을 로드합니다...
+2025-12-05 04:52:17,055 - INFO - 3266개의 질문을 로드했습니다.
+2025-12-05 04:52:17,055 - INFO - 부하 테스트 시작, client 수 = 100
+2025-12-05 04:55:17,776 - INFO - [실시간] 요청 1000개 처리 | 현재까지의 RPS: 5.53최근 1000개 request의 p99 TTFT: 31.0013 초 | 
+2025-12-05 04:55:17,776 - WARNING - 최근 1000개의 p99 TTFT 31.0013 초가 SLO 의 4배 (4.0 초)를 초과했습니다. 부하 테스트를 조기 종료합니다.
+/home/comsys/.local/lib/python3.10/site-packages/numpy/core/fromnumeric.py:3504: RuntimeWarning: Mean of empty slice.
+  return _methods._mean(a, axis=axis, dtype=dtype,
+/home/comsys/.local/lib/python3.10/site-packages/numpy/core/_methods.py:129: RuntimeWarning: invalid value encountered in scalar divide
+  ret = ret.dtype.type(ret / rcount)
+통계에 반영된 요청 인덱스 범위: 1000 ~ 1000 (총 0개 요청)
+통계 반영된 요청 수: 0, 통계 반영된 시간: 0.00 초
+
+==================================================
+ 실험 최종 결과 요약
+==================================================
+ 부하 테스트가 조기 종료되었습니다! (SLO 위반)
+ Client 수를 낮추어 다시 시도하세요.
+ 설정 실험 시간: 330 초
+ Clients 수: 100
+ 통계 반영 시간: 0.00 초
+ 총 시도된 요청: 14 개
+ 총 완료된 요청: 0 개
+ 총 실패한 요청: 14 개
+ 완료 요청 중 retrieval이 실패한 요청: -865 개
+ 요청 성공률: 0.00%
+ 전체 Requests Per Second (RPS): 0.00
+--------------------------------------------------
+ Time to First Token (TTFT) Latency:
+  - 평균 (Mean): nan 초
+Traceback (most recent call last):
+  File "/home/comsys/sungsu/CXLSharedMemGPU/ReqGen/main.py", line 418, in <module>
+    main()
+  File "/home/comsys/sungsu/CXLSharedMemGPU/ReqGen/main.py", line 415, in main
+    asyncio.run(reqgen.run())
+  File "/usr/lib/python3.10/asyncio/runners.py", line 44, in run
+    return loop.run_until_complete(main)
+  File "/usr/lib/python3.10/asyncio/base_events.py", line 649, in run_until_complete
+    return future.result()
+  File "/home/comsys/sungsu/CXLSharedMemGPU/ReqGen/main.py", line 395, in run
+    self._print_final_summary()
+  File "/home/comsys/sungsu/CXLSharedMemGPU/ReqGen/main.py", line 322, in _print_final_summary
+    print(f"  - 중간값 (50%ile): {np.percentile(ttfts, 50):.4f} 초")
+  File "/home/comsys/.local/lib/python3.10/site-packages/numpy/lib/function_base.py", line 4283, in percentile
+    return _quantile_unchecked(
+  File "/home/comsys/.local/lib/python3.10/site-packages/numpy/lib/function_base.py", line 4555, in _quantile_unchecked
+    return _ureduce(a,
+  File "/home/comsys/.local/lib/python3.10/site-packages/numpy/lib/function_base.py", line 3823, in _ureduce
+    r = func(a, **kwargs)
+  File "/home/comsys/.local/lib/python3.10/site-packages/numpy/lib/function_base.py", line 4722, in _quantile_ureduce_func
+    result = _quantile(arr,
+  File "/home/comsys/.local/lib/python3.10/site-packages/numpy/lib/function_base.py", line 4831, in _quantile
+    slices_having_nans = np.isnan(arr[-1, ...])
+IndexError: index -1 is out of bounds for axis 0 with size 0

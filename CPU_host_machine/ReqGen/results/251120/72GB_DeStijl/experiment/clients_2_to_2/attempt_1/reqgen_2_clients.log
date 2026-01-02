@@ -1,0 +1,54 @@
+2025-11-20 22:05:10,514 - INFO - ReqGen 시작: 서버=163.152.48.109:9000, 클라이언트=2, 시간=330초
+2025-11-20 22:05:10,514 - INFO - Hugging Face에서 'kroshan/BioASQ' 데이터셋을 로드합니다...
+Traceback (most recent call last):
+  File "/home/comsys/sungsu/CXLSharedMemGPU/ReqGen/main.py", line 417, in <module>
+    main()
+  File "/home/comsys/sungsu/CXLSharedMemGPU/ReqGen/main.py", line 413, in main
+    reqgen = ReqGen(args)
+  File "/home/comsys/sungsu/CXLSharedMemGPU/ReqGen/main.py", line 28, in __init__
+    self.questions = self._load_questions()
+  File "/home/comsys/sungsu/CXLSharedMemGPU/ReqGen/main.py", line 56, in _load_questions
+    dataset = load_dataset(self.dataset_name, split='train', streaming=True)
+  File "/home/comsys/.local/lib/python3.10/site-packages/datasets/load.py", line 2594, in load_dataset
+    builder_instance = load_dataset_builder(
+  File "/home/comsys/.local/lib/python3.10/site-packages/datasets/load.py", line 2266, in load_dataset_builder
+    dataset_module = dataset_module_factory(
+  File "/home/comsys/.local/lib/python3.10/site-packages/datasets/load.py", line 1896, in dataset_module_factory
+    ).get_module()
+  File "/home/comsys/.local/lib/python3.10/site-packages/datasets/load.py", line 1214, in get_module
+    dataset_readme_path = cached_path(
+  File "/home/comsys/.local/lib/python3.10/site-packages/datasets/utils/file_utils.py", line 201, in cached_path
+    output_path = get_from_cache(
+  File "/home/comsys/.local/lib/python3.10/site-packages/datasets/utils/file_utils.py", line 576, in get_from_cache
+    response = http_head(
+  File "/home/comsys/.local/lib/python3.10/site-packages/datasets/utils/file_utils.py", line 462, in http_head
+    response = _request_with_retry(
+  File "/home/comsys/.local/lib/python3.10/site-packages/datasets/utils/file_utils.py", line 336, in _request_with_retry
+    response = requests.request(method=method.upper(), url=url, timeout=timeout, **params)
+  File "/home/comsys/.local/lib/python3.10/site-packages/requests/api.py", line 59, in request
+    return session.request(method=method, url=url, **kwargs)
+  File "/home/comsys/.local/lib/python3.10/site-packages/requests/sessions.py", line 589, in request
+    resp = self.send(prep, **send_kwargs)
+  File "/home/comsys/.local/lib/python3.10/site-packages/requests/sessions.py", line 703, in send
+    r = adapter.send(request, **kwargs)
+  File "/home/comsys/.local/lib/python3.10/site-packages/requests/adapters.py", line 667, in send
+    resp = conn.urlopen(
+  File "/usr/lib/python3/dist-packages/urllib3/connectionpool.py", line 700, in urlopen
+    httplib_response = self._make_request(
+  File "/usr/lib/python3/dist-packages/urllib3/connectionpool.py", line 383, in _make_request
+    self._validate_conn(conn)
+  File "/usr/lib/python3/dist-packages/urllib3/connectionpool.py", line 1017, in _validate_conn
+    conn.connect()
+  File "/usr/lib/python3/dist-packages/urllib3/connection.py", line 411, in connect
+    self.sock = ssl_wrap_socket(
+  File "/usr/lib/python3/dist-packages/urllib3/util/ssl_.py", line 449, in ssl_wrap_socket
+    ssl_sock = _ssl_wrap_socket_impl(
+  File "/usr/lib/python3/dist-packages/urllib3/util/ssl_.py", line 493, in _ssl_wrap_socket_impl
+    return ssl_context.wrap_socket(sock, server_hostname=server_hostname)
+  File "/usr/lib/python3.10/ssl.py", line 513, in wrap_socket
+    return self.sslsocket_class._create(
+  File "/usr/lib/python3.10/ssl.py", line 1100, in _create
+    self.do_handshake()
+  File "/usr/lib/python3.10/ssl.py", line 1371, in do_handshake
+    self._sslobj.do_handshake()
+KeyboardInterrupt
