@@ -9,6 +9,3 @@
   - `sudo grep 'soft reserved' /proc/iomem`
   - `daxctl list` and enable dax device with `sudo daxctl enable-device daxX.X`
 - use dax_setting.c to check if devdax mode CXL
-
-## How to change alignment of CXL memory
--
