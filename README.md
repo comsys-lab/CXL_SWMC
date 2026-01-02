@@ -1,6 +1,6 @@
 # CXL_SWMC
 
-<img width="1447" height="880" alt="image" src="https://github.com/user-attachments/assets/8e3260f1-492c-4b36-913d-f65196cf6b24" />
+<img width="1417" height="814" alt="image" src="https://github.com/user-attachments/assets/ba275589-8b2a-4e92-af4c-90c913b05d3e" />
 
 
 - 위 그림에서 회색 박스는 RAG 서버의 component를 뜻하며, 검은 화살표로 연결된 component 끼리는 network로 통신함.
@@ -26,7 +26,7 @@
 
 ### Socket 0 Overview
 
-<img width="1187" height="900" alt="image" src="https://github.com/user-attachments/assets/530f0e75-a2ad-4b7a-940c-87ba6a12edcb" />
+<img width="1176" height="859" alt="image" src="https://github.com/user-attachments/assets/3eaa6419-13b3-4512-b8e3-4bf3edd7ed84" />
 
 
 - CPU Server socket 0는 2 개의 VM을 구동하고, 각 VM이 CXL memory expander를 CXL shared memory로 인식할 수 있도록 emulation함.
