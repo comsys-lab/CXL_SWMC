@@ -11,14 +11,13 @@
 ### HW/SW Requirements
 
 - HW
-    
-    
-    | **CPU** | 2× Intel Xeon 6426Y (Sapphire Rapids) @2.5 GHz, 16 cores
-    37.5 MiB LLC per CPU, Hyper-Threading Enabled |
-    | --- | --- |
-    | **Memory** | Socket 0: 4× 32 GB DDR5-4800 MT/s, Total 256 GB
-    Socket 1: 4× 16 GB DDR5-4000 MT/s, Total 64 GB
-    96 GB CXL Expander: PCIe 5.0 ×8, Total 96 GB (Connected in Socket 0 PCIe) |
+    - **CPU**: 2× Intel Xeon 6426Y (Sapphire Rapids)
+      - 16 cores @ 2.5 GHz
+      - 37.5 MiB LLC per CPU, HT Enabled
+    - **Memory**: Total 320 GB DDR5 + 96 GB CXL
+      - **Socket 0**: 4× 32 GB DDR5-4800 (256 GB)
+      - **Socket 1**: 4× 16 GB DDR5-4000 (64 GB)
+      - **CXL Expander**: 96 GB (PCIe 5.0 ×8, Socket 0)
 - SW
     - ubuntu 22.04 LTS
     - Qemu
@@ -59,13 +58,13 @@
 ### HW/SW Requirements
 
 - HW
-    
-    | **CPU** | 2× Intel Xeon 4410Y (Sapphire Rapids) @2.5 GHz, 12 cores
-    30 MiB LLC per CPU, Hyper-Threading Enabled |
-    | --- | --- |
-    | **Memory** | Socket 0: 2× 64 GB DDR5-4800 MT/s, Total 128 GB
-    Socket 1: 2× 64 GB DDR5-4800 MT/s, Total 128 GB |
-    | **GPU** | 2x NVIDIA GeForce RTX 4090 |
+    - **CPU**: 2× Intel Xeon 4410Y (Sapphire Rapids)
+      - 12 cores per CPU @ 2.5 GHz (Total 24C/48T)
+      - 30 MiB LLC per CPU, Hyper-Threading Enabled
+    - **Memory**: Total 256 GB DDR5-4800 MT/s
+      - **Socket 0**: 128 GB (2× 64 GB)
+      - **Socket 1**: 128 GB (2× 64 GB)
+    - **GPU**: 2× NVIDIA GeForce RTX 4090
 - SW
     - ubuntu 22.04 LTS
     - python 3.11
