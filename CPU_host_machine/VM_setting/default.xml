@@ -1,5 +1,6 @@
-<network>
+<network connections='2'>
   <name>default</name>
+  <uuid>7e60ec77-ac25-4ddf-bcd0-ec365a4aa43c</uuid>
   <forward mode='nat'>
     <nat>
       <port start='1024' end='65535'/>
@@ -11,6 +12,9 @@
     <dhcp>
       <range start='192.168.122.2' end='192.168.122.254'/>
       <host mac='52:54:00:8d:41:dd' ip='192.168.122.100'/>
+      <host mac='52:54:00:5c:ec:a0' ip='192.168.122.101'/>
+      <host mac='52:54:00:fc:10:bd' ip='192.168.122.110'/>
     </dhcp>
   </ip>
 </network>
+

@@ -4,7 +4,7 @@ HOST_SIZE=$1
 
 if [ -z "$HOST_SIZE" ]; then
     echo "Usage: $0 <host_size>"
-    echo "Example: $0 24GB_2MiB"
+    echo "Example: $0 24GB_2MB"
     exit 1
 fi
 
