@@ -267,14 +267,16 @@
   ```
 
 ## devdax device (emulated CXL shared memory) setup in VM
-- prerequisite
+- prerequisite  
+  first, `sudo cat /proc/iomem | grep Persistent` must show output like `1880000000-307effffff : Persistent Memory`  
+  second,
   ```bash
   sudo apt update
   sudo apt install linux-modules-extra-$(uname -r)
   sudo apt install -y libcxl1 libdaxctl1 libiniparser1 libndctl6 ndctl
   sudo apt install daxctl
   ```
-  and reboot
+  and `sudo reboot now`
 - modeprobe
   ```bash
   sudo modprobe nd_pmem
@@ -286,7 +288,7 @@
   ```bash
   sudo ndctl create-namespace --force --reconfig=namespace0.0 --mode=devdax --map=mem --size=103062437888
   # check device
-  sudo ndctl list -R
+  sudo ndctl list
   ```
 - Change devdax device alignment from 2MB to 4KB  
   To change alignment of emulated CXL shared memory device, we should change
