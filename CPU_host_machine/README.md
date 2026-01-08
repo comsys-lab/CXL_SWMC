@@ -334,3 +334,17 @@
     ```
     to return back to 2MB alignment:
     `sudo ndctl create-namespace --force --reconfig=namespace0.0 --mode=devdax --map=mem --size=103062437888 --align=2097152`
+
+## Change devdax device to uncachable region via intel MTRRs  
+MTRR is configurable only with 2's power alignment, so make sure to offline host memory in uncachable region first.  
+you need to check `/proc/iomem` output first to find the range of devdax device. (Soft Reserved)  
+`sudo vim /etc/default/grub` and add `memmap=2G!320G` to `GRUB_CMDLINE_LINUX_DEFAULT` to make 320GB~322GB is offlined.  
+and change MTRR settings in host machine
+```bash
+# check MTRR status
+sudo cat /proc/mtrr
+
+# set uncachable region for devdax device from 0x5080000000 to 0x687fffffff (322GB ~ 418GB)
+echo "base=0x5000000000 size=0x1000000000 type=uncachable" | sudo tee /proc/mtrr
+echo "base=0x6000000000 size=0x1000000000 type=uncachable" | sudo tee /proc/mtrr
+```
