@@ -1,0 +1,15 @@
+[submodule "CPU_guest_VM/kernel/popcorn_2mb"]
+	path = CPU_guest_VM/kernel/popcorn_2mb
+	url = https://github.com/youkioh/CXLSHMSWcoherence.git
+	branch = main
+[submodule "CPU_guest_VM/kernel/de_stijl"]
+	path = CPU_guest_VM/kernel/de_stijl
+	url = https://github.com/youkioh/CXLSHMSWcoherence.git
+	branch = SWMC_DAMON
+[submodule "CPU_guest_VM/kernel/popcorn_4kb"]
+	path = CPU_guest_VM/kernel/popcorn_4kb
+	url = https://github.com/youkioh/CXLSHMSWcoherence.git
+	branch = popcorn_4kb
+[submodule "CPU_guest_VM/kernel/famfs_vanilla"]
+	path = CPU_guest_VM/kernel/famfs_vanilla
+	url = https://github.com/youkioh/CXLSHMSWcoherence.git
