@@ -1,5 +1,0 @@
-# Secret files
-.env
-
-# HuggingFace cache
-.cache/

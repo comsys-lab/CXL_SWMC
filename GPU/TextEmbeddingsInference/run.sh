@@ -10,7 +10,6 @@ docker run --gpus '"device=0"' \
   --rm \
   -p ${PORT}:80 \
   -v $PWD/data:/data \
-  --pull always \
   ${IMAGE_NAME} \
   --model-id BAAI/bge-base-en-v1.5 \
   --max-client-batch-size 128

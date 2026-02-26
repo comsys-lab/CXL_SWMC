@@ -15,11 +15,15 @@ with open("batch_100.json", "w") as f:
 print("Sending batch of 100 inputs...")
 
 start = time.time()
-subprocess.run([
-    "curl", "-s", "-X", "POST", "http://localhost:8080/embed",
+result = subprocess.run([
+    "curl", "-s", "-X", "POST", "http://localhost:8081/embed",
     "-H", "Content-Type: application/json",
     "-d", "@batch_100.json"
-], stdout=subprocess.DEVNULL)
+], capture_output=True, text=True)
 end = time.time()
 
+# Print output
+output = json.loads(result.stdout)
+print(f"Output shape: {len(output)} x {len(output[0])}")
+print(f"First embedding (first 5 dims): {output[0][:5]}")
 print(f"Total elapsed time: {end - start:.3f} seconds")

@@ -8,3 +8,7 @@ Dataset/PubMed_bge/
 
 __pycache__/
 *.log
+*.json
+
+# HuggingFace Token
+.env

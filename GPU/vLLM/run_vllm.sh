@@ -16,7 +16,7 @@ TOKEN="${HUGGING_FACE_HUB_TOKEN:-}"
 
 # Run vLLM container with --rm
 docker run --runtime=nvidia --gpus '"device=1"' \
-  -it \
+  -dit \
   --name ${CONTAINER_NAME} \
   --rm \
   -p ${PORT}:${PORT} \
