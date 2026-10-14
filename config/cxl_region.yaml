@@ -8,6 +8,8 @@ device_size: auto          # /sys/bus/dax/devices/<dev>/size (observed 103060340
 align: 2097152             # 2 MiB; must be a multiple of 4096
 hwcc_offset: 0
 hwcc_size: 268435456       # 256 MiB HW-coherent budget (SCR)
+msg_ring: [268300288, 135168]  # last 132 KiB of hwcc: Popcorn cxl_shm message rings (ring_coherent=1);
+                           # user-level systems allocate only hwcc minus this range (cxl_region.h hwcc_alloc)
 swcc_offset: auto          # align_up(hwcc_offset + hwcc_size, align)
 swcc_size: auto            # up to device end, stopping at the first reserved range above swcc_offset
 reserved: []               # e.g. [[100931731456, 2147483648]] to exclude a range from all systems

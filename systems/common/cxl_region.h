@@ -27,6 +27,8 @@ struct region {
   uint64_t map_va = 0x600000000000ull;  // fixed mapping address, same on every node
   uint64_t align = 2ull << 20;
   range hwcc;
+  range msg_ring;    // optional kernel message ring (Popcorn cxl_shm) at the END of hwcc; size 0 = none
+  range hwcc_alloc;  // hwcc minus msg_ring: what user-level systems (e.g. Megalon's SCR) may allocate
   range swcc;
   std::vector<range> reserved;
   std::string source;  // config path actually used
@@ -129,6 +131,11 @@ inline bool region_load(const char *path, region *r, std::string *err,
     else if (k == "swcc_offset") sw_off = v;
     else if (k == "swcc_size") sw_size = v;
     else if (k == "reserved") ok = parse_ranges(v, &r->reserved);
+    else if (k == "msg_ring") {
+      std::vector<range> rr;
+      ok = parse_ranges("[" + v + "]", &rr) && rr.size() == 1;
+      if (ok) r->msg_ring = rr[0];
+    }
     else { *err = "line " + std::to_string(lineno) + ": unknown key " + k; return false; }
     if (!ok) { *err = "line " + std::to_string(lineno) + ": bad value for " + k; return false; }
   }
@@ -148,6 +155,19 @@ inline bool region_load(const char *path, region *r, std::string *err,
   if (r->hwcc.offset % r->align || r->hwcc.size % 4096) {
     *err = "hwcc_offset must be aligned, hwcc_size a multiple of 4096";
     return false;
+  }
+
+  // The message ring is carved from the tail of hwcc (hardware-coherent, so its lines need no flushes);
+  // everything else in hwcc stays one contiguous allocatable range.
+  r->hwcc_alloc = r->hwcc;
+  if (r->msg_ring.size) {
+    const range &m = r->msg_ring;
+    if (m.offset % 4096 || m.size % 4096 || m.offset < r->hwcc.offset || m.end() != r->hwcc.end() ||
+        m.size >= r->hwcc.size) {
+      *err = "msg_ring must be 4 KiB aligned, non-empty, end exactly at the end of hwcc and leave room before it";
+      return false;
+    }
+    r->hwcc_alloc.size = m.offset - r->hwcc.offset;
   }
 
   if (sw_off == "auto") r->swcc.offset = align_up(r->hwcc.end(), r->align);
@@ -185,6 +205,7 @@ inline std::string region_describe(const region &r) {
   o << "device=" << r.device << " device_size=" << r.device_size << " map_va=0x" << std::hex << r.map_va
     << std::dec << " align=" << r.align
     << " hwcc=[" << r.hwcc.offset << "," << r.hwcc.end() << ")"
+    << " msg_ring=[" << r.msg_ring.offset << "," << r.msg_ring.end() << ")"
     << " swcc=[" << r.swcc.offset << "," << r.swcc.end() << ")"
     << " reserved=" << r.reserved.size() << " config=" << r.source;
   return o.str();
