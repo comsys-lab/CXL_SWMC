@@ -1,0 +1,12 @@
+# Never commit secrets, datasets, model weights, results or logs.
+.env
+*.env
+__pycache__/
+*.pyc
+*.log
+screenlog.*
+*.arrow
+*.safetensors
+*.bin
+experiments/results/
+datasets/

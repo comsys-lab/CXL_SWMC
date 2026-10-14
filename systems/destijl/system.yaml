@@ -1,0 +1,14 @@
+name: destijl
+level: kernel
+kernel:
+  submodule: kernels/destijl
+  branch: DE_STIJL_DAMON
+  source_dir: famfs-linux
+  config_base: T/build/.config of rel/destijl-p3a (PAGE_COHERENCE, DE_STIJL, DAMON)
+  localversion: -ds-destijl-<n>
+  external_modules: [msg_layer_module]      # cxl_shm.ko
+guest_setup:
+  - scripts/guest/mount_famfs.sh            # MODE=DeStijl, NODE_ID per VM
+  - scripts/guest/start_cxlshm.sh           # clears shared rings at DAX base +94 GiB: approval-gated
+  - systems/destijl/start_damon.sh          # selective replication (damo_yamls/)
+boot_params: [page_replication_ext=on]

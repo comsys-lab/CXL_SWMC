@@ -1,5 +1,21 @@
 # CXL_SWMC
 
+## Repository layout (g1-restructure)
+
+| Path | Contents |
+| --- | --- |
+| kernels/ | submodules: destijl, popcorn_new (same repo, separate branches), linux-6.14 (vanilla, shallow) |
+| systems/ | per-system definitions, setup and adapters: destijl, popcorn_new, megalon |
+| workloads/ | rag, lmdb, microbench (recommendation, pagerank planned) |
+| scripts/ | ctl (Host controller, planned), host, guest, gpu, deploy |
+| third_party/ | famfs userspace (submodule) |
+| config/ | machine inventory |
+| experiments/ | experiment specs and result manifests |
+| docs/ | setup notes (host, guest, workloads) |
+
+Clone: `git clone --recurse-submodules --shallow-submodules https://github.com/comsys-lab/CXL_SWMC.git`
+
+
 <img width="1417" height="814" alt="image" src="https://github.com/user-attachments/assets/ba275589-8b2a-4e92-af4c-90c913b05d3e" />
 
 

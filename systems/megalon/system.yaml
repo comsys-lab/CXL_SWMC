@@ -1,0 +1,10 @@
+name: megalon
+level: user
+status: not started
+library:
+  source: paper implementation, to be added as a submodule under systems/megalon/
+kernel:
+  submodule: kernels/linux-6.14            # plain Linux 6.14 (v6.14)
+  localversion: -vanilla-<n>
+  config: to be decided with Megalon requirements (no FamFS assumed)
+notes: CXL memory setup and kernel options are validated later for the VM/CXL environment.

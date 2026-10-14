@@ -1,0 +1,9 @@
+# Machines managed from the CPU Host. No credentials here; SSH uses existing keys.
+host:
+  name: cloudcxl2
+  roles: [kernel-build, libvirt-qemu, physical-cxl]   # shared CXL: /dev/dax1.0
+guests:
+  vm0: {domain: cxl_vm0, ssh: comsys@192.168.122.100, roles: [kernel-run, dax-famfs, cpu-workload], node_id: 0}
+  vm1: {domain: cxl_vm1, ssh: comsys@192.168.122.101, roles: [kernel-run, dax-famfs, cpu-workload], node_id: 1}
+gpu:
+  gpu0: {ssh: comsys@163.152.48.206, port: 2380, roles: [vllm, tei, langchain, gpu-workload], repo: /home/comsys/CXL_SWMC}

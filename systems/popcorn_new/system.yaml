@@ -1,0 +1,14 @@
+name: popcorn_new
+level: kernel
+status: branch created at 122d22dc; implementation pending (after G1)
+kernel:
+  submodule: kernels/popcorn_new
+  branch: popcorn_new
+  source_dir: famfs-linux
+  localversion: -ds-popcorn-new-<n>
+  external_modules: [msg_layer_module]
+removes: [selective replication, asynchronous transaction handling]
+keeps: [PTE/MMU-fault transition detection, struct page coherence metadata, inter-kernel messaging]
+guest_setup:
+  - scripts/guest/mount_famfs.sh
+  - scripts/guest/start_cxlshm.sh
