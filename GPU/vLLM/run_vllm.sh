@@ -15,7 +15,7 @@ HUGGINGFACE_CACHE="$HOME/.cache/huggingface"
 TOKEN="${HUGGING_FACE_HUB_TOKEN:-}"
 
 # Run vLLM container with --rm
-docker run --runtime=nvidia --gpus '"device=1"' \
+docker run --runtime=nvidia --gpus '"device=0,1"' \
   -dit \
   --name ${CONTAINER_NAME} \
   --rm \

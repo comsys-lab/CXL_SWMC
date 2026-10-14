@@ -89,7 +89,13 @@ class AsyncCppVectorDBStore(VectorStore):
             results = response_data.get("data", {}).get("results", [])
             
             documents = [
-                Document(page_content="", metadata={"id": str(res.get("id"))})
+                Document(
+                    page_content="",
+                    metadata={
+                        "id": str(res.get("id")),
+                        "distance": res.get("distance"),
+                    },
+                )
                 for res in results
             ]
             return documents
@@ -122,6 +128,45 @@ class AsyncCppVectorDBStore(VectorStore):
         # print(f"쿼리 임베딩: {query_embedding}")
         
         return await self._asimilarity_search_by_vector(query_embedding, k, **kwargs)
+
+    async def ainsert_vector(self, embedding: List[float]) -> int | None:
+        """
+        비동기적으로 단일 벡터를 DB에 삽입하고, 생성된 ID를 반환합니다.
+        """
+        insert_url = f"{self.base_url}/api/insert"
+        payload = {"vector": embedding}
+
+        session = await self._get_session()
+        try:
+            async with session.post(insert_url, json=payload) as response:
+                response.raise_for_status()
+                response_data = await response.json()
+
+            await self._return_session(session)
+
+            if not response_data.get("success"):
+                logging.warning(f"Vector DB insert API 응답 실패: {response_data}")
+                return None
+
+            return response_data.get("data", {}).get("id")
+
+        except aiohttp.ClientError as e:
+            logging.error(f"Vector DB insert API 호출 중 에러 발생: {e}. 세션을 교체합니다.")
+
+            if not session.closed:
+                await session.close()
+
+            new_session = self._create_new_session()
+            await self.session_pool.put(new_session)
+
+            return None
+
+    async def ainsert_text(self, text: str) -> int | None:
+        """
+        텍스트를 임베딩한 뒤 비동기적으로 DB에 삽입하고, 생성된 ID를 반환합니다.
+        """
+        embedding = await self._embedding_function.aembed_query(text)
+        return await self.ainsert_vector(embedding)
 
     # 동기 메서드들은 사용하지 않으므로 에러를 발생시킵니다.
     def similarity_search(self, *args, **kwargs):

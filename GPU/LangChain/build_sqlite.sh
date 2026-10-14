@@ -1,6 +1,6 @@
 #!/bin/bash
 
-DATASET_PATH="/home/cloud_cxl/CXLSharedMemGPU/Dataset/PubMed_bge/PubMed_bge_28000000"  # Replace with your dataset path
+DATASET_PATH="/home/comsys/CXL_SWMC/GPU/Dataset/PubMed_bge_28000000_sorted"  # Replace with your dataset path
 SQLITE_DB_PATH="./Data/PubMed_28M.db"  # Replace with your desired SQLite DB path
 NUM_RECORDS=28000000  # Adjust based on your dataset size
 

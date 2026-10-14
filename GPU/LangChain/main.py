@@ -1,4 +1,4 @@
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import StreamingResponse
 from langchain_openai import ChatOpenAI
 import uvicorn
@@ -12,7 +12,8 @@ import numpy as np
 import logging
 
 # Retrieval 관련 imports
-from langchain.retrievers import MultiVectorRetriever
+from langchain_classic.retrievers import MultiVectorRetriever
+
 from langchain_core.embeddings import Embeddings
 from async_custom_vectorstore import AsyncCppVectorDBStore
 from async_sqlite_store import AsyncSQLiteStore
@@ -61,7 +62,7 @@ os.environ["OPENAI_API_KEY"] = "EMPTY"
 llm = ChatOpenAI(
     base_url=VLLM_BASE_URL,
     model="meta-llama/Llama-3.1-8B-Instruct",
-    temperature=0.7,
+    temperature=0.0,
     max_tokens=2048,
     streaming=True
 )
@@ -264,11 +265,68 @@ retriever_2 = MultiVectorRetriever(
 )
 
 # MultiVectorRetriever의 기본 검색 파라미터 설정
-retriever_1.search_kwargs = {"k": 5}  # 5개 문서 검색
-retriever_2.search_kwargs = {"k": 5}  # 5개 문서 검색
+retriever_1.search_kwargs = {"k": 10}  # 5개 문서 검색
+retriever_2.search_kwargs = {"k": 10}  # 5개 문서 검색
 
 # 3. FastAPI 애플리케이션 생성
 app = FastAPI()
+
+
+def cosine_distance(vec1: list[float], vec2: list[float]) -> float | None:
+    """두 벡터의 cosine distance(= 1 - cosine similarity)를 계산합니다."""
+    if not vec1 or not vec2:
+        return None
+
+    arr1 = np.asarray(vec1, dtype=np.float32)
+    arr2 = np.asarray(vec2, dtype=np.float32)
+
+    if arr1.shape != arr2.shape:
+        return None
+
+    norm1 = np.linalg.norm(arr1)
+    norm2 = np.linalg.norm(arr2)
+    if norm1 == 0.0 or norm2 == 0.0:
+        return None
+
+    cos_sim = float(np.dot(arr1, arr2) / (norm1 * norm2))
+    return 1.0 - cos_sim
+
+
+def embedding_metrics(vec1: list[float], vec2: list[float]) -> dict[str, float] | None:
+    """두 벡터 간 4개 메트릭을 계산합니다."""
+    if not vec1 or not vec2:
+        return None
+
+    arr1 = np.asarray(vec1, dtype=np.float32)
+    arr2 = np.asarray(vec2, dtype=np.float32)
+
+    if arr1.shape != arr2.shape:
+        return None
+
+    norm1 = np.linalg.norm(arr1)
+    norm2 = np.linalg.norm(arr2)
+    if norm1 == 0.0 or norm2 == 0.0:
+        return None
+
+    dot_product = float(np.dot(arr1, arr2))
+    cosine_similarity = float(dot_product / (norm1 * norm2))
+    cosine_dist = float(1.0 - cosine_similarity)
+    l2_dist = float(np.linalg.norm(arr1 - arr2))
+
+    return {
+        "cosine_similarity": cosine_similarity,
+        "cosine_distance": cosine_dist,
+        "dot_product": dot_product,
+        "l2_distance": l2_dist,
+    }
+
+
+def vector_head_str(vec: list[float] | None, n: int = 10) -> str:
+    """벡터 앞 n개 값을 로그 출력용 문자열로 변환합니다."""
+    if not vec:
+        return "[]"
+    head = vec[:n]
+    return "[" + ", ".join(f"{float(v):.6f}" for v in head) + "]"
 
 # 애플리케이션 시작 이벤트
 @app.on_event("startup")
@@ -290,6 +348,9 @@ async def shutdown_event():
 
 # 4-1. RAG를 사용한 실제 vLLM 추론 스트림 생성기
 async def real_stream_generator_with_rag(user_input: str, client_id: int = 0):
+    loop = asyncio.get_running_loop()
+    full_request_start_time = loop.time()
+
     latencies = {
         "embedding_latency": -1,
         "vectordb_latency": -1, 
@@ -298,30 +359,123 @@ async def real_stream_generator_with_rag(user_input: str, client_id: int = 0):
     }
     
     try:
-        # 1. Retrieval: 사용자 질문과 관련된 문서 검색
-        # logging.info(f"문서 검색 중: {user_input}")
-        start_time = asyncio.get_event_loop().time()
-        retrieved_docs = await retriever_1.ainvoke(user_input)
-        end_time = asyncio.get_event_loop().time()
-        latencies["retrieval_latency"] = end_time - start_time
-        # logging.info(f"문서 {len(retrieved_docs)}개 검색 완료 (소요 시간: {latencies['retrieval_latency']:.2f}s)")
-        # logging.info(f"Retrieved {len(retrieved_docs)} documents.")
-        # logging.info(retrieved_docs[:2])  # 첫 두 개 문서 내용 출력
+        # 1. 임베딩
+        embedding_start_time = loop.time()
+        query_embedding = await tei_embeddings.aembed_query(user_input)
+        embedding_end_time = loop.time()
+        latencies["embedding_latency"] = embedding_end_time - embedding_start_time
+        # logging.info(f"[REAL][EMBED_HEAD] query_embedding_head10={vector_head_str(query_embedding)}")
+
+        if not query_embedding:
+            raise ValueError("임베딩 결과가 비어있습니다.")
+
+        # 2. 벡터 검색
+        search_start_time = loop.time()
+        if client_id % 2 == 0:
+            id_docs = await vector_store_1._asimilarity_search_by_vector(query_embedding, k=10)
+        else:
+            id_docs = await vector_store_2._asimilarity_search_by_vector(query_embedding, k=10)
+        search_end_time = loop.time()
+        latencies["vectordb_latency"] = search_end_time - search_start_time
+
+        retrieved_ids = [doc.metadata["id"] for doc in id_docs]
+        vectordb_distances = [doc.metadata.get("distance") for doc in id_docs]
+        logging.info(f"[REAL] retrieved_ids: {retrieved_ids}")
+        logging.info(f"[REAL] vectordb_distances: {vectordb_distances}")
+
+        # 3. 문서 조회
+        doc_fetch_start_time = loop.time()
+        retrieved_docs_raw = await doc_store.amget(retrieved_ids)
+        doc_fetch_end_time = loop.time()
+        latencies["document_latency"] = doc_fetch_end_time - doc_fetch_start_time
+
+        valid_results = [
+            (doc_id, vectordb_distance, doc)
+            for doc_id, vectordb_distance, doc in zip(retrieved_ids, vectordb_distances, retrieved_docs_raw)
+            if doc is not None
+        ]
+        retrieved_docs = [doc for _, _, doc in valid_results]
+
+        full_request_end_time = loop.time()
+        latencies["retrieval_latency"] = full_request_end_time - full_request_start_time
+        # logging.info(f"[REAL] 문서 {len(retrieved_docs)}개 검색 완료 (소요 시간: {latencies['retrieval_latency']:.4f}s)")
+
+        # # 3-1. retrieve된 문서를 다시 TEI에 넣어 임베딩 후 cosine distance 비교
+        # async def _embed_doc_for_compare(doc_text: str):
+        #     try:
+        #         return await tei_embeddings.aembed_query(doc_text)
+        #     except Exception as embed_error:
+        #         logging.error(f"[REAL] 문서 재임베딩 실패: {type(embed_error).__name__}: {repr(embed_error)}")
+        #         return None
+
+        # doc_texts = [str(doc) for doc in retrieved_docs]
+        # doc_embeddings = await asyncio.gather(*[_embed_doc_for_compare(text) for text in doc_texts])
+
+        # for (doc_id, vectordb_distance, doc), doc_embedding in zip(valid_results, doc_embeddings):
+        #     metrics = embedding_metrics(query_embedding, doc_embedding) if doc_embedding is not None else None
+        #     doc_embedding_head10 = vector_head_str(doc_embedding)
+
+        #     if metrics is not None and vectordb_distance is not None:
+        #         distance_diff = abs(float(vectordb_distance) - float(metrics["cosine_distance"]))
+        #         logging.info(
+        #             f"[REAL][DISTANCE_COMPARE] id={doc_id}, vectordb_distance={vectordb_distance}, "
+        #             f"tei_cosine_similarity={metrics['cosine_similarity']:.6f}, "
+        #             f"tei_cosine_distance={metrics['cosine_distance']:.6f}, "
+        #             f"tei_dot_product={metrics['dot_product']:.6f}, "
+        #             f"tei_l2_distance={metrics['l2_distance']:.6f}, "
+        #             f"abs_diff_cosine_distance={distance_diff:.6f}, "
+        #             f"query_head10={vector_head_str(query_embedding)}, doc_head10={doc_embedding_head10}"
+        #         )
+        #     else:
+        #         logging.info(
+        #             f"[REAL][DISTANCE_COMPARE] id={doc_id}, vectordb_distance={vectordb_distance}, "
+        #             f"tei_metrics={metrics}, "
+        #             f"query_head10={vector_head_str(query_embedding)}, doc_head10={doc_embedding_head10}"
+        #         )
 
         # 2. 검색된 문서들로 컨텍스트 구성
-        context_parts = [f"Document {i+1}: {doc}" for i, doc in enumerate(retrieved_docs)]
+        context_parts = [
+            f"Document {i+1}: {doc}" if doc is not None else f"Document {i+1}: [No content]"
+            for i, doc in enumerate(retrieved_docs)
+        ]
+
+        # logging.info(f"question: {user_input}")
+        # for doc_id, _, doc in valid_results:
+        #     logging.info(f"document id: {doc_id}, content: {doc}")
         
         context = "\n\n".join(context_parts)
         
         # 3. RAG prompt construction (English)
         if context.strip():
-            system_message = """You are a helpful AI assistant. Please answer the user's question based on the provided documents.
-    If you cannot find the answer in the documents, respond using general knowledge."""
-            user_message = f"""Refer to the following documents to answer the question:
+            system_message = """You are an expert biomedical AI assistant"""
+            user_message = f"""You are a strict biomedical AI. Answer with ONLY "yes" or "no".
+If the [CONTEXT] does not directly answer the [QUESTION], IGNORE IT and use your internal knowledge.
 
-    {context}
+=== EXAMPLES ===
+[CONTEXT]
+Document 1: Gene XYZ is highly expressed in the brain.
+[QUESTION]
+Does Gene ABC cause breast cancer?
+[REASONING] Context is completely irrelevant (talks about XYZ, not ABC). I will use my internal knowledge. ABC (BRCA1) causes breast cancer.
+[ANSWER]
+yes
 
-    Question: {user_input}"""
+[CONTEXT]
+Document 1: The study shows that Drug K reduces blood pressure.
+[QUESTION]
+Is Drug K used for treating asthma?
+[REASONING] Context says it reduces blood pressure, which means it's not primarily for asthma. My internal knowledge confirms Drug K is not for asthma.
+[ANSWER]
+no
+=== END OF EXAMPLES ===
+
+[CONTEXT]
+{context}
+
+[QUESTION]
+{user_input}
+
+Output your answer strictly as "yes" or "no". Do NOT output the reasoning."""
             # logging.info(f"Number of retrieved documents: {len(retrieved_docs)}")
         else:
             system_message = "You are a helpful assistant."
@@ -399,7 +553,7 @@ async def dummy_stream_generator(user_input: str, client_id: int = 1):
         
         search_end_time = loop.time()
         latencies["vectordb_latency"] = search_end_time - search_start_time
-        # logging.info(f"[DUMMY] 2. 벡터 검색 완료 (소요 시간: {latencies['vectordb_latency']:.4f}s)")
+        logging.info(f"[DUMMY] 2. 벡터 검색 완료, 벡터 {len(id_docs)}개 (소요 시간: {latencies['vectordb_latency']:.4f}s)")
         
         retrieved_ids = [doc.metadata["id"] for doc in id_docs]
         
@@ -412,7 +566,7 @@ async def dummy_stream_generator(user_input: str, client_id: int = 1):
     retrieved_docs = []
     # === 3. 문서 내용 검색 단계 및 시간 측정 ===
     try:
-        # logging.info(f"[DUMMY] 3. 문서 내용 검색 시작 (ID 개수: {len(retrieved_ids)})...")
+        logging.info(f"[DUMMY] 3. 문서 내용 검색 시작 (ID 개수: {len(retrieved_ids)})...")
         doc_fetch_start_time = loop.time()
         
         retrieved_docs = await doc_store.amget(retrieved_ids)
@@ -421,10 +575,11 @@ async def dummy_stream_generator(user_input: str, client_id: int = 1):
 
         doc_fetch_end_time = loop.time()
         latencies["document_latency"] = doc_fetch_end_time - doc_fetch_start_time
-        # logging.info(f"[DUMMY] 3. 문서 내용 검색 완료 (소요 시간: {latencies['document_latency']:.4f}s)")
         
         # None 값을 필터링
         retrieved_docs = [doc for doc in retrieved_docs if doc is not None]
+        logging.info(f"[DUMMY] 3. 문서 내용 검색 완료. 문서 {len(retrieved_docs)}개 (소요 시간: {latencies['document_latency']:.4f}s)")
+
 
         
     except Exception as e:
@@ -521,7 +676,7 @@ async def chat_endpoint(request: Request):
         if not user_input:
             return {"error": "user_input is required"}, 400
 
-        if client_id == 0:
+        if client_id == 0 or client_id == 1:
             # 실제 LLM 사용 (항상 RAG 포함)
             generator = real_stream_generator_with_rag(user_input, client_id)
         else:
@@ -529,6 +684,40 @@ async def chat_endpoint(request: Request):
             generator = dummy_stream_generator(user_input, client_id)
 
         return StreamingResponse(generator, media_type="text/plain")
+
+
+@app.post("/insert_document")
+async def insert_document_endpoint(request: Request):
+    async with semaphore:
+        body = await request.json()
+        document = body.get("document", "")
+        client_id = body.get("client_id", 0)
+
+        if not document:
+            raise HTTPException(status_code=400, detail="document is required")
+
+        try:
+            embedding = await tei_embeddings.aembed_query(document)
+            if not embedding:
+                raise HTTPException(status_code=500, detail="embedding result is empty")
+
+            target_vector_store = vector_store_1 if client_id % 2 == 0 else vector_store_2
+            inserted_id = await target_vector_store.ainsert_vector(embedding)
+
+            if inserted_id is None:
+                raise HTTPException(status_code=500, detail="failed to insert vector into VectorDB")
+
+            return {
+                "success": True,
+                "inserted_id": inserted_id,
+                "target_vector_db": 1 if client_id % 2 == 0 else 2
+            }
+
+        except HTTPException:
+            raise
+        except Exception as e:
+            logging.error(f"문서 삽입 중 오류 발생: {e}")
+            raise HTTPException(status_code=500, detail=f"insert_document failed: {str(e)}")
 
 # 6. 서버 실행 (개발용)
 if __name__ == "__main__":

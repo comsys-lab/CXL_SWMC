@@ -1,7 +1,13 @@
-pip install "langchain>=0.1.0" langchain-openai fastapi uvicorn python-dotenv
-
-pip install gunicorn
-
-pip install uvloop
-
-pip install langchain-community langchain-core sqlalchemy datasets aiosqlite
+langchain>=0.1.0
+langchain-classic
+langchain-openai
+langchain-community
+langchain-core
+fastapi
+uvicorn
+gunicorn
+uvloop
+python-dotenv
+sqlalchemy
+datasets
+aiosqlite

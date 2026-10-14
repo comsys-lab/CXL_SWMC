@@ -15,10 +15,10 @@
 #   --keep-alive 120 \
 #   > /home/cloud_cxl/CXLSharedMemGPU/LangChain/gunicorn_2.log 2>&1
 
-
+PWD=$(pwd)
 APP_DATASET="kroshan/BioASQ" \
-SQLITE_DB_PATH="/home/cloud_cxl/CXLSharedMemGPU/LangChain/Data/PubMed_28M.db" \
-SQLITE_NAMESPACE="PubMed_bge_28000000" \
+SQLITE_DB_PATH="$PWD/Data/PubMed_28M.db" \
+SQLITE_NAMESPACE="PubMed_bge_28000000_sorted" \
 gunicorn main:app \
   --workers 48 \
   --worker-class uvicorn.workers.UvicornWorker \
@@ -27,4 +27,5 @@ gunicorn main:app \
   --graceful-timeout 120 \
   --worker-connections 80000 \
   --keep-alive 120 \
-  > /home/cloud_cxl/CXLSharedMemGPU/LangChain/gunicorn_sqlite.log 2>&1
+  --preload \
+  > $PWD/gunicorn_sqlite.log 2>&1

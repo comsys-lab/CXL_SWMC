@@ -34,3 +34,10 @@ docker build -f Dockerfile.llm -t llm_inference_image .
     ```
     
     - you need to authorize in huggingface to use “Llama3-ChatQA-1.5-8B” model
+
+### Run LangChain
+- install requirements
+```bash
+cd LangChain
+pip install -r requirements.txt
+```

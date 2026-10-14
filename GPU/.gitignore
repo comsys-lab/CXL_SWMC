@@ -5,6 +5,7 @@ Data/
 Dataset/bioasq/
 Dataset/pubmed/
 Dataset/PubMed_bge/
+Dataset/PubMed_bge_28000000_modified/
 
 __pycache__/
 *.log
