@@ -11,6 +11,10 @@ set -euo pipefail
 B=$1 RUN=$2 K=$3 RID=$4 REGION=$5 NODECFG=$6 WRITERS=$7 THREADS=$8 WR=$9 PRE=${10} EXEC=${11}
 case "$RID" in 0x[0-9a-fA-F]*) ;; *) echo "run_id must be 0x-prefixed hex" >&2; exit 2;; esac
 case "$WRITERS" in all|node0) ;; *) echo "writers must be all|node0" >&2; exit 2;; esac
+for f in "$RUN/node$K".{log,pid,rc,env} "$RUN/node$K"; do
+  # a reused run dir would let waiters read a previous attempt's .rc (G-B attempts 2-3); never reuse
+  [ -e "$f" ] && { echo "refusing: $f exists (use a fresh run dir)" >&2; exit 2; }
+done
 mkdir -p "$RUN/node$K"
 REINIT=0; [ "$K" = 0 ] && REINIT=1
 cat > "$RUN/node$K.env" <<EOF
