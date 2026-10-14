@@ -2,15 +2,44 @@
 #include <iostream>
 #include <sstream>
 #include <algorithm>
+#include <chrono>
+#include <cstdlib>
+
+namespace {
+bool
+DebugEnabled() {
+    static const bool enabled = []() {
+        const char* v = std::getenv("VDB_DEBUG");
+        return v != nullptr && std::string(v) == "1";
+    }();
+    return enabled;
+}
+
+int
+GetPositiveEnvInt(const char* name, int default_value) {
+    const char* v = std::getenv(name);
+    if (v == nullptr) {
+        return default_value;
+    }
+    int parsed = std::atoi(v);
+    if (parsed <= 0) {
+        return default_value;
+    }
+    return parsed;
+}
+}  // namespace
 
 // thread_local 버퍼들 정의
 thread_local std::vector<float> VectorDBServer::worker_batch_buffer_;
 thread_local std::vector<std::vector<float>> VectorDBServer::worker_queries_buffer_;
 thread_local std::vector<int> VectorDBServer::worker_k_values_buffer_;
 
-VectorDBServer::VectorDBServer(const std::string& hnsw_path, const std::string& flat_path, int port)
+VectorDBServer::VectorDBServer(const std::string& index_path,
+                               const std::string& flat_path,
+                               int port,
+                               const std::string& index_type)
     : running_(false), port_(port), acceptor_(ioc_) {
-    vector_db_ = std::make_unique<VectorDB>(hnsw_path, flat_path);
+    vector_db_ = std::make_unique<VectorDB>(index_path, flat_path, index_type);
 }
 
 VectorDBServer::~VectorDBServer() {
@@ -19,6 +48,20 @@ VectorDBServer::~VectorDBServer() {
 
 bool VectorDBServer::initialize() {
     std::cout << "=== VectorDB 서버 초기화 ===" << std::endl;
+
+    const int batch_size_env = GetPositiveEnvInt("VDB_BATCH_SIZE",
+                                                 static_cast<int>(DEFAULT_MAX_BATCH_SIZE));
+    const int batch_timeout_ms_env = GetPositiveEnvInt("VDB_BATCH_TIMEOUT_MS",
+                                                       DEFAULT_BATCH_TIMEOUT_MS);
+    max_batch_size_ = static_cast<size_t>(batch_size_env);
+    batch_timeout_ = std::chrono::milliseconds(batch_timeout_ms_env);
+    const int search_workers_env = GetPositiveEnvInt(
+        "VDB_SEARCH_WORKER_THREADS",
+        static_cast<int>(std::max(1u, std::thread::hardware_concurrency())));
+    search_worker_threads_ = static_cast<size_t>(search_workers_env);
+    std::cout << "Search batch config: size=" << max_batch_size_
+              << ", timeout_ms=" << batch_timeout_.count() << std::endl;
+    std::cout << "Search worker threads: " << search_worker_threads_ << std::endl;
     
     // VectorDB 초기화
     if (!vector_db_->initialize()) {
@@ -26,14 +69,8 @@ bool VectorDBServer::initialize() {
         return false;
     }
     
-    auto hardware_threads = std::thread::hardware_concurrency();
-
-    search_pool_ = std::make_unique<net::thread_pool>(hardware_threads);
-    
-    // Search worker들 시작
-    startSearchWorkers(hardware_threads);
-
-    std::cout << "Using " << hardware_threads << " threads for search workers" << std::endl;
+    search_pool_ = std::make_unique<net::thread_pool>(search_worker_threads_);
+    std::cout << "Prepared search pool with " << search_worker_threads_ << " threads" << std::endl;
     
     std::cout << "VectorDB 서버 초기화 완료" << std::endl;
     return true;
@@ -46,6 +83,10 @@ void VectorDBServer::start() {
     }
     
     running_.store(true);
+
+    // IMPORTANT: workers must start after running_=true, otherwise they may exit immediately.
+    startSearchWorkers(static_cast<int>(search_worker_threads_));
+    std::cout << "Using " << search_worker_threads_ << " threads for search workers" << std::endl;
     
     try {
         // TCP acceptor 설정
@@ -59,14 +100,16 @@ void VectorDBServer::start() {
         
         std::cout << "VectorDB 서버 시작됨 - 포트: " << port_ << std::endl;
         std::cout << "API 엔드포인트:" << std::endl;
-        std::cout << "  POST /api/vectors      - 벡터 삽입" << std::endl;
-        std::cout << "  POST /api/search       - 벡터 검색 (HNSW approximate)" << std::endl;
+        std::cout << "  POST /api/insert       - 벡터 삽입" << std::endl;
+        std::cout << "  POST /api/delete       - 소프트 삭제" << std::endl;
+        std::cout << "  POST /api/restore      - 소프트 삭제 복구" << std::endl;
+        std::cout << "  POST /api/is-deleted   - 삭제 상태 조회" << std::endl;
+        std::cout << "  POST /api/search       - 벡터 검색 (ANN approximate)" << std::endl;
         std::cout << "  POST /api/exact-search - 벡터 검색 (Brute-force exact)" << std::endl;
         std::cout << "  GET  /api/status       - 상태 조회" << std::endl;
         std::cout << "  GET  /health           - 헬스체크" << std::endl;
         
-        // auto const threads = std::max(1u, std::thread::hardware_concurrency());
-        auto const threads = std::thread::hardware_concurrency();
+        auto const threads = std::max(1u, std::thread::hardware_concurrency());
         std::cout << "Starting " << threads << " IO threads" << std::endl;
         ioc_threads_.reserve(threads);
         
@@ -143,7 +186,7 @@ void VectorDBServer::searchWorkerLoop() {
         bool has_task = false;
         
         // 1. 가능한 많은 태스크를 배치에 수집
-        while (current_batch.size() < MAX_BATCH_SIZE) {
+        while (current_batch.size() < max_batch_size_) {
             if (search_queue_.try_dequeue(task)) {
                 current_batch.push_back(std::move(task));
                 has_task = true;
@@ -153,8 +196,8 @@ void VectorDBServer::searchWorkerLoop() {
         }
         
         auto now = std::chrono::high_resolution_clock::now();
-        bool timeout_reached = (now - last_batch_time) >= BATCH_TIMEOUT;
-        bool batch_full = current_batch.size() >= MAX_BATCH_SIZE;
+        bool timeout_reached = (now - last_batch_time) >= batch_timeout_;
+        bool batch_full = current_batch.size() >= max_batch_size_;
         
         // 2. 배치 처리 조건 체크
         if (!current_batch.empty() && (batch_full || timeout_reached)) {
@@ -179,6 +222,8 @@ void VectorDBServer::processBatch(const std::vector<SearchTask>& batch) {
     if (batch.empty()) return;
     
     try {
+        const auto batch_begin = std::chrono::steady_clock::now();
+
         // 1. 배치 데이터 준비 (버퍼 재사용)
         worker_queries_buffer_.clear();
         worker_k_values_buffer_.clear();
@@ -196,6 +241,12 @@ void VectorDBServer::processBatch(const std::vector<SearchTask>& batch) {
         
         // 최대 k 값으로 배치 검색 (버퍼 재사용)
         int max_k = *std::max_element(worker_k_values_buffer_.begin(), worker_k_values_buffer_.end());
+        if (DebugEnabled()) {
+            std::cout << "[Server][processBatch] start size=" << batch.size()
+                      << " max_k=" << max_k
+                      << " queue_approx=" << search_queue_.size_approx()
+                      << std::endl;
+        }
         auto batch_results = vector_db_->searchVectorsBatch(worker_queries_buffer_, max_k, worker_batch_buffer_);
         
         auto end_time = std::chrono::high_resolution_clock::now();
@@ -226,6 +277,14 @@ void VectorDBServer::processBatch(const std::vector<SearchTask>& batch) {
         }
         
         total_processed_.fetch_add(batch.size());
+
+        if (DebugEnabled()) {
+            const auto batch_end = std::chrono::steady_clock::now();
+            std::cout << "[Server][processBatch] done size=" << batch.size()
+                      << " elapsed_ms="
+                      << std::chrono::duration_cast<std::chrono::milliseconds>(batch_end - batch_begin).count()
+                      << std::endl;
+        }
         
         // 배치 처리 로그 (선택적)
         // std::cout << "Processed batch of " << batch.size() << " queries in " 
@@ -290,6 +349,18 @@ void VectorDBServer::handleRequest(
         // 이 함수는 이제 비동기적으로 동작하며, 완료되면 내부에서 send_callback을 호출합니다.
         return handleSearchRequest(req.body(), req, std::move(send_callback));
     }
+    else if (req.method() == http::verb::post && target == "/api/insert") {
+        return handleInsertRequest(req.body(), req, std::move(send_callback));
+    }
+    else if (req.method() == http::verb::post && target == "/api/delete") {
+        return handleDeleteRequest(req.body(), req, std::move(send_callback));
+    }
+    else if (req.method() == http::verb::post && target == "/api/restore") {
+        return handleRestoreRequest(req.body(), req, std::move(send_callback));
+    }
+    else if (req.method() == http::verb::post && target == "/api/is-deleted") {
+        return handleIsDeletedRequest(req.body(), req, std::move(send_callback));
+    }
     else if (req.method() == http::verb::post && target == "/api/exact-search") {
         // Exact search (brute-force) 엔드포인트
         return handleExactSearchRequest(req.body(), req, std::move(send_callback));
@@ -312,6 +383,163 @@ void VectorDBServer::handleRequest(
     res.body() = createErrorResponse("Endpoint not found").dump();
     res.prepare_payload();
     return send_callback(std::move(res)); // 즉시 콜백 호출
+}
+
+void VectorDBServer::handleInsertRequest(
+    const std::string& body,
+    const http::request<http::string_body>& req,
+    std::function<void(http::response<http::string_body>&&)> send_callback) {
+
+    try {
+        auto request_json = json::parse(body);
+
+        if (!request_json.contains("vector") || !request_json["vector"].is_array()) {
+            http::response<http::string_body> res{http::status::bad_request, req.version()};
+            res.set(http::field::content_type, "application/json");
+            res.body() = createErrorResponse("Missing or invalid 'vector' field").dump();
+            res.prepare_payload();
+            return send_callback(std::move(res));
+        }
+
+        std::vector<float> vector = request_json["vector"].get<std::vector<float>>();
+        uint64_t assigned_id = 0;
+
+        if (!vector_db_->insertVector(vector, assigned_id)) {
+            http::response<http::string_body> res{http::status::bad_request, req.version()};
+            res.set(http::field::content_type, "application/json");
+            res.body() = createErrorResponse("Failed to insert vector").dump();
+            res.prepare_payload();
+            return send_callback(std::move(res));
+        }
+
+        json data = {
+            {"id", assigned_id},
+            {"message", "Vector inserted successfully"}
+        };
+
+        http::response<http::string_body> res{http::status::ok, req.version()};
+        res.set(http::field::content_type, "application/json");
+        res.body() = createSuccessResponse(data).dump();
+        res.prepare_payload();
+        return send_callback(std::move(res));
+
+    } catch (const std::exception& e) {
+        http::response<http::string_body> res{http::status::bad_request, req.version()};
+        res.set(http::field::content_type, "application/json");
+        res.body() = createErrorResponse(std::string("Invalid request: ") + e.what()).dump();
+        res.prepare_payload();
+        return send_callback(std::move(res));
+    }
+}
+
+void VectorDBServer::handleDeleteRequest(
+    const std::string& body,
+    const http::request<http::string_body>& req,
+    std::function<void(http::response<http::string_body>&&)> send_callback) {
+    try {
+        auto request_json = json::parse(body);
+        if (!request_json.contains("id") || !request_json["id"].is_number_unsigned()) {
+            http::response<http::string_body> res{http::status::bad_request, req.version()};
+            res.set(http::field::content_type, "application/json");
+            res.body() = createErrorResponse("Missing or invalid 'id' field").dump();
+            res.prepare_payload();
+            return send_callback(std::move(res));
+        }
+
+        uint64_t id = request_json["id"].get<uint64_t>();
+        bool ok = vector_db_->softDelete(id);
+        if (!ok) {
+            http::response<http::string_body> res{http::status::bad_request, req.version()};
+            res.set(http::field::content_type, "application/json");
+            res.body() = createErrorResponse("Failed to soft delete id").dump();
+            res.prepare_payload();
+            return send_callback(std::move(res));
+        }
+
+        json data = {{"id", id}, {"deleted", true}};
+        http::response<http::string_body> res{http::status::ok, req.version()};
+        res.set(http::field::content_type, "application/json");
+        res.body() = createSuccessResponse(data).dump();
+        res.prepare_payload();
+        return send_callback(std::move(res));
+    } catch (const std::exception& e) {
+        http::response<http::string_body> res{http::status::bad_request, req.version()};
+        res.set(http::field::content_type, "application/json");
+        res.body() = createErrorResponse(std::string("Invalid request: ") + e.what()).dump();
+        res.prepare_payload();
+        return send_callback(std::move(res));
+    }
+}
+
+void VectorDBServer::handleRestoreRequest(
+    const std::string& body,
+    const http::request<http::string_body>& req,
+    std::function<void(http::response<http::string_body>&&)> send_callback) {
+    try {
+        auto request_json = json::parse(body);
+        if (!request_json.contains("id") || !request_json["id"].is_number_unsigned()) {
+            http::response<http::string_body> res{http::status::bad_request, req.version()};
+            res.set(http::field::content_type, "application/json");
+            res.body() = createErrorResponse("Missing or invalid 'id' field").dump();
+            res.prepare_payload();
+            return send_callback(std::move(res));
+        }
+
+        uint64_t id = request_json["id"].get<uint64_t>();
+        bool ok = vector_db_->restoreDeleted(id);
+        if (!ok) {
+            http::response<http::string_body> res{http::status::bad_request, req.version()};
+            res.set(http::field::content_type, "application/json");
+            res.body() = createErrorResponse("Failed to restore id").dump();
+            res.prepare_payload();
+            return send_callback(std::move(res));
+        }
+
+        json data = {{"id", id}, {"deleted", false}};
+        http::response<http::string_body> res{http::status::ok, req.version()};
+        res.set(http::field::content_type, "application/json");
+        res.body() = createSuccessResponse(data).dump();
+        res.prepare_payload();
+        return send_callback(std::move(res));
+    } catch (const std::exception& e) {
+        http::response<http::string_body> res{http::status::bad_request, req.version()};
+        res.set(http::field::content_type, "application/json");
+        res.body() = createErrorResponse(std::string("Invalid request: ") + e.what()).dump();
+        res.prepare_payload();
+        return send_callback(std::move(res));
+    }
+}
+
+void VectorDBServer::handleIsDeletedRequest(
+    const std::string& body,
+    const http::request<http::string_body>& req,
+    std::function<void(http::response<http::string_body>&&)> send_callback) {
+    try {
+        auto request_json = json::parse(body);
+        if (!request_json.contains("id") || !request_json["id"].is_number_unsigned()) {
+            http::response<http::string_body> res{http::status::bad_request, req.version()};
+            res.set(http::field::content_type, "application/json");
+            res.body() = createErrorResponse("Missing or invalid 'id' field").dump();
+            res.prepare_payload();
+            return send_callback(std::move(res));
+        }
+
+        uint64_t id = request_json["id"].get<uint64_t>();
+        bool deleted = vector_db_->isDeleted(id);
+
+        json data = {{"id", id}, {"deleted", deleted}};
+        http::response<http::string_body> res{http::status::ok, req.version()};
+        res.set(http::field::content_type, "application/json");
+        res.body() = createSuccessResponse(data).dump();
+        res.prepare_payload();
+        return send_callback(std::move(res));
+    } catch (const std::exception& e) {
+        http::response<http::string_body> res{http::status::bad_request, req.version()};
+        res.set(http::field::content_type, "application/json");
+        res.body() = createErrorResponse(std::string("Invalid request: ") + e.what()).dump();
+        res.prepare_payload();
+        return send_callback(std::move(res));
+    }
 }
 
 void VectorDBServer::handleSearchRequest(
@@ -393,6 +621,13 @@ void VectorDBServer::handleSearchRequest(
         
         // 작업을 큐에 넣습니다. I/O 스레드는 여기서 블록되지 않고 즉시 다음 일을 처리하러 갑니다.
         search_queue_.enqueue(task);
+
+          if (DebugEnabled()) {
+              std::cout << "[Server][handleSearchRequest] enqueued"
+                        << " k=" << k
+                        << " queue_approx=" << search_queue_.size_approx()
+                        << std::endl;
+          }
         
     } catch (const std::exception& e) {
         // JSON 파싱 오류 등 즉시 에러를 반환할 수 있는 경우
@@ -504,7 +739,10 @@ http::response<http::string_body> VectorDBServer::handleStatusRequest(const http
         {"server_running", running_.load()},
         {"port", port_},
         {"queue_size", search_queue_.size_approx()},
-        {"total_processed", total_processed_.load()}
+        {"total_processed", total_processed_.load()},
+        {"search_worker_threads", search_worker_threads_},
+        {"batch_size", max_batch_size_},
+        {"batch_timeout_ms", batch_timeout_.count()}
     };
     
     http::response<http::string_body> res{http::status::ok, req.version()};

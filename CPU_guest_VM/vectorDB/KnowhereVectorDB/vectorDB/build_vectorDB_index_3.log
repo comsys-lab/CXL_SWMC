@@ -1,0 +1,338 @@
+=== 설정 ===
+DIM: 768
+NB: 6500000
+NQ: 1000
+K: 10
+PubMed BGE 데이터셋 디렉토리: /home/comsys/CXLSharedMemVM/KnowhereVectorDB/Dataset/PubMed_bge/PubMed_bge_28000000_sorted/
+인덱스 파일: /home/comsys/CXLSharedMemVM/KnowhereVectorDB/vectorDB/hnsw_index_6500k_3.bin
+Knowhere HNSW 예제 (PubMed BGE 데이터셋 - Arrow 파일 단위 처리)
+설정: DIM=768, NB=6500000, NQ=1000, K=10
+
+=== 메모리 사용량 분석: 시작 ===
+VmSize:	 2239268 kB
+VmRSS:	   28016 kB
+VmData:	 2099744 kB
+
+--- Memory Mapping 분석 ---
+LARGE ANON: 7f3d28a00000-7f3da8a00000 rw-p 00000000 00:00 0  (2048MB)
+총 파일 매핑: 0 MB
+총 익명 메모리: 2048 MB
+물리 메모리 사용: 27 MB
+
+=== 쿼리 데이터 로드 (1000개) ===
+Stream 포맷으로 Arrow 파일 열기: /home/comsys/CXLSharedMemVM/KnowhereVectorDB/Dataset/PubMed_bge/PubMed_bge_28000000_sorted/data-00000-of-00198.arrow
+쿼리 데이터 로드 완료.
+
+=== 메모리 사용량 분석: 쿼리 로드 후 ===
+VmSize:	 3712356 kB
+VmRSS:	  971508 kB
+VmData:	 3572832 kB
+
+--- Memory Mapping 분석 ---
+LARGE ANON: 4b8ea000000-4b92a000000 rw-p 00000000 00:00 0  (1024MB)
+LARGE ANON: 7f3cf4a75000-7f3d0e8c3000 rw-p 00000000 00:00 0  (414MB)
+LARGE ANON: 7f3d28a00000-7f3da8a00000 rw-p 00000000 00:00 0  (2048MB)
+총 파일 매핑: 0 MB
+총 익명 메모리: 3486 MB
+물리 메모리 사용: 948 MB
+
+=== HNSW 인덱스 빌드 시작 (Arrow 파일 단위 처리) ===
+인덱스 초기화를 위해 첫 번째 Arrow 파일 로드 중...
+Stream 포맷으로 Arrow 파일 열기: /home/comsys/CXLSharedMemVM/KnowhereVectorDB/Dataset/PubMed_bge/PubMed_bge_28000000_sorted/data-00141-of-00198.arrow
+인덱스 Train 단계... (Train 데이터: 141414개 벡터)
+Arrow 파일 단위로 인덱스에 데이터 추가하는 중... (총 198개 파일)
+  파일 처리 중 [142/197]: "data-00142-of-00198.arrow"
+Stream 포맷으로 Arrow 파일 열기: /home/comsys/CXLSharedMemVM/KnowhereVectorDB/Dataset/PubMed_bge/PubMed_bge_28000000_sorted/data-00142-of-00198.arrow
+    > 파일 추가 완료. (현재 파일: 141414개, 총 추가: 141414/6500000, ID 범위: 0-141413)
+  파일 처리 중 [143/197]: "data-00143-of-00198.arrow"
+Stream 포맷으로 Arrow 파일 열기: /home/comsys/CXLSharedMemVM/KnowhereVectorDB/Dataset/PubMed_bge/PubMed_bge_28000000_sorted/data-00143-of-00198.arrow
+    > 파일 추가 완료. (현재 파일: 141414개, 총 추가: 282828/6500000, ID 범위: 141414-282827)
+  파일 처리 중 [144/197]: "data-00144-of-00198.arrow"
+Stream 포맷으로 Arrow 파일 열기: /home/comsys/CXLSharedMemVM/KnowhereVectorDB/Dataset/PubMed_bge/PubMed_bge_28000000_sorted/data-00144-of-00198.arrow
+    > 파일 추가 완료. (현재 파일: 141414개, 총 추가: 424242/6500000, ID 범위: 282828-424241)
+  파일 처리 중 [145/197]: "data-00145-of-00198.arrow"
+Stream 포맷으로 Arrow 파일 열기: /home/comsys/CXLSharedMemVM/KnowhereVectorDB/Dataset/PubMed_bge/PubMed_bge_28000000_sorted/data-00145-of-00198.arrow
+    > 파일 추가 완료. (현재 파일: 141414개, 총 추가: 565656/6500000, ID 범위: 424242-565655)
+  파일 처리 중 [146/197]: "data-00146-of-00198.arrow"
+Stream 포맷으로 Arrow 파일 열기: /home/comsys/CXLSharedMemVM/KnowhereVectorDB/Dataset/PubMed_bge/PubMed_bge_28000000_sorted/data-00146-of-00198.arrow
+    > 파일 추가 완료. (현재 파일: 141414개, 총 추가: 707070/6500000, ID 범위: 565656-707069)
+  파일 처리 중 [147/197]: "data-00147-of-00198.arrow"
+Stream 포맷으로 Arrow 파일 열기: /home/comsys/CXLSharedMemVM/KnowhereVectorDB/Dataset/PubMed_bge/PubMed_bge_28000000_sorted/data-00147-of-00198.arrow
+    > 파일 추가 완료. (현재 파일: 141414개, 총 추가: 848484/6500000, ID 범위: 707070-848483)
+  파일 처리 중 [148/197]: "data-00148-of-00198.arrow"
+Stream 포맷으로 Arrow 파일 열기: /home/comsys/CXLSharedMemVM/KnowhereVectorDB/Dataset/PubMed_bge/PubMed_bge_28000000_sorted/data-00148-of-00198.arrow
+    > 파일 추가 완료. (현재 파일: 141414개, 총 추가: 989898/6500000, ID 범위: 848484-989897)
+  파일 처리 중 [149/197]: "data-00149-of-00198.arrow"
+Stream 포맷으로 Arrow 파일 열기: /home/comsys/CXLSharedMemVM/KnowhereVectorDB/Dataset/PubMed_bge/PubMed_bge_28000000_sorted/data-00149-of-00198.arrow
+    > 파일 추가 완료. (현재 파일: 141414개, 총 추가: 1131312/6500000, ID 범위: 989898-1131311)
+  파일 처리 중 [150/197]: "data-00150-of-00198.arrow"
+Stream 포맷으로 Arrow 파일 열기: /home/comsys/CXLSharedMemVM/KnowhereVectorDB/Dataset/PubMed_bge/PubMed_bge_28000000_sorted/data-00150-of-00198.arrow
+    > 파일 추가 완료. (현재 파일: 141414개, 총 추가: 1272726/6500000, ID 범위: 1131312-1272725)
+  파일 처리 중 [151/197]: "data-00151-of-00198.arrow"
+Stream 포맷으로 Arrow 파일 열기: /home/comsys/CXLSharedMemVM/KnowhereVectorDB/Dataset/PubMed_bge/PubMed_bge_28000000_sorted/data-00151-of-00198.arrow
+    > 파일 추가 완료. (현재 파일: 141414개, 총 추가: 1414140/6500000, ID 범위: 1272726-1414139)
+  파일 처리 중 [152/197]: "data-00152-of-00198.arrow"
+Stream 포맷으로 Arrow 파일 열기: /home/comsys/CXLSharedMemVM/KnowhereVectorDB/Dataset/PubMed_bge/PubMed_bge_28000000_sorted/data-00152-of-00198.arrow
+    > 파일 추가 완료. (현재 파일: 141414개, 총 추가: 1555554/6500000, ID 범위: 1414140-1555553)
+  파일 처리 중 [153/197]: "data-00153-of-00198.arrow"
+Stream 포맷으로 Arrow 파일 열기: /home/comsys/CXLSharedMemVM/KnowhereVectorDB/Dataset/PubMed_bge/PubMed_bge_28000000_sorted/data-00153-of-00198.arrow
+    > 파일 추가 완료. (현재 파일: 141414개, 총 추가: 1696968/6500000, ID 범위: 1555554-1696967)
+  파일 처리 중 [154/197]: "data-00154-of-00198.arrow"
+Stream 포맷으로 Arrow 파일 열기: /home/comsys/CXLSharedMemVM/KnowhereVectorDB/Dataset/PubMed_bge/PubMed_bge_28000000_sorted/data-00154-of-00198.arrow
+    > 파일 추가 완료. (현재 파일: 141414개, 총 추가: 1838382/6500000, ID 범위: 1696968-1838381)
+  파일 처리 중 [155/197]: "data-00155-of-00198.arrow"
+Stream 포맷으로 Arrow 파일 열기: /home/comsys/CXLSharedMemVM/KnowhereVectorDB/Dataset/PubMed_bge/PubMed_bge_28000000_sorted/data-00155-of-00198.arrow
+    > 파일 추가 완료. (현재 파일: 141414개, 총 추가: 1979796/6500000, ID 범위: 1838382-1979795)
+  파일 처리 중 [156/197]: "data-00156-of-00198.arrow"
+Stream 포맷으로 Arrow 파일 열기: /home/comsys/CXLSharedMemVM/KnowhereVectorDB/Dataset/PubMed_bge/PubMed_bge_28000000_sorted/data-00156-of-00198.arrow
+    > 파일 추가 완료. (현재 파일: 141414개, 총 추가: 2121210/6500000, ID 범위: 1979796-2121209)
+  파일 처리 중 [157/197]: "data-00157-of-00198.arrow"
+Stream 포맷으로 Arrow 파일 열기: /home/comsys/CXLSharedMemVM/KnowhereVectorDB/Dataset/PubMed_bge/PubMed_bge_28000000_sorted/data-00157-of-00198.arrow
+    > 파일 추가 완료. (현재 파일: 141414개, 총 추가: 2262624/6500000, ID 범위: 2121210-2262623)
+  파일 처리 중 [158/197]: "data-00158-of-00198.arrow"
+Stream 포맷으로 Arrow 파일 열기: /home/comsys/CXLSharedMemVM/KnowhereVectorDB/Dataset/PubMed_bge/PubMed_bge_28000000_sorted/data-00158-of-00198.arrow
+    > 파일 추가 완료. (현재 파일: 141414개, 총 추가: 2404038/6500000, ID 범위: 2262624-2404037)
+  파일 처리 중 [159/197]: "data-00159-of-00198.arrow"
+Stream 포맷으로 Arrow 파일 열기: /home/comsys/CXLSharedMemVM/KnowhereVectorDB/Dataset/PubMed_bge/PubMed_bge_28000000_sorted/data-00159-of-00198.arrow
+    > 파일 추가 완료. (현재 파일: 141414개, 총 추가: 2545452/6500000, ID 범위: 2404038-2545451)
+  파일 처리 중 [160/197]: "data-00160-of-00198.arrow"
+Stream 포맷으로 Arrow 파일 열기: /home/comsys/CXLSharedMemVM/KnowhereVectorDB/Dataset/PubMed_bge/PubMed_bge_28000000_sorted/data-00160-of-00198.arrow
+    > 파일 추가 완료. (현재 파일: 141414개, 총 추가: 2686866/6500000, ID 범위: 2545452-2686865)
+  파일 처리 중 [161/197]: "data-00161-of-00198.arrow"
+Stream 포맷으로 Arrow 파일 열기: /home/comsys/CXLSharedMemVM/KnowhereVectorDB/Dataset/PubMed_bge/PubMed_bge_28000000_sorted/data-00161-of-00198.arrow
+    > 파일 추가 완료. (현재 파일: 141414개, 총 추가: 2828280/6500000, ID 범위: 2686866-2828279)
+  파일 처리 중 [162/197]: "data-00162-of-00198.arrow"
+Stream 포맷으로 Arrow 파일 열기: /home/comsys/CXLSharedMemVM/KnowhereVectorDB/Dataset/PubMed_bge/PubMed_bge_28000000_sorted/data-00162-of-00198.arrow
+    > 파일 추가 완료. (현재 파일: 141414개, 총 추가: 2969694/6500000, ID 범위: 2828280-2969693)
+  파일 처리 중 [163/197]: "data-00163-of-00198.arrow"
+Stream 포맷으로 Arrow 파일 열기: /home/comsys/CXLSharedMemVM/KnowhereVectorDB/Dataset/PubMed_bge/PubMed_bge_28000000_sorted/data-00163-of-00198.arrow
+    > 파일 추가 완료. (현재 파일: 141414개, 총 추가: 3111108/6500000, ID 범위: 2969694-3111107)
+  파일 처리 중 [164/197]: "data-00164-of-00198.arrow"
+Stream 포맷으로 Arrow 파일 열기: /home/comsys/CXLSharedMemVM/KnowhereVectorDB/Dataset/PubMed_bge/PubMed_bge_28000000_sorted/data-00164-of-00198.arrow
+    > 파일 추가 완료. (현재 파일: 141414개, 총 추가: 3252522/6500000, ID 범위: 3111108-3252521)
+  파일 처리 중 [165/197]: "data-00165-of-00198.arrow"
+Stream 포맷으로 Arrow 파일 열기: /home/comsys/CXLSharedMemVM/KnowhereVectorDB/Dataset/PubMed_bge/PubMed_bge_28000000_sorted/data-00165-of-00198.arrow
+    > 파일 추가 완료. (현재 파일: 141414개, 총 추가: 3393936/6500000, ID 범위: 3252522-3393935)
+  파일 처리 중 [166/197]: "data-00166-of-00198.arrow"
+Stream 포맷으로 Arrow 파일 열기: /home/comsys/CXLSharedMemVM/KnowhereVectorDB/Dataset/PubMed_bge/PubMed_bge_28000000_sorted/data-00166-of-00198.arrow
+    > 파일 추가 완료. (현재 파일: 141414개, 총 추가: 3535350/6500000, ID 범위: 3393936-3535349)
+  파일 처리 중 [167/197]: "data-00167-of-00198.arrow"
+Stream 포맷으로 Arrow 파일 열기: /home/comsys/CXLSharedMemVM/KnowhereVectorDB/Dataset/PubMed_bge/PubMed_bge_28000000_sorted/data-00167-of-00198.arrow
+    > 파일 추가 완료. (현재 파일: 141414개, 총 추가: 3676764/6500000, ID 범위: 3535350-3676763)
+  파일 처리 중 [168/197]: "data-00168-of-00198.arrow"
+Stream 포맷으로 Arrow 파일 열기: /home/comsys/CXLSharedMemVM/KnowhereVectorDB/Dataset/PubMed_bge/PubMed_bge_28000000_sorted/data-00168-of-00198.arrow
+    > 파일 추가 완료. (현재 파일: 141414개, 총 추가: 3818178/6500000, ID 범위: 3676764-3818177)
+  파일 처리 중 [169/197]: "data-00169-of-00198.arrow"
+Stream 포맷으로 Arrow 파일 열기: /home/comsys/CXLSharedMemVM/KnowhereVectorDB/Dataset/PubMed_bge/PubMed_bge_28000000_sorted/data-00169-of-00198.arrow
+    > 파일 추가 완료. (현재 파일: 141414개, 총 추가: 3959592/6500000, ID 범위: 3818178-3959591)
+  파일 처리 중 [170/197]: "data-00170-of-00198.arrow"
+Stream 포맷으로 Arrow 파일 열기: /home/comsys/CXLSharedMemVM/KnowhereVectorDB/Dataset/PubMed_bge/PubMed_bge_28000000_sorted/data-00170-of-00198.arrow
+    > 파일 추가 완료. (현재 파일: 141414개, 총 추가: 4101006/6500000, ID 범위: 3959592-4101005)
+  파일 처리 중 [171/197]: "data-00171-of-00198.arrow"
+Stream 포맷으로 Arrow 파일 열기: /home/comsys/CXLSharedMemVM/KnowhereVectorDB/Dataset/PubMed_bge/PubMed_bge_28000000_sorted/data-00171-of-00198.arrow
+    > 파일 추가 완료. (현재 파일: 141414개, 총 추가: 4242420/6500000, ID 범위: 4101006-4242419)
+  파일 처리 중 [172/197]: "data-00172-of-00198.arrow"
+Stream 포맷으로 Arrow 파일 열기: /home/comsys/CXLSharedMemVM/KnowhereVectorDB/Dataset/PubMed_bge/PubMed_bge_28000000_sorted/data-00172-of-00198.arrow
+    > 파일 추가 완료. (현재 파일: 141414개, 총 추가: 4383834/6500000, ID 범위: 4242420-4383833)
+  파일 처리 중 [173/197]: "data-00173-of-00198.arrow"
+Stream 포맷으로 Arrow 파일 열기: /home/comsys/CXLSharedMemVM/KnowhereVectorDB/Dataset/PubMed_bge/PubMed_bge_28000000_sorted/data-00173-of-00198.arrow
+    > 파일 추가 완료. (현재 파일: 141414개, 총 추가: 4525248/6500000, ID 범위: 4383834-4525247)
+  파일 처리 중 [174/197]: "data-00174-of-00198.arrow"
+Stream 포맷으로 Arrow 파일 열기: /home/comsys/CXLSharedMemVM/KnowhereVectorDB/Dataset/PubMed_bge/PubMed_bge_28000000_sorted/data-00174-of-00198.arrow
+    > 파일 추가 완료. (현재 파일: 141414개, 총 추가: 4666662/6500000, ID 범위: 4525248-4666661)
+  파일 처리 중 [175/197]: "data-00175-of-00198.arrow"
+Stream 포맷으로 Arrow 파일 열기: /home/comsys/CXLSharedMemVM/KnowhereVectorDB/Dataset/PubMed_bge/PubMed_bge_28000000_sorted/data-00175-of-00198.arrow
+    > 파일 추가 완료. (현재 파일: 141414개, 총 추가: 4808076/6500000, ID 범위: 4666662-4808075)
+  파일 처리 중 [176/197]: "data-00176-of-00198.arrow"
+Stream 포맷으로 Arrow 파일 열기: /home/comsys/CXLSharedMemVM/KnowhereVectorDB/Dataset/PubMed_bge/PubMed_bge_28000000_sorted/data-00176-of-00198.arrow
+    > 파일 추가 완료. (현재 파일: 141414개, 총 추가: 4949490/6500000, ID 범위: 4808076-4949489)
+  파일 처리 중 [177/197]: "data-00177-of-00198.arrow"
+Stream 포맷으로 Arrow 파일 열기: /home/comsys/CXLSharedMemVM/KnowhereVectorDB/Dataset/PubMed_bge/PubMed_bge_28000000_sorted/data-00177-of-00198.arrow
+    > 파일 추가 완료. (현재 파일: 141414개, 총 추가: 5090904/6500000, ID 범위: 4949490-5090903)
+  파일 처리 중 [178/197]: "data-00178-of-00198.arrow"
+Stream 포맷으로 Arrow 파일 열기: /home/comsys/CXLSharedMemVM/KnowhereVectorDB/Dataset/PubMed_bge/PubMed_bge_28000000_sorted/data-00178-of-00198.arrow
+    > 파일 추가 완료. (현재 파일: 141414개, 총 추가: 5232318/6500000, ID 범위: 5090904-5232317)
+  파일 처리 중 [179/197]: "data-00179-of-00198.arrow"
+Stream 포맷으로 Arrow 파일 열기: /home/comsys/CXLSharedMemVM/KnowhereVectorDB/Dataset/PubMed_bge/PubMed_bge_28000000_sorted/data-00179-of-00198.arrow
+    > 파일 추가 완료. (현재 파일: 141414개, 총 추가: 5373732/6500000, ID 범위: 5232318-5373731)
+  파일 처리 중 [180/197]: "data-00180-of-00198.arrow"
+Stream 포맷으로 Arrow 파일 열기: /home/comsys/CXLSharedMemVM/KnowhereVectorDB/Dataset/PubMed_bge/PubMed_bge_28000000_sorted/data-00180-of-00198.arrow
+    > 파일 추가 완료. (현재 파일: 141414개, 총 추가: 5515146/6500000, ID 범위: 5373732-5515145)
+  파일 처리 중 [181/197]: "data-00181-of-00198.arrow"
+Stream 포맷으로 Arrow 파일 열기: /home/comsys/CXLSharedMemVM/KnowhereVectorDB/Dataset/PubMed_bge/PubMed_bge_28000000_sorted/data-00181-of-00198.arrow
+    > 파일 추가 완료. (현재 파일: 141414개, 총 추가: 5656560/6500000, ID 범위: 5515146-5656559)
+  파일 처리 중 [182/197]: "data-00182-of-00198.arrow"
+Stream 포맷으로 Arrow 파일 열기: /home/comsys/CXLSharedMemVM/KnowhereVectorDB/Dataset/PubMed_bge/PubMed_bge_28000000_sorted/data-00182-of-00198.arrow
+    > 파일 추가 완료. (현재 파일: 141414개, 총 추가: 5797974/6500000, ID 범위: 5656560-5797973)
+  파일 처리 중 [183/197]: "data-00183-of-00198.arrow"
+Stream 포맷으로 Arrow 파일 열기: /home/comsys/CXLSharedMemVM/KnowhereVectorDB/Dataset/PubMed_bge/PubMed_bge_28000000_sorted/data-00183-of-00198.arrow
+    > 파일 추가 완료. (현재 파일: 141414개, 총 추가: 5939388/6500000, ID 범위: 5797974-5939387)
+  파일 처리 중 [184/197]: "data-00184-of-00198.arrow"
+Stream 포맷으로 Arrow 파일 열기: /home/comsys/CXLSharedMemVM/KnowhereVectorDB/Dataset/PubMed_bge/PubMed_bge_28000000_sorted/data-00184-of-00198.arrow
+    > 파일 추가 완료. (현재 파일: 141414개, 총 추가: 6080802/6500000, ID 범위: 5939388-6080801)
+  파일 처리 중 [185/197]: "data-00185-of-00198.arrow"
+Stream 포맷으로 Arrow 파일 열기: /home/comsys/CXLSharedMemVM/KnowhereVectorDB/Dataset/PubMed_bge/PubMed_bge_28000000_sorted/data-00185-of-00198.arrow
+    > 파일 추가 완료. (현재 파일: 141414개, 총 추가: 6222216/6500000, ID 범위: 6080802-6222215)
+  파일 처리 중 [186/197]: "data-00186-of-00198.arrow"
+Stream 포맷으로 Arrow 파일 열기: /home/comsys/CXLSharedMemVM/KnowhereVectorDB/Dataset/PubMed_bge/PubMed_bge_28000000_sorted/data-00186-of-00198.arrow
+    > 파일 추가 완료. (현재 파일: 141414개, 총 추가: 6363630/6500000, ID 범위: 6222216-6363629)
+  파일 처리 중 [187/197]: "data-00187-of-00198.arrow"
+Stream 포맷으로 Arrow 파일 열기: /home/comsys/CXLSharedMemVM/KnowhereVectorDB/Dataset/PubMed_bge/PubMed_bge_28000000_sorted/data-00187-of-00198.arrow
+    > 파일 추가 완료. (현재 파일: 141414개, 총 추가: 6505044/6500000, ID 범위: 6363630-6505043)
+인덱스 빌드 완료: 1484s
+HNSW 네이티브 형식으로 인덱스 저장 중...
+HNSW 네이티브 저장 완료: 28534ms
+네이티브 HNSW 데이터: 22895177 KB
+파일 크기: 22358 MB
+
+=== 메모리 사용량 분석: 인덱스 빌드/확인 후 ===
+VmSize:	 4942380 kB
+VmRSS:	 1153104 kB
+VmData:	 3885436 kB
+
+--- Memory Mapping 분석 ---
+LARGE ANON: 4b8ea000000-4b92a000000 rw-p 00000000 00:00 0  (1024MB)
+LARGE ANON: 7f3cf4a75000-7f3d0e8c3000 rw-p 00000000 00:00 0  (414MB)
+LARGE ANON: 7f3d28a00000-7f3da8a00000 rw-p 00000000 00:00 0  (2048MB)
+총 파일 매핑: 0 MB
+총 익명 메모리: 3486 MB
+물리 메모리 사용: 1126 MB
+
+=== HNSW 네이티브 파일에서 인덱스 로딩 ===
+
+=== HNSW 네이티브 파일에서 인덱스 로드 ===
+
+=== 메모리 사용량 분석: 로드 시작 전 ===
+VmSize:	 4942380 kB
+VmRSS:	 1153104 kB
+VmData:	 3885436 kB
+
+--- Memory Mapping 분석 ---
+LARGE ANON: 4b8ea000000-4b92a000000 rw-p 00000000 00:00 0  (1024MB)
+LARGE ANON: 7f3cf4a75000-7f3d0e8c3000 rw-p 00000000 00:00 0  (414MB)
+LARGE ANON: 7f3d28a00000-7f3da8a00000 rw-p 00000000 00:00 0  (2048MB)
+총 파일 매핑: 0 MB
+총 익명 메모리: 3486 MB
+물리 메모리 사용: 1126 MB
+인덱스 파일 크기: 22358 MB
+인덱스 객체 생성 완료
+
+=== 메모리 사용량 분석: 인덱스 객체 생성 후 ===
+VmSize:	 4942380 kB
+VmRSS:	 1153104 kB
+VmData:	 3885436 kB
+
+--- Memory Mapping 분석 ---
+LARGE ANON: 4b8ea000000-4b92a000000 rw-p 00000000 00:00 0  (1024MB)
+LARGE ANON: 7f3cf4a75000-7f3d0e8c3000 rw-p 00000000 00:00 0  (414MB)
+LARGE ANON: 7f3d28a00000-7f3da8a00000 rw-p 00000000 00:00 0  (2048MB)
+총 파일 매핑: 0 MB
+총 익명 메모리: 3486 MB
+물리 메모리 사용: 1126 MB
+DeserializeFromFile로 네이티브 HNSW 로드 중...
+네이티브 HNSW DeserializeFromFile 로드 완료: 78ms
+
+=== 메모리 사용량 분석: DeserializeFromFile 완료 후 ===
+VmSize:	27939208 kB
+VmRSS:	 1356684 kB
+VmData:	 3987084 kB
+
+--- Memory Mapping 분석 ---
+LARGE ANON: 4b8ea000000-4b92a000000 rw-p 00000000 00:00 0  (1024MB)
+INDEX FILE: 7f36b2800000-7f3c27e93000 r--s 00000000 fc:01 268514                     /home/comsys/CXLSharedMemVM/KnowhereVectorDB/vectorDB/hnsw_index_6500k_3.bin
+LARGE ANON: 7f3cf4a75000-7f3d0e8c3000 rw-p 00000000 00:00 0  (414MB)
+LARGE ANON: 7f3d28a00000-7f3da8a00000 rw-p 00000000 00:00 0  (2048MB)
+총 파일 매핑: 22358 MB
+총 익명 메모리: 3486 MB
+물리 메모리 사용: 1324 MB
+
+--- 내부 구조 초기화를 위한 더미 검색 ---
+더미 검색 완료
+
+=== 메모리 사용량 분석: 첫 검색 후 (내부 구조 초기화 완료) ===
+VmSize:	28012940 kB
+VmRSS:	 1614744 kB
+VmData:	 3996084 kB
+
+--- Memory Mapping 분석 ---
+LARGE ANON: 4b8ea000000-4b92a000000 rw-p 00000000 00:00 0  (1024MB)
+INDEX FILE: 7f36b2800000-7f3c27e93000 r--s 00000000 fc:01 268514                     /home/comsys/CXLSharedMemVM/KnowhereVectorDB/vectorDB/hnsw_index_6500k_3.bin
+LARGE ANON: 7f3cf4a75000-7f3d0e8c3000 rw-p 00000000 00:00 0  (414MB)
+LARGE ANON: 7f3d28a00000-7f3da8a00000 rw-p 00000000 00:00 0  (2048MB)
+총 파일 매핑: 22358 MB
+총 익명 메모리: 3486 MB
+물리 메모리 사용: 1576 MB
+벤치마크 전 메모리 사용량 분석 ===
+
+=== 메모리 사용량 분석 ===
+VmSize:	28012940 kB
+VmRSS:	 1614744 kB
+VmData:	 3996084 kB
+
+--- Memory Mapping 분석 ---
+LARGE ANON: 4b8ea000000-4b92a000000 rw-p 00000000 00:00 0  (1024MB)
+INDEX FILE: 7f36b2800000-7f3c27e93000 r--s 00000000 fc:01 268514                     /home/comsys/CXLSharedMemVM/KnowhereVectorDB/vectorDB/hnsw_index_6500k_3.bin
+LARGE ANON: 7f3cf4a75000-7f3d0e8c3000 rw-p 00000000 00:00 0  (414MB)
+LARGE ANON: 7f3d28a00000-7f3da8a00000 rw-p 00000000 00:00 0  (2048MB)
+총 파일 매핑: 22358 MB
+총 익명 메모리: 3486 MB
+물리 메모리 사용: 1576 MB
+
+=== 검색 성능 벤치마크 ===
+Search successful, returned 1000 results
+Dimension: 10
+ef=50: 73.999μs/query, 13513 QPS
+Search successful, returned 1000 results
+Dimension: 10
+ef=100: 124.303μs/query, 8044 QPS
+Search successful, returned 1000 results
+Dimension: 10
+ef=200: 222.261μs/query, 4499 QPS
+Search successful, returned 1000 results
+Dimension: 10
+ef=400: 406.541μs/query, 2459 QPS
+계속하려면 Enter, 종료하려면 q 입력: 벤치마크 전 메모리 사용량 분석 ===
+
+=== 메모리 사용량 분석 ===
+VmSize:	29119052 kB
+VmRSS:	23769476 kB
+VmData:	 4131344 kB
+
+--- Memory Mapping 분석 ---
+LARGE ANON: 4b8ea000000-4b92a000000 rw-p 00000000 00:00 0  (1024MB)
+INDEX FILE: 7f36b2800000-7f3c27e93000 r--s 00000000 fc:01 268514                     /home/comsys/CXLSharedMemVM/KnowhereVectorDB/vectorDB/hnsw_index_6500k_3.bin
+LARGE ANON: 7f3cf4a75000-7f3d0e8c3000 rw-p 00000000 00:00 0  (414MB)
+LARGE ANON: 7f3d28a00000-7f3da8a00000 rw-p 00000000 00:00 0  (2048MB)
+총 파일 매핑: 22358 MB
+총 익명 메모리: 3486 MB
+물리 메모리 사용: 23212 MB
+
+=== 검색 성능 벤치마크 ===
+Search successful, returned 1000 results
+Dimension: 10
+ef=50: 73.246μs/query, 13652 QPS
+Search successful, returned 1000 results
+Dimension: 10
+ef=100: 123.677μs/query, 8085 QPS
+Search successful, returned 1000 results
+Dimension: 10
+ef=200: 219.521μs/query, 4555 QPS
+Search successful, returned 1000 results
+Dimension: 10
+ef=400: 397.974μs/query, 2512 QPS
+계속하려면 Enter, 종료하려면 q 입력: 
+=== 메모리 사용량 분석: 종료 전 ===
+VmSize:	29119052 kB
+VmRSS:	23769476 kB
+VmData:	 4131344 kB
+
+--- Memory Mapping 분석 ---
+LARGE ANON: 4b8ea000000-4b92a000000 rw-p 00000000 00:00 0  (1024MB)
+INDEX FILE: 7f36b2800000-7f3c27e93000 r--s 00000000 fc:01 268514                     /home/comsys/CXLSharedMemVM/KnowhereVectorDB/vectorDB/hnsw_index_6500k_3.bin
+LARGE ANON: 7f3cf4a75000-7f3d0e8c3000 rw-p 00000000 00:00 0  (414MB)
+LARGE ANON: 7f3d28a00000-7f3da8a00000 rw-p 00000000 00:00 0  (2048MB)
+총 파일 매핑: 22358 MB
+총 익명 메모리: 3486 MB
+물리 메모리 사용: 23212 MB
+
+=== HNSW PubMed BGE Apache Arrow 예제 완료 ===

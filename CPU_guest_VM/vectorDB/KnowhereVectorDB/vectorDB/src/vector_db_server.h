@@ -24,9 +24,9 @@ using json = nlohmann::json;
 
 class VectorDBServer {
 private:
-    // 배치 처리 상수
-    static constexpr size_t MAX_BATCH_SIZE = 32;
-    static constexpr std::chrono::milliseconds BATCH_TIMEOUT{10}; // 10ms
+    // 배치 처리 기본값
+    static constexpr size_t DEFAULT_MAX_BATCH_SIZE = 32;
+    static constexpr int DEFAULT_BATCH_TIMEOUT_MS = 10;
     
     // Worker별 재사용 버퍼들 (thread_local)
     static thread_local std::vector<float> worker_batch_buffer_;
@@ -65,8 +65,16 @@ private:
     std::atomic<size_t> queue_size_{0};
     std::atomic<size_t> total_processed_{0};
 
+    // 런타임 튜닝 파라미터
+    size_t max_batch_size_{DEFAULT_MAX_BATCH_SIZE};
+    std::chrono::milliseconds batch_timeout_{DEFAULT_BATCH_TIMEOUT_MS};
+    size_t search_worker_threads_{0};
+
 public:
-    VectorDBServer(const std::string& hnsw_path, const std::string& flat_path, int port = 8080);
+    VectorDBServer(const std::string& index_path,
+                   const std::string& flat_path,
+                   int port = 8080,
+                   const std::string& index_type = "hnsw");
     ~VectorDBServer();
     
     bool initialize();
@@ -98,6 +106,26 @@ private:
     
     void handleExactSearchRequest(
         const std::string& body, 
+        const http::request<http::string_body>& req,
+        std::function<void(http::response<http::string_body>&&)> send_callback);
+
+    void handleInsertRequest(
+        const std::string& body,
+        const http::request<http::string_body>& req,
+        std::function<void(http::response<http::string_body>&&)> send_callback);
+
+    void handleDeleteRequest(
+        const std::string& body,
+        const http::request<http::string_body>& req,
+        std::function<void(http::response<http::string_body>&&)> send_callback);
+
+    void handleRestoreRequest(
+        const std::string& body,
+        const http::request<http::string_body>& req,
+        std::function<void(http::response<http::string_body>&&)> send_callback);
+
+    void handleIsDeletedRequest(
+        const std::string& body,
         const http::request<http::string_body>& req,
         std::function<void(http::response<http::string_body>&&)> send_callback);
         

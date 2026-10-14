@@ -37,7 +37,7 @@ vectorDB/
 ┌─────────────────┐    ┌──────────────────┐    ┌────────────────────┐
 │   REST API      │    │   VectorDB       │    │  Storage           │
 │                 │    │                  │    │                    │
-│ POST /vectors   │────│ Insert Vector    │────│ Append-Only Flat   │
+│ POST /api/insert│────│ Insert Vector    │────│ Append-Only Flat   │
 │ POST /search    │────│ Search Vector    │────│ + HNSW Index       │
 │ GET  /status    │    │                  │    │ (mmap files)       │
 └─────────────────┘    └──────────────────┘    └────────────────────┘
@@ -192,7 +192,7 @@ The server uses built-in configuration:
 
 #### 1. Insert Vector
 ```http
-POST /api/vectors
+POST /api/insert
 Content-Type: application/json
 
 {
@@ -302,7 +302,7 @@ curl http://localhost:8080/health
 curl http://localhost:8080/api/status
 
 # Insert a vector
-curl -X POST http://localhost:8080/api/vectors \
+curl -X POST http://localhost:8080/api/insert \
   -H "Content-Type: application/json" \
   -d '{"vector": [0.1, 0.2, 0.3, ...]}'  # 384 dimensions
 

@@ -82,7 +82,7 @@ test_endpoint "GET" "/api/status" "" "Server status information"
 #     response=$(curl -s -w "\n%{http_code}" -X POST \
 #                -H "Content-Type: application/json" \
 #                -d "$data" \
-#                "$BASE_URL/api/vectors")
+#                "$BASE_URL/api/insert")
     
 #     body=$(echo "$response" | head -n -1)
 #     status_code=$(echo "$response" | tail -n 1)

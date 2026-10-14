@@ -10,6 +10,7 @@
 // 분리된 인덱스 헤더들
 #include "flat_index.h"
 #include "hnsw_index.h"
+#include "ivf_index.h"
 
 // VectorDB 메인 클래스
 class VectorDB {
@@ -19,9 +20,14 @@ private:
     
     std::string hnsw_index_dir_;
     std::string flat_index_path_;
+    std::string index_type_;
+    bool use_hnsw_;
     
     // HNSW 인덱스 관리자
     std::unique_ptr<HNSWIndexManager> hnsw_manager_;
+    
+    // IVF 인덱스 관리자
+    std::unique_ptr<IVFIndexManager> ivf_manager_;
     
     // Append-only flat 인덱스
     std::unique_ptr<AppendOnlyFlatIndex> flat_index_;
@@ -30,7 +36,9 @@ private:
     std::atomic<uint64_t> next_id_;
 
 public:
-    VectorDB(const std::string& hnsw_dir, const std::string& flat_path);
+    VectorDB(const std::string& index_dir,
+             const std::string& flat_path,
+             const std::string& index_type = "hnsw");
     ~VectorDB();
     
     bool initialize();
@@ -54,6 +62,11 @@ public:
     std::vector<std::vector<SearchResult>> exactSearchVectorsBatch(
         const std::vector<std::vector<float>>& queries,
         int k = DEFAULT_K);
+
+    // Soft delete (HNSW only)
+    bool softDelete(uint64_t id);
+    bool restoreDeleted(uint64_t id);
+    bool isDeleted(uint64_t id) const;
     
     // 상태 확인
     size_t getFlatIndexCount() const;
@@ -63,7 +76,7 @@ public:
 
 private:
     std::vector<SearchResult> mergeSearchResults(
-        const std::vector<SearchResult>& hnsw_results,
+    const std::vector<SearchResult>& ann_results,
         const std::vector<SearchResult>& flat_results,
         int k) const;
 };

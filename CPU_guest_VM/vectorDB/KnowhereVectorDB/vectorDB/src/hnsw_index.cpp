@@ -1,22 +1,43 @@
 #include "hnsw_index.h"
 #include "flat_index.h"  // SearchResult 정의를 위해
 #include "knowhere/comp/brute_force.h"  // BruteForce::Search를 위해
+#include "knowhere/comp/knowhere_config.h"
+
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <unistd.h>
+
+namespace {
+size_t
+GetKnowhereThreadPoolSize() {
+    constexpr size_t kDefaultThreads = 16;
+    const char* v = std::getenv("VDB_KNOWHERE_THREAD_POOL_SIZE");
+    if (v == nullptr) {
+        return kDefaultThreads;
+    }
+    int parsed = std::atoi(v);
+    return parsed > 0 ? static_cast<size_t>(parsed) : kDefaultThreads;
+}
+}  // namespace
 
 HNSWIndexManager::HNSWIndexManager(const std::string& index_dir, size_t vector_dim)
     : vector_dim_(vector_dim), index_dir_(index_dir) {
 }
 
 HNSWIndexManager::~HNSWIndexManager() {
+    closeDeletedBitset();
     // Knowhere 인덱스들은 자동으로 소멸
 }
 
 bool HNSWIndexManager::initialize() {
     std::cout << "=== HNSW Index Manager 초기화 ===" << std::endl;
-    
+
     // Knowhere 스레드 풀 크기 설정
-    setenv("KNOWHERE_BUILD_THREAD_POOL_SIZE", "64", 1);
-    setenv("KNOWHERE_SEARCH_THREAD_POOL_SIZE", "64", 1);
-    std::cout << "Knowhere 스레드 풀 크기를 64로 설정했습니다." << std::endl;
+    const size_t thread_pool_size = GetKnowhereThreadPoolSize();
+    knowhere::KnowhereConfig::SetBuildThreadPoolSize(thread_pool_size);
+    knowhere::KnowhereConfig::SetSearchThreadPoolSize(thread_pool_size);
+    std::cout << "Knowhere 스레드 풀 크기를 " << thread_pool_size << "로 설정했습니다." << std::endl;
     
     // 인덱스 로드
     if (!loadIndices()) {
@@ -27,8 +48,186 @@ bool HNSWIndexManager::initialize() {
     std::cout << "HNSW Index Manager 초기화 완료" << std::endl;
     std::cout << "- 로드된 인덱스 개수: " << indices_.size() << std::endl;
     std::cout << "- 전체 벡터 개수: " << getTotalVectorCount() << std::endl;
+
+    if (!initializeDeletedBitset()) {
+        std::cerr << "Failed to initialize deleted.bin mmap" << std::endl;
+        return false;
+    }
     
     return true;
+}
+
+bool HNSWIndexManager::initializeDeletedBitset() {
+    std::unique_lock<std::shared_mutex> lock(deleted_bits_mu_);
+    closeDeletedBitset();
+
+    const size_t shard_count = indices_.size();
+    deleted_bin_paths_.resize(shard_count);
+    deleted_fds_.assign(shard_count, -1);
+    deleted_bits_.assign(shard_count, nullptr);
+    deleted_bit_counts_.assign(shard_count, 0);
+    deleted_byte_counts_.assign(shard_count, 0);
+
+    for (size_t i = 0; i < shard_count; ++i) {
+        const size_t bit_count = static_cast<size_t>(indices_[i].Count());
+        const size_t byte_count = (bit_count + 7) / 8;
+
+        deleted_bit_counts_[i] = bit_count;
+        deleted_byte_counts_[i] = byte_count;
+        deleted_bin_paths_[i] = (std::filesystem::path(index_dir_) / ("deleted_" + std::to_string(i) + ".bin")).string();
+
+        if (byte_count == 0) {
+            continue;
+        }
+
+        const bool file_exists = std::filesystem::exists(deleted_bin_paths_[i]);
+        const int fd = open(deleted_bin_paths_[i].c_str(), O_RDWR | O_CREAT, 0644);
+        if (fd < 0) {
+            std::cerr << "Failed to open deleted bitset file: " << deleted_bin_paths_[i] << std::endl;
+            closeDeletedBitset();
+            return false;
+        }
+        deleted_fds_[i] = fd;
+
+        if (!file_exists) {
+            if (ftruncate(fd, static_cast<off_t>(byte_count)) != 0) {
+                std::cerr << "Failed to ftruncate " << deleted_bin_paths_[i]
+                          << " to " << byte_count << " bytes" << std::endl;
+                closeDeletedBitset();
+                return false;
+            }
+        } else {
+            struct stat st {};
+            if (fstat(fd, &st) != 0) {
+                std::cerr << "Failed to stat " << deleted_bin_paths_[i] << std::endl;
+                closeDeletedBitset();
+                return false;
+            }
+
+            if (static_cast<size_t>(st.st_size) < byte_count) {
+                std::cerr << deleted_bin_paths_[i] << " is smaller than required size. file_size=" << st.st_size
+                          << ", required=" << byte_count << std::endl;
+                closeDeletedBitset();
+                return false;
+            }
+        }
+
+        void* mapped = mmap(nullptr, byte_count, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+        if (mapped == MAP_FAILED) {
+            std::cerr << "Failed to mmap " << deleted_bin_paths_[i] << std::endl;
+            closeDeletedBitset();
+            return false;
+        }
+
+        deleted_bits_[i] = reinterpret_cast<uint8_t*>(mapped);
+    }
+
+    return true;
+}
+
+void HNSWIndexManager::closeDeletedBitset() {
+    for (size_t i = 0; i < deleted_bits_.size(); ++i) {
+        if (deleted_bits_[i] != nullptr && i < deleted_byte_counts_.size() && deleted_byte_counts_[i] > 0) {
+            msync(deleted_bits_[i], deleted_byte_counts_[i], MS_SYNC);
+            munmap(deleted_bits_[i], deleted_byte_counts_[i]);
+        }
+    }
+
+    for (int fd : deleted_fds_) {
+        if (fd >= 0) {
+            close(fd);
+        }
+    }
+
+    deleted_bin_paths_.clear();
+    deleted_fds_.clear();
+    deleted_bits_.clear();
+    deleted_bit_counts_.clear();
+    deleted_byte_counts_.clear();
+}
+
+knowhere::BitsetView HNSWIndexManager::buildBitsetView(size_t index_idx) const {
+    if (index_idx >= deleted_bits_.size() || index_idx >= deleted_bit_counts_.size()) {
+        return knowhere::BitsetView();
+    }
+
+    if (deleted_bits_[index_idx] == nullptr || deleted_bit_counts_[index_idx] == 0) {
+        return knowhere::BitsetView();
+    }
+
+    return knowhere::BitsetView(
+        deleted_bits_[index_idx],
+        deleted_bit_counts_[index_idx]
+    );
+}
+
+bool HNSWIndexManager::resolveGlobalId(uint64_t global_id, size_t& index_idx, size_t& local_id) const {
+    for (size_t i = 0; i < index_beg_ids_.size() && i < deleted_bit_counts_.size(); ++i) {
+        const uint64_t begin = static_cast<uint64_t>(index_beg_ids_[i]);
+        const uint64_t end = begin + static_cast<uint64_t>(deleted_bit_counts_[i]);
+        if (global_id >= begin && global_id < end) {
+            index_idx = i;
+            local_id = static_cast<size_t>(global_id - begin);
+            return true;
+        }
+    }
+    return false;
+}
+
+bool HNSWIndexManager::softDelete(uint64_t global_id) {
+    std::unique_lock<std::shared_mutex> lock(deleted_bits_mu_);
+
+    size_t index_idx = 0;
+    size_t local_id = 0;
+    if (!resolveGlobalId(global_id, index_idx, local_id)) {
+        return false;
+    }
+
+    if (index_idx >= deleted_bits_.size() || deleted_bits_[index_idx] == nullptr) {
+        return false;
+    }
+
+    const size_t byte_idx = (local_id >> 3);
+    const uint8_t bit_mask = static_cast<uint8_t>(1u << (local_id & 7));
+    deleted_bits_[index_idx][byte_idx] |= bit_mask;
+    return true;
+}
+
+bool HNSWIndexManager::restoreDeleted(uint64_t global_id) {
+    std::unique_lock<std::shared_mutex> lock(deleted_bits_mu_);
+
+    size_t index_idx = 0;
+    size_t local_id = 0;
+    if (!resolveGlobalId(global_id, index_idx, local_id)) {
+        return false;
+    }
+
+    if (index_idx >= deleted_bits_.size() || deleted_bits_[index_idx] == nullptr) {
+        return false;
+    }
+
+    const size_t byte_idx = (local_id >> 3);
+    const uint8_t bit_mask = static_cast<uint8_t>(1u << (local_id & 7));
+    deleted_bits_[index_idx][byte_idx] &= static_cast<uint8_t>(~bit_mask);
+    return true;
+}
+
+bool HNSWIndexManager::isDeleted(uint64_t global_id) const {
+    std::shared_lock<std::shared_mutex> lock(deleted_bits_mu_);
+
+    size_t index_idx = 0;
+    size_t local_id = 0;
+    if (!resolveGlobalId(global_id, index_idx, local_id)) {
+        return false;
+    }
+
+    if (index_idx >= deleted_bits_.size() || deleted_bits_[index_idx] == nullptr) {
+        return false;
+    }
+
+    const size_t byte_idx = (local_id >> 3);
+    const uint8_t bit_mask = static_cast<uint8_t>(1u << (local_id & 7));
+    return (deleted_bits_[index_idx][byte_idx] & bit_mask) != 0;
 }
 
 bool HNSWIndexManager::loadIndices() {
@@ -151,7 +350,8 @@ std::vector<SearchResult> HNSWIndexManager::searchSingleIndex(
     local_config[knowhere::indexparam::EF] = std::max(DEFAULT_EF, k * 2);
     local_config[knowhere::meta::TOPK] = static_cast<int64_t>(k);
 
-    auto result = indices_[index_idx].Search(local_query_dataset, local_config, knowhere::BitsetView());
+    std::shared_lock<std::shared_mutex> lock(deleted_bits_mu_);
+    auto result = indices_[index_idx].Search(local_query_dataset, local_config, buildBitsetView(index_idx));
 
     if (result.has_value()) {
         auto ids = result.value()->GetIds();
@@ -160,9 +360,21 @@ std::vector<SearchResult> HNSWIndexManager::searchSingleIndex(
 
         for (int64_t j = 0; j < num_results; ++j) {
             if (ids[j] >= 0) {
+                const size_t local_id = static_cast<size_t>(ids[j]);
+                if (index_idx < deleted_bits_.size() &&
+                    index_idx < deleted_bit_counts_.size() &&
+                    deleted_bits_[index_idx] != nullptr &&
+                    local_id < deleted_bit_counts_[index_idx]) {
+                    const size_t byte_idx = (local_id >> 3);
+                    const uint8_t bit_mask = static_cast<uint8_t>(1u << (local_id & 7));
+                    if ((deleted_bits_[index_idx][byte_idx] & bit_mask) != 0) {
+                        continue;
+                    }
+                }
+
                 results.emplace_back(
-                    static_cast<uint64_t>(ids[j] + index_beg_ids_[index_idx]), 
-                    distances[j]
+                    static_cast<uint64_t>(ids[j] + index_beg_ids_[index_idx]),
+                    1.0f - distances[j]  // cosine similarity → cosine distance
                 );
             }
         }
@@ -258,7 +470,8 @@ std::vector<std::vector<SearchResult>> HNSWIndexManager::searchBatch(
                 batch_config[knowhere::indexparam::EF] = std::max(DEFAULT_EF, k * 2);
                 batch_config[knowhere::meta::TOPK] = static_cast<int64_t>(k);
                 
-                auto result = indices_[i].Search(batch_dataset, batch_config, knowhere::BitsetView());
+                std::shared_lock<std::shared_mutex> lock(deleted_bits_mu_);
+                auto result = indices_[i].Search(batch_dataset, batch_config, buildBitsetView(i));
                 
                 if (result.has_value()) {
                     auto rows = result.value()->GetRows();
@@ -269,9 +482,25 @@ std::vector<std::vector<SearchResult>> HNSWIndexManager::searchBatch(
                     for (int64_t row = 0; row < rows; ++row) {
                         for (int64_t j = 0; j < dimension; ++j) {
                             int64_t idx = row * dimension + j;
+                            if (ids[idx] < 0) {
+                                continue;
+                            }
+
+                            const size_t local_id = static_cast<size_t>(ids[idx]);
+                            if (i < deleted_bits_.size() &&
+                                i < deleted_bit_counts_.size() &&
+                                deleted_bits_[i] != nullptr &&
+                                local_id < deleted_bit_counts_[i]) {
+                                const size_t byte_idx = (local_id >> 3);
+                                const uint8_t bit_mask = static_cast<uint8_t>(1u << (local_id & 7));
+                                if ((deleted_bits_[i][byte_idx] & bit_mask) != 0) {
+                                    continue;
+                                }
+                            }
+
                             batch_results[row].emplace_back(
-                                static_cast<uint64_t>(ids[idx] + index_beg_ids_[i]), 
-                                distances[idx]
+                                static_cast<uint64_t>(ids[idx] + index_beg_ids_[i]),
+                                1.0f - distances[idx]  // cosine similarity → cosine distance
                             );
                         }
                     }
@@ -470,7 +699,7 @@ std::vector<SearchResult> HNSWIndexManager::exactSearch(
                     
                     all_results.emplace_back(
                         static_cast<uint64_t>(global_id),
-                        result_dists[i]
+                        1.0f - result_dists[i]  // cosine similarity → cosine distance
                     );
                 }
             }

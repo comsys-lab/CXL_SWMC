@@ -8,6 +8,8 @@
 #include <filesystem>
 #include <future>
 #include <cstdlib>
+#include <cstdint>
+#include <shared_mutex>
 
 // Knowhere headers
 #include <knowhere/index/index_factory.h>
@@ -30,6 +32,12 @@ private:
     std::vector<int> index_beg_ids_;  // 각 인덱스의 시작 ID 오프셋
     size_t vector_dim_;
     std::string index_dir_;
+    std::vector<std::string> deleted_bin_paths_;
+    std::vector<int> deleted_fds_;
+    std::vector<uint8_t*> deleted_bits_;
+    std::vector<size_t> deleted_bit_counts_;
+    std::vector<size_t> deleted_byte_counts_;
+    mutable std::shared_mutex deleted_bits_mu_;
 
 public:
     HNSWIndexManager(const std::string& index_dir, size_t vector_dim = DEFAULT_VECTOR_DIM);
@@ -54,6 +62,11 @@ public:
     std::vector<std::vector<SearchResult>> exactSearchBatch(
         const std::vector<std::vector<float>>& queries,
         int k) const;
+
+    // Soft delete API
+    bool softDelete(uint64_t global_id);
+    bool restoreDeleted(uint64_t global_id);
+    bool isDeleted(uint64_t global_id) const;
     
     // 상태 조회
     size_t getIndexCount() const { return indices_.size(); }
@@ -65,6 +78,10 @@ public:
     
 private:
     bool loadIndices();
+    bool initializeDeletedBitset();
+    void closeDeletedBitset();
+    knowhere::BitsetView buildBitsetView(size_t index_idx) const;
+    bool resolveGlobalId(uint64_t global_id, size_t& index_idx, size_t& local_id) const;
     std::vector<SearchResult> searchSingleIndex(size_t index_idx, 
                                                 const std::vector<float>& query, 
                                                 int k) const;

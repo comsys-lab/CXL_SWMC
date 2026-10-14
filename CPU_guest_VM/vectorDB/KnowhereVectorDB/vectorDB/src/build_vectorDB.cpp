@@ -127,7 +127,7 @@ public:
         // 첫 번째 Arrow 파일 전체를 로드하여 Train에 사용
         std::cout << "인덱스 초기화를 위해 첫 번째 Arrow 파일 로드 중..." << std::endl;
         std::vector<float> train_data;
-        processFileInBatches(arrow_files[FIRST_FILE_IDX + 1],
+        processFileInBatches(arrow_files[FIRST_FILE_IDX],
             [&](const std::vector<float>& file_vectors) {
                 train_data = file_vectors;
             });
@@ -144,11 +144,18 @@ public:
             throw std::runtime_error("인덱스 Train 실패");
         }
 
+        // Train 데이터도 인덱스에 Add (Train은 구조 초기화만 하고 벡터를 저장하지 않음)
+        std::cout << "첫 번째 파일 Add 중... (" << train_size << "개 벡터)" << std::endl;
+        auto add_status_first = index.value().Add(init_dataset, config);
+        if (add_status_first != knowhere::Status::success) {
+            throw std::runtime_error("첫 번째 파일 Add 실패");
+        }
+
         // 두 번째 Arrow 파일부터 파일 단위로 Add
         std::cout << "Arrow 파일 단위로 인덱스에 데이터 추가하는 중... (총 " << arrow_files.size() << "개 파일)" << std::endl;
-        int64_t total_added = 0;
+        int64_t total_added = train_size;
 
-        for (size_t file_idx = FIRST_FILE_IDX + 2; file_idx < arrow_files.size(); ++file_idx) {
+        for (size_t file_idx = FIRST_FILE_IDX + 1; file_idx < arrow_files.size(); ++file_idx) {
             if (total_added >= NB) break;
             
             const auto& file_path = arrow_files[file_idx];
@@ -621,7 +628,7 @@ int main(int argc, char* argv[]) {
         } else if (arg == "--k" && i + 1 < argc) {
             k = std::atoi(argv[++i]);
         } else if (arg == "--first-file-idx" && i + 1 < argc) {
-            first_file_idx = std::atoi(argv[i]);
+            first_file_idx = std::atoi(argv[++i]);
         } else if (arg == "--dataset-dir" && i + 1 < argc) {
             dataset_dir = argv[++i];
         } else if (arg == "--index-file" && i + 1 < argc) {

@@ -1,6 +1,6 @@
 #!/bin/bash
 
-MODE="Popcorn" # Popcorn or MTRR or DeStijl
+MODE="DeStijl" # Popcorn or MTRR or DeStijl
 NODE_ID=0 # Node ID for CXL Shared Memory
 
 # turn on inter-kernel messaging layer
@@ -11,24 +11,30 @@ fi
 
 # Check filesystem and directories
 sudo /home/comsys/famfs/debug/famfs fsck -v /dev/dax0.0 # Filesystem 생성 확인
-sudo /home/comsys/famfs/debug/famfs mount --fuse /dev/dax0.0 /mnt/famfs 
+sudo /home/comsys/famfs/debug/famfs mount --fuse /dev/dax0.0 /mnt/famfs
 
 sudo /home/comsys/famfs/debug/famfs logplay -v /mnt/famfs
 sudo ls /mnt/famfs/vectorDB -ahl
 sudo ls /mnt/famfs/vectorDB/indexbin -ahl
 
 # Read index files from famfs mounted directory
-cd /home/comsys/CXLSHMSWcoherence/unittest/page_replication
-
-sudo ./read_once /mnt/famfs/vectorDB/indexbin/hnsw_index_6500k_0.bin 4096
-sudo ./read_once /mnt/famfs/vectorDB/indexbin/hnsw_index_6500k_1.bin 4096
-sudo ./read_once /mnt/famfs/vectorDB/indexbin/hnsw_index_6500k_2.bin 4096
-sudo ./read_once /mnt/famfs/vectorDB/indexbin/hnsw_index_6500k_3.bin 4096
-sudo ./read_once /mnt/famfs/vectorDB/flat_index_1M.bin 4096
+if [ "$MODE" == "DeStijl" ]; then
+    cd /home/comsys/CXLSHMSWcoherence/unittest/page_replication
+    sudo ./read_once /mnt/famfs/vectorDB/indexbin/hnsw_index_6500k_0.bin 4096
+    sudo ./read_once /mnt/famfs/vectorDB/indexbin/hnsw_index_6500k_1.bin 4096
+    sudo ./read_once /mnt/famfs/vectorDB/indexbin/hnsw_index_6500k_2.bin 4096
+    sudo ./read_once /mnt/famfs/vectorDB/indexbin/hnsw_index_6500k_3.bin 4096
+    sudo ./read_once /mnt/famfs/vectorDB/indexbin/ivf_index_6500k_0.bin 4096
+    sudo ./read_once /mnt/famfs/vectorDB/indexbin/ivf_index_6500k_1.bin 4096
+    sudo ./read_once /mnt/famfs/vectorDB/indexbin/ivf_index_6500k_2.bin 4096
+    sudo ./read_once /mnt/famfs/vectorDB/indexbin/ivf_index_6500k_3.bin 4096
+    sudo ./read_once /mnt/famfs/vectorDB/flat_index_1M.bin 4096
+    sudo ./read_once /mnt/famfs/lmdb_7M_4KB/data.mdb 4096
+fi
 
 sudo sh -c "echo 3 > /proc/sys/vm/drop_caches"
 
 if [ "$MODE" == "DeStijl" ]; then
-    # enable DeStijl page replication
-    sudo /home/comsys/CXLSHMSWcoherence/userspace_tool/page_replication enable
+    # enable DeStijl page coherence
+    sudo /home/comsys/CXLSHMSWcoherence/userspace_tool/page_coherence enable
 fi

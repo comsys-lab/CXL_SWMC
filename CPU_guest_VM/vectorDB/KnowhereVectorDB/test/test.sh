@@ -1,0 +1,1 @@
+wrk -t16 -c512 -d30s -s search.lua http://127.0.0.1:8080/api/search

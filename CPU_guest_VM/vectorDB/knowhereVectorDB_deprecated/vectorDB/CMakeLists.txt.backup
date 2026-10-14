@@ -1,0 +1,54 @@
+cmake_minimum_required(VERSION 3.16)
+project(vectorDB)
+
+set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
+# Set Knowhere paths
+set(KNOWHERE_ROOT_DIR "/home/comsys/CXLSharedMemVM/knowhereVectorDB/knowhere")
+set(KNOWHERE_BUILD_DIR "${KNOWHERE_ROOT_DIR}/build/Release")
+set(KNOWHERE_INCLUDE_DIR "${KNOWHERE_ROOT_DIR}/include")
+set(KNOWHERE_LIB "${KNOWHERE_BUILD_DIR}/libknowhere.so")
+
+# Add Conan generators path
+list(APPEND CMAKE_MODULE_PATH ${KNOWHERE_BUILD_DIR}/generators)
+list(APPEND CMAKE_PREFIX_PATH ${KNOWHERE_BUILD_DIR}/generators)
+
+# Check if Knowhere files exist
+if(NOT EXISTS ${KNOWHERE_LIB})
+    message(FATAL_ERROR "Knowhere library not found at: ${KNOWHERE_LIB}")
+endif()
+
+if(NOT EXISTS ${KNOWHERE_INCLUDE_DIR})
+    message(FATAL_ERROR "Knowhere include directory not found at: ${KNOWHERE_INCLUDE_DIR}")
+endif()
+
+# Find required dependencies
+find_package(nlohmann_json REQUIRED)
+find_package(Boost REQUIRED)
+find_package(glog REQUIRED)
+
+# Include directories
+include_directories(${KNOWHERE_INCLUDE_DIR})
+include_directories(${KNOWHERE_ROOT_DIR}/thirdparty/faiss)
+include_directories(/usr/local/include)
+include_directories(${CMAKE_CURRENT_SOURCE_DIR})
+
+# Add executable
+add_executable(vector_db main.cpp vector_db.cpp vector_db_server.cpp)
+
+# Link libraries
+target_link_libraries(vector_db 
+    ${KNOWHERE_LIB}
+    nlohmann_json::nlohmann_json
+    Boost::boost
+    glog::glog
+    pthread
+)
+
+# Compiler flags
+target_compile_options(vector_db PRIVATE 
+    -O2 
+    -Wall 
+    -Wextra
+)

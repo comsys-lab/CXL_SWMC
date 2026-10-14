@@ -54,10 +54,15 @@ add_executable(vector_db
     src/vector_db_server.cpp
     src/flat_index.cpp
     src/hnsw_index.cpp
+    src/ivf_index.cpp
 )
 
 add_executable(build_vectorDB
     src/build_vectorDB.cpp
+)
+
+add_executable(build_vectorDB_ivf
+    src/build_vectorDB_ivf.cpp
 )
 
 # Link libraries for vector_db
@@ -73,6 +78,18 @@ target_link_libraries(vector_db
 
 # Link libraries for build_vectorDB
 target_link_libraries(build_vectorDB 
+    ${KNOWHERE_LIB}
+    nlohmann_json::nlohmann_json
+    ${BOOST_SYSTEM_LIB}
+    ${BOOST_THREAD_LIB}
+    glog::glog
+    OpenMP::OpenMP_CXX
+    ${ARROW_LIBRARIES}
+    ${PARQUET_LIBRARIES}
+    pthread
+)
+
+target_link_libraries(build_vectorDB_ivf
     ${KNOWHERE_LIB}
     nlohmann_json::nlohmann_json
     ${BOOST_SYSTEM_LIB}
@@ -107,5 +124,11 @@ target_compile_options(vector_db PRIVATE
 target_compile_options(build_vectorDB PRIVATE 
     -O2 
     -Wall 
+    -Wextra
+)
+
+target_compile_options(build_vectorDB_ivf PRIVATE
+    -O2
+    -Wall
     -Wextra
 )

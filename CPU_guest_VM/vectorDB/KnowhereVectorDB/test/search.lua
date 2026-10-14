@@ -13,5 +13,5 @@ local vector_json = "[" .. table.concat(vector_data, ",") .. "]"
 wrk.body = '{"vector": ' .. vector_json .. ', "k": 10}'
 
 function setup(thread)
-    thread:set("timeout", 5000)  -- 밀리초 단위 (5000ms = 5초)
+    thread:set("timeout", 100000)  -- 밀리초 단위 (5000ms = 5초)
 end

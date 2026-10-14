@@ -3,8 +3,14 @@
 #include <future>
 
 // VectorDB 구현
-VectorDB::VectorDB(const std::string& hnsw_dir, const std::string& flat_path)
-    : hnsw_index_dir_(hnsw_dir), flat_index_path_(flat_path), next_id_(100000000) {
+VectorDB::VectorDB(const std::string& index_dir,
+                                     const std::string& flat_path,
+                                     const std::string& index_type)
+        : hnsw_index_dir_(index_dir),
+            flat_index_path_(flat_path),
+            index_type_(index_type),
+            use_hnsw_(index_type != "ivf"),
+            next_id_(0) {
 }
 
 VectorDB::~VectorDB() {
@@ -14,11 +20,18 @@ VectorDB::~VectorDB() {
 bool VectorDB::initialize() {
     std::cout << "=== VectorDB 초기화 ===" << std::endl;
     
-    // HNSW 인덱스 매니저 초기화
-    hnsw_manager_ = std::make_unique<HNSWIndexManager>(hnsw_index_dir_, VECTOR_DIM);
-    if (!hnsw_manager_->initialize()) {
-        std::cerr << "Failed to initialize HNSW index manager" << std::endl;
-        return false;
+    if (use_hnsw_) {
+        hnsw_manager_ = std::make_unique<HNSWIndexManager>(hnsw_index_dir_, VECTOR_DIM);
+        if (!hnsw_manager_->initialize()) {
+            std::cerr << "Failed to initialize HNSW index manager" << std::endl;
+            return false;
+        }
+    } else {
+        ivf_manager_ = std::make_unique<IVFIndexManager>(hnsw_index_dir_, VECTOR_DIM);
+        if (!ivf_manager_->initialize()) {
+            std::cerr << "Failed to initialize IVF index manager" << std::endl;
+            return false;
+        }
     }
     
     // Flat 인덱스 초기화
@@ -28,14 +41,33 @@ bool VectorDB::initialize() {
         return false;
     }
 
+    // Keep global IDs contiguous: ANN IDs [0, ann_total), flat IDs [ann_total, ...).
+    const uint64_t ann_total = static_cast<uint64_t>(use_hnsw_
+        ? hnsw_manager_->getTotalVectorCount()
+        : ivf_manager_->getTotalVectorCount());
+    const uint64_t flat_count = static_cast<uint64_t>(flat_index_->getCurrentCount());
+    next_id_.store(ann_total + flat_count);
+
     std::cout << "VectorDB 초기화 완료" << std::endl;
-    std::cout << "- HNSW 인덱스 개수: " << hnsw_manager_->getIndexCount() << std::endl;
-    for (size_t i = 0; i < hnsw_manager_->getIndexPaths().size(); ++i) {
-        std::cout << "  " << i << ": " << hnsw_manager_->getIndexPaths()[i] << std::endl;
+    if (use_hnsw_) {
+        std::cout << "- ANN 인덱스 타입: HNSW" << std::endl;
+        std::cout << "- HNSW 인덱스 개수: " << hnsw_manager_->getIndexCount() << std::endl;
+        for (size_t i = 0; i < hnsw_manager_->getIndexPaths().size(); ++i) {
+            std::cout << "  " << i << ": " << hnsw_manager_->getIndexPaths()[i] << std::endl;
+        }
+        std::cout << "- HNSW 전체 벡터 수: " << hnsw_manager_->getTotalVectorCount() << std::endl;
+    } else {
+        std::cout << "- ANN 인덱스 타입: IVF_FLAT" << std::endl;
+        std::cout << "- IVF 인덱스 개수: " << ivf_manager_->getIndexCount() << std::endl;
+        for (size_t i = 0; i < ivf_manager_->getIndexPaths().size(); ++i) {
+            std::cout << "  " << i << ": " << ivf_manager_->getIndexPaths()[i] << std::endl;
+        }
+        std::cout << "- IVF 전체 벡터 수: " << ivf_manager_->getTotalVectorCount() << std::endl;
     }
-    std::cout << "- HNSW 전체 벡터 수: " << hnsw_manager_->getTotalVectorCount() << std::endl;
     std::cout << "- Flat 인덱스: " << flat_index_path_ << " (" 
               << flat_index_->getCurrentCount() << " vectors)" << std::endl;
+    std::cout << "- Flat 시작 global_id: " << ann_total << std::endl;
+    std::cout << "- 다음 할당 global_id: " << next_id_.load() << std::endl;
     
     return true;
 }
@@ -72,9 +104,10 @@ std::vector<SearchResult> VectorDB::searchVectors(const std::vector<float>& quer
         return {};
     }
 
-    // 1. HNSW 인덱스 검색 (비동기)
-    auto hnsw_future = std::async(std::launch::async, [this, &query, k]() {
-        return hnsw_manager_->search(query, k);
+    // 1. ANN 인덱스 검색 (비동기)
+    auto ann_future = std::async(std::launch::async, [this, &query, k]() {
+        return use_hnsw_ ? hnsw_manager_->search(query, k)
+                         : ivf_manager_->search(query, k);
     });
 
     // 2. Flat 인덱스 검색 (비동기)
@@ -83,11 +116,11 @@ std::vector<SearchResult> VectorDB::searchVectors(const std::vector<float>& quer
     });
 
     // 3. 결과 수집
-    std::vector<SearchResult> hnsw_results = hnsw_future.get();
+    std::vector<SearchResult> ann_results = ann_future.get();
     std::vector<SearchResult> flat_results = flat_future.get();
 
     // 4. 결과 병합
-    return mergeSearchResults(hnsw_results, flat_results, k);
+    return mergeSearchResults(ann_results, flat_results, k);
 }
 
 std::vector<std::vector<SearchResult>> VectorDB::searchVectorsBatch(
@@ -109,9 +142,10 @@ std::vector<std::vector<SearchResult>> VectorDB::searchVectorsBatch(
         }
     }
     
-    // 1. HNSW 배치 검색 (비동기)
-    auto hnsw_future = std::async(std::launch::async, [this, &queries, k, &reused_batch_buffer]() {
-        return hnsw_manager_->searchBatch(queries, k, reused_batch_buffer);
+    // 1. ANN 배치 검색 (비동기)
+    auto ann_future = std::async(std::launch::async, [this, &queries, k, &reused_batch_buffer]() {
+        return use_hnsw_ ? hnsw_manager_->searchBatch(queries, k, reused_batch_buffer)
+                         : ivf_manager_->searchBatch(queries, k, reused_batch_buffer);
     });
     
     // 2. Flat 인덱스 배치 검색 (비동기)
@@ -126,13 +160,13 @@ std::vector<std::vector<SearchResult>> VectorDB::searchVectorsBatch(
     });
     
     // 3. 결과 수집
-    std::vector<std::vector<SearchResult>> hnsw_results = hnsw_future.get();
+    std::vector<std::vector<SearchResult>> ann_results = ann_future.get();
     std::vector<std::vector<SearchResult>> flat_results = flat_future.get();
     
     // 4. 각 쿼리별로 결과 병합
     std::vector<std::vector<SearchResult>> results(batch_size);
     for (size_t query_idx = 0; query_idx < batch_size; ++query_idx) {
-        results[query_idx] = mergeSearchResults(hnsw_results[query_idx], flat_results[query_idx], k);
+        results[query_idx] = mergeSearchResults(ann_results[query_idx], flat_results[query_idx], k);
     }
     
     return results;
@@ -146,9 +180,10 @@ std::vector<SearchResult> VectorDB::exactSearchVectors(const std::vector<float>&
 
     std::cout << "Performing exact search (brute-force)..." << std::endl;
 
-    // 1. HNSW 인덱스 Exact Search (비동기)
-    auto hnsw_future = std::async(std::launch::async, [this, &query, k]() {
-        return hnsw_manager_->exactSearch(query, k);
+    // 1. ANN 인덱스 Exact Search (비동기)
+    auto ann_future = std::async(std::launch::async, [this, &query, k]() {
+        return use_hnsw_ ? hnsw_manager_->exactSearch(query, k)
+                         : ivf_manager_->exactSearch(query, k);
     });
 
     // 2. Flat 인덱스 검색 (이미 brute-force) (비동기)
@@ -157,14 +192,14 @@ std::vector<SearchResult> VectorDB::exactSearchVectors(const std::vector<float>&
     });
 
     // 3. 결과 수집
-    std::vector<SearchResult> hnsw_results = hnsw_future.get();
+    std::vector<SearchResult> ann_results = ann_future.get();
     std::vector<SearchResult> flat_results = flat_future.get();
 
-    std::cout << "HNSW exact search: " << hnsw_results.size() << " results" << std::endl;
+    std::cout << "ANN exact search: " << ann_results.size() << " results" << std::endl;
     std::cout << "Flat search: " << flat_results.size() << " results" << std::endl;
 
     // 4. 결과 병합
-    return mergeSearchResults(hnsw_results, flat_results, k);
+    return mergeSearchResults(ann_results, flat_results, k);
 }
 
 std::vector<std::vector<SearchResult>> VectorDB::exactSearchVectorsBatch(
@@ -186,9 +221,10 @@ std::vector<std::vector<SearchResult>> VectorDB::exactSearchVectorsBatch(
     
     std::cout << "Performing exact batch search (brute-force) on " << batch_size << " queries..." << std::endl;
     
-    // 1. HNSW 인덱스 Exact Batch Search (비동기)
-    auto hnsw_future = std::async(std::launch::async, [this, &queries, k]() {
-        return hnsw_manager_->exactSearchBatch(queries, k);
+    // 1. ANN 인덱스 Exact Batch Search (비동기)
+    auto ann_future = std::async(std::launch::async, [this, &queries, k]() {
+        return use_hnsw_ ? hnsw_manager_->exactSearchBatch(queries, k)
+                         : ivf_manager_->exactSearchBatch(queries, k);
     });
     
     // 2. Flat 인덱스 배치 검색 (비동기)
@@ -203,13 +239,13 @@ std::vector<std::vector<SearchResult>> VectorDB::exactSearchVectorsBatch(
     });
     
     // 3. 결과 수집
-    std::vector<std::vector<SearchResult>> hnsw_results = hnsw_future.get();
+    std::vector<std::vector<SearchResult>> ann_results = ann_future.get();
     std::vector<std::vector<SearchResult>> flat_results = flat_future.get();
     
     // 4. 각 쿼리별로 결과 병합
     std::vector<std::vector<SearchResult>> results(batch_size);
     for (size_t query_idx = 0; query_idx < batch_size; ++query_idx) {
-        results[query_idx] = mergeSearchResults(hnsw_results[query_idx], flat_results[query_idx], k);
+        results[query_idx] = mergeSearchResults(ann_results[query_idx], flat_results[query_idx], k);
     }
     
     std::cout << "Exact batch search completed" << std::endl;
@@ -217,16 +253,37 @@ std::vector<std::vector<SearchResult>> VectorDB::exactSearchVectorsBatch(
     return results;
 }
 
+bool VectorDB::softDelete(uint64_t id) {
+    if (!use_hnsw_ || !hnsw_manager_) {
+        return false;
+    }
+    return hnsw_manager_->softDelete(id);
+}
+
+bool VectorDB::restoreDeleted(uint64_t id) {
+    if (!use_hnsw_ || !hnsw_manager_) {
+        return false;
+    }
+    return hnsw_manager_->restoreDeleted(id);
+}
+
+bool VectorDB::isDeleted(uint64_t id) const {
+    if (!use_hnsw_ || !hnsw_manager_) {
+        return false;
+    }
+    return hnsw_manager_->isDeleted(id);
+}
+
 std::vector<SearchResult> VectorDB::mergeSearchResults(
-    const std::vector<SearchResult>& hnsw_results,
+    const std::vector<SearchResult>& ann_results,
     const std::vector<SearchResult>& flat_results,
     int k) const {
     
     std::vector<SearchResult> merged_results;
-    merged_results.reserve(hnsw_results.size() + flat_results.size());
+    merged_results.reserve(ann_results.size() + flat_results.size());
     
     // 모든 결과를 합치기
-    for (const auto& result : hnsw_results) {
+    for (const auto& result : ann_results) {
         merged_results.push_back(result);
     }
     for (const auto& result : flat_results) {
