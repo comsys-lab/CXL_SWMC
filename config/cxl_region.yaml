@@ -1,0 +1,13 @@
+# Shared CXL region layout used by every system (all-HWcc, Megalon, Popcorn).
+# The single source of offsets/sizes: code reads it through systems/common/cxl_region.h
+# and must not hard-code any of these values. Override per run with CXL_REGION_CONFIG.
+# Sizes/offsets in bytes; "auto" means derived (see cxl_region.h).
+device: /dev/dax0.0
+map_va: 0x600000000000    # fixed VA of the whole-device mapping, identical on every node (raw pointers in shared data)
+device_size: auto          # /sys/bus/dax/devices/<dev>/size (observed 103060340736)
+align: 2097152             # 2 MiB; must be a multiple of 4096
+hwcc_offset: 0
+hwcc_size: 268435456       # 256 MiB HW-coherent budget (SCR)
+swcc_offset: auto          # align_up(hwcc_offset + hwcc_size, align)
+swcc_size: auto            # up to device end, stopping at the first reserved range above swcc_offset
+reserved: []               # e.g. [[100931731456, 2147483648]] to exclude a range from all systems
