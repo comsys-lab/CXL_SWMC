@@ -3,24 +3,25 @@
 ##########################
 ###    Mode Choice    ####
 ##########################
-MEM_CONFIG="96GB_Popcorn_4KiB"
+INDEX="IVF"
+MEM_CONFIG="24GB_MTRR"
 MODE="experiment"  # "tuning" or "experiment"
 
 
 ##########################
 ###   공통 Parameter   ###
 ##########################
-LANGCHAIN_IP="163.152.48.109"
+LANGCHAIN_IP="163.152.48.206"
 LANGCHAIN_PORT=9000
 DATASET="kroshan/BioASQ"
-# ZIPF=1.2
+# ZIPF=1.
 SLO=1
 
 ##########################
 ### Tuning용 Parameter ###
 ##########################
 
-MAX_NUM_CLIENTS=5000
+MAX_NUM_CLIENTS=1
 TUNING_DURATION=80
 TUNING_ACCURACY=125 # client 개수 100 개까지의 정확도로 tuning 수행
 
@@ -28,14 +29,14 @@ TUNING_ACCURACY=125 # client 개수 100 개까지의 정확도로 tuning 수행
 ### Experiment용 Parameter ###
 ##############################
 
-NUM_CLIENTS_LIST=(100 100 100 100)
-EXPERIMENT_DURATION=330  # 5 minutes + 30 seconds warmup
+NUM_CLIENTS_LIST=(1 2 4 8 16 32)
+EXPERIMENT_DURATION=120 # 5 minutes + 30 seconds warmup
 
 #######################
 ### Result 저장 위치 ###
 #######################
 
-RESULT_BASE=./results/$(date +%y%m%d)/${MEM_CONFIG}
+RESULT_BASE=./results/$(date +%y%m%d)/${INDEX}/${MEM_CONFIG}
 TUNING_BASE=$RESULT_BASE/tuning
 EXPERIMENT_BASE=$RESULT_BASE/experiment
 

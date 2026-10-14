@@ -1,0 +1,16 @@
+CC = gcc
+CFLAGS = -O2 -Wall -Wextra -std=gnu99
+LDFLAGS = -lpthread
+
+TARGET = dax_mmap_test
+SRC = dax_mmap_test.c
+
+all: $(TARGET)
+
+$(TARGET): $(SRC)
+	$(CC) $(CFLAGS) -o $(TARGET) $(SRC) $(LDFLAGS)
+
+clean:
+	rm -f $(TARGET)
+
+.PHONY: all clean

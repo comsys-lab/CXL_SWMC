@@ -201,6 +201,13 @@ class ReqGen:
                         self.retrieval_latencies.append(retrieval_latency)
                         
                     self.requests_completed += 1
+
+                    # 통계는 처음부터 모두 반영하고,
+                    # 종료 경계는 duration을 처음 넘는 완료 요청 인덱스로 고정합니다.
+                    if not self.stop_test and (response_end_time - self.start_time) >= self.duration:
+                        self.stop_test = True
+                        self.statistics_end_time = response_end_time
+                        self.statistics_end_index = self.requests_completed
                     
                     if self.requests_completed // 1000 > self.last_report_count // 1000:
                         self._print_realtime_report()
@@ -215,7 +222,7 @@ class ReqGen:
                     break
 
     def _print_realtime_report(self):
-        """100개의 요청마다 실시간 성능 지표를 출력합니다."""
+        """1000개의 요청마다 실시간 성능 지표를 출력합니다."""
         recent_ttfts = [r['ttft'] for r in self.results[-1000:]]
         if not recent_ttfts:
             return
@@ -231,22 +238,10 @@ class ReqGen:
             f"최근 1000개 request의 p99 TTFT: {p99_ttft:.4f} 초 | "
         )
 
-        # ## 초반 10초의 통계는 버림
-        if not self.statistics_start_time:
-            if elapsed_time >= 10:
-                self.statistics_start_index = self.requests_completed
-                self.statistics_start_time = time.monotonic()
-        
-        ## duration 까지만 실험 결과 반영 (실제 실험 시간 = duration - 60초)
-        if elapsed_time >= self.duration and not self.stop_test:
-            self.stop_test = True
-            self.statistics_end_time = time.monotonic()
-            self.statistics_end_index = self.requests_completed  # 통계 집계 종료 인덱스 설정
-
         ## 최근 1000개의 ttft가 slo를 초과하면, 조기종료하고. self.slo_violation = True로 설정.
         if not self.stop_test and not self.slo_violation:
-            if p99_ttft > self.slo * 4:
-                logging.warning(f"최근 1000개의 p99 TTFT {p99_ttft:.4f} 초가 SLO 의 4배 ({self.slo * 4} 초)를 초과했습니다. 부하 테스트를 조기 종료합니다.")
+            if p99_ttft > self.slo * 100:
+                logging.warning(f"최근 1000개의 p99 TTFT {p99_ttft:.4f} 초가 SLO 의 100배 ({self.slo * 100} 초)를 초과했습니다. 부하 테스트를 조기 종료합니다.")
                 self.stop_test = True
                 self.statistics_end_index = self.requests_completed  # 통계 집계 종료 인덱스 설정
                 self.statistics_end_time = time.monotonic()
@@ -282,11 +277,11 @@ class ReqGen:
         self.results = self.results[start_index:end_index]
         self.requests_completed = len(self.results)
         self.requests_failed = self.requests_failed  # 실패한 요청 수는 변하지 않음
-        retrieval_success_count = len(self.retrieval_latencies)
         self.embedding_latencies = self.embedding_latencies[start_index:end_index]
         self.vectordb_latencies = self.vectordb_latencies[start_index:end_index]
         self.document_latencies = self.document_latencies[start_index:end_index]
         self.retrieval_latencies = self.retrieval_latencies[start_index:end_index]
+        retrieval_success_count = len(self.retrieval_latencies)
 
         ttfts = np.array([r['ttft'] for r in self.results])
         tpots = np.array([r['tpot'] for r in self.results if r['tpot'] > 0])
@@ -297,6 +292,8 @@ class ReqGen:
             print("statistics_end_time이 설정되지 않았습니다.")
         
         final_duration = self.statistics_end_time - self.statistics_start_time if self.statistics_start_time and self.statistics_end_time else (time.monotonic() - self.start_time)
+        if final_duration <= 0:
+            final_duration = 1e-9
         statistics_requests_num = end_index - start_index
         print(f"통계 반영된 요청 수: {statistics_requests_num}, 통계 반영된 시간: {final_duration:.2f} 초")
         final_rps = statistics_requests_num / final_duration 
@@ -382,6 +379,8 @@ class ReqGen:
     async def run(self):
         """부하 테스트를 시작하고 실행합니다."""
         self.start_time = time.monotonic()
+        self.statistics_start_time = self.start_time
+        self.statistics_start_index = 0
         logging.info(f"부하 테스트 시작, client 수 = {self.num_clients}")
         # logging.info(f"Zipf 값 {self.zipf_param}에서 상위 20%의 질문이 차지하는 비율: {self._calculate_pareto_percentage(self.zipf_param):.2f}%")
 
@@ -391,6 +390,11 @@ class ReqGen:
         async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
             tasks = [self._run_client(session, client_id) for client_id in range(self.num_clients)]
             await asyncio.gather(*tasks)
+
+        if self.statistics_end_index < 0:
+            self.statistics_end_index = self.requests_completed
+        if self.statistics_end_time is None:
+            self.statistics_end_time = time.monotonic()
             
         self._print_final_summary()
 

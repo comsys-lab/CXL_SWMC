@@ -186,7 +186,7 @@
     </rng>
     <memory model='nvdimm' access='shared'>
       <source>
-        <path>/dev/dax0.0</path>
+        <path>/dev/dax1.0</path>
         <alignsize unit='KiB'>2048</alignsize>
         <pmem/>
       </source>

@@ -28,6 +28,7 @@ class ReqGen:
         self.server_chat_url = f"http://{self.host}:{self.port}/chat"
         self.server_insert_url = f"http://{self.host}:{self.port}/insert_document"
         self.read_write_ratio = args.read_write  # 읽기/쓰기 비율
+        self.max_insert_words = 400  # 512 토큰 이하를 위해 대략 400단어로 제한
         
         self.questions = self._load_questions()
         self.documents = self._load_documents()
@@ -99,7 +100,8 @@ class ReqGen:
                                 break
             except Exception as e:
                 logging.error(f"문서 로드 실패: {e}. 빈 문서 리스트로 대체합니다.")
-                return []   
+                return []
+            return documents
         else:
             logging.info("문서 디렉토리가 지정되지 않았습니다. 쓰기 요청 시 문서를 생성하지 않습니다.")
             return documents
@@ -241,14 +243,28 @@ class ReqGen:
 
 
                     # wait_interval = received_chunks * 0.200
-                    wait_interval = generated_tokens * 0.200
+                    wait_interval = generated_tokens * 0.002
                     await asyncio.sleep(wait_interval)
                     if self.stop_test:
                         # logging.info(f"조기 종료 플래그 감지, {client_id} 정지.")
                         break
             else:
                 # 쓰기 요청
-                document = self.documents.pop()
+                async with self.lock:
+                    if self.stop_test:
+                        break
+
+                    document = None
+                    while self.documents:
+                        candidate = self.documents.pop()
+                        if len(candidate.split()) <= self.max_insert_words:
+                            document = candidate
+                            break
+
+                    if document is None:
+                        self.requests_failed += 1
+                        continue
+
                 try: 
                     async with session.post(self.server_insert_url, json={"client_id": 0, "document": document}) as response:
                         response.raise_for_status()
@@ -257,6 +273,10 @@ class ReqGen:
                     continue
                 except aiohttp.ClientError as e:
                     continue
+                
+                # 추가: stop_test 확인 (read와 동일하게)
+                if self.stop_test:
+                    break
 
 
     def _print_realtime_report(self):

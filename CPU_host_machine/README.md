@@ -348,3 +348,12 @@ sudo cat /proc/mtrr
 echo "base=0x5000000000 size=0x1000000000 type=uncachable" | sudo tee /proc/mtrr
 echo "base=0x6000000000 size=0x1000000000 type=uncachable" | sudo tee /proc/mtrr
 ```
+
+delete mtrr setting
+```bash
+# check MTRR status
+sudo cat /proc/mtrr
+
+echo "disable=8"  | sudo tee /proc/mtrr
+echo "disable=9"  | sudo tee /proc/mtrr
+```

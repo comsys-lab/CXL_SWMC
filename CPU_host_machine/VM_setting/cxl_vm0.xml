@@ -243,21 +243,6 @@
       <backend model='random'>/dev/urandom</backend>
       <address type='pci' domain='0x0000' bus='0x06' slot='0x00' function='0x0'/>
     </rng>
-    <memory model='nvdimm' access='shared'>
-      <source>
-        <path>/dev/dax1.0</path>
-        <alignsize unit='KiB'>4</alignsize>
-        <pmem/>
-      </source>
-      <target>
-        <size unit='KiB'>100663296</size>
-        <node>0</node>
-        <label>
-          <size unit='KiB'>16384</size>
-        </label>
-      </target>
-      <address type='dimm' slot='1'/>
-    </memory>
     <graphics type='vnc' port='-1' autoport='yes' listen='127.0.0.1'>
       <listen type='address' address='127.0.0.1'/>
     </graphics>
