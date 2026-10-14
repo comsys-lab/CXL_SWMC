@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
 # Build one Megalon flavor out of tree (De Stijl 2-VM port).
 #
-#   systems/megalon/build.sh <flavor> <n> [-j N] [--no-tests] [--wmeta artifact64|packed4]
+#   systems/megalon/build.sh <flavor> <n> [-j N] [--no-tests] [--wmeta artifact64|rev64|packed4]
 #     flavor: megalon (SCR + LIMITED_SCR) | hwcc (FULL_COHERENCE; also used for popcorn)
 #     wmeta:  HWcc record layout; artifact64 (default, upstream 64 B/record) | packed4 (paper's 4 B record;
-#             with flavor megalon the owner key moves to the NR replica, nr feature wmeta-rev)
+#             with flavor megalon the owner key moves to the NR replica, nr feature wmeta-rev) | rev64
+#             (packed4's owner-key path, 64 B per record; measurement control for false sharing)
 #     n:      build number -> builds/megalon/<n>/ (n=0 is the upstream baseline; refused)
 #
 # Output in builds/megalon/<n>/:
@@ -24,7 +25,7 @@ SRC=$ROOT/CXL_SWMC/systems/megalon/src
 T=$ROOT/workspaces/toolchain
 TOOLCHAIN_FILE=$SRC/cmake-variant/toolchains/clang17-gcc.cmake
 
-usage() { echo "usage: $0 <megalon|hwcc> <n> [-j N] [--no-tests] [--wmeta artifact64|packed4]" >&2; exit 2; }
+usage() { echo "usage: $0 <megalon|hwcc> <n> [-j N] [--no-tests] [--wmeta artifact64|rev64|packed4]" >&2; exit 2; }
 [ $# -ge 2 ] || usage
 FLAVOR=$1; N=$2; shift 2
 JOBS=60; RUN_TESTS=1; WMETA=artifact64
@@ -43,7 +44,7 @@ case $FLAVOR in
 esac
 case $WMETA in
     artifact64) ;;
-    packed4) if [ "$FLAVOR" = megalon ]; then NR_FEATURES="$NR_FEATURES wmeta-rev"; fi ;;  # must match CMakeLists.txt
+    packed4|rev64) if [ "$FLAVOR" = megalon ]; then NR_FEATURES="$NR_FEATURES wmeta-rev"; fi ;;  # must match CMakeLists.txt
     *) usage ;;
 esac
 [[ $N =~ ^[0-9]+$ ]] || usage
