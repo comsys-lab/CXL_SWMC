@@ -2,15 +2,15 @@
 set -euo pipefail
 
 ##### Directory and file paths #####
-SUFFIX="DE_STIJL_24GB_THREAD_1_test"
+SUFFIX="Popcorn_24GB_THREAD_1_test"
 # DB_PATH="/home/comsys/CXLSharedMemVM/LMDB/Dataset/lmdb_7M_4KB"
 DB_PATH="/mnt/famfs/lmdb_7M_4KB"
 ####################################
 
 ##### Benchmark parameters #####
-DURATION=180
+DURATION=120
 THREADS=1
-ARRIVAL_RATES="100,1000,10000"
+ARRIVAL_RATES="4000,8000"
 WARMUP_SEC=10
 ################################
 

@@ -1,10 +1,10 @@
 #!/bin/bash
 
-HOST_SIZE="24GB"
-MODE="test" # all, test
+HOST_SIZE="${HOST_SIZE:-96GB}"
+MODE="${MODE:-test}" # all, test
 
 # enable DeStijl page replication
-if [ "$MODE" == "test" ]; then
+if [ "$MODE" == "all" ]; then
     sudo damo start --kdamond ./damo_yamls/replicate_all_${HOST_SIZE}.yaml
 else
     sudo damo start --kdamond ./damo_yamls/replicate_test_${HOST_SIZE}.yaml

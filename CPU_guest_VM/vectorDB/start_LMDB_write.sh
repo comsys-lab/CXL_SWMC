@@ -2,12 +2,12 @@
 set -euo pipefail
 
 ##### Directory and file paths #####
-SUFFIX="DE_STIJL_72GB"
+SUFFIX="DE_STIJL_24GB"
 DB_PATH="/mnt/famfs/lmdb_7M_4KB"
 ####################################
 
 ##### Benchmark parameters #####
-DURATION=1800
+DURATION=800
 WRITES_PER_SECOND=0
 ################################
 
