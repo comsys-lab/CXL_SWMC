@@ -1,3 +1,0 @@
-[submodule "KnowhereVectorDB/vectorDB/external/knowhere"]
-	path = KnowhereVectorDB/vectorDB/external/knowhere
-	url = https://github.com/zilliztech/knowhere.git

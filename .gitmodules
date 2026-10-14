@@ -1,18 +1,6 @@
-[submodule "CPU_guest_VM/kernel/popcorn_2mb"]
-	path = CPU_guest_VM/kernel/popcorn_2mb
-	url = https://github.com/youkioh/CXLSHMSWcoherence.git
-	branch = main
-[submodule "CPU_guest_VM/kernel/de_stijl"]
-	path = CPU_guest_VM/kernel/de_stijl
-	url = https://github.com/youkioh/CXLSHMSWcoherence.git
-	branch = SWMC_DAMON
-[submodule "CPU_guest_VM/kernel/popcorn_4kb"]
-	path = CPU_guest_VM/kernel/popcorn_4kb
-	url = https://github.com/youkioh/CXLSHMSWcoherence.git
-	branch = popcorn_4kb
-[submodule "CPU_guest_VM/kernel/famfs_vanilla"]
-	path = CPU_guest_VM/kernel/famfs_vanilla
-	url = https://github.com/youkioh/CXLSHMSWcoherence.git
-[submodule "CPU_guest_VM/famfs"]
-	path = CPU_guest_VM/famfs
+[submodule "third_party/famfs"]
+	path = third_party/famfs
 	url = https://github.com/cxl-micron-reskit/famfs.git
+[submodule "workloads/rag/vectordb/vectorDB/external/knowhere"]
+	path = workloads/rag/vectordb/vectorDB/external/knowhere
+	url = https://github.com/zilliztech/knowhere.git
