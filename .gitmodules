@@ -4,3 +4,15 @@
 [submodule "workloads/rag/vectordb/vectorDB/external/knowhere"]
 	path = workloads/rag/vectordb/vectorDB/external/knowhere
 	url = https://github.com/zilliztech/knowhere.git
+[submodule "kernels/destijl"]
+	path = kernels/destijl
+	url = https://github.com/youkioh/CXLSHMSWcoherence.git
+	branch = DE_STIJL_DAMON
+[submodule "kernels/popcorn_new"]
+	path = kernels/popcorn_new
+	url = https://github.com/youkioh/CXLSHMSWcoherence.git
+	branch = popcorn_new
+[submodule "kernels/linux-6.14"]
+	path = kernels/linux-6.14
+	url = https://github.com/torvalds/linux.git
+	shallow = true
