@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
 # Build one Megalon flavor out of tree (De Stijl 2-VM port).
 #
-#   systems/megalon/build.sh <flavor> <n> [-j N] [--no-tests]
+#   systems/megalon/build.sh <flavor> <n> [-j N] [--no-tests] [--wmeta artifact64|packed4]
 #     flavor: megalon (SCR + LIMITED_SCR) | hwcc (FULL_COHERENCE; also used for popcorn)
+#     wmeta:  HWcc record layout; artifact64 (default, upstream 64 B/record) | packed4 (paper's 4 B record;
+#             with flavor megalon the owner key moves to the NR replica, nr feature wmeta-rev)
 #     n:      build number -> builds/megalon/<n>/ (n=0 is the upstream baseline; refused)
 #
 # Output in builds/megalon/<n>/:
@@ -22,20 +24,26 @@ SRC=$ROOT/CXL_SWMC/systems/megalon/src
 T=$ROOT/workspaces/toolchain
 TOOLCHAIN_FILE=$SRC/cmake-variant/toolchains/clang17-gcc.cmake
 
-usage() { echo "usage: $0 <megalon|hwcc> <n> [-j N] [--no-tests]" >&2; exit 2; }
+usage() { echo "usage: $0 <megalon|hwcc> <n> [-j N] [--no-tests] [--wmeta artifact64|packed4]" >&2; exit 2; }
 [ $# -ge 2 ] || usage
 FLAVOR=$1; N=$2; shift 2
-JOBS=60; RUN_TESTS=1
+JOBS=60; RUN_TESTS=1; WMETA=artifact64
 while [ $# -gt 0 ]; do
     case $1 in
         -j) JOBS=$2; shift 2 ;;
         --no-tests) RUN_TESTS=0; shift ;;
+        --wmeta) [ $# -ge 2 ] || usage; WMETA=$2; shift 2 ;;
         *) usage ;;
     esac
 done
 case $FLAVOR in
     megalon) NR_FEATURES="scr"; NR_RUSTFLAGS="-C target-feature=+clflushopt" ;;
     hwcc)    NR_FEATURES="";    NR_RUSTFLAGS="" ;;
+    *) usage ;;
+esac
+case $WMETA in
+    artifact64) ;;
+    packed4) if [ "$FLAVOR" = megalon ]; then NR_FEATURES="$NR_FEATURES wmeta-rev"; fi ;;  # must match CMakeLists.txt
     *) usage ;;
 esac
 [[ $N =~ ^[0-9]+$ ]] || usage
@@ -49,12 +57,17 @@ if [ -f "$OUT/CMakeCache.txt" ]; then
         echo "builds/megalon/$N already holds flavor '$prev'; use another build number" >&2
         exit 1
     fi
+    prevw=$(sed -n 's/^MEGALON_WMETA_LAYOUT:STRING=//p' "$OUT/CMakeCache.txt")
+    if [ "${prevw:-artifact64}" != "$WMETA" ]; then
+        echo "builds/megalon/$N already holds wmeta layout '${prevw:-artifact64}'; use another build number" >&2
+        exit 1
+    fi
 fi
 exec > >(tee "$OUT/build.log") 2>&1
 
 # shellcheck disable=SC1091
 . "$T/env.sh"
-echo "== megalon build: flavor=$FLAVOR n=$N out=$OUT jobs=$JOBS $(date -Is)"
+echo "== megalon build: flavor=$FLAVOR wmeta=$WMETA n=$N out=$OUT jobs=$JOBS $(date -Is)"
 
 # ---- provenance ----
 COMMIT=$(git -C "$SRC" rev-parse HEAD)
@@ -78,7 +91,7 @@ echo "== cargo build (features='$NR_FEATURES')"
 ( cd "$SRC/third-party/nr_rust/ffi" &&
   CARGO_TARGET_DIR=$NR_TARGET RUSTFLAGS="$NR_RUSTFLAGS" cargo build --release "${feat_args[@]}" )
 [ -f "$NR_LIB" ] || { echo "missing $NR_LIB" >&2; exit 1; }
-printf 'features=%s\nflavor=%s\nbuild_id=%s\n' "$NR_FEATURES" "$FLAVOR" "$BUILD_ID" > "$NR_LIB.features"
+printf 'features=%s\nflavor=%s\nwmeta=%s\nbuild_id=%s\n' "$NR_FEATURES" "$FLAVOR" "$WMETA" "$BUILD_ID" > "$NR_LIB.features"
 
 NR_TESTS="not run"
 ENTRY_SIZE=unknown
@@ -104,6 +117,7 @@ cmake -S "$SRC" -B "$OUT" \
     -DCMAKE_TOOLCHAIN_FILE="$TOOLCHAIN_FILE" \
     -DCMAKE_BUILD_TYPE=Release \
     -DMEGALON_FLAVOR="$FLAVOR" \
+    -DMEGALON_WMETA_LAYOUT="$WMETA" \
     -DMEGALON_NR_LIB="$NR_LIB" \
     -DMEGALON_BUILD_ID="$BUILD_ID" > "$OUT/cmake.log" 2>&1 || { tail -40 "$OUT/cmake.log"; exit 1; }
 grep -E 'MEGALON_FLAVOR=|linking nr lib' "$OUT/cmake.log" || true
@@ -151,6 +165,7 @@ M=$OUT/manifest.txt
     echo "date=$(date -Is)"
     echo "host=$(hostname)"
     echo "flavor=$FLAVOR"
+    echo "wmeta_layout=$WMETA"
     echo "build_dir=$OUT"
     echo "source_repo=$SRC"
     echo "source_branch=$BRANCH"
