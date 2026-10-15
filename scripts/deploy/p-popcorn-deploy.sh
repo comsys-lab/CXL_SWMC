@@ -71,6 +71,7 @@ precheck)
   ssh_vm "test ! -e $G && test ! -L $G && test ! -e $GT && test ! -L $GT && test ! -e /lib/modules/$K && test ! -L /lib/modules/$K"
   ssh_vm "python3 -I -c 'import os,stat; assert all(stat.S_ISDIR(os.lstat(p).st_mode) for p in (\"/var\",\"/var/tmp\",\"/home/comsys\"))'"
   ssh_vm "uname -r; cat /proc/cmdline" > "$R/kernel-before.txt"
+  grep -qx '6.14.0-famfs-de-stijl+-p3a' <(head -1 "$R/kernel-before.txt") || { echo "STOP: VM does not run the p3a kernel"; exit 1; }
   nd_state > "$R/nd-before.txt"
   grep -q '"dev":"namespace0.0"' "$R/nd-before.txt"; grep -qx dax0.0 "$R/nd-before.txt"
   grep -q '"mode":"devdax"' "$R/nd-before.txt"; grep -q '"map":"mem"' "$R/nd-before.txt"
@@ -168,8 +169,15 @@ tools)
 rollback)
   if [ "$(state)" = "running" ] && xml_is "$R/before.xml"; then
     log "rollback: definition unchanged and VM running; nothing to do"; exit 0; fi
-  if ssh_vm "grep -q '^cxl_shm ' /proc/modules" 2>/dev/null; then
-    log "STOP: cxl_shm still loaded; unload it first (p-popcorn-shm.sh teardown)"; exit 1; fi
+  # Reachable VM: cxl_shm must be unloaded first (p-popcorn-shm.sh teardown, ONLY=<k> if the peer is gone).
+  # Unreachable VM (ssh fails): it cannot be torn down; it is rolled back directly (shutdown, destroy after
+  # 120 s) - explicit, not mistaken for "not loaded".
+  if ssh_vm true 2>/dev/null; then
+    if ssh_vm "grep -q '^cxl_shm ' /proc/modules"; then
+      log "STOP: cxl_shm still loaded; unload it first (p-popcorn-shm.sh teardown)"; exit 1; fi
+  else
+    log "VM unreachable over ssh: rolling back without teardown"
+  fi
   if [ "$(state)" != "shut off" ]; then
     "${V[@]}" shutdown "$VM" || true
     wait_off 120 || "${V[@]}" destroy "$VM"

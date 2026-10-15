@@ -8,21 +8,60 @@
 #   chown     /dev/dax0.0 -> comsys (for unprivileged faultlat / vdb-server)
 #   smoke     faultlat smoke.sh --execute (windows from $BASE), collect results
 #   status    counters and state of both guests -> $R/status-<STATUS_TAG>-vm<k>.txt
-#   teardown  no user of /dev/dax0.0 left; dax0.0 back to root:root 600;
-#             disable coherence and unload cxl_shm on both (VM1, then VM0)
+#   teardown  waits (<= 120 s) for faultlat to exit; no user of /dev/dax0.0
+#             left; dax0.0 back to root:root 600; disable coherence and unload
+#             cxl_shm (VM1, then VM0). ONLY=<k> tears down that VM alone (the
+#             other one is unreachable and goes to p-popcorn-deploy.sh rollback).
+# smoke also checks acceptance: per node, counter deltas transaction_error /
+# send_drop / late_response = 0, remote_request_count delta > 0, and no
+# BUG/Oops/WARNING in dmesg; on a failed step it waits (<= 120 s) until no
+# faultlat runs on either guest, then stops.
 # Env (required): K GT R; optional: IP0 IP1 (default .100/.101), BASE (smoke
 # base page, default 25000000), RUN (smoke run id), C (bundle dir, for smoke.sh),
-# STATUS_TAG.
+# STATUS_TAG, ONLY.
 set -euo pipefail
 umask 077
 : "${K:?}" "${GT:?}" "${R:?}"
 IP=("${IP0:-192.168.122.100}" "${IP1:-192.168.122.101}")
 BASE=${BASE:-25000000}
-FLAGS=(-o BatchMode=yes -o ConnectTimeout=8 -o StrictHostKeyChecking=yes)
+# Same ssh options as p-popcorn-deploy.sh
+FLAGS=(-F /dev/null -o BatchMode=yes -o PasswordAuthentication=no -o KbdInteractiveAuthentication=no -o StrictHostKeyChecking=yes -o UpdateHostKeys=no -o ForwardAgent=no -o ClearAllForwardings=yes -o ControlMaster=no -o ControlPath=none -o ConnectTimeout=8 -o ConnectionAttempts=1)
 on() { local k=$1; shift; ssh -T "${FLAGS[@]}" "comsys@${IP[$k]}" "$@" < /dev/null; }
 G() { local k=$1; shift; on "$k" "sudo -n $GT/p-popcorn-guest.sh $*"; }
 log() { printf '[%s] %s\n' "$(date +%T)" "$*" | tee -a "$R/steps.log"; }
 [ -d "$R" ] || { test -d "$(dirname "$R")" && mkdir -m 0700 "$R"; }
+NODES=(0 1)
+if [ -n "${ONLY:-}" ]; then [[ "$ONLY" =~ ^[01]$ ]] || { echo "ONLY must be 0 or 1"; exit 2; }; NODES=("$ONLY"); fi
+wait_no_faultlat() {  # bounded wait (120 s) until no faultlat runs on the given nodes
+  local i k busy
+  for ((i = 0; i < 60; i++)); do
+    busy=0
+    for k in "$@"; do [ -z "$(on "$k" "pgrep -x faultlat || true")" ] || busy=1; done
+    [ "$busy" = 0 ] && return 0
+    sleep 2
+  done
+  return 1
+}
+smoke_accept() {  # smoke_accept <before> <after> <node>: counters and dmesg
+  python3 -I - "$1" "$2" "$3" <<'PY'
+import sys
+def kv(p):
+    d = {}
+    for l in open(p):
+        if '=' in l and not l.startswith('dmesg: '):
+            k, v = l.rstrip('\n').split('=', 1); d[k] = v
+    return d
+b, a, node = kv(sys.argv[1]), kv(sys.argv[2]), sys.argv[3]
+bad = []
+for c in ('transaction_error_count', 'send_drop_count', 'late_response_count'):
+    if int(a['swmc.' + c]) - int(b['swmc.' + c]) != 0: bad.append(c)
+rr = int(a['swmc.remote_request_count']) - int(b['swmc.remote_request_count'])
+if rr <= 0: bad.append('remote_request_count delta %d' % rr)
+if a.get('dmesg_bad') != '0': bad.append('dmesg BUG/Oops/WARNING lines: %s' % a.get('dmesg_bad'))
+print('vm%s acceptance: remote_request_delta=%d %s' % (node, rr, 'OK' if not bad else 'FAIL ' + ', '.join(bad)))
+sys.exit(1 if bad else 0)
+PY
+}
 
 case "${1:-}" in
 precheck)
@@ -53,20 +92,30 @@ chown)
 smoke)
   : "${RUN:?}" "${C:?}"
   for k in 0 1; do G $k status > "$R/status-smoke-before-vm$k.txt"; done
+  rc=0
   NODE0=comsys@${IP[0]} NODE1=comsys@${IP[1]} GDIR=$GT GOUT=/home/comsys/popcorn-results \
-    CXL_REGION_CONFIG=$GT/cxl_region.yaml bash "$C/smoke.sh" "$RUN" "$BASE" --execute 2>&1 | tee "$R/smoke.log"
-  grep -q "smoke $RUN: PASS" "$R/smoke.log"
+    CXL_REGION_CONFIG=$GT/cxl_region.yaml bash "$C/smoke.sh" "$RUN" "$BASE" --execute 2>&1 | tee "$R/smoke.log" || rc=$?
+  if [ "$rc" != 0 ] || ! grep -q "smoke $RUN: PASS" "$R/smoke.log"; then
+    # a failed pair step can leave the other node's faultlat running (or waiting in a fault): let it end first
+    wait_no_faultlat 0 1 && log "faultlat gone on both guests" || log "faultlat still running after 120 s"
+    for k in 0 1; do G $k status > "$R/status-smoke-failed-vm$k.txt" || true; done
+    log "STOP: smoke failed ($RUN, rc $rc); next: teardown"; exit 1
+  fi
+  ok=0
   for k in 0 1; do
     G $k status > "$R/status-smoke-after-vm$k.txt"
     mkdir -p "$R/smoke-vm$k"
     scp -q "${FLAGS[@]}" "comsys@${IP[$k]}:/home/comsys/popcorn-results/$RUN/*" "$R/smoke-vm$k/"
+    smoke_accept "$R/status-smoke-before-vm$k.txt" "$R/status-smoke-after-vm$k.txt" $k | tee -a "$R/smoke-acceptance.txt" || ok=1
   done
-  log "smoke PASS ($RUN)" ;;
+  [ "$ok" = 0 ] || { log "STOP: smoke acceptance failed ($RUN)"; exit 1; }
+  log "smoke PASS ($RUN, acceptance OK)" ;;
 status)
   for k in 0 1; do G $k status > "$R/status-${STATUS_TAG:-now}-vm$k.txt"; done
   log "status recorded (${STATUS_TAG:-now})" ;;
 teardown)
-  for k in 0 1; do
+  wait_no_faultlat "${NODES[@]}" || { log "STOP: faultlat still running after 120 s"; exit 1; }
+  for k in "${NODES[@]}"; do
     on $k "pgrep -a -x 'vdb-server|faultlat' || true" > "$R/procs-teardown-vm$k.txt"
     test ! -s "$R/procs-teardown-vm$k.txt" || { log "STOP: processes still running on vm$k"; exit 1; }
     G $k status > "$R/status-teardown-vm$k.txt"
@@ -76,10 +125,11 @@ teardown)
     grep -qx 'root:root 600' "$R/unchown-vm$k.txt"
   done
   for k in 1 0; do
+    [[ " ${NODES[*]} " == *" $k "* ]] || continue
     G $k disable | tee -a "$R/teardown-vm$k.txt"   # 0 also when already off; EBUSY = mappings left -> stop
     G $k unload | tee -a "$R/teardown-vm$k.txt"
     grep -q 'unload OK\|cxl_shm not loaded' "$R/teardown-vm$k.txt"
   done
-  log "teardown PASS (coherence off, cxl_shm unloaded, dax0.0 root:root 600)" ;;
-*) sed -n '2,17p' "$0"; exit 2 ;;
+  log "teardown PASS on vm${NODES[*]} (coherence off, cxl_shm unloaded, dax0.0 root:root 600)" ;;
+*) sed -n '2,24p' "$0"; exit 2 ;;
 esac

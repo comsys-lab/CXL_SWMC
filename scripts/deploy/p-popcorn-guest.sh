@@ -101,6 +101,7 @@ status)
     awk -v hz="$(getconf CLK_TCK)" '{print "recv_thread." $2 "=" $14 + $15 " ticks (" hz "/s)"}' "/proc/$p/stat"
   done
   echo "uptime=$(cut -d' ' -f1 /proc/uptime)"
+  echo "dmesg_bad=$(dmesg | grep -cE 'BUG:|Oops|WARNING:|Call Trace' || true)"
   echo "dax_users=$(dax_users | tr '\n' ';')"
   echo "dax0.0=$(stat -c '%U:%G %a' /dev/dax0.0)"
   dmesg | grep -E 'shm_cxl|swmc-popcorn|swmc_kmsg|dax:' | tail -n 20 | sed 's/^/dmesg: /' ;;

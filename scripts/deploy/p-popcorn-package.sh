@@ -3,7 +3,7 @@
 # P3c-pattern deployment. Host-local only (no guest, no VM change, no sudo).
 #   p-popcorn-package.sh <n> <bundle-version>
 # Writes (all new; refuses if they exist):
-#   builds/popcorn_new/<n>/stage/                      modules_install (kernel + cxl_shm in updates/),
+#   builds/popcorn_new/<n>/stage/ (reused if present)  modules_install (kernel + cxl_shm in updates/),
 #                                                      signed by the build's own key (kbuild), depmod -b
 #   builds/popcorn_new/<n>/deploy-v<v>/
 #     modules.tar, modules-manifest.json, kernel.config, prepare-guest.sh,
@@ -35,15 +35,20 @@ K=$(rec release); COMMIT=$(rec source_commit)
 [ "$(sha256sum "$B/.config" | cut -d' ' -f1)" = "$(rec config_sha256)" ] || { echo ".config changed since the build"; exit 1; }
 [ "$(sha256sum "$B/arch/x86/boot/bzImage" | cut -d' ' -f1)" = "$(rec bzImage_sha256)" ] || { echo "bzImage changed"; exit 1; }
 [ "$($WRAP make -s -C "$KS" O="$B" LOCALVERSION="$LV" kernelrelease)" = "$K" ]
-test ! -e "$OUT" && test ! -e "$ST"
+test ! -e "$OUT"
 mkdir -p "$SCR"; trap 'rm -rf "$SCR"' EXIT
 
-# 1. stage: kernel modules + cxl_shm (updates/), signed by kbuild with this build's key
-mkdir "$ST"
-$WRAP make -s -C "$KS" O="$B" LOCALVERSION="$LV" INSTALL_MOD_PATH="$ST" modules_install
-$WRAP make -s -C "$B" M="$SUB/msg_layer_module" MO="$B/cxl_shm" LOCALVERSION="$LV" \
-  CONFIG_MODULE_SIG_KEY="$B/certs/signing_key.pem" INSTALL_MOD_PATH="$ST" modules_install
-depmod -b "$ST" -F "$B/System.map" "$K"
+# 1. stage: kernel modules + cxl_shm (updates/), signed by kbuild with this build's key.
+#    A stage from an earlier bundle of the same build is reused (every module is re-verified in step 2).
+if [ -e "$ST" ]; then
+  echo "reusing existing stage $ST"
+else
+  mkdir "$ST"
+  $WRAP make -s -C "$KS" O="$B" LOCALVERSION="$LV" INSTALL_MOD_PATH="$ST" modules_install
+  $WRAP make -s -C "$B" M="$SUB/msg_layer_module" MO="$B/cxl_shm" LOCALVERSION="$LV" \
+    CONFIG_MODULE_SIG_KEY="$B/certs/signing_key.pem" INSTALL_MOD_PATH="$ST" modules_install
+  depmod -b "$ST" -F "$B/System.map" "$K"
+fi
 MD=$ST/lib/modules/$K
 test -f "$MD/updates/cxl_shm.ko"
 
