@@ -8,9 +8,10 @@
 // (config/cxl_region.yaml via systems/common/cxl_region.h).
 //
 // Subcommands (see README.md):
-//   faultlat params
+//   faultlat params [--nodes N] [--device-size B]
 //   faultlat access --op read|write|rw [--pages N] [--page-offset P] [--stride S]
 //                   [--passes K] [--shuffle] [--cpu C] [--out F] [--raw F]
+//                   [--pattern X] [--expect X]
 //   faultlat pingpong --role R --nonce X [--nodes N] [--iters N] [--page-offset P]
 //                   [--cpu C] [--out F] [--raw F]
 //
@@ -46,7 +47,7 @@ namespace {
 
 constexpr uint64_t kPage = 4096;
 constexpr const char *kSysfs = "/sys/kernel/swmc/page_coherence";
-constexpr const char *kVersion = "faultlat-1";
+constexpr const char *kVersion = "faultlat-2";
 
 [[noreturn]] void die(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 void die(const char *fmt, ...) {
@@ -78,6 +79,9 @@ struct Args {
   int nodes = 2;
   uint64_t nonce = 0;
   uint64_t iters = 10000;
+  uint64_t device_size = 0;   // params only: override /sys/bus/dax/.../size (Host dry run)
+  bool has_pattern = false, has_expect = false;
+  uint64_t pattern = 0, expect = 0;  // access: written / expected value X ^ page index (data check)
   std::string out, raw, config;
 };
 
@@ -113,6 +117,9 @@ Args parse_args(int argc, char **argv) {
     else if (k == "--out") a.out = val("--out");
     else if (k == "--raw") a.raw = val("--raw");
     else if (k == "--config") a.config = val("--config");
+    else if (k == "--device-size") a.device_size = parse_num(val("--device-size"), "--device-size");
+    else if (k == "--pattern") { a.pattern = parse_num(val("--pattern"), "--pattern"); a.has_pattern = true; }
+    else if (k == "--expect") { a.expect = parse_num(val("--expect"), "--expect"); a.has_expect = true; }
     else die("unknown option %s", k.c_str());
   }
   if (a.stride == 0 || a.pages == 0 || a.passes < 1) die("--pages, --stride, --passes must be > 0");
@@ -122,7 +129,7 @@ Args parse_args(int argc, char **argv) {
 cxl::region load_region(const Args &a) {
   cxl::region r;
   std::string err;
-  if (!cxl::region_load(a.config.empty() ? nullptr : a.config.c_str(), &r, &err))
+  if (!cxl::region_load(a.config.empty() ? nullptr : a.config.c_str(), &r, &err, a.device_size))
     die("region config: %s", err.c_str());
   return r;
 }
@@ -308,10 +315,20 @@ int cmd_params(const Args &a) {
       ring.end() > r.hwcc.end())
     die("msg_ring [%" PRIu64 ", +%" PRIu64 ") must be 4 KiB aligned and inside hwcc [%" PRIu64 ", %" PRIu64 ")",
         ring.offset, ring.size, r.hwcc.offset, r.hwcc.end());
+  // Same sizing rule as cxl_shm v6: a page-aligned header (2 lines per window + 2 lines per node), then
+  // N*(N-1) directions x {request, response} windows of at least 256 64-byte slots.
+  const uint64_t n = uint64_t(a.nodes), windows = n * (n - 1) * 2;
+  if (a.nodes < 2 || a.nodes > 8) die("--nodes must be 2..8 (cxl_shm nr_nodes)");
+  const uint64_t hdr = (windows * 2 * 64 + 2 * n * 64 + 4095) / 4096 * 4096;
+  const uint64_t need = hdr + windows * 256 * 64;
+  if (ring.size < need)
+    die("msg_ring size %" PRIu64 " too small for %d nodes: need >= %" PRIu64, ring.size, a.nodes, need);
+  // Managed (MSI) range = exactly swcc; it must not touch hwcc (app + msg_ring + system part).
+  if (r.swcc.offset < r.hwcc.end() && r.hwcc.offset < r.swcc.end()) die("swcc overlaps hwcc");
   std::string dev = r.device.substr(r.device.rfind('/') + 1);
-  printf("dax_name=%s ring_offset=%" PRIu64 " ring_size=%" PRIu64 " ring_coherent=1 managed_offset=%" PRIu64
+  printf("dax_name=%s nr_nodes=%d ring_offset=%" PRIu64 " ring_size=%" PRIu64 " ring_coherent=1 managed_offset=%" PRIu64
          " managed_size=%" PRIu64 "\n",
-         dev.c_str(), ring.offset, ring.size, r.swcc.offset, r.swcc.size);
+         dev.c_str(), a.nodes, ring.offset, ring.size, r.swcc.offset, r.swcc.size);
   return 0;
 }
 
@@ -341,6 +358,10 @@ int cmd_access(const Args &a) {
   std::vector<long> faults(nsteps);
   std::vector<std::string> names(nsteps);
   volatile uint64_t sink = 0;
+  // Data check (--pattern / --expect): writes store X ^ page index in the first and last word of the page;
+  // reads compare both words with the expected value.
+  uint64_t checked = 0, mismatches = 0;
+  std::string first_bad;
   for (size_t st = 0; st < nsteps; st++) {
     int pass = int(st / ops.size());
     bool write = ops[st % ops.size()];
@@ -348,12 +369,33 @@ int cmd_access(const Args &a) {
     long f0 = minflt();
     for (uint64_t i = 0; i < a.pages; i++) {
       volatile uint64_t *w = reinterpret_cast<volatile uint64_t *>(m.base + order[i] * kPage);
-      uint64_t t0 = now_ns();
-      if (write)
-        *w = (uint64_t(pass) << 32) | i;
-      else
-        sink = sink + *w;
+      volatile uint64_t *wl = w + kPage / sizeof(uint64_t) - 1;
+      const uint64_t page = a.page_offset + order[i];
+      uint64_t t0 = now_ns(), v = 0, vl = 0;
+      if (write) {
+        if (a.has_pattern) {
+          *w = a.pattern ^ page;
+          *wl = a.pattern ^ page;
+        } else {
+          *w = (uint64_t(pass) << 32) | i;
+        }
+      } else {
+        v = *w;
+        if (a.has_expect) vl = *wl;
+        sink = sink + v;
+      }
       lat[st][i] = now_ns() - t0;
+      if (!write && a.has_expect) {
+        checked++;
+        if (v != (a.expect ^ page) || vl != (a.expect ^ page)) {
+          if (!mismatches++) {
+            char buf[160];
+            snprintf(buf, sizeof(buf), "page %" PRIu64 ": first %#" PRIx64 " last %#" PRIx64 " expected %#" PRIx64,
+                     page, v, vl, a.expect ^ page);
+            first_bad = buf;
+          }
+        }
+      }
     }
     faults[st] = minflt() - f0;
   }
@@ -369,12 +411,22 @@ int cmd_access(const Args &a) {
             st + 1 < nsteps ? "," : "");
   }
   fprintf(f, "  },\n");
+  if (a.has_pattern || a.has_expect)
+    fprintf(f, "  \"verify\": {\"pattern\": %s, \"expect\": %s, \"checked\": %" PRIu64 ", \"mismatches\": %" PRIu64
+               ", \"first_mismatch\": \"%s\"},\n",
+            a.has_pattern ? std::to_string(a.pattern).c_str() : "null",
+            a.has_expect ? std::to_string(a.expect).c_str() : "null", checked, mismatches, first_bad.c_str());
   json_sysfs(f, sys_before, sys_after);
   fprintf(f, "\n}\n");
   if (f != stdout) fclose(f);
   write_raw(a.raw, lat);
   munmap(m.base, m.len);
   close(m.fd);
+  if (mismatches) {
+    fprintf(stderr, "faultlat: DATA MISMATCH in %" PRIu64 " of %" PRIu64 " pages (%s)\n", mismatches, checked,
+            first_bad.c_str());
+    return 2;
+  }
   return 0;
 }
 
@@ -415,6 +467,11 @@ int cmd_pingpong(const Args &a) {
 
   std::vector<uint64_t> rtt;
   rtt.reserve(a.iters);
+  // Coherence check: role 1 moves first, so at role r's i-th turn seq must be i*N + (r-1 mod N) (every earlier
+  // hand-off's increment is visible).
+  const uint64_t N = uint64_t(a.nodes), first = (me + N - 1) % N;
+  uint64_t seq_errors = 0;
+  std::string first_bad;
   long f0 = minflt();
   uint64_t t_handoff = now_ns();
   for (uint64_t i = 0; i < a.iters; i++) {
@@ -423,7 +480,13 @@ int cmd_pingpong(const Args &a) {
       if (now_ns() - t_wait > timeout_ns) die("timeout waiting for turn at iteration %" PRIu64, i);
     uint64_t t = now_ns();
     if (me == 0 && i > 0) rtt.push_back(t - t_handoff);
-    pg->seq = pg->seq + 1;
+    const uint64_t seq = pg->seq;
+    if (seq != i * N + first && !seq_errors++) {
+      char buf[128];
+      snprintf(buf, sizeof(buf), "iteration %" PRIu64 ": seq %" PRIu64 " expected %" PRIu64, i, seq, i * N + first);
+      first_bad = buf;
+    }
+    pg->seq = seq + 1;
     t_handoff = now_ns();
     pg->turn = other;
   }
@@ -434,13 +497,20 @@ int cmd_pingpong(const Args &a) {
   json_header(f, a, r, m);
   fprintf(f, "  \"passes\": {\n");
   json_summary(f, "round_trip", rtt);
-  fprintf(f, ",\n    \"minflt\": %ld, \"final_seq\": %" PRIu64 "\n  },\n", faults, uint64_t(pg->seq));
+  fprintf(f, ",\n    \"minflt\": %ld, \"final_seq\": %" PRIu64 ", \"seq_errors\": %" PRIu64
+             ", \"first_seq_error\": \"%s\"\n  },\n",
+          faults, uint64_t(pg->seq), seq_errors, first_bad.c_str());
   json_sysfs(f, sys_before, sys_after);
   fprintf(f, "\n}\n");
   if (f != stdout) fclose(f);
   write_raw(a.raw, {rtt});
   munmap(m.base, m.len);
   close(m.fd);
+  if (seq_errors) {
+    fprintf(stderr, "faultlat: SEQUENCE ERROR in %" PRIu64 " of %" PRIu64 " turns (%s)\n", seq_errors, a.iters,
+            first_bad.c_str());
+    return 2;
+  }
   return 0;
 }
 

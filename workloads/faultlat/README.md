@@ -25,28 +25,25 @@ All offsets come from the region config (`config/cxl_region.yaml`, path in
 `CXL_REGION_CONFIG`). The tool maps windows of the swcc range only:
 `--page-offset P` is the first page relative to `swcc_offset`.
 
-`faultlat params` prints the cxl_shm module parameters derived from the same
-config: `managed_offset/size` = the swcc range, `ring_offset/size` = the
-`msg_ring: [offset, size]` key, which must lie inside the hwcc range (so
-`ring_coherent=1`). Until systems/common/cxl_region.h knows `msg_ring`, the
-tool strips that key before loading the rest of the config; other users of
-cxl_region.h reject the key, and HWcc users must not allocate over the ring.
-Proposed config addition (last 132 KiB of the default 256 MiB HWcc range,
-512 slots per window = 1024 per direction):
+`faultlat params [--nodes N]` prints the cxl_shm module parameters derived
+from the same config (N = 2 by default): `nr_nodes=N`, `managed_offset/size`
+= exactly the swcc range (the MSI-managed range; never hwcc), `ring_offset/size`
+= the `msg_ring: [offset, size]` key (tail of hwcc, so `ring_coherent=1`).
+It refuses a ring that is too small for N nodes (cxl_shm v6 sizing: N=2 needs
+69632 B, N=8 1851392 B). `--device-size B` replaces the sysfs device size, for
+a dry run on the Host (dax0.0 exists only in the guests). With the current
+config and the guests' dax0.0 (103060340736 B) it prints
 
-    msg_ring: [268300288, 135168]   # inside hwcc; cxl_shm message rings
+    dax_name=dax0.0 nr_nodes=2 ring_offset=268300288 ring_size=135168 ring_coherent=1 managed_offset=268435456 managed_size=102791905280
 
-Example for the Popcorn kernel:
+Example for the Popcorn kernel (root; grant-gated):
 
-    eval "$(faultlat params)"     # sets dax_name ring_offset ... as shell vars
-    insmod cxl_shm.ko dax_name=$dax_name node_id=<0|1> ring_offset=$ring_offset \
-        ring_size=$ring_size ring_coherent=$ring_coherent \
-        managed_offset=$managed_offset managed_size=$managed_size
+    insmod cxl_shm.ko node_id=<0|1> $(faultlat params)
 
 ## Preconditions on both guests (grant-gated, not done by these scripts)
 
 1. Popcorn kernel booted; cxl_shm loaded on both nodes with identical
-   parameters and different node ids. Each node only writes its own ring
+   parameters (including `nr_nodes`) and different node ids. Each node only writes its own ring
    lines; the link comes up when both are loaded (dmesg "link to node N up").
 2. Coherence enabled before the first mmap (syscall 470,
    `enable_page_coherence`, root; returns EAGAIN until the link is up).
@@ -59,7 +56,7 @@ Example for the Popcorn kernel:
 ## Steps
 
     run.sh <outdir> <step> access --op read|write|rw --pages N --page-offset P \
-           [--stride S] [--passes K] [--shuffle] [--cpu C]
+           [--stride S] [--passes K] [--shuffle] [--cpu C] [--pattern X] [--expect X]
     run.sh <outdir> <step> pingpong --role 0|1 --nonce X --iters N --page-offset P [--cpu C]
 
 - `access`: one 8-byte load or store per page; pass 0 faults on every page
@@ -67,14 +64,29 @@ Example for the Popcorn kernel:
   no-fault access cost. `rw` reads all pages then writes all pages in the same
   process (the writes take the write-protect / pfn_mkwrite fault on S pages).
   `<step>_minflt` confirms one fault per page.
+- `--pattern X` (writes) stores X ^ page index in the first and last word of
+  every page; `--expect X` (reads) checks both words and exits 2 on any
+  mismatch (`verify` in the JSON). Page index = swcc page number.
 - `pingpong`: two nodes hand a turn back and forth on one managed page; each
   hand-off is a write on a page the peer holds and a read fault on I at the
   peer. Role 0 records the round trip (2 hand-offs). Start role 1 first;
-  `--nonce` must be the same on both and new per run.
+  `--nonce` must be the same on both and new per run. Every turn checks
+  that all earlier increments are visible (`seq_errors`, exit 2).
 - Each step writes `<step>.json` (summary, histogram, kernel counter deltas
   from `/sys/kernel/swmc/page_coherence`), `<step>.csv` (raw samples) and
   `<step>.env` (kernel release, protocol, knobs, cxl_shm parameters, binary
   and config hashes, load average).
+
+## Correctness smoke test (smoke.sh)
+
+`smoke.sh <run-id> <base-page> [--execute]` (same env as scenarios.sh, PAGES
+default 1024): c1 node1 writes / node0 reads and checks; c2 node0 overwrites
+the shared pages (S->M) / node1 checks; c3 both nodes write disjoint halves at
+once, then check each other's half at once; c4 both nodes write the same pages
+at once (conflicts), then node0 writes a pattern and node1 checks it; c5
+ping-pong with a per-turn sequence check (every turn must see all earlier
+increments). Any data mismatch or sequence error makes the step exit 2 and
+stops the sequence. Uses 5 windows from `<base-page>`.
 
 ## Scenarios (scenarios.sh)
 
