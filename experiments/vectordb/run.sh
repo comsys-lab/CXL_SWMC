@@ -69,12 +69,17 @@ for k in "${!NODE[@]}"; do
 done
 for k in "${!NODE[@]}"; do $SSH comsys@"${NODE[$k]}" "$V/bin/vdb-node.sh ready $GRUN $k 300" < /dev/null; done
 
+cpu_snap() {  # guest CPU time counters (/proc/stat "cpu" line) per node, for busy-fraction over the loadgen run
+  for k in "${!NODE[@]}"; do echo "$1 node$k $($SSH comsys@"${NODE[$k]}" 'head -1 /proc/stat' < /dev/null)"; done >> "$RUN/guest-cpu.txt"
+}
 TARGETS=$(printf '%s:'"$PORT"',' "${NODE[@]}"); TARGETS=${TARGETS%,}
+cpu_snap before
 set +e
 numactl --physcpubind="$LG_CPUS" --membind=1 "$LOADGEN" --workload vectordb --target "$TARGETS" --out "$RUN/loadgen" "$@" \
   2>&1 | tee "$RUN/loadgen.log"
 LG=${PIPESTATUS[0]}
 set -e
+cpu_snap after
 stop_nodes
 collect
 host_check after
