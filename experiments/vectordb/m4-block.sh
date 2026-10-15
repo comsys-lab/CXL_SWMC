@@ -10,7 +10,8 @@
 #              with TRACE=1, U 5 TRACE=0; L from this block's all-HWcc SLO results).
 # env: Popcorn blocks C8 K8 GT8 (and RECV_MODE for pop); pop round 2: LREF (van round-1 evidence dir);
 #      KV (vanilla release, default 6.14.0-vanilla-1). Every run: m4-run.sh (Host gate, checks, E1).
-# Holds the measurement lock for the whole block. Stops at the first M4RUN STOP; vanilla blocks then roll back
+# Request seed (loadgen --seed and plugin seed) = 20261014 + round: same request sequence for every system within a
+# round, a different one per round. Holds the measurement lock for the whole block. Stops at the first M4RUN STOP; vanilla blocks then roll back
 # /dev/dax0.0 (Popcorn runs tear down per run).
 set -uo pipefail
 B=$1 R=$2 E=$3
@@ -34,7 +35,7 @@ finish() {
 trap finish EXIT
 run() {  # name, env assignments...
   local name=$1; shift
-  env "$@" bash $X/m4-run.sh "$name" "$E" 2>&1 | tee -a "$E/runs.log" | grep -E "^M4RUN|SEQUENCE" ; local st=${PIPESTATUS[0]}
+  env SEED=$((20261014 + R)) "$@" bash $X/m4-run.sh "$name" "$E" 2>&1 | tee -a "$E/runs.log" | grep -E "^M4RUN|SEQUENCE" ; local st=${PIPESTATUS[0]}
   [ $st = 0 ] || { echo "$(date -Is) SEQUENCE STOP at $name"; exit 1; }
 }
 shuffle() { python3 -c 'import random,sys; v=sys.argv[2:]; random.Random(sys.argv[1]).shuffle(v); print(" ".join(v))' "$OWNER" "$@"; }
