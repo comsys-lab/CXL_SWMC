@@ -40,6 +40,20 @@ wait_off() {
   [ "$(state)" = "shut off" ]
 }
 xml_is() { "${V[@]}" dumpxml "$VM" --inactive | cmp - "$1"; }
+# workload processes that must not run during a switch (bracket trick: no self-match by the remote shell)
+PROCS='[v]db-server|[f]aultlat|[k]v-store|[k]v-server|[o]bject-test|[m]egalon|[r]ecsys|[l]mdb'
+wait_ssh() { local i; for i in $(seq 40); do ssh_vm true 2>/dev/null && return 0; sleep 6; done; return 1; }
+# back to before.xml (VM shut off), start, check release+cmdline; used by rollback and failed switches
+restore() {
+  "${V[@]}" define --validate "$R/before.xml"
+  "${V[@]}" dumpxml "$VM" --inactive > "$R/after-rollback.xml"
+  cmp "$R/before.xml" "$R/after-rollback.xml"
+  "${V[@]}" start "$VM"
+  wait_ssh || { log "FAIL: no SSH after the rollback start"; return 1; }
+  ssh_vm "uname -r; cat /proc/cmdline" > "$R/kernel-after-rollback.txt"
+  cmp "$R/kernel-before.txt" "$R/kernel-after-rollback.txt"
+  log "rollback done (original definition restored, $(head -1 "$R/kernel-after-rollback.txt") running)"
+}
 cmdline_of() { sed -n 's#.*<cmdline>\(.*\)</cmdline>.*#\1#p' "$1"; }
 host_check() {  # images in $D == HOSTREC, qemu-readable
   sudo -n sha256sum "$D/bzImage" "$D/initrd.img-$K" > "$R/host-images.sha256"
@@ -90,21 +104,35 @@ PY
   dmesg_err > "$R/dmesg-err-before.txt"
   ssh_vm "findmnt -rn -o SOURCE,TARGET,FSTYPE | grep -i famfs; grep -i famfs /etc/fstab; true" > "$R/famfs-before.txt"
   test ! -s "$R/famfs-before.txt" || { echo "STOP: FamFS configured"; exit 1; }
-  ssh_vm "pgrep -a -x 'vdb-server|faultlat|kv-store|object-test|megalon.*' || true" > "$R/procs-before.txt"
+  ssh_vm "pgrep -a -f '$PROCS' || true" > "$R/procs-before.txt"
   test ! -s "$R/procs-before.txt" || { echo "STOP: workload processes running"; exit 1; }
   log "precheck PASS (running $PRE_K, target $K)" ;;
 switch)
   grep -q "$VM precheck PASS" "$R/steps.log"
   xml_is "$R/before.xml"; host_check
-  ssh_vm "pgrep -a -x 'vdb-server|faultlat|kv-store|object-test|megalon.*' || true; grep '^cxl_shm ' /proc/modules || true" > "$R/procs-before-shutdown.txt"
+  ssh_vm "pgrep -a -f '$PROCS' || true; grep '^cxl_shm ' /proc/modules || true" > "$R/procs-before-shutdown.txt"
   test ! -s "$R/procs-before-shutdown.txt" || { log "STOP: workload processes or cxl_shm present"; exit 1; }
   "${V[@]}" shutdown "$VM"
-  wait_off 120 || { log "STOP: shutdown timed out (no force, no change)"; exit 1; }
+  if ! wait_off 120; then
+    # no force; the shutdown may still complete late: only "running + definition unchanged" means still on PRE_K
+    sleep 10
+    if [ "$(state)" = "shut off" ]; then
+      log "STOP: shutdown completed only after the timeout; restoring the original definition and starting"
+      restore; exit 1
+    fi
+    xml_is "$R/before.xml" && log "STOP: shutdown timed out; VM $(state), definition unchanged (still $PRE_K)" ||
+      log "FAIL: shutdown timed out and the definition differs from before.xml"
+    exit 1
+  fi
   "${V[@]}" define --validate "$TARGET_XML"
   "${V[@]}" dumpxml "$VM" --inactive > "$R/after-define.xml"
-  cmp "$R/after-define.xml" "$TARGET_XML" || diff "$TARGET_XML" "$R/after-define.xml" > "$R/after-define.diff" || true
+  if ! cmp "$R/after-define.xml" "$TARGET_XML"; then
+    diff "$TARGET_XML" "$R/after-define.xml" > "$R/after-define.diff" || true
+    log "FAIL: defined XML differs from the target (after-define.diff); not starting it, rolling back"
+    restore; exit 1
+  fi
   "${V[@]}" start "$VM"
-  for i in $(seq 40); do ssh_vm true 2>/dev/null && break; sleep 6; done
+  wait_ssh || { log "FAIL: no SSH after boot (VM $(state)); next: rollback"; exit 1; }
   ssh_vm "uname -r; cat /proc/cmdline; findmnt -rn -o SOURCE,FSTYPE,OPTIONS /; \
     echo SYSTEMD=\$(systemctl is-system-running); systemctl --failed --no-legend --plain" | tee "$R/switch-check.txt"
   test "$(sed -n 1p "$R/switch-check.txt")" = "$K" || { log "FAIL: release"; exit 1; }
@@ -126,19 +154,15 @@ switch)
 rollback)
   if [ "$(state)" = "running" ] && xml_is "$R/before.xml"; then
     log "rollback: definition unchanged and VM running; nothing to do"; exit 0; fi
-  if ssh_vm true 2>/dev/null && ssh_vm "grep -q '^cxl_shm ' /proc/modules"; then
-    log "STOP: cxl_shm loaded; unload it first"; exit 1; fi
+  if ssh_vm true 2>/dev/null; then
+    if ssh_vm "grep -q '^cxl_shm ' /proc/modules"; then log "STOP: cxl_shm loaded; unload it first"; exit 1; fi
+  else
+    log "VM unreachable over ssh: cxl_shm check skipped, rolling back without it"
+  fi
   if [ "$(state)" != "shut off" ]; then
     "${V[@]}" shutdown "$VM" || true
-    wait_off 120 || "${V[@]}" destroy "$VM"
+    wait_off 120 || { log "graceful shutdown timed out; destroy"; "${V[@]}" destroy "$VM"; }
   fi
-  "${V[@]}" define --validate "$R/before.xml"
-  "${V[@]}" dumpxml "$VM" --inactive > "$R/after-rollback.xml"
-  cmp "$R/before.xml" "$R/after-rollback.xml"
-  "${V[@]}" start "$VM"
-  for i in $(seq 40); do ssh_vm true 2>/dev/null && break; sleep 6; done
-  ssh_vm "uname -r; cat /proc/cmdline" > "$R/kernel-after-rollback.txt"
-  cmp "$R/kernel-before.txt" "$R/kernel-after-rollback.txt"
-  log "rollback done (original definition restored, $(head -1 "$R/kernel-after-rollback.txt") running)" ;;
+  restore ;;
 *) sed -n '2,24p' "$0"; exit 2 ;;
 esac
