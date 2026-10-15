@@ -11,16 +11,20 @@
 #pragma once
 
 #include <dlfcn.h>
+#include <time.h>
 
+#include <atomic>
 #include <cstdio>
 #include <cstring>
 #include <fstream>
+#include <mutex>
 #include <sstream>
 #include <string>
 #include <type_traits>
 #include <vector>
 
 #include "cxl_region.h"
+#include "hwcc_app.h"
 #include "layout.h"
 #include "megalon_api.h"
 #include "shm_hnsw.h"
@@ -79,6 +83,36 @@ inline bool mapped_by(uint64_t va, uint64_t len, const std::string &path, std::s
 
 class MegalonBackend;
 class MegalonAcc;
+
+// Measurement (DESIGN.md §13; MOT1 v4 H1 "Instrumentation" and §4.3 false-sharing classification); Megalon
+// itself is unchanged. Read sections: 1 in kSample sections (random per section) is timed (read_start / body / read_end);
+// a failed attempt of a timed section is timed in full. Write sections are always timed. With a trace dir, every
+// write section is logged (id, written ranges, wsec sequence number taken from an HWcc counter after write_end) and
+// every failed read attempt (id, read range, wsec counter before read_start and after the failed read_end):
+// tools/classify_retries.py marks a retry false sharing when a peer write with seq in (s0, s1] hit the same object
+// on disjoint ranges, true sharing when ranges overlap.
+// Note: ObjectReadStart retries internally when the object's counter moved since this node last read it (flush the
+// whole object, retry; megalon.read_retry_incoherent): that time is inside rd_start_ns but is not a wrapper retry
+// (rd_retries / the retry log see only failed ObjectReadEnd calls).
+inline uint64_t mono_ns() {
+  timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return uint64_t(ts.tv_sec) * 1000000000ull + uint64_t(ts.tv_nsec);
+}
+struct __attribute__((packed)) WsecRec {  // 48 B
+  uint64_t seq, id;
+  uint32_t off0, len0, off1, len1;
+  uint64_t t_ns, node;
+};
+struct __attribute__((packed)) RetryRec {  // 48 B
+  uint64_t id;
+  uint32_t off, len;
+  uint64_t s0, s1, t_ns, node;
+};
+struct MegTimers {
+  std::atomic<uint64_t> rd_sampled{0}, rd_start_ns{0}, rd_body_ns{0}, rd_end_ns{0}, rd_retries{0}, rd_failed_timed{0},
+      rd_failed_ns{0}, wr_sections{0}, wr_start_ns{0}, wr_body_ns{0}, wr_end_ns{0};
+};
 
 struct MegalonMem {
   GraphMeta *meta;  // HWcc
@@ -158,34 +192,67 @@ class MegalonBackend {
   // (per-attempt local state); returns the result of the accepted attempt.
   template <class F> auto read(uint64_t id, uint64_t off, uint64_t len, F f) const {
     using R = decltype(f(static_cast<const uint8_t *>(nullptr)));
+    // random 1/kSample sampling per section (a fixed every-k-th rule could alias with HNSW's regular access pattern)
+    thread_local uint64_t rs = 0x9e3779b97f4a7c15ull ^ uint64_t(reinterpret_cast<uintptr_t>(&rs));
+    rs ^= rs << 13, rs ^= rs >> 7, rs ^= rs << 17;  // xorshift64
+    const bool timed = (rs >> 32 & (kSample - 1)) == 0;
     for (;;) {
       MegObj h;
+      const uint64_t s0 = wsec_ ? cxl::hwcc::load_acquire(wsec_) : 0;
+      const uint64_t t0 = timed ? mono_ns() : 0;
       const int rc = api_->read_start(id, &h);
       if (rc != 0) megalon_fatal("ObjectReadStart(" + hex(id) + ") = " + std::to_string(rc));
       if (off + len > h.size) megalon_fatal("read beyond object " + hex(id));
+      const uint64_t t1 = timed ? mono_ns() : 0;
       if constexpr (std::is_void_v<R>) {
         f(static_cast<const uint8_t *>(h.ptr + off));
-        if (api_->read_end(&h)) return;
+        const uint64_t t2 = timed ? mono_ns() : 0;
+        const bool ok = api_->read_end(&h);
+        if (timed) account_read(t0, t1, t2, ok);
+        if (ok) return;
       } else {
         R r = f(static_cast<const uint8_t *>(h.ptr + off));
-        if (api_->read_end(&h)) return r;
+        const uint64_t t2 = timed ? mono_ns() : 0;
+        const bool ok = api_->read_end(&h);
+        if (timed) account_read(t0, t1, t2, ok);
+        if (ok) return r;
+      }
+      tm_.rd_retries++;
+      if (trace_) log_retry(id, off, len, s0);
+    }
+  }
+  // Write section; f(base, size) writes whole lines only and reads nothing of the object (D3). Ranges are for the
+  // trace only (what the section wrote; [0, size) when not given).
+  template <class F>
+  void write_obj(uint64_t id, F f, uint64_t off0 = 0, uint64_t len0 = ~0ull, uint64_t off1 = 0, uint64_t len1 = 0) const {
+    MegObj h;
+    const uint64_t t0 = mono_ns();
+    const int rc = api_->write_start(id, &h);
+    if (rc != 0) megalon_fatal("ObjectWriteStart(" + hex(id) + ") = " + std::to_string(rc));
+    const uint64_t t1 = mono_ns();
+    f(h.ptr, h.size);
+    const uint64_t t2 = mono_ns();
+    api_->write_end(&h);
+    const uint64_t t3 = mono_ns();
+    tm_.wr_sections++, tm_.wr_start_ns += t1 - t0, tm_.wr_body_ns += t2 - t1, tm_.wr_end_ns += t3 - t2;
+    if (wsec_) {
+      const uint64_t seq = cxl::hwcc::fetch_add(wsec_, uint64_t(1)) + 1;
+      if (trace_) {
+        if (len0 == ~0ull) len0 = h.size;
+        std::lock_guard<std::mutex> g(tmu_);
+        wlog_.push_back(WsecRec{seq, id, uint32_t(off0), uint32_t(len0), uint32_t(off1), uint32_t(len1), t3, node_});
       }
     }
   }
-  // Write section; f(base, size) writes whole lines only and reads nothing of the object (D3).
-  template <class F> void write_obj(uint64_t id, F f) const {
-    MegObj h;
-    const int rc = api_->write_start(id, &h);
-    if (rc != 0) megalon_fatal("ObjectWriteStart(" + hex(id) + ") = " + std::to_string(rc));
-    f(h.ptr, h.size);
-    api_->write_end(&h);
-  }
   // Write section over [off, off + len), whole lines (len may end at the object end).
   template <class F> void write(uint64_t id, uint64_t off, uint64_t len, F fill) const {
-    write_obj(id, [&](uint8_t *base, size_t size) {
-      check_lines(id, off, len, size);
-      fill(base + off);
-    });
+    write_obj(
+        id,
+        [&](uint8_t *base, size_t size) {
+          check_lines(id, off, len, size);
+          fill(base + off);
+        },
+        off, len);
   }
   static void check_lines(uint64_t id, uint64_t off, uint64_t len, size_t size) {
     if (off % 64 || off + len > size || (len % 64 && off + len != size))
@@ -237,8 +304,31 @@ class MegalonBackend {
       << "\nmegalon.write_retry=" << s.write_retry << "\nmegalon.switch_rw=" << s.switch_rw
       << "\nmegalon.flushes=" << s.flushes << "\nmegalon.flush_bytes=" << s.flush_bytes
       << "\nmegalon.replay_flushes=" << s.replay_flushes << "\nmegalon.replay_flush_bytes=" << s.replay_flush_bytes
-      << "\n";
+      << "\nmegt.sample=" << kSample << "\nmegt.rd_sampled=" << tm_.rd_sampled << "\nmegt.rd_start_ns=" << tm_.rd_start_ns
+      << "\nmegt.rd_body_ns=" << tm_.rd_body_ns << "\nmegt.rd_end_ns=" << tm_.rd_end_ns << "\nmegt.rd_retries=" << tm_.rd_retries
+      << "\nmegt.rd_failed_timed=" << tm_.rd_failed_timed << "\nmegt.rd_failed_ns=" << tm_.rd_failed_ns
+      << "\nmegt.wr_sections=" << tm_.wr_sections << "\nmegt.wr_start_ns=" << tm_.wr_start_ns
+      << "\nmegt.wr_body_ns=" << tm_.wr_body_ns << "\nmegt.wr_end_ns=" << tm_.wr_end_ns << "\n";
     return o.str();
+  }
+
+  // ---- measurement hooks (server.cc)
+  static constexpr uint32_t kSample = 64;  // power of two
+  void set_trace(uint64_t *wsec_counter, bool log, uint32_t node) {
+    wsec_ = wsec_counter, trace_ = log, node_ = node;
+  }
+  bool dump_trace(const std::string &prefix, std::string *err) const {
+    if (!trace_) return true;
+    std::lock_guard<std::mutex> g(tmu_);
+    for (int k = 0; k < 2; k++) {
+      const std::string path = prefix + (k ? ".megalon-retry.bin" : ".megalon-wsec.bin");
+      FILE *f = std::fopen(path.c_str(), "wb");
+      if (!f) return *err = "cannot write " + path, false;
+      if (k) std::fwrite(rlog_.data(), sizeof(RetryRec), rlog_.size(), f);
+      else std::fwrite(wlog_.data(), sizeof(WsecRec), wlog_.size(), f);
+      std::fclose(f);
+    }
+    return true;
   }
 
  private:
@@ -247,9 +337,29 @@ class MegalonBackend {
     std::snprintf(b, sizeof(b), "%#lx", (unsigned long)x);
     return b;
   }
+  void account_read(uint64_t t0, uint64_t t1, uint64_t t2, bool ok) const {
+    const uint64_t t3 = mono_ns();
+    if (ok) {
+      tm_.rd_sampled++, tm_.rd_start_ns += t1 - t0, tm_.rd_body_ns += t2 - t1, tm_.rd_end_ns += t3 - t2;
+    } else {
+      tm_.rd_failed_timed++, tm_.rd_failed_ns += t3 - t0;
+    }
+  }
+  void log_retry(uint64_t id, uint64_t off, uint64_t len, uint64_t s0) const {
+    const uint64_t s1 = wsec_ ? cxl::hwcc::load_acquire(wsec_) : 0;
+    std::lock_guard<std::mutex> g(tmu_);
+    rlog_.push_back(RetryRec{id, uint32_t(off), uint32_t(len), s0, s1, mono_ns(), node_});
+  }
   Params p_;
   const MegalonApi *api_;
   uint64_t dlog_chunks_;
+  uint64_t *wsec_ = nullptr;  // HWcc: write sections completed by all nodes
+  bool trace_ = false;
+  uint32_t node_ = 0;
+  mutable MegTimers tm_;
+  mutable std::mutex tmu_;
+  mutable std::vector<WsecRec> wlog_;
+  mutable std::vector<RetryRec> rlog_;
 };
 
 // HNSW accessor (shm_hnsw.h): every chunk access is one Megalon section; reads copy into the caller's scratch.
@@ -292,14 +402,17 @@ class MegalonAcc {
       std::memcpy(dst + sizeof(ElemHeader), v, size_t(p_.dim) * 4);
     });
     const uint64_t l0off = (i % N_) * l0_, uoff = upper_base_ + h.upper_off;
-    m_.be->write_obj(lid(i), [&](uint8_t *base, size_t size) {
-      MegalonBackend::check_lines(lid(i), l0off, l0_, size);
-      std::memset(base + l0off, 0, l0_);
-      if (upper_bytes) {
-        MegalonBackend::check_lines(lid(i), uoff, upper_bytes, size);
-        std::memset(base + uoff, 0, upper_bytes);
-      }
-    });
+    m_.be->write_obj(
+        lid(i),
+        [&](uint8_t *base, size_t size) {
+          MegalonBackend::check_lines(lid(i), l0off, l0_, size);
+          std::memset(base + l0off, 0, l0_);
+          if (upper_bytes) {
+            MegalonBackend::check_lines(lid(i), uoff, upper_bytes, size);
+            std::memset(base + uoff, 0, upper_bytes);
+          }
+        },
+        l0off, l0_, uoff, upper_bytes);
   }
   void prefetch(uint32_t) const {}
 

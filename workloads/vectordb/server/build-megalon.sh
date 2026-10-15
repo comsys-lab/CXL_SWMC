@@ -27,6 +27,8 @@ c++ -std=c++17 -O2 -g -fPIC -shared -Wall -Wextra -I"$HERE" -I"$MSRC/include" -D
 LD_LIBRARY_PATH= ldd "$OUT/lib/libvdb-megalon.so" | grep -q "not found" && { ldd "$OUT/lib/libvdb-megalon.so"; exit 1; }
 { echo "# vdb-server Megalon build (CXL_SWMC/workloads/vectordb/server/build-megalon.sh)"; echo "date=$(date -Is)"
   echo "source_commit=$COMMIT dirty=$DIRTY"
+  echo "source_dirty_files=$(git -C "$HERE" status --porcelain -- "$HERE/.." "$ROOT/systems/common" "$ROOT/experiments/loadgen" | awk '{print $2}' | tr '\n' ' ')"
+  echo "source_dirty_diff_sha256=$(git -C "$HERE" diff HEAD -- "$HERE/.." "$ROOT/systems/common" "$ROOT/experiments/loadgen" | sha256sum | cut -c1-64)"
   echo "shim_info=$INFO"
   echo "megalon_build=$MB"
   grep -E '^(source_commit|source_dirty_diff_sha256|build_id|flavor|wmeta_layout|cmake_effective)=' "$MB/manifest.txt" | sed 's/^/megalon./'

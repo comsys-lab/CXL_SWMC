@@ -9,6 +9,7 @@ enum Op : uint16_t {
   kOpInsert = 1,  // InsertReq + float vec[dim]            -> WriteResp
   kOpDelete = 2,  // DeleteReq                             -> WriteResp
   kOpSearch = 3,  // SearchReq + float q[dim]              -> SearchResp + uint64 ids[n] + float scores[n]
+  kOpUpdate = 4,  // UpdateReq + float vec[dim]            -> WriteResp (w_seq = w_ins)
   kOpStats = 10,  // empty                                 -> text (key=value lines)
 };
 
@@ -22,6 +23,14 @@ struct __attribute__((packed)) DeleteReq {
   uint32_t w_seq;
   uint32_t pad;
   uint64_t id;
+};
+
+// Update = replace one record: delete del_id (w_seq w_del), then insert ins_id (w_seq w_ins = w_del + 1) with the
+// vector, applied and published in that order by the node's writer; one request, one response after both (not atomic:
+// a search with snapshot w_del sees neither, as specified by the E1 rule).
+struct __attribute__((packed)) UpdateReq {
+  uint32_t w_del, w_ins;
+  uint64_t del_id, ins_id;
 };
 
 struct __attribute__((packed)) WriteResp {

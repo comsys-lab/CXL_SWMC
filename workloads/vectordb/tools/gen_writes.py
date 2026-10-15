@@ -3,7 +3,10 @@
 
 Searches are made at run time by the loadgen plugin (query row and target drawn with its seed; E1 snapshot
 ref_w = last write made before it), and arrival times come from the loadgen rate, so this file holds only the
-writes: w_seq 1..W in order, independent INSERT and DELETE requests, each with its target VM.
+writes: w_seq 1..W in order, each with its target VM. Default mode "update" (user 2026-10-16): W/2 updates, update k =
+DELETE (w_seq 2k+1) of a live id chosen uniformly, then INSERT (w_seq 2k+2) of the next pool B row, same target VM;
+the loadgen plugin sends each pair as one UPDATE request. Mode "independent": INSERT/DELETE drawn per write
+(--insert-frac), sent as separate requests (earlier runs).
 
 Record ids: pool A row i -> id i (initial records, ins_seq 0); pool B row j -> id NA + j (inserted in pool B order).
 Deletes pick uniformly among ids live at their w_seq (pool A and already inserted pool B ids).
@@ -13,8 +16,8 @@ Output: <out> = binary records (little-endian, 24 B each):
   u32 pad
 plus <out>.manifest.txt.
 
-usage: gen_writes.py --out writes.bin --pool-a 1000000 --pool-b 1000000 --writes 2000000 [--insert-frac 0.5]
-                     [--vms 2] [--seed S]
+usage: gen_writes.py --out writes.bin --pool-a 1000000 --pool-b 1000000 --writes 2000000 [--mode update|independent]
+                     [--insert-frac 0.5] [--vms 2] [--seed S]
 """
 import argparse, sys
 
@@ -32,13 +35,19 @@ def main():
     ap.add_argument("--pool-a", type=int, required=True)
     ap.add_argument("--pool-b", type=int, required=True)
     ap.add_argument("--writes", type=int, required=True, help="W (must stay below the server's --max-writes)")
-    ap.add_argument("--insert-frac", type=float, default=0.5)
+    ap.add_argument("--mode", choices=["update", "independent"], default="update")
+    ap.add_argument("--insert-frac", type=float, default=0.5, help="independent mode only")
     ap.add_argument("--vms", type=int, default=2)
     ap.add_argument("--seed", type=int, default=20261015)
     a = ap.parse_args()
     rng = np.random.default_rng(a.seed)
     W = a.writes
-    is_ins = rng.random(W) < a.insert_frac
+    if a.mode == "update":
+        if W % 2:
+            sys.exit("update mode needs an even --writes")
+        is_ins = np.tile(np.array([False, True]), W // 2)  # delete, then insert
+    else:
+        is_ins = rng.random(W) < a.insert_frac
     if is_ins.sum() > a.pool_b:
         sys.exit(f"{is_ins.sum()} inserts exceed pool B ({a.pool_b})")
 
@@ -63,7 +72,10 @@ def main():
             nlive -= 1
     w["op"] = np.where(is_ins, INSERT, DELETE)
     w["w_seq"] = np.arange(1, W + 1, dtype=np.uint32)
-    w["target"] = rng.integers(0, a.vms, size=W, dtype=np.uint8)
+    if a.mode == "update":
+        w["target"] = np.repeat(rng.integers(0, a.vms, size=W // 2, dtype=np.uint8), 2)
+    else:
+        w["target"] = rng.integers(0, a.vms, size=W, dtype=np.uint8)
     w.tofile(a.out)
     with open(a.out + ".manifest.txt", "w") as m:
         m.write("# vectordb writes (CXL_SWMC/workloads/vectordb/tools/gen_writes.py)\n")

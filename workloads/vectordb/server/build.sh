@@ -11,6 +11,8 @@ c++ "${FLAGS[@]}" "$HERE/server.cc" -o "$OUT/bin/vdb-server"
 c++ "${FLAGS[@]}" "$HERE/../tools/build_index.cc" -o "$OUT/bin/vdb-build-index"
 { echo "# vdb-server build (CXL_SWMC/workloads/vectordb/server/build.sh)"; echo "date=$(date -Is)"
   echo "source_commit=$(git -C "$HERE" rev-parse HEAD) dirty=$(git -C "$HERE" status --porcelain -- "$HERE/.." "$ROOT/systems/common" "$ROOT/experiments/loadgen" | wc -l)"
+  echo "source_dirty_files=$(git -C "$HERE" status --porcelain -- "$HERE/.." "$ROOT/systems/common" "$ROOT/experiments/loadgen" | awk '{print $2}' | tr '\n' ' ')"
+  echo "source_dirty_diff_sha256=$(git -C "$HERE" diff HEAD -- "$HERE/.." "$ROOT/systems/common" "$ROOT/experiments/loadgen" | sha256sum | cut -c1-64)"
   echo "cxx=$(c++ --version | head -1)"
   (cd "$OUT" && find bin -type f | sort | while read -r f; do echo "sha256[$f]=$(sha256sum "$f" | cut -d' ' -f1)"; done)
   echo "glibc_max=$(objdump -T "$OUT"/bin/* | grep -o 'GLIBC_[0-9.]*' | sort -Vu | tail -1)"

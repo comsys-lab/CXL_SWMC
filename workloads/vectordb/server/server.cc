@@ -34,6 +34,7 @@
 #include "frame.h"
 #include "layout.h"
 #include "megalon_backend.h"
+#include "proc_stats.h"
 #include "proto.h"
 #include "shm_hnsw.h"
 
@@ -71,6 +72,7 @@ struct Opts {
   std::string region;    // region config (default $CXL_REGION_CONFIG)
   std::string backend = "plain";
   std::string megalon_lib;  // default: <dir of the executable>/../lib/libvdb-megalon.so
+  std::string trace_dir;    // measurement traces written at stop (empty: none)
 };
 
 struct Conn {
@@ -119,8 +121,9 @@ class Queue {
 };
 
 struct Stats {
-  std::atomic<uint64_t> inserts{0}, deletes{0}, searches{0}, timeouts{0}, bad_records{0}, dists{0}, wait_ns{0},
-      replay_ns{0}, search_ns{0}, lock_ns{0}, insert_ns{0}, insert_lock_ns{0};
+  std::atomic<uint64_t> inserts{0}, deletes{0}, updates{0}, searches{0}, timeouts{0}, bad_records{0}, dists{0},
+      wait_ns{0}, replay_ns{0}, search_ns{0}, lock_ns{0}, insert_ns{0}, insert_lock_ns{0}, update_ns{0},
+      search_busy_ns{0}, writer_busy_ns{0};
 };
 
 template <class Be>
@@ -138,7 +141,11 @@ class Server {
       // Megalon maps the whole device at map_va when its library initialises (dlopen; joins the run and waits in its
       // start barrier for every node); the server uses that mapping and never maps the device itself.
       if (2 + o_.search_threads > 32) die("megalon: at most 32 registered threads per node (main, writer, searchers)");
+      // threads the library starts while it initialises inherit this name (stats: thr.megalon-lib.*, the coherence
+      // library's own CPU); the main thread gets its process name back afterwards (pgrep -x vdb-server)
+      cxl::proc::name_thread("megalon-lib");
       api_ = megalon_load(o_.megalon_lib, &err);
+      cxl::proc::name_thread("vdb-server");
       if (!api_) die(err);
       if (api_->node_id() != o_.node) die("megalon node id " + std::to_string(api_->node_id()) + " != --node");
       if (!mapped_by(r_.map_va, r_.device_size, r_.device, &err)) die(err);
@@ -157,6 +164,8 @@ class Server {
     if constexpr (std::is_same_v<Be, MegalonBackend>) be_ = std::make_unique<Be>(r_, map_, p_, api_);
     else be_ = std::make_unique<Be>(r_, map_, p_);
     if (!be_->fits(&err)) die(err);
+    if constexpr (std::is_same_v<Be, MegalonBackend>)
+      be_->set_trace(o_.trace_dir.empty() ? nullptr : h_->wsec, !o_.trace_dir.empty(), o_.node);
     be_->thread_init(0);  // main thread: prepare (object creation, initial copy) and warm-up
     for (uint32_t s = 0; s < p_.segments; s++) g_.push_back(std::make_unique<Graph>(p_.g, be_->mem(s, &h_->segs[s].meta)));
     std::fprintf(stderr,
@@ -187,19 +196,32 @@ class Server {
     std::thread([this] { listen_loop(); }).detach();
   }
 
+  // End of run: measurement traces into --trace-dir (node<K>.*; the harness collects node<K>.* from the run dir).
+  void dump_traces() {
+    if (o_.trace_dir.empty()) return;
+    std::string err;
+    if constexpr (std::is_same_v<Be, MegalonBackend>)
+      if (!be_->dump_trace(o_.trace_dir + "/node" + std::to_string(o_.node), &err)) std::fprintf(stderr, "vdb-server: %s\n", err.c_str());
+  }
+
   std::string stats_text() {
     std::ostringstream o;
     uint64_t elems = 0;
     for (auto &g : g_) elems += g->count();
     o << "node=" << o_.node << "\nP=" << load_acquire(h_->P) << "\nelements=" << elems << "\ninserts=" << st_.inserts
-      << "\ndeletes=" << st_.deletes << "\nsearches=" << st_.searches << "\ntimeouts=" << st_.timeouts
+      << "\ndeletes=" << st_.deletes << "\nupdates=" << st_.updates << "\nsearches=" << st_.searches << "\ntimeouts=" << st_.timeouts
       << "\nbad_records=" << st_.bad_records << "\ndists=" << st_.dists << "\nwait_ms=" << st_.wait_ns / 1000000
       << "\nreplay_ms=" << st_.replay_ns / 1000000 << "\nsearch_ms=" << st_.search_ns / 1000000
       << "\nsearch_lock_ms=" << st_.lock_ns / 1000000 << "\ninsert_ms=" << st_.insert_ns / 1000000
       << "\ninsert_lock_ms=" << st_.insert_lock_ns / 1000000 << "\nwrite_queue=" << wq_.size()
+      << "\nsearch_busy_ns=" << st_.search_busy_ns << "\nwriter_busy_ns=" << st_.writer_busy_ns
+      << "\nupdate_ns=" << st_.update_ns << "\nsearch_ns_total=" << st_.search_ns << "\nwait_ns_total=" << st_.wait_ns
+      << "\nreplay_ns_total=" << st_.replay_ns << "\nsearch_lock_ns_total=" << st_.lock_ns
+      << "\ninsert_ns_total=" << st_.insert_ns << "\ninsert_lock_ns_total=" << st_.insert_lock_ns
       << "\nsearch_queue=" << search_queue_len();
     for (uint32_t v = 0; v < p_.nr_nodes; v++) o << "\ndlog_count." << v << "=" << load_acquire(&h_->nodes[v].dlog_count);
     o << "\nbackend=" << be_->usage() << "\n" << be_->stats();
+    o << "\n" << cxl::proc::text(pst_);
     return o.str();
   }
 
@@ -331,40 +353,67 @@ class Server {
 
   // ---------------------------------------------------------------- writer (this node's writes, arrival order)
   void writer() {
+    cxl::proc::name_thread("vdb-writer");
     be_->thread_init(1);
+    const uint32_t dim = p_.g.dim;
     for (;;) {
       Job j = wq_.pop();
+      const uint64_t b0 = now_ns();
       const uint32_t n = frame::payload_len(j.h);
-      if (j.h.code == kOpInsert && n == sizeof(InsertReq) + p_.g.dim * 4) {
+      if (j.h.code == kOpInsert && n == sizeof(InsertReq) + dim * 4) {
         InsertReq rq;
         std::memcpy(&rq, j.p.data(), sizeof(rq));
-        if (rq.id >= p_.max_ids || rq.w_seq == 0 || rq.w_seq > p_.max_writes) { bad(j); continue; }
-        const uint64_t t0 = now_ns();
-        SegLines &sl = h_->segs[p_.seg_of(rq.id)];
-        cxl::hwcc::write_lock(&sl.lock);
-        const uint64_t t1 = now_ns();
-        try {
-          g_[p_.seg_of(rq.id)]->insert(rq.id, rq.w_seq, reinterpret_cast<const float *>(j.p.data() + sizeof(rq)), rng_);
-        } catch (const std::exception &e) {  // never leave the cross-VM write lock held (peers would spin)
-          cxl::hwcc::write_unlock(&sl.lock);
-          die(std::string("insert: ") + e.what());
-        }
-        cxl::hwcc::write_unlock(&sl.lock);
-        st_.insert_lock_ns += t1 - t0;
-        st_.insert_ns += now_ns() - t0;
-        finish_write(j, rq.w_seq);
+        if (!valid(rq.id, rq.w_seq)) { bad(j); continue; }
+        do_insert(rq.w_seq, rq.id, reinterpret_cast<const float *>(j.p.data() + sizeof(rq)));
+        publish(rq.w_seq);
+        reply_write(j, rq.w_seq);
         st_.inserts++;
       } else if (j.h.code == kOpDelete && n == sizeof(DeleteReq)) {
         DeleteReq rq;
         std::memcpy(&rq, j.p.data(), sizeof(rq));
-        if (rq.id >= p_.max_ids || rq.w_seq == 0 || rq.w_seq > p_.max_writes) { bad(j); continue; }
+        if (!valid(rq.id, rq.w_seq)) { bad(j); continue; }
         do_delete(rq.w_seq, rq.id);
-        finish_write(j, rq.w_seq);
+        publish(rq.w_seq);
+        reply_write(j, rq.w_seq);
         st_.deletes++;
+      } else if (j.h.code == kOpUpdate && n == sizeof(UpdateReq) + dim * 4) {
+        UpdateReq rq;
+        std::memcpy(&rq, j.p.data(), sizeof(rq));
+        if (!valid(rq.del_id, rq.w_del) || !valid(rq.ins_id, rq.w_ins) || rq.w_ins != rq.w_del + 1) { bad(j); continue; }
+        const uint64_t t0 = now_ns();
+        do_delete(rq.w_del, rq.del_id);
+        publish(rq.w_del);
+        do_insert(rq.w_ins, rq.ins_id, reinterpret_cast<const float *>(j.p.data() + sizeof(rq)));
+        publish(rq.w_ins);
+        reply_write(j, rq.w_ins);
+        st_.update_ns += now_ns() - t0;
+        st_.updates++;
+        st_.deletes++;
+        st_.inserts++;
       } else {
         bad(j);
+        continue;
       }
+      st_.writer_busy_ns += now_ns() - b0;
     }
+  }
+
+  bool valid(uint64_t id, uint32_t w) const { return id < p_.max_ids && w != 0 && w <= p_.max_writes; }
+
+  void do_insert(uint32_t w, uint64_t id, const float *vec) {
+    const uint64_t t0 = now_ns();
+    SegLines &sl = h_->segs[p_.seg_of(id)];
+    cxl::hwcc::write_lock(&sl.lock);
+    const uint64_t t1 = now_ns();
+    try {
+      g_[p_.seg_of(id)]->insert(id, w, vec, rng_);
+    } catch (const std::exception &e) {  // never leave the cross-VM write lock held (peers would spin)
+      cxl::hwcc::write_unlock(&sl.lock);
+      die(std::string("insert: ") + e.what());
+    }
+    cxl::hwcc::write_unlock(&sl.lock);
+    st_.insert_lock_ns += t1 - t0;
+    st_.insert_ns += now_ns() - t0;
   }
 
   void bad(Job &j) { j.c->reply(frame::kStatusBadRequest, j.h.req_id, nullptr, 0); }
@@ -381,7 +430,7 @@ class Server {
   }
 
   // applied[w] then advance P over contiguous set bits (every node's writer races through CAS)
-  void finish_write(Job &j, uint32_t w) {
+  void publish(uint32_t w) {
     fetch_or(&h_->applied[w >> 6], uint64_t(1) << (w & 63));
     uint64_t p = load_acquire(h_->P);
     for (;;) {
@@ -390,6 +439,9 @@ class Server {
       if (q == p || cxl::hwcc::cas(h_->P, &p, q)) break;
     }
     h_->nodes[o_.node].writes_applied++;
+  }
+
+  void reply_write(Job &j, uint32_t w) {
     WriteResp r{w, uint32_t(load_acquire(h_->P))};
     j.c->reply(frame::kStatusOk, j.h.req_id, &r, sizeof(r));
   }
@@ -433,6 +485,7 @@ class Server {
   }
 
   void searcher(int tid) {
+    cxl::proc::name_thread("vdb-search");
     be_->thread_init(tid);
     for (;;) {
       QueryCtx *task = nullptr;
@@ -448,13 +501,18 @@ class Server {
           queries_.pop_front();
         }
       }
+      const uint64_t b0 = now_ns();
       if (task) {
         run_segment(task);
         release(task);
+        st_.search_busy_ns += now_ns() - b0;
         continue;
       }
       QueryCtx *c = start_query(std::move(job));
-      if (!c) continue;
+      if (!c) {
+        st_.search_busy_ns += now_ns() - b0;
+        continue;
+      }
       c->refs.store(p_.segments);  // S - 1 task entries + this owner
       {
         std::lock_guard<std::mutex> g(smu_);
@@ -464,6 +522,7 @@ class Server {
       while (run_segment(c)) {
       }
       release(c);
+      st_.search_busy_ns += now_ns() - b0;
     }
   }
 
@@ -575,6 +634,7 @@ class Server {
 
   // ---------------------------------------------------------------- network
   void listen_loop() {
+    cxl::proc::name_thread("vdb-listen");
     int ls = socket(AF_INET, SOCK_STREAM, 0), one = 1;
     setsockopt(ls, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
     sockaddr_in a{};
@@ -597,6 +657,7 @@ class Server {
   }
 
   void read_conn(std::shared_ptr<Conn> c) {
+    cxl::proc::name_thread("vdb-conn");
     frame::header h;
     while (frame::read_full(c->fd, &h, sizeof(h))) {
       if (h.len < frame::kHeaderTail || h.len > frame::kMaxFrame) break;
@@ -604,7 +665,8 @@ class Server {
       if (!j.p.empty() && !frame::read_full(c->fd, j.p.data(), j.p.size())) break;
       switch (h.code) {
         case kOpInsert:
-        case kOpDelete: wq_.push(std::move(j)); break;
+        case kOpDelete:
+        case kOpUpdate: wq_.push(std::move(j)); break;
         case kOpSearch: push_search(std::move(j)); break;
         case kOpStats: {
           std::string t = stats_text();
@@ -626,6 +688,9 @@ class Server {
   std::unique_ptr<Be> be_;
   std::vector<std::unique_ptr<Graph>> g_;
   Stats st_;
+  cxl::proc::Opts pst_{{"cxl_recv"},
+                       {"TLB", "CAL", "RES", "LOC"},
+                       {"/sys/kernel/swmc/page_coherence", "/sys/kernel/swmc/instr", "/sys/kernel/cxl_shm"}};
   Queue wq_;
   std::mutex smu_;  // search scheduling
   std::condition_variable scv_;
@@ -653,6 +718,7 @@ int run(const Opts &o) {
   s.start();
   while (!g_stop) usleep(200000);
   std::fprintf(stderr, "vdb-server: stopping\n%s", s.stats_text().c_str());
+  s.dump_traces();
   std::fflush(stderr);
   std::_Exit(0);
 }
@@ -664,6 +730,7 @@ void usage() {
                "  [--dim D] [--M M] [--efc E] [--chunk-bytes B (32 MiB)] [--max-writes W] [--max-ids N] [--dlog-chunk E] [--max-deletes D]\n"
                "  [--wait-timeout-ms T] [--start-timeout-ms T] [--backend plain|megalon] [--megalon-lib PATH]\n"
                "  [--preload-only | --preloaded]   Popcorn init_state=shared: node 0 writes the initial chunks before enable\n"
+               "  [--trace-dir DIR]   measurement traces at stop (Megalon: node<K>.megalon-{wsec,retry}.bin)\n"
                "--backend megalon: Megalon (RACKOBJ_CONFIG, object_arena_size > 0) maps the device; MEGALON_NODE_ID and\n"
                "  MEGALON_RUN_ID default to --node and --run-id, CXL_REGION_CONFIG to --region (DESIGN.md §12).\n"
                "All nodes need identical parameters (checked through the HWcc app layout hash).\n"
@@ -707,6 +774,7 @@ int main(int argc, char **argv) {
     else if (a == "--print-app-bytes") print_bytes = true;
     else if (a == "--preload-only") o.preload_only = true;
     else if (a == "--preloaded") o.preloaded = true;
+    else if (a == "--trace-dir") o.trace_dir = v();
     else usage();
   }
   o.p.derive();

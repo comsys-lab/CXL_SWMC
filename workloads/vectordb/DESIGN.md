@@ -48,9 +48,14 @@ into a single `cxl_region` struct; nothing else defines offsets.
 
 - Insert(id, vec): new id, never reused. Delete(id): exclude an existing id
   from search; no physical reclamation. Search(q, k=10).
-- Main workload: searches run while data is replaced by independent
-  Delete(old) and Insert(new) requests (not an atomic replacement). Counts
-  are reported per operation; "one replacement" = 1 delete + 1 insert.
+- Main workload (user 2026-10-16): searches run while records are replaced
+  by Update requests. Update(del_id, ins_id, vec) = delete one live record
+  (chosen uniformly) + insert the next pool B record, one request to one node,
+  applied and published by that node's writer in that order (two w_seq:
+  w_del, w_ins = w_del + 1; not atomic: a snapshot s = w_del sees neither
+  record), one response after both (WriteResp.w_seq = w_ins). Throughput and
+  latency are per update (an update is one operation in total ops/s).
+  Earlier runs (before 2026-10-16) sent independent Insert/Delete requests.
 - Delete targets: uniform over the live set at trace time, fixed seed.
 - Data: PubMed BGE 768-d (`binbin10/PubMed_bge`), split into disjoint
   pool A (initial N, e.g. 1M) and pool B (inserts). Replacements are between
@@ -196,8 +201,8 @@ Atomicity and coherence are separate problems.
 - GT: exact top-10 of the ref_w snapshot of the common trace, computed offline
   (top-K' per query over all pools, filter by (ins_seq, del_seq), brute-force
   fallback when < 10 remain). Never computed during measurement.
-- Metrics: search QPS, p50/p99 (from scheduled time), insert/s and delete/s
-  separately, visibility latency, recall@10 (timeouts/unserved count as
+- Metrics: search QPS, p50/p99 (from scheduled time), update/s (earlier runs: insert/s and delete/s
+  separately), visibility latency, recall@10 (timeouts/unserved count as
   misses; success-only value also reported), write backlog over time, timeouts,
   cost counters (Megalon: flushes/bytes, read retries, log replays; Popcorn:
   faults, invalidations).
@@ -214,11 +219,12 @@ Atomicity and coherence are separate problems.
 - Generic engine: CXL_SWMC/experiments/loadgen (open-loop, latency from the scheduled time, warmup, steps,
   max throughput under SLO by ramp + bisection + confirm repeats; README there). Binary frames over TCP
   (frame.h; python/frame.py for Python callers such as a LangChain VectorStore).
-- vectordb plugin (loadgen/vectordb_plugin.cc): stream `write` (ordered, writes file from tools/gen_writes.py
-  in w_seq order, each to its target VM) and stream `search` (query row and target drawn with the seed).
-  Searches are made at run time, in global schedule order, so ref_w = the last write made before the search =
-  the last write scheduled at or before it (E1, §4). The trace therefore holds only the write order; rates come
-  from the loadgen step.
+- vectordb plugin (loadgen/vectordb_plugin.cc): stream `update` (ordered; writes file from
+  `tools/gen_writes.py --mode update` = DELETE w, INSERT w+1 pairs with one target, checked at init; each pair is
+  one kOpUpdate request) and stream `search` (query row and target drawn with the seed). Searches are made at run
+  time, in global schedule order, so ref_w = the last write made before the search = the insert w_seq of the last
+  update scheduled at or before it (E1, §4). The trace therefore holds only the write order; rates come from the
+  loadgen step. (Until 2026-10-16 the stream was `write`: one request per INSERT/DELETE record.)
 - GT/recall: tools/compute_gt.py after the run from writes + searches.bin (also counts E1 violations:
   returned ids not visible at the snapshot).
 - Loadgen pinned to Host node1 CPUs; requests go straight to target VMs (no coordinator).
@@ -281,6 +287,33 @@ indexing unit; Megalon flushes the whole object at write end (no dirty-line trac
   invisible_returned 0, timeouts 0 (also with 256-entry delete-log chunks and inserts crossing into new groups);
   read retries (incoherent) occurred and were re-run. A file region is HW coherent, so this proves the API usage,
   not the coherence protocol (see Limitation above).
+
+## 13. Measurement (implemented 2026-10-16; MOT1 v4 H1 "Instrumentation", §4.3; coherence behaviour unchanged)
+
+- Stats request (kOpStats = 10, text): server counters (`updates`, `inserts`, `deletes`, `searches`, `P`,
+  `search_busy_ns` = worker time on query/segment tasks, `writer_busy_ns`, `update_ns`, `*_ns_total` times), the
+  backend's counters (Megalon `megalon.*` object counters and `megt.*` wrapper timers) and
+  `systems/common/proc_stats.h`: per thread role (threads named `vdb-search`, `vdb-writer`, `vdb-conn`,
+  `vdb-listen`; main = `vdb-server`; threads Megalon starts while it initialises inherit `megalon-lib`, its log
+  thread names itself `nr-log-sync`) CPU ticks and schedstat run/run-queue-wait ns, per-thread Popcorn counters
+  (`/proc/self/task/<tid>/swmc`, Popcorn build >= 8) summed per role, `cxl_recv*` kernel-thread CPU, `/proc/interrupts`
+  TLB/CAL/RES/LOC, `/proc/stat` cpu, page faults, sysfs counters of `/sys/kernel/swmc/page_coherence`,
+  `/sys/kernel/swmc/instr` ("name value" files) and `/sys/kernel/cxl_shm`. A snapshot reads /proc and sysfs
+  (Host test: ~15 ms; it runs on the connection's reader thread).
+- Per measured step: loadgen `--stats-op 10` takes a snapshot per node at the window start and end; offline
+  `experiments/loadgen/stats_delta.py` (deltas) and `export_csv.py` (derived columns) — experiments/vectordb/README.md.
+- Megalon wrapper timers (server/megalon_backend.h): 1 in 64 read sections (random per section) timed as
+  read_start / body / read_end; failed attempts of timed sections timed in full; every write section timed
+  (write_start, body, write_end incl. flush). `rd_retries` counts every failed ObjectReadEnd. ObjectReadStart's
+  internal "incoherent" flush-and-retry (`megalon.read_retry_incoherent`) is inside read_start time, not a retry.
+- False-sharing log (`--trace-dir`, Megalon only): HWcc line `wsec` (app layout, all backends; unused by plain)
+  is incremented after every write_end (one HWcc atomic per write section) and read before every read_start (one
+  HWcc load per read section); write sections log (seq, object, written ranges), failed reads log (object, read range,
+  s0 = counter before read_start, s1 = after the failed read_end); dumped at stop as
+  `node<K>.megalon-{wsec,retry}.bin`; `tools/classify_retries.py` classifies each retry (peer write in (s0, s1] on the
+  same object: overlapping range = true sharing, disjoint = false sharing, none = unexplained).
+- Host smoke test: tests/host_smoke.sh (2 processes on a scratch file, plain or Megalon); unit tests
+  tests/plugin_pairs_test.cc, tests/classify_retries_test.py, experiments/loadgen/test/stats_delta_test.py.
 
 ## 10. Future reference: E2 (not implemented)
 

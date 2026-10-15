@@ -1,6 +1,8 @@
 // loadgen plugin "vectordb" (workloads/vectordb/DESIGN.md, experiments/loadgen/README.md).
-// Streams: "write" (ordered; the writes file in w_seq order, each to its target VM) and "search" (query row and
-// target drawn with the seed; E1 snapshot ref_w = last write made before it, i.e. scheduled before it).
+// Streams: "update" (ordered; the writes file in w_seq order, two records per update: DELETE w, INSERT w+1, same
+// target VM -> one kOpUpdate request) and "search" (query row and target drawn with the seed; E1 snapshot ref_w = last
+// write made before it, i.e. the insert's w_seq of the last update scheduled before it). The writes file must come
+// from tools/gen_writes.py --mode update (checked at init); an update counts as one request/operation.
 // Options: data=DIR (pool_b.fbin, queries.fbin), writes=FILE (tools/gen_writes.py), k=10, seed=N,
 //          max_searches=N (default 100M; result slots are allocated in chunks as used).
 // Output: <out>/searches.bin, one record per search response (header struct below + ids[k] u64 + scores[k] f32),
@@ -97,32 +99,39 @@ class VectorDb : public loadgen::Workload {
         return *err = "writes file record " + std::to_string(i) + " invalid for " + std::to_string(targets) +
                       " targets", false;
     }
+    if (!check_pairs(writes_, err)) return false;
     chunks_.reset(new std::atomic<Slot *>[kMaxChunks]);
     for (uint64_t i = 0; i < kMaxChunks; i++) chunks_[i].store(nullptr);
     writes_path_ = writes, data_ = data;
     return true;
   }
 
-  std::vector<loadgen::StreamSpec> streams() const override { return {{"write", true}, {"search", false}}; }
+  // Update pairs (gen_writes.py --mode update): record 2k = DELETE (w_seq 2k+1), record 2k+1 = INSERT (w_seq 2k+2),
+  // same target. Records are already checked for w_seq order, targets and pool B rows.
+  static bool check_pairs(const std::vector<WriteRec> &w, std::string *err) {
+    if (w.size() % 2) return *err = "writes file: odd record count (not update pairs; gen_writes.py --mode update)", false;
+    for (size_t i = 0; i < w.size(); i += 2)
+      if (w[i].op != vdb::kOpDelete || w[i + 1].op != vdb::kOpInsert || w[i].target != w[i + 1].target)
+        return *err = "writes file: records " + std::to_string(i) + "/" + std::to_string(i + 1) +
+                      " are not a DELETE+INSERT pair to one target (gen_writes.py --mode update)", false;
+    return true;
+  }
+
+  std::vector<loadgen::StreamSpec> streams() const override { return {{"update", true}, {"search", false}}; }
 
   bool make(uint32_t stream, loadgen::Request *r, std::vector<uint8_t> *p) override {
     if (stream == 0) {
-      if (next_w_ >= writes_.size()) return false;
-      const WriteRec &w = writes_[next_w_];
+      if (next_w_ + 2 > writes_.size()) return false;
+      const WriteRec &d = writes_[next_w_], &w = writes_[next_w_ + 1];
       r->target = w.target;
-      r->op = w.op;
-      r->seq = next_w_++;
-      if (w.op == vdb::kOpInsert) {
-        vdb::InsertReq q{w.w_seq, 0, w.id};
-        p->resize(sizeof(q) + dim_ * 4);
-        std::memcpy(p->data(), &q, sizeof(q));
-        std::memcpy(p->data() + sizeof(q), pool_b_.rows + uint64_t(w.vec_ref) * dim_, dim_ * 4);
-      } else {
-        vdb::DeleteReq q{w.w_seq, 0, w.id};
-        p->resize(sizeof(q));
-        std::memcpy(p->data(), &q, sizeof(q));
-      }
-      last_w_ = w.w_seq;
+      r->op = vdb::kOpUpdate;
+      r->seq = next_w_ / 2;  // update index
+      vdb::UpdateReq q{d.w_seq, w.w_seq, d.id, w.id};
+      p->resize(sizeof(q) + dim_ * 4);
+      std::memcpy(p->data(), &q, sizeof(q));
+      std::memcpy(p->data() + sizeof(q), pool_b_.rows + uint64_t(w.vec_ref) * dim_, dim_ * 4);
+      next_w_ += 2;
+      last_w_ = w.w_seq;  // E1: the insert's w_seq (the update's last write)
       return true;
     }
     if (next_s_ >= max_searches_) return false;
@@ -143,7 +152,11 @@ class VectorDb : public loadgen::Workload {
   void on_response(const loadgen::Request &r, bool measured, uint16_t status, const uint8_t *p,
                    uint32_t len) override {
     if (r.op != vdb::kOpSearch) {
-      if (status != frame::kStatusOk) write_errors_.fetch_add(1);
+      vdb::WriteResp wr{};
+      if (status == frame::kStatusOk && len == sizeof(wr)) std::memcpy(&wr, p, sizeof(wr));
+      // OK response for an update carries the insert's w_seq (= 2 * (update index + 1))
+      if (status != frame::kStatusOk || len != sizeof(wr) || wr.w_seq != uint32_t(2 * (r.seq + 1)))
+        write_errors_.fetch_add(1);
       return;
     }
     Slot *s = slot(r.seq, false);
@@ -183,9 +196,10 @@ class VectorDb : public loadgen::Workload {
     }
     std::fclose(f);
     FILE *t = std::fopen((dir + "/vectordb.txt").c_str(), "w");
-    std::fprintf(t, "writes_made=%lu\nlast_w=%u\nsearches_made=%lu\nwrite_errors=%lu\nbad_search_responses=%lu\n"
-                 "search_record_bytes=%zu\nk=%u\n",
-                 (unsigned long)next_w_, last_w_, (unsigned long)next_s_, (unsigned long)write_errors_.load(),
+    std::fprintf(t, "updates_made=%lu\nwrites_made=%lu\nlast_w=%u\nsearches_made=%lu\nwrite_errors=%lu\n"
+                 "bad_search_responses=%lu\nsearch_record_bytes=%zu\nk=%u\n",
+                 (unsigned long)(next_w_ / 2), (unsigned long)next_w_, last_w_, (unsigned long)next_s_,
+                 (unsigned long)write_errors_.load(),
                  (unsigned long)bad_responses_.load(), sizeof(SearchLog) + size_t(k_) * 12, k_);
     std::fclose(t);
     if (write_errors_.load()) *err = "write errors " + std::to_string(write_errors_.load());
@@ -194,7 +208,7 @@ class VectorDb : public loadgen::Workload {
 
   std::string describe() const override {
     return "vectordb data=" + data_ + " writes=" + writes_path_ + " (" + std::to_string(writes_.size()) +
-           ") k=" + std::to_string(k_) + " seed=" + std::to_string(seed_) + " dim=" + std::to_string(dim_);
+           " records, update pairs) k=" + std::to_string(k_) + " seed=" + std::to_string(seed_) + " dim=" + std::to_string(dim_);
   }
 
  private:

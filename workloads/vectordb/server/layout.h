@@ -56,7 +56,7 @@ struct alignas(64) SegLines {  // HWcc per segment: lock and graph meta on separ
 
 struct HwccLayout {
   cxl::hwcc::layout L;
-  uint64_t off_p, off_nodes, off_applied, off_segs;
+  uint64_t off_p, off_nodes, off_applied, off_segs, off_wsec;
   // backend_tag: "" for plain (hash unchanged), " backend=megalon" for Megalon; the size never depends on it
   explicit HwccLayout(const Params &p, const char *backend_tag = "") {
     L.add(("vdb-seg " + p.describe() + backend_tag).c_str(), 0, 8);  // parameters go into the layout hash
@@ -64,6 +64,7 @@ struct HwccLayout {
     off_nodes = L.add("nodes", uint64_t(p.nr_nodes) * sizeof(NodeLine));
     off_applied = L.add("applied", (p.max_writes + 1 + 63) / 64 * 8);
     off_segs = L.add("segments", uint64_t(p.segments) * sizeof(SegLines));
+    off_wsec = L.add("wsec", 64);  // measurement: Megalon write-section counter (trace); unused by plain
   }
 };
 
@@ -72,11 +73,13 @@ struct Hwcc {
   NodeLine *nodes;
   uint64_t *applied;
   SegLines *segs;
+  uint64_t *wsec;
   Hwcc(uint8_t *app, const HwccLayout &h)
       : P(reinterpret_cast<uint64_t *>(app + h.off_p)),
         nodes(reinterpret_cast<NodeLine *>(app + h.off_nodes)),
         applied(reinterpret_cast<uint64_t *>(app + h.off_applied)),
-        segs(reinterpret_cast<SegLines *>(app + h.off_segs)) {}
+        segs(reinterpret_cast<SegLines *>(app + h.off_segs)),
+        wsec(reinterpret_cast<uint64_t *>(app + h.off_wsec)) {}
 };
 
 }  // namespace vdb
