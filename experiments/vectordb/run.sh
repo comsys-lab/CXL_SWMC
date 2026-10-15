@@ -84,6 +84,11 @@ stop_nodes
 collect
 host_check after
 echo "end=$(date -Is) loadgen_rc=$LG" >> "$RUN/manifest.txt"
+# spreadsheet/plot outputs, always (CSV: one row per step and stream)
+if [ -s "$RUN/loadgen/steps.jsonl" ] && [ -s "$RUN/loadgen/summary.json" ]; then
+  python3 "$ROOT/experiments/loadgen/export_csv.py" --out "$RUN/steps.csv" "$RUN/loadgen=$SYSTEM" > /dev/null || true
+  python3 "$ROOT/experiments/loadgen/plot_slo.py" --out "$RUN/slo.png" "$RUN/loadgen=$SYSTEM" > "$RUN/slo-points.txt" 2>&1 || true
+fi
 grep -h "vdb-server: stopping" -A30 "$RUN"/node*.log | grep -E "^(node|elements|inserts|deletes|searches|timeouts|bad_records)=" | tr '\n' ' '; echo
 [ "$LG" = 0 ] || { echo "run $NAME: loadgen rc=$LG"; exit 1; }
 echo "run $NAME: OK -> $RUN"

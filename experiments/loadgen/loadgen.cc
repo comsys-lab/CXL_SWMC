@@ -74,6 +74,7 @@ struct Config {
   double step_warmup_s = 3, step_measure_s = 15, drain_s = 5;
   double confirm_s = 30;
   uint32_t confirm_reps = 3;
+  std::vector<double> overload = {1.05, 1.1, 1.2};  // SLO mode: extra points at first-fail x f (past the knee)
   double tol = 0.05;            // achieved >= (1 - tol) * offered
   double max_err = 0.001;       // errors + timeouts / measured
   double abort_queue_s = 2.0;   // abort a step when outstanding > max(1000, rate * this)
@@ -98,6 +99,8 @@ void usage() {
                "  --warmup-s S --warmup-rate R          run-start warmup (default 10 s at the first rate)\n"
                "  --step-warmup-s S --step-measure-s S --drain-s S  (defaults 3, 15, 5)\n"
                "  --confirm-s S --confirm-reps N        SLO mode: repeats at the found rate (30 s x 3)\n"
+               "  --overload f1,f2,...|none             SLO mode: points at first-fail rate x f, measured in full\n"
+               "                                        (no early SLO abort) for the curve past the knee (1.05,1.1,1.2)\n"
                "  --tol T --max-err E --abort-queue-s S --lag-limit-us U\n"
                "  --arrival poisson|uniform --seed N --raw\n"
                "workloads:");
@@ -153,6 +156,12 @@ Config parse(int argc, char **argv) {
     else if (a == "--drain-s") c.drain_s = std::atof(need(i).c_str());
     else if (a == "--confirm-s") c.confirm_s = std::atof(need(i).c_str());
     else if (a == "--confirm-reps") c.confirm_reps = std::stoul(need(i));
+    else if (a == "--overload") {
+      std::string v = need(i);
+      c.overload.clear();
+      if (v != "none")
+        for (auto &f : split(v, ',')) c.overload.push_back(std::atof(f.c_str()));
+    }
     else if (a == "--tol") c.tol = std::atof(need(i).c_str());
     else if (a == "--max-err") c.max_err = std::atof(need(i).c_str());
     else if (a == "--abort-queue-s") c.abort_queue_s = std::atof(need(i).c_str());
@@ -300,10 +309,14 @@ class Engine {
       }
       best_ = good;
       best_bad_ = bad;
-      if (2 * fails <= c_.confirm_reps) return finish("");
+      if (2 * fails <= c_.confirm_reps) {
+        overload(bad);
+        return finish("");
+      }
       bad = good;
       good /= 1 + c_.precision;
     }
+    overload(best_bad_);
     return finish("confirm failed at three rates; the knee is noisy (longer --confirm-s?)");
   }
 
@@ -359,7 +372,16 @@ class Engine {
   }
 
   // One step: warmup_s at rate x (not measured), then measure_s measured; stop sending; drain.
-  StepResult step(const char *phase, double x, double warmup_s, double measure_s) {
+  // Points past the knee for the throughput/latency curve: measured in full (the early "SLO already exceeded"
+  // abort is off; the saturation abort stays). They never change the SLO result.
+  void overload(double first_fail) {
+    for (double f : c_.overload) {
+      StepResult s = step("overload", first_fail * f, c_.step_warmup_s, c_.step_measure_s, false);
+      if (s.exhausted) return;
+    }
+  }
+
+  StepResult step(const char *phase, double x, double warmup_s, double measure_s, bool slo_abort = true) {
     const size_t S = specs_.size();
     std::vector<double> rate = stream_rates(x);
     double total = 0;
@@ -401,7 +423,7 @@ class Engine {
           res.reason = "outstanding > " + std::to_string(queue_cap) + " (saturated)";
           break;
         }
-        if (measure_s > 0 && slo_rate > 0 && sched >= ws && double(slow_.load()) > allowed_slow + 10) {
+        if (slo_abort && measure_s > 0 && slo_rate > 0 && sched >= ws && double(slow_.load()) > allowed_slow + 10) {
           res.aborted = true;
           res.reason = "SLO percentile already exceeded";
           break;
@@ -577,6 +599,7 @@ class Engine {
       << " max_steps=" << c_.max_steps << "\nwarmup_s=" << c_.warmup_s << " warmup_rate=" << c_.warmup_rate
       << " step_warmup_s=" << c_.step_warmup_s << " step_measure_s=" << c_.step_measure_s
       << " drain_s=" << c_.drain_s << " confirm_s=" << c_.confirm_s << " confirm_reps=" << c_.confirm_reps
+      << " overload=" << [&] { std::string o; for (double f : c_.overload) o += (o.empty() ? "" : ",") + fmt(f); return o.empty() ? std::string("none") : o; }()
       << "\ntol=" << c_.tol << " max_err=" << c_.max_err << " abort_queue_s=" << c_.abort_queue_s
       << " lag_limit_us=" << c_.lag_limit_us << "\n";
     for (auto &kv : c_.mix) m << "mix." << kv.first << "=" << kv.second << "\n";
