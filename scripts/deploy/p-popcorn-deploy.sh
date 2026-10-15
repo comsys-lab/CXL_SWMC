@@ -16,7 +16,8 @@
 #             p-popcorn-guest.sh, popcorn.env) to $GT (comsys-owned, no sudo)
 #   rollback  stop VM (graceful, destroy after 120 s), define saved XML,
 #             verify, start on the original definition
-# Env (all required): VM IP C X G D GT K BZ BZ_SHA R
+# Env (all required): VM IP C X G D GT K BZ BZ_SHA R PRE_K
+#   PRE_K  release the VM must be running at precheck (e.g. 6.14.0-vanilla-1)
 #   C  common bundle dir (modules.tar, manifest, prepare scripts, tools/)
 #   X  per-VM XML dir (rollback-inactive.xml, candidate-{normal,restricted}.xml)
 #   G  guest staging dir (/var/tmp/<new>), D Host images dir (new),
@@ -24,7 +25,7 @@
 #   BZ_SHA its sha256, R evidence dir for this VM (new; parent must exist)
 set -euo pipefail
 umask 077
-: "${VM:?}" "${IP:?}" "${C:?}" "${X:?}" "${G:?}" "${D:?}" "${GT:?}" "${K:?}" "${BZ:?}" "${BZ_SHA:?}" "${R:?}"
+: "${VM:?}" "${IP:?}" "${C:?}" "${X:?}" "${G:?}" "${D:?}" "${GT:?}" "${K:?}" "${BZ:?}" "${BZ_SHA:?}" "${R:?}" "${PRE_K:?}"
 [[ "$G" =~ ^/var/tmp/[A-Za-z0-9._-]+$ ]] && [[ "$D" =~ ^/var/lib/libvirt/images/[A-Za-z0-9._-]+$ ]] &&
   [[ "$GT" =~ ^/home/comsys/[A-Za-z0-9._-]+$ ]] || { echo "bad G/D/GT"; exit 2; }
 CONSOLE=$C/vm-console.py
@@ -71,7 +72,7 @@ precheck)
   ssh_vm "test ! -e $G && test ! -L $G && test ! -e $GT && test ! -L $GT && test ! -e /lib/modules/$K && test ! -L /lib/modules/$K"
   ssh_vm "python3 -I -c 'import os,stat; assert all(stat.S_ISDIR(os.lstat(p).st_mode) for p in (\"/var\",\"/var/tmp\",\"/home/comsys\"))'"
   ssh_vm "uname -r; cat /proc/cmdline" > "$R/kernel-before.txt"
-  grep -qx '6.14.0-famfs-de-stijl+-p3a' <(head -1 "$R/kernel-before.txt") || { echo "STOP: VM does not run the p3a kernel"; exit 1; }
+  grep -qxF "$PRE_K" <(head -1 "$R/kernel-before.txt") || { echo "STOP: VM does not run $PRE_K"; exit 1; }
   nd_state > "$R/nd-before.txt"
   grep -q '"dev":"namespace0.0"' "$R/nd-before.txt"; grep -qx dax0.0 "$R/nd-before.txt"
   grep -q '"mode":"devdax"' "$R/nd-before.txt"; grep -q '"map":"mem"' "$R/nd-before.txt"

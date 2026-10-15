@@ -1,7 +1,11 @@
 #!/bin/bash
 # Package a built Popcorn kernel (tools/popcorn-build.sh <n>) for the
 # P3c-pattern deployment. Host-local only (no guest, no VM change, no sudo).
-#   p-popcorn-package.sh <n> <bundle-version>
+#   [XML_SRC=<dir>] p-popcorn-package.sh <n> <bundle-version>
+# XML_SRC: take each VM's rollback (= expected current inactive) XML from
+#   <dir>/cxl_vm<k>/candidate-normal.xml (e.g. the vanilla bundle, when the
+#   vanilla deployment precedes this one) instead of a fresh read-only
+#   `virsh dumpxml --inactive`; precheck cmp checks it at execution time.
 # Writes (all new; refuses if they exist):
 #   builds/popcorn_new/<n>/stage/ (reused if present)  modules_install (kernel + cxl_shm in updates/),
 #                                                      signed by the build's own key (kbuild), depmod -b
@@ -128,7 +132,11 @@ ENV
 
 # 4. per-VM candidate XMLs from the current inactive definitions (read-only virsh)
 for k in 0 1; do
-  virsh -c qemu:///system dumpxml --inactive "cxl_vm$k" > "$SCR/vm$k.xml"
+  if [ -n "${XML_SRC:-}" ]; then
+    cp "$XML_SRC/cxl_vm$k/candidate-normal.xml" "$SCR/vm$k.xml"
+  else
+    virsh -c qemu:///system dumpxml --inactive "cxl_vm$k" > "$SCR/vm$k.xml"
+  fi
   rmdir "$OUT/vm$k"
   python3 -I "$DEP/p-popcorn-xml.py" "$SCR/vm$k.xml" "/var/lib/libvirt/images/popcorn-new-$n-vm$k-v$v" "$K" "$OUT/vm$k"
   (cd "$OUT/vm$k" && sha256sum rollback-inactive.xml candidate-normal.xml candidate-restricted.xml > xml.sha256)
@@ -147,6 +155,7 @@ cat > "$OUT/package-record.json" <<JSON
   "cxl_swmc_commit": "$(git -C "$SW" rev-parse HEAD)", "cxl_swmc_dirty_files": $(git -C "$SW" status --porcelain -- scripts/deploy workloads/faultlat config | wc -l),
   "faultlat_sha256": "$(sha256sum "$OUT/tools/faultlat" | cut -d' ' -f1)",
   "cxl_shm_params": "$PARAMS",
+  "xml_source": "${XML_SRC:-virsh dumpxml --inactive (read-only, at packaging)}",
   "created": "$(date -Is)"
 }
 JSON
