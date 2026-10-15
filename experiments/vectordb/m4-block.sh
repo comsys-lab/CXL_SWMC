@@ -17,6 +17,7 @@ set -uo pipefail
 B=$1 R=$2 E=$3
 P=/home/comsys/sungsu/destijl-control X=$P/CXL_SWMC/experiments/vectordb
 KV=${KV:-6.14.0-vanilla-1}
+INIT_SUMS=$(sha256sum < $P/workspaces/vdb-data/seg32-c32m-a27m-m16-efc128-b1/SHA256SUMS | cut -d' ' -f1)  # Host image (5058 files)
 SSH="ssh -o BatchMode=yes -o ConnectTimeout=8"
 IPS=(192.168.122.100 192.168.122.101)
 [ -d "$E" ] && [ -z "$(ls -A "$E" | grep -v '^sequence')" ] || { echo "SEQUENCE STOP: $E missing or not empty"; exit 2; }
@@ -44,7 +45,7 @@ rate() { python3 -c 'import sys; x,u=float(sys.argv[1]),float(sys.argv[2]); asse
 precheck() {  # kernel release
   local kr=$1 i f
   for i in 0 1; do
-    $SSH comsys@${IPS[$i]} "EXPECT_K=$kr INIT_CHECK=$([ $i = 0 ] && echo 1 || echo 0) bash -s" < $X/m4-precheck.sh > "$E/precheck-${IPS[$i]}.out" 2>&1
+    $SSH comsys@${IPS[$i]} "EXPECT_K=$kr INIT_SUMS=$INIT_SUMS INIT_CHECK=$([ $i = 0 ] && echo 1 || echo 0) bash -s" < $X/m4-precheck.sh > "$E/precheck-${IPS[$i]}.out" 2>&1
     grep -q "^PRECHECK PASS" "$E/precheck-${IPS[$i]}.out" || { echo "SEQUENCE STOP: precheck ${IPS[$i]}"; exit 1; }
     for f in "vdb8/bin/vdb-server $P/builds/vdb/8/bin/vdb-server" "vdbm5/bin/vdb-server $P/builds/vdb-megalon/5/bin/vdb-server" \
              "vdbm5/lib/libvdb-megalon.so $P/builds/vdb-megalon/5/lib/libvdb-megalon.so" \
