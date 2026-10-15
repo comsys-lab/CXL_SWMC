@@ -19,6 +19,8 @@ w.writeheader()
 for d in sys.argv[1:]:
     for f in sorted(pathlib.Path(d).glob("*.json")):
         j = json.loads(f.read_text())
+        if "passes" not in j:  # contend results: stress_summary.py
+            continue
         k = j.get("kernel", {})
         for name, s in j["passes"].items():
             if not isinstance(s, dict):

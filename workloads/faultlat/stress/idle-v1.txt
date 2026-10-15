@@ -1,0 +1,4 @@
+# P-popcorn-stress v1, optional Part V (recv_mode idle or sleep; same kernel/load).  Same columns.
+v-ww-h8-t16      16   8    0   0   uniform 60
+v-rw-5050-h8-t64 64   8   50  50   uniform 60
+v-cr-w-t512     512 4096   0   0   partition 120 --max-ops 4

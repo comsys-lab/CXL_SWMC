@@ -1,0 +1,35 @@
+# P-popcorn-stress v1, Part S (init_state=invalid, recv_mode poll).  Columns:
+# name threads pages read_pct_node0 read_pct_node1 dist duration_s [extra; @0/@1/@a select node]
+# Windows: from BASE in file order, each pages rounded up to 1024 (p-popcorn-stress.sh parse).
+#
+# (1) write-write, 100 % writes on both nodes; threads per node 1, 8, 16 (= vCPUs), 64 (4x oversubscribed)
+ww-h1-t1      1   1    0   0   uniform 60
+ww-h1-t8      8   1    0   0   uniform 60
+ww-h1-t16    16   1    0   0   uniform 60
+ww-h1-t64    64   1    0   0   uniform 60
+ww-h8-t1      1   8    0   0   uniform 60
+ww-h8-t8      8   8    0   0   uniform 60
+ww-h8-t16    16   8    0   0   uniform 60
+ww-h8-t64    64   8    0   0   uniform 60
+# (2) read/write mix: node 0 all reads + node 1 all writes (read starvation under write priority), then 50/50
+rw-asym-h8-t1    1   8  100   0   uniform 60
+rw-asym-h8-t8    8   8  100   0   uniform 60
+rw-asym-h8-t16  16   8  100   0   uniform 60
+rw-asym-h8-t64  64   8  100   0   uniform 60
+rw-asym-h1-t16  16   1  100   0   uniform 60
+rw-5050-h8-t1    1   8   50  50   uniform 60
+rw-5050-h8-t8    8   8   50  50   uniform 60
+rw-5050-h8-t16  16   8   50  50   uniform 60
+rw-5050-h8-t64  64   8   50  50   uniform 60
+# T = 1 per node with reads: the SWMR probe is active (unfaulted remote change = missing invalidation)
+probe-h1-t1      1   1   50  50   uniform 60
+# (3) credit exhaustion: 512 threads per node (> 480 request slots per direction) each write 4 distinct fresh
+#     pages (state I on both nodes), released together; then node 1 reads fresh pages of its own partition
+cr-w-t512      512 4096   0   0   partition 120 --max-ops 4
+cr-rw-t512     512 4096   0 100   partition 120 --max-ops 4
+# (4) churn: node 0 reads + MADV_DONTNEED / fresh-VMA map-check-unmap every 200 us while node 1 writes
+churn-h8-t8      8   8  100   0   uniform 60 @0 --churn-us 200
+churn-h1-t1      1   1  100   0   uniform 60 @0 --churn-us 200
+# broader hot sets (zipf and uniform, read-mostly and 50/50)
+hot-h1024-t16-z90  16 1024  90  90  zipf    60
+hot-h1024-t16-u50  16 1024  50  50  uniform 60

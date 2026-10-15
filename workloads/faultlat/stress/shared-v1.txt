@@ -1,0 +1,6 @@
+# P-popcorn-stress v1, Part T (init_state=shared: every page S on both nodes at the start; preloaded init
+# stamps, runs with --skip-init --salt SALT).  Same columns as main-v1.txt.
+sh-ww-h8-t16      16   8    0   0   uniform 30
+sh-rw-5050-h8-t16 16   8   50  50   uniform 30
+sh-asym-h1-t16    16   1  100   0   uniform 30
+sh-probe-h1-t1     1   1   50  50   uniform 30

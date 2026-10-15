@@ -10,7 +10,9 @@ run it unchanged, the kernel counters are then just absent).
 
 Plugin layout: `setup.sh` (build), `run.sh` (one step on this node),
 `parse.py` (CSV summary), `scenarios.sh` (two-node step sequence, from the
-Host), `faultlat.cc` (the tool).
+Host), `faultlat.cc` (the tool), `contend.h` / `contend_test.cc` (contend data
+invariant + unit tests, `make test`), `stress_summary.py` + `stress/*.txt`
+(contend scenario matrices; driver `scripts/deploy/p-popcorn-stress.sh`).
 
 ## Build
 
@@ -137,3 +139,59 @@ ping-pong).
 
 Flush knobs at 0 are only correct on the hardware-coherent testbed and exist to
 measure their cost.
+
+## High-contention stress (`contend`)
+
+`faultlat contend` runs T threads per node (1..1024, nodes*T < 4095) on a hot
+set of H SWcc pages (`--pages H --page-offset P`) for D seconds; each op picks a
+page (`--dist uniform|zipf|partition`) and reads it (read ratio `--read-pct`,
+may differ per node) or writes it. All nodes run the same command with their
+`--node k`, the same `--run-id` (new per run) and `CXL_APP_HWCC_BYTES` =
+`faultlat contend --app-bytes --nodes N --threads T --pages H`.
+
+Data invariant (details in `contend.h`): a write stores one 8-byte stamp
+(writer, per-writer seq, 16 check bits) XOR a page/word mask in every word, in
+ascending order; a read loads the words in descending order and checks, with
+per-thread floors per (page, writer): no word older than a newer word of the
+same writer above it in the same scan (`stale_intra`), no regression below
+seqs seen in earlier scans or written by the thread itself (`stale_cross`),
+every word decodes for this page and offset (`corrupt`). After all writers
+stopped, every node checks that every word holds its writer's LAST write to
+that page (`final_stale`, `final_init_left`; last seqs exchanged through
+HWcc). Torn pages from concurrent writers are legal and not reported. With
+T = 1 and reads, the SWMR probe compares each scan with the thread's previous
+scan of that page: a change by another node's writer without any fault in
+between (RUSAGE_THREAD) means a missing invalidation
+(`unfaulted_remote_change`). On a hardware-coherent testbed the data checks
+can only see protocol bugs that change data (wrong pfn, copies, stale
+write-back); the probe also sees a PTE left mapped after a remote write.
+
+Liveness: per-thread progress sampled every `--interval-ms` (100):
+`starvation_samples` (thread did nothing while others progressed),
+`node_stall_samples`, `global_stall_samples` (node 0: nobody progressed),
+`max_thread_zero_ms`, per-thread op counts with min/max and Jain fairness,
+worker faults per op, read/write latency histograms (p50/p99/p99.9/max).
+Watchdog (`--watchdog-s`, default 10): no progress on this node, or one op in
+flight, for that long -> per-thread dump (in-flight page/op/age, state, wchan,
+peer threads' in-flight ops) in JSON and stderr, exit 3. SIGBUS -> stderr line,
+exit 4 (no JSON). Violation -> exit 2 (both nodes stop via the abort word;
+the peer exits 6). Coordination timeout (`--barrier-timeout-s`, 120) -> 5.
+
+Coordination uses only the HWcc app range below msg_ring (`hwcc_app.h`
+header/run_id handshake, phases, abort word, per-thread progress lines, last
+seq table); the hot set is the only SWcc memory touched. Node 0 writes the
+init stamp on the hot set unless `--skip-init` (init_state=shared: preload it
+before enable with `contend --init-only --pages H --page-offset P --salt S`
+through a plain mapping, then run with `--skip-init --salt S`).
+
+Other options: `--max-ops M` (per thread; with `partition`, every writer
+walks its own H/(N*T) pages once, so ops hit fresh pages: request-slot
+exhaustion test), `--churn-us U` (extra thread: MADV_DONTNEED of a random
+hot-set page every U us, every 8th time map it through a fresh VMA, check,
+unmap), `--think-ns`, `--cpu-list`, `--no-abort`, `--no-swmr-probe`,
+`--inject stale|corrupt|lost|stall|sigbus:N` (Host tests only).
+
+Matrices: `stress/main-v1.txt` (Part S), `stress/shared-v1.txt` (Part T),
+`stress/idle-v1.txt` (optional recv_mode idle/sleep). Driver and evidence
+layout: `scripts/deploy/p-popcorn-stress.sh`; packet
+`reports/P-popcorn-stress-packet.md`.
