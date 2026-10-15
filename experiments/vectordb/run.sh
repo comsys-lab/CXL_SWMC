@@ -71,7 +71,7 @@ for k in "${!NODE[@]}"; do
   STARTED+=("$k")
   $SSH comsys@"${NODE[$k]}" "$V/bin/vdb-node.sh start $V $GRUN $k $RID $APP $XE $SERVER_ARGS --port $PORT $EXTRA" < /dev/null
 done
-for k in "${!NODE[@]}"; do $SSH comsys@"${NODE[$k]}" "$V/bin/vdb-node.sh ready $GRUN $k 300" < /dev/null; done
+for k in "${!NODE[@]}"; do $SSH comsys@"${NODE[$k]}" "$V/bin/vdb-node.sh ready $GRUN $k ${READY_TIMEOUT:-300}" < /dev/null; done
 
 cpu_snap() {  # guest CPU time counters (/proc/stat "cpu" line) per node, for busy-fraction over the loadgen run
   for k in "${!NODE[@]}"; do echo "$1 node$k $($SSH comsys@"${NODE[$k]}" 'head -1 /proc/stat' < /dev/null)"; done >> "$RUN/guest-cpu.txt"
