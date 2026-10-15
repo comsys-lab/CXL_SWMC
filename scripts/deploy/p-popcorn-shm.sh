@@ -14,6 +14,14 @@
 #             reads Q (FETCH); checks data and counter deltas
 #   smoke     faultlat smoke.sh --execute (windows from $BASE), collect results
 #   status    counters and state of both guests -> $R/status-<STATUS_TAG>-vm<k>.txt
+#   instr-check  (build >= 8, after enable + chown) both guests: instr/ sysfs
+#             present and enabled, a comsys process touches one page of IPAGE
+#             (read, then write) and reads its own /proc/thread-self/swmc (16
+#             "name value" lines, mode 0400, its uid; read/wp counts >= 1)
+#   overhead  (build >= 8) faultlat with instrumentation on vs off on both
+#             nodes (/sys/kernel/swmc/instr/enabled), OREPS repeats per
+#             setting in ABBA order, fresh pages from OBASE; prints a table
+#             (numbers only; stops only on errors); ends with enabled=1
 #   teardown  waits (<= 120 s) for faultlat to exit; no user of /dev/dax0.0
 #             left; dax0.0 back to root:root 600; disable coherence and unload
 #             cxl_shm (VM1, then VM0). ONLY=<k> tears down that VM alone (the
@@ -25,7 +33,9 @@
 # Env (required): K GT R; optional: IP0 IP1 (default .100/.101), BASE (smoke
 # base page, default 25000000), RUN (smoke run id), C (bundle dir, for smoke.sh),
 # STATUS_TAG, ONLY, INIT_STATE, PBASE (default 25010000), PPAGES (default 1024),
-# PRUN (preload run id, default preload-v1).
+# PRUN (preload run id, default preload-v1), IPAGE (instr-check page,
+# default 25019000), OBASE (overhead base page, default 25020000), OREPS
+# (default 3), ORUN (overhead run id, default overhead-v1), OPAGES (default 1024).
 set -euo pipefail
 umask 077
 : "${K:?}" "${GT:?}" "${R:?}"
@@ -35,6 +45,7 @@ INIT_STATE=${INIT_STATE:-invalid}
 [[ "$INIT_STATE" =~ ^(invalid|shared)$ ]] || { echo "INIT_STATE must be invalid or shared"; exit 2; }
 PBASE=${PBASE:-25010000} PPAGES=${PPAGES:-1024} PRUN=${PRUN:-preload-v1}
 PA=0x7777000000000000 PB=0x8888000000000000
+IPAGE=${IPAGE:-25019000} OBASE=${OBASE:-25020000} OREPS=${OREPS:-3} ORUN=${ORUN:-overhead-v1} OPAGES=${OPAGES:-1024}
 fl() {  # fl <node> <step> <faultlat args...>: one faultlat step on a guest (results in popcorn-results/$PRUN)
   local k=$1; shift
   echo "[$(date +%T)] vm$k $1"
@@ -169,6 +180,103 @@ shared-check)
   [ "$(jdelta $d3 transaction_count)" -ge "$PPAGES" ] && [ "$(jdelta $d4 transaction_count)" -ge "$PPAGES" ] ||
     { log "STOP: shared-check counters unexpected"; exit 1; }
   log "shared-check PASS (init-S reads without messages; first write INVALIDATE; data checked)" ;;
+instr-check)
+  for k in 0 1; do
+    G $k status > "$R/status-instr-vm$k.txt"
+    grep -qx 'instr_enabled=1' "$R/status-instr-vm$k.txt" || { log "STOP: instr not enabled on vm$k"; exit 1; }
+    grep -qx 'dax0.0=comsys:root 600' "$R/status-instr-vm$k.txt"
+    G $k instr-dump > "$R/instr-before-vm$k.txt"
+    for f in swmc.tx_fetch.wait_count swmc.tx_invalidate.wait_count swmc.serve.unmap_ns swmc.fault_wp.count \
+             cxl_shm.ring_rtt.count cxl_shm.counters.tsc_khz; do
+      grep -q "^$f " "$R/instr-before-vm$k.txt" || { log "STOP: $f missing on vm$k"; exit 1; }
+    done
+  done
+  for k in 0 1; do
+    page=$((IPAGE + k))   # one fresh page per node
+    ssh -T "${FLAGS[@]}" "comsys@${IP[$k]}" "python3 -I - $GT/popcorn.env $page" > "$R/thread-swmc-vm$k.txt" <<'PY'
+import mmap, os, re, sys
+env, page = open(sys.argv[1]).read(), int(sys.argv[2])
+swcc = int(re.search(r'^MANAGED_BASE_OFF=(\d+)$', env, re.M).group(1))   # = managed_offset = swcc start
+off = swcc + page * 4096
+fd = os.open('/dev/dax0.0', os.O_RDWR)
+m = mmap.mmap(fd, 4096, mmap.MAP_SHARED, mmap.PROT_READ | mmap.PROT_WRITE, offset=off)
+_ = m[0:8]                         # read fault (I -> S, FETCH)
+m[8:16] = (page ^ 0x9999).to_bytes(8, 'little')   # write-protect fault (S -> M, INVALIDATE)
+p = '/proc/thread-self/swmc'
+st = os.stat(p)
+lines = open(p).read().splitlines()
+m.close(); os.close(fd)
+print('mode=%o uid=%d me=%d lines=%d' % (st.st_mode & 0o777, st.st_uid, os.getuid(), len(lines)))
+for l in lines:
+    print(l)
+PY
+    python3 -I - "$R/thread-swmc-vm$k.txt" <<'PY' || { log "STOP: per-thread file check failed on vm$k"; exit 1; }
+import re, sys
+t = open(sys.argv[1]).read().splitlines()
+h = dict(re.findall(r'(\w+)=(\d+)', t[0]))
+kv = dict(l.split(' ') for l in t[1:])
+assert h['mode'] == '400' and h['uid'] == h['me'] and h['lines'] == '16', h
+assert all(re.fullmatch(r'[a-z0-9_]+', k) and v.isdigit() for k, v in kv.items()), kv
+assert int(kv['read_faults']) >= 1 and int(kv['wp_faults']) >= 1 and int(kv['write_faults']) >= 1, kv
+assert int(kv['fault_errors']) == 0, kv
+print('per-thread file OK:', ' '.join('%s=%s' % (k, kv[k]) for k in ('read_faults', 'read_transactions',
+      'read_msg_wait_ns', 'write_faults', 'wp_faults', 'write_transactions', 'write_msg_wait_ns')))
+PY
+  done | tee "$R/instr-check.txt"
+  for k in 0 1; do G $k instr-dump > "$R/instr-after-vm$k.txt"; done
+  log "instr-check PASS (instr/ present and enabled; per-thread file readable by its owner on both)" ;;
+overhead)
+  PRUN=$ORUN   # fl() writes to popcorn-results/$PRUN
+  for k in 0 1; do G $k status > "$R/status-overhead-before-vm$k.txt"; done
+  order=(); for ((r = 0; r < OREPS; r++)); do if ((r % 2)); then order+=(0 1); else order+=(1 0); fi; done
+  i=0; rc=0
+  for e in "${order[@]}"; do
+    w=$((OBASE + i * 3 * OPAGES)); tag=o$(printf %02d $i)_e$e
+    for k in 0 1; do G $k instr "$e" > /dev/null || { rc=1; break 2; }; done
+    if ! {
+      fl 1 ${tag}_prep access --op write --pages "$OPAGES" --page-offset "$w" &&
+      fl 0 ${tag}_readM access --op read --pages "$OPAGES" --page-offset "$w" &&
+      fl 0 ${tag}_writeI access --op write --pages "$OPAGES" --page-offset $((w + OPAGES)) &&
+      nonce=$(( $(date +%s) * 1000 + i )) && pp=$((w + 2 * OPAGES)) &&
+      { fl 1 ${tag}_pp1 pingpong --role 1 --nonce $nonce --iters 10000 --page-offset $pp & x=$!;
+        a=0; fl 0 ${tag}_pp0 pingpong --role 0 --nonce $nonce --iters 10000 --page-offset $pp || a=$?;
+        wait $x && [ $a = 0 ]; }
+    } 2>&1 | tee -a "$R/overhead.log"; then rc=1; break; fi
+    i=$((i + 1))
+  done
+  for k in 0 1; do G $k instr 1 | tee -a "$R/overhead.log" || rc=1; done   # always end with instrumentation on
+  if [ "$rc" != 0 ]; then
+    wait_no_faultlat 0 1 || true
+    for k in 0 1; do G $k status > "$R/status-overhead-failed-vm$k.txt" || true; done
+    log "STOP: overhead step failed (see overhead.log); next: teardown"; exit 1
+  fi
+  ok=0
+  for k in 0 1; do
+    G $k status > "$R/status-overhead-after-vm$k.txt"
+    mkdir -p "$R/$ORUN-vm$k"
+    scp -q "${FLAGS[@]}" "comsys@${IP[$k]}:/home/comsys/popcorn-results/$ORUN/*" "$R/$ORUN-vm$k/"
+    smoke_accept "$R/status-overhead-before-vm$k.txt" "$R/status-overhead-after-vm$k.txt" $k | tee -a "$R/overhead-acceptance.txt" || ok=1
+  done
+  [ "$ok" = 0 ] || { log "STOP: overhead acceptance failed"; exit 1; }
+  python3 -I - "$R/$ORUN-vm0" <<'PY' | tee "$R/overhead.txt"
+import json, pathlib, statistics, sys
+d = pathlib.Path(sys.argv[1]); rows = {}
+for f in sorted(d.glob('o*_e[01]_*.json')):
+    j = json.loads(f.read_text()); tag, e, kind = f.stem.split('_', 2); e = e[1:]
+    key = {'readM': 'pass0_read', 'writeI': 'pass0_write', 'pp0': 'round_trip'}.get(kind)
+    if key:
+        s = j['passes'][key]; rows.setdefault((kind, e), []).append((s['mean_ns'], s['p50_ns'], s['p99_ns']))
+print('scenario instr n mean_ns(avg+-sd over repeats) p50_ns(avg) p99_ns(avg)')
+for (kind, e), v in sorted(rows.items()):
+    m = [x[0] for x in v]
+    print('%s %s %d %.0f+-%.0f %.0f %.0f' % (kind, e, len(v), statistics.mean(m),
+          statistics.stdev(m) if len(m) > 1 else 0, statistics.mean(x[1] for x in v), statistics.mean(x[2] for x in v)))
+for kind in ('readM', 'writeI', 'pp0'):
+    if (kind, '1') in rows and (kind, '0') in rows:
+        a = statistics.mean(x[0] for x in rows[(kind, '1')]); b = statistics.mean(x[0] for x in rows[(kind, '0')])
+        print('%s overhead mean: %+.0f ns (%+.1f%%)' % (kind, a - b, 100 * (a - b) / b))
+PY
+  log "overhead done ($((i)) runs; numbers in overhead.txt; instrumentation enabled=1 on both)" ;;
 status)
   for k in 0 1; do G $k status > "$R/status-${STATUS_TAG:-now}-vm$k.txt"; done
   log "status recorded (${STATUS_TAG:-now})" ;;
@@ -190,5 +298,5 @@ teardown)
     grep -q 'unload OK\|cxl_shm not loaded' "$R/teardown-vm$k.txt"
   done
   log "teardown PASS on vm${NODES[*]} (coherence off, cxl_shm unloaded, dax0.0 root:root 600)" ;;
-*) sed -n '2,32p' "$0"; exit 2 ;;
+*) sed -n '2,40p' "$0"; exit 2 ;;
 esac

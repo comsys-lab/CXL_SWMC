@@ -1,6 +1,7 @@
 #!/bin/bash
 # Popcorn guest control (runs ON a guest, as root via `sudo -n`; grant-gated).
 #   p-popcorn-guest.sh load <node_id> <invalid|shared> | wait-link <sec> | enable <sec> | status | disable | unload
+#                      | instr <0|1> | instr-dump
 # Expected values come from popcorn.env next to this script (frozen in the
 # packet): K (kernel release), KO_SHA (sha256 of the installed, signed
 # cxl_shm.ko), PARAMS (cxl_shm parameters except node_id, = `faultlat params`
@@ -19,6 +20,9 @@
 #   disable   syscall 471 (fails with EBUSY while managed mappings exist)
 #   unload    rmmod cxl_shm (writes back this node's S/M pages, withdraws its
 #             ring identity; refused while managed mappings exist)
+#   instr     (build >= 8) set the measurement-only instrumentation static key
+#             (/sys/kernel/swmc/instr/enabled); no protocol effect
+#   instr-dump  (build >= 8) every instr file as "<dir>.<file>.<name> <value>"
 set -euo pipefail
 H=$(dirname "$(readlink -f "$0")")
 # shellcheck source=/dev/null
@@ -104,9 +108,10 @@ status)
   echo "release=$(uname -r) loaded=$(grep -c '^cxl_shm ' /proc/modules)"
   if loaded; then
     for f in /sys/module/cxl_shm/parameters/*; do echo "param.$(basename "$f")=$(cat "$f")"; done
-    for f in $CS/*; do echo "cxl_shm.$(basename "$f")=$(cat "$f")"; done
+    for f in $CS/*; do [ -f "$f" ] || continue; echo "cxl_shm.$(basename "$f")=$(cat "$f")"; done
   fi
   for f in $SYS/*; do [ "$(basename "$f")" = reset_counters ] || echo "swmc.$(basename "$f")=$(cat "$f")"; done
+  [ -r /sys/kernel/swmc/instr/enabled ] && echo "instr_enabled=$(cat /sys/kernel/swmc/instr/enabled)"
   echo "inline_dispatch=$(cat /sys/module/swmc_kmsg/parameters/inline_dispatch)"
   for p in $(pgrep -x 'cxl_recv_[0-9]' || true); do  # coherence CPU: receive thread utime+stime (clock ticks)
     awk -v hz="$(getconf CLK_TCK)" '{print "recv_thread." $2 "=" $14 + $15 " ticks (" hz "/s)"}' "/proc/$p/stat"
@@ -126,5 +131,21 @@ unload)
   if loaded; then echo "STOP: cxl_shm still loaded"; exit 1; fi
   dmesg | grep -E 'shm_cxl|swmc-popcorn' | tail -n 4
   echo "unload OK" ;;
-*) sed -n '2,17p' "$0"; exit 2 ;;
+instr)
+  v=${2:?0|1}; [[ "$v" =~ ^[01]$ ]] || { echo "STOP: instr 0|1"; exit 1; }
+  f=/sys/kernel/swmc/instr/enabled
+  test -w "$f" || { echo "STOP: no $f (kernel without instrumentation)"; exit 1; }
+  echo "$v" > "$f"
+  [ "$(cat "$f")" = "$v" ] || { echo "STOP: $f reads $(cat "$f")"; exit 1; }
+  echo "instr OK (enabled=$v)" ;;
+instr-dump)
+  for d in /sys/kernel/swmc/instr /sys/kernel/cxl_shm/instr; do
+    [ -d "$d" ] || continue
+    for f in "$d"/*; do
+      case "$(basename "$f")" in reset) continue ;; esac
+      [ -r "$f" ] || continue
+      sed "s|^|$(basename "$(dirname "$d")").$(basename "$f").|" "$f"
+    done
+  done ;;
+*) sed -n '2,20p' "$0"; exit 2 ;;
 esac
