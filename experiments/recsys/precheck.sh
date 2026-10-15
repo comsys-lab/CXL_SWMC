@@ -1,5 +1,5 @@
 # recsys pilot guest pre-check (reports/RECSYS-design.md §8), per guest:
-#   ssh comsys@<ip> 'EXPECT_K=<release> INSTALL_FILES="<files below /home/comsys>" bash -s' < precheck.sh
+#   ssh comsys@<ip> 'EXPECT_K=<release> INSTALL_FILES="<files below /home/comsys>" [MEM_MIN=<GiB, default 20>] bash -s' < precheck.sh
 # Read-only + sudo -n fuser (standing grant A2 pre-check). Prints "PRECHECK PASS" or "PRECHECK FAIL <item>".
 fail() { echo "PRECHECK FAIL $*"; exit 1; }
 echo "host=$(hostname) uname=$(uname -r) nproc=$(nproc) $(date -Is)"
@@ -18,5 +18,5 @@ echo "procs recsys-server=$(pgrep -c -x recsys-server) vdb-server=$(pgrep -c -x 
 for f in $INSTALL_FILES; do sha256sum /home/comsys/$f || fail "install /home/comsys/$f"; done
 for f in $INSTALL_FILES; do case $f in *.so|*/recsys-server) ldd /home/comsys/$f | grep -q "not found" && fail "ldd $f";; esac; done
 m=$(free -g | awk '/Mem/{print $7}'); echo "disk_free=$(df -h /home | tail -1 | awk '{print $4}') mem_avail=${m}G"
-[ "$m" -ge 20 ] || fail "mem_avail ${m}G < 20G (Megalon index + placement)"
+[ "$m" -ge "${MEM_MIN:-20}" ] || fail "mem_avail ${m}G < ${MEM_MIN:-20}G (Megalon index + placement)"
 echo PRECHECK PASS

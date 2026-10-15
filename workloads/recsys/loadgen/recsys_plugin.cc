@@ -4,7 +4,9 @@
 // tools/dist_quantile.txt, or fixed with pairs=N; all to the serving target).
 // Options: samples=FILE (update trace, samples.h format), queries=FILE (query pool; default samples), quantiles=FILE
 //          or pairs=N, update_target=0, query_target=1 (index into --target), seed=N, scores=0|1 (return scores),
-//          max_queries=N (default 50M).
+//          max_queries=N (default 50M), seq_base=N (default 0: update seqs continue after N; the trace position of
+//          seq s is s-1, so measurements against one server lifetime replay the trace on from where the previous one
+//          stopped), wrap=0|1 (default 0; 1 = the update trace wraps to its start instead of ending the stream).
 // Output: <out>/queries.bin (one QueryLog per query response) and <out>/recsys.txt (counts).
 #include <fcntl.h>
 #include <sys/mman.h>
@@ -81,6 +83,11 @@ class Recsys : public loadgen::Workload {
     seed_ = std::stoull(get("seed", "20261016"));
     scores_ = get("scores", "0") == "1";
     max_queries_ = std::stoull(get("max_queries", "50000000"));
+    seq_base_ = std::stoull(get("seq_base", "0"));
+    wrap_ = get("wrap", "0") == "1";
+    if (upd_.n == 0) return *err = "empty update trace", false;
+    if (!wrap_ && seq_base_ >= upd_.n) return *err = "seq_base beyond the update trace (use wrap=1)", false;
+    next_u_ = seq_base_;
     const std::string pairs = get("pairs", ""), qf = get("quantiles", "");
     if (!pairs.empty()) quant_.push_back(std::stoul(pairs));
     else if (!qf.empty()) {
@@ -105,14 +112,14 @@ class Recsys : public loadgen::Workload {
 
   bool make(uint32_t stream, loadgen::Request *r, std::vector<uint8_t> *p) override {
     if (stream == 0) {
-      if (next_u_ >= upd_.n) return false;
+      if (!wrap_ && next_u_ >= upd_.n) return false;
       r->target = update_target_;
       r->op = kOpUpdate;
-      r->seq = ++next_u_;  // seq 1..
+      r->seq = ++next_u_;  // seq seq_base+1.. (trace position seq-1, modulo the trace length with wrap=1)
       UpdateReq q{next_u_};
       p->resize(sizeof(q) + sizeof(Sample));
       std::memcpy(p->data(), &q, sizeof(q));
-      std::memcpy(p->data() + sizeof(q), &upd_.rows[next_u_ - 1], sizeof(Sample));
+      std::memcpy(p->data() + sizeof(q), &upd_.rows[(next_u_ - 1) % upd_.n], sizeof(Sample));
       return true;
     }
     if (next_q_ >= max_queries_) return false;
@@ -178,11 +185,12 @@ class Recsys : public loadgen::Workload {
     std::fprintf(t,
                  "updates_made=%lu\nqueries_made=%lu\nupdate_errors=%lu\nquery_errors=%lu\nbad_query_responses=%lu\n"
                  "max_published_seq=%lu\nquery_pairs=%lu\nquery_lookups=%lu\nquery_seq_retries=%lu\nquery_misses=%lu\n"
-                 "query_log_record_bytes=%zu\n",
-                 (unsigned long)next_u_, (unsigned long)next_q_, (unsigned long)update_errors_.load(),
+                 "query_log_record_bytes=%zu\nseq_base=%lu\nlast_update_seq=%lu\ntrace_samples=%lu\ntrace_wraps=%lu\n",
+                 (unsigned long)(next_u_ - seq_base_), (unsigned long)next_q_, (unsigned long)update_errors_.load(),
                  (unsigned long)query_errors_.load(), (unsigned long)bad_responses_.load(), (unsigned long)published_.load(),
                  (unsigned long)pairs, (unsigned long)lookups, (unsigned long)retries, (unsigned long)misses,
-                 sizeof(QueryLog));
+                 sizeof(QueryLog), (unsigned long)seq_base_, (unsigned long)next_u_, (unsigned long)upd_.n,
+                 (unsigned long)(next_u_ ? (next_u_ - 1) / upd_.n : 0));
     std::fclose(t);
     if (update_errors_ || query_errors_ || bad_responses_) {
       *err = "errors: update " + std::to_string(update_errors_.load()) + " query " + std::to_string(query_errors_.load()) +
@@ -197,7 +205,8 @@ class Recsys : public loadgen::Workload {
     o << "recsys samples=" << samples_path_ << " (" << upd_.n << ", " << upd_.source << ") queries=" << queries_path_
       << " (" << qry_.n << ") quantiles=" << (quantiles_path_.empty() ? "fixed" : quantiles_path_) << " sizes=";
     for (size_t i = 0; i < quant_.size(); i++) o << (i ? "," : "") << quant_[i];
-    o << " update_target=" << update_target_ << " query_target=" << query_target_ << " seed=" << seed_;
+    o << " update_target=" << update_target_ << " query_target=" << query_target_ << " seed=" << seed_
+      << " seq_base=" << seq_base_ << " wrap=" << wrap_;
     return o.str();
   }
 
@@ -211,8 +220,8 @@ class Recsys : public loadgen::Workload {
   std::string samples_path_, queries_path_, quantiles_path_;
   std::vector<uint32_t> quant_;
   uint32_t update_target_ = 0, query_target_ = 1;
-  uint64_t seed_ = 0, max_queries_ = 0, next_u_ = 0, next_q_ = 0;
-  bool scores_ = false;
+  uint64_t seed_ = 0, max_queries_ = 0, next_u_ = 0, next_q_ = 0, seq_base_ = 0;
+  bool scores_ = false, wrap_ = false;
   std::mt19937_64 rng_;
   std::mutex mu_;
   std::vector<Meta> meta_;

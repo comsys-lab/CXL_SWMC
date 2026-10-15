@@ -1,0 +1,214 @@
+#!/bin/bash
+# One recsys server lifetime on the 2 VMs with several loadgen measurements against it (reports/RECSYS-main-packet.md:
+# "load once per system", a recorded exception to "every run starts from the initial image"). Same steps as run.sh,
+# split into phases so the tables are prepared once and every measurement reads the same server processes:
+#   session.sh start   <S>                       S = new session dir: manifest, both servers, READY, port check, load times
+#   session.sh measure <S> <name> -- <loadgen args>
+#                                                idle check (no queued query, counters still), Host build check, stats
+#                                                snapshots before/after, one loadgen run into <S>/<name>/ (manifest.txt,
+#                                                loadgen/, steps.csv, stats-steps.csv, breakdown.csv, slo.png), window
+#                                                invariants (torn_rows, misses, update_misses, bad_requests deltas = 0)
+#   session.sh stop    <S>                       stop both servers, collect node logs, final invariants from the logs
+# Update seqs continue over the lifetime: measurement i gets --opt seq_base=<last update seq of i-1> --opt wrap=1, so
+# the updater replays the trace on from where the previous measurement stopped (recsys plugin; never restarts at 1).
+# env (start): SYSTEM, V (guest install dir), HOST_SERVER (Host recsys-server of the same build, --print-app-bytes),
+#   SERVER_ARGS (every node; no --publish-*), T_MS (--publish-ms), optional NODE0_ARGS, NODE_ENV, NODE0_ENV (ENV:K=V
+#   tokens, e.g. ENV:XTIMEOUT=28800), READY_TIMEOUT (s, default 14400), NODES, PORT (7100).
+# env (measure): LOADGEN, optional LG_CPUS (56-63), STATS_OP (10), PROFILE (main | pilot, as run.sh), RUN_KIND
+#   (measurement | functional), IDLE_WAIT_S (900).
+# SESSION_LOCAL=1 is for Host tests only (tests/session_host_test.sh): guest commands run in a local shell, node k
+# listens on PORT+k, no virsh. Exit codes: 0 ok; 1 loadgen rc != 0 (caller reads summary.json note); 3 precondition
+# (servers gone, not idle, Host build, existing dir); 4 invariant violated; 2 usage.
+set -uo pipefail
+CMD=${1:-} S=${2:-}
+[ -n "$CMD" ] && [ -n "$S" ] || { sed -n 2,20p "$0" >&2; exit 2; }
+HERE=$(cd "$(dirname "$0")" && pwd); ROOT=$(cd "$HERE/../.." && pwd)
+SSH="ssh -o BatchMode=yes -o ConnectTimeout=8"
+LOCAL=${SESSION_LOCAL:-0}
+rx() {  # rx <node index> <command>: run on the node's guest (Host shell in SESSION_LOCAL=1)
+  if [ "$LOCAL" = 1 ]; then bash -c "$2" < /dev/null; else $SSH comsys@"${NODE[$1]}" "$2" < /dev/null; fi
+}
+fetch() {  # fetch <node index> <guest glob> <local dir>
+  if [ "$LOCAL" = 1 ]; then cp $2 "$3/" 2>/dev/null; else scp -q "comsys@${NODE[$1]}:$2" "$3/" 2>/dev/null; fi
+}
+host_check() {  # <log> <tag>: any compiler/linker/build tool on the Host invalidates a measurement
+  local p; p=$(pgrep -a -x 'make|cc1|cc1plus|ld|ld.gold|lld|cargo|rustc|ninja|cmake|conan' || true)
+  echo "$(date -Is) $2 builds=[${p//$'\n'/; }] loadavg=$(cut -d' ' -f1-3 /proc/loadavg)" >> "$1"
+  [ -z "$p" ] || [ "${RUN_KIND:-measurement}" = functional ] || { echo "Host build running ($2): $p"; return 1; }
+}
+kvget() { sed -n "s/^$2=//p" "$1" | tail -1; }  # kvget <file> <key>
+
+case "$CMD" in
+start)
+  : "${SYSTEM:?}" "${V:?}" "${HOST_SERVER:?}" "${SERVER_ARGS:?}" "${T_MS:?}"
+  [[ $T_MS =~ ^[0-9]+$ ]] || { echo "bad T_MS"; exit 2; }
+  case " $SERVER_ARGS " in *" --publish-"*) echo "SERVER_ARGS must not set --publish-*; use T_MS"; exit 2;; esac
+  [ -e "$S" ] && { echo "refusing: $S exists"; exit 3; }
+  mkdir -p "$S" || exit 3
+  SA="$SERVER_ARGS --publish-ms $T_MS"
+  if [ "$LOCAL" = 1 ]; then read -r -a NODE <<< "${NODES:-127.0.0.1 127.0.0.1}"; else read -r -a NODE <<< "${NODES:-192.168.122.100 192.168.122.101}"; fi
+  PORT=${PORT:-7100}
+  PORTS=(); for k in "${!NODE[@]}"; do [ "$LOCAL" = 1 ] && PORTS+=($((PORT + k))) || PORTS+=("$PORT"); done
+  RID=0x$(openssl rand -hex 4)$(printf '%08x' $(( (RANDOM << 16 | RANDOM) | 1 )))
+  GRUN=$V/runs/session-$(basename "$S")-${RID#0x}
+  # shellcheck disable=SC2086
+  APP=$("$HOST_SERVER" $SA --print-app-bytes) || { echo "print-app-bytes failed"; exit 2; }
+  LAYOUT=$("$HOST_SERVER" $SA --print-layout | head -1)
+  { echo "SYSTEM='$SYSTEM'"; echo "V='$V'"; echo "HOST_SERVER='$HOST_SERVER'"; echo "T_MS='$T_MS'"; echo "SA='$SA'"
+    echo "RID='$RID'"; echo "GRUN='$GRUN'"; echo "APP='$APP'"; echo "NODES_S='${NODE[*]}'"; echo "PORTS_S='${PORTS[*]}'"
+    echo "LOCAL='$LOCAL'"; echo "NODE0_ARGS_S='${NODE0_ARGS:-}'"; echo "NODE_ENV_S='${NODE_ENV:-}'"; echo "NODE0_ENV_S='${NODE0_ENV:-}'"
+  } > "$S/session.env"
+  echo 0 > "$S/seq_base"
+  { echo "# recsys session (CXL_SWMC/experiments/recsys/session.sh): one server lifetime, several measurements"
+    echo "system=$SYSTEM"; echo "start=$(date -Is)"; echo "run_id=$RID"; echo "guest_run_dir=$GRUN"
+    echo "cxl_swmc_commit=$(git -C "$ROOT" rev-parse HEAD)"; echo "cxl_swmc_dirty=$(git -C "$ROOT" status --porcelain | wc -l)"
+    echo "host_server=$HOST_SERVER sha256=$(sha256sum "$HOST_SERVER" | cut -d' ' -f1)"
+    echo "publish_ms=$T_MS"; echo "server_args=$SA"; echo "node_env=${NODE_ENV:-} node0_env=${NODE0_ENV:-}"
+    echo "node0_args=${NODE0_ARGS:-}"; echo "app_hwcc_bytes=$APP"; echo "layout=$LAYOUT"
+    for k in "${!NODE[@]}"; do
+      info=$(rx "$k" "uname -r; sha256sum $V/bin/recsys-server $V/cfg/cxl_region.yaml \$(ls $V/lib/libmegalon-objapi.so $V/lib/libmegalon.so $V/cfg/megalon.yaml 2>/dev/null) | cut -c1-64; nproc" | tr '\n' ' ')
+      [ -n "$info" ] || { echo "node$k info empty" >&2; exit 4; }
+      echo "node$k=${NODE[$k]}:${PORTS[$k]} $info"
+    done
+    if [ "$LOCAL" != 1 ]; then
+      for d in cxl_vm0 cxl_vm1; do
+        x=$(virsh -c qemu:///system dumpxml --inactive "$d" 2>/dev/null) || x=""
+        [ -n "$x" ] && echo "vm_xml_sha256.$d=$(printf '%s' "$x" | sha256sum | cut -d' ' -f1)" || echo "vm_xml_error.$d=virsh failed"
+      done
+    fi
+  } > "$S/session-manifest.txt" || { echo "session manifest failed"; exit 4; }
+  STARTED=()
+  fail_start() { echo "session start: $1, stopping servers"; for k in "${STARTED[@]}"; do rx "$k" "$V/bin/recsys-node.sh stop $GRUN $k"; done
+    for k in "${STARTED[@]}"; do fetch "$k" "$GRUN/node$k.*" "$S"; done; echo "stopped=$(date -Is) start_failed" >> "$S/session-manifest.txt"; exit 1; }
+  trap 'fail_start interrupted' INT TERM HUP
+  T0=$(date +%s)
+  for k in "${!NODE[@]}"; do
+    EXTRA=""; XE="${NODE_ENV:-}"; [ "$k" = 0 ] && EXTRA="${NODE0_ARGS:-}" && XE="$XE ${NODE0_ENV:-}"
+    STARTED+=("$k")
+    rx "$k" "$V/bin/recsys-node.sh start $V $GRUN $k $RID $APP $XE $SA --port ${PORTS[$k]} $EXTRA" || fail_start "node$k start"
+  done
+  for k in "${!NODE[@]}"; do rx "$k" "$V/bin/recsys-node.sh ready $GRUN $k ${READY_TIMEOUT:-14400}" || fail_start "node$k ready"; done
+  T1=$(date +%s)
+  for k in "${!NODE[@]}"; do  # port check: guest listen state + Host TCP connect
+    l=$(rx "$k" "ss -ltn | awk '\$4 ~ /:${PORTS[$k]}\$/ {print \$4}'")
+    if timeout 3 bash -c "exec 3<>/dev/tcp/${NODE[$k]}/${PORTS[$k]}" 2>/dev/null; then c=OK; else c=FAILED; fi
+    echo "node$k ${NODE[$k]}:${PORTS[$k]} listen=[$l] host_connect=$c" | tee -a "$S/port-check.txt"
+    [ -n "$l" ] && [ "$c" = OK ] || fail_start "port check node$k"
+  done
+  { echo "# load times (s), session $(basename "$S")"; echo "start_to_ready_s=$((T1 - T0))"
+    for k in "${!NODE[@]}"; do
+      rx "$k" "grep -h 'initial tables\|created .* objects\|warm-up read\|preloaded\|READY node\|wmeta records\|records' $GRUN/node$k.log | head -20" | sed "s/^/node$k: /"
+    done; } > "$S/load-times.txt"
+  for k in "${!NODE[@]}"; do python3 "$HERE/stats_snap.py" "${NODE[$k]}:${PORTS[$k]}" "$S/ready-t$k.txt" > /dev/null || fail_start "stats node$k"; done
+  echo "ready=$(date -Is) start_to_ready_s=$((T1 - T0))" >> "$S/session-manifest.txt"
+  echo "session $(basename "$S"): READY after $((T1 - T0)) s";;
+
+measure)
+  NAME=${3:-}; shift 3; [ "${1:-}" = "--" ] && shift
+  [ -n "$NAME" ] || exit 2
+  : "${LOADGEN:?}"
+  [ -f "$S/session.env" ] && [ ! -e "$S/stopped" ] || { echo "no running session in $S"; exit 3; }
+  # shellcheck disable=SC1091
+  . "$S/session.env"
+  read -r -a NODE <<< "$NODES_S"; read -r -a PORTS <<< "$PORTS_S"
+  for a in "$@"; do case "$a" in seq_base=*|wrap=*) echo "seq_base/wrap are set by session.sh"; exit 2;; esac; done
+  M=$S/$NAME
+  [ -e "$M" ] && { echo "refusing: $M exists"; exit 3; }
+  mkdir -p "$M"
+  case "${PROFILE:-main}" in
+    main) PROF=(--warmup-s 10 --step-warmup-s 3 --step-measure-s 15 --drain-s 5 --confirm-reps 3 --confirm-s 30);;
+    pilot) PROF=(--warmup-s 10 --step-warmup-s 2 --step-measure-s 8 --drain-s 5 --confirm-reps 1 --confirm-s 15 --fill none --overload none);;
+    *) echo "bad PROFILE"; exit 2;;
+  esac
+  LG_CPUS=${LG_CPUS:-56-63} STATS_OP=${STATS_OP:-10}
+  for k in "${!NODE[@]}"; do  # both servers of this session still alive
+    rx "$k" "kill -0 \$(cat $GRUN/node$k.pid) 2>/dev/null && ! grep -q FATAL $GRUN/node$k.log" || { echo "node$k server gone"; exit 3; }
+  done
+  # idle: no queued query and counters unchanged over 5 s (queries drain after an overload step of the previous one)
+  deadline=$(( $(date +%s) + ${IDLE_WAIT_S:-900} )) n=0
+  while :; do
+    n=$((n + 1)) ok=1
+    for k in "${!NODE[@]}"; do python3 "$HERE/stats_snap.py" "${NODE[$k]}:${PORTS[$k]}" "$M/idle$n-a-t$k.txt" > /dev/null || ok=0; done
+    sleep 5
+    for k in "${!NODE[@]}"; do
+      python3 "$HERE/stats_snap.py" "${NODE[$k]}:${PORTS[$k]}" "$M/idle$n-b-t$k.txt" > /dev/null || ok=0
+      for key in queries samples; do [ "$(kvget "$M/idle$n-a-t$k.txt" $key)" = "$(kvget "$M/idle$n-b-t$k.txt" $key)" ] || ok=0; done
+      [ "$(kvget "$M/idle$n-b-t$k.txt" serve_queue)" = 0 ] || ok=0
+    done
+    echo "$(date -Is) idle probe $n ok=$ok" >> "$M/idle.txt"
+    [ $ok = 1 ] && break
+    [ "$(date +%s)" -lt $deadline ] || { echo "servers not idle after ${IDLE_WAIT_S:-900} s"; exit 3; }
+    sleep 10
+  done
+  host_check "$M/host-check.txt" before || exit 3
+  SEQB=$(cat "$S/seq_base")
+  set -- "${PROF[@]}" "$@" --opt seq_base="$SEQB" --opt wrap=1
+  { echo "# recsys measurement (CXL_SWMC/experiments/recsys/session.sh measure)"; echo "name=$NAME"; echo "system=$SYSTEM"
+    echo "session=$S"; echo "session_run_id=$RID"; echo "measurement_index=$(ls -d "$S"/*/manifest.txt 2>/dev/null | wc -l)"
+    echo "start=$(date -Is)"; echo "run_kind=${RUN_KIND:-measurement}"; echo "guest_run_dir=$GRUN"
+    echo "cxl_swmc_commit=$(git -C "$ROOT" rev-parse HEAD)"; echo "cxl_swmc_dirty=$(git -C "$ROOT" status --porcelain | wc -l)"
+    echo "host_server=$HOST_SERVER sha256=$(sha256sum "$HOST_SERVER" | cut -d' ' -f1)"
+    echo "loadgen=$LOADGEN sha256=$(sha256sum "$LOADGEN" | cut -d' ' -f1)"
+    echo "publish_ms=$T_MS"; echo "profile=${PROFILE:-main}"; echo "server_args=$SA"; echo "app_hwcc_bytes=$APP"
+    echo "seq_base=$SEQB"; echo "loadgen_args=$*"; echo "lg_cpus=$LG_CPUS"; echo "stats_op=$STATS_OP"
+    for a in "$@"; do case "$a" in samples=*|queries=*|quantiles=*) echo "${a%%=*}_sha256=$(sha256sum "${a#*=}" | cut -d' ' -f1)";; esac; done
+    grep -E '^(node[0-9]+|vm_xml_sha256\.[a-z0-9_]+|vm_xml_error\.[a-z0-9_]+)=' "$S/session-manifest.txt"
+  } > "$M/manifest.txt"
+  for k in "${!NODE[@]}"; do python3 "$HERE/stats_snap.py" "${NODE[$k]}:${PORTS[$k]}" "$M/pre-t$k.txt" > /dev/null || { echo "stats node$k"; exit 3; }; done
+  cpu() { for k in "${!NODE[@]}"; do echo "$1 node$k $(rx "$k" 'head -1 /proc/stat')"; done >> "$M/guest-cpu.txt"; }
+  cpu before
+  TARGETS=""; for k in "${!NODE[@]}"; do TARGETS="$TARGETS${TARGETS:+,}${NODE[$k]}:${PORTS[$k]}"; done
+  LG_STATS=(); [ "$STATS_OP" = 0 ] || LG_STATS=(--stats-op "$STATS_OP")
+  numactl --physcpubind="$LG_CPUS" --membind=1 "$LOADGEN" --workload recsys --target "$TARGETS" --out "$M/loadgen" \
+    "${LG_STATS[@]}" "$@" > "$M/loadgen.log" 2>&1
+  LG=$?
+  tail -3 "$M/loadgen.log"
+  cpu after
+  for k in "${!NODE[@]}"; do python3 "$HERE/stats_snap.py" "${NODE[$k]}:${PORTS[$k]}" "$M/post-t$k.txt" > /dev/null || { echo "stats node$k after"; exit 3; }; done
+  HC=0; host_check "$M/host-check.txt" after || HC=1
+  NEXT=$(kvget "$M/loadgen/recsys.txt" last_update_seq)
+  [[ $NEXT =~ ^[0-9]+$ ]] && [ "$NEXT" -ge "$SEQB" ] || { echo "no last_update_seq in $M/loadgen/recsys.txt"; exit 4; }
+  echo "$NEXT" > "$S/seq_base"
+  # window invariants from the server counters (cumulative, so deltas over this measurement)
+  INV=0
+  for k in "${!NODE[@]}"; do
+    for key in torn_rows misses update_misses bad_requests; do
+      d=$(( $(kvget "$M/post-t$k.txt" $key) - $(kvget "$M/pre-t$k.txt" $key) ))
+      echo "node$k ${key}_delta=$d" >> "$M/invariants.txt"
+      [ "$d" = 0 ] || INV=1
+    done
+  done
+  echo "end=$(date -Is) loadgen_rc=$LG host_check_after=$HC invariants=$([ $INV = 0 ] && echo ok || echo VIOLATED) next_seq_base=$NEXT" >> "$M/manifest.txt"
+  if [ -s "$M/loadgen/steps.jsonl" ] && [ -s "$M/loadgen/summary.json" ]; then
+    [ ! -d "$M/loadgen/stats" ] || python3 "$ROOT/experiments/loadgen/stats_delta.py" "$M/loadgen" --out "$M/stats-steps.csv" > /dev/null 2>&1 || true
+    python3 "$ROOT/experiments/loadgen/export_csv.py" --out "$M/steps.csv" "$M/loadgen=$SYSTEM" > /dev/null 2>&1 || true
+    [ ! -d "$M/loadgen/stats" ] || python3 "$HERE/breakdown.py" "$M" --out "$M/breakdown.csv" > "$M/breakdown.log" 2>&1 || true
+    python3 "$ROOT/experiments/loadgen/plot_slo.py" --out "$M/slo.png" "$M/loadgen=$SYSTEM" > "$M/slo-points.txt" 2>&1 || true
+  fi
+  [ $INV = 0 ] || { echo "measurement $NAME: invariant violated ($(grep -v '_delta=0$' "$M/invariants.txt" | tr '\n' ' '))"; exit 4; }
+  [ $HC = 0 ] || { echo "measurement $NAME: Host build during the measurement"; exit 3; }
+  [ "$LG" = 0 ] || { echo "measurement $NAME: loadgen rc=$LG"; exit 1; }
+  echo "measurement $NAME: OK -> $M";;
+
+stop)
+  [ -f "$S/session.env" ] || { echo "no session in $S"; exit 3; }
+  # shellcheck disable=SC1091
+  . "$S/session.env"
+  read -r -a NODE <<< "$NODES_S"
+  RC=0
+  for k in "${!NODE[@]}"; do rx "$k" "[ -e $GRUN/node$k.pid ] && $V/bin/recsys-node.sh stop $GRUN $k" >> "$S/stop.txt" 2>&1 || RC=1; done
+  for k in "${!NODE[@]}"; do fetch "$k" "$GRUN/node$k.*" "$S"; done
+  date -Is > "$S/stopped"
+  for k in "${!NODE[@]}"; do  # clean stop and the workload's own cumulative checks
+    L=$S/node$k.log
+    grep -q "recsys-server: stopping" "$L" 2>/dev/null || { echo "node$k: no clean stop" | tee -a "$S/final-check.txt"; RC=4; }
+    for kv in torn_rows=0 misses=0 update_misses=0 bad_requests=0; do
+      grep -q "^$kv\$" "$L" 2>/dev/null || { echo "node$k: $kv violated" | tee -a "$S/final-check.txt"; RC=4; }
+    done
+  done
+  grep -h "^flush_overruns=\|^published_seq=\|^samples=\|^rows_written=\|^flushes=\|^queries=\|^mem.vm_hwm_kb=" "$S"/node*.log > "$S/final-counters.txt" 2>/dev/null
+  echo "stopped=$(date -Is) stop_rc=$RC" >> "$S/session-manifest.txt"
+  [ $RC = 0 ] && echo "session $(basename "$S"): stopped, final checks ok" || echo "session $(basename "$S"): stop rc=$RC"
+  exit $RC;;
+*) sed -n 2,20p "$0" >&2; exit 2;;
+esac
