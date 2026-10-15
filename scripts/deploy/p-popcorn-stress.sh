@@ -13,6 +13,8 @@
 #                                               (salt $SALT) on every scenario window through a plain mapping
 #   p-popcorn-stress.sh run <scenarios>         each scenario: status/dmesg pre, both nodes at once, status/dmesg
 #                                               post, acceptance, collect; stops at the first failure
+#   p-popcorn-stress.sh diag                    read-only evidence after a failure (kernel stacks of faultlat
+#                                               threads via sudo cat /proc/<pid>/task/*/stack, dmesg, status)
 #   p-popcorn-stress.sh soak-pick <summary.csv> <out>   scenario line for the soak (see packet)
 #   p-popcorn-stress.sh summary                 $R/summary.csv from every scenario dir under $R
 #
@@ -217,6 +219,15 @@ run)
   [ -s "$R/scenarios.parsed" ] || { echo "no scenarios in $2"; exit 2; }
   while IFS= read -r l; do run_one "$l" || exit 1; done < "$R/scenarios.parsed"
   log "run PASS ($(wc -l < "$R/scenarios.parsed") scenarios from $(basename "$2"))" ;;
+diag)
+  # after a failed scenario, before teardown: read-only evidence (kernel stacks of any faultlat left, dmesg, status)
+  need; dg=$R/diag-$(date +%H%M%S); mkdir -m 0700 "$dg"
+  for k in 0 1; do
+    on $k 'for p in $(pgrep -x faultlat); do echo "== pid $p"; for t in /proc/$p/task/*; do echo "-- $t $(cat $t/comm) $(cut -d" " -f3 $t/stat) wchan=$(cat $t/wchan)"; sudo -n cat $t/stack; done; done' > "$dg/stacks-vm$k.txt" 2>&1 || true
+    on $k 'dmesg | tail -n 300' > "$dg/dmesg-tail-vm$k.txt" 2>&1 || true
+    G $k status > "$dg/status-vm$k.txt" 2>&1 || true
+  done
+  log "diag recorded in $dg" ;;
 soak-pick)
   : "${2:?summary.csv}" "${3:?out}"
   # worst point of part (1) = ww-* scenario with the largest write max latency (ties: lowest Jain fairness)
@@ -233,5 +244,5 @@ PY
 summary)
   : "${R:?}"; B=${B:-$here}
   python3 -I "$B/stress_summary.py" "$R" > "$R/summary.csv"; column -s, -t < "$R/summary.csv" | cut -c1-220 ;;
-*) sed -n '2,33p' "$0"; exit 2 ;;
+*) awk 'NR > 1 && !/^#/ {exit} NR > 1' "$0"; exit 2 ;;
 esac
