@@ -139,7 +139,8 @@ int main() {
     whole(buf, kPage, 0, 1);
     p.scan(buf, 0, kPage, kSalt, true, &v);
     whole(buf, kPage, 1, 1);
-    p.scan(buf, 0, kPage, kSalt, true, &v);  // faulted: fine
+    p.scan(buf, 0, kPage, kSalt, true, &v);   // faulted: fine (remote change seen through a fault)
+    p.scan(buf, 0, kPage, kSalt, false, &v);  // fault-free: snapshot
     EXPECT(v.total() == 0);
     whole(buf, kPage, 1, 2);
     p.scan(buf, 0, kPage, kSalt, false, &v);  // no fault, remote change
@@ -149,6 +150,19 @@ int main() {
     whole(buf, kPage, 0, 9);
     p.scan(buf, 0, kPage, kSalt, false, &v2);  // snapshot invalidated by own write
     EXPECT(v2.total() == 0 && p.checks == 1);
+  }
+  {  // a faulted scan mixing old and new words is never a reference (verifier HIGH, v1)
+    SwmrProbe p(1, 1, 0);
+    Violations v;
+    whole(buf, kPage, 1, 1);
+    p.scan(buf, 0, kPage, kSalt, false, &v);    // fault-free snapshot: remote seq 1
+    mixed(buf, kPage, 1, 1, 1, 2, 256);          // revoked mid-scan: high words new (2), low words old (1)
+    p.scan(buf, 0, kPage, kSalt, true, &v);     // faulted: no check, snapshot dropped
+    whole(buf, kPage, 1, 2);                     // next scan fault-free, all words new
+    p.scan(buf, 0, kPage, kSalt, false, &v);    // no reference -> no check, becomes the snapshot
+    EXPECT(v.total() == 0 && p.checks == 0 && p.faulted_scans == 1);
+    p.scan(buf, 0, kPage, kSalt, false, &v);    // unchanged, fault-free: checked, fine
+    EXPECT(v.total() == 0 && p.checks == 1);
   }
   {  // pickers
     Picker u(16, false, 0), z(1024, true, 0.99), one(1, true, 0.99);

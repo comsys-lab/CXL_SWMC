@@ -23,10 +23,17 @@ rw-5050-h8-t16  16   8   50  50   uniform 60
 rw-5050-h8-t64  64   8   50  50   uniform 60
 # T = 1 per node with reads: the SWMR probe is active (unfaulted remote change = missing invalidation)
 probe-h1-t1      1   1   50  50   uniform 60
-# (3) credit exhaustion: 512 threads per node (> 480 request slots per direction) each write 4 distinct fresh
-#     pages (state I on both nodes), released together; then node 1 reads fresh pages of its own partition
-cr-w-t512      512 4096   0   0   partition 120 --max-ops 4
-cr-rw-t512     512 4096   0 100   partition 120 --max-ops 4
+# (3) credit exhaustion: 512 threads per node (> 480 request slots per direction), all released together on both
+#     nodes (cross-node start barrier after thread creation).
+#   cr-w:  --skip-init, so every page is still I on both nodes; each thread writes its own 4 pages once (write on I
+#          -> INVALIDATE to the peer): up to 512 outstanding requests in EACH direction.  No reads; the final
+#          check verifies every page holds its owner's write.
+#   cr-r1: node 0 writes the init stamp on all pages first (they start in M on node 0); node 1's 512 threads each
+#          read their own 4 pages once (read on I -> FETCH, node 0 downgrades M->S): ONE direction, node 1 ->
+#          node 0, up to 512 outstanding.  Node 0's threads write their own pages, which it already holds in M
+#          (no faults, no messages): node 0 is only the responder here.
+cr-w-t512      512 4096   0   0   partition 120 --max-ops 4 --skip-init
+cr-r1-t512     512 4096   0 100   partition 120 --max-ops 4
 # (4) churn: node 0 reads + MADV_DONTNEED / fresh-VMA map-check-unmap every 200 us while node 1 writes
 churn-h8-t8      8   8  100   0   uniform 60 @0 --churn-us 200
 churn-h1-t1      1   1  100   0   uniform 60 @0 --churn-us 200

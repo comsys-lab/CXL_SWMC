@@ -725,6 +725,8 @@ struct ContendRun {
   std::vector<Worker> w;
   std::atomic<bool> stop{false};
   std::atomic<bool> go{false};  // in-process start gate: all workers start together
+  std::atomic<uint64_t> guard_deadline{0};  // post-run guard (0 = off)
+  std::atomic<const char *> guard_phase{""};
   std::atomic<uint32_t> ready{0};
   // churn thread (--churn-us): madvise(MADV_DONTNEED) + fresh-VMA map/read/check/unmap on hot-set pages
   uint64_t churn_dontneed = 0, churn_remaps = 0, churn_errors = 0;
@@ -1045,6 +1047,52 @@ void contend_churn(ContendRun *R) {
   }
 }
 
+// Watchdog: dump per-thread state (and the peers' in-flight ops), JSON, exit 3 (stuck threads cannot be joined).
+[[noreturn]] void watchdog_fire(ContendRun *R, const std::string &why, uint64_t now) {
+  const Args &A = *R->a;
+  const uint32_t me = uint32_t(A.node);
+  R->set_abort(kAbWatchdog);
+  R->stop.store(true);
+  if (!R->t_end) R->t_end = now;
+  R->abort_seen = R->abort_word();
+  std::string s = "reason=" + why + "\\n";
+  for (uint32_t t = 0; t < R->T(); t++) {
+    Worker &W = R->w[t];
+    uint64_t t0 = __atomic_load_n(&W.cur_t0, __ATOMIC_RELAXED), cur = R->line(me, t).cur;
+    char b[256];
+    snprintf(b, sizeof(b), "t%u tid %d ops %" PRIu64 " inflight page %" PRId64 " %s age_ms %" PRIu64 " state ", t,
+             int(W.tid), R->line(me, t).ops, cur ? int64_t(cur >> 1) - 1 : -1, cur ? (cur & 1 ? "write" : "read") : "-",
+             t0 && now > t0 ? (now - t0) / 1000000 : 0);
+    std::string st = proc_task(W.tid, "stat");
+    size_t rp = st.rfind(')');
+    s += b + (rp != std::string::npos && rp + 2 < st.size() ? st.substr(rp + 2, 1) : std::string("?")) +
+         " wchan " + proc_task(W.tid, "wchan") + " stack " + proc_task(W.tid, "stack") + "\\n";
+  }
+  for (uint32_t k = 0; k < R->N(); k++) {
+    if (k == me) continue;
+    for (uint32_t t = 0; t < R->T(); t++) {
+      char b[160];
+      uint64_t cur = R->line(k, t).cur;
+      snprintf(b, sizeof(b), "peer%u t%u ops %" PRIu64 " inflight page %" PRId64 " %s\\n", k, t, R->line(k, t).ops,
+               cur ? int64_t(cur >> 1) - 1 : -1, cur ? (cur & 1 ? "write" : "read") : "-");
+      s += b;
+    }
+  }
+  R->watchdog_dump = s;
+  R->status = "watchdog";
+  R->exit_code = 3;
+  fprintf(stderr, "faultlat contend: node %d: WATCHDOG (%s, %.1f s)\n%s", A.node, why.c_str(), A.watchdog_s,
+          [&] {
+            std::string o = s;
+            for (size_t p; (p = o.find("\\n")) != std::string::npos;) o.replace(p, 2, "\n");
+            return o;
+          }()
+              .c_str());
+  R->write_json(A.out.c_str());
+  fflush(nullptr);
+  _exit(3);  // stuck threads cannot be joined
+}
+
 // Monitor (main thread): progress sampling, starvation/stall samples, watchdog, duration, abort.
 void contend_monitor(ContendRun *R) {
   const Args &A = *R->a;
@@ -1104,48 +1152,7 @@ void contend_monitor(ContendRun *R) {
       uint64_t t0 = __atomic_load_n(&R->w[t].cur_t0, __ATOMIC_RELAXED);
       if (t0 && now > t0 && now - t0 >= wd) why = "op_stuck";
     }
-    if (!why.empty() && !R->stop.load()) {
-      R->set_abort(kAbWatchdog);
-      R->stop.store(true);
-      R->t_end = now;
-      R->abort_seen = R->abort_word();
-      std::string s = "reason=" + why + "\\n";
-      for (uint32_t t = 0; t < R->T(); t++) {
-        Worker &W = R->w[t];
-        uint64_t t0 = __atomic_load_n(&W.cur_t0, __ATOMIC_RELAXED), cur = R->line(me, t).cur;
-        char b[256];
-        snprintf(b, sizeof(b), "t%u tid %d ops %" PRIu64 " inflight page %" PRId64 " %s age_ms %" PRIu64 " state ", t,
-                 int(W.tid), R->line(me, t).ops, cur ? int64_t(cur >> 1) - 1 : -1, cur ? (cur & 1 ? "write" : "read") : "-",
-                 t0 && now > t0 ? (now - t0) / 1000000 : 0);
-        std::string st = proc_task(W.tid, "stat");
-        size_t rp = st.rfind(')');
-        s += b + (rp != std::string::npos && rp + 2 < st.size() ? st.substr(rp + 2, 1) : std::string("?")) +
-             " wchan " + proc_task(W.tid, "wchan") + " stack " + proc_task(W.tid, "stack") + "\\n";
-      }
-      for (uint32_t k = 0; k < R->N(); k++) {
-        if (k == me) continue;
-        for (uint32_t t = 0; t < R->T(); t++) {
-          char b[160];
-          uint64_t cur = R->line(k, t).cur;
-          snprintf(b, sizeof(b), "peer%u t%u ops %" PRIu64 " inflight page %" PRId64 " %s\\n", k, t, R->line(k, t).ops,
-                   cur ? int64_t(cur >> 1) - 1 : -1, cur ? (cur & 1 ? "write" : "read") : "-");
-          s += b;
-        }
-      }
-      R->watchdog_dump = s;
-      R->status = "watchdog";
-      R->exit_code = 3;
-      fprintf(stderr, "faultlat contend: node %d: WATCHDOG (%s, %.1f s)\n%s", A.node, why.c_str(), A.watchdog_s,
-              [&] {
-                std::string o = s;
-                for (size_t p; (p = o.find("\\n")) != std::string::npos;) o.replace(p, 2, "\n");
-                return o;
-              }()
-                  .c_str());
-      R->write_json(A.out.c_str());
-      fflush(nullptr);
-      _exit(3);  // stuck threads cannot be joined
-    }
+    if (!why.empty() && !R->stop.load()) watchdog_fire(R, why, now);
     if (uint64_t ab = R->abort_word()) {
       R->abort_seen = ab;
       R->stop.store(true);
@@ -1268,9 +1275,37 @@ int cmd_contend(const Args &a) {
   std::thread churn;
   if (a.churn_us) churn = std::thread(contend_churn, &R);
   while (R.ready.load() < a.threads) usleep(100);
+  // Cross-node start: every node has all its threads created and waiting, then all are released together.
+  if (!R.barrier(2)) {
+    R.abort_seen = R.abort_word();
+    if (!R.abort_seen) R.set_abort(kAbCoord);
+    finish(R.abort_seen && (R.abort_seen >> 8) != kAbCoord ? "peer_abort" : "coordination",
+           R.abort_seen && (R.abort_seen >> 8) != kAbCoord ? 6 : 5);
+  }
   R.t_start = now_ns();
   R.go.store(true, std::memory_order_release);
   contend_monitor(&R);
+  // Post-run guard: every later step (worker drain, barriers, final scan) has a deadline; past it the watchdog
+  // dumps and exits 3 instead of hanging (e.g. a worker or the final scan stuck in a fault).
+  const uint64_t wd_ns = uint64_t(a.watchdog_s * 1e9), bt_ns = uint64_t(a.barrier_timeout_s * 1e9);
+  std::thread([] {
+    for (;;) {
+      usleep(100000);
+      const uint64_t d = R.guard_deadline.load(), now = now_ns();
+      if (d && now > d) watchdog_fire(&R, std::string("post_run_") + R.guard_phase.load(), now);
+    }
+  }).detach();
+  auto guard = [&](const char *phase, uint64_t budget_ns) {
+    R.guard_phase.store(phase);
+    R.guard_deadline.store(now_ns() + budget_ns);
+  };
+  guard("drain", wd_ns);  // workers finish their current op and exit
+  for (;;) {
+    bool all = true;
+    for (auto &x : R.w) all &= __atomic_load_n(&x.exited, __ATOMIC_ACQUIRE);
+    if (all) break;
+    usleep(1000);
+  }
   for (auto &x : th) x.join();
   if (churn.joinable()) churn.join();
 
@@ -1284,12 +1319,14 @@ int cmd_contend(const Args &a) {
   // Publish this node's last seqs, then every node checks the final page contents against all writers.
   for (uint32_t t = 0; t < a.threads; t++)
     for (uint64_t p = 0; p < H; p++) R.lastseq[(uint64_t(R.w[t].wid)) * H + p] = R.w[t].last[p];
-  if (!R.barrier(2)) {
+  guard("barrier3", bt_ns + wd_ns);
+  if (!R.barrier(3)) {
     R.abort_seen = R.abort_word();
     if (!R.abort_seen) R.set_abort(kAbCoord);
     finish(R.abort_seen && (R.abort_seen >> 8) != kAbCoord ? "peer_abort" : "coordination",
            R.abort_seen && (R.abort_seen >> 8) != kAbCoord ? 6 : 5);
   }
+  guard("final_scan", wd_ns + H * 1000000ull);
   const uint32_t nw = uint32_t(a.nodes) * a.threads;
   uint64_t buf[ct::kWords];
   for (uint64_t p = 0; p < H; p++) {
@@ -1303,10 +1340,12 @@ int cmd_contend(const Args &a) {
     R.set_abort(kAbViolation);
     finish("violation", 2);
   }
-  if (!R.barrier(3)) {
+  guard("barrier4", bt_ns + wd_ns);
+  if (!R.barrier(4)) {
     R.abort_seen = R.abort_word();
     finish(R.abort_seen ? "peer_abort" : "coordination", R.abort_seen ? 6 : 5);
   }
+  R.guard_deadline.store(0);
   R.write_json(a.out.c_str());
   munmap(R.win.base, R.win.len);
   close(R.win.fd);

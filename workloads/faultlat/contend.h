@@ -191,9 +191,9 @@ uint64_t final_check(const uint64_t *buf, uint64_t page_abs, uint64_t salt, uint
   return out->total() - before;
 }
 
-// SWMR probe (T = 1 per node): snapshot per page after each scan of this thread; a later scan that took no
-// fault (RUSAGE_THREAD minflt delta 0) means the page stayed mapped since the snapshot, so no word may have
-// changed to a write by another node.  own writes invalidate the snapshot.
+// SWMR probe (T = 1 per node): snapshot per page after each FAULT-FREE scan of this thread; a later scan that
+// took no fault (RUSAGE_THREAD minflt delta 0) means the page stayed mapped since the snapshot, so no word may
+// have changed to a write by another node.  A faulted scan or an own write drops the snapshot.
 class SwmrProbe {
  public:
   SwmrProbe(uint64_t pages, uint32_t threads, uint32_t node)
@@ -211,11 +211,15 @@ class SwmrProbe {
         Decoded d = decode(buf[i] ^ word_mask(pm, i));
         if (d.w != kInitWriter && d.w / T_ != node_) out->add({kUnfaultedRemote, page_abs, i, buf[i], d.w, d.s, 0});
       }
-    } else if (valid_[page]) {
-      faulted_scans++;
     }
-    std::memcpy(s, buf, kWords * 8);
-    valid_[page] = true;
+    if (faulted) {
+      // A scan that faulted may mix words from before and after a mid-scan revocation: never a reference.
+      faulted_scans++;
+      valid_[page] = false;
+    } else {
+      std::memcpy(s, buf, kWords * 8);  // fault-free scan: the page stayed mapped, a stable snapshot
+      valid_[page] = true;
+    }
     return out->total() - before;
   }
   void own_write(uint64_t page) { valid_[page] = false; }

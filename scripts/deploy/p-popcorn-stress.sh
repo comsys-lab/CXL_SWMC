@@ -15,6 +15,9 @@
 #                                               post, acceptance, collect; stops at the first failure
 #   p-popcorn-stress.sh diag                    read-only evidence after a failure (kernel stacks of faultlat
 #                                               threads via sudo cat /proc/<pid>/task/*/stack, dmesg, status)
+#   p-popcorn-stress.sh kill                    failure only, after diag: pkill -KILL -u comsys -x faultlat on both
+#                                               guests, then wait <= 120 s until none is left (run does this
+#                                               itself when a node failed and faultlat is still there after 120 s)
 #   p-popcorn-stress.sh soak-pick <summary.csv> <out>   scenario line for the soak (see packet)
 #   p-popcorn-stress.sh summary                 $R/summary.csv from every scenario dir under $R
 #
@@ -46,6 +49,13 @@ on() { local k=$1; shift; $SSH -T "${FLAGS[@]}" "comsys@${IP[$k]}" "$@" < /dev/n
 G() { local k=$1; shift; on "$k" "sudo -n $GT/p-popcorn-guest.sh $*"; }
 log() { printf '[%s] %s\n' "$(date +%T)" "$*" | tee -a "$R/steps.log"; }
 need() { : "${K:?}" "${GT:?}" "${R:?}" "${B:?}"; [ -d "$R" ] || { test -d "$(dirname "$R")" && mkdir -m 0700 "$R"; }; }
+kill_faultlat() {  # failure only: unprivileged SIGKILL of comsys's faultlat on both guests, then re-check
+  local k
+  for k in 0 1; do on $k 'pkill -KILL -u comsys -x faultlat; sleep 1; pgrep -a -x faultlat || echo none' \
+    | tee -a "$R/kill-vm$k.txt" || true; done
+  if wait_no_faultlat; then log "faultlat killed and gone on both guests"; return 0; fi
+  log "faultlat still present after SIGKILL (thread stuck in the kernel?); see kill-vm*.txt"; return 1
+}
 wait_no_faultlat() {  # bounded wait (120 s) until no faultlat runs on either guest
   local i k busy
   for ((i = 0; i < 60; i++)); do
@@ -128,7 +138,9 @@ run_one() {  # run_one <fields>: one scenario on both nodes (called under ||: ev
   for k in 0 1; do
     G $k status > "$d/status-pre-vm$k.txt" || { log "STOP: status pre vm$k failed"; return 1; }
     test -z "$(on $k 'pgrep -a -x faultlat || true')" || { log "STOP: faultlat already running on vm$k"; return 1; }
-    on $k 'dmesg | wc -l' > "$d/dmesg-lines-pre-vm$k.txt" || { log "STOP: dmesg vm$k failed"; return 1; }
+    # anchor = last dmesg line (timestamped, unique) before the run; new lines = everything after it
+    on $k 'dmesg | tail -n 1' > "$d/dmesg-anchor-vm$k.txt" || { log "STOP: dmesg vm$k failed"; return 1; }
+    [ -s "$d/dmesg-anchor-vm$k.txt" ] || { log "STOP: empty dmesg on vm$k (no anchor)"; return 1; }
     gcmd $k "$rid" "$name" "$T" "$H" "$R0" "$R1" "$dist" "$D" "$off" "$a0" "$a1" "$app" > "$d/cmd-vm$k.txt"
   done
   log "scenario $name: T=$T H=$H R=$R0/$R1 $dist D=${D}s pages [$off,+$H) extra '$extra'"
@@ -138,11 +150,19 @@ run_one() {  # run_one <fields>: one scenario on both nodes (called under ||: ev
   wait "$p1" || rc1=$?
   echo "end=$(date -Is)" >> "$d/scenario.txt"
   if [ "$rc0" != 0 ] || [ "$rc1" != 0 ]; then
-    wait_no_faultlat && log "faultlat gone on both guests" || log "faultlat still running after 120 s"
+    if wait_no_faultlat; then log "faultlat gone on both guests"; else kill_faultlat; fi
   fi
   for k in 0 1; do
     G $k status > "$d/status-post-vm$k.txt" || ok=1
-    on $k "dmesg | tail -n +\$(( $(cat "$d/dmesg-lines-pre-vm$k.txt") + 1 ))" > "$d/dmesg-new-vm$k.txt" || true
+    on $k 'dmesg' > "$d/dmesg-post-vm$k.txt" || ok=1
+    python3 -I - "$d/dmesg-anchor-vm$k.txt" "$d/dmesg-post-vm$k.txt" "$d/dmesg-new-vm$k.txt" <<'PY' || { echo "vm$k FAIL dmesg anchor not found (ring wrapped or dmesg cleared)" >> "$d/accept.txt"; ok=1; }
+import sys
+anchor = open(sys.argv[1]).read().rstrip('\n')
+lines = open(sys.argv[2]).read().split('\n')
+idx = [i for i, l in enumerate(lines) if l == anchor]
+open(sys.argv[3], 'w').write('\n'.join(lines[idx[-1] + 1:] if idx else lines))
+sys.exit(0 if idx else 1)
+PY
     grep -E "$BADPAT" "$d/dmesg-new-vm$k.txt" > "$d/dmesg-bad-vm$k.txt" || true
     mkdir -p "$d/vm$k"
     $SCP -q "${FLAGS[@]}" "comsys@${IP[$k]}:/home/comsys/popcorn-results/${RUNTAG:-$(basename "$R")}/$name/*" "$d/vm$k/" || true
@@ -219,6 +239,9 @@ run)
   [ -s "$R/scenarios.parsed" ] || { echo "no scenarios in $2"; exit 2; }
   while IFS= read -r l; do run_one "$l" || exit 1; done < "$R/scenarios.parsed"
   log "run PASS ($(wc -l < "$R/scenarios.parsed") scenarios from $(basename "$2"))" ;;
+kill)
+  # failure only (after diag): SIGKILL any faultlat of comsys on both guests, wait <= 120 s until gone
+  need; kill_faultlat ;;
 diag)
   # after a failed scenario, before teardown: read-only evidence (kernel stacks of any faultlat left, dmesg, status)
   need; dg=$R/diag-$(date +%H%M%S); mkdir -m 0700 "$dg"

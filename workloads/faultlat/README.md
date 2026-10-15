@@ -159,8 +159,9 @@ every word decodes for this page and offset (`corrupt`). After all writers
 stopped, every node checks that every word holds its writer's LAST write to
 that page (`final_stale`, `final_init_left`; last seqs exchanged through
 HWcc). Torn pages from concurrent writers are legal and not reported. With
-T = 1 and reads, the SWMR probe compares each scan with the thread's previous
-scan of that page: a change by another node's writer without any fault in
+T = 1 and reads, the SWMR probe compares each fault-free scan with the
+thread's previous fault-free scan of that page (a faulted scan or an own write
+drops the reference): a change by another node's writer without any fault in
 between (RUSAGE_THREAD) means a missing invalidation
 (`unfaulted_remote_change`). On a hardware-coherent testbed the data checks
 can only see protocol bugs that change data (wrong pfn, copies, stale
@@ -173,7 +174,11 @@ Liveness: per-thread progress sampled every `--interval-ms` (100):
 worker faults per op, read/write latency histograms (p50/p99/p99.9/max).
 Watchdog (`--watchdog-s`, default 10): no progress on this node, or one op in
 flight, for that long -> per-thread dump (in-flight page/op/age, state, wchan,
-peer threads' in-flight ops) in JSON and stderr, exit 3. SIGBUS -> stderr line,
+peer threads' in-flight ops) in JSON and stderr, exit 3. After the run a
+post-run guard bounds every later step (worker drain: watchdog; each barrier:
+barrier timeout + watchdog; final scan: watchdog + 1 ms per page) with the same
+dump and exit 3, so the process never hangs in a join. All nodes create their
+threads, then pass a cross-node start barrier, then release them together. SIGBUS -> stderr line,
 exit 4 (no JSON). Violation -> exit 2 (both nodes stop via the abort word;
 the peer exits 6). Coordination timeout (`--barrier-timeout-s`, 120) -> 5.
 
