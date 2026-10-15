@@ -4,14 +4,14 @@
 # usage: m4-install.sh <log file> plain|megalon
 #   plain:   VPLAIN (default /home/comsys/vdb8) <- PLAIN_BUILD (default builds/vdb/8): bin/vdb-server, bin/vdb-node.sh,
 #            cfg/cxl_region.yaml
-#   megalon: VMEG (default /home/comsys/vdbm5) <- MEG_BUILD (default builds/vdb-megalon/5): bin/vdb-server, lib/*,
+#   megalon: VMEG (default /home/comsys/vdbm6-28m) <- MEG_BUILD (default builds/vdb-megalon/6): bin/vdb-server, lib/*,
 #            bin/vdb-node.sh, cfg/cxl_region.yaml, cfg/megalon.yaml <- MEG_CFG (default systems/megalon/vectordb-2vm.yaml)
 set -euo pipefail
 P=/home/comsys/sungsu/destijl-control C=$P/CXL_SWMC LOG=$1 WHAT=$2
 SSH="ssh -o BatchMode=yes -o ConnectTimeout=8"
 case "$WHAT" in
   plain) V=${VPLAIN:-/home/comsys/vdb8} B=${PLAIN_BUILD:-$P/builds/vdb/8};;
-  megalon) V=${VMEG:-/home/comsys/vdbm5} B=${MEG_BUILD:-$P/builds/vdb-megalon/5} CFG=${MEG_CFG:-$C/systems/megalon/vectordb-2vm.yaml}
+  megalon) V=${VMEG:-/home/comsys/vdbm6-28m} B=${MEG_BUILD:-$P/builds/vdb-megalon/6} CFG=${MEG_CFG:-$C/systems/megalon/vectordb-2vm.yaml}
            grep -q "^source_commit=.* dirty=0$" $B/manifest.txt || { echo "megalon build not clean: $B"; exit 1; };;
   *) echo "plain|megalon"; exit 2;;
 esac

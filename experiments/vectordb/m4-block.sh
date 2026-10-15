@@ -20,15 +20,20 @@ B=$1 R=$2 E=$3
 P=/home/comsys/sungsu/destijl-control X=$P/CXL_SWMC/experiments/vectordb
 KV=${KV:-6.14.0-vanilla-1} SEED_BASE=20261014 OWNER="M4-$B-r$R"
 GUEST_INIT=/home/comsys/vdb/init/seg32c32m-a27m HOST_IMAGE=$P/workspaces/vdb-data/seg32-c32m-a27m-m16-efc128-b1
+# Megalon variant (default: vdb-megalon/6 on Megalon build 70, 28M config, guest /home/comsys/vdbm6-28m)
+export MEG_BUILD=${MEG_BUILD:-$P/builds/vdb-megalon/6} VMEG=${VMEG:-/home/comsys/vdbm6-28m}
+MEG_CFG=${MEG_CFG:-$P/CXL_SWMC/systems/megalon/vectordb-2vm.yaml}
+grep -q "^source_commit=.* dirty=0$" $MEG_BUILD/manifest.txt || { echo "SEQUENCE STOP: $MEG_BUILD not clean"; exit 2; }
+VM=${VMEG#/home/comsys/}
 INSTALL="vdb8/bin/vdb-server $P/builds/vdb/8/bin/vdb-server
 vdb8/bin/vdb-node.sh $P/CXL_SWMC/scripts/guest/vdb-node.sh
 vdb8/cfg/cxl_region.yaml $P/CXL_SWMC/config/cxl_region.yaml
-vdbm5/bin/vdb-server $P/builds/vdb-megalon/5/bin/vdb-server
-vdbm5/bin/vdb-node.sh $P/CXL_SWMC/scripts/guest/vdb-node.sh
-vdbm5/lib/libvdb-megalon.so $P/builds/vdb-megalon/5/lib/libvdb-megalon.so
-vdbm5/lib/libmegalon.so $P/builds/vdb-megalon/5/lib/libmegalon.so
-vdbm5/cfg/megalon.yaml $P/CXL_SWMC/systems/megalon/vectordb-2vm.yaml
-vdbm5/cfg/cxl_region.yaml $P/CXL_SWMC/config/cxl_region.yaml"
+$VM/bin/vdb-server $MEG_BUILD/bin/vdb-server
+$VM/bin/vdb-node.sh $P/CXL_SWMC/scripts/guest/vdb-node.sh
+$VM/lib/libvdb-megalon.so $MEG_BUILD/lib/libvdb-megalon.so
+$VM/lib/libmegalon.so $MEG_BUILD/lib/libmegalon.so
+$VM/cfg/megalon.yaml $MEG_CFG
+$VM/cfg/cxl_region.yaml $P/CXL_SWMC/config/cxl_region.yaml"
 . $X/m4-lib.sh
 block_start
 case "$B" in

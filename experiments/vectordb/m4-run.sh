@@ -9,7 +9,7 @@
 #   DATASET: 28m (default: pubmed-a27m-b1m-q10k, image seg32c32m-a27m) | 1m (pubmed-a1m-b1m-q10k, writes
 #   writes-a1m-b1m-u1m.bin, image seg32c32m)
 #   Builds / guest install dirs (defaults = M4): PLAIN_BUILD (builds/vdb/8), VPLAIN (/home/comsys/vdb8),
-#   MEG_BUILD (builds/vdb-megalon/5), VMEG (/home/comsys/vdbm5)
+#   MEG_BUILD (builds/vdb-megalon/6), VMEG (/home/comsys/vdbm6-28m)
 #   SYS=Popcorn: C8 (build-8 deploy bundle dir), K8 (release), GT8 (guest tools dir), RECV_MODE (poll | idle | sleep)
 # optional: REP (repeat label, recorded), SEED (loadgen --seed, default 20261015), GATE=0 (skip the Host gate:
 #   functional runs only).
@@ -32,7 +32,7 @@ case "${DATASET:-28m}" in
   *) stop "bad DATASET";;
 esac
 PLAIN_BUILD=${PLAIN_BUILD:-$P/builds/vdb/8} VPLAIN=${VPLAIN:-/home/comsys/vdb8}
-MEG_BUILD=${MEG_BUILD:-$P/builds/vdb-megalon/5} VMEG=${VMEG:-/home/comsys/vdbm5}
+MEG_BUILD=${MEG_BUILD:-$P/builds/vdb-megalon/6} VMEG=${VMEG:-/home/comsys/vdbm6-28m}
 SA="--nodes 2 --segments 32 --M 16 --efc 128 --ef 32 --max-writes 2097152 --max-ids $MAXIDS --max-deletes 1048576
  --search-threads 14 --wait-timeout-ms 60000 --start-timeout-ms 5400000"
 SA=$(echo $SA)
