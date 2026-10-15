@@ -32,8 +32,11 @@ recovery/M3-vdb-runs-vN/                 packet evidence dir (one approved attem
         ├── searches.bin, vectordb.txt  every search response (query row, E1 snapshot, ids, server time split)
         └── raw-step<N>.bin             per-request sched/send/done ns (--raw)
 ```
-SLO-search phases in steps.csv: `ramp` (rate x1.5, x2.25 far below the SLO), `bisect` (knee), `confirm`
-(repeats at the result), `overload` (first-fail rate x 1.05/1.1/1.2, measured in full: the curve past the knee).
+SLO-search phases in steps.csv: `ramp` (adaptive: x2.25 far below the SLO, x1.5, x1.2, x1.1 near the SLO or where
+the tail latency jumped), `bisect` (knee), `confirm` (3 repeats at the result; "confirm fails k/3" = k repeats had the
+SLO percentile above the SLO; a majority of fails steps the rate down 5% and confirms again), `fill` (result x
+0.7/0.8/0.9: the bend), `overload` (first-fail rate x 1.05/1.1/1.2, measured in full: the curve past the knee).
+From loadgen build 3 (CXL_SWMC commit with "adaptive ramp"); earlier runs have no fill points.
 For a throughput/p99 chart: filter `stream = search`, x = `achieved`, y = `p99_ms`, colour by `pass`.
 
 ## Combining runs (e.g. systems) for a spreadsheet or a plot
