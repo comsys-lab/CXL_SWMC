@@ -42,8 +42,9 @@ shuffle() { python3 -c 'import random,sys; v=sys.argv[2:]; random.Random(sys.arg
 confirm_x() { python3 -c 'import json,sys; c=json.load(open(sys.argv[1])).get("confirm",{}); print(c.get("x_mean",0))' "$1"; }
 rate() { python3 -c 'import sys; x,u=float(sys.argv[1]),float(sys.argv[2]); assert x>0; print(round(0.5*x/(1-u/100),3))' "$1" "$2"; }
 precheck() {  # kernel release
+  local kr=$1 i f
   for i in 0 1; do
-    $SSH comsys@${IPS[$i]} "EXPECT_K=$1 INIT_CHECK=$([ $i = 0 ] && echo 1 || echo 0) bash -s" < $X/m4-precheck.sh > "$E/precheck-${IPS[$i]}.out" 2>&1
+    $SSH comsys@${IPS[$i]} "EXPECT_K=$kr INIT_CHECK=$([ $i = 0 ] && echo 1 || echo 0) bash -s" < $X/m4-precheck.sh > "$E/precheck-${IPS[$i]}.out" 2>&1
     grep -q "^PRECHECK PASS" "$E/precheck-${IPS[$i]}.out" || { echo "SEQUENCE STOP: precheck ${IPS[$i]}"; exit 1; }
     for f in "vdb8/bin/vdb-server $P/builds/vdb/8/bin/vdb-server" "vdbm5/bin/vdb-server $P/builds/vdb-megalon/5/bin/vdb-server" \
              "vdbm5/lib/libvdb-megalon.so $P/builds/vdb-megalon/5/lib/libvdb-megalon.so" \
