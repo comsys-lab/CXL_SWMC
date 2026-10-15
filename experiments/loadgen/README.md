@@ -6,13 +6,13 @@ statistics; a workload is a plugin (`workload.h`) that only makes requests and r
 asyncio peer (e.g. for a LangChain VectorStore client).
 
 ## Model
-- **Streams.** A workload declares streams (vectordb: `write`, `search`). Each stream is an open-loop arrival
+- **Streams.** A workload declares streams (vectordb: `update`, `search`; runs before 2026-10-16: `write`). Each stream is an open-loop arrival
   process (Poisson by default, seeded) at its own rate; requests are made in global schedule order, so a plugin
   can stamp "everything scheduled before me" (vectordb E1: ref_w = last write made). `ordered` streams use one
   connection per target, so the server sees them in schedule order.
 - **Rates.** `--mix s=w,...` streams scale together with the swept rate x (x = their total); `--fixed s=r`
-  streams keep a fixed rate. Sweep (a) "fixed writes, rising searches": `--fixed write=2000 --mix search=1`;
-  sweep (b) "fixed mix, rising total": `--mix write=1,search=4`.
+  streams keep a fixed rate. Sweep (a) "fixed updates, rising searches": `--fixed update=1000 --mix search=1`;
+  sweep (b) "fixed mix, rising total": `--mix update=1,search=19` (95:5).
 - **Latency** is measured from the scheduled time (no coordinated omission): it includes send lag and queueing.
   Requests still outstanding after the drain time count as +inf (they fail the percentile). Throughput =
   completions inside the measurement window / window.
@@ -42,9 +42,29 @@ confirm ≈ 4-6 min per (system, configuration). `--mode fixed --rates r1,r2,...
 ## Outputs (`--out DIR`, must not exist)
 `manifest.txt` (all parameters, workload description), `steps.jsonl` (one JSON per step: offered/achieved,
 p50/p90/p99/p99.9/SLO percentile/max, errors, timeouts, send lag, pass/abort reason, per stream),
-`summary.json`, optional `raw-step<N>.bin` (`--raw`: sched/send/done ns, stream/status per request), plus the
+`summary.json`, optional `raw-step<N>.bin` (`--raw`: sched/send/done ns, stream/status per request), optional
+`stats/` (`--stats-op`, below), plus the
 workload's own files (e.g. vectordb search results for offline recall).
 Plot: `plot_slo.py --out fig.pdf runA=all-HWcc runB=Megalon ...` (x = throughput, y = tail latency).
+
+## Server counter snapshots (`--stats-op N`, default off)
+With `--stats-op N` the engine opens one extra connection per target and, for every measured step (not the run
+warm-up), sends a frame with op N (empty payload) and stores the text reply: once from a helper thread at the
+window start (end of the step warm-up) and once right after sending stops (= window end; in-flight requests drain
+afterwards). Files: `<out>/stats/step<NNN>-{begin,end}-t<k>.txt` (NNN = `step` in steps.jsonl, k = target index),
+first line `# when= phase= step= offered_x= target= addr= status= wall_ns= mono_ns= rtt_us=`, then the reply
+(vdb-server: `key=value` lines incl. `systems/common/proc_stats.h` keys). A step that stops before its window starts
+has no snapshots. Requests and replies on that connection are synchronous; the measured connections are untouched.
+- `stats_delta.py <out> [--out stats-steps.csv]`: one row per (step, target) with both snapshots; end − begin for
+  every numeric key (gauges: `node`, `write_queue`, `search_queue`, `megt.sample`, `*.n`, `*max_ns` keep the end
+  value), `window_s` (loadgen clock) and `srv_window_s` (server `t_mono_ns`).
+- `export_csv.py` adds step-level and per-node derived columns from these deltas (column list in its docstring):
+  rates (search/s, update/s, total ops/s; an update is one operation), search/update p50/p99, worker busy
+  fractions, CPU and run-queue wait per thread role, coherence stall estimates (Popcorn per-thread fault time,
+  Megalon section timers), coherence background CPU (`cxl_recv*` kernel threads, library threads), TLB/call IPIs,
+  traffic (Megalon flush bytes; Popcorn flush counts × 4 KiB). Existing columns keep their order; new columns are
+  appended.
+- Unit test (Host): `python3 test/stats_delta_test.py <scratch dir>`.
 
 ## Build and self-test (Host)
 `build.sh <out dir> [plugin.cc ...]` (out dir outside the repo, e.g. builds/loadgen/<n>; pin builds to node1).

@@ -2,11 +2,135 @@
 """Export loadgen runs to CSV for spreadsheets: one row per (run, step, stream).
 
 usage: export_csv.py --out steps.csv RUN_DIR[=label] ...
-RUN_DIR is a loadgen --out dir (steps.jsonl, summary.json). Columns: label, step, phase, measure_s, pass, aborted,
-reason, stream, offered, achieved, sent, done, errors, timeouts, p50/p90/p99/p999/pslo/max (ms), lag_p99_us,
-max_under_slo (the run's confirm mean, same on every row of the run).
+RUN_DIR is a loadgen --out dir (steps.jsonl, summary.json, optional stats/ from --stats-op).
+
+Columns (stable; new columns are only ever appended):
+  label, step, phase, measure_s, pass, aborted, reason, stream, offered, achieved, sent, done, errors, timeouts,
+  p50/p90/p99/p999/pslo/max (ms), lag_p99_us, max_under_slo (the run's confirm mean, same on every row of the run)
+Step-level (same value on every stream row of a step):
+  search_per_s, update_per_s     achieved rate of stream "search" / "update" (empty if the run has no such stream)
+  total_ops_per_s                sum of the achieved rates of all streams (an update counts as one operation)
+  search_p50_ms, search_p99_ms, update_p50_ms, update_p99_ms
+  traffic_bytes, traffic_per_update   coherence traffic over all nodes (n<k>_traffic_bytes summed) and per update
+                                      completed by the servers in the window (sum of n<k>_updates)
+Per node k (target index of --target; from the stats snapshot deltas, experiments/loadgen/stats_delta.py; empty
+when the run has no snapshots or the counter is absent). Times in seconds of the window, summed over threads:
+  n<k>_window_s            loadgen-clock window between the begin and end snapshots
+  n<k>_searches, n<k>_updates, n<k>_p_advance   server counters (searches done, updates done, watermark P advance)
+  n<k>_search_busy_frac    search_busy_ns / (window x search threads): worker busy fraction
+  n<k>_writer_busy_frac    writer_busy_ns / window
+  n<k>_search_cpu_s, n<k>_search_rq_wait_s, n<k>_writer_cpu_s   schedstat CPU / run-queue wait (thread groups
+                           vdb-search, vdb-writer)
+  n<k>_cpu_busy_frac       node CPU busy fraction (/proc/stat: 1 - (idle + iowait) / total)
+  Popcorn (per-thread /proc/<pid>/task/<tid>/swmc, Popcorn build >= 8; node-wide sysfs):
+  n<k>_pop_search_fault_s  vdb-search threads: swmc.read_fault_ns + swmc.write_fault_ns (wp is a subset of write)
+  n<k>_pop_search_msg_wait_s   vdb-search: swmc.read_msg_wait_ns + swmc.write_msg_wait_ns (part of the fault time)
+  n<k>_pop_search_local_wait_s vdb-search: swmc.read_local_wait_ns + swmc.write_local_wait_ns (part of the fault time)
+  n<k>_pop_writer_fault_s  vdb-writer: swmc.read_fault_ns + swmc.write_fault_ns
+  n<k>_pop_node_fault_s    sys.page_coherence.total_page_fault_handling_time (ns, all tasks of the node)
+  Megalon (workload wrapper timers megt.*, all threads; read sections sampled 1/megt.sample):
+  n<k>_meg_rd_check_s      (megt.rd_start_ns + megt.rd_end_ns) x megt.sample   (successful read sections, estimate)
+  n<k>_meg_wr_check_s      megt.wr_start_ns
+  n<k>_meg_flush_s         megt.wr_end_ns (write_end includes the flush)
+  n<k>_meg_reexec_s        megt.rd_retries x (megt.rd_failed_ns / megt.rd_failed_timed): failed attempts, mean of the
+                           timed (sampled) ones times the exact retry count (empty if none was timed)
+  n<k>_meg_stall_s         sum of the four above
+  n<k>_coh_stall_s         Popcorn: pop_search_fault_s + pop_writer_fault_s; Megalon: meg_stall_s
+  n<k>_recv_cpu_s          kernel threads cxl_recv* (schedstat run_ns; cpu_ticks / 100 if absent)
+  n<k>_lib_bg_cpu_s        this process's thread groups not named vdb-* (e.g. megalon-lib: Megalon's own threads)
+  n<k>_coh_bg_cpu_s        recv_cpu_s + lib_bg_cpu_s
+  n<k>_tlb_ipi, n<k>_cal_ipi   /proc/interrupts TLB shootdowns / function-call IPIs (whole node)
+  n<k>_traffic_bytes, n<k>_traffic_src   coherence traffic estimate and its source:
+                           megalon       megalon.flush_bytes + megalon.replay_flush_bytes
+                           popcorn-instr (sys.instr.serve.wb_flush_count + sys.instr.serve.acquire_flush_count) x 4096
+                           popcorn-wb    sys.page_coherence.remote_writeback_count x 4096 (no instr/ counters)
 """
-import argparse, csv, json, os
+import argparse, csv, json, os, sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import stats_delta  # noqa: E402
+
+BASE = ["label", "step", "phase", "measure_s", "pass", "aborted", "reason", "stream", "offered", "achieved", "sent",
+        "done", "errors", "timeouts", "p50_ms", "p90_ms", "p99_ms", "p999_ms", "pslo_ms", "max_ms", "lag_p99_us",
+        "max_under_slo"]
+STEP = ["search_per_s", "update_per_s", "total_ops_per_s", "search_p50_ms", "search_p99_ms", "update_p50_ms",
+        "update_p99_ms", "traffic_bytes", "traffic_per_update"]
+NODE = ["window_s", "searches", "updates", "p_advance", "search_busy_frac", "writer_busy_frac", "search_cpu_s",
+        "search_rq_wait_s", "writer_cpu_s", "cpu_busy_frac", "pop_search_fault_s", "pop_search_msg_wait_s",
+        "pop_search_local_wait_s", "pop_writer_fault_s", "pop_node_fault_s", "meg_rd_check_s", "meg_wr_check_s",
+        "meg_flush_s", "meg_reexec_s", "meg_stall_s", "coh_stall_s", "recv_cpu_s", "lib_bg_cpu_s", "coh_bg_cpu_s",
+        "tlb_ipi", "cal_ipi", "traffic_bytes", "traffic_src"]
+PAGE = 4096
+
+
+def _sum(d, keys):
+    v = [d[k] for k in keys if k in d]
+    return sum(v) if v else None
+
+
+def node_metrics(fixed, d):
+    """Derived per-node values of one step (dict of NODE -> value or None)."""
+    m = dict.fromkeys(NODE)
+    win = fixed["window_s"] if fixed["window_s"] != "" else None
+    m["window_s"] = win
+    m["searches"], m["updates"], m["p_advance"] = d.get("searches"), d.get("updates"), d.get("P")
+    nsearch = d.get("thr.vdb-search.n")
+    if win and "search_busy_ns" in d and nsearch:
+        m["search_busy_frac"] = d["search_busy_ns"] / (win * 1e9 * nsearch)
+    if win and "writer_busy_ns" in d:
+        m["writer_busy_frac"] = d["writer_busy_ns"] / (win * 1e9)
+    s = lambda k: d[k] / 1e9 if k in d else None  # noqa: E731
+    m["search_cpu_s"], m["search_rq_wait_s"] = s("thr.vdb-search.run_ns"), s("thr.vdb-search.wait_ns")
+    m["writer_cpu_s"] = s("thr.vdb-writer.run_ns")
+    cpu = [d[k] for k in d if k.startswith("cpu.")]
+    if cpu and sum(cpu) > 0:
+        m["cpu_busy_frac"] = 1 - (d.get("cpu.idle", 0) + d.get("cpu.iowait", 0)) / sum(cpu)
+    ns = lambda keys: (lambda v: v / 1e9 if v is not None else None)(_sum(d, keys))  # noqa: E731
+    sw = "thr.vdb-search.swmc."
+    m["pop_search_fault_s"] = ns([sw + "read_fault_ns", sw + "write_fault_ns"])
+    m["pop_search_msg_wait_s"] = ns([sw + "read_msg_wait_ns", sw + "write_msg_wait_ns"])
+    m["pop_search_local_wait_s"] = ns([sw + "read_local_wait_ns", sw + "write_local_wait_ns"])
+    m["pop_writer_fault_s"] = ns(["thr.vdb-writer.swmc.read_fault_ns", "thr.vdb-writer.swmc.write_fault_ns"])
+    m["pop_node_fault_s"] = ns(["sys.page_coherence.total_page_fault_handling_time"])
+    if "megt.sample" in d:
+        smp = d["megt.sample"]
+        m["meg_rd_check_s"] = (d.get("megt.rd_start_ns", 0) + d.get("megt.rd_end_ns", 0)) * smp / 1e9
+        m["meg_wr_check_s"] = d.get("megt.wr_start_ns", 0) / 1e9
+        m["meg_flush_s"] = d.get("megt.wr_end_ns", 0) / 1e9
+        if d.get("megt.rd_failed_timed"):
+            m["meg_reexec_s"] = d.get("megt.rd_retries", 0) * d["megt.rd_failed_ns"] / d["megt.rd_failed_timed"] / 1e9
+        elif d.get("megt.rd_retries", 0) == 0:
+            m["meg_reexec_s"] = 0.0
+        m["meg_stall_s"] = sum(m[k] or 0 for k in ("meg_rd_check_s", "meg_wr_check_s", "meg_flush_s", "meg_reexec_s"))
+    if m["pop_search_fault_s"] is not None or m["pop_writer_fault_s"] is not None:
+        m["coh_stall_s"] = (m["pop_search_fault_s"] or 0) + (m["pop_writer_fault_s"] or 0)
+    elif m["meg_stall_s"] is not None:
+        m["coh_stall_s"] = m["meg_stall_s"]
+    recv = [k for k in d if k.startswith("kthr.cxl_recv") and k.endswith(".run_ns")]
+    if recv:
+        m["recv_cpu_s"] = sum(d[k] for k in recv) / 1e9
+    else:
+        ticks = [k for k in d if k.startswith("kthr.cxl_recv") and k.endswith(".cpu_ticks")]
+        m["recv_cpu_s"] = sum(d[k] for k in ticks) / 100 if ticks else None
+    bg = [k for k in d if k.startswith("thr.") and k.endswith(".run_ns") and not k.startswith("thr.vdb-")]
+    m["lib_bg_cpu_s"] = sum(d[k] for k in bg) / 1e9 if bg else (0.0 if "thr.vdb-search.run_ns" in d else None)
+    if m["recv_cpu_s"] is not None or m["lib_bg_cpu_s"] is not None:
+        m["coh_bg_cpu_s"] = (m["recv_cpu_s"] or 0) + (m["lib_bg_cpu_s"] or 0)
+    m["tlb_ipi"], m["cal_ipi"] = d.get("irq.TLB"), d.get("irq.CAL")
+    if "megalon.flush_bytes" in d:
+        m["traffic_bytes"] = d["megalon.flush_bytes"] + d.get("megalon.replay_flush_bytes", 0)
+        m["traffic_src"] = "megalon"
+    elif "sys.instr.serve.wb_flush_count" in d:
+        m["traffic_bytes"] = (d["sys.instr.serve.wb_flush_count"] + d.get("sys.instr.serve.acquire_flush_count", 0)) * PAGE
+        m["traffic_src"] = "popcorn-instr"
+    elif "sys.page_coherence.remote_writeback_count" in d:
+        m["traffic_bytes"] = d["sys.page_coherence.remote_writeback_count"] * PAGE
+        m["traffic_src"] = "popcorn-wb"
+    return m
+
+
+def blank(v):
+    return "" if v is None else v
 
 
 def main():
@@ -14,26 +138,46 @@ def main():
     ap.add_argument("runs", nargs="+")
     ap.add_argument("--out", required=True)
     a = ap.parse_args()
-    cols = ["label", "step", "phase", "measure_s", "pass", "aborted", "reason", "stream", "offered", "achieved", "sent",
-            "done", "errors", "timeouts", "p50_ms", "p90_ms", "p99_ms", "p999_ms", "pslo_ms", "max_ms", "lag_p99_us",
-            "max_under_slo"]
+    runs = []
+    for spec in a.runs:
+        run, _, label = spec.partition("=")
+        per_step = {}
+        for fixed, d in stats_delta.deltas(run):
+            per_step.setdefault(fixed["step"], {})[fixed["target"]] = node_metrics(fixed, d)
+        ntgt = sum(1 for line in open(os.path.join(run, "manifest.txt")) if line.startswith("target=")) \
+            if os.path.exists(os.path.join(run, "manifest.txt")) else 0
+        runs.append((run, label or os.path.basename(run.rstrip("/")), per_step, ntgt))
+    nodes = max([2] + [r[3] for r in runs] + [max(t) + 1 for r in runs for t in r[2].values()])
+    cols = BASE + STEP + [f"n{k}_{c}" for k in range(nodes) for c in NODE]
     with open(a.out, "w", newline="") as f:
         w = csv.writer(f)
         w.writerow(cols)
-        for spec in a.runs:
-            run, _, label = spec.partition("=")
-            label = label or os.path.basename(run.rstrip("/"))
+        for run, label, per_step, _ in runs:
             summ = json.load(open(os.path.join(run, "summary.json")))
             best = summ.get("confirm", {}).get("x_mean", "")
             for line in open(os.path.join(run, "steps.jsonl")):
                 s = json.loads(line)
                 if s["phase"] == "warmup":
                     continue
-                for name, st in s["streams"].items():
+                st = s["streams"]
+                g = lambda n, k: st[n][k] if n in st else ""  # noqa: E731
+                nm = per_step.get(s["step"], {})
+                tb = [m["traffic_bytes"] for m in nm.values() if m["traffic_bytes"] is not None]
+                upd = [m["updates"] for m in nm.values() if m["updates"] is not None]
+                traffic = sum(tb) if tb else None
+                per_upd = traffic / sum(upd) if tb and upd and sum(upd) > 0 else None
+                step_cols = [g("search", "achieved"), g("update", "achieved"),
+                             sum(x["achieved"] for x in st.values()), g("search", "p50_ms"), g("search", "p99_ms"),
+                             g("update", "p50_ms"), g("update", "p99_ms"), blank(traffic), blank(per_upd)]
+                node_cols = []
+                for k in range(nodes):
+                    m = nm.get(k, {})
+                    node_cols += [blank(m.get(c)) for c in NODE]
+                for name, x in st.items():
                     w.writerow([label, s["step"], s["phase"], s["measure_s"], s["pass"], s["aborted"], s["reason"], name,
-                                st["offered"], st["achieved"], st["sent"], st["done"], st["errors"], st["timeouts"],
-                                st["p50_ms"], st["p90_ms"], st["p99_ms"], st["p999_ms"], st["pslo_ms"], st["max_ms"],
-                                st["lag_p99_us"], best])
+                                x["offered"], x["achieved"], x["sent"], x["done"], x["errors"], x["timeouts"],
+                                x["p50_ms"], x["p90_ms"], x["p99_ms"], x["p999_ms"], x["pslo_ms"], x["max_ms"],
+                                x["lag_p99_us"], best] + step_cols + node_cols)
     print(f"-> {a.out}")
 
 

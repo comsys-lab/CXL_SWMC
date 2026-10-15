@@ -15,6 +15,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <ctime>
 #include <fstream>
 #include <memory>
 #include <random>
@@ -83,6 +84,7 @@ struct Config {
   std::string arrival = "poisson";
   uint64_t seed = 20261015;
   bool raw = false;
+  uint16_t stats_op = 0;  // 0 = off; else op code of the server's text stats request (snapshots per measured step)
 };
 
 void usage() {
@@ -105,6 +107,8 @@ void usage() {
                "  --fill f1,f2,...|none                 SLO mode: points at the result x f for the bend (0.7,0.8,0.9)\n"
                "  --tol T --max-err E --abort-queue-s S --lag-limit-us U\n"
                "  --arrival poisson|uniform --seed N --raw\n"
+               "  --stats-op N            server stats snapshot (request op N, text reply) per target at each measured\n"
+               "                          step's window start and right after sending stops: <out>/stats/ (default off)\n"
                "workloads:");
   for (auto &kv : registry()) std::fprintf(stderr, " %s", kv.first.c_str());
   std::fprintf(stderr, "\n");
@@ -176,6 +180,11 @@ Config parse(int argc, char **argv) {
     else if (a == "--arrival") c.arrival = need(i);
     else if (a == "--seed") c.seed = std::stoull(need(i));
     else if (a == "--raw") c.raw = true;
+    else if (a == "--stats-op") {
+      const unsigned long v = std::stoul(need(i));
+      if (v == 0 || v > 0xffff) die("--stats-op 1..65535");
+      c.stats_op = uint16_t(v);
+    }
     else usage();
   }
   if (c.workload.empty() || c.targets.empty() || c.out.empty()) usage();
@@ -269,6 +278,10 @@ class Engine {
     for (size_t t = 0; t < fds_.size(); t++)
       for (int fd : fds_[t]) rx_.emplace_back([this, fd] { receive(fd); });
     if (mkdir(c_.out.c_str(), 0755) != 0) die("cannot create --out " + c_.out + " (must not exist)");
+    if (c_.stats_op) {  // one extra connection per target, used only for the synchronous stats requests
+      for (auto &t : c_.targets) stats_fds_.push_back(connect_to(t));
+      if (mkdir((c_.out + "/stats").c_str(), 0755) != 0) die("cannot create " + c_.out + "/stats");
+    }
     steps_ = std::fopen((c_.out + "/steps.jsonl").c_str(), "w");
     write_manifest();
   }
@@ -426,6 +439,22 @@ class Engine {
     std::vector<double> next(S);
     for (size_t s = 0; s < S; s++) next[s] = double(t0) + gap(s);
     const uint64_t first_id = issued_.load();
+    // stats snapshots (--stats-op): "begin" from a helper thread at the window start ws, "end" right after sending
+    // stops; only for measured steps, and "end" only if "begin" was taken (a step that stops before ws has none)
+    std::atomic<bool> snap_cancel{false}, snap_begun{false};
+    std::thread snap;
+    if (c_.stats_op && measure_s > 0)
+      snap = std::thread([&, phase, x, ws] {
+        for (uint64_t t = now_ns(); t < ws; t = now_ns()) {
+          if (snap_cancel.load()) return;
+          const uint64_t d = std::min<uint64_t>(ws - t, 1000000);
+          timespec ts{0, long(d)};
+          nanosleep(&ts, nullptr);
+        }
+        if (snap_cancel.load()) return;
+        snapshot_all("begin", phase, x);
+        snap_begun.store(true);
+      });
     StepResult res;
     std::vector<uint8_t> payload;
     std::vector<uint8_t> wire;
@@ -483,6 +512,11 @@ class Engine {
     }
     const uint64_t send_end = now_ns();
     const uint64_t last_id = issued_.load();
+    if (snap.joinable()) {
+      snap_cancel.store(true);
+      snap.join();
+      if (snap_begun.load()) snapshot_all("end", phase, x);
+    }
     const uint64_t drain_until = send_end + uint64_t(c_.drain_s * 1e9);
     while (outstanding_.load() > out_base && now_ns() < drain_until) usleep(1000);
 
@@ -544,6 +578,41 @@ class Engine {
     if (c_.raw && measure_s > 0) dump_raw(first_id, last_id);
     step_no_++;
     return res;
+  }
+
+  // One stats snapshot per target, in parallel: request op --stats-op on the target's stats connection, write the
+  // text reply to <out>/stats/step<NNN>-<when>-t<k>.txt after one header line.
+  void snapshot_all(const char *when, const char *phase, double x) {
+    std::vector<std::thread> th;
+    for (size_t t = 0; t < stats_fds_.size(); t++) th.emplace_back([=] { snapshot(t, when, phase, x); });
+    for (auto &h : th) h.join();
+  }
+  void snapshot(size_t t, const char *when, const char *phase, double x) {
+    timespec rt;
+    clock_gettime(CLOCK_REALTIME, &rt);
+    const uint64_t t0 = now_ns();
+    frame::header h;
+    frame::fill(&h, c_.stats_op, step_no_, 0);
+    if (!frame::write_full(stats_fds_[t], &h, sizeof(h))) die("stats request failed (target " + c_.targets[t] + ")");
+    frame::header rh;
+    std::string body;
+    if (!frame::read_full(stats_fds_[t], &rh, sizeof(rh)) || rh.len < frame::kHeaderTail || rh.len > frame::kMaxFrame)
+      die("stats reply failed (target " + c_.targets[t] + ")");
+    body.resize(frame::payload_len(rh));
+    if (!body.empty() && !frame::read_full(stats_fds_[t], &body[0], body.size()))
+      die("stats reply failed (target " + c_.targets[t] + ")");
+    const uint64_t t1 = now_ns();
+    char name[64];
+    std::snprintf(name, sizeof(name), "/stats/step%03u-%s-t%zu.txt", step_no_, when, t);
+    FILE *f = std::fopen((c_.out + name).c_str(), "w");
+    if (!f) die("cannot write " + c_.out + name);
+    std::fprintf(f, "# when=%s phase=%s step=%u offered_x=%s target=%zu addr=%s status=%u wall_ns=%llu mono_ns=%llu "
+                 "rtt_us=%.1f\n",
+                 when, phase, step_no_, fmt(x).c_str(), t, c_.targets[t].c_str(), unsigned(rh.code),
+                 (unsigned long long)(uint64_t(rt.tv_sec) * 1000000000ull + uint64_t(rt.tv_nsec)),
+                 (unsigned long long)t0, (t1 - t0) / 1e3);
+    std::fwrite(body.data(), 1, body.size(), f);
+    std::fclose(f);
   }
 
   int pick_fd(uint32_t t, bool ordered) {
@@ -624,7 +693,7 @@ class Engine {
       << " drain_s=" << c_.drain_s << " confirm_s=" << c_.confirm_s << " confirm_reps=" << c_.confirm_reps
       << " overload=" << [&] { std::string o; for (double f : c_.overload) o += (o.empty() ? "" : ",") + fmt(f); return o.empty() ? std::string("none") : o; }()
       << "\ntol=" << c_.tol << " max_err=" << c_.max_err << " abort_queue_s=" << c_.abort_queue_s
-      << " lag_limit_us=" << c_.lag_limit_us << "\n";
+      << " lag_limit_us=" << c_.lag_limit_us << "\nstats_op=" << c_.stats_op << "\n";
     for (auto &kv : c_.mix) m << "mix." << kv.first << "=" << kv.second << "\n";
     for (auto &kv : c_.fixed) m << "fixed." << kv.first << "=" << kv.second << "\n";
   }
@@ -659,6 +728,7 @@ class Engine {
     stopping_.store(true);
     for (auto &v : fds_)
       for (int fd : v) shutdown(fd, SHUT_RDWR);
+    for (int fd : stats_fds_) close(fd);
     for (auto &t : rx_) t.join();
     return note.empty() && ok ? 0 : 1;
   }
@@ -674,6 +744,7 @@ class Engine {
   std::vector<StreamSpec> specs_;
   std::map<std::string, size_t> idx_;
   std::vector<std::vector<int>> fds_;
+  std::vector<int> stats_fds_;  // --stats-op: one per target
   std::vector<uint32_t> rr_;
   std::vector<std::thread> rx_;
   Store store_;
