@@ -1,10 +1,11 @@
 #!/bin/bash
 # Popcorn guest control (runs ON a guest, as root via `sudo -n`; grant-gated).
-#   p-popcorn-guest.sh load <node_id> | wait-link <sec> | enable <sec> | status | disable | unload
+#   p-popcorn-guest.sh load <node_id> <invalid|shared> | wait-link <sec> | enable <sec> | status | disable | unload
 # Expected values come from popcorn.env next to this script (frozen in the
 # packet): K (kernel release), KO_SHA (sha256 of the installed, signed
 # cxl_shm.ko), PARAMS (cxl_shm parameters except node_id, = `faultlat params`
-# for the region config), MANAGED_BASE_OFF/MANAGED_BYTES. Every step stops
+# for the region config, with init_state=invalid; `load` substitutes the
+# requested init_state), MANAGED_BASE_OFF/MANAGED_BYTES. Every step stops
 # (exit != 0) on the first unexpected result and changes nothing more.
 #   load      checks release, module not loaded, nobody has /dev/dax0.0 open
 #             or mapped, params recomputed from the region config == PARAMS,
@@ -12,7 +13,9 @@
 #             at msg_ring, registers the swcc range; no SWcc write)
 #   wait-link waits until the link to the peer is up (cxl_shm counters)
 #   enable    syscall 470 (enable_page_coherence), retried while EAGAIN;
-#             checks the managed range reported by the kernel
+#             checks the managed range reported by the kernel. With
+#             INIT_STATE=shared the first enable blocks in the cross-node
+#             barrier until every node enables (run them in parallel).
 #   disable   syscall 471 (fails with EBUSY while managed mappings exist)
 #   unload    rmmod cxl_shm (writes back this node's S/M pages, withdraws its
 #             ring identity; refused while managed mappings exist)
@@ -47,18 +50,21 @@ links_up() { echo $(( $(cat $CS/link_up) - $(cat $CS/link_down) )); }
 
 case "${1:-}" in
 load)
-  id=${2:?node_id}
+  id=${2:?node_id}; mode=${3:?init_state}
   [[ "$id" =~ ^[0-9]$ ]] || { echo "STOP: bad node_id"; exit 1; }
+  [[ "$mode" =~ ^(invalid|shared)$ ]] || { echo "STOP: bad init_state"; exit 1; }
+  [[ "$PARAMS" == *" init_state=invalid" ]] || { echo "STOP: frozen PARAMS lack init_state=invalid"; exit 1; }
+  want="${PARAMS% init_state=invalid} init_state=$mode"
   ! loaded || { echo "STOP: cxl_shm already loaded"; exit 1; }
   u=$(dax_users); [ -z "$u" ] || { echo "STOP: /dev/dax0.0 in use: $u"; exit 1; }
-  p=$(CXL_REGION_CONFIG=$H/cxl_region.yaml "$H/faultlat" params)
-  [ "$p" = "$PARAMS" ] || { echo "STOP: params from region config differ: '$p' vs '$PARAMS'"; exit 1; }
+  p=$(CXL_REGION_CONFIG=$H/cxl_region.yaml "$H/faultlat" params --init-state "$mode")
+  [ "$p" = "$want" ] || { echo "STOP: params from region config differ: '$p' vs '$want'"; exit 1; }
   [ "$(sha256sum "$KO" | cut -d' ' -f1)" = "$KO_SHA" ] || { echo "STOP: $KO hash differs"; exit 1; }
   [ "$(modinfo -F vermagic "$KO" | cut -d' ' -f1)" = "$K" ] || { echo "STOP: vermagic"; exit 1; }
   # shellcheck disable=SC2086
-  insmod "$KO" node_id="$id" $PARAMS
+  insmod "$KO" node_id="$id" $want
   loaded || { echo "STOP: cxl_shm not loaded after insmod"; exit 1; }
-  for f in dax_name nr_nodes node_id ring_offset ring_size ring_coherent managed_offset managed_size recv_mode; do
+  for f in dax_name nr_nodes node_id ring_offset ring_size ring_coherent managed_offset managed_size init_state recv_mode; do
     echo "$f=$(cat /sys/module/cxl_shm/parameters/$f)"
   done
   dmesg | grep -E 'shm_cxl|swmc-popcorn|swmc_kmsg' | tail -n 8
@@ -86,7 +92,12 @@ enable)
   start=$(python3 -I -c 'import sys; print(hex(int(open("/sys/bus/dax/devices/dax0.0/resource").read(),0)+int(sys.argv[1])))' "$MANAGED_BASE_OFF")
   [ "$base" = "$start" ] && [ "$bytes" = "$MANAGED_BYTES" ] ||
     { echo "STOP: managed range $base +$bytes, expected $start +$MANAGED_BYTES"; exit 1; }
-  echo "protocol=$(cat $SYS/protocol) managed_base=$base managed_bytes=$bytes"
+  is=$(cat $SYS/init_state)
+  case "$(cat /sys/module/cxl_shm/parameters/init_state)" in
+    shared) [ "$is" = "shared (initialized)" ] || { echo "STOP: init_state '$is'"; exit 1; } ;;
+    *) [ "$is" = invalid ] || { echo "STOP: init_state '$is'"; exit 1; } ;;
+  esac
+  echo "protocol=$(cat $SYS/protocol) managed_base=$base managed_bytes=$bytes init_state=$is"
   dmesg | grep 'swmc-popcorn' | tail -n 3
   echo "enable OK" ;;
 status)

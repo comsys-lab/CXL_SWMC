@@ -8,7 +8,7 @@
 // (config/cxl_region.yaml via systems/common/cxl_region.h).
 //
 // Subcommands (see README.md):
-//   faultlat params [--nodes N] [--device-size B]
+//   faultlat params [--nodes N] [--device-size B] [--init-state invalid|shared]
 //   faultlat access --op read|write|rw [--pages N] [--page-offset P] [--stride S]
 //                   [--passes K] [--shuffle] [--cpu C] [--out F] [--raw F]
 //                   [--pattern X] [--expect X]
@@ -80,6 +80,7 @@ struct Args {
   uint64_t nonce = 0;
   uint64_t iters = 10000;
   uint64_t device_size = 0;   // params only: override /sys/bus/dax/.../size (Host dry run)
+  std::string init_state = "invalid";  // params only: cxl_shm init_state
   bool has_pattern = false, has_expect = false;
   uint64_t pattern = 0, expect = 0;  // access: written / expected value X ^ page index (data check)
   std::string out, raw, config;
@@ -117,6 +118,7 @@ Args parse_args(int argc, char **argv) {
     else if (k == "--out") a.out = val("--out");
     else if (k == "--raw") a.raw = val("--raw");
     else if (k == "--config") a.config = val("--config");
+    else if (k == "--init-state") a.init_state = val("--init-state");
     else if (k == "--device-size") a.device_size = parse_num(val("--device-size"), "--device-size");
     else if (k == "--pattern") { a.pattern = parse_num(val("--pattern"), "--pattern"); a.has_pattern = true; }
     else if (k == "--expect") { a.expect = parse_num(val("--expect"), "--expect"); a.has_expect = true; }
@@ -315,11 +317,12 @@ int cmd_params(const Args &a) {
       ring.end() > r.hwcc.end())
     die("msg_ring [%" PRIu64 ", +%" PRIu64 ") must be 4 KiB aligned and inside hwcc [%" PRIu64 ", %" PRIu64 ")",
         ring.offset, ring.size, r.hwcc.offset, r.hwcc.end());
-  // Same sizing rule as cxl_shm v6: a page-aligned header (2 lines per window + 2 lines per node), then
+  // Same sizing rule as cxl_shm v7: a page-aligned header (2 lines per window + 3 lines per node), then
   // N*(N-1) directions x {request, response} windows of at least 256 64-byte slots.
   const uint64_t n = uint64_t(a.nodes), windows = n * (n - 1) * 2;
   if (a.nodes < 2 || a.nodes > 8) die("--nodes must be 2..8 (cxl_shm nr_nodes)");
-  const uint64_t hdr = (windows * 2 * 64 + 2 * n * 64 + 4095) / 4096 * 4096;
+  const uint64_t hdr = (windows * 2 * 64 + 3 * n * 64 + 4095) / 4096 * 4096;
+  if (a.init_state != "invalid" && a.init_state != "shared") die("--init-state must be invalid or shared");
   const uint64_t need = hdr + windows * 256 * 64;
   if (ring.size < need)
     die("msg_ring size %" PRIu64 " too small for %d nodes: need >= %" PRIu64, ring.size, a.nodes, need);
@@ -327,8 +330,8 @@ int cmd_params(const Args &a) {
   if (r.swcc.offset < r.hwcc.end() && r.hwcc.offset < r.swcc.end()) die("swcc overlaps hwcc");
   std::string dev = r.device.substr(r.device.rfind('/') + 1);
   printf("dax_name=%s nr_nodes=%d ring_offset=%" PRIu64 " ring_size=%" PRIu64 " ring_coherent=1 managed_offset=%" PRIu64
-         " managed_size=%" PRIu64 "\n",
-         dev.c_str(), a.nodes, ring.offset, ring.size, r.swcc.offset, r.swcc.size);
+         " managed_size=%" PRIu64 " init_state=%s\n",
+         dev.c_str(), a.nodes, ring.offset, ring.size, r.swcc.offset, r.swcc.size, a.init_state.c_str());
   return 0;
 }
 

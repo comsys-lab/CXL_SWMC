@@ -112,7 +112,9 @@ bash "$SW/workloads/faultlat/setup.sh" "$SCR/fl" > /dev/null
 cp "$SCR/fl/faultlat" "$SW/workloads/faultlat/run.sh" "$OUT/tools/"
 cp "$SW/config/cxl_region.yaml" "$OUT/tools/cxl_region.yaml"
 cp "$DEP/p-popcorn-guest.sh" "$OUT/tools/"
-PARAMS=$("$OUT/tools/faultlat" params --config "$OUT/tools/cxl_region.yaml" --device-size 103060340736 --nodes 2)
+# base parameters (init_state=invalid); p-popcorn-guest.sh load substitutes the requested init_state
+PARAMS=$("$OUT/tools/faultlat" params --config "$OUT/tools/cxl_region.yaml" --device-size 103060340736 --nodes 2 \
+  --init-state invalid)
 read -r MOFF MBYTES < <(sed -n 's/.*managed_offset=\([0-9]*\) managed_size=\([0-9]*\).*/\1 \2/p' <<<"$PARAMS")
 cat > "$OUT/tools/popcorn.env" <<ENV
 # Popcorn guest expectations (frozen with the packet; read by p-popcorn-guest.sh)

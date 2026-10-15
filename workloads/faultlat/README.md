@@ -29,12 +29,16 @@ All offsets come from the region config (`config/cxl_region.yaml`, path in
 from the same config (N = 2 by default): `nr_nodes=N`, `managed_offset/size`
 = exactly the swcc range (the MSI-managed range; never hwcc), `ring_offset/size`
 = the `msg_ring: [offset, size]` key (tail of hwcc, so `ring_coherent=1`).
-It refuses a ring that is too small for N nodes (cxl_shm v6 sizing: N=2 needs
+It refuses a ring that is too small for N nodes (cxl_shm v7 sizing: N=2 needs
 69632 B, N=8 1851392 B). `--device-size B` replaces the sysfs device size, for
 a dry run on the Host (dax0.0 exists only in the guests). With the current
 config and the guests' dax0.0 (103060340736 B) it prints
 
-    dax_name=dax0.0 nr_nodes=2 ring_offset=268300288 ring_size=135168 ring_coherent=1 managed_offset=268435456 managed_size=102791905280
+    dax_name=dax0.0 nr_nodes=2 ring_offset=268300288 ring_size=135168 ring_coherent=1 managed_offset=268435456 managed_size=102791905280 init_state=invalid
+
+`--init-state shared` selects cxl_shm's "all Shared" initial state (v7;
+reports/P-popcorn-init-shared.md). It must be the same on all nodes; the
+guest tooling recomputes the string and refuses a difference.
 
 Example for the Popcorn kernel (root; grant-gated):
 
