@@ -5,6 +5,8 @@
 # env (required): SYSTEM (label, e.g. all-HWcc), V (guest install dir), HOST_SERVER (Host vdb-server of the same
 #   build, for --print-app-bytes), LOADGEN, SERVER_ARGS (identical on every node), INIT (initial segments dir on
 #   node 0's guest); optional: NODES (default 192.168.122.100 192.168.122.101), PORT (7000), LG_CPUS (56-63),
+#   RUN_KIND (measurement [default] | functional: correctness-only run; a Host build is recorded, not fatal —
+#   CLAUDE.md allows builds during correctness-only runs only with the user's OK, given through the packet),
 #   NODE_ENV (ENV:K=V tokens for every node), NODE0_ENV (extra tokens for node 0 only), e.g. for Megalon:
 #   NODE_ENV="ENV:RACKOBJ_CONFIG=$V/cfg/megalon.yaml" NODE0_ENV="ENV:MEGALON_REINIT=1".
 # Stops (and stops the servers) on the first error. Measurement hygiene: no Host build before/after (pgrep).
@@ -22,7 +24,7 @@ HERE=$(cd "$(dirname "$0")" && pwd); ROOT=$(cd "$HERE/../.." && pwd)
 host_check() {  # any compiler/linker/build tool running on the Host invalidates a measurement
   local p; p=$(pgrep -a -x 'make|cc1|cc1plus|ld|ld.gold|lld|cargo|rustc|ninja|cmake|conan' || true)
   echo "$(date -Is) $1 builds=[${p//$'\n'/; }] loadavg=$(cut -d' ' -f1-3 /proc/loadavg)" >> "$RUN/host-check.txt"
-  [ -z "$p" ] || { echo "Host build running ($1): $p"; return 1; }
+  [ -z "$p" ] || [ "${RUN_KIND:-measurement}" = functional ] || { echo "Host build running ($1): $p"; return 1; }
 }
 STARTED=()  # node indices this run started (only these are stopped/collected)
 stop_nodes() {
@@ -40,7 +42,7 @@ GRUN=$V/runs/$NAME-${RID#0x}  # fresh guest dir per run (never reuses an earlier
 # shellcheck disable=SC2086
 APP=$("$HOST_SERVER" $SERVER_ARGS --print-app-bytes)
 { echo "# vectordb run (CXL_SWMC/experiments/vectordb/run.sh)"; echo "name=$NAME"; echo "system=$SYSTEM"
-  echo "start=$(date -Is)"; echo "run_id=$RID"; echo "guest_run_dir=$GRUN"; echo "cxl_swmc_commit=$(git -C "$ROOT" rev-parse HEAD)"
+  echo "start=$(date -Is)"; echo "run_kind=${RUN_KIND:-measurement}"; echo "run_id=$RID"; echo "guest_run_dir=$GRUN"; echo "cxl_swmc_commit=$(git -C "$ROOT" rev-parse HEAD)"
   echo "cxl_swmc_dirty=$(git -C "$ROOT" status --porcelain | wc -l)"
   echo "host_server=$HOST_SERVER sha256=$(sha256sum "$HOST_SERVER" | cut -d' ' -f1)"
   echo "loadgen=$LOADGEN sha256=$(sha256sum "$LOADGEN" | cut -d' ' -f1)"
