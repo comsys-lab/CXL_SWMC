@@ -79,6 +79,10 @@ precheck)
   grep -q '"align":4096' "$R/nd-before.txt"; grep -q '"size":103060340736' "$R/nd-before.txt"
   if grep -qx cxl_shm "$R/nd-before.txt"; then echo "STOP: cxl_shm loaded on current VM"; exit 1; fi
   ssh_vm "test \$(df -Pk /var/tmp | awk 'NR==2 {print \$4}') -ge 6291456 && test \$(df -Pk /lib/modules | awk 'NR==2 {print \$4}') -ge 6291456"
+  # Popcorn refuses fs-DAX holders (fs_dax_get): no FamFS mount, fstab entry or unit may be configured
+  ssh_vm "findmnt -rn -o SOURCE,TARGET,FSTYPE | grep -i famfs; grep -i famfs /etc/fstab; \
+    systemctl list-unit-files --no-legend 2>/dev/null | grep -i famfs; true" > "$R/famfs-before.txt"
+  test ! -s "$R/famfs-before.txt" || { echo "STOP: FamFS configured on the guest (see famfs-before.txt)"; exit 1; }
   ssh_vm "pgrep -a -x 'vdb-server|faultlat|megalon.*' || true" > "$R/procs-before.txt"
   test ! -s "$R/procs-before.txt" || { echo "STOP: workload processes running"; exit 1; }
   log "precheck PASS" ;;
