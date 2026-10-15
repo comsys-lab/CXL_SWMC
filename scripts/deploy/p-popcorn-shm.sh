@@ -18,6 +18,8 @@
 #             present and enabled, a comsys process touches one page of IPAGE
 #             (read, then write) and reads its own /proc/thread-self/swmc (16
 #             "name value" lines, mode 0400, its uid; read/wp counts >= 1)
+#   instr-on  (build >= 8) set instrumentation enabled=1 (ONLY=<k>: one VM); recovery
+#             after an interrupted `overhead` (teardown refuses instr_enabled != 1)
 #   overhead  (build >= 8) faultlat with instrumentation on vs off on both
 #             nodes (/sys/kernel/swmc/instr/enabled), OREPS repeats per
 #             setting in ABBA order, fresh pages from OBASE; prints a table
@@ -26,6 +28,7 @@
 #             left; dax0.0 back to root:root 600; disable coherence and unload
 #             cxl_shm (VM1, then VM0). ONLY=<k> tears down that VM alone (the
 #             other one is unreachable and goes to p-popcorn-deploy.sh rollback).
+#             Build >= 8: refuses (STOP) while instr_enabled != 1 (see instr-on).
 # smoke also checks acceptance: per node, counter deltas transaction_error /
 # send_drop / late_response = 0, remote_request_count delta > 0, and no
 # BUG/Oops/WARNING in dmesg; on a failed step it waits (<= 120 s) until no
@@ -184,7 +187,7 @@ instr-check)
   for k in 0 1; do
     G $k status > "$R/status-instr-vm$k.txt"
     grep -qx 'instr_enabled=1' "$R/status-instr-vm$k.txt" || { log "STOP: instr not enabled on vm$k"; exit 1; }
-    grep -qx 'dax0.0=comsys:root 600' "$R/status-instr-vm$k.txt"
+    grep -qx 'dax0.0=comsys:root 600' "$R/status-instr-vm$k.txt" || { log "STOP: dax0.0 not comsys-owned on vm$k (chown phase?)"; exit 1; }
     G $k instr-dump > "$R/instr-before-vm$k.txt"
     for f in swmc.tx_fetch.wait_count swmc.tx_invalidate.wait_count swmc.serve.unmap_ns swmc.fault_wp.count \
              cxl_shm.ring_rtt.count cxl_shm.counters.tsc_khz; do
@@ -277,6 +280,10 @@ for kind in ('readM', 'writeI', 'pp0'):
         print('%s overhead mean: %+.0f ns (%+.1f%%)' % (kind, a - b, 100 * (a - b) / b))
 PY
   log "overhead done ($((i)) runs; numbers in overhead.txt; instrumentation enabled=1 on both)" ;;
+instr-on)
+  # recovery after an interrupted `overhead`: instrumentation back on (ONLY=<k> for one VM)
+  for k in "${NODES[@]}"; do G $k instr 1 | tee -a "$R/instr-on-vm$k.txt"; grep -q 'instr OK (enabled=1)' "$R/instr-on-vm$k.txt"; done
+  log "instr-on PASS on vm${NODES[*]}" ;;
 status)
   for k in 0 1; do G $k status > "$R/status-${STATUS_TAG:-now}-vm$k.txt"; done
   log "status recorded (${STATUS_TAG:-now})" ;;
@@ -287,6 +294,10 @@ teardown)
     test ! -s "$R/procs-teardown-vm$k.txt" || { log "STOP: processes still running on vm$k"; exit 1; }
     G $k status > "$R/status-teardown-vm$k.txt"
     grep -qx 'dax_users=' "$R/status-teardown-vm$k.txt" || { log "STOP: /dev/dax0.0 still in use on vm$k"; exit 1; }
+    # kernels with instrumentation (build >= 8): it must be back on (an interrupted `overhead` may leave 0;
+    # recovery: `p-popcorn-shm.sh instr-on`, then teardown again)
+    if grep -q '^instr_enabled=' "$R/status-teardown-vm$k.txt" && ! grep -qx 'instr_enabled=1' "$R/status-teardown-vm$k.txt"; then
+      log "STOP: instr_enabled != 1 on vm$k (run: env R=... p-popcorn-shm.sh instr-on, then teardown)"; exit 1; fi
     on $k 'sudo -n chown root:root /dev/dax0.0 && sudo -n chmod 600 /dev/dax0.0 && stat -c "%U:%G %a" /dev/dax0.0' \
       | tee "$R/unchown-vm$k.txt"
     grep -qx 'root:root 600' "$R/unchown-vm$k.txt"
