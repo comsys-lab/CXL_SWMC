@@ -1,0 +1,32 @@
+# Megalon config for the vectordb Megalon backend (workloads/vectordb/DESIGN.md §12), 2 VMs, 1M-record pilots
+# (reports/M5-pilot-packet.md). Identical to vectordb-2vm.yaml except object_arena_size.
+# Objects (2M ids = pool A 1M + pool B 1M, 32 segments, capacity 62,500 -> 6 groups of 10,699, 32 MiB vector chunk
+# 33,552,064 B + link chunk 2,427,584 B; 2 x 256 delete-log chunks of 4096 x 64 B with --max-deletes 1048576):
+# 32 x 6 x 35,979,648 + 512 x 262,144 = 7,042,310,144 B = 6.56 GiB, 896 objects. 8GB as in the earlier 2M-id runs.
+mount_directory: /mydata        # required by the config parser; unused
+key_space: 10000
+slots: 10240
+logical_scr_size: 64MB
+node_id: 0                      # overridden by MEGALON_NODE_ID (vdb-server sets it from --node)
+region_config: ""               # $CXL_REGION_CONFIG
+reinit: false                   # node 0: MEGALON_REINIT=1
+attach_mprotect: true
+stuck_timeout_ms: 10000
+log_sync_interval_us: 100
+nr_log_size: 64MB
+attach_timeout_s: 600
+start_barrier_timeout_s: 600
+object_arena_size: 8GB
+object_align: 64
+object_max_count: 65536         # hwcc flavor only (static records): >= object count (vdb-server prints objects=)
+replicate: false
+flush: false
+evict: false
+partition_ratio: 0.0
+excluded_files:
+excluded_directories:
+  - /usr
+  - /proc
+  - /etc
+  - /dev
+  - /sys

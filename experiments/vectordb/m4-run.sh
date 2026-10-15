@@ -1,8 +1,15 @@
 #!/bin/bash
-# One M4 VectorDB run (reports/M4-vdb-packet.md): Host gate, system setup, run.sh, post checks, E1 check, load times.
+# One VectorDB run of the M4 / M5 packets (reports/M4-vdb-packet.md, reports/M5-pilot-packet.md; MOT1 v5 §3.3, §4.3):
+# Host gate, system setup, run.sh, post checks, E1 check, load times.
 # usage: m4-run.sh <name> <evidence dir>
-# env (required): SYS (all-HWcc | Megalon | Popcorn), U (update %: 0 | 5 | 20 | 50), KIND (functional | slo | fixed)
-#   KIND=fixed: RATE (total req/s of the scaled streams = L / (1 - U/100)); TRACE (0 | 1, default 0; Megalon only)
+# env (required): SYS (all-HWcc | Megalon | Popcorn), U (update %: 0 | 5 | 20 | 50),
+#   KIND: functional | slo (MOT1 step 1) | fixed (step 2, 60 s) | pslo (pilot SLO search: steps 2 s + 8 s, confirm
+#   1 x 15 s, no fill/overload) | pfix (pilot fixed load, 30 s)
+#   KIND=fixed|pfix: RATE (total req/s of the scaled streams = L / (1 - U/100)); TRACE (0 | 1, default 0; Megalon only)
+#   DATASET: 28m (default: pubmed-a27m-b1m-q10k, image seg32c32m-a27m) | 1m (pubmed-a1m-b1m-q10k, writes
+#   writes-a1m-b1m-u1m.bin, image seg32c32m)
+#   Builds / guest install dirs (defaults = M4): PLAIN_BUILD (builds/vdb/8), VPLAIN (/home/comsys/vdb8),
+#   MEG_BUILD (builds/vdb-megalon/5), VMEG (/home/comsys/vdbm5)
 #   SYS=Popcorn: C8 (build-8 deploy bundle dir), K8 (release), GT8 (guest tools dir), RECV_MODE (poll | idle | sleep)
 # optional: REP (repeat label, recorded), SEED (loadgen --seed, default 20261015), GATE=0 (skip the Host gate:
 #   functional runs only).
@@ -17,23 +24,29 @@ TRACE=${TRACE:-0} SEED=${SEED:-20261015}
 stop() { echo "M4RUN $NAME STOP $*"; exit 1; }
 [ -d "$E" ] || stop "missing evidence dir $E"
 [ -e "$E/$NAME" ] && stop "$E/$NAME exists"
-D=$P/workspaces/vdb-data/pubmed-a27m-b1m-q10k W=$P/workspaces/vdb-data/writes-a27m-b1m-u1m.bin
-INIT=/home/comsys/vdb/init/seg32c32m-a27m
-NA=26990000 NB=1000000
-SA="--nodes 2 --segments 32 --M 16 --efc 128 --ef 32 --max-writes 2097152 --max-ids 28000000 --max-deletes 1048576
+case "${DATASET:-28m}" in
+  28m) D=$P/workspaces/vdb-data/pubmed-a27m-b1m-q10k W=$P/workspaces/vdb-data/writes-a27m-b1m-u1m.bin
+       INIT=/home/comsys/vdb/init/seg32c32m-a27m NA=26990000 NB=1000000 MAXIDS=28000000;;
+  1m)  D=$P/workspaces/vdb-data/pubmed-a1m-b1m-q10k W=$P/workspaces/vdb-data/writes-a1m-b1m-u1m.bin
+       INIT=/home/comsys/vdb/init/seg32c32m NA=1000000 NB=1000000 MAXIDS=2000000;;
+  *) stop "bad DATASET";;
+esac
+PLAIN_BUILD=${PLAIN_BUILD:-$P/builds/vdb/8} VPLAIN=${VPLAIN:-/home/comsys/vdb8}
+MEG_BUILD=${MEG_BUILD:-$P/builds/vdb-megalon/5} VMEG=${VMEG:-/home/comsys/vdbm5}
+SA="--nodes 2 --segments 32 --M 16 --efc 128 --ef 32 --max-writes 2097152 --max-ids $MAXIDS --max-deletes 1048576
  --search-threads 14 --wait-timeout-ms 60000 --start-timeout-ms 5400000"
 SA=$(echo $SA)
 export LOADGEN=$P/builds/loadgen/4/loadgen READY_TIMEOUT=5400 RUN_KIND=measurement TRACE STATS_OP=10 INIT
 [ "$KIND" = functional ] && RUN_KIND=functional
 export RUN_KIND
 case "$SYS" in
-  all-HWcc) export SYSTEM=all-HWcc V=/home/comsys/vdb8 HOST_SERVER=$P/builds/vdb/8/bin/vdb-server SERVER_ARGS="$SA";;
-  Megalon) export SYSTEM=Megalon V=/home/comsys/vdbm5 HOST_SERVER=$P/builds/vdb-megalon/5/bin/vdb-server \
-             SERVER_ARGS="--backend megalon $SA" NODE_ENV="ENV:RACKOBJ_CONFIG=/home/comsys/vdbm5/cfg/megalon.yaml" \
+  all-HWcc) export SYSTEM=all-HWcc V=$VPLAIN HOST_SERVER=$PLAIN_BUILD/bin/vdb-server SERVER_ARGS="$SA";;
+  Megalon) export SYSTEM=Megalon V=$VMEG HOST_SERVER=$MEG_BUILD/bin/vdb-server \
+             SERVER_ARGS="--backend megalon $SA" NODE_ENV="ENV:RACKOBJ_CONFIG=$VMEG/cfg/megalon.yaml" \
              NODE0_ENV="ENV:MEGALON_REINIT=1";;
   Popcorn) : "${C8:?}" "${K8:?}" "${GT8:?}" "${RECV_MODE:?}"
            [[ $RECV_MODE =~ ^(poll|idle|sleep)$ ]] || stop "bad RECV_MODE"
-           export SYSTEM=Popcorn-$RECV_MODE V=/home/comsys/vdb8 HOST_SERVER=$P/builds/vdb/8/bin/vdb-server \
+           export SYSTEM=Popcorn-$RECV_MODE V=$VPLAIN HOST_SERVER=$PLAIN_BUILD/bin/vdb-server \
              SERVER_ARGS="$SA --preloaded";;
   *) stop "bad SYS";;
 esac
@@ -50,41 +63,54 @@ case "$KIND" in
             --step-measure-s 15 --confirm-s 30 --confirm-reps 3);;
   fixed) : "${RATE:?}"; LG+=(--raw --mode fixed --rates "$RATE" --warmup-s 10 --step-warmup-s 10 --step-measure-s 60
             --drain-s 10);;
+  pslo) LG+=(--raw --mode slo --start 10 --factor 1.5 --precision 0.05 --max-steps 25 --warmup-s 10 --step-warmup-s 2
+            --step-measure-s 8 --confirm-s 15 --confirm-reps 1 --fill none --overload none);;
+  pfix) : "${RATE:?}"; LG+=(--raw --mode fixed --rates "$RATE" --warmup-s 10 --step-warmup-s 5 --step-measure-s 30
+            --drain-s 10);;
   *) stop "bad KIND";;
 esac
 SSH="ssh -o BatchMode=yes -o ConnectTimeout=8"
 IPS=(192.168.122.100 192.168.122.101)
 servers_gone() { for ip in "${IPS[@]}"; do [ "$($SSH comsys@$ip 'pgrep -c -x vdb-server' < /dev/null)" = 0 ] || return 1; done; }
-echo "$(date -Is) $NAME: SYS=$SYS U=$U KIND=$KIND REP=${REP:-} TRACE=$TRACE RATE=${RATE:-} RECV_MODE=${RECV_MODE:-} SEED=$SEED"
+echo "$(date -Is) $NAME: SYS=$SYS U=$U KIND=$KIND DATASET=${DATASET:-28m} REP=${REP:-} TRACE=$TRACE RATE=${RATE:-} RECV_MODE=${RECV_MODE:-} SEED=$SEED V=$V HOST_SERVER=$HOST_SERVER"
 servers_gone || stop "a vdb-server is running before the run"
 if [ "${GATE:-1}" = 1 ]; then bash $X/host-gate.sh check "$E/gate-$NAME.txt" || stop "host gate"; fi
 T0=$(date +%s)
 if [ "$SYS" = Popcorn ]; then  # P-popcorn-deploy §6a cycle with build 8 (init_state=shared)
   PS=(K=$K8 GT=$GT8 C=$C8 R=$E/shm-$NAME INIT_STATE=shared)
-  for ph in precheck load chown; do env "${PS[@]}" bash $C8/p-popcorn-shm.sh $ph || stop "shm $ph"; done
-  for ip in "${IPS[@]}"; do  # the server's region config must equal the module parameters' one
-    [ "$($SSH comsys@$ip "sha256sum $V/cfg/cxl_region.yaml $GT8/cxl_region.yaml | cut -d' ' -f1 | sort -u | wc -l" < /dev/null)" = 1 ] \
-      || { env "${PS[@]}" bash $C8/p-popcorn-shm.sh teardown; stop "region config differs on $ip"; }
+  SHM=0  # 1 from the load attempt until a successful teardown: any exit in between tears down (EXIT trap)
+  shm_down() {
+    [ $SHM = 1 ] || return 0
+    servers_gone || { echo "M4RUN $NAME: servers still running, teardown skipped (manual: packet rollback)"; return 1; }
+    env "${PS[@]}" bash $C8/p-popcorn-shm.sh teardown && SHM=0
+  }
+  trap 'shm_down' EXIT
+  env "${PS[@]}" bash $C8/p-popcorn-shm.sh precheck || stop "shm precheck"
+  SHM=1
+  for ph in load chown; do env "${PS[@]}" bash $C8/p-popcorn-shm.sh $ph || stop "shm $ph"; done
+  for ip in "${IPS[@]}"; do  # the server's region config must equal the module parameters' one (both must exist)
+    [ "$($SSH comsys@$ip "test -f $V/cfg/cxl_region.yaml && test -f $GT8/cxl_region.yaml && sha256sum $V/cfg/cxl_region.yaml $GT8/cxl_region.yaml | cut -d' ' -f1 | sort -u | wc -l" < /dev/null)" = 1 ] \
+      || stop "region config missing or different on $ip"
   done
   t=$(date +%s)
   $SSH comsys@${IPS[0]} "CXL_REGION_CONFIG=$V/cfg/cxl_region.yaml $V/bin/vdb-server --node 0 --preload-only --init-dir $INIT $SA" \
     < /dev/null > "$E/preload-$NAME.log" 2>&1
   echo "preload_wall_s=$(( $(date +%s) - t ))" >> "$E/preload-$NAME.log"
-  { grep -q "PRELOAD DONE" "$E/preload-$NAME.log" && servers_gone; } || { env "${PS[@]}" bash $C8/p-popcorn-shm.sh teardown; stop "preload"; }
-  env "${PS[@]}" bash $C8/p-popcorn-shm.sh enable || { env "${PS[@]}" bash $C8/p-popcorn-shm.sh teardown; stop "enable gate"; }
+  { grep -q "PRELOAD DONE" "$E/preload-$NAME.log" && servers_gone; } || stop "preload"
+  env "${PS[@]}" bash $C8/p-popcorn-shm.sh enable || stop "enable gate"
   for ip in "${IPS[@]}"; do  # recv_mode is runtime-writable (after enable, before the run)
     m=$($SSH comsys@$ip "sudo -n sh -c 'echo $RECV_MODE > /sys/module/cxl_shm/parameters/recv_mode' && cat /sys/module/cxl_shm/parameters/recv_mode" < /dev/null)
     echo "$ip recv_mode=$m" >> "$E/recv-mode-$NAME.txt"
-    [ "$m" = "$RECV_MODE" ] || { env "${PS[@]}" bash $C8/p-popcorn-shm.sh teardown; stop "recv_mode on $ip = $m"; }
+    [ "$m" = "$RECV_MODE" ] || stop "recv_mode on $ip = $m"
   done
-  env "${PS[@]}" STATUS_TAG=pre bash $C8/p-popcorn-shm.sh status || { env "${PS[@]}" bash $C8/p-popcorn-shm.sh teardown; stop "status pre"; }
+  env "${PS[@]}" STATUS_TAG=pre bash $C8/p-popcorn-shm.sh status || stop "status pre"
 fi
 bash $X/run.sh "$NAME" "$E" -- "${LG[@]}"
 RC=$?
 if [ "$SYS" = Popcorn ]; then
   env "${PS[@]}" STATUS_TAG=post bash $C8/p-popcorn-shm.sh status
   servers_gone || stop "servers left (Popcorn teardown not attempted)"
-  env "${PS[@]}" bash $C8/p-popcorn-shm.sh teardown || stop "shm teardown"
+  shm_down || stop "shm teardown"
 fi
 servers_gone || stop "servers left"
 R=$E/$NAME
@@ -103,7 +129,7 @@ python3 $X/e1_check.py --writes $W --na $NA --nb $NB --searches $R/loadgen/searc
 grep -q "workload_finish\":\"ok" $R/loadgen/summary.json || stop "loadgen workload finish"
 if [ $RC != 0 ]; then
   note=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["note"])' $R/loadgen/summary.json 2>/dev/null)
-  [ "$KIND" = slo ] && [ "$note" = "confirm failed at three rates; the knee is noisy (longer --confirm-s?)" ] \
+  [[ $KIND =~ ^p?slo$ ]] && [ "$note" = "confirm failed at three rates; the knee is noisy (longer --confirm-s?)" ] \
     && { echo "M4RUN $NAME NOTE $note"; exit 0; }
   stop "run.sh rc $RC ($note)"
 fi

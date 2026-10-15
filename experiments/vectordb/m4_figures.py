@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
-"""M4 VectorDB figure tables (reports/M4-vdb-packet.md §6; MOT1 v4 "Values needed" of Figures 1a, 1b, Table 1,
-Figures 2a, 2b, 2c, Table 2). Offline, Host only; reads run dirs written by m4-run.sh / run.sh.
+"""M4/M5 VectorDB figure tables (reports/M4-vdb-packet.md §6, reports/M5-pilot-packet.md; MOT1 v5 "Values needed" of
+Figures 1a, 1b, the collected background-CPU/traffic values, Figures 2a, 2b, 2c, Table 2). Offline, Host only; reads
+run dirs written by m4-run.sh / run.sh. Pilot kinds (pslo, pfix) are treated as slo / fix.
+A run whose SLO search ended with a note (e.g. "confirm failed at three rates") is flagged (valid=0 in runs.csv) and
+excluded from fig1a/fig2a (excluded_runs counts them).
 
 usage: m4_figures.py --out DIR EVIDENCE_DIR...    (run dirs named <sys>-u<U>-<kind>[-r<R>|-<recv_mode>])
 Outputs in DIR:
@@ -12,8 +15,11 @@ Outputs in DIR:
   fig1b.csv    U=5 fixed load: mean search latency (raw per-request times), per-search stall split per node and
                system (Popcorn: message wait, local fault handling = fault - message wait; Megalon: section checks,
                flushes, re-executed work), busy fraction, all-HWcc latency at the same L
-  table1.csv   fixed load: coherence background CPU (vCPU-s per s) and traffic (bytes/s) per node and system
-  fig2b.csv    fixed load U 20/50: traffic bytes per update (all nodes / updates done)
+  table1.csv   fixed load at U = 5 (H1 point): coherence background CPU (vCPU-s per s) and traffic (bytes/s) per node
+  fig2b.csv    fixed load U 20/50: traffic bytes per update (all nodes / updates done). Megalon: megalon.flush_bytes +
+               replay_flush_bytes; flush_bytes counts every ObjectStore::Flush (write_end, the incoherent flush in
+               ObjectReadStart and the one after a failed ObjectReadEnd: object_store.cc:191, 214, 264), so retry and
+               refetch flushes are included. Page MSI: (remote write-back + acquire flush) x 4 KiB
   fig2c.csv    Megalon fixed load with trace: classify_retries counts (retry, refetch, combined) for the window
   table2.csv   Megalon fixed load: failed read sections and refetches per update on the other node, mean time of one
                re-executed attempt, switch_rw (reclaims are not exposed by the shim; switch_rw reported instead)
@@ -28,7 +34,8 @@ sys.path.insert(0, os.path.join(ROOT, "experiments", "loadgen"))
 import export_csv  # noqa: E402
 import stats_delta  # noqa: E402
 
-NAME = re.compile(r"^(hw|mg|pop)-u(\d+)-(slo|fix|func)(?:-(r\d+|poll|idle|sleep))?$")
+NAME = re.compile(r"^(hw|mg|pop)-u(\d+)-(slo|fix|func|pslo|pfix)(?:-(\w+))?$")
+KIND = {"pslo": "slo", "pfix": "fix"}
 SYSN = {"hw": "all-HWcc", "mg": "Megalon", "pop": "Popcorn"}
 
 
@@ -39,7 +46,7 @@ def runs(evid):
             if m and os.path.exists(os.path.join(d, "loadgen", "summary.json")):
                 s, u, kind, tag = m.groups()
                 yield dict(block=os.path.basename(e.rstrip("/")), run=os.path.basename(d.rstrip("/")), dir=d.rstrip("/"),
-                           system=SYSN[s], u=int(u), kind=kind, rep=tag or "")
+                           system=SYSN[s], u=int(u), kind=KIND.get(kind, kind), rep=tag or "", mode=kind)
 
 
 def kv(path):
@@ -124,10 +131,10 @@ def main():
         gt = kv(os.path.join(r["dir"], "gt.recall.txt"))
         rows.append(dict(r, trace=manifest_trace(r["dir"]), x_mean=c.get("x_mean"), x_sd=c.get("x_sd"),
                          p99_mean_ms=c.get("pslo_mean_ms"), p99_sd_ms=c.get("pslo_sd_ms"), confirm_fails=c.get("fails"),
-                         max_offered_pass=sm.get("max_offered_x_pass"), note=sm.get("note"),
+                         max_offered_pass=sm.get("max_offered_x_pass"), note=sm.get("note"), valid=0 if sm.get("note") else 1,
                          invisible=e1.get("invisible_returned"), duplicates=e1.get("duplicate_ids"),
                          recall_sampled=gt.get("recall_measured_ok"), **load_times(r["dir"])))
-    rcols = ["block", "run", "system", "u", "kind", "rep", "trace", "x_mean", "x_sd", "p99_mean_ms", "p99_sd_ms",
+    rcols = ["block", "run", "system", "u", "kind", "mode", "rep", "trace", "valid", "x_mean", "x_sd", "p99_mean_ms", "p99_sd_ms",
              "confirm_fails", "max_offered_pass", "note", "run_wall_s", "preload_s", "load_s", "warmup_s",
              "invisible", "duplicates", "recall_sampled"]
     write(os.path.join(a.out, "runs.csv"), rcols, rows)
@@ -136,7 +143,8 @@ def main():
                         os.path.join(a.out, "steps-all.csv")] +
                        [f"{r['dir']}/loadgen={r['block']}/{r['run']}" for r in R], check=True, stdout=subprocess.DEVNULL)
     # fig1a / fig2a
-    slo = [x for x in rows if x["kind"] == "slo" and x["x_mean"]]
+    slo = [x for x in rows if x["kind"] == "slo" and x["x_mean"] and x["valid"]]
+    excl = [x for x in rows if x["kind"] == "slo" and not x["valid"]]
     agg = []
     for u in sorted({x["u"] for x in slo}):
         base = [x["x_mean"] for x in slo if x["u"] == u and x["system"] == "all-HWcc"]
@@ -146,11 +154,12 @@ def main():
             if not v:
                 continue
             m = st.mean(x["x_mean"] for x in v)
-            agg.append(dict(u=u, system=sys_, repeats=len(v), search_per_s_mean=m,
+            agg.append(dict(u=u, system=sys_, repeats=len(v), excluded_runs=sum(1 for x in excl if x["u"] == u and x["system"] == sys_),
+                            search_per_s_mean=m,
                             sd_over_repeats=st.stdev([x["x_mean"] for x in v]) if len(v) > 1 else None,
                             within_run_sd_mean=st.mean(x["x_sd"] or 0 for x in v), normalized=m / bm if bm else None,
                             normalized_sd=(st.stdev([x["x_mean"] for x in v]) / bm if bm and len(v) > 1 else None)))
-    acols = ["u", "system", "repeats", "search_per_s_mean", "sd_over_repeats", "within_run_sd_mean", "normalized",
+    acols = ["u", "system", "repeats", "excluded_runs", "search_per_s_mean", "sd_over_repeats", "within_run_sd_mean", "normalized",
              "normalized_sd"]
     write(os.path.join(a.out, "fig2a.csv"), acols, agg)
     write(os.path.join(a.out, "fig1a.csv"), acols, [x for x in agg if x["u"] == 5])
@@ -181,7 +190,8 @@ def main():
                        meg_flush_ms=per(m["meg_flush_s"]), meg_reexec_ms=per(m["meg_reexec_s"]),
                        meg_reexec_src=m["meg_reexec_src"], tlb_ipi=m["tlb_ipi"])
             f1b.append(row)
-            t1.append(dict(block=r["block"], run=r["run"], system=r["system"], u=r["u"], node=k, window_s=win,
+            if r["u"] == 5:  # collected values at the H1 operating point
+              t1.append(dict(block=r["block"], run=r["run"], system=r["system"], u=r["u"], node=k, window_s=win,
                            coh_bg_vcpu=m["coh_bg_cpu_s"] / win if m["coh_bg_cpu_s"] is not None and win else None,
                            recv_vcpu=m["recv_cpu_s"] / win if m["recv_cpu_s"] is not None and win else None,
                            lib_bg_vcpu=m["lib_bg_cpu_s"] / win if m["lib_bg_cpu_s"] is not None and win else None,

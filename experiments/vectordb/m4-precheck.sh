@@ -1,5 +1,6 @@
-# M4 guest pre-check (reports/M4-vdb-packet.md §3.2), per guest:
-#   ssh comsys@<ip> 'EXPECT_K=<release> INIT_CHECK=0|1 INIT_SUMS=<sha256 of the Host image SHA256SUMS> bash -s' < m4-precheck.sh
+# M4/M5 guest pre-check (reports/M4-vdb-packet.md, reports/M5-pilot-packet.md), per guest (m4-lib.sh precheck):
+#   ssh comsys@<ip> 'EXPECT_K=<release> INIT_DIR=<guest image dir> INIT_SUMS=<sha256 of the Host image SHA256SUMS>
+#                    INIT_CHECK=0|1 INSTALL_DIRS="<files below /home/comsys>" bash -s' < m4-precheck.sh
 # Read-only + sudo -n fuser (standing grant A2 pre-check). Prints "PRECHECK PASS" or "PRECHECK FAIL <item>".
 fail() { echo "PRECHECK FAIL $*"; exit 1; }
 echo "host=$(hostname) uname=$(uname -r) nproc=$(nproc) $(date -Is)"
@@ -15,8 +16,8 @@ echo "$f" | grep -q "sudo:" && fail "sudo denied"
 echo "$f" | grep -qE '[0-9]+' && fail "dax0.0 in use"
 echo "procs vdb-server=$(pgrep -c -x vdb-server) faultlat=$(pgrep -c -x faultlat)"
 [ "$(pgrep -c -x vdb-server)" = 0 ] && [ "$(pgrep -c -x faultlat)" = 0 ] || fail procs
-sha256sum /home/comsys/vdb8/bin/* /home/comsys/vdb8/cfg/* /home/comsys/vdbm5/bin/* /home/comsys/vdbm5/lib/* /home/comsys/vdbm5/cfg/* || fail install
-I=/home/comsys/vdb/init/seg32c32m-a27m
+for f in $INSTALL_DIRS; do sha256sum /home/comsys/$f || fail "install /home/comsys/$f"; done
+I=$INIT_DIR
 if [ "${INIT_CHECK:-0}" = 1 ]; then
   [ "$(sha256sum < $I/SHA256SUMS | cut -d' ' -f1)" = "$INIT_SUMS" ] || fail "init SHA256SUMS differs from the Host image's"
   (cd $I && sha256sum -c --quiet SHA256SUMS) && echo "init SHA256SUMS OK $(wc -l < $I/SHA256SUMS) files" || fail init
