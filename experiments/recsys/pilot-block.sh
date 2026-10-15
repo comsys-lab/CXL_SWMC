@@ -5,7 +5,7 @@
 # env: C8 (= builds/popcorn_new/8/deploy-v3, verified: packet.sha256 hash, sha256sum -c, no SUPERSEDED.txt) K8 GT8
 #      RECV_MODE (page MSI build 8); MEG_BUILD (recsys-megalon build on builds/megalon/70, default
 #      builds/recsys-megalon/4; its manifest must name builds/megalon/70), VM_MEG (default /home/comsys/rsm4).
-# Runs (systems chosen by name):
+# Runs (systems chosen by name; RECSYS_SET / RECSYS_FUNC=0 select a subset, defaults = all below):
 #   functional (T = 60 s): all-HWcc, Megalon, page MSI
 #   pilot SLO searches, order shuffled (seed = owner): all-HWcc T in {60 s, 1 s, 0}; page MSI T in {60 s, 1 s, 0};
 #     Megalon T in {60 s (H1), 0 (H3, reported)}
@@ -22,6 +22,13 @@ VM_MEG=${VM_MEG:-/home/comsys/rsm4} MB=${MEG_BUILD:-$P/builds/recsys-megalon/4}
 SSH="ssh -o BatchMode=yes -o ConnectTimeout=8"
 IPS=(192.168.122.100 192.168.122.101)
 OWNER="RECSYS-pilot-$B"
+# run selection (H1 only: RECSYS_SET="hw:60000 pop:60000 mg:60000" RECSYS_FUNC=0); every T in the set needs its hw:T
+SET=${RECSYS_SET:-"hw:60000 hw:1000 hw:0 pop:60000 pop:1000 pop:0 mg:60000 mg:0"} FUNC=${RECSYS_FUNC:-1}
+for st in $SET; do
+  case $st in hw:*|pop:*|mg:*) ;; *) echo "SEQUENCE STOP: bad RECSYS_SET entry $st"; exit 2;; esac
+  [[ "${st#*:}" =~ ^[0-9]+$ ]] && [[ " $SET " == *" hw:${st#*:} "* ]] || { echo "SEQUENCE STOP: RECSYS_SET entry $st (T must be numeric with hw:T in the set)"; exit 2; }
+done
+case $FUNC in 0|1) ;; *) echo "SEQUENCE STOP: RECSYS_FUNC must be 0 or 1"; exit 2;; esac
 [ "$B" = k8 ] || { echo "SEQUENCE STOP: bad block (only k8)"; exit 2; }
 grep -q "^megalon_build=$P/builds/megalon/70$" $MB/manifest.txt || { echo "SEQUENCE STOP: $MB is not on builds/megalon/70"; exit 2; }
 # page MSI bundle: deploy-v3 of build 8 (what the VMs run; has instr-on and the instr_enabled teardown gate), unchanged
@@ -125,12 +132,13 @@ precheck() {  # kernel release
     || { echo "SEQUENCE STOP: pilot inputs differ from their manifest"; exit 1; }
 }
 tag() { case $1 in 60000) echo t60s;; 1000) echo t1s;; 0) echo t0;; *) echo t$1ms;; esac; }
-echo "$(date -Is) block $OWNER start (git $(git -C $P/CXL_SWMC rev-parse --short HEAD)) K8=$K8 RECV_MODE=$RECV_MODE MEG_BUILD=$MB"
+echo "$(date -Is) block $OWNER start (git $(git -C $P/CXL_SWMC rev-parse --short HEAD)) K8=$K8 RECV_MODE=$RECV_MODE MEG_BUILD=$MB SET=\"$SET\" FUNC=$FUNC"
 precheck "$K8"
-run hw hw-t60s-func T_MS=60000 KIND=functional GATE=0
-run mg mg-t60s-func T_MS=60000 KIND=functional GATE=0
-run pop pop-t60s-func T_MS=60000 KIND=functional GATE=0
-SET="hw:60000 hw:1000 hw:0 pop:60000 pop:1000 pop:0 mg:60000 mg:0"
+if [ "$FUNC" = 1 ]; then
+  run hw hw-t60s-func T_MS=60000 KIND=functional GATE=0
+  run mg mg-t60s-func T_MS=60000 KIND=functional GATE=0
+  run pop pop-t60s-func T_MS=60000 KIND=functional GATE=0
+fi
 for st in $(shuffle $SET); do s=${st%:*} t=${st#*:}; run $s $s-$(tag $t)-slo T_MS=$t KIND=slo; done
 for st in $(shuffle $SET); do
   s=${st%:*} t=${st#*:}
