@@ -1,0 +1,29 @@
+# Megalon config for the recsys Host test (tests/host_test.sh fills object_arena_size and region_config).
+# Same shape as systems/megalon/vectordb-2vm.yaml; only objects are used (no kv Put/Get).
+mount_directory: /mydata
+key_space: 10000
+slots: 10240
+logical_scr_size: 64MB          # records = logical_scr_size / 4 B (packed4); host_test.sh MEGALON_SCR overrides
+node_id: 0
+region_config: ""
+reinit: false
+attach_mprotect: true
+stuck_timeout_ms: 10000
+log_sync_interval_us: 100
+nr_log_size: 64MB
+attach_timeout_s: 900
+start_barrier_timeout_s: 900
+object_arena_size: 0
+object_align: 64
+object_max_count: 65536
+replicate: false
+flush: false
+evict: false
+partition_ratio: 0.0
+excluded_files:
+excluded_directories:
+  - /usr
+  - /proc
+  - /etc
+  - /dev
+  - /sys
