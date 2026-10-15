@@ -11,12 +11,18 @@
 #   NODE_ENV="ENV:RACKOBJ_CONFIG=$V/cfg/megalon.yaml" NODE0_ENV="ENV:MEGALON_REINIT=1".
 #   SERVER_CPUS (unset = no change): guest CPU list (e.g. 0-14); after READY every vdb-server thread on every
 #   node is pinned with taskset -a and verified; recorded in the manifest and node<k>.server-cpus.txt.
+#   TRACE (default 1): vdb-server --trace-dir <guest run dir> (Megalon: write-section counter in HWcc + write-section
+#   and retry logs, collected as node<k>.megalon-{wsec,retry}.bin; plain: nothing); TRACE=0 omits it.
+#   STATS_OP (default 10 = vdb kOpStats): loadgen --stats-op, a server stats snapshot per node at the start and end of
+#   every measured step (loadgen/stats/); STATS_OP=0 omits it. After the run: stats-steps.csv (stats_delta.py) and
+#   steps.csv with the derived per-node columns (export_csv.py).
 # Stops (and stops the servers) on the first error. Measurement hygiene: no Host build before/after (pgrep).
 set -euo pipefail
 NAME=$1 OUT=$2; shift 2; [ "${1:-}" = "--" ] && shift
 : "${SYSTEM:?}" "${V:?}" "${HOST_SERVER:?}" "${LOADGEN:?}" "${SERVER_ARGS:?}" "${INIT:?}"
 read -r -a NODE <<< "${NODES:-192.168.122.100 192.168.122.101}"
-PORT=${PORT:-7000} LG_CPUS=${LG_CPUS:-56-63}
+PORT=${PORT:-7000} LG_CPUS=${LG_CPUS:-56-63} TRACE=${TRACE:-1} STATS_OP=${STATS_OP:-10}
+[[ $TRACE =~ ^[01]$ ]] && [[ $STATS_OP =~ ^[0-9]+$ ]] || { echo "bad TRACE/STATS_OP"; exit 2; }
 [ -z "${SERVER_CPUS:-}" ] || [[ $SERVER_CPUS =~ ^[0-9]+(-[0-9]+)?(,[0-9]+(-[0-9]+)?)*$ ]] || { echo "bad SERVER_CPUS"; exit 2; }
 SSH="ssh -o BatchMode=yes -o ConnectTimeout=5"
 RUN=$OUT/$NAME
@@ -50,7 +56,7 @@ APP=$("$HOST_SERVER" $SERVER_ARGS --print-app-bytes)
   echo "host_server=$HOST_SERVER sha256=$(sha256sum "$HOST_SERVER" | cut -d' ' -f1)"
   echo "loadgen=$LOADGEN sha256=$(sha256sum "$LOADGEN" | cut -d' ' -f1)"
   echo "server_args=$SERVER_ARGS"; echo "node_env=${NODE_ENV:-} node0_env=${NODE0_ENV:-}"; echo "app_hwcc_bytes=$APP"; echo "init=$INIT"; echo "loadgen_args=$*"
-  echo "lg_cpus=$LG_CPUS"
+  echo "lg_cpus=$LG_CPUS"; echo "trace=$TRACE stats_op=$STATS_OP"
   [ -z "${SERVER_CPUS:-}" ] || echo "server_cpus=$SERVER_CPUS"
   for k in "${!NODE[@]}"; do
     info=$($SSH comsys@"${NODE[$k]}" "uname -r; sha256sum $V/bin/vdb-server $V/cfg/cxl_region.yaml \$(ls $V/lib/libvdb-megalon.so $V/lib/libmegalon.so $V/cfg/megalon.yaml 2>/dev/null) | cut -c1-64; nproc" < /dev/null | tr '\n' ' ')
@@ -72,6 +78,7 @@ APP=$("$HOST_SERVER" $SERVER_ARGS --print-app-bytes)
 
 for k in "${!NODE[@]}"; do
   EXTRA=""; XE="${NODE_ENV:-}"; [ "$k" = 0 ] && EXTRA="--init-dir $INIT" && XE="$XE ${NODE0_ENV:-}"
+  [ "$TRACE" = 1 ] && EXTRA="$EXTRA --trace-dir $GRUN"
   STARTED+=("$k")
   $SSH comsys@"${NODE[$k]}" "$V/bin/vdb-node.sh start $V $GRUN $k $RID $APP $XE $SERVER_ARGS --port $PORT $EXTRA" < /dev/null
 done
@@ -100,9 +107,10 @@ cpu_snap() {  # guest CPU time counters (/proc/stat "cpu" line) per node, for bu
 }
 TARGETS=$(printf '%s:'"$PORT"',' "${NODE[@]}"); TARGETS=${TARGETS%,}
 cpu_snap before
+LG_STATS=(); [ "$STATS_OP" = 0 ] || LG_STATS=(--stats-op "$STATS_OP")
 set +e
-numactl --physcpubind="$LG_CPUS" --membind=1 "$LOADGEN" --workload vectordb --target "$TARGETS" --out "$RUN/loadgen" "$@" \
-  2>&1 | tee "$RUN/loadgen.log"
+numactl --physcpubind="$LG_CPUS" --membind=1 "$LOADGEN" --workload vectordb --target "$TARGETS" --out "$RUN/loadgen" \
+  "${LG_STATS[@]}" "$@" 2>&1 | tee "$RUN/loadgen.log"
 LG=${PIPESTATUS[0]}
 set -e
 [ -z "${SERVER_CPUS:-}" ] || server_cpus check
@@ -111,11 +119,12 @@ stop_nodes
 collect
 host_check after
 echo "end=$(date -Is) loadgen_rc=$LG" >> "$RUN/manifest.txt"
-# spreadsheet/plot outputs, always (CSV: one row per step and stream)
+# spreadsheet/plot outputs, always (CSV: one row per step and stream; per-step counter deltas)
 if [ -s "$RUN/loadgen/steps.jsonl" ] && [ -s "$RUN/loadgen/summary.json" ]; then
+  [ ! -d "$RUN/loadgen/stats" ] || python3 "$ROOT/experiments/loadgen/stats_delta.py" "$RUN/loadgen" --out "$RUN/stats-steps.csv" || true
   python3 "$ROOT/experiments/loadgen/export_csv.py" --out "$RUN/steps.csv" "$RUN/loadgen=$SYSTEM" > /dev/null || true
   python3 "$ROOT/experiments/loadgen/plot_slo.py" --out "$RUN/slo.png" "$RUN/loadgen=$SYSTEM" > "$RUN/slo-points.txt" 2>&1 || true
 fi
-grep -h "vdb-server: stopping" -A30 "$RUN"/node*.log | grep -E "^(node|elements|inserts|deletes|searches|timeouts|bad_records)=" | tr '\n' ' '; echo
+grep -h "vdb-server: stopping" -A30 "$RUN"/node*.log | grep -E "^(node|P|elements|updates|inserts|deletes|searches|timeouts|bad_records)=" | tr '\n' ' '; echo
 [ "$LG" = 0 ] || { echo "run $NAME: loadgen rc=$LG"; exit 1; }
 echo "run $NAME: OK -> $RUN"
