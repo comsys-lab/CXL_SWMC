@@ -4,21 +4,51 @@
 SSH="ssh -o BatchMode=yes -o ConnectTimeout=8"
 IPS=(192.168.122.100 192.168.122.101)
 CHOWNED=0
-# Rollback of a vanilla-style block (dax0.0 owned by comsys for the block): stop only this block's servers (the
-# guest run dirs recorded in this block's run manifests), then dax0.0 root:root 600.
-block_rollback() {
+# Stop this block's servers only: the guest run dirs recorded in this block's run manifests (run.sh writes
+# guest_run_dir before it starts a server).
+block_stop_servers() {
   local ip g
   for ip in "${IPS[@]}"; do
     for g in $(sed -n 's/^guest_run_dir=//p' "$E"/*/manifest.txt 2>/dev/null); do
       $SSH comsys@$ip "for k in 0 1; do [ -e $g/node\$k.pid ] && \$(dirname $g)/../bin/vdb-node.sh stop $g \$k; done; true" < /dev/null 2>&1 \
         | sed "s|^|$ip $g |" >> "$E/rollback.out"
     done
-    $SSH comsys@$ip 'echo procs=$(pgrep -c -x vdb-server); sudo -n chown root:root /dev/dax0.0 && sudo -n chmod 600 /dev/dax0.0; echo stat=$(stat -c "%U:%G %a" /dev/dax0.0)' \
+    $SSH comsys@$ip 'echo procs=$(pgrep -c -x vdb-server)' < /dev/null 2>&1 | sed "s/^/$ip /" >> "$E/rollback.out"
+  done
+}
+# page MSI: every shm-<run> dir whose load was attempted (load-vm0.txt) and that has no "teardown PASS" in its
+# steps.log gets p-popcorn-shm.sh teardown; if teardown stops on the instrumentation gate, instr-on, then teardown.
+block_shm_cleanup() {
+  [ -n "${C8:-}" ] || return 0
+  local r
+  for r in "$E"/shm-*/; do
+    r=${r%/}
+    [ -f "$r/load-vm0.txt" ] || continue
+    grep -q "teardown PASS" "$r/steps.log" 2>/dev/null && continue
+    echo "$(date -Is) cleanup teardown $r" >> "$E/cleanup.out"
+    if ! env K=$K8 GT=$GT8 C=$C8 R=$r bash $C8/p-popcorn-shm.sh teardown >> "$E/cleanup.out" 2>&1; then
+      if grep -q "instr_enabled=1 missing" "$r/steps.log" 2>/dev/null; then
+        env K=$K8 GT=$GT8 C=$C8 R=$r bash $C8/p-popcorn-shm.sh instr-on >> "$E/cleanup.out" 2>&1 \
+          && env K=$K8 GT=$GT8 C=$C8 R=$r bash $C8/p-popcorn-shm.sh teardown >> "$E/cleanup.out" 2>&1
+      fi
+    fi
+    grep -q "teardown PASS" "$r/steps.log" 2>/dev/null || echo "CLEANUP FAILED: $r (manual: packet §6)" | tee -a "$E/cleanup.out"
+  done
+}
+# dax0.0 back to root:root 600 (blocks that chowned it)
+block_dax_root() {
+  local ip
+  for ip in "${IPS[@]}"; do
+    $SSH comsys@$ip 'sudo -n chown root:root /dev/dax0.0 && sudo -n chmod 600 /dev/dax0.0; echo stat=$(stat -c "%U:%G %a" /dev/dax0.0)' \
       < /dev/null 2>&1 | sed "s/^/$ip /" >> "$E/rollback.out"
   done
 }
+block_rollback() { block_stop_servers; block_dax_root; }
+# On every block exit: stop this block's servers, clean up page MSI, then dax rollback, then the lock.
 block_finish() {
-  [ $CHOWNED = 1 ] && block_rollback
+  block_stop_servers
+  block_shm_cleanup
+  [ $CHOWNED = 1 ] && block_dax_root
   bash $X/host-gate.sh unlock "$OWNER"
 }
 block_start() {
@@ -33,7 +63,8 @@ run() {  # name, env assignments...  (stops the sequence on M4RUN STOP)
   local st=${PIPESTATUS[0]}
   [ $st = 0 ] || { echo "$(date -Is) SEQUENCE STOP at $name"; exit 1; }
 }
-shuffle() { python3 -c 'import random,sys; v=sys.argv[2:]; random.Random(sys.argv[1]).shuffle(v); print(" ".join(v))' "$OWNER" "$@"; }
+# run order: seeded by SHUFFLE_SEED (default the block owner)
+shuffle() { python3 -c 'import random,sys; v=sys.argv[2:]; random.Random(sys.argv[1]).shuffle(v); print(" ".join(v))' "${SHUFFLE_SEED:-$OWNER}" "$@"; }
 # confirm mean of a run, only if the SLO search ended without a note (a "confirm failed" run is never used for L)
 confirm_x() {
   python3 -c 'import json,sys; s=json.load(open(sys.argv[1])); c=s.get("confirm",{})

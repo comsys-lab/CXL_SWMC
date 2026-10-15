@@ -39,7 +39,10 @@ when the run has no snapshots or the counter is absent). Times in seconds of the
                                       failed read_end flushes the object
                            none       no retries (0)
   n<k>_meg_stall_s         sum of the four above
-  n<k>_coh_stall_s         Popcorn: pop_search_fault_s + pop_writer_fault_s; Megalon: meg_stall_s
+  n<k>_coh_stall_s         coherence time over all request-serving threads (search + writer), by the run's system
+                           (manifest system=, not by counter presence): page MSI pop_search_fault_s +
+                           pop_writer_fault_s; Megalon meg_stall_s; all-HWcc empty. pop_* columns only for page MSI
+                           runs, meg_* only for Megalon runs
   n<k>_recv_cpu_s          kernel threads cxl_recv* (schedstat run_ns; cpu_ticks / 100 if absent)
   n<k>_lib_bg_cpu_s        this process's thread groups not named vdb-* (e.g. megalon-lib: Megalon's own threads)
   n<k>_coh_bg_cpu_s        recv_cpu_s + lib_bg_cpu_s
@@ -83,8 +86,42 @@ def _sum(d, keys):
     return sum(v) if v else None
 
 
-def node_metrics(fixed, d):
-    """Derived per-node values of one step (dict of NODE -> value or None)."""
+def system_kind(system):
+    """'popcorn' | 'megalon' | 'hwcc' from a run manifest's system= value (run.sh SYSTEM), None if unknown."""
+    if not system:
+        return None
+    s = system.lower()
+    if s.startswith("popcorn") or s.startswith("page msi") or s.startswith("page-msi"):
+        return "popcorn"
+    if s.startswith("megalon"):
+        return "megalon"
+    if s.startswith("all-hwcc"):
+        return "hwcc"
+    return None
+
+
+def run_system(loadgen_dir):
+    """system= of the run.sh manifest next to a loadgen dir (<run>/manifest.txt), or None."""
+    p = os.path.join(os.path.dirname(os.path.abspath(loadgen_dir.rstrip("/"))), "manifest.txt")
+    if os.path.exists(p):
+        for line in open(p):
+            if line.startswith("system="):
+                return line.strip().split("=", 1)[1]
+    return None
+
+
+POP_COLS = ("pop_search_fault_s", "pop_search_msg_wait_s", "pop_search_local_wait_s", "pop_writer_fault_s",
+            "pop_node_fault_s", "pop_remote_wb", "pop_acquire_flush")
+MEG_COLS = ("meg_rd_check_s", "meg_wr_check_s", "meg_flush_s", "meg_reexec_s", "meg_stall_s", "meg_reexec_src")
+
+
+def node_metrics(fixed, d, system=None):
+    """Derived per-node values of one step (dict of NODE -> value or None). The coherence formula follows the run's
+    system (system_kind; a page MSI kernel creates /proc/<tid>/swmc for every thread even without cxl_shm, so key
+    presence does not identify the system): page MSI columns only for page MSI runs, Megalon columns only for
+    Megalon runs, neither for all-HWcc. Unknown system (no manifest): page MSI if its fault counters are non-zero,
+    else Megalon if megt.* exist. Missing counters stay None."""
+    kind = system_kind(system)
     m = dict.fromkeys(NODE)
     win = fixed["window_s"] if fixed["window_s"] != "" else None
     m["window_s"] = win
@@ -125,9 +162,22 @@ def node_metrics(fixed, d):
             m["meg_reexec_s"] = retries * sec / d["megt.rd_sampled"] / 1e9
             m["meg_reexec_src"] = "est_section"
         m["meg_stall_s"] = sum(m[k] or 0 for k in ("meg_rd_check_s", "meg_wr_check_s", "meg_flush_s", "meg_reexec_s"))
-    if m["pop_search_fault_s"] is not None or m["pop_writer_fault_s"] is not None:
+    if kind is None:  # legacy inference
+        if (m["pop_search_fault_s"] or 0) + (m["pop_writer_fault_s"] or 0) > 0:
+            kind = "popcorn"
+        elif m["meg_stall_s"] is not None:
+            kind = "megalon"
+    if kind != "popcorn":
+        for c in POP_COLS:
+            m[c] = None
+    if kind != "megalon":
+        for c in MEG_COLS:
+            m[c] = None
+    # coherence time over all request-serving threads (search + writer): page MSI managed-fault time of vdb-search
+    # and vdb-writer threads; Megalon megt.* (per process: search, writer, main)
+    if kind == "popcorn" and (m["pop_search_fault_s"] is not None or m["pop_writer_fault_s"] is not None):
         m["coh_stall_s"] = (m["pop_search_fault_s"] or 0) + (m["pop_writer_fault_s"] or 0)
-    elif m["meg_stall_s"] is not None:
+    elif kind == "megalon" and m["meg_stall_s"] is not None:
         m["coh_stall_s"] = m["meg_stall_s"]
     recv = [k for k in d if k.startswith("kthr.cxl_recv") and k.endswith(".run_ns")]
     if recv:
@@ -140,13 +190,13 @@ def node_metrics(fixed, d):
     if m["recv_cpu_s"] is not None or m["lib_bg_cpu_s"] is not None:
         m["coh_bg_cpu_s"] = (m["recv_cpu_s"] or 0) + (m["lib_bg_cpu_s"] or 0)
     m["tlb_ipi"], m["cal_ipi"] = d.get("irq.TLB"), d.get("irq.CAL")
-    if "megalon.flush_bytes" in d:
+    if kind == "megalon" and "megalon.flush_bytes" in d:
         m["traffic_bytes"] = d["megalon.flush_bytes"] + d.get("megalon.replay_flush_bytes", 0)
         m["traffic_src"] = "megalon"
-    elif m["pop_remote_wb"] is not None and m["pop_acquire_flush"] is not None and d.get("sys.swmc.instr.enabled") == 1:
+    elif kind == "popcorn" and m["pop_remote_wb"] is not None and m["pop_acquire_flush"] is not None and d.get("sys.swmc.instr.enabled") == 1:
         m["traffic_bytes"] = (m["pop_remote_wb"] + m["pop_acquire_flush"]) * PAGE
         m["traffic_src"] = "popcorn"
-    elif m["pop_remote_wb"] is not None:
+    elif kind == "popcorn" and m["pop_remote_wb"] is not None:
         m["traffic_bytes"] = m["pop_remote_wb"] * PAGE
         m["traffic_src"] = "popcorn-wb"
     return m
@@ -165,8 +215,9 @@ def main():
     for spec in a.runs:
         run, _, label = spec.partition("=")
         per_step = {}
+        system = run_system(run)
         for fixed, d in stats_delta.deltas(run):
-            per_step.setdefault(fixed["step"], {})[fixed["target"]] = node_metrics(fixed, d)
+            per_step.setdefault(fixed["step"], {})[fixed["target"]] = node_metrics(fixed, d, system)
         ntgt = sum(1 for line in open(os.path.join(run, "manifest.txt")) if line.startswith("target=")) \
             if os.path.exists(os.path.join(run, "manifest.txt")) else 0
         runs.append((run, label or os.path.basename(run.rstrip("/")), per_step, ntgt))

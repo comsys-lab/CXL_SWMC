@@ -13,8 +13,10 @@ Outputs in DIR:
   fig1a.csv    U=5 SLO: per system mean and sd over repeats of the confirm mean, mean within-run sd, normalized
   fig2a.csv    same for every U (0/5/20/50)
   fig1b.csv    U=5 fixed load: mean search latency (raw per-request times), per-search stall split per node and
-               system (Popcorn: message wait, local fault handling = fault - message wait; Megalon: section checks,
-               flushes, re-executed work), busy fraction, all-HWcc latency at the same L
+               system (page MSI search threads: message wait, local fault handling = fault - message wait; Megalon:
+               section checks, flushes, re-executed work), busy fraction, all-HWcc latency at the same L, and
+               coh_ms_per_search_all_threads = coherence time of all request-serving threads (search + writer;
+               export_csv coh_stall_s, chosen by the run's system=) per search on that node
   table1.csv   fixed load at U = 5 (H1 point): coherence background CPU (vCPU-s per s) and traffic (bytes/s) per node
   fig2b.csv    fixed load U 20/50: traffic bytes per update (all nodes / updates done). Megalon: megalon.flush_bytes +
                replay_flush_bytes; flush_bytes counts every ObjectStore::Flush (write_end, the incoherent flush in
@@ -100,10 +102,13 @@ def fixed_step(d):
 
 
 def node_rows(d, step):
+    """per target: (export_csv.node_metrics, deltas) of one step; the coherence formula follows the run's system="""
     out = {}
-    for fixed, dv in stats_delta.deltas(os.path.join(d, "loadgen")):
+    lg = os.path.join(d, "loadgen")
+    system = export_csv.run_system(lg)
+    for fixed, dv in stats_delta.deltas(lg):
         if fixed["step"] == step:
-            out[fixed["target"]] = (export_csv.node_metrics(fixed, dv), dv)
+            out[fixed["target"]] = (export_csv.node_metrics(fixed, dv, system), dv)
     return out
 
 
@@ -188,7 +193,8 @@ def main():
                        pop_local_fault_ms=per(m["pop_search_fault_s"] - msg) if m["pop_search_fault_s"] is not None and msg is not None else None,
                        meg_section_checks_ms=per((m["meg_rd_check_s"] or 0) + (m["meg_wr_check_s"] or 0)) if m["meg_rd_check_s"] is not None else None,
                        meg_flush_ms=per(m["meg_flush_s"]), meg_reexec_ms=per(m["meg_reexec_s"]),
-                       meg_reexec_src=m["meg_reexec_src"], tlb_ipi=m["tlb_ipi"])
+                       meg_reexec_src=m["meg_reexec_src"], tlb_ipi=m["tlb_ipi"],
+                       coh_ms_per_search_all_threads=per(m["coh_stall_s"]))
             f1b.append(row)
             if r["u"] == 5:  # collected values at the H1 operating point
               t1.append(dict(block=r["block"], run=r["run"], system=r["system"], u=r["u"], node=k, window_s=win,
@@ -223,7 +229,8 @@ def main():
         x["hw_latency_same_L_ms"] = hw_lat.get(x["u"])
     write(os.path.join(a.out, "fig1b.csv"), ["block", "run", "system", "u", "node", "rate", "search_per_s",
           "mean_latency_ms", "hw_latency_same_L_ms", "searches", "search_busy_frac", "pop_msg_wait_ms",
-          "pop_local_fault_ms", "meg_section_checks_ms", "meg_flush_ms", "meg_reexec_ms", "meg_reexec_src", "tlb_ipi"], f1b)
+          "pop_local_fault_ms", "meg_section_checks_ms", "meg_flush_ms", "meg_reexec_ms", "meg_reexec_src", "tlb_ipi",
+          "coh_ms_per_search_all_threads"], f1b)
     write(os.path.join(a.out, "table1.csv"), ["block", "run", "system", "u", "node", "window_s", "coh_bg_vcpu",
           "recv_vcpu", "lib_bg_vcpu", "traffic_bytes_per_s", "traffic_src"], t1)
     write(os.path.join(a.out, "fig2b.csv"), ["block", "run", "system", "u", "traffic_bytes", "updates",

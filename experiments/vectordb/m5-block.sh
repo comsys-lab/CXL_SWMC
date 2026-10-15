@@ -14,6 +14,7 @@ set -uo pipefail
 B=$1 E=$2 R=1
 P=/home/comsys/sungsu/destijl-control X=$P/CXL_SWMC/experiments/vectordb
 KV=${KV:-6.14.0-vanilla-1} SEED_BASE=20261014 OWNER="M5-$B"
+[ $B = eqA ] || [ $B = eqB ] && SHUFFLE_SEED=M5-eq  # identical run order on both kernels
 : "${MEG_BUILD:?}"
 VMEG=${VMEG:-/home/comsys/vdbm6}
 grep -q "^megalon_build=$P/builds/megalon/70$" $MEG_BUILD/manifest.txt && grep -q "^source_commit=.* dirty=0$" $MEG_BUILD/manifest.txt \
