@@ -29,6 +29,7 @@ collect() {
   for k in "${!NODE[@]}"; do scp -q "comsys@${NODE[$k]}:$GRUN/node$k.*" "$RUN/" 2>/dev/null || true; done
 }
 trap 'echo "run $NAME: error, stopping servers"; stop_nodes; collect' ERR
+trap 'echo "run $NAME: interrupted, stopping servers"; stop_nodes; collect; exit 130' INT TERM HUP
 
 host_check before
 RID=0x$(openssl rand -hex 4)$(printf '%08x' $(( (RANDOM << 16 | RANDOM) | 1 )))
@@ -42,9 +43,21 @@ APP=$("$HOST_SERVER" $SERVER_ARGS --print-app-bytes)
   echo "server_args=$SERVER_ARGS"; echo "app_hwcc_bytes=$APP"; echo "init=$INIT"; echo "loadgen_args=$*"
   echo "lg_cpus=$LG_CPUS"
   for k in "${!NODE[@]}"; do
-    echo "node$k=${NODE[$k]} $($SSH comsys@"${NODE[$k]}" "uname -r; sha256sum $V/bin/vdb-server $V/cfg/cxl_region.yaml | cut -c1-64; nproc" < /dev/null | tr '\n' ' ')"
+    info=$($SSH comsys@"${NODE[$k]}" "uname -r; sha256sum $V/bin/vdb-server $V/cfg/cxl_region.yaml | cut -c1-64; nproc" < /dev/null | tr '\n' ' ')
+    [ -n "$info" ] || { echo "node$k info empty" >&2; exit 4; }
+    echo "node$k=${NODE[$k]} $info"
   done
-  for d in cxl_vm0 cxl_vm1; do echo "vm_xml_sha256.$d=$(virsh -c qemu:///system dumpxml --inactive "$d" 2>/dev/null | sha256sum | cut -d' ' -f1)"; done
+  echo "init_sha256sums_sha256=$($SSH comsys@"${NODE[0]}" "sha256sum $INIT/SHA256SUMS | cut -d' ' -f1" < /dev/null)"
+  for a in "$@"; do  # dataset provenance: every file named by --opt data=/writes=
+    case "$a" in
+      data=*) for f in pool_b.fbin queries.fbin; do echo "data_sha256.$f=$(sha256sum "${a#data=}/$f" | cut -d' ' -f1)"; done;;
+      writes=*) echo "writes_sha256=$(sha256sum "${a#writes=}" | cut -d' ' -f1)";;
+    esac
+  done
+  for d in cxl_vm0 cxl_vm1; do
+    x=$(virsh -c qemu:///system dumpxml --inactive "$d" 2>/dev/null) || x=""
+    [ -n "$x" ] && echo "vm_xml_sha256.$d=$(printf '%s' "$x" | sha256sum | cut -d' ' -f1)" || echo "vm_xml_error.$d=virsh failed"
+  done
 } > "$RUN/manifest.txt"
 
 for k in "${!NODE[@]}"; do

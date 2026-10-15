@@ -232,7 +232,12 @@ class Server {
         SegLines &sl = h_->segs[p_.seg_of(rq.id)];
         cxl::hwcc::write_lock(&sl.lock);
         const uint64_t t1 = now_ns();
-        g_[p_.seg_of(rq.id)]->insert(rq.id, rq.w_seq, reinterpret_cast<const float *>(j.p.data() + sizeof(rq)), rng_);
+        try {
+          g_[p_.seg_of(rq.id)]->insert(rq.id, rq.w_seq, reinterpret_cast<const float *>(j.p.data() + sizeof(rq)), rng_);
+        } catch (const std::exception &e) {  // never leave the cross-VM write lock held (peers would spin)
+          cxl::hwcc::write_unlock(&sl.lock);
+          die(std::string("insert: ") + e.what());
+        }
         cxl::hwcc::write_unlock(&sl.lock);
         st_.insert_lock_ns += t1 - t0;
         st_.insert_ns += now_ns() - t0;
