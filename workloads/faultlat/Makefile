@@ -12,7 +12,7 @@ $(TEST_BIN): contend_test.cc contend.h
 	$(CXX) $(CXXFLAGS) -o $@ contend_test.cc
 
 test: $(TEST_BIN)
-	./$(TEST_BIN)
+	$(abspath $(TEST_BIN))
 
 clean:
 	rm -f $(BIN) $(TEST_BIN)
