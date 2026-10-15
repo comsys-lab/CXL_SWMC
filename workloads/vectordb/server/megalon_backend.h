@@ -17,6 +17,7 @@
 #include <cstdio>
 #include <cstring>
 #include <fstream>
+#include <memory>
 #include <mutex>
 #include <sstream>
 #include <string>
@@ -90,7 +91,10 @@ class MegalonAcc;
 // write section is logged (id, written ranges, wsec sequence number taken from an HWcc counter after write_end) and
 // every failed read attempt (id, read range, wsec counter before read_start and after the failed read_end):
 // tools/classify_retries.py marks a retry false sharing when a peer write with seq in (s0, s1] hit the same object
-// on disjoint ranges, true sharing when ranges overlap.
+// on disjoint ranges, true sharing when ranges overlap. Also with a trace dir, an HWcc slot per object holds the seq
+// of its last write section; a read that finds it past this node's cache logs a refetch (Megalon flushes and
+// re-reads the object in ObjectReadStart), classified the same way (node<K>.megalon-refetch.bin).
+// Without a trace dir none of the HWcc trace lines is touched.
 // Note: ObjectReadStart retries internally when the object's counter moved since this node last read it (flush the
 // whole object, retry; megalon.read_retry_incoherent): that time is inside rd_start_ns but is not a wrapper retry
 // (rd_retries / the retry log see only failed ObjectReadEnd calls).
@@ -111,7 +115,7 @@ struct __attribute__((packed)) RetryRec {  // 48 B
 };
 struct MegTimers {
   std::atomic<uint64_t> rd_sampled{0}, rd_start_ns{0}, rd_body_ns{0}, rd_end_ns{0}, rd_retries{0}, rd_failed_timed{0},
-      rd_failed_ns{0}, wr_sections{0}, wr_start_ns{0}, wr_body_ns{0}, wr_end_ns{0};
+      rd_failed_ns{0}, wr_sections{0}, wr_start_ns{0}, wr_body_ns{0}, wr_end_ns{0}, refetch{0};
 };
 
 struct MegalonMem {
@@ -126,7 +130,7 @@ class MegalonBackend {
   static constexpr const char *kLayoutTag = " backend=megalon";
 
   MegalonBackend(const cxl::region &, uint8_t *, const Params &p, const MegalonApi *api) : p_(p), api_(api) {
-    dlog_chunks_ = (p.max_deletes + p.dlog_chunk - 1) / p.dlog_chunk;
+    dlog_chunks_ = p.dlog_chunks();
   }
   bool fits(std::string *err) const {
     if (p_.g.vrec_bytes() % 64 || p_.g.links0_bytes() % 64 || p_.g.links_bytes() % 64) {
@@ -196,6 +200,7 @@ class MegalonBackend {
     thread_local uint64_t rs = 0x9e3779b97f4a7c15ull ^ uint64_t(reinterpret_cast<uintptr_t>(&rs));
     rs ^= rs << 13, rs ^= rs >> 7, rs ^= rs << 17;  // xorshift64
     const bool timed = (rs >> 32 & (kSample - 1)) == 0;
+    if (oseq_) note_read(id, off, len);
     for (;;) {
       MegObj h;
       const uint64_t s0 = wsec_ ? cxl::hwcc::load_acquire(wsec_) : 0;
@@ -237,6 +242,7 @@ class MegalonBackend {
     tm_.wr_sections++, tm_.wr_start_ns += t1 - t0, tm_.wr_body_ns += t2 - t1, tm_.wr_end_ns += t3 - t2;
     if (wsec_) {
       const uint64_t seq = cxl::hwcc::fetch_add(wsec_, uint64_t(1)) + 1;
+      note_write(id, seq);
       if (trace_) {
         if (len0 == ~0ull) len0 = h.size;
         std::lock_guard<std::mutex> g(tmu_);
@@ -308,24 +314,32 @@ class MegalonBackend {
       << "\nmegt.rd_body_ns=" << tm_.rd_body_ns << "\nmegt.rd_end_ns=" << tm_.rd_end_ns << "\nmegt.rd_retries=" << tm_.rd_retries
       << "\nmegt.rd_failed_timed=" << tm_.rd_failed_timed << "\nmegt.rd_failed_ns=" << tm_.rd_failed_ns
       << "\nmegt.wr_sections=" << tm_.wr_sections << "\nmegt.wr_start_ns=" << tm_.wr_start_ns
-      << "\nmegt.wr_body_ns=" << tm_.wr_body_ns << "\nmegt.wr_end_ns=" << tm_.wr_end_ns << "\n";
+      << "\nmegt.wr_body_ns=" << tm_.wr_body_ns << "\nmegt.wr_end_ns=" << tm_.wr_end_ns
+      << "\nmegt.trace_refetch=" << tm_.refetch << "\n";
     return o.str();
   }
 
   // ---- measurement hooks (server.cc)
   static constexpr uint32_t kSample = 64;  // power of two
-  void set_trace(uint64_t *wsec_counter, bool log, uint32_t node) {
-    wsec_ = wsec_counter, trace_ = log, node_ = node;
+  // Trace on: wsec_counter / objseq = the HWcc lines (layout.h), log = keep the logs. Off: nullptrs, no HWcc access.
+  void set_trace(uint64_t *wsec_counter, uint64_t *objseq, bool log, uint32_t node) {
+    wsec_ = wsec_counter, oseq_ = objseq, trace_ = log, node_ = node;
+    if (oseq_) {
+      ocache_.reset(new std::atomic<uint64_t>[p_.trace_objects()]);
+      for (uint64_t i = 0; i < p_.trace_objects(); i++) ocache_[i].store(0);
+    }
   }
   bool dump_trace(const std::string &prefix, std::string *err) const {
     if (!trace_) return true;
     std::lock_guard<std::mutex> g(tmu_);
-    for (int k = 0; k < 2; k++) {
-      const std::string path = prefix + (k ? ".megalon-retry.bin" : ".megalon-wsec.bin");
+    for (int k = 0; k < 3; k++) {
+      static const char *const names[] = {".megalon-wsec.bin", ".megalon-retry.bin", ".megalon-refetch.bin"};
+      const std::string path = prefix + names[k];
       FILE *f = std::fopen(path.c_str(), "wb");
       if (!f) return *err = "cannot write " + path, false;
-      if (k) std::fwrite(rlog_.data(), sizeof(RetryRec), rlog_.size(), f);
-      else std::fwrite(wlog_.data(), sizeof(WsecRec), wlog_.size(), f);
+      if (k == 0) std::fwrite(wlog_.data(), sizeof(WsecRec), wlog_.size(), f);
+      else if (k == 1) std::fwrite(rlog_.data(), sizeof(RetryRec), rlog_.size(), f);
+      else std::fwrite(flog_.data(), sizeof(RetryRec), flog_.size(), f);
       std::fclose(f);
     }
     return true;
@@ -345,6 +359,39 @@ class MegalonBackend {
       tm_.rd_failed_timed++, tm_.rd_failed_ns += t3 - t0;
     }
   }
+  // dense index of an object id (for_each_object order: vec/link per segment group, then delete-log chunks per node)
+  uint64_t obj_index(uint64_t id) const {
+    const uint64_t kind = id >> 44 & 0xf, a = id >> 24 & 0xfffff, b = id & 0xffffff;
+    if (kind == 1 || kind == 2) return (a * p_.g.groups() + b) * 2 + (kind - 1);
+    return uint64_t(p_.segments) * p_.g.groups() * 2 + a * dlog_chunks_ + b;
+  }
+  // Trace only. A read section whose object's HWcc objseq moved past this node's cache: a write section completed
+  // on the object since this node last saw it, so Megalon's ObjectReadStart flushes and re-reads the object (when
+  // that write came from a peer). One thread per node logs the transition (cache CAS): refetch record (object, this
+  // read's range, old seq, new seq); classify_retries.py classifies it like a retry.
+  void note_read(uint64_t id, uint64_t off, uint64_t len) const {
+    const uint64_t i = obj_index(id);
+    const uint64_t v = cxl::hwcc::load_acquire(&oseq_[i]);
+    uint64_t c = ocache_[i].load(std::memory_order_relaxed);
+    if (v <= c || !ocache_[i].compare_exchange_strong(c, v)) return;
+    tm_.refetch++;
+    if (trace_) {
+      std::lock_guard<std::mutex> g(tmu_);
+      flog_.push_back(RetryRec{id, uint32_t(off), uint32_t(len), c, v, mono_ns(), node_});
+    }
+  }
+  // Trace only, after write_end (inside the segment's HWcc write lock or the node's own delete log: one writer per
+  // object at a time): objseq = seq; if this node had seen every earlier write on the object, its own write does not
+  // make its copy stale (cache = seq).
+  void note_write(uint64_t id, uint64_t seq) const {
+    if (!oseq_) return;
+    const uint64_t i = obj_index(id);
+    uint64_t prev = cxl::hwcc::load_acquire(&oseq_[i]);
+    while (prev < seq && !cxl::hwcc::cas(&oseq_[i], &prev, seq)) {
+    }
+    uint64_t c = prev;
+    ocache_[i].compare_exchange_strong(c, seq);
+  }
   void log_retry(uint64_t id, uint64_t off, uint64_t len, uint64_t s0) const {
     const uint64_t s1 = wsec_ ? cxl::hwcc::load_acquire(wsec_) : 0;
     std::lock_guard<std::mutex> g(tmu_);
@@ -353,13 +400,16 @@ class MegalonBackend {
   Params p_;
   const MegalonApi *api_;
   uint64_t dlog_chunks_;
-  uint64_t *wsec_ = nullptr;  // HWcc: write sections completed by all nodes
+  uint64_t *wsec_ = nullptr;  // HWcc: write sections completed by all nodes (trace only)
+  uint64_t *oseq_ = nullptr;  // HWcc: per object, seq of its last write section (trace only)
+  mutable std::unique_ptr<std::atomic<uint64_t>[]> ocache_;  // this node: last objseq value seen per object
   bool trace_ = false;
   uint32_t node_ = 0;
   mutable MegTimers tm_;
   mutable std::mutex tmu_;
   mutable std::vector<WsecRec> wlog_;
   mutable std::vector<RetryRec> rlog_;
+  mutable std::vector<RetryRec> flog_;  // refetches (same record layout: s0 = old seq, s1 = new seq)
 };
 
 // HNSW accessor (shm_hnsw.h): every chunk access is one Megalon section; reads copy into the caller's scratch.

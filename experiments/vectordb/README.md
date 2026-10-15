@@ -9,8 +9,9 @@ VM runs go through an approved packet (reports/M3-vdb-packet.md); `<out_root>` i
 Streams (vectordb plugin): `search` and `update` (one request = delete a live record + insert the next pool B
 record on one node; writes file from `tools/gen_writes.py --mode update`). Mix 95:5 = `--mix update=1,search=19`.
 By default run.sh passes `--stats-op 10` to loadgen (server stats snapshot per node at the start and end of every
-measured step) and `--trace-dir <guest run dir>` to vdb-server (Megalon write-section/retry logs; nothing for
-plain); `STATS_OP=0` / `TRACE=0` turn them off (recorded in the manifest as `trace= stats_op=`).
+measured step; `STATS_OP=0` turns it off). `TRACE=1` (default 0; MOT1 v4 H2 step 2: fixed-load runs only) adds
+`--trace-dir <guest run dir>` to vdb-server (Megalon false-sharing logs; HWcc trace lines are touched only then;
+nothing for plain). Both are recorded in the manifest (`trace= stats_op=`).
 
 ## Result layout (immutable; run.sh refuses to overwrite)
 ```
@@ -35,8 +36,8 @@ recovery/M3-vdb-runs-vN/                 packet evidence dir (one approved attem
     ├── loadgen.log      step-by-step console output
     ├── node<k>.{log,env,pid}   server log (incl. final stats: updates, inserts, deletes, searches, timeouts,
     │                           bad_records, lock/search times, proc/sysfs counters) and start environment per VM
-    ├── node<k>.megalon-{wsec,retry}.bin   Megalon only (TRACE=1): write-section and failed-read logs for
-    │                           tools/classify_retries.py (false / true sharing)
+    ├── node<k>.megalon-{wsec,retry,refetch}.bin   Megalon only (TRACE=1): write-section, failed-read and
+    │                           refetch logs for tools/classify_retries.py (false / true sharing)
     └── loadgen/
         ├── steps.jsonl, summary.json   per-step statistics and the SLO-search result (max_offered_x_pass, confirm)
         ├── manifest.txt               loadgen parameters

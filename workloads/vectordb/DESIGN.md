@@ -298,7 +298,8 @@ indexing unit; Megalon flushes the whole object at write end (no dirty-line trac
   thread names itself `nr-log-sync`) CPU ticks and schedstat run/run-queue-wait ns, per-thread Popcorn counters
   (`/proc/self/task/<tid>/swmc`, Popcorn build >= 8) summed per role, `cxl_recv*` kernel-thread CPU, `/proc/interrupts`
   TLB/CAL/RES/LOC, `/proc/stat` cpu, page faults, sysfs counters of `/sys/kernel/swmc/page_coherence`,
-  `/sys/kernel/swmc/instr` ("name value" files) and `/sys/kernel/cxl_shm`. A snapshot reads /proc and sysfs
+  `/sys/kernel/swmc/instr`, `/sys/kernel/cxl_shm` and `/sys/kernel/cxl_shm/instr` (keys `sys.swmc.page_coherence.*`,
+  `sys.swmc.instr.<file>.<name>`, `sys.cxl_shm.*`, `sys.cxl_shm.instr.<file>.<name>`). A snapshot reads /proc and sysfs
   (Host test: ~15 ms; it runs on the connection's reader thread).
 - Per measured step: loadgen `--stats-op 10` takes a snapshot per node at the window start and end; offline
   `experiments/loadgen/stats_delta.py` (deltas) and `export_csv.py` (derived columns) — experiments/vectordb/README.md.
@@ -306,12 +307,24 @@ indexing unit; Megalon flushes the whole object at write end (no dirty-line trac
   read_start / body / read_end; failed attempts of timed sections timed in full; every write section timed
   (write_start, body, write_end incl. flush). `rd_retries` counts every failed ObjectReadEnd. ObjectReadStart's
   internal "incoherent" flush-and-retry (`megalon.read_retry_incoherent`) is inside read_start time, not a retry.
-- False-sharing log (`--trace-dir`, Megalon only): HWcc line `wsec` (app layout, all backends; unused by plain)
-  is incremented after every write_end (one HWcc atomic per write section) and read before every read_start (one
-  HWcc load per read section); write sections log (seq, object, written ranges), failed reads log (object, read range,
-  s0 = counter before read_start, s1 = after the failed read_end); dumped at stop as
-  `node<K>.megalon-{wsec,retry}.bin`; `tools/classify_retries.py` classifies each retry (peer write in (s0, s1] on the
-  same object: overlapping range = true sharing, disjoint = false sharing, none = unexplained).
+- False-sharing log (`--trace-dir`, Megalon only; run.sh TRACE=1, fixed-load runs only, MOT1 v4 H2 step 2). HWcc
+  lines in the app layout of every backend (plain never touches them; Megalon only with --trace-dir): `wsec`
+  (write sections completed by all nodes) and `objseq[o]`, one u64 per Megalon object (vector and link chunk per
+  segment group, delete-log chunks per node; `Params::trace_objects()`), = wsec seq of the object's last write
+  section. Per write section (after write_end): wsec fetch-add, objseq[o] = seq (inside the segment write lock or
+  the node's own delete log, so one writer per object), log (seq, object, written ranges); if the node's cache for o
+  was current, it moves to seq (own writes do not make the node's copy stale). Per read section: one HWcc load of
+  objseq[o]; if it is past the node's cache (node-wide array, CAS: one thread per transition) a write section
+  completed on o since this node last saw it, so ObjectReadStart flushes and re-reads o (Megalon's "incoherent"
+  retry): refetch log (object, read range, old seq, new seq). Per read attempt: wsec load before read_start; a
+  failed read_end logs a retry (object, read range, s0, s1 = wsec after the failure). Dumped at stop as
+  `node<K>.megalon-{wsec,retry,refetch}.bin`. `tools/classify_retries.py`: peer write sections with seq in (s0, s1]
+  on the same object: overlapping range = true sharing, disjoint = false sharing, none = unexplained (refetch with
+  only own writes = local_only, excluded); retries, refetches and combined; with `--stats --step` per-node window
+  counts next to megalon.read_retry_incoherent (counts ObjectReadStart's incoherent retries and incoherent failed
+  read_ends) as a sanity check. Limits: a refetch carries the range of the first read after the change; a write
+  between the objseq load and read_start is attributed to the next read; concurrent readers on one node may make
+  Megalon flush more than once per transition (logged once).
 - Host smoke test: tests/host_smoke.sh (2 processes on a scratch file, plain or Megalon); unit tests
   tests/plugin_pairs_test.cc, tests/classify_retries_test.py, experiments/loadgen/test/stats_delta_test.py.
 

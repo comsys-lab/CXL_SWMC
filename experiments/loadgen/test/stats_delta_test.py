@@ -93,6 +93,14 @@ def main():
     check(f("n0_traffic_bytes") == 9600 and x["n0_traffic_src"] == "megalon", "traffic")
     check(f("traffic_bytes") == 9600 and f("traffic_per_update") == 480, "step traffic per update")
     check(x["n1_window_s"] == "" and x["n0_pop_search_fault_s"] == "", "absent node / counters are empty")
+    # Popcorn traffic: (remote write-backs + acquire flushes) x 4 KiB; wb_flush_count is not added
+    import export_csv  # noqa: E402
+    pd = {"sys.swmc.page_coherence.remote_writeback_count": 10, "sys.swmc.instr.serve.acquire_flush_count": 5,
+          "sys.swmc.instr.serve.wb_flush_count": 10}
+    pm = export_csv.node_metrics({"window_s": 1.0}, pd)
+    check(pm["traffic_bytes"] == 15 * 4096 and pm["traffic_src"] == "popcorn", "popcorn traffic")
+    pm = export_csv.node_metrics({"window_s": 1.0}, {"sys.swmc.page_coherence.remote_writeback_count": 3})
+    check(pm["traffic_bytes"] == 3 * 4096 and pm["traffic_src"] == "popcorn-wb", "popcorn traffic without instr")
     print("PASSED" if not fails else f"FAILED ({fails})")
     return 1 if fails else 0
 

@@ -28,13 +28,19 @@ def main():
     w1.tofile(os.path.join(d, "node1.megalon-wsec.bin"))
     r0.tofile(os.path.join(d, "node0.megalon-retry.bin"))
     np.zeros(0, dtype=RETRY).tofile(os.path.join(d, "node1.megalon-retry.bin"))
+    # refetches on node 1: (id, off, len, old, new, t, node)
+    np.array([(0xA, 512, 64, 0, 1, 11, 1),     # node 0's seq 1 on A [0,64), read 512.. -> false
+              (0xB, 4096, 64, 3, 4, 41, 1),    # node 0's seq 4 on B covers 4096..      -> true
+              (0xA, 0, 64, 1, 3, 31, 1)],      # only own writes 2, 3                   -> local_only
+             dtype=RETRY).tofile(os.path.join(d, "node1.megalon-refetch.bin"))
     fails = 0
-    for slack, want in [(0, ["false_sharing", "true_sharing", "true_sharing", "unexplained", "unexplained"]),
-                        (1, ["false_sharing", "true_sharing", "true_sharing", "unexplained", "true_sharing"])]:
+    ref = ["false_sharing", "true_sharing", "local_only"]
+    for slack, want in [(0, ["false_sharing", "true_sharing", "true_sharing", "unexplained", "unexplained"] + ref),
+                        (1, ["false_sharing", "true_sharing", "true_sharing", "unexplained", "true_sharing"] + ref)]:
         out = os.path.join(d, f"s{slack}")
         subprocess.run([sys.executable, TOOL, "--trace", d, "--out", out, "--slack", str(slack)], check=True,
                        stdout=subprocess.DEVNULL)
-        rows = list(csv.DictReader(open(out + ".retries.csv")))
+        rows = list(csv.DictReader(open(out + ".events.csv")))
         got = [r["class"] for r in rows]
         if got != want:
             fails += 1
@@ -42,6 +48,10 @@ def main():
         if slack == 0 and (rows[2]["n_local_same_obj"] != "1" or rows[2]["n_peer_same_obj"] != "2"):
             fails += 1
             print("FAIL counts", rows[2])
+    summ = open(os.path.join(d, "s0.summary.txt")).read()
+    if "combined: events=7 false_sharing=2" not in summ or "true_sharing=3" not in summ:
+        fails += 1
+        print("FAIL summary", summ)
     print("PASSED" if not fails else f"FAILED ({fails})")
     return 1 if fails else 0
 

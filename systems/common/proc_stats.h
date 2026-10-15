@@ -15,7 +15,7 @@
 //   cpu.<field>                              /proc/stat "cpu" line (node-wide, ticks)
 //   proc.minflt / proc.majflt                this process's page faults
 //   sys.<dir>.<file>                         every single-integer file in configured sysfs dirs (e.g. Popcorn counters;
-//                                            <dir> = last path component)
+//                                            <dir> = path below /sys/kernel/ with '.' for '/', e.g. swmc.page_coherence)
 //   sys.<dir>.<file>.<name>                  files of "name value" lines in those dirs (e.g. Popcorn instr/ histograms)
 // cpu_ticks are USER_HZ ticks (utime + stime); run_ns / wait_ns are ns from schedstat. Key names never contain '='
 // or spaces. *.max_ns style keys are maxima, not sums (stats_delta.py reports their end value).
@@ -177,7 +177,10 @@ inline std::string text(const Opts &o) {
   for (const std::string &d : o.sysfs_dirs) {
     std::string base = d;
     while (!base.empty() && base.back() == '/') base.pop_back();
-    const std::string tag = base.substr(base.rfind('/') + 1);
+    // tag: path below /sys/kernel/ with '/' -> '.' (e.g. swmc.page_coherence, cxl_shm.instr), else the last component
+    std::string tag = base.compare(0, 12, "/sys/kernel/") == 0 ? base.substr(12) : base.substr(base.rfind('/') + 1);
+    for (char &c : tag)
+      if (c == '/') c = '.';
     for (const std::string &f : dir_entries(base)) {
       const std::string v = trim(slurp(base + "/" + f, 1 << 16));
       if (v.empty()) continue;

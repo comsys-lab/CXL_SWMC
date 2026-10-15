@@ -165,7 +165,15 @@ class Server {
     else be_ = std::make_unique<Be>(r_, map_, p_);
     if (!be_->fits(&err)) die(err);
     if constexpr (std::is_same_v<Be, MegalonBackend>)
-      be_->set_trace(o_.trace_dir.empty() ? nullptr : h_->wsec, !o_.trace_dir.empty(), o_.node);
+      be_->set_trace(o_.trace_dir.empty() ? nullptr : h_->wsec, o_.trace_dir.empty() ? nullptr : h_->objseq,
+                     !o_.trace_dir.empty(), o_.node);
+    {  // trace lines' device offsets (Host tests check that they stay 0 without --trace-dir)
+      const uint64_t app = uint64_t(cxl::hwcc::app_base(r_, map_) - map_);
+      std::fprintf(stderr, "vdb-server: trace %s (%s), wsec at device offset %lu, objseq at %lu (%lu objects)\n",
+                   o_.trace_dir.empty() ? "off" : "on", Be::kLayoutTag[0] ? "megalon" : "plain: unused",
+                   (unsigned long)(app + lay.off_wsec), (unsigned long)(app + lay.off_objseq),
+                   (unsigned long)p_.trace_objects());
+    }
     be_->thread_init(0);  // main thread: prepare (object creation, initial copy) and warm-up
     for (uint32_t s = 0; s < p_.segments; s++) g_.push_back(std::make_unique<Graph>(p_.g, be_->mem(s, &h_->segs[s].meta)));
     std::fprintf(stderr,
@@ -690,7 +698,8 @@ class Server {
   Stats st_;
   cxl::proc::Opts pst_{{"cxl_recv"},
                        {"TLB", "CAL", "RES", "LOC"},
-                       {"/sys/kernel/swmc/page_coherence", "/sys/kernel/swmc/instr", "/sys/kernel/cxl_shm"}};
+                       {"/sys/kernel/swmc/page_coherence", "/sys/kernel/swmc/instr", "/sys/kernel/cxl_shm",
+                        "/sys/kernel/cxl_shm/instr"}};
   Queue wq_;
   std::mutex smu_;  // search scheduling
   std::condition_variable scv_;
@@ -730,7 +739,7 @@ void usage() {
                "  [--dim D] [--M M] [--efc E] [--chunk-bytes B (32 MiB)] [--max-writes W] [--max-ids N] [--dlog-chunk E] [--max-deletes D]\n"
                "  [--wait-timeout-ms T] [--start-timeout-ms T] [--backend plain|megalon] [--megalon-lib PATH]\n"
                "  [--preload-only | --preloaded]   Popcorn init_state=shared: node 0 writes the initial chunks before enable\n"
-               "  [--trace-dir DIR]   measurement traces at stop (Megalon: node<K>.megalon-{wsec,retry}.bin)\n"
+               "  [--trace-dir DIR]   Megalon false-sharing trace (HWcc wsec/objseq lines; node<K>.megalon-{wsec,retry,refetch}.bin at stop)\n"
                "--backend megalon: Megalon (RACKOBJ_CONFIG, object_arena_size > 0) maps the device; MEGALON_NODE_ID and\n"
                "  MEGALON_RUN_ID default to --node and --run-id, CXL_REGION_CONFIG to --region (DESIGN.md §12).\n"
                "All nodes need identical parameters (checked through the HWcc app layout hash).\n"

@@ -11,8 +11,9 @@
 #   NODE_ENV="ENV:RACKOBJ_CONFIG=$V/cfg/megalon.yaml" NODE0_ENV="ENV:MEGALON_REINIT=1".
 #   SERVER_CPUS (unset = no change): guest CPU list (e.g. 0-14); after READY every vdb-server thread on every
 #   node is pinned with taskset -a and verified; recorded in the manifest and node<k>.server-cpus.txt.
-#   TRACE (default 1): vdb-server --trace-dir <guest run dir> (Megalon: write-section counter in HWcc + write-section
-#   and retry logs, collected as node<k>.megalon-{wsec,retry}.bin; plain: nothing); TRACE=0 omits it.
+#   TRACE (default 0): TRACE=1 adds vdb-server --trace-dir <guest run dir> (Megalon: HWcc write-section counter and
+#   per-object seq + write-section/retry/refetch logs, collected as node<k>.megalon-{wsec,retry,refetch}.bin; plain:
+#   nothing). MOT1 v4 H2 step 2: set TRACE=1 only for the fixed-load runs, never for SLO searches.
 #   STATS_OP (default 10 = vdb kOpStats): loadgen --stats-op, a server stats snapshot per node at the start and end of
 #   every measured step (loadgen/stats/); STATS_OP=0 omits it. After the run: stats-steps.csv (stats_delta.py) and
 #   steps.csv with the derived per-node columns (export_csv.py).
@@ -21,7 +22,7 @@ set -euo pipefail
 NAME=$1 OUT=$2; shift 2; [ "${1:-}" = "--" ] && shift
 : "${SYSTEM:?}" "${V:?}" "${HOST_SERVER:?}" "${LOADGEN:?}" "${SERVER_ARGS:?}" "${INIT:?}"
 read -r -a NODE <<< "${NODES:-192.168.122.100 192.168.122.101}"
-PORT=${PORT:-7000} LG_CPUS=${LG_CPUS:-56-63} TRACE=${TRACE:-1} STATS_OP=${STATS_OP:-10}
+PORT=${PORT:-7000} LG_CPUS=${LG_CPUS:-56-63} TRACE=${TRACE:-0} STATS_OP=${STATS_OP:-10}
 [[ $TRACE =~ ^[01]$ ]] && [[ $STATS_OP =~ ^[0-9]+$ ]] || { echo "bad TRACE/STATS_OP"; exit 2; }
 [ -z "${SERVER_CPUS:-}" ] || [[ $SERVER_CPUS =~ ^[0-9]+(-[0-9]+)?(,[0-9]+(-[0-9]+)?)*$ ]] || { echo "bad SERVER_CPUS"; exit 2; }
 SSH="ssh -o BatchMode=yes -o ConnectTimeout=5"

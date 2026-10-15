@@ -23,6 +23,10 @@ struct Params {
   uint64_t max_deletes = 1u << 23; // per node
   void derive() { g.capacity = (max_ids + segments - 1) / segments; }
   uint32_t seg_of(uint64_t id) const { return uint32_t(id % segments); }
+  uint64_t dlog_chunks() const { return (max_deletes + dlog_chunk - 1) / dlog_chunk; }  // per node
+  // measurement (trace): one slot per coherence object of the Megalon backend (vector + link chunk per segment
+  // group, delete-log chunks per node), sized identically for every backend
+  uint64_t trace_objects() const { return uint64_t(segments) * g.groups() * 2 + uint64_t(nr_nodes) * dlog_chunks(); }
   std::string describe() const {
     return "nr_nodes=" + std::to_string(nr_nodes) + " segments=" + std::to_string(segments) +
            " dim=" + std::to_string(g.dim) + " M=" + std::to_string(g.M) + " efc=" + std::to_string(g.ef_construction) +
@@ -56,7 +60,7 @@ struct alignas(64) SegLines {  // HWcc per segment: lock and graph meta on separ
 
 struct HwccLayout {
   cxl::hwcc::layout L;
-  uint64_t off_p, off_nodes, off_applied, off_segs, off_wsec;
+  uint64_t off_p, off_nodes, off_applied, off_segs, off_wsec, off_objseq;
   // backend_tag: "" for plain (hash unchanged), " backend=megalon" for Megalon; the size never depends on it
   explicit HwccLayout(const Params &p, const char *backend_tag = "") {
     L.add(("vdb-seg " + p.describe() + backend_tag).c_str(), 0, 8);  // parameters go into the layout hash
@@ -64,7 +68,10 @@ struct HwccLayout {
     off_nodes = L.add("nodes", uint64_t(p.nr_nodes) * sizeof(NodeLine));
     off_applied = L.add("applied", (p.max_writes + 1 + 63) / 64 * 8);
     off_segs = L.add("segments", uint64_t(p.segments) * sizeof(SegLines));
-    off_wsec = L.add("wsec", 64);  // measurement: Megalon write-section counter (trace); unused by plain
+    // measurement (vdb-server --trace-dir, Megalon only; plain never touches them, nor does Megalon without trace):
+    // wsec = write sections completed by all nodes; objseq[o] = wsec value of the last write section on object o
+    off_wsec = L.add("wsec", 64);
+    off_objseq = L.add("objseq", (p.trace_objects() * 8 + 63) / 64 * 64);
   }
 };
 
@@ -74,12 +81,14 @@ struct Hwcc {
   uint64_t *applied;
   SegLines *segs;
   uint64_t *wsec;
+  uint64_t *objseq;
   Hwcc(uint8_t *app, const HwccLayout &h)
       : P(reinterpret_cast<uint64_t *>(app + h.off_p)),
         nodes(reinterpret_cast<NodeLine *>(app + h.off_nodes)),
         applied(reinterpret_cast<uint64_t *>(app + h.off_applied)),
         segs(reinterpret_cast<SegLines *>(app + h.off_segs)),
-        wsec(reinterpret_cast<uint64_t *>(app + h.off_wsec)) {}
+        wsec(reinterpret_cast<uint64_t *>(app + h.off_wsec)),
+        objseq(reinterpret_cast<uint64_t *>(app + h.off_objseq)) {}
 };
 
 }  // namespace vdb

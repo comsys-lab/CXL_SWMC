@@ -62,7 +62,7 @@ has no snapshots. Requests and replies on that connection are synchronous; the m
   rates (search/s, update/s, total ops/s; an update is one operation), search/update p50/p99, worker busy
   fractions, CPU and run-queue wait per thread role, coherence stall estimates (Popcorn per-thread fault time,
   Megalon section timers), coherence background CPU (`cxl_recv*` kernel threads, library threads), TLB/call IPIs,
-  traffic (Megalon flush bytes; Popcorn flush counts × 4 KiB). Existing columns keep their order; new columns are
+  traffic (Megalon flush bytes; Popcorn (remote write-backs + acquire flushes) × 4 KiB). Existing columns keep their order; new columns are
   appended.
 - Unit test (Host): `python3 test/stats_delta_test.py <scratch dir>`.
 

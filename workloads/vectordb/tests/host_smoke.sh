@@ -8,11 +8,13 @@
 # env: CPUS (default 16-31: Host node1), SEGMENTS (4), CHUNK (1048576), RATES (100,300), MIX (update=1,search=19),
 #      INDEX_BUILDER (default <build>/bin/vdb-build-index), DEVICE_SIZE (bytes, default 2 GiB),
 #      BACKEND (plain | megalon: <build> from build-megalon.sh; Megalon config from systems/megalon/vectordb-2vm.yaml
-#      with object_arena_size ARENA (default 512MB); node 0 MEGALON_REINIT=1)
+#      with object_arena_size ARENA (default 512MB); node 0 MEGALON_REINIT=1), TRACE (1 = --trace-dir <scratch>,
+#      default 1; 0 = none). At the end the HWcc trace lines (wsec, objseq) are read from the device file: they must
+#      stay 0 with TRACE=0 or with the plain backend.
 set -euo pipefail
 B=$(cd "$1" && pwd) LG=$2 D=$(cd "$3" && pwd) S=$4
 HERE=$(cd "$(dirname "$0")" && pwd); ROOT=$(cd "$HERE/../../.." && pwd)
-BACKEND=${BACKEND:-plain} DEVSZ=${DEVICE_SIZE:-2147483648} CPUS=${CPUS:-16-31} SEG=${SEGMENTS:-4} CHUNK=${CHUNK:-1048576} RATES=${RATES:-100,300} MIX=${MIX:-update=1,search=19}
+TRACE=${TRACE:-1} BACKEND=${BACKEND:-plain} DEVSZ=${DEVICE_SIZE:-2147483648} CPUS=${CPUS:-16-31} SEG=${SEGMENTS:-4} CHUNK=${CHUNK:-1048576} RATES=${RATES:-100,300} MIX=${MIX:-update=1,search=19}
 [ -e "$S" ] && { echo "refusing: $S exists"; exit 2; }
 mkdir -p "$S"
 NA=$(python3 -c "import numpy as np,sys; print(np.fromfile(sys.argv[1],dtype=np.int32,count=1)[0])" "$D/pool_a.fbin")
@@ -34,7 +36,7 @@ for k in 0 1; do
   XE=(); [ "$BACKEND" = megalon ] && XE=(RACKOBJ_CONFIG="$S/megalon.yaml") && [ "$k" = 0 ] && XE+=(MEGALON_REINIT=1)
   # shellcheck disable=SC2086
   env ${XE[@]+"${XE[@]}"} CXL_REGION_CONFIG=$S/region.yaml CXL_APP_HWCC_BYTES=$APP taskset -c "$CPUS" "$B/bin/vdb-server" --node $k --run-id "$RID" \
-    $PARAMS --port $((19300 + k)) --search-threads 4 --trace-dir "$S" $EXTRA > "$S/node$k.log" 2>&1 &
+    $PARAMS --port $((19300 + k)) --search-threads 4 $([ "$TRACE" = 1 ] && echo --trace-dir "$S") $EXTRA > "$S/node$k.log" 2>&1 &
   PIDS+=($!)
 done
 for k in 0 1; do
@@ -54,4 +56,17 @@ python3 "$ROOT/experiments/loadgen/stats_delta.py" "$S/loadgen" --out "$S/stats-
 python3 "$ROOT/experiments/loadgen/export_csv.py" --out "$S/steps.csv" "$S/loadgen=host-smoke"
 echo "loadgen rc=$LGRC"; cat "$S/loadgen/vectordb.txt"
 for k in 0 1; do sed -n '/vdb-server: stopping/,$p' "$S/node$k.log" | grep -E "^(node|P|elements|updates|inserts|deletes|searches|timeouts|bad_records)=" | tr '\n' ' '; echo; done
+# HWcc trace lines in the device file (offsets from the server log)
+python3 - "$S" "$BACKEND" "$TRACE" <<'PY'
+import re, sys, numpy as np
+S, be, tr = sys.argv[1:]
+m = re.search(r"wsec at device offset (\d+), objseq at (\d+) \((\d+) objects\)", open(S + "/node0.log").read())
+w, o, n = map(int, m.groups())
+dev = np.memmap(S + "/device.img", dtype=np.uint64, mode="r")
+wsec, objseq = int(dev[w // 8]), dev[o // 8:o // 8 + n]
+print(f"hwcc trace lines: wsec={wsec} objseq nonzero={int((objseq != 0).sum())}/{n} max={int(objseq.max())}")
+expect_on = be == "megalon" and tr == "1"
+if (wsec != 0 or objseq.any()) != expect_on:
+    sys.exit("hwcc trace lines: unexpected (" + ("should be written" if expect_on else "must stay 0") + ")")
+PY
 exit $LGRC

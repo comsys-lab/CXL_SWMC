@@ -27,7 +27,7 @@ when the run has no snapshots or the counter is absent). Times in seconds of the
   n<k>_pop_search_msg_wait_s   vdb-search: swmc.read_msg_wait_ns + swmc.write_msg_wait_ns (part of the fault time)
   n<k>_pop_search_local_wait_s vdb-search: swmc.read_local_wait_ns + swmc.write_local_wait_ns (part of the fault time)
   n<k>_pop_writer_fault_s  vdb-writer: swmc.read_fault_ns + swmc.write_fault_ns
-  n<k>_pop_node_fault_s    sys.page_coherence.total_page_fault_handling_time (ns, all tasks of the node)
+  n<k>_pop_node_fault_s    sys.swmc.page_coherence.total_page_fault_handling_time (ns, all tasks of the node)
   Megalon (workload wrapper timers megt.*, all threads; read sections sampled 1/megt.sample):
   n<k>_meg_rd_check_s      (megt.rd_start_ns + megt.rd_end_ns) x megt.sample   (successful read sections, estimate)
   n<k>_meg_wr_check_s      megt.wr_start_ns
@@ -42,8 +42,16 @@ when the run has no snapshots or the counter is absent). Times in seconds of the
   n<k>_tlb_ipi, n<k>_cal_ipi   /proc/interrupts TLB shootdowns / function-call IPIs (whole node)
   n<k>_traffic_bytes, n<k>_traffic_src   coherence traffic estimate and its source:
                            megalon       megalon.flush_bytes + megalon.replay_flush_bytes
-                           popcorn-instr (sys.instr.serve.wb_flush_count + sys.instr.serve.acquire_flush_count) x 4096
-                           popcorn-wb    sys.page_coherence.remote_writeback_count x 4096 (no instr/ counters)
+                           popcorn       (n<k>_pop_remote_wb + n<k>_pop_acquire_flush) x 4096 (MOT1 v4 Figure 2b)
+                           popcorn-wb    n<k>_pop_remote_wb x 4096 (kernel without instr/ counters)
+  n<k>_pop_remote_wb       sys.swmc.page_coherence.remote_writeback_count: pages this node wrote back for a peer =
+                           Figure 2b terms "remote write-back" (FETCH on M: M -> S) + "remote invalidate with
+                           write-back" (INVALIDATE on M: M -> I); one increment per pc_downgrade_m(), both cases.
+                           Not used: instr serve wb_flush_count (the flush of the same downgrades: double count),
+                           remote_invalidate_count (S -> I, nothing written back), mkclean/unmap counts (only pages
+                           mapped on the node).
+  n<k>_pop_acquire_flush   sys.swmc.instr.serve.acquire_flush_count: Figure 2b "requester acquire-flush" (stale lines
+                           dropped on I -> S/M or the first map of an init-S page)
 """
 import argparse, csv, json, os, sys
 
@@ -59,7 +67,7 @@ NODE = ["window_s", "searches", "updates", "p_advance", "search_busy_frac", "wri
         "search_rq_wait_s", "writer_cpu_s", "cpu_busy_frac", "pop_search_fault_s", "pop_search_msg_wait_s",
         "pop_search_local_wait_s", "pop_writer_fault_s", "pop_node_fault_s", "meg_rd_check_s", "meg_wr_check_s",
         "meg_flush_s", "meg_reexec_s", "meg_stall_s", "coh_stall_s", "recv_cpu_s", "lib_bg_cpu_s", "coh_bg_cpu_s",
-        "tlb_ipi", "cal_ipi", "traffic_bytes", "traffic_src"]
+        "tlb_ipi", "cal_ipi", "traffic_bytes", "traffic_src", "pop_remote_wb", "pop_acquire_flush"]
 PAGE = 4096
 
 
@@ -91,7 +99,9 @@ def node_metrics(fixed, d):
     m["pop_search_msg_wait_s"] = ns([sw + "read_msg_wait_ns", sw + "write_msg_wait_ns"])
     m["pop_search_local_wait_s"] = ns([sw + "read_local_wait_ns", sw + "write_local_wait_ns"])
     m["pop_writer_fault_s"] = ns(["thr.vdb-writer.swmc.read_fault_ns", "thr.vdb-writer.swmc.write_fault_ns"])
-    m["pop_node_fault_s"] = ns(["sys.page_coherence.total_page_fault_handling_time"])
+    m["pop_node_fault_s"] = ns(["sys.swmc.page_coherence.total_page_fault_handling_time"])
+    m["pop_remote_wb"] = d.get("sys.swmc.page_coherence.remote_writeback_count")
+    m["pop_acquire_flush"] = d.get("sys.swmc.instr.serve.acquire_flush_count")
     if "megt.sample" in d:
         smp = d["megt.sample"]
         m["meg_rd_check_s"] = (d.get("megt.rd_start_ns", 0) + d.get("megt.rd_end_ns", 0)) * smp / 1e9
@@ -120,11 +130,11 @@ def node_metrics(fixed, d):
     if "megalon.flush_bytes" in d:
         m["traffic_bytes"] = d["megalon.flush_bytes"] + d.get("megalon.replay_flush_bytes", 0)
         m["traffic_src"] = "megalon"
-    elif "sys.instr.serve.wb_flush_count" in d:
-        m["traffic_bytes"] = (d["sys.instr.serve.wb_flush_count"] + d.get("sys.instr.serve.acquire_flush_count", 0)) * PAGE
-        m["traffic_src"] = "popcorn-instr"
-    elif "sys.page_coherence.remote_writeback_count" in d:
-        m["traffic_bytes"] = d["sys.page_coherence.remote_writeback_count"] * PAGE
+    elif m["pop_remote_wb"] is not None and m["pop_acquire_flush"] is not None:
+        m["traffic_bytes"] = (m["pop_remote_wb"] + m["pop_acquire_flush"]) * PAGE
+        m["traffic_src"] = "popcorn"
+    elif m["pop_remote_wb"] is not None:
+        m["traffic_bytes"] = m["pop_remote_wb"] * PAGE
         m["traffic_src"] = "popcorn-wb"
     return m
 
