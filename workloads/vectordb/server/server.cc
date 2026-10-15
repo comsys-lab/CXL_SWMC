@@ -133,7 +133,14 @@ class Server {
     be_ = std::make_unique<PlainBackend>(r_, map_, p_);
     if (!be_->fits(&err)) die(err);
     for (uint32_t s = 0; s < p_.segments; s++)
-      g_.push_back(std::make_unique<ShmHnsw>(p_.g, ShmHnsw::Mem{&h_->segs[s].meta, be_->level0(s), be_->upper(s)}));
+    {
+      ShmHnsw::Mem mem{&h_->segs[s].meta, {}, {}};
+      for (uint64_t g = 0; g < p_.g.groups(); g++) {
+        mem.vec.push_back(be_->vec_chunk(s, g));
+        mem.link.push_back(be_->link_chunk(s, g));
+      }
+      g_.push_back(std::make_unique<ShmHnsw>(p_.g, std::move(mem)));
+    }
     std::fprintf(stderr,
                  "vdb-server: node %u/%u run %#lx %s\nvdb-server: region %s\nvdb-server: app layout %lu B (used %lu, "
                  "hash %016lx), backend %s\n",
@@ -156,6 +163,7 @@ class Server {
             },
             o_.start_timeout_ms))
       die("not every node became ready in time");
+    warm_up();
     std::thread([this] { writer(); }).detach();
     for (uint32_t i = 0; i < o_.search_threads; i++) std::thread([this] { searcher(); }).detach();
     std::thread([this] { listen_loop(); }).detach();
@@ -171,7 +179,7 @@ class Server {
       << "\nreplay_ms=" << st_.replay_ns / 1000000 << "\nsearch_ms=" << st_.search_ns / 1000000
       << "\nsearch_lock_ms=" << st_.lock_ns / 1000000 << "\ninsert_ms=" << st_.insert_ns / 1000000
       << "\ninsert_lock_ms=" << st_.insert_lock_ns / 1000000 << "\nwrite_queue=" << wq_.size()
-      << "\nsearch_queue=" << sq_.size();
+      << "\nsearch_queue=" << search_queue_len();
     for (uint32_t v = 0; v < p_.nr_nodes; v++) o << "\ndlog_count." << v << "=" << load_acquire(&h_->nodes[v].dlog_count);
     o << "\nbackend=" << be_->usage() << "\n";
     return o.str();
@@ -179,8 +187,9 @@ class Server {
 
  private:
   // ---------------------------------------------------------------- initial segments (prepare, node 0, unmeasured)
-  // init_dir: segments.txt ("<s> <count> <ep_level> <upper_cur>"), seg-<s>.level0, seg-<s>.upper, manifest.txt with
-  // the graph parameters; images are copied into SWcc as is (same layout, offsets inside the segment).
+  // init_dir: segments.txt ("<s> <count> <ep_level> <upper_cur>"), per group g < ceil(count / per_chunk):
+  // seg-<s>-v<g>.bin (vector chunk, used bytes) and seg-<s>-l<g>.bin (whole link chunk); manifest.txt with the graph
+  // parameters. Images are copied into the chunk objects as is (offsets are chunk-relative).
   void load_initial() {
     for (uint32_t s = 0; s < p_.segments; s++) ShmHnsw::init_empty(&h_->segs[s].meta);
     if (o_.init_dir.empty()) return;
@@ -188,7 +197,7 @@ class Server {
     std::ifstream man(o_.init_dir + "/manifest.txt");
     std::string line, want = "graph " + std::to_string(p_.segments) + " " + std::to_string(p_.g.dim) + " " +
                              std::to_string(p_.g.M) + " " + std::to_string(p_.g.ef_construction) + " " +
-                             std::to_string(p_.g.capacity);
+                             std::to_string(p_.g.capacity) + " " + std::to_string(p_.g.chunk_bytes);
     bool ok = false;
     while (std::getline(man, line)) ok = ok || line == want;
     if (!ok) die("init_dir manifest does not contain '" + want + "' (built for other parameters)");
@@ -196,9 +205,14 @@ class Server {
     uint64_t s, count, epl, ucur, total = 0;
     uint32_t seen = 0;
     while (f >> s >> count >> epl >> ucur) {
-      if (s >= p_.segments || count > p_.g.capacity || ucur > p_.g.upper_arena_bytes()) die("bad segments.txt");
-      read_file(o_.init_dir + "/seg-" + std::to_string(s) + ".level0", be_->level0(uint32_t(s)), count * p_.g.slot_bytes());
-      read_file(o_.init_dir + "/seg-" + std::to_string(s) + ".upper", be_->upper(uint32_t(s)), ucur);
+      if (s >= p_.segments || count > p_.g.capacity || ucur > p_.g.upper_group_bytes()) die("bad segments.txt");
+      const uint64_t N = p_.g.per_chunk();
+      for (uint64_t g = 0; g * N < count; g++) {
+        const std::string b = o_.init_dir + "/seg-" + std::to_string(s);
+        read_file(b + "-v" + std::to_string(g) + ".bin", be_->vec_chunk(uint32_t(s), g),
+                  std::min(N, count - g * N) * p_.g.vrec_bytes());
+        read_file(b + "-l" + std::to_string(g) + ".bin", be_->link_chunk(uint32_t(s), g), p_.g.lchunk_bytes());
+      }
       GraphMeta &m = h_->segs[s].meta;
       m.upper_cur = ucur;
       m.ep_level = epl;
@@ -209,6 +223,26 @@ class Server {
     if (seen != p_.segments) die("segments.txt lists " + std::to_string(seen) + " segments");
     std::fprintf(stderr, "vdb-server: loaded %lu initial records in %u segments (%.1f s)\n", (unsigned long)total, seen,
                  (now_ns() - t0) / 1e9);
+  }
+
+  // Read every byte of the populated chunks once (every node, before READY; identical in every system), so that
+  // measurements do not include the first touch of shared pages (page faults / nested-paging fills).
+  void warm_up() {
+    const uint64_t t0 = now_ns();
+    uint64_t bytes = 0, sum = 0;
+    for (uint32_t s = 0; s < p_.segments; s++) {
+      const uint64_t n = load_acquire(&h_->segs[s].meta.count), N = p_.g.per_chunk();
+      for (uint64_t g = 0; g * N < n; g++) {
+        const uint64_t vb = std::min(N, n - g * N) * p_.g.vrec_bytes();
+        for (const uint8_t *c : {be_->vec_chunk(s, g), be_->link_chunk(s, g)}) {
+          const uint64_t len = c == be_->vec_chunk(s, g) ? vb : p_.g.lchunk_bytes();
+          for (uint64_t o = 0; o < len; o += 64) sum += c[o];
+          bytes += len;
+        }
+      }
+    }
+    std::fprintf(stderr, "vdb-server: warm-up read %lu MiB in %.1f s (%lu)\n", (unsigned long)(bytes >> 20),
+                 (now_ns() - t0) / 1e9, (unsigned long)(sum & 1));
   }
 
   static void read_file(const std::string &path, uint8_t *dst, uint64_t n) {
@@ -300,76 +334,164 @@ class Server {
     if (upto > dcursor_[u]) __atomic_store_n(&dcursor_[u], upto, __ATOMIC_RELEASE);
   }
 
-  void searcher() {
-    std::vector<uint16_t> visited(p_.g.capacity, 0);
-    uint16_t tag = 0;
-    std::vector<std::pair<float, uint32_t>> part;
+  // Search scheduling: one pool of workers; a query's segment searches are spread over idle workers (intra-query
+  // parallelism, as vector databases search the segments of one request in parallel). The worker that starts a
+  // query waits for E1 readiness and replays deletes, then publishes S segment tasks; any worker claims segments
+  // with fetch_add; whoever completes the last segment merges and replies.
+  struct QueryCtx {
+    Job job;
+    const float *q = nullptr;
+    uint32_t k = 0, s = 0;
+    uint64_t t0 = 0, t1 = 0, t2 = 0;
+    std::atomic<uint32_t> next{0}, done{0};
+    std::atomic<uint32_t> refs{0};  // task entries + the owner; freed when the last one is released
+    std::atomic<uint64_t> lock_ns{0}, dists{0};
+    std::mutex mu;
     std::vector<std::pair<float, uint64_t>> all;
-    std::vector<uint8_t> out;
+  };
+
+  void push_search(Job j) {
+    {
+      std::lock_guard<std::mutex> g(smu_);
+      queries_.push_back(std::move(j));
+    }
+    scv_.notify_one();
+  }
+
+  void searcher() {
     for (;;) {
-      Job j = sq_.pop();
-      if (frame::payload_len(j.h) != sizeof(SearchReq) + p_.g.dim * 4) { bad(j); continue; }
-      SearchReq rq;
-      std::memcpy(&rq, j.p.data(), sizeof(rq));
-      const float *q = reinterpret_cast<const float *>(j.p.data() + sizeof(rq));
-      const uint32_t k = std::min<uint32_t>(std::max<uint32_t>(rq.k, 1), 1024);
-      const uint32_t s = rq.ref_w;
-      SearchResp resp{};
-      resp.s_used = s;
-      // E1 readiness: P >= s (every write <= s applied by its writer)
-      const uint64_t t0 = now_ns();
-      if (!cxl::hwcc::poll_until([&] { return load_acquire(h_->P) >= s; }, o_.wait_timeout_ms)) {
-        st_.timeouts++;
-        j.c->reply(frame::kStatusTimeout, j.h.req_id, nullptr, 0);
+      QueryCtx *task = nullptr;
+      Job job;
+      {
+        std::unique_lock<std::mutex> l(smu_);
+        scv_.wait(l, [&] { return !tasks_.empty() || !queries_.empty(); });
+        if (!tasks_.empty()) {  // help running queries first
+          task = tasks_.front();
+          tasks_.pop_front();
+        } else {
+          job = std::move(queries_.front());
+          queries_.pop_front();
+        }
+      }
+      if (task) {
+        run_segment(task);
+        release(task);
         continue;
       }
-      const uint64_t t1 = now_ns();
-      for (uint32_t u = 0; u < p_.nr_nodes; u++) {
-        uint64_t c = load_acquire(&h_->nodes[u].dlog_count);
-        if (__atomic_load_n(&dcursor_[u], __ATOMIC_ACQUIRE) < c) replay(u, c);
+      QueryCtx *c = start_query(std::move(job));
+      if (!c) continue;
+      c->refs.store(p_.segments);  // S - 1 task entries + this owner
+      {
+        std::lock_guard<std::mutex> g(smu_);
+        for (uint32_t x = 1; x < p_.segments; x++) tasks_.push_back(c);
       }
-      const uint64_t t2 = now_ns();
-      all.clear();
-      uint64_t lock_ns = 0, nd = 0;
-      for (uint32_t sg = 0; sg < p_.segments; sg++) {
-        SegLines &sl = h_->segs[sg];
-        const uint64_t l0 = now_ns();
-        cxl::hwcc::read_lock(&sl.lock);
-        lock_ns += now_ns() - l0;
-        const ShmHnsw &g = *g_[sg];
-        auto allowed = [&](uint32_t i) {
-          const ElemHeader &h = g.header(i);
-          return h.ins_seq <= s && __atomic_load_n(&del_seq_[h.ext_id], __ATOMIC_RELAXED) > s;
-        };
-        g.search(q, k, o_.ef, allowed, &part, visited, tag, &nd);
-        for (auto &pr : part) all.emplace_back(pr.first, g.header(pr.second).ext_id);
-        cxl::hwcc::read_unlock(&sl.lock);
+      scv_.notify_all();
+      while (run_segment(c)) {
       }
-      const uint64_t t3 = now_ns();
-      std::sort(all.begin(), all.end());
-      if (all.size() > k) all.resize(k);
-      resp.n = uint16_t(all.size());
-      resp.wait_us = uint32_t((t1 - t0) / 1000);
-      resp.replay_us = uint32_t((t2 - t1) / 1000);
-      resp.search_us = uint32_t((t3 - t2) / 1000);
-      resp.lock_us = uint32_t(lock_ns / 1000);
-      resp.dists = uint32_t(nd);
-      resp.segs = uint16_t(p_.segments);
-      out.resize(sizeof(resp) + all.size() * 12);
-      std::memcpy(out.data(), &resp, sizeof(resp));
-      for (size_t x = 0; x < all.size(); x++) {
-        const float score = -all[x].first;  // inner product
-        std::memcpy(out.data() + sizeof(resp) + x * 8, &all[x].second, 8);
-        std::memcpy(out.data() + sizeof(resp) + all.size() * 8 + x * 4, &score, 4);
-      }
-      j.c->reply(frame::kStatusOk, j.h.req_id, out.data(), uint32_t(out.size()));
-      st_.searches++;
-      st_.dists += nd;
-      st_.wait_ns += t1 - t0;
-      st_.replay_ns += t2 - t1;
-      st_.search_ns += t3 - t2;
-      st_.lock_ns += lock_ns;
+      release(c);
     }
+  }
+
+  QueryCtx *start_query(Job j) {
+    if (frame::payload_len(j.h) != sizeof(SearchReq) + p_.g.dim * 4) {
+      bad(j);
+      return nullptr;
+    }
+    SearchReq rq;
+    std::memcpy(&rq, j.p.data(), sizeof(rq));
+    auto *c = new QueryCtx;
+    c->k = std::min<uint32_t>(std::max<uint32_t>(rq.k, 1), 1024);
+    c->s = rq.ref_w;
+    c->t0 = now_ns();
+    // E1 readiness: P >= s (every write <= s applied by its writer)
+    if (!cxl::hwcc::poll_until([&] { return load_acquire(h_->P) >= c->s; }, o_.wait_timeout_ms)) {
+      st_.timeouts++;
+      j.c->reply(frame::kStatusTimeout, j.h.req_id, nullptr, 0);
+      delete c;
+      return nullptr;
+    }
+    c->t1 = now_ns();
+    for (uint32_t u = 0; u < p_.nr_nodes; u++) {
+      uint64_t n = load_acquire(&h_->nodes[u].dlog_count);
+      if (__atomic_load_n(&dcursor_[u], __ATOMIC_ACQUIRE) < n) replay(u, n);
+    }
+    c->t2 = now_ns();
+    c->job = std::move(j);
+    c->q = reinterpret_cast<const float *>(c->job.p.data() + sizeof(SearchReq));
+    return c;
+  }
+
+  // Claim and search one segment of c; returns false when no segment was left to claim.
+  bool run_segment(QueryCtx *c) {
+    const uint32_t sg = c->next.fetch_add(1);
+    if (sg >= p_.segments) return false;
+    thread_local std::vector<uint16_t> visited;
+    thread_local uint16_t tag = 0;
+    thread_local std::vector<std::pair<float, uint32_t>> part;
+    if (visited.size() < p_.g.capacity) visited.assign(p_.g.capacity, 0);
+    SegLines &sl = h_->segs[sg];
+    const uint64_t l0 = now_ns();
+    cxl::hwcc::read_lock(&sl.lock);
+    c->lock_ns += now_ns() - l0;
+    const ShmHnsw &g = *g_[sg];
+    const uint32_t s = c->s;
+    auto allowed = [&](uint32_t i) {
+      const ElemHeader &h = g.header(i);
+      return h.ins_seq <= s && __atomic_load_n(&del_seq_[h.ext_id], __ATOMIC_RELAXED) > s;
+    };
+    uint64_t nd = 0;
+    g.search(c->q, c->k, o_.ef, allowed, &part, visited, tag, &nd);
+    std::vector<std::pair<float, uint64_t>> mine;
+    for (auto &pr : part) mine.emplace_back(pr.first, g.header(pr.second).ext_id);
+    cxl::hwcc::read_unlock(&sl.lock);
+    c->dists += nd;
+    {
+      std::lock_guard<std::mutex> lg(c->mu);
+      c->all.insert(c->all.end(), mine.begin(), mine.end());
+    }
+    if (c->done.fetch_add(1) + 1 == p_.segments) finish_query(c);
+    return true;
+  }
+
+  void finish_query(QueryCtx *c) {
+    const uint64_t t3 = now_ns();
+    auto &all = c->all;
+    std::sort(all.begin(), all.end());
+    if (all.size() > c->k) all.resize(c->k);
+    SearchResp resp{};
+    resp.s_used = c->s;
+    resp.n = uint16_t(all.size());
+    resp.wait_us = uint32_t((c->t1 - c->t0) / 1000);
+    resp.replay_us = uint32_t((c->t2 - c->t1) / 1000);
+    resp.search_us = uint32_t((t3 - c->t2) / 1000);
+    resp.lock_us = uint32_t(c->lock_ns.load() / 1000);
+    resp.dists = uint32_t(c->dists.load());
+    resp.segs = uint16_t(p_.segments);
+    std::vector<uint8_t> out(sizeof(resp) + all.size() * 12);
+    std::memcpy(out.data(), &resp, sizeof(resp));
+    for (size_t x = 0; x < all.size(); x++) {
+      const float score = -all[x].first;  // inner product
+      std::memcpy(out.data() + sizeof(resp) + x * 8, &all[x].second, 8);
+      std::memcpy(out.data() + sizeof(resp) + all.size() * 8 + x * 4, &score, 4);
+    }
+    c->job.c->reply(frame::kStatusOk, c->job.h.req_id, out.data(), uint32_t(out.size()));
+    st_.searches++;
+    st_.dists += c->dists.load();
+    st_.wait_ns += c->t1 - c->t0;
+    st_.replay_ns += c->t2 - c->t1;
+    st_.search_ns += t3 - c->t2;
+    st_.lock_ns += c->lock_ns.load();
+  }
+
+  size_t search_queue_len() {
+    std::lock_guard<std::mutex> g(smu_);
+    return queries_.size();
+  }
+
+  // Unclaimed task entries may outlive the reply; they only fetch_add `next` (>= S) and return. The context is
+  // deleted when the owner and every task entry have released it.
+  void release(QueryCtx *c) {
+    if (c->refs.fetch_sub(1) == 1) delete c;
   }
 
   // ---------------------------------------------------------------- network
@@ -404,7 +526,7 @@ class Server {
       switch (h.code) {
         case kOpInsert:
         case kOpDelete: wq_.push(std::move(j)); break;
-        case kOpSearch: sq_.push(std::move(j)); break;
+        case kOpSearch: push_search(std::move(j)); break;
         case kOpStats: {
           std::string t = stats_text();
           c->reply(frame::kStatusOk, h.req_id, t.data(), uint32_t(t.size()));
@@ -424,7 +546,11 @@ class Server {
   std::unique_ptr<PlainBackend> be_;
   std::vector<std::unique_ptr<ShmHnsw>> g_;
   Stats st_;
-  Queue wq_, sq_;
+  Queue wq_;
+  std::mutex smu_;  // search scheduling
+  std::condition_variable scv_;
+  std::deque<Job> queries_;
+  std::deque<QueryCtx *> tasks_;
   uint64_t dlog_next_ = 0;  // writer
   std::mt19937_64 rng_;     // writer: HNSW levels
   std::unique_ptr<uint32_t[]> del_seq_;
@@ -438,7 +564,7 @@ void usage() {
   std::fprintf(stderr,
                "usage: vdb-server --node K --nodes N --run-id 0x.. [--port P] [--region yaml] [--init-dir DIR]\n"
                "  [--segments S] [--search-threads N] [--ef E] [--seed N]\n"
-               "  [--dim D] [--M M] [--efc E] [--max-writes W] [--max-ids N] [--dlog-chunk E] [--max-deletes D]\n"
+               "  [--dim D] [--M M] [--efc E] [--chunk-bytes B (32 MiB)] [--max-writes W] [--max-ids N] [--dlog-chunk E] [--max-deletes D]\n"
                "  [--wait-timeout-ms T] [--start-timeout-ms T]\n"
                "All nodes need identical parameters (checked through the HWcc app layout hash).\n"
                "CXL_APP_HWCC_BYTES must equal the app layout size: vdb-server --print-app-bytes [params].\n");
@@ -469,6 +595,7 @@ int main(int argc, char **argv) {
     else if (a == "--dim") o.p.g.dim = std::stoul(v());
     else if (a == "--M") o.p.g.M = std::stoul(v());
     else if (a == "--efc") o.p.g.ef_construction = std::stoul(v());
+    else if (a == "--chunk-bytes") o.p.g.chunk_bytes = std::stoull(v());
     else if (a == "--max-writes") o.p.max_writes = std::stoull(v());
     else if (a == "--max-ids") o.p.max_ids = std::stoull(v());
     else if (a == "--dlog-chunk") o.p.dlog_chunk = std::stoul(v());

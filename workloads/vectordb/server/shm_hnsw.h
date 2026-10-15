@@ -4,8 +4,12 @@
 // Concurrency follows Qdrant (user decision 2026-10-15): every node may write every segment, and the segment's
 // HWcc reader-writer lock serialises it — insert() runs under the write lock, search() under the read lock — so
 // hnswlib's per-element mutexes are not needed and readers never see a list being rewritten.
-// Changes for sharing: level-0 slots and upper-level link blocks live in SWcc and are addressed by offsets; the
-// graph meta (entry point, max level, element count, upper-arena cursor) lives in HWcc (docs/hwcc-contract.md);
+// Storage is chunked (user decision 2026-10-15; data points grouped in contiguous chunks, the chunk located through a
+// small table, the point by offset inside it): element i belongs to group g = i / N. Group g has a vector chunk
+// (N x {header line, vector}; immutable once written; ~32 MiB) and a link chunk (N x level-0 link block, then the
+// group's upper-level link arena; rewritten by inserts). hnswlib keeps links and vector together in one
+// data_level0_memory_ slot; here vectors and links are separate chunks. The graph meta (entry point, max level,
+// element count, upper-arena cursor of the current group) lives in HWcc (docs/hwcc-contract.md);
 // deletions are not marked in the graph (queries filter results with a visibility predicate, E1 snapshot);
 // inner product distance = -dot (hnswlib InnerProductSpace uses 1 - dot; same order).
 #pragma once
@@ -29,17 +33,17 @@ namespace vdb {
 struct alignas(64) GraphMeta {  // HWcc, one line; written under the segment write lock
   uint64_t ep_level;   // entry point (low 32) | max level (high 32); kNoEntry = empty graph
   uint64_t count;      // elements [0, count) are complete
-  uint64_t upper_cur;  // bytes used in the segment's upper-level link arena
+  uint64_t upper_cur;  // bytes used in the current (last) group's upper-level link arena
   uint8_t pad[40];
 };
 static_assert(sizeof(GraphMeta) == 64, "graph meta is one line");
 constexpr uint64_t kNoEntry = ~0ull;
 
-struct alignas(64) ElemHeader {  // first line of a level-0 slot
+struct alignas(64) ElemHeader {  // first line of a vector record (vector chunk)
   uint64_t ext_id;     // record id
   uint32_t ins_seq;    // w_seq of the insert (0 = initial record)
   uint32_t level;
-  uint64_t upper_off;  // offset of the element's upper-level link blocks in the segment's upper arena
+  uint64_t upper_off;  // offset of the element's upper-level link blocks in its group's upper arena
   uint32_t check;      // canary: ext_id ^ ins_seq ^ level ^ magic
   uint8_t pad[36];
 };
@@ -48,30 +52,37 @@ constexpr uint32_t kElemMagic = 0x484e5357u;
 
 struct GraphParams {
   uint32_t dim = 768, M = 16, ef_construction = 128;
-  uint64_t capacity = 62500;  // elements per segment
+  uint64_t capacity = 62500;          // elements per segment
+  uint64_t chunk_bytes = 32ull << 20; // target vector chunk size (user: 32 MiB)
   uint32_t M0() const { return 2 * M; }
   uint64_t links0_bytes() const { return (4ull * (1 + M0()) + 63) / 64 * 64; }
   uint64_t links_bytes() const { return (4ull * (1 + M) + 63) / 64 * 64; }  // per upper level
-  uint64_t slot_bytes() const { return sizeof(ElemHeader) + links0_bytes() + uint64_t(dim) * 4; }
-  uint64_t upper_arena_bytes() const {  // expected upper levels per element 1/(M-1); 4x margin
-    return (capacity * 4 / (M - 1) + 1024) * links_bytes();
+  uint64_t vrec_bytes() const { return sizeof(ElemHeader) + uint64_t(dim) * 4; }
+  uint64_t per_chunk() const { return chunk_bytes / vrec_bytes(); }  // N elements per group
+  uint64_t groups() const { return (capacity + per_chunk() - 1) / per_chunk(); }
+  uint64_t vchunk_bytes() const { return per_chunk() * vrec_bytes(); }
+  uint64_t upper_group_bytes() const {  // expected upper levels per element 1/(M-1); 4x margin
+    return (per_chunk() * 4 / (M - 1) + 64) * links_bytes();
   }
+  uint64_t lchunk_bytes() const { return per_chunk() * links0_bytes() + upper_group_bytes(); }
 };
 
 class ShmHnsw {
  public:
   using Dist = float;
   struct Mem {
-    GraphMeta *meta;  // HWcc
-    uint8_t *level0;  // SWcc: capacity * slot_bytes
-    uint8_t *upper;   // SWcc: upper_arena_bytes
+    GraphMeta *meta;              // HWcc
+    std::vector<uint8_t *> vec;   // SWcc vector chunk g (vchunk_bytes), g < groups()
+    std::vector<uint8_t *> link;  // SWcc link chunk g (lchunk_bytes)
   };
 
-  ShmHnsw(const GraphParams &p, Mem m) : p_(p), m_(m), mult_(1 / std::log(double(p.M))) {
+  ShmHnsw(const GraphParams &p, Mem m) : p_(p), m_(std::move(m)), mult_(1 / std::log(double(p.M))) {
     if (p.M < 2 || p.M0() > 63) throw std::invalid_argument("HNSW M must be in [2, 31]");
-    slot_ = p.slot_bytes();
-    links0_off_ = sizeof(ElemHeader);
-    vec_off_ = sizeof(ElemHeader) + p.links0_bytes();
+    if (m_.vec.size() != p.groups() || m_.link.size() != p.groups()) throw std::invalid_argument("chunk table size");
+    N_ = p.per_chunk();
+    vrec_ = p.vrec_bytes();
+    l0_ = p.links0_bytes();
+    upper_base_ = N_ * l0_;
   }
 
   static void init_empty(GraphMeta *meta) {
@@ -81,8 +92,8 @@ class ShmHnsw {
   }
 
   uint64_t count() const { return cxl::hwcc::load_acquire(&m_.meta->count); }
-  const ElemHeader &header(uint32_t i) const { return *reinterpret_cast<const ElemHeader *>(slot(i)); }
-  const float *vec(uint32_t i) const { return reinterpret_cast<const float *>(slot(i) + vec_off_); }
+  const ElemHeader &header(uint32_t i) const { return *reinterpret_cast<const ElemHeader *>(vrec(i)); }
+  const float *vec(uint32_t i) const { return reinterpret_cast<const float *>(vrec(i) + sizeof(ElemHeader)); }
   const GraphParams &params() const { return p_; }
 
   // ---------------------------------------------------------------- insert (hnswlib addPoint); write lock held
@@ -91,22 +102,24 @@ class ShmHnsw {
     if (n >= p_.capacity) throw std::runtime_error("segment full (capacity)");
     const uint32_t cur = uint32_t(n);
     const int curlevel = random_level(rng);
-    uint8_t *s = slot(cur);
+    if (cur % N_ == 0) m_.meta->upper_cur = 0;  // first element of a new group: its upper arena starts empty
+    uint8_t *lc = m_.link[cur / N_];
     ElemHeader h{};
     h.ext_id = ext_id;
     h.ins_seq = ins_seq;
     h.level = uint32_t(curlevel);
     if (curlevel > 0) {
       h.upper_off = m_.meta->upper_cur;
-      if (h.upper_off + uint64_t(curlevel) * p_.links_bytes() > p_.upper_arena_bytes())
-        throw std::runtime_error("upper-level arena full");
+      if (h.upper_off + uint64_t(curlevel) * p_.links_bytes() > p_.upper_group_bytes())
+        throw std::runtime_error("upper-level arena of the group full");
       m_.meta->upper_cur = h.upper_off + uint64_t(curlevel) * p_.links_bytes();
-      std::memset(m_.upper + h.upper_off, 0, uint64_t(curlevel) * p_.links_bytes());
+      std::memset(lc + upper_base_ + h.upper_off, 0, uint64_t(curlevel) * p_.links_bytes());
     }
     h.check = uint32_t(ext_id) ^ uint32_t(ext_id >> 32) ^ ins_seq ^ uint32_t(curlevel) ^ kElemMagic;
-    std::memcpy(s, &h, sizeof(h));
-    std::memset(s + links0_off_, 0, p_.links0_bytes());
-    std::memcpy(s + vec_off_, v, size_t(p_.dim) * 4);
+    uint8_t *vr = vrec(cur);  // vector chunk: header + vector, whole lines, written once
+    std::memcpy(vr, &h, sizeof(h));
+    std::memcpy(vr + sizeof(ElemHeader), v, size_t(p_.dim) * 4);
+    std::memset(lc + (cur % N_) * l0_, 0, l0_);
 
     const uint64_t epl = m_.meta->ep_level;
     if (epl == kNoEntry) {
@@ -206,10 +219,11 @@ class ShmHnsw {
  private:
   using MaxHeap = std::priority_queue<std::pair<Dist, uint32_t>>;  // hnswlib CompareByFirst: largest on top
 
-  uint8_t *slot(uint32_t i) const { return m_.level0 + uint64_t(i) * slot_; }
+  uint8_t *vrec(uint32_t i) const { return m_.vec[i / N_] + (i % N_) * vrec_; }
   uint32_t *links(uint32_t i, int level) const {
-    if (level == 0) return reinterpret_cast<uint32_t *>(slot(i) + links0_off_);
-    return reinterpret_cast<uint32_t *>(m_.upper + header(i).upper_off + uint64_t(level - 1) * p_.links_bytes());
+    uint8_t *lc = m_.link[i / N_];
+    if (level == 0) return reinterpret_cast<uint32_t *>(lc + (i % N_) * l0_);
+    return reinterpret_cast<uint32_t *>(lc + upper_base_ + header(i).upper_off + uint64_t(level - 1) * p_.links_bytes());
   }
   float dot(const float *a, const float *b) const {
     float s = 0;
@@ -309,7 +323,7 @@ class ShmHnsw {
   GraphParams p_;
   Mem m_;
   double mult_;
-  uint64_t slot_, links0_off_, vec_off_;
+  uint64_t N_, vrec_, l0_, upper_base_;
   std::vector<uint8_t> marks_;  // construction visited marks (writer side; one ShmHnsw per writer thread)
 };
 

@@ -26,7 +26,7 @@ struct Params {
   std::string describe() const {
     return "nr_nodes=" + std::to_string(nr_nodes) + " segments=" + std::to_string(segments) +
            " dim=" + std::to_string(g.dim) + " M=" + std::to_string(g.M) + " efc=" + std::to_string(g.ef_construction) +
-           " capacity=" + std::to_string(g.capacity) + " max_writes=" + std::to_string(max_writes) +
+           " capacity=" + std::to_string(g.capacity) + " chunk_bytes=" + std::to_string(g.chunk_bytes) + " max_writes=" + std::to_string(max_writes) +
            " max_ids=" + std::to_string(max_ids) + " dlog_chunk=" + std::to_string(dlog_chunk) +
            " max_deletes=" + std::to_string(max_deletes);
   }
