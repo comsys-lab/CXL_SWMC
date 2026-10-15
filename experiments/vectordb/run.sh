@@ -9,12 +9,15 @@
 #   CLAUDE.md allows builds during correctness-only runs only with the user's OK, given through the packet),
 #   NODE_ENV (ENV:K=V tokens for every node), NODE0_ENV (extra tokens for node 0 only), e.g. for Megalon:
 #   NODE_ENV="ENV:RACKOBJ_CONFIG=$V/cfg/megalon.yaml" NODE0_ENV="ENV:MEGALON_REINIT=1".
+#   SERVER_CPUS (unset = no change): guest CPU list (e.g. 0-14); after READY every vdb-server thread on every
+#   node is pinned with taskset -a and verified; recorded in the manifest and node<k>.server-cpus.txt.
 # Stops (and stops the servers) on the first error. Measurement hygiene: no Host build before/after (pgrep).
 set -euo pipefail
 NAME=$1 OUT=$2; shift 2; [ "${1:-}" = "--" ] && shift
 : "${SYSTEM:?}" "${V:?}" "${HOST_SERVER:?}" "${LOADGEN:?}" "${SERVER_ARGS:?}" "${INIT:?}"
 read -r -a NODE <<< "${NODES:-192.168.122.100 192.168.122.101}"
 PORT=${PORT:-7000} LG_CPUS=${LG_CPUS:-56-63}
+[ -z "${SERVER_CPUS:-}" ] || [[ $SERVER_CPUS =~ ^[0-9]+(-[0-9]+)?(,[0-9]+(-[0-9]+)?)*$ ]] || { echo "bad SERVER_CPUS"; exit 2; }
 SSH="ssh -o BatchMode=yes -o ConnectTimeout=5"
 RUN=$OUT/$NAME
 [ -e "$RUN" ] && { echo "refusing: $RUN exists (results are immutable)"; exit 3; }
@@ -48,6 +51,7 @@ APP=$("$HOST_SERVER" $SERVER_ARGS --print-app-bytes)
   echo "loadgen=$LOADGEN sha256=$(sha256sum "$LOADGEN" | cut -d' ' -f1)"
   echo "server_args=$SERVER_ARGS"; echo "node_env=${NODE_ENV:-} node0_env=${NODE0_ENV:-}"; echo "app_hwcc_bytes=$APP"; echo "init=$INIT"; echo "loadgen_args=$*"
   echo "lg_cpus=$LG_CPUS"
+  [ -z "${SERVER_CPUS:-}" ] || echo "server_cpus=$SERVER_CPUS"
   for k in "${!NODE[@]}"; do
     info=$($SSH comsys@"${NODE[$k]}" "uname -r; sha256sum $V/bin/vdb-server $V/cfg/cxl_region.yaml \$(ls $V/lib/libvdb-megalon.so $V/lib/libmegalon.so $V/cfg/megalon.yaml 2>/dev/null) | cut -c1-64; nproc" < /dev/null | tr '\n' ' ')
     [ -n "$info" ] || { echo "node$k info empty" >&2; exit 4; }
@@ -72,6 +76,18 @@ for k in "${!NODE[@]}"; do
   $SSH comsys@"${NODE[$k]}" "$V/bin/vdb-node.sh start $V $GRUN $k $RID $APP $XE $SERVER_ARGS --port $PORT $EXTRA" < /dev/null
 done
 for k in "${!NODE[@]}"; do $SSH comsys@"${NODE[$k]}" "$V/bin/vdb-node.sh ready $GRUN $k ${READY_TIMEOUT:-300}" < /dev/null; done
+server_cpus() {  # $1 = set|check: pin (set) and verify every vdb-server thread of this run's session on each node
+  for k in "${!NODE[@]}"; do
+    $SSH comsys@"${NODE[$k]}" "set -e; S=\$(cat $GRUN/node$k.pid); P=\$(pgrep -u comsys -x -s \$S vdb-server)
+      [ \$(echo \"\$P\" | wc -w) = 1 ] || { echo \"vdb-server pids in session \$S: [\$P]\"; exit 1; }
+      [ $1 = set ] && taskset -a -c -p $SERVER_CPUS \$P > /dev/null
+      L=\$(taskset -a -c -p \$P); echo \"$1 \$(date -Is) session=\$S pid=\$P threads=\$(echo \"\$L\" | wc -l)\"; echo \"\$L\"
+      [ \$(echo \"\$L\" | grep -cv ': $SERVER_CPUS\$') = 0 ] || { echo 'affinity mismatch'; exit 1; }" \
+      < /dev/null >> "$RUN/node$k.server-cpus.txt" || { echo "node$k server_cpus $1 failed (see node$k.server-cpus.txt)"; return 1; }
+    grep "^$1 " "$RUN/node$k.server-cpus.txt" | tail -1 | sed "s/^/node$k server_cpus /"
+  done
+}
+[ -z "${SERVER_CPUS:-}" ] || server_cpus set
 for k in "${!NODE[@]}"; do  # port check: guest listen state + Host TCP connect (fails the run)
   l=$($SSH comsys@"${NODE[$k]}" "ss -ltn | awk '\$4 ~ /:$PORT\$/ {print \$4}'" < /dev/null)
   if timeout 3 bash -c "exec 3<>/dev/tcp/${NODE[$k]}/$PORT" 2>/dev/null; then c=OK; else c=FAILED; fi
@@ -89,6 +105,7 @@ numactl --physcpubind="$LG_CPUS" --membind=1 "$LOADGEN" --workload vectordb --ta
   2>&1 | tee "$RUN/loadgen.log"
 LG=${PIPESTATUS[0]}
 set -e
+[ -z "${SERVER_CPUS:-}" ] || server_cpus check
 cpu_snap after
 stop_nodes
 collect
