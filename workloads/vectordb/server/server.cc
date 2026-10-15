@@ -64,6 +64,10 @@ struct Opts {
   uint64_t run_id = 0, seed = 20261015;
   uint64_t wait_timeout_ms = 10000, start_timeout_ms = 600000;
   std::string init_dir;  // initial segments (tools/build_index); node 0 loads them
+  // Popcorn init_state=shared (reports/P-popcorn-init-shared.md): --preload-only writes the initial chunk images into
+  // SWcc through a plain mapping BEFORE coherence is enabled and exits (no HWcc access); the later server run with
+  // --preloaded only publishes the segment meta (HWcc) and does not copy the chunks again.
+  bool preload_only = false, preloaded = false;
   std::string region;    // region config (default $CXL_REGION_CONFIG)
   std::string backend = "plain";
   std::string megalon_lib;  // default: <dir of the executable>/../lib/libvdb-megalon.so
@@ -223,7 +227,7 @@ class Server {
     while (f >> s >> count >> epl >> ucur) {
       if (s >= p_.segments || count > p_.g.capacity || ucur > p_.g.upper_group_bytes()) die("bad segments.txt");
       const uint64_t N = p_.g.per_chunk();
-      for (uint64_t g = 0; g * N < count; g++) {
+      for (uint64_t g = 0; !o_.preloaded && g * N < count; g++) {
         const std::string b = o_.init_dir + "/seg-" + std::to_string(s);
         const uint64_t vb = std::min(N, count - g * N) * p_.g.vrec_bytes(), lb = p_.g.lchunk_bytes();
         be_->write_chunk(Chunk::kVec, uint32_t(s), g, 0, vb, [&](uint8_t *dst) { read_file(b + "-v" + std::to_string(g) + ".bin", dst, vb); });
@@ -237,9 +241,47 @@ class Server {
       seen++;
     }
     if (seen != p_.segments) die("segments.txt lists " + std::to_string(seen) + " segments");
-    std::fprintf(stderr, "vdb-server: loaded %lu initial records in %u segments (%.1f s)\n", (unsigned long)total, seen,
-                 (now_ns() - t0) / 1e9);
+    std::fprintf(stderr, "vdb-server: %s %lu initial records in %u segments (%.1f s)\n",
+                 o_.preloaded ? "published preloaded" : "loaded", (unsigned long)total, seen, (now_ns() - t0) / 1e9);
   }
+
+ public:
+  // --preload-only (plain backend, node 0): copy the initial chunk images into SWcc through a plain mapping, then
+  // unmap and return. Touches no HWcc (no app_init, no meta); run before Popcorn enables coherence.
+  void preload() {
+    std::string err;
+    if (!cxl::region_load(o_.region.empty() ? nullptr : o_.region.c_str(), &r_, &err)) die("region: " + err);
+    if (o_.init_dir.empty()) die("--preload-only needs --init-dir");
+    int fd = int(syscall(SYS_openat, AT_FDCWD, r_.device.c_str(), O_RDWR | O_CLOEXEC));
+    if (fd < 0) die("open " + r_.device);
+    void *m = mmap(reinterpret_cast<void *>(r_.map_va), r_.device_size, PROT_READ | PROT_WRITE,
+                   MAP_SHARED | MAP_FIXED_NOREPLACE, fd, 0);
+    if (m == MAP_FAILED || m != reinterpret_cast<void *>(r_.map_va)) die("mmap " + r_.device + " at map_va");
+    map_ = static_cast<uint8_t *>(m);
+    be_ = std::make_unique<Be>(r_, map_, p_);
+    if (!be_->fits(&err)) die(err);
+    const uint64_t t0 = now_ns();
+    std::ifstream f(o_.init_dir + "/segments.txt");
+    uint64_t s, count, epl, ucur, total = 0, bytes = 0;
+    while (f >> s >> count >> epl >> ucur) {
+      if (s >= p_.segments || count > p_.g.capacity) die("bad segments.txt");
+      const uint64_t N = p_.g.per_chunk();
+      for (uint64_t g = 0; g * N < count; g++) {
+        const std::string b = o_.init_dir + "/seg-" + std::to_string(s);
+        const uint64_t vb = std::min(N, count - g * N) * p_.g.vrec_bytes(), lb = p_.g.lchunk_bytes();
+        be_->write_chunk(Chunk::kVec, uint32_t(s), g, 0, vb, [&](uint8_t *dst) { read_file(b + "-v" + std::to_string(g) + ".bin", dst, vb); });
+        be_->write_chunk(Chunk::kLink, uint32_t(s), g, 0, lb, [&](uint8_t *dst) { read_file(b + "-l" + std::to_string(g) + ".bin", dst, lb); });
+        bytes += vb + lb;
+      }
+      total += count;
+    }
+    if (munmap(m, r_.device_size) != 0) die("munmap");
+    close(fd);
+    std::fprintf(stderr, "vdb-server: PRELOAD DONE %lu records, %lu MiB in %.1f s (plain mapping, no HWcc access)\n",
+                 (unsigned long)total, (unsigned long)(bytes >> 20), (now_ns() - t0) / 1e9);
+  }
+
+ private:
 
   // Read every byte of the populated chunks once (every node, before READY; identical in every system), so that
   // measurements do not include the first touch of shared pages (page faults / nested-paging fills).
@@ -591,6 +633,13 @@ volatile sig_atomic_t g_stop = 0;
 template <class Be>
 int run(const Opts &o) {
   Server<Be> s(o);
+  if constexpr (std::is_same_v<Be, PlainBackend>) {
+    if (o.preload_only) {
+      s.preload();
+      std::fflush(stderr);
+      std::_Exit(0);
+    }
+  }
   s.start();
   while (!g_stop) usleep(200000);
   std::fprintf(stderr, "vdb-server: stopping\n%s", s.stats_text().c_str());
@@ -604,6 +653,7 @@ void usage() {
                "  [--segments S] [--search-threads N] [--ef E] [--seed N]\n"
                "  [--dim D] [--M M] [--efc E] [--chunk-bytes B (32 MiB)] [--max-writes W] [--max-ids N] [--dlog-chunk E] [--max-deletes D]\n"
                "  [--wait-timeout-ms T] [--start-timeout-ms T] [--backend plain|megalon] [--megalon-lib PATH]\n"
+               "  [--preload-only | --preloaded]   Popcorn init_state=shared: node 0 writes the initial chunks before enable\n"
                "--backend megalon: Megalon (RACKOBJ_CONFIG, object_arena_size > 0) maps the device; MEGALON_NODE_ID and\n"
                "  MEGALON_RUN_ID default to --node and --run-id, CXL_REGION_CONFIG to --region (DESIGN.md §12).\n"
                "All nodes need identical parameters (checked through the HWcc app layout hash).\n"
@@ -645,6 +695,8 @@ int main(int argc, char **argv) {
     else if (a == "--backend") o.backend = v();
     else if (a == "--megalon-lib") o.megalon_lib = v();
     else if (a == "--print-app-bytes") print_bytes = true;
+    else if (a == "--preload-only") o.preload_only = true;
+    else if (a == "--preloaded") o.preloaded = true;
     else usage();
   }
   o.p.derive();
@@ -652,7 +704,11 @@ int main(int argc, char **argv) {
     std::printf("%lu\n", (unsigned long)HwccLayout(o.p).L.bytes());
     return 0;
   }
-  if (o.run_id == 0) usage();
+  if (o.run_id == 0 && !o.preload_only) usage();
+  if ((o.preload_only || o.preloaded) && o.backend != "plain") {
+    std::fprintf(stderr, "vdb-server: --preload-only/--preloaded are for the plain backend (Popcorn init_state=shared)\n");
+    return 2;
+  }
   signal(SIGPIPE, SIG_IGN);
   signal(SIGTERM, [](int) { g_stop = 1; });
   signal(SIGINT, [](int) { g_stop = 1; });
