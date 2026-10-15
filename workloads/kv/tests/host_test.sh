@@ -15,7 +15,7 @@ mkdir -p "$WD"; WD=$(cd "$WD" && pwd)
 KEYS=${KEYS:-1000000} MIX=${MIX:-mixed=1} PUT_RATIO=${PUT_RATIO:-0.5} RATES=${RATES:-2000,5000} BATCH=${BATCH:-32} THREADS=${THREADS:-6}
 LOADER=${LOADER:-node0} TRACE=${TRACE:-0} PORT=${PORT:-27300}
 CPUS0=${CPUS0:-16-21,48-53} CPUS1=${CPUS1:-22-27,54-59} CPUSL=${CPUSL:-28-31,60-63}
-IMG=/dev/shm/kv-test-$$.img
+IMG=${IMG:-/dev/shm/kv-test-$$.img}  # IMG + KEEP_IMG=1: reuse a region image across tests (stale-data test)
 HW=$((256 << 20)) AL=$((2 << 20))
 DEV=$(( (HW + KEYS * 1280 + (192 << 20) + AL - 1) / AL * AL ))  # slots + CacheNodes + NR log entries + margin
 cat > "$WD/region.yaml" <<EOF

@@ -90,7 +90,8 @@ def cmd_csv(a):
     w = csv.writer(out)
     w.writerow(["t_real_ns", "t_mono_ns", "key", "writer", "version", "slot", "page", "tid", "dur_ns"])
     for t_real, t_mono, key, stamp, slot, page, tid, dur in read(a.file):
-        w.writerow([t_real, t_mono, key, stamp >> 56, stamp & ((1 << 56) - 1), slot, page, tid, dur])
+        writer = stamp >> 56  # 0xff = initial load (version 0; the low bits are the run tag)
+        w.writerow([t_real, t_mono, key, writer, 0 if writer == 0xff else stamp & ((1 << 56) - 1), slot, page, tid, dur])
     return 0
 
 

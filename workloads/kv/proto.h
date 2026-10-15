@@ -76,7 +76,11 @@ constexpr uint64_t kVersionMask = (1ull << 56) - 1;
 
 inline uint64_t stamp(uint64_t writer, uint64_t version) { return (writer << 56) | (version & kVersionMask); }
 inline uint64_t stamp_writer(uint64_t s) { return s >> 56; }
-inline uint64_t stamp_version(uint64_t s) { return s & kVersionMask; }
+// Initial-load values carry the run's tag (low 56 bits of the run id) in the version bits: version 0 for every
+// check, but a value left in SWcc by an earlier run (the region is disposable and reused) never matches this run's
+// initial-load stamp (kv-server's trace-mode slot scan relies on it).
+inline uint64_t preload_stamp(uint64_t run_id) { return stamp(kPreloadWriter, run_id); }
+inline uint64_t stamp_version(uint64_t s) { return stamp_writer(s) == kPreloadWriter ? 0 : s & kVersionMask; }
 
 inline uint64_t mix64(uint64_t x) {
   x ^= x >> 33;

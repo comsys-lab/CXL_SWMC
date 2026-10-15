@@ -354,7 +354,7 @@ class Server {
       const uint64_t first = (o_.loader == "all" ? uint64_t(o_.node) * o_.threads : 0) + i;
       uint64_t n = 0;
       for (uint64_t k = first; k < o_.keys; k += step, n++) {
-        fill_value(buf.get(), k, stamp(kPreloadWriter, 0));
+        fill_value(buf.get(), k, preload_stamp(o_.run_id));
         api_->put(buf.get(), kValueBytes, k);
       }
       load_count_ += n;
@@ -366,7 +366,7 @@ class Server {
       for (uint64_t k = i; k < o_.keys; k += o_.threads) {
         const ssize_t rc = api_->get(buf.get(), kValueBytes, k);
         if (rc != ssize_t(kValueBytes)) miss++;
-        else if (!check_value(buf.get(), k, &st) || st != stamp(kPreloadWriter, 0)) bad++;
+        else if (!check_value(buf.get(), k, &st) || st != preload_stamp(o_.run_id)) bad++;
       }
       warm_bad_ += bad;
       warm_miss_ += miss;
@@ -530,7 +530,8 @@ class Server {
     v.push_back(r);
   }
 
-  // Trace mode: key -> slot (device offset / 1024) by scanning SWcc for the version-0 values of the initial load
+  // Trace mode: key -> slot (device offset / 1024) by scanning SWcc for this run's initial-load values (stamp tagged
+  // with the run id, so slots left by earlier runs in the reused region are ignored)
   // (layout-independent: the library decides where a slot lives). Read-only, before READY.
   void scan_slots() {
     const uint64_t t0 = now_ns();
@@ -550,7 +551,7 @@ class Server {
             const uint8_t *v = map_ + off;
             uint64_t key, st;
             std::memcpy(&key, v, 8);
-            if (key >= o_.keys || !check_value(v, key, &st) || st != stamp(kPreloadWriter, 0)) continue;
+            if (key >= o_.keys || !check_value(v, key, &st) || st != preload_stamp(o_.run_id)) continue;
             uint32_t exp = UINT32_MAX;
             if (__atomic_compare_exchange_n(&slot_[key], &exp, uint32_t(off / 1024), false, __ATOMIC_RELAXED, __ATOMIC_RELAXED))
               found++;

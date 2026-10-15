@@ -7,6 +7,8 @@
 #        result at the same ratio (shuffled); then one traced window per system at 0.5 (ptrace, Figure 2c logs only).
 #   pop: page MSI (C8 K8 GT8 RECV_MODE): functional (0.5), pilot SLO searches at 0.05 / 0 / 0.5 (shuffled), untraced
 #        fixed-load windows at L from the hm block (LREF = its evidence dir), then the traced 0.5 window.
+#   hmtrace: only the traced 0.5 windows of all-HWcc and Megalon (shuffled) at L from an earlier hm block (LREF), e.g.
+#        after an hm block that stopped at its ptrace runs.
 # env: PIN (harness commit; every build manifest must name it with dirty=0), KV_CFG, K8.
 # Holds the measurement lock for the whole block; stops at the first PILOTRUN STOP; the hm block rolls /dev/dax0.0
 # back to root:root 600 at its end or on a stop; page MSI runs tear down per run (and leave dax0.0 root:root 600).
@@ -91,12 +93,23 @@ precheck() {
 echo "$(date -Is) block $OWNER start (git $(git -C $P/CXL_SWMC rev-parse --short HEAD))"
 precheck
 case "$B" in
-  hm)
+  hm|hmtrace)
     for ip in "${IPS[@]}"; do
       $SSH comsys@$ip 'sudo -n chown comsys /dev/dax0.0 && stat -c "%U:%G %a" /dev/dax0.0' < /dev/null > "$E/chown-$ip.out" 2>&1
       CHOWNED=1
       grep -qx "comsys:root 600" "$E/chown-$ip.out" || { echo "SEQUENCE STOP: chown $ip"; exit 1; }
     done
+    if [ "$B" = hmtrace ]; then
+      : "${LREF:?}"
+      for s in $(shuffle hw mg); do
+        [ $s = hw ] && S=all-HWcc || S=Megalon
+        r=$(confirm_l $LREF/hw-u50-pslo/loadgen/summary.json) || { echo "SEQUENCE STOP: no all-HWcc result for 0.5 in $LREF"; exit 1; }
+        echo "$s u=0.5 L = 0.5 x $LREF/hw-u50-pslo = $r requests/s (trace)" >> "$E/fixed-load-L.txt"
+        run $s-u50-ptrace SYS=$S PUT_RATIO=0.5 KIND=ptrace RATE=$r
+      done
+      echo "$(date -Is) SEQUENCE DONE $OWNER"
+      exit 0
+    fi
     run hw-u50-func SYS=all-HWcc PUT_RATIO=0.5 KIND=functional GATE=0
     run mg-u50-func SYS=Megalon PUT_RATIO=0.5 KIND=functional GATE=0
     for su in $(shuffle hw:0.05 mg:0.05 hw:0 mg:0 hw:0.5 mg:0.5); do
