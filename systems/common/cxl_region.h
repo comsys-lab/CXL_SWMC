@@ -28,7 +28,9 @@ struct region {
   uint64_t align = 2ull << 20;
   range hwcc;
   range msg_ring;    // optional kernel message ring (Popcorn cxl_shm) at the END of hwcc; size 0 = none
-  range hwcc_alloc;  // hwcc minus msg_ring: what user-level systems (e.g. Megalon's SCR) may allocate
+  range app;         // workload control state (docs/hwcc-contract.md), directly before msg_ring; size from
+                     // $CXL_APP_HWCC_BYTES (the workload's computed need, rounded up to 4 KiB); 0 = none
+  range hwcc_alloc;  // hwcc minus app minus msg_ring: what systems (e.g. Megalon's SCR) may allocate
   range swcc;
   std::vector<range> reserved;
   std::string source;  // config path actually used
@@ -169,6 +171,22 @@ inline bool region_load(const char *path, region *r, std::string *err,
     }
     r->hwcc_alloc.size = m.offset - r->hwcc.offset;
   }
+  // Workload control state is carved directly below the ring (or the end of hwcc); systems keep the front of
+  // hwcc (Megalon's control block sits at hwcc_offset). Its size is computed by the workload for this run
+  // (docs/hwcc-contract.md), never a tuned constant; both nodes must see the same value (layout hashes check it).
+  r->app = range{r->hwcc_alloc.end(), 0};
+  if (const char *app = getenv("CXL_APP_HWCC_BYTES"); app && *app) {
+    uint64_t want = 0;
+    if (!parse_u64(app, &want)) { *err = "bad CXL_APP_HWCC_BYTES"; return false; }
+    want = align_up(want, 4096);
+    if (want >= r->hwcc_alloc.size) {
+      *err = "CXL_APP_HWCC_BYTES " + std::to_string(want) + " leaves no hwcc for the system (hwcc minus msg_ring " +
+             std::to_string(r->hwcc_alloc.size) + ")";
+      return false;
+    }
+    r->hwcc_alloc.size -= want;
+    r->app = range{r->hwcc_alloc.end(), want};
+  }
 
   if (sw_off == "auto") r->swcc.offset = align_up(r->hwcc.end(), r->align);
   else if (!parse_u64(sw_off, &r->swcc.offset)) { *err = "bad swcc_offset"; return false; }
@@ -205,6 +223,8 @@ inline std::string region_describe(const region &r) {
   o << "device=" << r.device << " device_size=" << r.device_size << " map_va=0x" << std::hex << r.map_va
     << std::dec << " align=" << r.align
     << " hwcc=[" << r.hwcc.offset << "," << r.hwcc.end() << ")"
+    << " hwcc_alloc=[" << r.hwcc_alloc.offset << "," << r.hwcc_alloc.end() << ")"
+    << " app=[" << r.app.offset << "," << r.app.end() << ")"
     << " msg_ring=[" << r.msg_ring.offset << "," << r.msg_ring.end() << ")"
     << " swcc=[" << r.swcc.offset << "," << r.swcc.end() << ")"
     << " reserved=" << r.reserved.size() << " config=" << r.source;

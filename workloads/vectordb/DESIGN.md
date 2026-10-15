@@ -33,9 +33,11 @@ into a single `cxl_region` struct; nothing else defines offsets.
 
 - Startup validation: no overlap, aligned, inside the device, no reserved
   conflict; otherwise refuse to run.
-- HWcc internal layout (Megalon control area, segment descriptors, counters,
-  `applied` bitmap, P) is computed from `hwcc_size`, W and MAXSEG. If it does
-  not fit, fail at startup. Actual usage goes to the manifest.
+- HWcc use follows docs/hwcc-contract.md (2026-10-15): the vectordb control
+  state (segment descriptors, counters, `applied` bitmap, P) lives in the
+  `app` range below msg_ring, sized exactly by the layout computed from W,
+  MAXSEG and nr_nodes (`CXL_APP_HWCC_BYTES`); the system (Megalon SCR) gets the
+  rest of the 256 MiB. If it does not fit, fail at startup. Usage goes to the manifest.
 - If Megalon fixes SCR size/base at compile time, values are generated from
   the same config and injected into its build; the mapping is recorded (TBD).
 - In all-HWcc the SWcc area is also treated as HW coherent (baseline). Here
