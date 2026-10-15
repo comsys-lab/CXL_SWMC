@@ -1,7 +1,9 @@
 #!/bin/bash
 # vectordb server node inside a guest (workloads/vectordb), detached from the SSH session, bounded.
-# Usage: vdb-node.sh start <V> <run_dir> <node_id> <run_id 0x..> <app_bytes> <vdb-server args...>
-#          V = install dir (bin/vdb-server, cfg/cxl_region.yaml); writes <run_dir>/node<k>.{log,pid,env}
+# Usage: vdb-node.sh start <V> <run_dir> <node_id> <run_id 0x..> <app_bytes> [ENV:K=V ...] <vdb-server args...>
+#          V = install dir (bin/vdb-server, cfg/cxl_region.yaml; lib/ for the Megalon build); writes
+#          <run_dir>/node<k>.{log,pid,env}. ENV:K=V tokens (before the server args) are exported to the server
+#          (e.g. ENV:RACKOBJ_CONFIG=... ENV:MEGALON_REINIT=1 for the Megalon backend).
 #        vdb-node.sh ready <run_dir> <node_id> <timeout_s>   # node log shows "vdb-server: READY"
 #        vdb-node.sh stop  <run_dir> <node_id>               # SIGTERM to the node's session (server prints its
 #                                                            # stats and exits), KILL after 15 s, verify gone
@@ -10,6 +12,8 @@ case "${1:-}" in
   start)
     [ $# -ge 6 ] || { sed -n 2,7p "$0" >&2; exit 2; }
     V=$2 RUN=$3 K=$4 RID=$5 APP=$6; shift 6
+    XENV=()
+    while [ $# -gt 0 ] && [ "${1#ENV:}" != "$1" ]; do XENV+=("${1#ENV:}"); shift; done
     case "$RID" in 0x[0-9a-fA-F]*) ;; *) echo "run_id must be 0x-prefixed hex" >&2; exit 2;; esac
     for f in "$RUN/node$K".{log,pid,env}; do [ -e "$f" ] && { echo "refusing: $f exists" >&2; exit 2; }; done
     mkdir -p "$RUN"
@@ -18,12 +22,13 @@ node_id=$K
 run_id=$RID
 app_hwcc_bytes=$APP
 args=$*
+extra_env=${XENV[*]:-}
 uname_r=$(uname -r)
 server_sha256=$(sha256sum "$V/bin/vdb-server" | cut -d' ' -f1)
 region_sha256=$(sha256sum "$V/cfg/cxl_region.yaml" | cut -d' ' -f1)
 start=$(date -Is)
 ENV
-    setsid nohup env CXL_REGION_CONFIG="$V/cfg/cxl_region.yaml" CXL_APP_HWCC_BYTES="$APP" \
+    setsid nohup env CXL_REGION_CONFIG="$V/cfg/cxl_region.yaml" CXL_APP_HWCC_BYTES="$APP" ${XENV[@]+"${XENV[@]}"} \
       timeout 7200 "$V/bin/vdb-server" --node "$K" --run-id "$RID" "$@" > "$RUN/node$K.log" 2>&1 < /dev/null &
     echo $! > "$RUN/node$K.pid"
     echo "started node$K pid $(cat "$RUN/node$K.pid")";;

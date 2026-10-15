@@ -4,7 +4,9 @@
 # usage: run.sh <name> <out_root> -- <loadgen args (mode, rates/SLO, --opt ...)>
 # env (required): SYSTEM (label, e.g. all-HWcc), V (guest install dir), HOST_SERVER (Host vdb-server of the same
 #   build, for --print-app-bytes), LOADGEN, SERVER_ARGS (identical on every node), INIT (initial segments dir on
-#   node 0's guest); optional: NODES (default 192.168.122.100 192.168.122.101), PORT (7000), LG_CPUS (56-63).
+#   node 0's guest); optional: NODES (default 192.168.122.100 192.168.122.101), PORT (7000), LG_CPUS (56-63),
+#   NODE_ENV (ENV:K=V tokens for every node), NODE0_ENV (extra tokens for node 0 only), e.g. for Megalon:
+#   NODE_ENV="ENV:RACKOBJ_CONFIG=$V/cfg/megalon.yaml" NODE0_ENV="ENV:MEGALON_REINIT=1".
 # Stops (and stops the servers) on the first error. Measurement hygiene: no Host build before/after (pgrep).
 set -euo pipefail
 NAME=$1 OUT=$2; shift 2; [ "${1:-}" = "--" ] && shift
@@ -42,7 +44,7 @@ APP=$("$HOST_SERVER" $SERVER_ARGS --print-app-bytes)
   echo "cxl_swmc_dirty=$(git -C "$ROOT" status --porcelain | wc -l)"
   echo "host_server=$HOST_SERVER sha256=$(sha256sum "$HOST_SERVER" | cut -d' ' -f1)"
   echo "loadgen=$LOADGEN sha256=$(sha256sum "$LOADGEN" | cut -d' ' -f1)"
-  echo "server_args=$SERVER_ARGS"; echo "app_hwcc_bytes=$APP"; echo "init=$INIT"; echo "loadgen_args=$*"
+  echo "server_args=$SERVER_ARGS"; echo "node_env=${NODE_ENV:-} node0_env=${NODE0_ENV:-}"; echo "app_hwcc_bytes=$APP"; echo "init=$INIT"; echo "loadgen_args=$*"
   echo "lg_cpus=$LG_CPUS"
   for k in "${!NODE[@]}"; do
     info=$($SSH comsys@"${NODE[$k]}" "uname -r; sha256sum $V/bin/vdb-server $V/cfg/cxl_region.yaml | cut -c1-64; nproc" < /dev/null | tr '\n' ' ')
@@ -63,9 +65,9 @@ APP=$("$HOST_SERVER" $SERVER_ARGS --print-app-bytes)
 } > "$RUN/manifest.txt"
 
 for k in "${!NODE[@]}"; do
-  EXTRA=""; [ "$k" = 0 ] && EXTRA="--init-dir $INIT"
+  EXTRA=""; XE="${NODE_ENV:-}"; [ "$k" = 0 ] && EXTRA="--init-dir $INIT" && XE="$XE ${NODE0_ENV:-}"
   STARTED+=("$k")
-  $SSH comsys@"${NODE[$k]}" "$V/bin/vdb-node.sh start $V $GRUN $k $RID $APP $SERVER_ARGS --port $PORT $EXTRA" < /dev/null
+  $SSH comsys@"${NODE[$k]}" "$V/bin/vdb-node.sh start $V $GRUN $k $RID $APP $XE $SERVER_ARGS --port $PORT $EXTRA" < /dev/null
 done
 for k in "${!NODE[@]}"; do $SSH comsys@"${NODE[$k]}" "$V/bin/vdb-node.sh ready $GRUN $k 300" < /dev/null; done
 
