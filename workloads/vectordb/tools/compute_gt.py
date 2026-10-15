@@ -1,22 +1,32 @@
 #!/usr/bin/env python3
-"""Offline exact top-k ground truth for a vectordb trace (DESIGN.md §8). Never run during a measurement.
+"""Offline exact top-k ground truth and recall for a vectordb run (DESIGN.md §8). Never run during a measurement.
 
-For each query row used by the trace: exact top-K' by inner product (vectors are unit-norm, so this is cosine)
-over all of pool A and pool B. For each SEARCH with snapshot s = ref_w, keep the candidates visible at s
-(ins_seq <= s < del_seq) in score order and take the first k; if fewer than k remain, recompute that search by
-brute force over every visible record.
+Inputs: the dataset (pool_a/pool_b/queries .fbin), the writes file of the run (gen_writes.py) and the loadgen
+plugin's searches.bin (one record per search response: query row, E1 snapshot ref_w, returned ids).
+For each distinct query row: exact top-K' by inner product (unit-norm vectors: cosine) over pools A and B. For each
+search with snapshot s: keep the candidates visible at s (ins_seq <= s < del_seq) in score order and take the
+first k; if fewer than k remain, recompute that search by brute force over every visible record.
 
-Output: <out>.npy, uint64 array [num_searches, k] of record ids (row i = i-th SEARCH in trace order), its
-op_seq in <out>.op_seq.npy, and <out>.manifest.txt.
+Output: <out>.recall.txt (recall@k over measured OK responses and over all OK responses), <out>.gt.npy
+(uint64 [searches, k], rows in searches.bin order), <out>.manifest.txt.
 
-usage: compute_gt.py --data DIR (pool_a.fbin, pool_b.fbin, queries.fbin) --trace trace.npy --out gt [--k 10 --kprime 200]
+usage: compute_gt.py --data DIR --writes writes.bin --searches RUN/searches.bin --out PREFIX [--k 10 --kprime 200]
 """
 import argparse, os, sys, time
 
 import numpy as np
 
-INSERT, DELETE, SEARCH = 1, 2, 3
+INSERT, DELETE = 1, 2
 INF = np.iinfo(np.uint32).max
+WDT = np.dtype([("op", "u1"), ("target", "u1"), ("pad0", "<u2"), ("w_seq", "<u4"), ("id", "<u8"),
+                ("vec_ref", "<u4"), ("pad1", "<u4")])
+
+
+def search_dtype(k):  # vectordb_plugin.cc SearchLog (packed) + ids[k] + scores[k]
+    return np.dtype([("seq", "<u8"), ("qrow", "<u4"), ("ref_w", "<u4"), ("s_used", "<u4"), ("measured", "u1"),
+                     ("pad", "u1"), ("status", "<u2"), ("n", "<u2"), ("k", "<u2"), ("wait_us", "<u4"),
+                     ("replay_us", "<u4"), ("search_us", "<u4"), ("mask_us", "<u4"), ("raw_scanned", "<u4"),
+                     ("indexed_segs", "<u2"), ("sealed_backlog", "<u2"), ("ids", "<u8", (k,)), ("scores", "<f4", (k,))])
 
 
 def read_fbin(path):
@@ -25,17 +35,11 @@ def read_fbin(path):
     return np.memmap(path, dtype=np.float32, mode="r", offset=8, shape=(int(n), int(d)))
 
 
-def topk_rows(scores, k):
-    idx = np.argpartition(-scores, k - 1, axis=1)[:, :k]
-    s = np.take_along_axis(scores, idx, axis=1)
-    order = np.argsort(-s, axis=1, kind="stable")
-    return np.take_along_axis(idx, order, axis=1)
-
-
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--data", required=True)
-    ap.add_argument("--trace", required=True)
+    ap.add_argument("--writes", required=True)
+    ap.add_argument("--searches", required=True)
     ap.add_argument("--out", required=True)
     ap.add_argument("--k", type=int, default=10)
     ap.add_argument("--kprime", type=int, default=200)
@@ -46,23 +50,23 @@ def main():
     B = read_fbin(os.path.join(a.data, "pool_b.fbin"))
     Q = read_fbin(os.path.join(a.data, "queries.fbin"))
     NA, NB = A.shape[0], B.shape[0]
-    tr = np.load(a.trace)
+    w = np.fromfile(a.writes, dtype=WDT)
+    sr = np.fromfile(a.searches, dtype=search_dtype(a.k))
+    if len(sr) and int(sr["k"][0]) != a.k:
+        sys.exit(f"searches.bin has k={sr['k'][0]}, not {a.k}")
 
     # ins_seq / del_seq per record id (A: ins 0; B: ins at its INSERT's w_seq or never)
     ins = np.full(NA + NB, INF, dtype=np.uint32)
     ins[:NA] = 0
     dele = np.full(NA + NB, INF, dtype=np.uint32)
-    w = tr[tr["op"] != SEARCH]
     wi = w[w["op"] == INSERT]
     ins[wi["id"].astype(np.int64)] = wi["w_seq"]
     wd = w[w["op"] == DELETE]
     dele[wd["id"].astype(np.int64)] = wd["w_seq"]
 
-    srch = tr[tr["op"] == SEARCH]
-    qrows = np.unique(srch["vec_ref"])
+    ok = sr[sr["status"] == 0]
+    qrows = np.unique(ok["qrow"])
     Qu = np.ascontiguousarray(Q[qrows])
-
-    # exact top-K' per used query over A ∪ B (ids: A rows 0..NA-1, B rows NA..)
     best_s = np.full((len(qrows), a.kprime), -np.inf, dtype=np.float32)
     best_i = np.zeros((len(qrows), a.kprime), dtype=np.int64)
     for base, X in ((0, A), (NA, B)):
@@ -81,30 +85,45 @@ def main():
     best_i = np.take_along_axis(best_i, order, axis=1)
     row_of = {int(q): r for r, q in enumerate(qrows)}
 
-    gt = np.zeros((len(srch), a.k), dtype=np.uint64)
-    fallback = 0
-    allX = None
-    for n, (q, s) in enumerate(zip(srch["vec_ref"], srch["ref_w"])):
-        cand = best_i[row_of[int(q)]]
+    gt = np.zeros((len(sr), a.k), dtype=np.uint64)
+    hits = np.zeros(len(sr), dtype=np.float64)
+    fallback = invisible = dup = 0
+    for n, rec in enumerate(sr):
+        if rec["status"] != 0:
+            continue
+        q, s = int(rec["qrow"]), int(rec["ref_w"])
+        cand = best_i[row_of[q]]
         vis = cand[(ins[cand] <= s) & (s < dele[cand])]
         if len(vis) >= a.k:
             gt[n] = vis[:a.k]
-            continue
-        fallback += 1
-        if allX is None:
-            allX = (A, B)
-        ids = np.nonzero((ins <= s) & (s < dele))[0]
-        sc = np.concatenate([np.asarray(A[ids[ids < NA]]) @ Q[q], np.asarray(B[ids[ids >= NA] - NA]) @ Q[q]])
-        gt[n] = ids[np.argsort(-sc, kind="stable")[:a.k]]
-    np.save(a.out + ".npy", gt)
-    np.save(a.out + ".op_seq.npy", srch["op_seq"])
+        else:
+            fallback += 1
+            ids = np.nonzero((ins <= s) & (s < dele))[0]
+            sc = np.concatenate([np.asarray(A[ids[ids < NA]]) @ Q[q], np.asarray(B[ids[ids >= NA] - NA]) @ Q[q]])
+            gt[n] = ids[np.argsort(-sc, kind="stable")[:a.k]]
+        got = rec["ids"][:rec["n"]].astype(np.int64)
+        hits[n] = len(np.intersect1d(got, gt[n])) / a.k
+        bad = (got >= NA + NB)
+        g = got[~bad]
+        invisible += int(bad.sum()) + int(((ins[g] > s) | (dele[g] <= s)).sum())  # E1 violation
+        dup += len(got) - len(np.unique(got))
+    np.save(a.out + ".gt.npy", gt)
+    okm = (sr["status"] == 0) & (sr["measured"] == 1)
+    oka = sr["status"] == 0
+    with open(a.out + ".recall.txt", "w") as f:
+        f.write(f"k={a.k}\nresponses={len(sr)} ok={int(oka.sum())} measured_ok={int(okm.sum())} "
+                f"not_ok={int((~oka).sum())}\n")
+        f.write(f"recall_measured_ok={hits[okm].mean() if okm.any() else float('nan'):.5f}\n")
+        f.write(f"recall_all_ok={hits[oka].mean() if oka.any() else float('nan'):.5f}\n")
+        f.write(f"invisible_returned={invisible}\nduplicate_ids={dup}\n")
+        f.write("(searches never answered are not in searches.bin: take timeouts from the loadgen steps.jsonl)\n")
     with open(a.out + ".manifest.txt", "w") as m:
         m.write("# vectordb ground truth (CXL_SWMC/workloads/vectordb/tools/compute_gt.py)\n")
-        for k, v in sorted(vars(a).items()):
-            m.write(f"{k}={v}\n")
-        m.write(f"searches={len(srch)} distinct_queries={len(qrows)} brute_force_fallbacks={fallback}\n")
+        for key, v in sorted(vars(a).items()):
+            m.write(f"{key}={v}\n")
+        m.write(f"searches={len(sr)} distinct_queries={len(qrows)} brute_force_fallbacks={fallback}\n")
         m.write(f"seconds={time.time() - t0:.1f}\n")
-    print(f"searches={len(srch)} fallbacks={fallback} -> {a.out}.npy ({time.time() - t0:.0f}s)")
+    print(open(a.out + ".recall.txt").read(), end="")
 
 
 if __name__ == "__main__":
