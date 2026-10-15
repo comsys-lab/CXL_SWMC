@@ -117,7 +117,7 @@ for a delete, its replay cursor has passed the entry, minus w's arrival time.
 A per-VM observer thread records P/replay progress timestamps; cross-VM clock
 offset is measured at run start/end and recorded.
 
-## 6. Segments
+## 6. Segments (superseded by §11)
 
 - Descriptor table in HWcc; VM v only uses slots [v·MAXSEG, (v+1)·MAXSEG).
   Fields: state (GROWING → SEALED → INDEXED), published_count, raw base ptr,
@@ -222,6 +222,28 @@ Atomicity and coherence are separate problems.
 - GT/recall: tools/compute_gt.py after the run from writes + searches.bin (also counts E1 violations:
   returned ids not visible at the snapshot).
 - Loadgen pinned to Host node1 CPUs; requests go straight to target VMs (no coordinator).
+
+## 11. Shared HNSW segments (implemented 2026-10-15; replaces §6 growing/sealed segments)
+
+User decisions 2026-10-15: incremental HNSW updated in place in shared memory; one shared index written by all
+VMs (no per-VM graphs); Qdrant-style segments, count = CPUs of the VM socket (host node0: 32 logical CPUs =
+2 VMs x 16 vCPUs; stays 32 with 8 VMs); every node writes every segment under an HWcc reader-writer lock.
+- Segment s holds records with id % S == s; one HNSW graph per segment (server/shm_hnsw.h: port of hnswlib,
+  same level/search/heuristic/connect algorithm and parameters M 16, efConstruction 128, query ef 64).
+- HWcc (region.app): per segment a writer-preferring rwlock line (hwcc_app.h) and the graph meta line (entry
+  point/max level, element count, upper-arena cursor); plus P, applied bitmap, per-node lines.
+- SWcc: per segment level-0 slots (header line + level-0 links + vector, whole lines) and upper-level links.
+- Insert (owner = receiving VM's writer): write lock of segment id % S, hnswlib addPoint, unlock, then applied/P.
+- Search: wait P >= s, replay delete logs, then each segment under its read lock: hnswlib searchKnn with a
+  result filter (ins_seq <= s < del_seq), merge top-k. Segments are searched one after another per query
+  (Qdrant parallelises segments inside a request; here queries run in parallel across worker threads).
+- Initial pool A: tools/build_index.cc builds the 32 segment images offline (one thread per segment, seed + s,
+  deterministic); node 0 copies them into SWcc at prepare.
+- Why (Host pilot 2026-10-15): the growing/sealed design drifted (brute-force growing segments: search cost 9 ->
+  25 ms within one SLO search, confirm failed); the shared graph keeps per-query cost nearly constant (distance
+  computations +3% over 105k writes) and puts fine-grained shared writes where the coherence systems differ.
+- Host pilot (node1, 2 processes x 12 search threads, shm file, 1M records, writes 500/s, search p99 <= 50 ms):
+  max under SLO 521 +- 2 search/s (3/3 confirm), p99 30 +- 1 ms, recall@10 0.997, E1 violations 0, ~6 min.
 
 ## 10. Future reference: E2 (not implemented)
 

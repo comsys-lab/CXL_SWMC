@@ -43,7 +43,7 @@ def main():
     ap.add_argument("--out", required=True)
     ap.add_argument("--k", type=int, default=10)
     ap.add_argument("--kprime", type=int, default=200)
-    ap.add_argument("--block", type=int, default=262144, help="database rows per matmul block")
+    ap.add_argument("--block-mb", type=int, default=256, help="score-matrix budget per matmul block (MiB)")
     a = ap.parse_args()
     t0 = time.time()
     A = read_fbin(os.path.join(a.data, "pool_a.fbin"))
@@ -70,8 +70,9 @@ def main():
     best_s = np.full((len(qrows), a.kprime), -np.inf, dtype=np.float32)
     best_i = np.zeros((len(qrows), a.kprime), dtype=np.int64)
     for base, X in ((0, A), (NA, B)):
-        for lo in range(0, X.shape[0], a.block):
-            blk = np.asarray(X[lo:lo + a.block])
+        block = max(1024, (a.block_mb << 20) // (4 * max(1, len(qrows))))  # rows per block: bounded score matrix
+        for lo in range(0, X.shape[0], block):
+            blk = np.asarray(X[lo:lo + block])
             sc = Qu @ blk.T
             kk = min(a.kprime, sc.shape[1])
             loc = np.argpartition(-sc, kk - 1, axis=1)[:, :kk]
