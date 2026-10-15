@@ -252,6 +252,16 @@ class Server {
     std::string err;
     if (!cxl::region_load(o_.region.empty() ? nullptr : o_.region.c_str(), &r_, &err)) die("region: " + err);
     if (o_.init_dir.empty()) die("--preload-only needs --init-dir");
+    if (o_.node != 0) die("--preload-only runs on node 0 only");
+    {  // same parameter check as load_initial: refuse an init dir built for other parameters before writing anything
+      std::ifstream man(o_.init_dir + "/manifest.txt");
+      std::string line, want = "graph " + std::to_string(p_.segments) + " " + std::to_string(p_.g.dim) + " " +
+                               std::to_string(p_.g.M) + " " + std::to_string(p_.g.ef_construction) + " " +
+                               std::to_string(p_.g.capacity) + " " + std::to_string(p_.g.chunk_bytes);
+      bool ok = false;
+      while (std::getline(man, line)) ok = ok || line == want;
+      if (!ok) die("init_dir manifest does not contain '" + want + "' (built for other parameters)");
+    }
     int fd = int(syscall(SYS_openat, AT_FDCWD, r_.device.c_str(), O_RDWR | O_CLOEXEC));
     if (fd < 0) die("open " + r_.device);
     void *m = mmap(reinterpret_cast<void *>(r_.map_va), r_.device_size, PROT_READ | PROT_WRITE,
