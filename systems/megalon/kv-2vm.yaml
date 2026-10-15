@@ -1,0 +1,34 @@
+# Megalon config for kv-server (workloads/kv, reports/KV-port.md), 2 VMs, both backends (plain = hwcc-flavor build,
+# megalon = megalon-flavor build; same file, so both flavors get the same slots and records).
+# Same file on both VMs; node id, run id and region config come from kv-server (--node, --run-id, --region).
+# key_space, slots and logical_scr_size depend on the key count: experiments/kv/run.sh rewrites them from
+# `kv-server --print-sizes --keys N` (key_space = N; slots = N rounded up to 64, one 1 KiB slot per key;
+# logical_scr_size = 4 B x (slots x 100 / 90 + 1), so records = slots x 100 / 90 = the artifact's cap and every loaded
+# key stays under Megalon's 90 % record watermark: no reclaim pressure). Values below: the 4M-key pilot.
+# HWcc use: ~4.94 B per key (records 4.44 B + four slot bitmaps 0.5 B) + ~10 KiB; it must fit hwcc - msg_ring - app
+# (Megalon prints "SCR footprint (upper bound)" and refuses otherwise). Slot data: 1 KiB per key in SWcc.
+mount_directory: /mydata        # required by the config parser; unused
+key_space: 4000000
+slots: 4000000
+logical_scr_size: 17777780
+node_id: 0                      # overridden by MEGALON_NODE_ID (kv-server sets it from --node)
+region_config: ""               # $CXL_REGION_CONFIG
+reinit: false                   # node 0: MEGALON_REINIT=1
+attach_mprotect: true
+stuck_timeout_ms: 10000
+log_sync_interval_us: 100
+nr_log_size: 64MB               # NR log: header in HWcc, 524,288 x 128 B entries in SWcc (cxl_port.h)
+attach_timeout_s: 600
+start_barrier_timeout_s: 600
+object_arena_size: 0            # no phase-B objects: the artifact's slot path only
+replicate: false
+flush: false
+evict: false
+partition_ratio: 0.0
+excluded_files:
+excluded_directories:
+  - /usr
+  - /proc
+  - /etc
+  - /dev
+  - /sys

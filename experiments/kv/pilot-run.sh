@@ -1,0 +1,102 @@
+#!/bin/bash
+# One KV pilot run (reports/M5-pilot-kv.md, MOT1 v5 pilots): Host gate, system setup, run.sh, post checks.
+# 4M keys, 1 KiB values, Zipfian 0.99, requests of BATCH mixed ops (each op a put with probability PUT_RATIO),
+# SLO per request mixed p99 <= 1 ms.
+# usage: pilot-run.sh <name> <evidence dir>
+# env (required): SYS (all-HWcc | Megalon | Popcorn), PUT_RATIO (0 | 0.05 | 0.5), KIND (functional | pslo | pfix);
+#   KIND=pfix: RATE (requests/s = L)
+#   SYS=Popcorn: C8 (build-8 deploy bundle dir), K8 (release), GT8 (guest tools dir), RECV_MODE (poll | idle | sleep)
+# optional: KEYS (4000000), BATCH (16), SEED (20261016), GATE=0 (skip the Host gate: functional runs only),
+#   TRACE (0 | 1: put/get logs, fixed-load runs only), VM_PLAIN (/home/comsys/kv2), VM_MEG (/home/comsys/kvm2),
+#   PLAIN_BUILD (builds/kv/2), MEG_BUILD (builds/kv-megalon/2).
+# Page MSI (user decision A, 2026-10-16): cxl_shm is loaded and coherence ENABLED before kv-server starts, so node 0's
+# initial load and every warm-up read run under coherence (no --preload-only: the store's index replicas are
+# process-local). init_state=shared, as for the other workloads' page MSI runs.
+# Prints "PILOTRUN <name> OK|NOTE|STOP <reason>"; exit 0 for OK/NOTE, 1 for STOP (the sequence stops).
+set -uo pipefail
+NAME=$1 E=$2
+P=/home/comsys/sungsu/destijl-control
+X=$P/CXL_SWMC/experiments/kv
+: "${SYS:?}" "${PUT_RATIO:?}" "${KIND:?}"
+KEYS=${KEYS:-4000000} BATCH=${BATCH:-16} SEED=${SEED:-20261016} TRACE=${TRACE:-0}
+VM_PLAIN=${VM_PLAIN:-/home/comsys/kv2} VM_MEG=${VM_MEG:-/home/comsys/kvm2}
+PLAIN_BUILD=${PLAIN_BUILD:-$P/builds/kv/2} MEG_BUILD=${MEG_BUILD:-$P/builds/kv-megalon/2}
+stop() { echo "PILOTRUN $NAME STOP $*"; exit 1; }
+[ -d "$E" ] || stop "missing evidence dir $E"
+[ -e "$E/$NAME" ] && stop "$E/$NAME exists"
+[[ $PUT_RATIO =~ ^(0|0\.05|0\.2|0\.5)$ ]] || stop "bad PUT_RATIO"
+[[ $BATCH =~ ^(16|32|64)$ ]] || stop "bad BATCH"
+SA="--nodes 2 --keys $KEYS --threads 14 --start-timeout-ms 5400000"
+export LOADGEN=$P/builds/kv-loadgen/2/loadgen READY_TIMEOUT=5400 RUN_KIND=measurement STATS_OP=10 TRACE
+[ "$KIND" = functional ] && RUN_KIND=functional
+export RUN_KIND
+case "$SYS" in
+  all-HWcc) export SYSTEM=all-HWcc V=$VM_PLAIN HOST_SERVER=$PLAIN_BUILD/bin/kv-server SERVER_ARGS="$SA --backend plain";;
+  Megalon)  export SYSTEM=Megalon V=$VM_MEG HOST_SERVER=$MEG_BUILD/bin/kv-server SERVER_ARGS="$SA --backend megalon";;
+  Popcorn)  : "${C8:?}" "${K8:?}" "${GT8:?}" "${RECV_MODE:?}"
+            [[ $RECV_MODE =~ ^(poll|idle|sleep)$ ]] || stop "bad RECV_MODE"
+            export SYSTEM=Popcorn-$RECV_MODE V=$VM_PLAIN HOST_SERVER=$PLAIN_BUILD/bin/kv-server SERVER_ARGS="$SA --backend plain";;
+  *) stop "bad SYS";;
+esac
+export NODE_ENV="ENV:XTIMEOUT=14400"
+LG=(--opt keys=$KEYS --opt batch=$BATCH --opt put_ratio=$PUT_RATIO --opt seed=$SEED --seed "$SEED" --mix mixed=1
+    --slo mixed:99:1 --x-stream mixed)
+case "$KIND" in
+  functional) LG+=(--mode fixed --rates 200,2000 --warmup-s 10 --step-warmup-s 5 --step-measure-s 30 --drain-s 10);;
+  pslo) LG+=(--raw --mode slo --start 500 --factor 1.5 --precision 0.05 --max-steps 25 --warmup-s 10 --step-warmup-s 2
+             --step-measure-s 8 --confirm-s 15 --confirm-reps 1 --fill none --overload none);;
+  pfix) : "${RATE:?}"; LG+=(--raw --mode fixed --rates "$RATE" --warmup-s 10 --step-warmup-s 5 --step-measure-s 30 --drain-s 10);;
+  *) stop "bad KIND";;
+esac
+SSH="ssh -o BatchMode=yes -o ConnectTimeout=8"
+IPS=(192.168.122.100 192.168.122.101)
+servers_gone() { for ip in "${IPS[@]}"; do [ "$($SSH comsys@$ip 'pgrep -c -x kv-server' < /dev/null)" = 0 ] || return 1; done; }
+echo "$(date -Is) $NAME: SYS=$SYS PUT_RATIO=$PUT_RATIO KIND=$KIND RATE=${RATE:-} BATCH=$BATCH KEYS=$KEYS TRACE=$TRACE RECV_MODE=${RECV_MODE:-} SEED=$SEED"
+servers_gone || stop "a kv-server is running before the run"
+if [ "${GATE:-1}" = 1 ]; then bash $P/CXL_SWMC/experiments/vectordb/host-gate.sh check "$E/gate-$NAME.txt" || stop "host gate"; fi
+T0=$(date +%s)
+if [ "$SYS" = Popcorn ]; then  # P-popcorn-deploy §6a cycle with build 8; enable BEFORE the server (load under coherence)
+  PS=(K=$K8 GT=$GT8 C=$C8 R=$E/shm-$NAME INIT_STATE=shared)
+  for ph in precheck load chown; do env "${PS[@]}" bash $C8/p-popcorn-shm.sh $ph || stop "shm $ph"; done
+  for ip in "${IPS[@]}"; do
+    [ "$($SSH comsys@$ip "sha256sum $V/cfg/cxl_region.yaml $GT8/cxl_region.yaml | cut -d' ' -f1 | sort -u | wc -l" < /dev/null)" = 1 ] \
+      || { env "${PS[@]}" bash $C8/p-popcorn-shm.sh teardown; stop "region config differs on $ip"; }
+  done
+  env "${PS[@]}" bash $C8/p-popcorn-shm.sh enable || { env "${PS[@]}" bash $C8/p-popcorn-shm.sh teardown; stop "enable gate"; }
+  for ip in "${IPS[@]}"; do
+    m=$($SSH comsys@$ip "sudo -n sh -c 'echo $RECV_MODE > /sys/module/cxl_shm/parameters/recv_mode' && cat /sys/module/cxl_shm/parameters/recv_mode" < /dev/null)
+    echo "$ip recv_mode=$m" >> "$E/recv-mode-$NAME.txt"
+    [ "$m" = "$RECV_MODE" ] || { env "${PS[@]}" bash $C8/p-popcorn-shm.sh teardown; stop "recv_mode on $ip = $m"; }
+  done
+  env "${PS[@]}" STATUS_TAG=pre bash $C8/p-popcorn-shm.sh status || { env "${PS[@]}" bash $C8/p-popcorn-shm.sh teardown; stop "status pre"; }
+fi
+bash $X/run.sh "$NAME" "$E" -- "${LG[@]}"
+RC=$?
+if [ "$SYS" = Popcorn ]; then
+  env "${PS[@]}" STATUS_TAG=post bash $C8/p-popcorn-shm.sh status
+  servers_gone || stop "servers left (Popcorn teardown not attempted)"
+  env "${PS[@]}" bash $C8/p-popcorn-shm.sh teardown || stop "shm teardown"
+fi
+servers_gone || stop "servers left"
+R=$E/$NAME
+[ -d "$R" ] || stop "no run dir"
+for k in 0 1; do  # clean stop and the workload's own invariants
+  L=$R/node$k.log
+  grep -q "kv-server: stopping" $L || stop "node$k: no clean stop"
+  for kv in misses=0 short_reads=0 bad_requests=0; do grep -q "^$kv\$" $L || stop "node$k: $kv violated"; done
+done
+for kv in torn=0 wrong_key=0 bad_writer=0 future=0 stale=0 misses=0 get_errors=0 put_errors=0; do
+  grep -q "^$kv\$" $R/loadgen/kv.txt || stop "value check: $kv violated"
+done
+[ "$TRACE" = 1 ] && { grep -q "KVLOG CHECK PASS" $R/kvlog-check.txt || stop "trace log check"; }
+{ echo "# load times $NAME (s)"; echo "run_wall_s=$(( $(date +%s) - T0 ))"
+  grep -h "loaded .* keys\|warm-up read\|slot scan\|SCR used\|READY node" $R/node*.log
+  grep -h "^start=\|^end=" $R/manifest.txt; } > $R/load-times.txt
+grep -q "workload_finish\":\"ok" $R/loadgen/summary.json || stop "loadgen workload finish"
+if [ $RC != 0 ]; then
+  note=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("note",""))' $R/loadgen/summary.json 2>/dev/null)
+  [ "$KIND" = pslo ] && [ -n "$note" ] && { echo "PILOTRUN $NAME NOTE $note"; exit 0; }
+  stop "run.sh rc $RC ($note)"
+fi
+[ "$KIND" = functional ] && ! grep -q '"pass":true' $R/loadgen/steps.jsonl && stop "functional step not PASS"
+echo "PILOTRUN $NAME OK"
