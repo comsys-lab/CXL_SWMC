@@ -25,14 +25,18 @@ asyncio peer (e.g. for a LangChain VectorStore client).
   (loadgen-bound; summary `passing_steps_with_send_lag` must be 0).
 
 ## Max throughput under SLO (`--mode slo`), minimal time
-1. Ramp from `--start`: × factor² while the SLO percentile is below SLO/4, else × factor (default 1.5), until a
+1. Ramp from `--start` with an adaptive step (factor f, default 1.5): × f² while the SLO percentile is below SLO/4,
+   × f below SLO/2, × (1 + 0.4(f-1)) = 1.2 below 0.8·SLO, × (1 + 0.2(f-1)) = 1.1 above, and also × 1.1 whenever the
+   percentile grew more than 1.5× in the last step (the curve bends) — denser points around the knee — until a
    step fails.
 2. Bisect geometrically between the last pass and the first fail until fail/pass ≤ 1 + precision (5%).
 3. Confirm the best passing rate with `--confirm-reps` × `--confirm-s` (3 × 30 s); if most repeats fail, step
    down by the precision and confirm again (at most twice). Reported: confirm mean/sd of x and of the SLO
    percentile.
 Every ramp/bisect step is a (throughput, tail latency) point; the ramp gives the low-load part of the curve,
-the bisection the knee, the first failing ramp step a point past it. Typical cost: about 8-12 steps × ~20 s +
+the bisection the knee, the first failing ramp step a point past it; afterwards `fill` points at the result x
+0.7/0.8/0.9 (the bend) and `overload` points at the first-fail rate x 1.05/1.1/1.2 (past the knee), both measured
+in full and never changing the result. Typical cost: about 8-12 steps × ~20 s +
 confirm ≈ 4-6 min per (system, configuration). `--mode fixed --rates r1,r2,...` measures given rates.
 
 ## Outputs (`--out DIR`, must not exist)

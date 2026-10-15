@@ -75,6 +75,7 @@ struct Config {
   double confirm_s = 30;
   uint32_t confirm_reps = 3;
   std::vector<double> overload = {1.05, 1.1, 1.2};  // SLO mode: extra points at first-fail x f (past the knee)
+  std::vector<double> fill = {0.7, 0.8, 0.9};       // SLO mode: extra points at the result x f (bend before the knee)
   double tol = 0.05;            // achieved >= (1 - tol) * offered
   double max_err = 0.001;       // errors + timeouts / measured
   double abort_queue_s = 2.0;   // abort a step when outstanding > max(1000, rate * this)
@@ -101,6 +102,7 @@ void usage() {
                "  --confirm-s S --confirm-reps N        SLO mode: repeats at the found rate (30 s x 3)\n"
                "  --overload f1,f2,...|none             SLO mode: points at first-fail rate x f, measured in full\n"
                "                                        (no early SLO abort) for the curve past the knee (1.05,1.1,1.2)\n"
+               "  --fill f1,f2,...|none                 SLO mode: points at the result x f for the bend (0.7,0.8,0.9)\n"
                "  --tol T --max-err E --abort-queue-s S --lag-limit-us U\n"
                "  --arrival poisson|uniform --seed N --raw\n"
                "workloads:");
@@ -156,7 +158,12 @@ Config parse(int argc, char **argv) {
     else if (a == "--drain-s") c.drain_s = std::atof(need(i).c_str());
     else if (a == "--confirm-s") c.confirm_s = std::atof(need(i).c_str());
     else if (a == "--confirm-reps") c.confirm_reps = std::stoul(need(i));
-    else if (a == "--overload") {
+    else if (a == "--fill") {
+      std::string v = need(i);
+      c.fill.clear();
+      if (v != "none")
+        for (auto &f : split(v, ',')) c.fill.push_back(std::atof(f.c_str()));
+    } else if (a == "--overload") {
       std::string v = need(i);
       c.overload.clear();
       if (v != "none")
@@ -279,14 +286,15 @@ class Engine {
     }
     // SLO search: ramp (x factor, x factor^2 while far below the SLO) until a step fails, bisect geometrically
     // to the precision, then confirm the best passing rate with longer repeats.
-    double good = 0, bad = 0, r = c_.start;
+    double good = 0, bad = 0, r = c_.start, prev_pslo = 0;
     uint32_t n = 0;
     for (; n < c_.max_steps; n++) {
       StepResult s = step("ramp", r, c_.step_warmup_s, c_.step_measure_s);
       if (s.exhausted) return finish("streams exhausted during ramp");
       if (!s.pass) { bad = r; break; }
       good = r;
-      r *= s.s[idx_[c_.slo_stream]].pslo < c_.slo_ms / 4 ? c_.factor * c_.factor : c_.factor;
+      r *= next_factor(s.s[idx_[c_.slo_stream]].pslo, prev_pslo);
+      prev_pslo = s.s[idx_[c_.slo_stream]].pslo;
     }
     if (good == 0) return finish("the start rate already violates the SLO; lower --start");
     if (bad == 0) return finish("max steps reached without an SLO violation; raise --start or --max-steps");
@@ -372,9 +380,24 @@ class Engine {
   }
 
   // One step: warmup_s at rate x (not measured), then measure_s measured; stop sending; drain.
+  // Ramp step size from how close the SLO percentile is to the SLO and how fast it grew in the last step: big steps
+  // far below the SLO, small steps where the curve bends (denser points around the knee).
+  double next_factor(double p, double prev) const {
+    const double f = c_.factor;  // default 1.5
+    if (prev > 0 && p > 1.5 * prev) return 1 + (f - 1) / 5;  // steep: latency grew > 1.5x in one step -> x1.1
+    if (p < c_.slo_ms / 4) return f * f;                     // far below the SLO: x2.25
+    if (p < c_.slo_ms / 2) return f;                         // x1.5
+    if (p < 0.8 * c_.slo_ms) return 1 + (f - 1) * 2 / 5;     // x1.2
+    return 1 + (f - 1) / 5;                                  // close to the SLO: x1.1
+  }
+
   // Points past the knee for the throughput/latency curve: measured in full (the early "SLO already exceeded"
   // abort is off; the saturation abort stays). They never change the SLO result.
   void overload(double first_fail) {
+    for (double f : c_.fill) {  // bend before the knee (result = best_)
+      StepResult s = step("fill", best_ * f, c_.step_warmup_s, c_.step_measure_s, false);
+      if (s.exhausted) return;
+    }
     for (double f : c_.overload) {
       StepResult s = step("overload", first_fail * f, c_.step_warmup_s, c_.step_measure_s, false);
       if (s.exhausted) return;
