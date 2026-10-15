@@ -1,12 +1,18 @@
 // Offline (Host): initial segments for pool A with the server's own HNSW (server/shm_hnsw.h), identical input for
 // every system. Segment s holds pool A rows with row % segments == s (record id = row), inserted in row order by one
 // thread per segment with seed (seed + s): deterministic graphs.
+// Input is mmap'ed read-only (2026-10-16, 28M set: pool A no longer fits a node's memory twice); each insert reads its
+// row from the page cache, so results are identical to the earlier read-into-memory version.
 // Output dir: segments.txt ("<s> <count> <ep_level> <upper_cur>"), per group g: seg-<s>-v<g>.bin (vector chunk,
 // used bytes) and seg-<s>-l<g>.bin (whole link chunk) = byte images the server copies into the chunk objects,
 // manifest.txt (incl. "graph <segments> <dim> <M> <efc> <capacity> <chunk_bytes>").
 // usage: vdb-build-index <pool_a.fbin> <out dir> <segments> <max_ids> [M 16] [efc 128] [rows 0=all] [threads 16]
 //        [seed 20261015] [chunk_bytes 33554432]
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <sys/resource.h>
 #include <sys/stat.h>
+#include <unistd.h>
 
 #include <atomic>
 #include <chrono>
@@ -36,18 +42,22 @@ int main(int argc, char **argv) {
   const unsigned threads = argc > 8 ? unsigned(std::atoi(argv[8])) : 16;
   const uint64_t seed = argc > 9 ? std::strtoull(argv[9], nullptr, 10) : 20261015;
   if (argc > 10) p.g.chunk_bytes = std::strtoull(argv[10], nullptr, 10);
-  FILE *f = std::fopen(in.c_str(), "rb");
+  const int fd = open(in.c_str(), O_RDONLY);
   int32_t hdr[2];
-  if (!f || std::fread(hdr, 4, 2, f) != 2) return std::fprintf(stderr, "cannot read %s\n", in.c_str()), 1;
+  if (fd < 0 || pread(fd, hdr, 8, 0) != 8) return std::fprintf(stderr, "cannot read %s\n", in.c_str()), 1;
   const uint64_t N = uint64_t(hdr[0]);
   p.g.dim = uint32_t(hdr[1]);
   if (rows == 0 || rows > N) rows = N;
   p.derive();
   if (rows > p.max_ids) return std::fprintf(stderr, "rows > max_ids\n"), 1;
   if (mkdir(out.c_str(), 0755) != 0) return std::fprintf(stderr, "out dir must not exist: %s\n", out.c_str()), 1;
-  std::vector<float> all(rows * p.g.dim);
-  if (std::fread(all.data(), 4, all.size(), f) != all.size()) return std::fprintf(stderr, "short read\n"), 1;
-  std::fclose(f);
+  struct stat st;
+  const uint64_t need = 8 + rows * p.g.dim * 4;
+  if (fstat(fd, &st) != 0 || uint64_t(st.st_size) < need) return std::fprintf(stderr, "short read\n"), 1;
+  void *map = mmap(nullptr, need, PROT_READ, MAP_PRIVATE, fd, 0);
+  if (map == MAP_FAILED) return std::perror("mmap"), 1;
+  close(fd);
+  const float *all = reinterpret_cast<const float *>(static_cast<const uint8_t *>(map) + 8);
 
   struct Res { uint64_t count, epl, ucur; };
   std::vector<Res> res(p.segments);
@@ -97,5 +107,9 @@ int main(int argc, char **argv) {
     << p.g.dim << " " << p.g.M << " " << p.g.ef_construction << " " << p.g.capacity << " " << p.g.chunk_bytes
     << "\nper_chunk=" << p.g.per_chunk() << " groups=" << p.g.groups() << " vchunk_bytes=" << p.g.vchunk_bytes()
     << " lchunk_bytes=" << p.g.lchunk_bytes() << "\n";
+  rusage ru{};
+  getrusage(RUSAGE_SELF, &ru);
+  std::fprintf(stderr, "build done: %.0f s, maxrss %ld KiB (includes mapped input pages)\n",
+               std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count(), ru.ru_maxrss);
   return 0;
 }

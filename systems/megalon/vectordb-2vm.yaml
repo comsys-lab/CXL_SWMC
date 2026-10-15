@@ -1,7 +1,8 @@
 # Megalon config for the vectordb Megalon backend (workloads/vectordb/DESIGN.md §12), 2 VMs.
 # Same file on both VMs; node id, run id and region config come from vdb-server (--node, --run-id, --region).
 # Only objects are used (no kv Put/Get), so key_space/slots stay small. object_arena_size must hold every object:
-# vdb-server prints "object_bytes=" in its backend line (2M ids, 32 segments, 32 MiB chunks, 2 x 8M deletes: 7.43 GiB).
+# vdb-server prints "object_bytes=" in its backend line (28M ids, 32 segments, 82 groups, 32 MiB chunks,
+# 2 x 1M deletes: 88.05 GiB; 2 x 8M deletes: 88.93 GiB). Earlier 2M-id runs used 8GB.
 mount_directory: /mydata        # required by the config parser; unused
 key_space: 10000
 slots: 10240
@@ -15,7 +16,7 @@ log_sync_interval_us: 100
 nr_log_size: 64MB
 attach_timeout_s: 600
 start_barrier_timeout_s: 600
-object_arena_size: 8GB
+object_arena_size: 90GB   # parsed as GiB; fits SWcc (95.73 GiB) with nr_log 64 MB
 object_align: 64
 object_max_count: 65536         # hwcc flavor only (static records): >= object count (vdb-server prints objects=)
 replicate: false
