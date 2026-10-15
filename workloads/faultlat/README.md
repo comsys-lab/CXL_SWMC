@@ -94,6 +94,21 @@ every run needs a fresh `<base-page>` (the script prints the next one) or a
 reboot of both guests. Then collect the guest output dirs and run
 `parse.py <dir>... > summary.csv`.
 
+## N-node scenarios (Popcorn broadcast MSI, popcorn-msi-n)
+
+With `NODES="<ssh0> <ssh1> ... <sshN-1>"` (N > 2) `scenarios.sh` also runs,
+on windows of `PPAGES` pages (default 256):
+
+| Step | What is measured |
+| --- | --- |
+| s8_writer, s8_reader_k | one writer (node 0), then readers 1..N-1 in turn: the first read-on-I makes the writer downgrade M->S, later readers find only S sharers (each fault still waits for N-1 ACKs) |
+| s9_rr_writer_k | round-robin writers: node k writes after node k-1 (write-on-I, previous writer M->I, N-1 INVALIDATEs per fault) |
+| s10_conc_writer_k | all N nodes write the same pages at once (write-write conflicts; NACK/abort/retry counters show the priority rule at work) |
+| s11_ring_rk | token ring over all N nodes on one page (`pingpong --nodes N`); role 0 records one lap (N hand-offs) |
+
+`pingpong --nodes N --role r` works for any N >= 2 (N = 2 is the old
+ping-pong).
+
 ## Knobs worth sweeping (Popcorn kernels; root, so grant-gated)
 
 - `/sys/kernel/swmc/page_coherence/acquire_flush` (1/0): requester flush on

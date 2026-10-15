@@ -156,6 +156,36 @@ offset is measured at run start/end and recorded.
   in-place index memory (reports/M2-knowhere-audit.md). Popcorn's coherence
   hook covers only fsdax/FamFS faults, not devdax (reports/M2-popcorn-audit.md).
 
+### 7.1 Atomicity vs coherence (agreed 2026-10-15)
+
+Atomicity and coherence are separate problems.
+- **HW coherence** gives a current value per cache line.
+- **Atomicity of a multi-line update** (a 1 KiB value, a vector, an index node) needs object-level
+  synchronisation, for example a seqlock (an optimistic reader-writer lock), in every system:
+  all-HWcc, Megalon and Popcorn alike.
+- **Placement.** These locks and other metadata live in the HWcc region in all three systems; Popcorn manages
+  only SWcc data pages.
+
+| | all-HWcc | Megalon | Popcorn |
+|---|---|---|---|
+| object atomicity | same mechanism in all three (seqlock or the publish protocol below) | same | same |
+| coherence actions | none | tail check (index sync); write flush; pre/post-read checks (seq + log events); dynamic records | page faults and invalidation (kernel), 4 KiB granularity |
+| read-only objects | — | no seqlock; mode changes detected through log events (post-read tail check) | — |
+
+- **kv-store** (reports/M2-first-runs.md): one 1 KiB record = one seqlock. Megalon allocates the record only for
+  read-write-shared objects. The hwcc flavor keeps a seqlock on every object and drops only the coherence
+  actions.
+- **vectordb (this design):**
+  - Atomicity comes from the publish protocol: payload written beyond `published_count`, then a release store;
+    readers acquire and read only up to that point. Sealed segments and index blobs are immutable. So all-HWcc
+    needs no per-object lock.
+  - Megalon's per-object records (append chunk / index blob / delete-log chunk; phase B extent chunks,
+    reports/M2-phaseB-extents.md) serve coherence detection only.
+  - The comparison therefore isolates coherence cost on top of identical synchronisation.
+- **Read-only correctness.** Sealed data is read on Megalon's RO path. Its correctness depends on:
+  - the post-read tail check (megalon fix 5acf086/e806494, reports/M2-first-runs.md attempts 9-11);
+  - the RO first-read flush ([C2], port design §6).
+
 ## 8. Ground truth and metrics
 
 - GT: exact top-10 of the ref_w snapshot of the common trace, computed offline

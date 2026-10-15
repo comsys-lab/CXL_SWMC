@@ -8,6 +8,9 @@
 #   scenarios.sh <run-id> <base-page> [--execute]
 #
 # Env: NODE0/NODE1 (ssh targets, default comsys@192.168.122.100/.101),
+# NODES (optional, space-separated ssh targets of nodes 0..N-1 for N > 2:
+# runs the N-node scenarios s8-s11 after s1-s7; NODE0/NODE1 default to the
+# first two), PPAGES (pages per N-node window, default 256),
 # GDIR (plugin dir on the guests), GOUT (guest output root), PAGES (pages per
 # window, default 4096), CPU (pinned CPU, default 2), ITERS (ping-pong, 10000),
 # CXL_REGION_CONFIG (path on the guests).
@@ -15,8 +18,11 @@
 # persist across runs; use a new base per run or reboot both guests).
 set -euo pipefail
 run=$1; base=$2; exec_=${3:-}
-NODE0=${NODE0:-comsys@192.168.122.100}
-NODE1=${NODE1:-comsys@192.168.122.101}
+read -r -a NODEV <<< "${NODES:-}"
+NODE0=${NODE0:-${NODEV[0]:-comsys@192.168.122.100}}
+NODE1=${NODE1:-${NODEV[1]:-comsys@192.168.122.101}}
+N=${#NODEV[@]}
+PPAGES=${PPAGES:-256}
 GDIR=${GDIR:-/home/comsys/faultlat}
 GOUT=${GOUT:-/home/comsys/faultlat-results}
 PAGES=${PAGES:-4096}
@@ -62,4 +68,41 @@ else
   echo "  (role 1 in the background, then:)"
   step "$NODE0" s7_pingpong_r0 pingpong --role 0 --nonce "$nonce" --iters "$ITERS" --page-offset "$pp"
 fi
-echo "next window base: $(win 7)"
+next=7
+
+# --- N-node scenarios (NODES with N > 2 entries) ---------------------------
+if [ "$N" -gt 2 ]; then
+  bg() {  # run a step in the background when executing
+    if [ "$exec_" = --execute ]; then step "$@" & else step "$@"; echo "  (background)"; fi
+  }
+  nwin() { echo $((base + 7 * PAGES + $1 * PPAGES)); }
+  # 8 one writer, N-1 readers: node 0 writes; nodes 1..N-1 read in turn.
+  #   First reader: read-on-I, writer downgrades M->S (write-back);
+  #   later readers: read-on-I with S sharers (FETCH to N-1 peers, no work).
+  step "${NODEV[0]}" s8_writer access --op write --pages "$PPAGES" --page-offset "$(nwin 0)"
+  for k in $(seq 1 $((N - 1))); do
+    step "${NODEV[$k]}" "s8_reader_$k" access --op read --pages "$PPAGES" --page-offset "$(nwin 0)"
+  done
+  # 9 round-robin writers: node k writes after node k-1 (write-on-I, the
+  #   previous writer goes M->I; N-1 INVALIDATEs per fault).
+  for k in $(seq 0 $((N - 1))); do
+    step "${NODEV[$k]}" "s9_rr_writer_$k" access --op write --pages "$PPAGES" --page-offset "$(nwin 1)"
+  done
+  # 10 concurrent writers: all N nodes write the same pages at once
+  #   (write-write conflicts; priority rule, NACK/abort counters).
+  for k in $(seq 1 $((N - 1))); do
+    bg "${NODEV[$k]}" "s10_conc_writer_$k" access --op write --pages "$PPAGES" --page-offset "$(nwin 2)"
+  done
+  step "${NODEV[0]}" s10_conc_writer_0 access --op write --pages "$PPAGES" --page-offset "$(nwin 2)"
+  [ "$exec_" = --execute ] && wait
+  # 11 token ring over all N nodes on one page (role 0 records one lap).
+  nonce=$(( $(date +%s) * 1000 + RANDOM % 1000 ))
+  for k in $(seq 1 $((N - 1))); do
+    bg "${NODEV[$k]}" "s11_ring_r$k" pingpong --role "$k" --nodes "$N" --nonce "$nonce" --iters "$ITERS" --page-offset "$(nwin 3)"
+  done
+  step "${NODEV[0]}" s11_ring_r0 pingpong --role 0 --nodes "$N" --nonce "$nonce" --iters "$ITERS" --page-offset "$(nwin 3)"
+  [ "$exec_" = --execute ] && wait
+  echo "next window base: $(nwin 4)"
+else
+  echo "next window base: $(win $next)"
+fi

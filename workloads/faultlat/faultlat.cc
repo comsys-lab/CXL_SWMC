@@ -11,7 +11,7 @@
 //   faultlat params
 //   faultlat access --op read|write|rw [--pages N] [--page-offset P] [--stride S]
 //                   [--passes K] [--shuffle] [--cpu C] [--out F] [--raw F]
-//   faultlat pingpong --role 0|1 --nonce X [--iters N] [--page-offset P]
+//   faultlat pingpong --role R --nonce X [--nodes N] [--iters N] [--page-offset P]
 //                   [--cpu C] [--out F] [--raw F]
 //
 // Nothing here needs root, but opening the DAX device needs permission on it.
@@ -75,6 +75,7 @@ struct Args {
   bool shuffle = false;
   int cpu = -1;
   int role = -1;
+  int nodes = 2;
   uint64_t nonce = 0;
   uint64_t iters = 10000;
   std::string out, raw, config;
@@ -106,6 +107,7 @@ Args parse_args(int argc, char **argv) {
     else if (k == "--shuffle") a.shuffle = true;
     else if (k == "--cpu") a.cpu = int(parse_num(val("--cpu"), "--cpu"));
     else if (k == "--role") a.role = int(parse_num(val("--role"), "--role"));
+    else if (k == "--nodes") a.nodes = int(parse_num(val("--nodes"), "--nodes"));
     else if (k == "--nonce") a.nonce = parse_num(val("--nonce"), "--nonce");
     else if (k == "--iters") a.iters = parse_num(val("--iters"), "--iters");
     else if (k == "--out") a.out = val("--out");
@@ -267,10 +269,10 @@ void json_header(FILE *f, const Args &a, const cxl::region &r, const Mapping &m)
           a.cmd.c_str(), host);
   fprintf(f, "  \"region\": \"%s\",\n", cxl::region_describe(r).c_str());
   fprintf(f, "  \"params\": {\"op\": \"%s\", \"pages\": %" PRIu64 ", \"page_offset\": %" PRIu64
-             ", \"stride\": %" PRIu64 ", \"passes\": %d, \"shuffle\": %s, \"cpu\": %d, \"role\": %d"
+             ", \"stride\": %" PRIu64 ", \"passes\": %d, \"shuffle\": %s, \"cpu\": %d, \"role\": %d, \"nodes\": %d"
              ", \"nonce\": %" PRIu64 ", \"iters\": %" PRIu64 ", \"dev_offset\": %" PRIu64 "},\n",
           a.op.c_str(), a.pages, a.page_offset, a.stride, a.passes, a.shuffle ? "true" : "false",
-          a.cpu, a.role, a.nonce, a.iters, m.dev_offset);
+          a.cpu, a.role, a.nodes, a.nonce, a.iters, m.dev_offset);
 }
 
 void json_sysfs(FILE *f, const std::map<std::string, std::string> &before,
@@ -376,9 +378,12 @@ int cmd_access(const Args &a) {
   return 0;
 }
 
-// Ping-pong on one managed page between two nodes.  Each hand-off is a write
-// on a page the peer holds (write-on-I or write-on-S) and the waiting side's
-// next read faults on I (read-on-I).  Role 0 records the round trip.
+// Token ring on one managed page between N nodes (N=2: ping-pong).  Role r
+// waits for turn == r, then hands the turn to (r+1) % N.  Each hand-off is a
+// write on a page other nodes hold (write-on-I/S: invalidates all N-1 peers)
+// and the next role's read faults on I (read-on-I: the writer downgrades).
+// Role 0 records the time for the token to go once around the ring
+// (N hand-offs).
 struct PingPage {
   volatile uint64_t nonce;
   volatile uint64_t turn;     // role whose turn it is
@@ -386,19 +391,20 @@ struct PingPage {
 };
 
 int cmd_pingpong(const Args &a) {
-  if (a.role != 0 && a.role != 1) die("--role 0|1 is required");
+  if (a.nodes < 2 || a.nodes > 64) die("--nodes must be 2..64");
+  if (a.role < 0 || a.role >= a.nodes) die("--role 0..nodes-1 is required");
   if (!a.nonce) die("--nonce (non-zero, same on both nodes, new per run) is required");
   cxl::region r = load_region(a);
   pin_cpu(a.cpu);
   auto sys_before = read_sysfs();
   Mapping m = map_window(r, a.page_offset, 1);
   PingPage *pg = reinterpret_cast<PingPage *>(m.base);
-  uint64_t me = uint64_t(a.role), other = 1 - me;
+  uint64_t me = uint64_t(a.role), other = (me + 1) % uint64_t(a.nodes);
   const uint64_t timeout_ns = 60ull * 1000000000ull;
 
   // Start: role 0 publishes the nonce and hands the turn to role 1.
   if (me == 0) {
-    pg->turn = 2;  // nobody's turn while (re)initializing
+    pg->turn = uint64_t(a.nodes);  // nobody's turn while (re)initializing
     pg->seq = 0;
     pg->nonce = a.nonce;
     pg->turn = 1;
