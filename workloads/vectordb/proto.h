@@ -57,4 +57,33 @@ struct __attribute__((packed)) SearchResp {
   uint16_t pad;
 };
 
+// SearchResp.flags bit: a SearchCoh block follows ids[n] and scores[n] (servers since vdb build 9). Clients that do not
+// know the block ignore the trailing bytes.
+constexpr uint16_t kRespCoh = 1;
+
+// Per-query coherence time (server/qcoh.h, DESIGN.md §14): sums over the query's sections on the search threads.
+// Thread time, summed over the query's sections (segment tasks run in parallel on several threads).
+// coh_ns = pf_fault_ns + mg_check_est_ns + mg_reexec_est_ns (only one system's part is non-zero in practice):
+//   page MSI: managed-fault handler time of the query's sections (/proc/thread-self/swmc deltas)
+//   Megalon:  mg_check_est_ns = max(0, rd_start + rd_end - 2 clock_ns x rd_sampled) x kSample (sampled read
+//             sections, timer overhead subtracted); mg_reexec_est_ns = rd_retries x mean failed attempt (this
+//             query's timed failed attempts minus clock_ns each; none timed: its mean sampled section minus 3 clock_ns)
+struct __attribute__((packed)) SearchCoh {
+  uint16_t version;  // kSearchCohVersion
+  uint16_t source;   // page MSI counter source: 0 none (no swmc file), 1 swmc, 2 fake (Host tests only)
+  uint32_t sections; // sections attributed (start + one per segment task)
+  uint64_t coh_ns;
+  uint64_t pf_fault_ns, pf_msg_wait_ns, pf_local_wait_ns;
+  uint32_t pf_faults, pf_transactions;
+  uint64_t mg_rd_sampled, mg_rd_start_ns, mg_rd_body_ns, mg_rd_end_ns, mg_rd_retries, mg_rd_failed_timed,
+      mg_rd_failed_ns;          // raw (uncalibrated) sampled sums of the query's read sections
+  uint32_t clock_ns;            // timer-read overhead per timed interval (server start calibration)
+  uint32_t mg_sample;           // Megalon read-section sampling factor (0: not Megalon)
+  uint64_t mg_check_est_ns, mg_reexec_est_ns;
+  uint64_t busy_ns;             // thread time of the query's sections (start + segment tasks, incl. lock waits);
+                                // segment tasks run in parallel, so busy_ns (and coh_ns) can exceed the latency
+};
+constexpr uint16_t kSearchCohVersion = 1;
+static_assert(sizeof(SearchCoh) == 136, "SearchCoh wire size");
+
 }  // namespace vdb

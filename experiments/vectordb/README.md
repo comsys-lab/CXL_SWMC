@@ -42,6 +42,8 @@ recovery/M3-vdb-runs-vN/                 packet evidence dir (one approved attem
         ├── steps.jsonl, summary.json   per-step statistics and the SLO-search result (max_offered_x_pass, confirm)
         ├── manifest.txt               loadgen parameters
         ├── searches.bin, vectordb.txt  every search response (query row, E1 snapshot, ids, server time split)
+        ├── search-coh.bin             vdb build >= 9: per-query coherence block of every OK search response
+        │                              (DESIGN.md §14); qcoh.py -> <run>/qcoh-steps.csv (m4-run.sh QCOH_EXPECT)
         ├── stats/step<NNN>-{begin,end}-t<k>.txt   server stats snapshots per measured step (--stats-op)
         └── raw-step<N>.bin             per-request sched/send/done ns (--raw)
 ```
@@ -63,3 +65,6 @@ False-sharing classification of a Megalon run (offline), optionally limited to o
 `python3 workloads/vectordb/tools/classify_retries.py --trace r<k> --out r<k>-fs [--stats r<k>/loadgen --step N]`
 Recall / E1 check of a run (offline, never during a measurement):
 `python3 workloads/vectordb/tools/compute_gt.py --data <dataset dir> --writes <writes.bin> --searches r<k>/loadgen/searches.bin --out r<k>-gt`
+Coherence time per search query (vdb build >= 9; search threads only, writer per update separately; offline):
+`python3 experiments/vectordb/qcoh.py r<k> [--queries r<k>/qcoh-queries.csv]` -> `r<k>/qcoh-steps.csv`.
+H1 main block (reports/M4-vdb-packet.md v2.0): `experiments/vectordb/h1-block.sh <evidence dir>`.

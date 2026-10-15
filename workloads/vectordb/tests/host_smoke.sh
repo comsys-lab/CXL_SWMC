@@ -46,7 +46,7 @@ done
 set +e
 taskset -c "$CPUS" "$LG" --workload vectordb --target 127.0.0.1:19300,127.0.0.1:19301 --out "$S/loadgen" --stats-op 10 \
   --opt data="$D" --opt writes="$D/writes.bin" --mode fixed --rates "$RATES" --mix "$MIX" --warmup-s 2 \
-  --step-warmup-s 1 --step-measure-s 5 --drain-s 2 > "$S/loadgen.log" 2>&1
+  --step-warmup-s 1 --step-measure-s 5 --drain-s 2 --raw > "$S/loadgen.log" 2>&1
 LGRC=$?
 set -e
 for p in "${PIDS[@]}"; do kill -TERM "$p"; done

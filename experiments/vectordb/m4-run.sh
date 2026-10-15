@@ -8,11 +8,14 @@
 #   KIND=fixed|pfix: RATE (total req/s of the scaled streams = L / (1 - U/100)); TRACE (0 | 1, default 0; Megalon only)
 #   DATASET: 28m (default: pubmed-a27m-b1m-q10k, image seg32c32m-a27m) | 1m (pubmed-a1m-b1m-q10k, writes
 #   writes-a1m-b1m-u1m.bin, image seg32c32m)
-#   Builds / guest install dirs (defaults = M4): PLAIN_BUILD (builds/vdb/8), VPLAIN (/home/comsys/vdb8),
+#   Builds / guest install dirs (defaults = M4): LOADGEN_BIN (builds/loadgen/4/loadgen), PLAIN_BUILD (builds/vdb/8), VPLAIN (/home/comsys/vdb8),
 #   MEG_BUILD (builds/vdb-megalon/6), VMEG (/home/comsys/vdbm6-28m)
 #   SYS=Popcorn: C8 (build-8 deploy bundle dir), K8 (release), GT8 (guest tools dir), RECV_MODE (poll | idle | sleep)
 # optional: REP (repeat label, recorded), SEED (loadgen --seed, default 20261015), GATE=0 (skip the Host gate:
-#   functional runs only).
+#   functional runs only), QCOH_EXPECT (none | swmc: per-query coherence, vdb build >= 9, DESIGN.md §14; both
+#   servers must log "query coherence on, page MSI source <QCOH_EXPECT>", end with qcoh.read_errors=0 and
+#   qcoh.open_errors=0, and every OK search response must carry the block (vectordb.txt ok_without_coh=0,
+#   bad_coh_version=0); then qcoh.py writes <run>/qcoh-steps.csv).
 # Prints "M4RUN <name> OK|NOTE|STOP <reason>"; exit 0 for OK/NOTE (NOTE = a loadgen SLO-search outcome that is a
 # result, not an error: "confirm failed at three rates"), 1 for STOP (the sequence stops).
 set -uo pipefail
@@ -36,7 +39,7 @@ MEG_BUILD=${MEG_BUILD:-$P/builds/vdb-megalon/6} VMEG=${VMEG:-/home/comsys/vdbm6-
 SA="--nodes 2 --segments 32 --M 16 --efc 128 --ef 32 --max-writes 2097152 --max-ids $MAXIDS --max-deletes 1048576
  --search-threads 14 --wait-timeout-ms 60000 --start-timeout-ms 5400000"
 SA=$(echo $SA)
-export LOADGEN=$P/builds/loadgen/4/loadgen READY_TIMEOUT=5400 RUN_KIND=measurement TRACE STATS_OP=10 INIT
+export LOADGEN=${LOADGEN_BIN:-$P/builds/loadgen/4/loadgen} READY_TIMEOUT=5400 RUN_KIND=measurement TRACE STATS_OP=10 INIT
 [ "$KIND" = functional ] && RUN_KIND=functional
 export RUN_KIND
 case "$SYS" in
@@ -124,6 +127,15 @@ done
   [ -f "$E/preload-$NAME.log" ] && grep -h "PRELOAD DONE\|preload_wall_s" "$E/preload-$NAME.log"
   grep -h "loaded .* initial records\|published preloaded\|warm-up read\|READY node" $R/node*.log
   grep -h "^start=\|^end=" $R/manifest.txt; } > $R/load-times.txt
+if [ -n "${QCOH_EXPECT:-}" ]; then  # per-query coherence (DESIGN.md §14)
+  for k in 0 1; do
+    grep -qE "^vdb-server: query coherence on, page MSI source $QCOH_EXPECT[ :]" $R/node$k.log || stop "node$k: query coherence source != $QCOH_EXPECT"
+    { grep -qx "qcoh.read_errors=0" $R/node$k.log && grep -qx "qcoh.open_errors=0" $R/node$k.log; } || stop "node$k: qcoh read/open errors"
+  done
+  { grep -qx "ok_without_coh=0" $R/loadgen/vectordb.txt && grep -qx "bad_coh_version=0" $R/loadgen/vectordb.txt; } \
+    || stop "search responses without a coherence block"
+  python3 $X/qcoh.py $R > $R/qcoh.log 2>&1 || echo "M4RUN $NAME: qcoh.py failed (analysis only; see $R/qcoh.log)"
+fi
 python3 $X/e1_check.py --writes $W --na $NA --nb $NB --searches $R/loadgen/searches.bin --out $R/e1 --sample 500 > /dev/null \
   || stop "E1 violation (see $R/e1.e1.txt)"
 grep -q "workload_finish\":\"ok" $R/loadgen/summary.json || stop "loadgen workload finish"

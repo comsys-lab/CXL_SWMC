@@ -122,10 +122,15 @@ struct __attribute__((packed)) RetryRec {  // 48 B
 };
 // Wrapper counters, one block per thread (owner-only relaxed load + store: no shared cache-line writes on the read
 // path), summed at stats time.
+// Each block has the role of its thread (server thread ids: 0 main, 1 writer, >= 2 search; set by thread_init), so
+// stats report the search-serving threads and the writer separately (megt.search.*, megt.writer.*, megt.main.*);
+// megt.* without a role is the sum over all blocks (as before).
 struct alignas(64) MegTimers {
   enum : int { kRdSampled, kRdStartNs, kRdBodyNs, kRdEndNs, kRdRetries, kRdFailedTimed, kRdFailedNs, kWrSections,
                kWrStartNs, kWrBodyNs, kWrEndNs, kRefetch, kFirstSight, kN };
+  enum : int { kRoleMain, kRoleWriter, kRoleSearch, kRoleOther, kRoles };
   std::atomic<uint64_t> v[kN] = {};
+  std::atomic<int> role{kRoleOther};
   void add(int k, uint64_t d) { v[k].store(v[k].load(std::memory_order_relaxed) + d, std::memory_order_relaxed); }
 };
 
@@ -202,7 +207,18 @@ class MegalonBackend {
   }
 
   // ---- sections
-  void thread_init(int tid) const { api_->reg(tid); }
+  void thread_init(int tid) const {
+    api_->reg(tid);
+    tm().role.store(tid == 0 ? MegTimers::kRoleMain : tid == 1 ? MegTimers::kRoleWriter : MegTimers::kRoleSearch);
+  }
+  // This thread's counters (owner-only writes: exact deltas around a section; server.cc per-query attribution).
+  void thread_snap(uint64_t *out) const {
+    MegTimers &t = tm();
+    for (int k = 0; k < MegTimers::kN; k++) out[k] = t.v[k].load(std::memory_order_relaxed);
+  }
+  // Timer-read overhead per timed interval (qcoh.h calibrate_clock_ns, measured once at server start); reported as
+  // megt.clock_ns. The counters stay raw; analysis subtracts clock_ns per timed interval.
+  void set_clock_ns(uint32_t c) { clock_ns_ = c; }
   // Read section over [off, off + len): f(const uint8_t *) may run more than once and must only produce its result
   // (per-attempt local state); returns the result of the accepted attempt.
   template <class F> auto read(uint64_t id, uint64_t off, uint64_t len, F f) const {
@@ -334,13 +350,18 @@ class MegalonBackend {
       << "\nmegalon.write_retry=" << s.write_retry << "\nmegalon.switch_rw=" << s.switch_rw
       << "\nmegalon.flushes=" << s.flushes << "\nmegalon.flush_bytes=" << s.flush_bytes
       << "\nmegalon.replay_flushes=" << s.replay_flushes << "\nmegalon.replay_flush_bytes=" << s.replay_flush_bytes
-      << "\nmegt.sample=" << kSample;
+      << "\nmegt.sample=" << kSample << "\nmegt.clock_ns=" << clock_ns_;
     static const char *const names[MegTimers::kN] = {"rd_sampled", "rd_start_ns", "rd_body_ns", "rd_end_ns",
                                                       "rd_retries", "rd_failed_timed", "rd_failed_ns", "wr_sections",
                                                       "wr_start_ns", "wr_body_ns", "wr_end_ns", "trace_refetch",
                                                       "trace_first_sight"};
-    const std::vector<uint64_t> sum = timers();
+    static const char *const roles[MegTimers::kRoles] = {"main.", "writer.", "search.", "other."};
+    const std::vector<uint64_t> sum = timers(-1);
     for (int k = 0; k < MegTimers::kN; k++) o << "\nmegt." << names[k] << "=" << sum[k];
+    for (int r = 0; r < MegTimers::kRoles; r++) {
+      const std::vector<uint64_t> rs = timers(r);
+      for (int k = 0; k < MegTimers::kN; k++) o << "\nmegt." << roles[r] << names[k] << "=" << rs[k];
+    }
     o << "\n";
     return o.str();
   }
@@ -448,11 +469,12 @@ class MegalonBackend {
     }
     return *mine;
   }
-  std::vector<uint64_t> timers() const {
+  std::vector<uint64_t> timers(int role) const {  // role -1: all blocks
     std::vector<uint64_t> sum(MegTimers::kN, 0);
     std::lock_guard<std::mutex> g(tmu_);
     for (const MegTimers *t : tblocks_)
-      for (int k = 0; k < MegTimers::kN; k++) sum[k] += t->v[k].load(std::memory_order_relaxed);
+      if (role < 0 || t->role.load() == role)
+        for (int k = 0; k < MegTimers::kN; k++) sum[k] += t->v[k].load(std::memory_order_relaxed);
     return sum;
   }
   void log_retry(uint64_t id, uint64_t off, uint64_t len, uint64_t s0) const {
@@ -467,7 +489,7 @@ class MegalonBackend {
   uint64_t *oseq_ = nullptr;  // HWcc: per object, seq of its last write section (trace only)
   mutable std::unique_ptr<std::atomic<uint64_t>[]> ocache_;  // this node: last objseq value seen per object
   bool trace_ = false;
-  uint32_t node_ = 0;
+  uint32_t node_ = 0, clock_ns_ = 0;
   mutable std::vector<MegTimers *> tblocks_;  // every thread's counter block (under tmu_)
   mutable std::mutex tmu_;
   mutable std::vector<WsecRec> wlog_;

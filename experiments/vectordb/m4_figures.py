@@ -25,6 +25,12 @@ Outputs in DIR:
   fig2c.csv    Megalon fixed load with trace: classify_retries counts (retry, refetch, combined) for the window
   table2.csv   Megalon fixed load: failed read sections and refetches per update on the other node, mean time of one
                re-executed attempt, switch_rw (reclaims are not exposed by the shim; switch_rw reported instead)
+  Per-query coherence (runs with loadgen/search-coh.bin, vdb build >= 9; qcoh.py, DESIGN.md §14):
+  qcoh-steps-all.csv  qcoh.py step rows of every run (label = <block>/<run>; SLO-search curves of coherence per query)
+  fig1b-query.csv     U=5 fixed load, one row per run: mean latency, all-HWcc latency at the same L, per-query
+               coherence (search threads: mean / p50 / p99, page MSI message wait / local wait / other handler time,
+               Megalon checks / re-executed work, thread time of the query, coh/busy, wall-equivalent), the window
+               time-share of the search threads, writer coherence per update (separate)
 """
 import argparse, csv, glob, json, os, re, statistics as st, subprocess, sys
 
@@ -35,6 +41,8 @@ ROOT = os.path.dirname(os.path.dirname(HERE))
 sys.path.insert(0, os.path.join(ROOT, "experiments", "loadgen"))
 import export_csv  # noqa: E402
 import stats_delta  # noqa: E402
+sys.path.insert(0, HERE)
+import qcoh  # noqa: E402
 
 NAME = re.compile(r"^(hw|mg|pop)-u(\d+)-(slo|fix|func|pslo|pfix)(?:-(\w+))?$")
 KIND = {"pslo": "slo", "pfix": "fix"}
@@ -240,6 +248,29 @@ def main():
     write(os.path.join(a.out, "fig2c.csv"), cc, f2c)
     write(os.path.join(a.out, "table2.csv"), ["block", "run", "u", "node", "updates_other_node", "failed_reads",
           "failed_reads_per_update", "incoherent_per_update", "mean_failed_attempt_us", "switch_rw"], t2)
+    # per-query coherence tables
+    qall, fq = [], []
+    for r in R:
+        if not os.path.exists(os.path.join(r["dir"], "loadgen", "search-coh.bin")):
+            continue
+        rows_q, _, summ = qcoh.analyze(r["dir"])
+        for x in rows_q:
+            qall.append(dict(x, label=f"{r['block']}/{r['run']}", system=r["system"], kind=r["kind"], rep=r["rep"],
+                             match=summ))
+        if r["kind"] == "fix":
+            for x in rows_q:
+                if x["phase"] == "fixed":
+                    fq.append(dict(x, block=r["block"], run=r["run"], system=r["system"], u=r["u"],
+                                   hw_latency_same_L_ms=None))
+    hwq = {x["u"]: x["latency_mean_ms"] for x in fq if x["system"] == "all-HWcc"}
+    for x in fq:
+        x["hw_latency_same_L_ms"] = hwq.get(x["u"])
+    write(os.path.join(a.out, "qcoh-steps-all.csv"), ["label", "system", "kind", "rep"] + qcoh.COLS + ["match"], qall)
+    write(os.path.join(a.out, "fig1b-query.csv"), ["block", "run", "system", "u", "achieved", "latency_mean_ms",
+          "hw_latency_same_L_ms", "queries", "coh_mean_ms", "coh_p50_ms", "coh_p99_ms", "pf_msg_wait_mean_ms",
+          "pf_local_wait_mean_ms", "pf_other_mean_ms", "mg_check_mean_ms", "mg_reexec_mean_ms", "busy_mean_ms",
+          "coh_frac_of_busy", "coh_wall_equiv_mean_ms", "server_ms_mean", "ts_search_coh_ms", "ts_vs_query",
+          "writer_coh_ms_per_update", "writer_wr_flush_ms_per_update", "ambiguous", "unmatched_measured"], fq)
     print(f"{len(R)} runs -> {a.out}")
 
 

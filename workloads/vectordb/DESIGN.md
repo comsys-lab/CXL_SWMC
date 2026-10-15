@@ -339,6 +339,42 @@ indexing unit; Megalon flushes the whole object at write end (no dirty-line trac
 - Host smoke test: tests/host_smoke.sh (2 processes on a scratch file, plain or Megalon); unit tests
   tests/plugin_pairs_test.cc, tests/classify_retries_test.py, experiments/loadgen/test/stats_delta_test.py.
 
+## 14. Per-query coherence time (implemented 2026-10-16, vdb build 9; user decision before the H1 main runs)
+
+- Every search response carries its own coherence time: `SearchResp.flags & kRespCoh` and a `SearchCoh` block
+  (proto.h) after ids/scores (old clients ignore the trailing bytes). Search-serving threads only; the writer is
+  reported separately by the window counters (thr.vdb-writer.swmc.*, megt.writer.*). The window time-share
+  (stats deltas / searches) stays.
+- Attribution (server/qcoh.h, server.cc qc_*): a query = its start section (E1 wait + delete-log replay) + one task
+  per segment, run by any search thread. Between sections a search thread touches no shared memory (queues, merge,
+  reply are process-local), so each search thread reads its own counters once at the end of every section and adds
+  the change since its previous section end to the query (under QueryCtx::mu, before done.fetch_add, so the
+  finishing thread sees all sections). A search whose E1 wait times out gets no response: its section delta is
+  counted in `qcoh.unattributed_*`, not carried into the next query.
+  - page MSI: `/proc/thread-self/swmc` (Popcorn build >= 8), one fd per search thread, `pread` at offset 0 and parse
+    (`qcoh.swmc_read_ns` = median read cost at start). Read on every system whose kernel has the file (H1 runs all
+    three systems on build 8: identical overhead; all-HWcc and Megalon read zeros with cxl_shm unloaded). Fields:
+    fault handler time, message wait, local wait, faults, transactions (read + write).
+  - Megalon: deltas of the thread's own MegTimers block (owner-only writes). Estimate per query: checks =
+    max(0, read_start + read_end - 2 clock_ns x sampled) x 64; re-executed work = retries x mean failed attempt
+    (timed failed attempts minus clock_ns each; none timed: mean sampled section minus 3 clock_ns). Raw sums travel
+    in the block too.
+- Timer fix (Megalon): `clock_ns` = median of back-to-back CLOCK_MONOTONIC reads at server start (`megt.clock_ns`,
+  `qcoh.clock_ns`); every timed interval contains about one read's cost, subtracted in the estimates (the counters
+  stay raw). Wrapper blocks carry their thread's role (thread_init: 0 main, 1 writer, >= 2 search): stats print
+  `megt.<name>` (all, as before) and `megt.{main,writer,search,other}.<name>`.
+- `busy_ns` = thread time of the query's sections. Segment tasks run in parallel, so coh_ns and busy_ns are sums of
+  thread time and can exceed the latency; `experiments/vectordb/qcoh.py` reports both, coh/busy, and coh/busy x the
+  server time (wall-equivalent).
+- Output: loadgen plugin `search-coh.bin` (CohLog: seq, recv_ns, measured, target, status + SearchCoh);
+  `experiments/vectordb/qcoh.py RUN` -> `qcoh-steps.csv` (per measured step: per-query mean/p50/p99 and parts,
+  window time-share of search threads, writer per update, matched by the request's done time to the raw-step
+  records). `--query-coh off` disables reads and the block.
+- Tests (Host): tests/build_qcoh_test.sh (reader on fixture files in the kernel's format, estimate rule, clock),
+  tests/host_smoke.sh + tests/qcoh_check.py: `VDB_QCOH_FAKE=1` (plain; fake source = a segment's distance count:
+  per query fault_ns = dists exactly), BACKEND=megalon (sum of per-query sampled sums = megt.search totals; role
+  blocks sum to megt.*), plain without the swmc file (source none, coh 0).
+
 ## 10. Future reference: E2 (not implemented)
 
 - No-wait: s_used = min(P, ref_w); no staleness bound.
