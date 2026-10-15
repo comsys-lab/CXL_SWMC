@@ -23,7 +23,7 @@ set -uo pipefail
 CMD=${1:-} S=${2:-}
 [ -n "$CMD" ] && [ -n "$S" ] || { sed -n 2,20p "$0" >&2; exit 2; }
 HERE=$(cd "$(dirname "$0")" && pwd); ROOT=$(cd "$HERE/../.." && pwd)
-SSH="ssh -o BatchMode=yes -o ConnectTimeout=8"
+SSH="ssh -o BatchMode=yes -o ConnectTimeout=8 -o ServerAliveInterval=30 -o ServerAliveCountMax=10"
 LOCAL=${SESSION_LOCAL:-0}
 rx() {  # rx <node index> <command>: run on the node's guest (Host shell in SESSION_LOCAL=1)
   if [ "$LOCAL" = 1 ]; then bash -c "$2" < /dev/null; else $SSH comsys@"${NODE[$1]}" "$2" < /dev/null; fi
@@ -124,7 +124,8 @@ measure)
   for k in "${!NODE[@]}"; do  # both servers of this session still alive
     rx "$k" "kill -0 \$(cat $GRUN/node$k.pid) 2>/dev/null && ! grep -q FATAL $GRUN/node$k.log" || { echo "node$k server gone"; exit 3; }
   done
-  # idle: no queued query and counters unchanged over 5 s (queries drain after an overload step of the previous one)
+  # idle: no queued query, queries / samples / rows_written unchanged and updater CPU < 0.2 s over 5 s (queued queries
+  # of an overload step and an overrunning publication round of the previous measurement finish first)
   deadline=$(( $(date +%s) + ${IDLE_WAIT_S:-900} )) n=0
   while :; do
     n=$((n + 1)) ok=1
@@ -132,10 +133,13 @@ measure)
     sleep 5
     for k in "${!NODE[@]}"; do
       python3 "$HERE/stats_snap.py" "${NODE[$k]}:${PORTS[$k]}" "$M/idle$n-b-t$k.txt" > /dev/null || ok=0
-      for key in queries samples; do [ "$(kvget "$M/idle$n-a-t$k.txt" $key)" = "$(kvget "$M/idle$n-b-t$k.txt" $key)" ] || ok=0; done
+      for key in queries samples rows_written; do [ "$(kvget "$M/idle$n-a-t$k.txt" $key)" = "$(kvget "$M/idle$n-b-t$k.txt" $key)" ] || ok=0; done
+      # updater threads < 0.2 s CPU in the 5 s (rows_written moves only when a round ends; run_ns shows a running one)
+      ub=$(( $(kvget "$M/idle$n-b-t$k.txt" thr.rs-update.run_ns) - $(kvget "$M/idle$n-a-t$k.txt" thr.rs-update.run_ns) ))
+      [ "$ub" -lt 200000000 ] || ok=0
       [ "$(kvget "$M/idle$n-b-t$k.txt" serve_queue)" = 0 ] || ok=0
     done
-    echo "$(date -Is) idle probe $n ok=$ok" >> "$M/idle.txt"
+    echo "$(date -Is) idle probe $n ok=$ok updater_run_ns_5s=${ub:-}" >> "$M/idle.txt"
     [ $ok = 1 ] && break
     [ "$(date +%s)" -lt $deadline ] || { echo "servers not idle after ${IDLE_WAIT_S:-900} s"; exit 3; }
     sleep 10

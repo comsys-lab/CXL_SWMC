@@ -47,7 +47,7 @@ SA="--nodes 2 --row-div 1 --serve-threads 14 --update-threads 4 --load-threads 8
 SA=$(echo $SA)
 LGC=(--opt samples=$D/updates-zipf105-s1-16M.smp --opt queries=$D/queries-zipf105-s2-1M.smp
      --opt quantiles=$D/dist_quantile.txt --fixed update=$UPD_RATE --mix query=1 --x-stream query)
-export LOADGEN PROFILE=main RUN_KIND=measurement STATS_OP=10 READY_TIMEOUT=$((XT / 2))
+export LOADGEN PROFILE=main RUN_KIND=measurement STATS_OP=10 READY_TIMEOUT=$((XT / 2)) IDLE_WAIT_S=2400  # idle: an overrunning T = 60 s round may take > 10 min (Megalon)
 PS=(K=$K8 GT=$GT8 C=$C8 R=$E/shm-pop INIT_STATE=shared)
 CHOWNED=0
 stop_servers() {  # this block's servers only: every session dir's guest run dir + the preload pid dir

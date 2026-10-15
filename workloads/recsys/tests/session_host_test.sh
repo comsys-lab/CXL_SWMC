@@ -64,8 +64,8 @@ echo "gate: $(python3 "$X/main_util.py" gate60 "$S/gate/loadgen/steps.jsonl" "$S
 python3 "$X/main_util.py" gate60 "$S/gate/loadgen/steps.jsonl" "$SLO_MS" | grep -qE '^(PASS|MISS) p99_ms=' || bad "gate60 output"
 python3 "$X/main_util.py" gate60 "$S/gate/loadgen/steps.jsonl" 0.000001 | grep -q '^MISS' || bad "gate60 does not MISS at a tiny limit"
 for r in 1 2; do
-  m slo-r$r -- "${LGC[@]}" --opt seed=$((20261016 + r)) --seed $((20261016 + r)) --slo query:99:1000 --raw --mode slo \
-    --start 1 --factor 1.5 --precision 0.2 --max-steps 6 --warmup-s 2 --step-measure-s 5 --confirm-s 5; rc=$?
+  m slo-r$r -- "${LGC[@]}" --opt seed=$((20261016 + r)) --seed $((20261016 + r)) --slo query:99:$SLO_MS --raw --mode slo \
+    --start 1 --factor 1.5 --precision 0.2 --max-steps 20 --warmup-s 2 --step-measure-s 5 --confirm-s 5; rc=$?
   [ $rc = 0 ] || [ $rc = 1 ] || bad "slo-r$r rc $rc"
   grep -q 'workload_finish":"ok' "$S/slo-r$r/loadgen/summary.json" || bad "slo-r$r workload finish"
   echo "slo-r$r: $(head -c 400 "$S/slo-r$r/loadgen/summary.json")"
@@ -77,7 +77,13 @@ echo "seq: gate last=$g1, r1 base=$b1 last=$s1, r2 base=$b2"
 p1=$(sed -n 's/^published_seq=//p' "$S/slo-r1/post-t0.txt"); p2=$(sed -n 's/^published_seq=//p' "$S/slo-r2/post-t0.txt")
 echo "published_seq after r1=$p1 after r2=$p2"
 [ "$p2" -gt "$p1" ] && [ "$p1" -gt "$b1" ] || bad "published_seq does not rise over the lifetime"
-L=$(python3 "$X/main_util.py" half "$S/slo-r1/loadgen/summary.json") || { bad "no L from r1"; L=2; }
+L=""
+for r in 1 2; do  # half must refuse a noted search and give 0.5 x confirm mean otherwise (the block uses all-HWcc r1)
+  note=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("note",""))' "$S/slo-r$r/loadgen/summary.json")
+  if [ -n "$note" ]; then python3 "$X/main_util.py" half "$S/slo-r$r/loadgen/summary.json" > /dev/null 2>&1 && bad "half accepted noted slo-r$r"
+  else x=$(python3 "$X/main_util.py" half "$S/slo-r$r/loadgen/summary.json") || bad "half failed on slo-r$r"; [ -n "$L" ] || L=$x; fi
+done
+[ -n "$L" ] || { bad "no SLO search with a confirm result (Host noise?)"; L=2; }
 echo "L=$L"
 m fixed -- "${LGC[@]}" --opt seed=20261016 --seed 20261016 --raw --mode fixed --rates "$L" --warmup-s 2 --step-measure-s 10; rc=$?
 [ $rc = 0 ] || bad "fixed rc $rc"
