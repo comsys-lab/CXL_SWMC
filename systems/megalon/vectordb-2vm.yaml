@@ -16,7 +16,7 @@ log_sync_interval_us: 100
 nr_log_size: 64MB
 attach_timeout_s: 600
 start_barrier_timeout_s: 600
-object_arena_size: 90GB   # parsed as GiB; fits SWcc (95.73 GiB) with nr_log 64 MB
+object_arena_size: 90GB
 object_align: 64
 object_max_count: 65536         # hwcc flavor only (static records): >= object count (vdb-server prints objects=)
 replicate: false
