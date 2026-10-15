@@ -62,6 +62,9 @@ into a single `cxl_region` struct; nothing else defines offsets.
 ## 3. Trace
 
 Generated once per experiment, deterministic seed, shared by all systems.
+Since 2026-10-15 only the writes are pre-generated (tools/gen_writes.py: op, target, w_seq, id, vec_ref);
+searches, their sched_t and ref_w are made at run time by the loadgen plugin (§9). The table below is the
+logical request model.
 
 | field | meaning |
 | --- | --- |
@@ -206,20 +209,19 @@ Atomicity and coherence are separate problems.
   (9:1, 8:2, 2:1), rising total rate. ≥3 repeats; immutable result dirs with
   manifest (CLAUDE.md "Experiments").
 
-## 9. Load generation
+## 9. Load generation (implemented 2026-10-15)
 
-- Existing tools checked (2026-10-14): `workloads/rag/reqgen/*.py` is
-  closed-loop (each client awaits its response) and sends text to the
-  LangChain `/chat` endpoint; LMDB open-loop generation lives inside db_bench
-  (`readopen`) and is not reusable for HTTP requests.
-- Plan: reuse the reqgen aiohttp session/statistics code; replace only the
-  client loop with an open-loop trace replayer that fires each request at
-  sched_t without awaiting earlier ones, sharded over several processes pinned
-  to Host node1 CPUs (16-31,48-63). It records send lag vs sched_t, completion,
-  timeouts and outstanding requests. Rewrite in C++ only if send lag shows the
-  Python replayer is the bottleneck at target rates.
-- Requests go straight to trace target_vm; no coordinator (global order comes
-  from w_seq). Rationale vs Megalon's client setup: TBD (audit).
+- Generic engine: CXL_SWMC/experiments/loadgen (open-loop, latency from the scheduled time, warmup, steps,
+  max throughput under SLO by ramp + bisection + confirm repeats; README there). Binary frames over TCP
+  (frame.h; python/frame.py for Python callers such as a LangChain VectorStore).
+- vectordb plugin (loadgen/vectordb_plugin.cc): stream `write` (ordered, writes file from tools/gen_writes.py
+  in w_seq order, each to its target VM) and stream `search` (query row and target drawn with the seed).
+  Searches are made at run time, in global schedule order, so ref_w = the last write made before the search =
+  the last write scheduled at or before it (E1, §4). The trace therefore holds only the write order; rates come
+  from the loadgen step.
+- GT/recall: tools/compute_gt.py after the run from writes + searches.bin (also counts E1 violations:
+  returned ids not visible at the snapshot).
+- Loadgen pinned to Host node1 CPUs; requests go straight to target VMs (no coordinator).
 
 ## 10. Future reference: E2 (not implemented)
 
