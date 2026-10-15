@@ -1,11 +1,15 @@
 // vectordb backends (DESIGN.md §7, §11): where SWcc data lives and which coherence actions wrap its access.
 // SWcc objects (the data units a coherence system manages): per segment and group g a vector chunk (~32 MiB,
 // immutable once written) and a link chunk (level-0 links + the group's upper-level links); one delete log per node. The common synchronisation (HWcc atomics, P, element locks) is identical in every system.
-//   plain   all-HWcc and Popcorn: fixed placement, no coherence actions.
-//   megalon (next): paper §4 objects with read/write sections; granularity decided with the user.
+//   plain   all-HWcc and Popcorn: fixed placement, no coherence actions (direct pointers).
+//   megalon paper §4 objects, one object per chunk, every access in a read/write section (megalon_backend.h, §12).
+// Backend interface used by server.cc (Server<Backend>): Acc (shm_hnsw.h accessor) and mem(s, meta); thread_init(tid);
+// create_objects / check_objects; write_chunk / read_chunk (whole-line writes; reads may re-run their body);
+// dlog_write / dlog_scan; usage(), stats().
 #pragma once
 
 #include <cstdint>
+#include <cstring>
 #include <string>
 
 #include "cxl_region.h"
@@ -13,8 +17,12 @@
 
 namespace vdb {
 
+enum class Chunk { kVec, kLink };
+
 class PlainBackend {
  public:
+  using Acc = PlainAcc;
+  static constexpr const char *kLayoutTag = "";  // the plain HWcc layout hash is unchanged
   PlainBackend(const cxl::region &r, uint8_t *map, const Params &p) : map_(map), p_(p) {
     uint64_t off = r.swcc.offset;
     vstride_ = page(p.g.vchunk_bytes());
@@ -41,6 +49,36 @@ class PlainBackend {
     return map_ + segs_ + s * seg_bytes_ + p_.g.groups() * vstride_ + g * lstride_;
   }
   DlogEntry *dlog(uint32_t node) const { return reinterpret_cast<DlogEntry *>(map_ + dlog_ + node * dlog_node_); }
+
+  Acc::Mem mem(uint32_t s, GraphMeta *meta) const {
+    Acc::Mem m{meta, {}, {}};
+    for (uint64_t g = 0; g < p_.g.groups(); g++) {
+      m.vec.push_back(vec_chunk(s, g));
+      m.link.push_back(link_chunk(s, g));
+    }
+    return m;
+  }
+  void thread_init(int) const {}
+  bool create_objects(std::string *) const { return true; }
+  bool check_objects(std::string *) const { return true; }
+  uint8_t *chunk(Chunk k, uint32_t s, uint64_t g) const { return k == Chunk::kVec ? vec_chunk(s, g) : link_chunk(s, g); }
+  // fill(dst) writes the bytes at chunk offset off
+  template <class F> void write_chunk(Chunk k, uint32_t s, uint64_t g, uint64_t off, uint64_t, F fill) const {
+    fill(chunk(k, s, g) + off);
+  }
+  template <class F> auto read_chunk(Chunk k, uint32_t s, uint64_t g, uint64_t off, uint64_t, F f) const {
+    return f(static_cast<const uint8_t *>(chunk(k, s, g) + off));
+  }
+  void dlog_write(uint32_t node, uint64_t e, const DlogEntry &d) const { std::memcpy(dlog(node) + e, &d, sizeof(d)); }
+  template <class F> void dlog_scan(uint32_t node, uint64_t from, uint64_t to, F f) const {
+    const DlogEntry *log = dlog(node);
+    for (uint64_t e = from; e < to; e++) {
+      DlogEntry d;
+      std::memcpy(&d, log + e, sizeof(d));
+      f(d);
+    }
+  }
+  std::string stats() const { return ""; }
   std::string usage() const {
     return "plain segments=" + std::to_string(p_.segments) + " groups=" + std::to_string(p_.g.groups()) +
            " per_chunk=" + std::to_string(p_.g.per_chunk()) + " vchunk=" + std::to_string(p_.g.vchunk_bytes()) +

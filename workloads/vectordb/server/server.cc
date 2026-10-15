@@ -2,7 +2,9 @@
 // workloads/vectordb/proto.h. Data: `segments` HNSW graphs (shm_hnsw.h) shared by all nodes in CXL memory; record id
 // -> segment id % segments; every node inserts into every segment under the segment's HWcc write lock, searches take
 // the read lock (Qdrant-style). Threads: one reader per connection, one writer (this node's writes in arrival
-// order), N search workers.
+// order), N search workers. Backend (--backend plain|megalon, DESIGN.md §7, §12): where the SWcc data live and which
+// coherence actions wrap each access; Server<Backend> is compiled once per backend, so the plain path has no
+// indirection.
 #include <fcntl.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
@@ -25,11 +27,13 @@
 #include <sstream>
 #include <string>
 #include <thread>
+#include <type_traits>
 #include <vector>
 
 #include "backend.h"
 #include "frame.h"
 #include "layout.h"
+#include "megalon_backend.h"
 #include "proto.h"
 #include "shm_hnsw.h"
 
@@ -61,6 +65,8 @@ struct Opts {
   uint64_t wait_timeout_ms = 10000, start_timeout_ms = 600000;
   std::string init_dir;  // initial segments (tools/build_index); node 0 loads them
   std::string region;    // region config (default $CXL_REGION_CONFIG)
+  std::string backend = "plain";
+  std::string megalon_lib;  // default: <dir of the executable>/../lib/libvdb-megalon.so
 };
 
 struct Conn {
@@ -113,34 +119,42 @@ struct Stats {
       replay_ns{0}, search_ns{0}, lock_ns{0}, insert_ns{0}, insert_lock_ns{0};
 };
 
+template <class Be>
 class Server {
  public:
+  using Graph = HnswT<typename Be::Acc>;
   explicit Server(Opts o) : o_(std::move(o)), p_(o_.p) {}
 
   void start() {
     std::string err;
     if (!cxl::region_load(o_.region.empty() ? nullptr : o_.region.c_str(), &r_, &err)) die("region: " + err);
     if (p_.nr_nodes == 0 || o_.node >= p_.nr_nodes || p_.segments == 0) die("bad node/nodes/segments");
-    HwccLayout lay(p_);
-    int fd = int(syscall(SYS_openat, AT_FDCWD, r_.device.c_str(), O_RDWR | O_CLOEXEC));
-    if (fd < 0) die("open " + r_.device);
-    void *m = mmap(reinterpret_cast<void *>(r_.map_va), r_.device_size, PROT_READ | PROT_WRITE,
-                   MAP_SHARED | MAP_FIXED_NOREPLACE, fd, 0);
-    if (m == MAP_FAILED || m != reinterpret_cast<void *>(r_.map_va)) die("mmap " + r_.device + " at map_va");
-    map_ = static_cast<uint8_t *>(m);
+    HwccLayout lay(p_, Be::kLayoutTag);
+    if constexpr (std::is_same_v<Be, MegalonBackend>) {
+      // Megalon maps the whole device at map_va when its library initialises (dlopen; joins the run and waits in its
+      // start barrier for every node); the server uses that mapping and never maps the device itself.
+      if (2 + o_.search_threads > 32) die("megalon: at most 32 registered threads per node (main, writer, searchers)");
+      api_ = megalon_load(o_.megalon_lib, &err);
+      if (!api_) die(err);
+      if (api_->node_id() != o_.node) die("megalon node id " + std::to_string(api_->node_id()) + " != --node");
+      if (!mapped_by(r_.map_va, r_.device_size, r_.device, &err)) die(err);
+      map_ = reinterpret_cast<uint8_t *>(r_.map_va);
+      std::fprintf(stderr, "vdb-server: megalon initialised (%s), device mapped by Megalon at map_va\n", api_->info);
+    } else {
+      int fd = int(syscall(SYS_openat, AT_FDCWD, r_.device.c_str(), O_RDWR | O_CLOEXEC));
+      if (fd < 0) die("open " + r_.device);
+      void *m = mmap(reinterpret_cast<void *>(r_.map_va), r_.device_size, PROT_READ | PROT_WRITE,
+                     MAP_SHARED | MAP_FIXED_NOREPLACE, fd, 0);
+      if (m == MAP_FAILED || m != reinterpret_cast<void *>(r_.map_va)) die("mmap " + r_.device + " at map_va");
+      map_ = static_cast<uint8_t *>(m);
+    }
     if (!cxl::hwcc::app_init(r_, map_, lay.L, o_.run_id, p_.nr_nodes, o_.node, o_.start_timeout_ms, &err)) die(err);
     h_ = std::make_unique<Hwcc>(cxl::hwcc::app_base(r_, map_), lay);
-    be_ = std::make_unique<PlainBackend>(r_, map_, p_);
+    if constexpr (std::is_same_v<Be, MegalonBackend>) be_ = std::make_unique<Be>(r_, map_, p_, api_);
+    else be_ = std::make_unique<Be>(r_, map_, p_);
     if (!be_->fits(&err)) die(err);
-    for (uint32_t s = 0; s < p_.segments; s++)
-    {
-      ShmHnsw::Mem mem{&h_->segs[s].meta, {}, {}};
-      for (uint64_t g = 0; g < p_.g.groups(); g++) {
-        mem.vec.push_back(be_->vec_chunk(s, g));
-        mem.link.push_back(be_->link_chunk(s, g));
-      }
-      g_.push_back(std::make_unique<ShmHnsw>(p_.g, std::move(mem)));
-    }
+    be_->thread_init(0);  // main thread: prepare (object creation, initial copy) and warm-up
+    for (uint32_t s = 0; s < p_.segments; s++) g_.push_back(std::make_unique<Graph>(p_.g, be_->mem(s, &h_->segs[s].meta)));
     std::fprintf(stderr,
                  "vdb-server: node %u/%u run %#lx %s\nvdb-server: region %s\nvdb-server: app layout %lu B (used %lu, "
                  "hash %016lx), backend %s\n",
@@ -165,7 +179,7 @@ class Server {
       die("not every node became ready in time");
     warm_up();
     std::thread([this] { writer(); }).detach();
-    for (uint32_t i = 0; i < o_.search_threads; i++) std::thread([this] { searcher(); }).detach();
+    for (uint32_t i = 0; i < o_.search_threads; i++) std::thread([this, i] { searcher(int(2 + i)); }).detach();
     std::thread([this] { listen_loop(); }).detach();
   }
 
@@ -181,7 +195,7 @@ class Server {
       << "\ninsert_lock_ms=" << st_.insert_lock_ns / 1000000 << "\nwrite_queue=" << wq_.size()
       << "\nsearch_queue=" << search_queue_len();
     for (uint32_t v = 0; v < p_.nr_nodes; v++) o << "\ndlog_count." << v << "=" << load_acquire(&h_->nodes[v].dlog_count);
-    o << "\nbackend=" << be_->usage() << "\n";
+    o << "\nbackend=" << be_->usage() << "\n" << be_->stats();
     return o.str();
   }
 
@@ -191,9 +205,11 @@ class Server {
   // seg-<s>-v<g>.bin (vector chunk, used bytes) and seg-<s>-l<g>.bin (whole link chunk); manifest.txt with the graph
   // parameters. Images are copied into the chunk objects as is (offsets are chunk-relative).
   void load_initial() {
-    for (uint32_t s = 0; s < p_.segments; s++) ShmHnsw::init_empty(&h_->segs[s].meta);
-    if (o_.init_dir.empty()) return;
+    for (uint32_t s = 0; s < p_.segments; s++) Graph::init_empty(&h_->segs[s].meta);
     const uint64_t t0 = now_ns();
+    std::string err;
+    if (!be_->create_objects(&err)) die(err);
+    if (o_.init_dir.empty()) return;
     std::ifstream man(o_.init_dir + "/manifest.txt");
     std::string line, want = "graph " + std::to_string(p_.segments) + " " + std::to_string(p_.g.dim) + " " +
                              std::to_string(p_.g.M) + " " + std::to_string(p_.g.ef_construction) + " " +
@@ -209,9 +225,9 @@ class Server {
       const uint64_t N = p_.g.per_chunk();
       for (uint64_t g = 0; g * N < count; g++) {
         const std::string b = o_.init_dir + "/seg-" + std::to_string(s);
-        read_file(b + "-v" + std::to_string(g) + ".bin", be_->vec_chunk(uint32_t(s), g),
-                  std::min(N, count - g * N) * p_.g.vrec_bytes());
-        read_file(b + "-l" + std::to_string(g) + ".bin", be_->link_chunk(uint32_t(s), g), p_.g.lchunk_bytes());
+        const uint64_t vb = std::min(N, count - g * N) * p_.g.vrec_bytes(), lb = p_.g.lchunk_bytes();
+        be_->write_chunk(Chunk::kVec, uint32_t(s), g, 0, vb, [&](uint8_t *dst) { read_file(b + "-v" + std::to_string(g) + ".bin", dst, vb); });
+        be_->write_chunk(Chunk::kLink, uint32_t(s), g, 0, lb, [&](uint8_t *dst) { read_file(b + "-l" + std::to_string(g) + ".bin", dst, lb); });
       }
       GraphMeta &m = h_->segs[s].meta;
       m.upper_cur = ucur;
@@ -227,16 +243,24 @@ class Server {
 
   // Read every byte of the populated chunks once (every node, before READY; identical in every system), so that
   // measurements do not include the first touch of shared pages (page faults / nested-paging fills).
+  // Megalon: every node first checks every object (ids and sizes; node 0 created them before publishing `loaded`),
+  // and the warm-up reads go through read sections.
   void warm_up() {
     const uint64_t t0 = now_ns();
+    std::string err;
+    if (!be_->check_objects(&err)) die(err);
     uint64_t bytes = 0, sum = 0;
     for (uint32_t s = 0; s < p_.segments; s++) {
       const uint64_t n = load_acquire(&h_->segs[s].meta.count), N = p_.g.per_chunk();
       for (uint64_t g = 0; g * N < n; g++) {
         const uint64_t vb = std::min(N, n - g * N) * p_.g.vrec_bytes();
-        for (const uint8_t *c : {be_->vec_chunk(s, g), be_->link_chunk(s, g)}) {
-          const uint64_t len = c == be_->vec_chunk(s, g) ? vb : p_.g.lchunk_bytes();
-          for (uint64_t o = 0; o < len; o += 64) sum += c[o];
+        for (Chunk k : {Chunk::kVec, Chunk::kLink}) {
+          const uint64_t len = k == Chunk::kVec ? vb : p_.g.lchunk_bytes();
+          sum += be_->read_chunk(k, s, g, 0, len, [&](const uint8_t *c) {
+            uint64_t x = 0;
+            for (uint64_t o = 0; o < len; o += 64) x += c[o];
+            return x;
+          });
           bytes += len;
         }
       }
@@ -255,6 +279,7 @@ class Server {
 
   // ---------------------------------------------------------------- writer (this node's writes, arrival order)
   void writer() {
+    be_->thread_init(1);
     for (;;) {
       Job j = wq_.pop();
       const uint32_t n = frame::payload_len(j.h);
@@ -299,7 +324,7 @@ class Server {
     de.id = id;
     de.del_seq = w;
     de.check = uint32_t(id) ^ uint32_t(id >> 32) ^ w ^ kDlogMagic;
-    std::memcpy(be_->dlog(o_.node) + e, &de, sizeof(de));  // whole line
+    be_->dlog_write(o_.node, e, de);  // whole line
     store_release(&h_->nodes[o_.node].dlog_count, e + 1);
   }
 
@@ -321,16 +346,13 @@ class Server {
   // Replay node u's delete log up to `upto` entries into del_seq_ (one cursor per log, under dmu_[u]).
   void replay(uint32_t u, uint64_t upto) {
     std::lock_guard<std::mutex> g(dmu_[u]);
-    const DlogEntry *log = be_->dlog(u);
-    for (uint64_t e = dcursor_[u]; e < upto; e++) {
-      DlogEntry d;
-      std::memcpy(&d, log + e, sizeof(d));
+    be_->dlog_scan(u, dcursor_[u], upto, [&](const DlogEntry &d) {
       if (d.check != (uint32_t(d.id) ^ uint32_t(d.id >> 32) ^ d.del_seq ^ kDlogMagic) || d.id >= p_.max_ids) {
         st_.bad_records++;
-        continue;
+        return;
       }
       if (d.del_seq < del_seq_[d.id]) __atomic_store_n(&del_seq_[d.id], d.del_seq, __ATOMIC_RELAXED);
-    }
+    });
     if (upto > dcursor_[u]) __atomic_store_n(&dcursor_[u], upto, __ATOMIC_RELEASE);
   }
 
@@ -358,7 +380,8 @@ class Server {
     scv_.notify_one();
   }
 
-  void searcher() {
+  void searcher(int tid) {
+    be_->thread_init(tid);
     for (;;) {
       QueryCtx *task = nullptr;
       Job job;
@@ -433,16 +456,20 @@ class Server {
     const uint64_t l0 = now_ns();
     cxl::hwcc::read_lock(&sl.lock);
     c->lock_ns += now_ns() - l0;
-    const ShmHnsw &g = *g_[sg];
+    const Graph &g = *g_[sg];
     const uint32_t s = c->s;
     auto allowed = [&](uint32_t i) {
-      const ElemHeader &h = g.header(i);
+      ElemHeader tmp;
+      const ElemHeader &h = g.header(i, tmp);
       return h.ins_seq <= s && __atomic_load_n(&del_seq_[h.ext_id], __ATOMIC_RELAXED) > s;
     };
     uint64_t nd = 0;
     g.search(c->q, c->k, o_.ef, allowed, &part, visited, tag, &nd);
     std::vector<std::pair<float, uint64_t>> mine;
-    for (auto &pr : part) mine.emplace_back(pr.first, g.header(pr.second).ext_id);
+    for (auto &pr : part) {
+      ElemHeader tmp;
+      mine.emplace_back(pr.first, g.header(pr.second, tmp).ext_id);
+    }
     cxl::hwcc::read_unlock(&sl.lock);
     c->dists += nd;
     {
@@ -543,8 +570,9 @@ class Server {
   cxl::region r_;
   uint8_t *map_ = nullptr;
   std::unique_ptr<Hwcc> h_;
-  std::unique_ptr<PlainBackend> be_;
-  std::vector<std::unique_ptr<ShmHnsw>> g_;
+  const MegalonApi *api_ = nullptr;
+  std::unique_ptr<Be> be_;
+  std::vector<std::unique_ptr<Graph>> g_;
   Stats st_;
   Queue wq_;
   std::mutex smu_;  // search scheduling
@@ -560,12 +588,24 @@ class Server {
 
 volatile sig_atomic_t g_stop = 0;
 
+template <class Be>
+int run(const Opts &o) {
+  Server<Be> s(o);
+  s.start();
+  while (!g_stop) usleep(200000);
+  std::fprintf(stderr, "vdb-server: stopping\n%s", s.stats_text().c_str());
+  std::fflush(stderr);
+  std::_Exit(0);
+}
+
 void usage() {
   std::fprintf(stderr,
                "usage: vdb-server --node K --nodes N --run-id 0x.. [--port P] [--region yaml] [--init-dir DIR]\n"
                "  [--segments S] [--search-threads N] [--ef E] [--seed N]\n"
                "  [--dim D] [--M M] [--efc E] [--chunk-bytes B (32 MiB)] [--max-writes W] [--max-ids N] [--dlog-chunk E] [--max-deletes D]\n"
-               "  [--wait-timeout-ms T] [--start-timeout-ms T]\n"
+               "  [--wait-timeout-ms T] [--start-timeout-ms T] [--backend plain|megalon] [--megalon-lib PATH]\n"
+               "--backend megalon: Megalon (RACKOBJ_CONFIG, object_arena_size > 0) maps the device; MEGALON_NODE_ID and\n"
+               "  MEGALON_RUN_ID default to --node and --run-id, CXL_REGION_CONFIG to --region (DESIGN.md §12).\n"
                "All nodes need identical parameters (checked through the HWcc app layout hash).\n"
                "CXL_APP_HWCC_BYTES must equal the app layout size: vdb-server --print-app-bytes [params].\n");
   std::exit(2);
@@ -602,6 +642,8 @@ int main(int argc, char **argv) {
     else if (a == "--max-deletes") o.p.max_deletes = std::stoull(v());
     else if (a == "--wait-timeout-ms") o.wait_timeout_ms = std::stoull(v());
     else if (a == "--start-timeout-ms") o.start_timeout_ms = std::stoull(v());
+    else if (a == "--backend") o.backend = v();
+    else if (a == "--megalon-lib") o.megalon_lib = v();
     else if (a == "--print-app-bytes") print_bytes = true;
     else usage();
   }
@@ -614,10 +656,28 @@ int main(int argc, char **argv) {
   signal(SIGPIPE, SIG_IGN);
   signal(SIGTERM, [](int) { g_stop = 1; });
   signal(SIGINT, [](int) { g_stop = 1; });
-  Server s(o);
-  s.start();
-  while (!g_stop) usleep(200000);
-  std::fprintf(stderr, "vdb-server: stopping\n%s", s.stats_text().c_str());
-  std::fflush(stderr);
-  std::_Exit(0);
+  if (o.backend == "plain") return run<PlainBackend>(o);
+  if (o.backend != "megalon") usage();
+  // Megalon reads its node id, run id and region config from the environment when its library initialises.
+  auto env = [](const char *k, const std::string &v) {
+    const char *cur = getenv(k);
+    if (cur && *cur && v != cur) {
+      std::fprintf(stderr, "vdb-server: %s=%s contradicts the server option (%s)\n", k, cur, v.c_str());
+      std::exit(2);
+    }
+    setenv(k, v.c_str(), 1);
+  };
+  env("MEGALON_NODE_ID", std::to_string(o.node));
+  if (!getenv("MEGALON_RUN_ID") || !*getenv("MEGALON_RUN_ID")) setenv("MEGALON_RUN_ID", std::to_string(o.run_id).c_str(), 1);
+  else if (std::stoull(getenv("MEGALON_RUN_ID"), nullptr, 0) != o.run_id) env("MEGALON_RUN_ID", std::to_string(o.run_id));
+  if (!o.region.empty()) env("CXL_REGION_CONFIG", o.region);
+  if (o.megalon_lib.empty()) {
+    char exe[4096];
+    ssize_t n = readlink("/proc/self/exe", exe, sizeof(exe) - 1);
+    if (n <= 0) usage();
+    exe[n] = 0;
+    std::string d(exe);
+    o.megalon_lib = d.substr(0, d.rfind('/')) + "/../lib/libvdb-megalon.so";
+  }
+  return run<MegalonBackend>(o);
 }

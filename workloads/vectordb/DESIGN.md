@@ -154,7 +154,7 @@ offset is measured at run start/end and recorded.
   `vdb_coh_write(obj, body)` likewise.
 - Common synchronisation (one writer per VM, HWcc atomics, release/acquire,
   P advance) is never compiled out.
-- Megalon object granularity (append chunk, index object, delete-log chunk) TBD.
+- Megalon object granularity: one object per chunk (§12).
 - Audit facts (reports/M2-megalon-audit.md): the all-HWcc Megalon flavor is
   FULL_COHERENCE (NO_COHERENCE means nothing is coherent). Artifact objects are
   fixed 1 KiB/4 KiB slots with copy-out Put/Get only; Knowhere needs contiguous
@@ -244,6 +244,43 @@ VMs (no per-VM graphs); Qdrant-style segments, count = CPUs of the VM socket (ho
   computations +3% over 105k writes) and puts fine-grained shared writes where the coherence systems differ.
 - Host pilot (node1, 2 processes x 12 search threads, shm file, 1M records, writes 500/s, search p99 <= 50 ms):
   max under SLO 521 +- 2 search/s (3/3 confirm), p99 30 +- 1 ms, recall@10 0.997, E1 violations 0, ~6 min.
+
+## 12. Megalon backend (implemented 2026-10-15)
+
+User decisions 2026-10-15: follow the paper as is (no coherence optimisations of our own); one Megalon object per
+indexing unit; Megalon flushes the whole object at write end (no dirty-line tracking); D3 write contract.
+- Selection: `vdb-server --backend plain|megalon`; `Server<Backend>` and `HnswT<Accessor>` are compiled once per
+  backend, so the plain path is the old code with direct pointers (tools/build_index output byte-identical).
+- Objects (server/megalon_backend.h, deterministic ids `0x5644<<48 | kind<<44 | a<<24 | b`): per segment s and group g
+  a vector chunk (kind 1, `vchunk_bytes`) and a link chunk (kind 2, `lchunk_bytes`); per node u the delete log in
+  chunks of `dlog_chunk` 64 B entries (kind 3). Node 0 creates all objects at prepare (before it publishes `loaded`);
+  every node checks every id and size by ObjectLookup before warm-up. Production size (2M ids, 32 segments, 32 MiB
+  chunks, 2 x 8M deletes): 7.43 GiB of objects (`object_arena_size` 8GB, systems/megalon/vectordb-2vm.yaml).
+- Sections (one per chunk access, never nested): distance = read section over the vector (dot product inside,
+  result kept only if ObjectReadEnd accepts); header / vector / link block reads copy into per-attempt scratch;
+  a link update reads the block in a read section, then writes the whole block (3 or 2 lines) in a write section;
+  an insert writes header + vector (49 lines) in one write section on the vector chunk and zeroes its level-0 and
+  upper blocks in one write section on the link chunk; a delete writes one 64 B entry in a write section; replay
+  copies the published entries chunk by chunk in read sections and applies them after the section. Initial images
+  are copied by node 0 in one write section per chunk; warm-up reads every populated chunk in read sections.
+- HWcc: unchanged (segment rwlocks, graph meta, P, applied, node lines in region.app). Megalon maps the whole device
+  at map_va when its library initialises; the server checks that mapping in /proc/self/maps and never maps the device.
+  The layout hash includes ` backend=megalon` (plain hash unchanged), so both nodes must run the same backend.
+- Packaging: the server does not link libmegalon (its static constructor maps the device and waits in the start
+  barrier at load). `lib/libvdb-megalon.so` (server/megalon_shim.cc, linked against libmegalon) is dlopen()ed only for
+  `--backend megalon`; build with server/build-megalon.sh <out> builds/megalon/<n> (flavor megalon, `--wmeta packed4`).
+- Run: `RACKOBJ_CONFIG` (object_arena_size > 0), `CXL_APP_HWCC_BYTES` (also carves Megalon's hwcc_alloc), node 0 with
+  `MEGALON_REINIT=1` unless the control block is empty; MEGALON_NODE_ID / MEGALON_RUN_ID / CXL_REGION_CONFIG default to
+  --node / --run-id / --region (a contradicting value is refused). At most 32 registered threads per node: main,
+  writer and the search workers (`--search-threads` <= 30). The server exits with _Exit (no Megalon teardown
+  barrier), so the next run's node 0 needs MEGALON_REINIT=1. Server stats add `megalon.*` object counters
+  (sections, retries, flushes, replay flushes).
+- Deviations / notes: segment atomicity stays with the HWcc rwlock (§7.1), Megalon only provides coherence; the
+  per-access section granularity follows "one section per object access" and is not batched. Host functional test
+  (2026-10-15, /dev/shm file region, 20k + 50k subset, 1 MiB chunks, 2 x 4 search threads): recall@10 0.9998,
+  invisible_returned 0, timeouts 0 (also with 256-entry delete-log chunks and inserts crossing into new groups);
+  read retries (incoherent) occurred and were re-run. A file region is HW coherent, so this proves the API usage,
+  not the coherence protocol (see Limitation above).
 
 ## 10. Future reference: E2 (not implemented)
 

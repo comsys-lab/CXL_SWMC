@@ -57,8 +57,9 @@ struct alignas(64) SegLines {  // HWcc per segment: lock and graph meta on separ
 struct HwccLayout {
   cxl::hwcc::layout L;
   uint64_t off_p, off_nodes, off_applied, off_segs;
-  explicit HwccLayout(const Params &p) {
-    L.add(("vdb-seg " + p.describe()).c_str(), 0, 8);  // parameters go into the layout hash
+  // backend_tag: "" for plain (hash unchanged), " backend=megalon" for Megalon; the size never depends on it
+  explicit HwccLayout(const Params &p, const char *backend_tag = "") {
+    L.add(("vdb-seg " + p.describe() + backend_tag).c_str(), 0, 8);  // parameters go into the layout hash
     off_p = L.add("P", 8);
     off_nodes = L.add("nodes", uint64_t(p.nr_nodes) * sizeof(NodeLine));
     off_applied = L.add("applied", (p.max_writes + 1 + 63) / 64 * 8);
