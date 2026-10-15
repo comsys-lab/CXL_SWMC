@@ -181,6 +181,11 @@ PY
   log "scenario $name PASS"
 }
 
+# Coherence state from a status file (the kernel exposes no enabled flag): the last of the dmesg lines
+# "swmc-popcorn: region:" (load) / "page coherence enabled|disabled" -> loaded | on | off.
+coh_state() { awk '/^dmesg: .*swmc-popcorn: region:/{st="loaded"} /^dmesg: .*page coherence enabled/{st="on"}
+  /^dmesg: .*page coherence disabled/{st="off"} END{print st}' "$1"; }
+
 case "${1:-}" in
 list)
   : "${2:?scenario file}"
@@ -214,7 +219,7 @@ precheck)
     grep -qx "param.init_state=$INIT_STATE" "$s"
     grep -qx 'dax0.0=comsys:root 600' "$s"
     grep -qx 'swmc.in_flight_transaction_count=0' "$s"
-    if [ "$ENABLED" = 1 ]; then ! grep -qx 'swmc.managed_bytes=0' "$s"; else grep -qx 'swmc.managed_bytes=0' "$s"; fi
+    test "$(coh_state "$s")" = "$([ "$ENABLED" = 1 ] && echo on || echo loaded)"
     test -z "$(on $k "pgrep -a -x 'faultlat|vdb-server' || true")"
   done
   log "stress precheck PASS (init_state $INIT_STATE, enabled $ENABLED, recv_mode $RECV_MODE)" ;;
@@ -222,8 +227,10 @@ preload)
   need; : "${2:?scenario file}" "${SALT:?SALT}"
   [ "$INIT_STATE" = shared ] || { echo "preload needs INIT_STATE=shared"; exit 2; }
   G 0 status > "$R/status-preload-vm0.txt"
-  grep -qx 'swmc.managed_bytes=0' "$R/status-preload-vm0.txt"   # coherence still off: plain mapping
+  # loaded shared, never enabled since load: plain mapping. managed_bytes is set at load (cxl_shm v7), so it
+  # cannot tell; init_state has no ' (initialized)' suffix until the first enable.
   grep -qx 'swmc.init_state=shared' "$R/status-preload-vm0.txt"
+  test "$(coh_state "$R/status-preload-vm0.txt")" = loaded
   while IFS='|' read -r name T H R0 R1 dist D off a0 a1 extra; do
     on 0 "CXL_REGION_CONFIG=$GS/cxl_region.yaml $GS/faultlat contend --init-only --pages $H --page-offset $off --salt $SALT" \
       | tee -a "$R/preload.log"
