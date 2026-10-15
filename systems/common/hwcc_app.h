@@ -49,6 +49,33 @@ template <class Pred> inline bool poll_until(Pred pred, uint64_t timeout_ms) {
   }
 }
 
+// Writer-preferring reader-writer lock in one HWcc word (cross-VM, polling). Layout: bit 63 writer active,
+// bits 32-47 writers waiting, bits 0-31 readers. New readers wait while a writer is active or waiting.
+struct alignas(64) rwlock {
+  uint64_t w;
+  uint8_t pad[56];
+};
+static_assert(sizeof(rwlock) == 64, "rwlock is one line");
+constexpr uint64_t kRwWriter = 1ull << 63, kRwWaiter = 1ull << 32, kRwWaiterMask = 0xffffull << 32;
+
+inline void read_lock(rwlock *l) {
+  for (;;) {
+    uint64_t s = load_relaxed(&l->w);
+    if (!(s & (kRwWriter | kRwWaiterMask)) && cas(&l->w, &s, s + 1)) return;
+    _mm_pause();
+  }
+}
+inline void read_unlock(rwlock *l) { __atomic_fetch_sub(&l->w, uint64_t(1), __ATOMIC_RELEASE); }
+inline void write_lock(rwlock *l) {
+  __atomic_fetch_add(&l->w, kRwWaiter, __ATOMIC_ACQ_REL);
+  for (;;) {
+    uint64_t s = load_relaxed(&l->w);
+    if (!(s & kRwWriter) && (s & 0xffffffffull) == 0 && cas(&l->w, &s, (s - kRwWaiter) | kRwWriter)) return;
+    _mm_pause();
+  }
+}
+inline void write_unlock(rwlock *l) { __atomic_fetch_and(&l->w, ~kRwWriter, __ATOMIC_RELEASE); }
+
 // ---- header at the start of region.app ----
 constexpr uint64_t kMagic = 0x4357434341505031ull;  // "CWCCAPP1"
 constexpr uint32_t kVersion = 1;

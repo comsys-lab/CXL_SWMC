@@ -39,13 +39,13 @@ struct __attribute__((packed)) SearchResp {
   uint32_t s_used;
   uint16_t n;  // results (<= k)
   uint16_t flags;
-  uint32_t wait_us;         // waiting for P >= ref_w
-  uint32_t replay_us;       // delete-log replay
-  uint32_t search_us;       // segment search incl. masks
-  uint32_t mask_us;         // snapshot-mask building (part of search_us)
-  uint32_t raw_scanned;     // records scanned on the raw path
-  uint16_t indexed_segs;    // segments searched on the index path
-  uint16_t sealed_backlog;  // SEALED (not yet indexed) segments seen
+  uint32_t wait_us;    // waiting for P >= ref_w
+  uint32_t replay_us;  // delete-log replay
+  uint32_t search_us;  // all segments, including lock waits
+  uint32_t lock_us;    // waiting for segment read locks (part of search_us)
+  uint32_t dists;      // distance computations
+  uint16_t segs;       // segments searched
+  uint16_t pad;
 };
 
 }  // namespace vdb

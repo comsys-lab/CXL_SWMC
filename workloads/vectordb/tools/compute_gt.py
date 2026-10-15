@@ -25,8 +25,8 @@ WDT = np.dtype([("op", "u1"), ("target", "u1"), ("pad0", "<u2"), ("w_seq", "<u4"
 def search_dtype(k):  # vectordb_plugin.cc SearchLog (packed) + ids[k] + scores[k]
     return np.dtype([("seq", "<u8"), ("qrow", "<u4"), ("ref_w", "<u4"), ("s_used", "<u4"), ("measured", "u1"),
                      ("pad", "u1"), ("status", "<u2"), ("n", "<u2"), ("k", "<u2"), ("wait_us", "<u4"),
-                     ("replay_us", "<u4"), ("search_us", "<u4"), ("mask_us", "<u4"), ("raw_scanned", "<u4"),
-                     ("indexed_segs", "<u2"), ("sealed_backlog", "<u2"), ("ids", "<u8", (k,)), ("scores", "<f4", (k,))])
+                     ("replay_us", "<u4"), ("search_us", "<u4"), ("lock_us", "<u4"), ("dists", "<u4"),
+                     ("segs", "<u2"), ("pad2", "<u2"), ("ids", "<u8", (k,)), ("scores", "<f4", (k,))])
 
 
 def read_fbin(path):

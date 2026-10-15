@@ -41,8 +41,8 @@ struct __attribute__((packed)) SearchLog {  // one per search response, followed
   uint32_t qrow, ref_w, s_used;
   uint8_t measured, pad;
   uint16_t status, n, k;
-  uint32_t wait_us, replay_us, search_us, mask_us, raw_scanned;
-  uint16_t indexed_segs, sealed_backlog;
+  uint32_t wait_us, replay_us, search_us, lock_us, dists;
+  uint16_t segs, pad2;
 };
 
 struct Fbin {
@@ -167,8 +167,7 @@ class VectorDb : public loadgen::Workload {
         bad_responses_.fetch_add(1);
       }
       lg.s_used = sr.s_used, lg.wait_us = sr.wait_us, lg.replay_us = sr.replay_us, lg.search_us = sr.search_us;
-      lg.mask_us = sr.mask_us, lg.raw_scanned = sr.raw_scanned, lg.indexed_segs = sr.indexed_segs;
-      lg.sealed_backlog = sr.sealed_backlog;
+      lg.lock_us = sr.lock_us, lg.dists = sr.dists, lg.segs = sr.segs;
     }
     std::memcpy(rec.data(), &lg, sizeof(lg));
     std::lock_guard<std::mutex> g(out_mu_);
