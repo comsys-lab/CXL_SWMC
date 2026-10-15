@@ -11,6 +11,11 @@
 #   NODE_ENV="ENV:RACKOBJ_CONFIG=$V/cfg/megalon.yaml" NODE0_ENV="ENV:MEGALON_REINIT=1".
 #   SERVER_CPUS (unset = no change): guest CPU list (e.g. 0-14); after READY every recsys-server thread on every
 #   node is pinned with taskset -a and verified; recorded in the manifest and node<k>.server-cpus.txt.
+#   T_MS (required): the updater's publication interval T in ms (recsys-server --publish-ms; 0 = every sample
+#   immediately), a start argument of every node, recorded in the manifest; SERVER_ARGS must not contain --publish-*.
+#   PROFILE (main [default] | pilot): loadgen timing defaults placed BEFORE the caller's loadgen args (the caller's
+#   later options win). main = MOT1 §3.3 (warm-up 10 s, step 3 s + 15 s, confirm 3 x 30 s, fill/overload points);
+#   pilot = MOT1 v5 pilots (warm-up 10 s, step 2 s + 8 s, confirm 1 x 15 s, no fill, no overload).
 #   TRACE: not supported by recsys-server (must stay 0).
 #   STATS_OP (default 10 = recsys kOpStats): loadgen --stats-op, a server stats snapshot per node at the start and end of
 #   every measured step (loadgen/stats/); STATS_OP=0 omits it. After the run: stats-steps.csv (stats_delta.py) and
@@ -18,7 +23,16 @@
 # Stops (and stops the servers) on the first error. Measurement hygiene: no Host build before/after (pgrep).
 set -euo pipefail
 NAME=$1 OUT=$2; shift 2; [ "${1:-}" = "--" ] && shift
-: "${SYSTEM:?}" "${V:?}" "${HOST_SERVER:?}" "${LOADGEN:?}" "${SERVER_ARGS:?}"
+: "${SYSTEM:?}" "${V:?}" "${HOST_SERVER:?}" "${LOADGEN:?}" "${SERVER_ARGS:?}" "${T_MS:?}"
+[[ $T_MS =~ ^[0-9]+$ ]] || { echo "bad T_MS"; exit 2; }
+case " $SERVER_ARGS " in *" --publish-"*) echo "SERVER_ARGS must not set --publish-*; use T_MS"; exit 2;; esac
+SERVER_ARGS="$SERVER_ARGS --publish-ms $T_MS"
+case "${PROFILE:-main}" in
+  main) PROF=(--warmup-s 10 --step-warmup-s 3 --step-measure-s 15 --drain-s 5 --confirm-reps 3 --confirm-s 30);;
+  pilot) PROF=(--warmup-s 10 --step-warmup-s 2 --step-measure-s 8 --drain-s 5 --confirm-reps 1 --confirm-s 15 --fill none --overload none);;
+  *) echo "bad PROFILE"; exit 2;;
+esac
+set -- "${PROF[@]}" "$@"
 read -r -a NODE <<< "${NODES:-192.168.122.100 192.168.122.101}"
 PORT=${PORT:-7100} LG_CPUS=${LG_CPUS:-56-63} TRACE=${TRACE:-0} STATS_OP=${STATS_OP:-10}
 [[ $TRACE =~ ^[01]$ ]] && [[ $STATS_OP =~ ^[0-9]+$ ]] || { echo "bad TRACE/STATS_OP"; exit 2; }
@@ -54,7 +68,7 @@ APP=$("$HOST_SERVER" $SERVER_ARGS --print-app-bytes)
   echo "cxl_swmc_dirty=$(git -C "$ROOT" status --porcelain | wc -l)"
   echo "host_server=$HOST_SERVER sha256=$(sha256sum "$HOST_SERVER" | cut -d' ' -f1)"
   echo "loadgen=$LOADGEN sha256=$(sha256sum "$LOADGEN" | cut -d' ' -f1)"
-  echo "server_args=$SERVER_ARGS"; echo "node_env=${NODE_ENV:-} node0_env=${NODE0_ENV:-}"; echo "app_hwcc_bytes=$APP"; echo "node0_args=${NODE0_ARGS:-}"; echo "loadgen_args=$*"
+  echo "publish_ms=$T_MS"; echo "profile=${PROFILE:-main}"; echo "server_args=$SERVER_ARGS"; echo "node_env=${NODE_ENV:-} node0_env=${NODE0_ENV:-}"; echo "app_hwcc_bytes=$APP"; echo "node0_args=${NODE0_ARGS:-}"; echo "loadgen_args=$*"
   echo "lg_cpus=$LG_CPUS"; echo "trace=$TRACE stats_op=$STATS_OP"
   [ -z "${SERVER_CPUS:-}" ] || echo "server_cpus=$SERVER_CPUS"
   for k in "${!NODE[@]}"; do
@@ -120,6 +134,7 @@ echo "end=$(date -Is) loadgen_rc=$LG" >> "$RUN/manifest.txt"
 if [ -s "$RUN/loadgen/steps.jsonl" ] && [ -s "$RUN/loadgen/summary.json" ]; then
   [ ! -d "$RUN/loadgen/stats" ] || python3 "$ROOT/experiments/loadgen/stats_delta.py" "$RUN/loadgen" --out "$RUN/stats-steps.csv" || true
   python3 "$ROOT/experiments/loadgen/export_csv.py" --out "$RUN/steps.csv" "$RUN/loadgen=$SYSTEM" > /dev/null || true
+  [ ! -d "$RUN/loadgen/stats" ] || python3 "$HERE/breakdown.py" "$RUN" --out "$RUN/breakdown.csv" || true  # §8.4 per-step coherence split
   python3 "$ROOT/experiments/loadgen/plot_slo.py" --out "$RUN/slo.png" "$RUN/loadgen=$SYSTEM" > "$RUN/slo-points.txt" 2>&1 || true
 fi
 grep -h "recsys-server: stopping" -A30 "$RUN"/node*.log | grep -E "^(node|queries|samples|rows_written|seq_retries|misses|torn_rows|update_misses|flush_overruns|published_seq)=" | tr '\n' ' '; echo

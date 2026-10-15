@@ -1,0 +1,141 @@
+#!/bin/bash
+# The recommendation-system pilot block (reports/RECSYS-design.md §8): every run on the page MSI kernel (build 8, K8):
+# all-HWcc and Megalon with cxl_shm unloaded, page MSI with cxl_shm loaded per run (init_state=shared + preload).
+# usage: pilot-block.sh k8 <evidence dir (exists, empty)>
+# env: C8 (= builds/popcorn_new/8/deploy-v3, verified: packet.sha256 hash, sha256sum -c, no SUPERSEDED.txt) K8 GT8
+#      RECV_MODE (page MSI build 8); MEG_BUILD (recsys-megalon build on builds/megalon/70, default
+#      builds/recsys-megalon/4; its manifest must name builds/megalon/70), VM_MEG (default /home/comsys/rsm4).
+# Runs (systems chosen by name):
+#   functional (T = 60 s): all-HWcc, Megalon, page MSI
+#   pilot SLO searches, order shuffled (seed = owner): all-HWcc T in {60 s, 1 s, 0}; page MSI T in {60 s, 1 s, 0};
+#     Megalon T in {60 s (H1), 0 (H3, reported)}
+#   30 s fixed-load windows (shuffled) at L = 0.5 x this block's all-HWcc result at the same T: the same 8 (system, T)
+# /dev/dax0.0: owned by comsys for all-HWcc/Megalon runs, back to root:root 600 before every page MSI run (its
+# p-popcorn-shm.sh precheck needs it; its teardown restores it). Holds workspaces/MEASUREMENT.lock; stops at the first
+# PILOTRUN STOP; on every exit: stop this block's servers (incl. a running --preload-only, via its pid file), tear down any page MSI run without "teardown PASS"
+# (instr-on retry), dax0.0 back to root:root 600, unlock (pattern of experiments/vectordb/m4-lib.sh block_finish).
+set -uo pipefail
+B=$1 E=$2
+P=/home/comsys/sungsu/destijl-control X=$P/CXL_SWMC/experiments/recsys G=$P/CXL_SWMC/experiments/vectordb/host-gate.sh
+: "${C8:?}" "${K8:?}" "${GT8:?}" "${RECV_MODE:?}"
+VM_MEG=${VM_MEG:-/home/comsys/rsm4} MB=${MEG_BUILD:-$P/builds/recsys-megalon/4}
+SSH="ssh -o BatchMode=yes -o ConnectTimeout=8"
+IPS=(192.168.122.100 192.168.122.101)
+OWNER="RECSYS-pilot-$B"
+[ "$B" = k8 ] || { echo "SEQUENCE STOP: bad block (only k8)"; exit 2; }
+grep -q "^megalon_build=$P/builds/megalon/70$" $MB/manifest.txt || { echo "SEQUENCE STOP: $MB is not on builds/megalon/70"; exit 2; }
+# page MSI bundle: deploy-v3 of build 8 (what the VMs run; has instr-on and the instr_enabled teardown gate), unchanged
+[ "$C8" = $P/builds/popcorn_new/8/deploy-v3 ] && [ ! -e $C8/SUPERSEDED.txt ] \
+  && [ "$(sha256sum < $C8/packet.sha256 | cut -d' ' -f1)" = c67fa82b8649c8de5afcfe65f48657555bef0fcb0e635fc36a751689afead5a4 ] \
+  && (cd $C8 && sha256sum -c --quiet packet.sha256) || { echo "SEQUENCE STOP: C8 is not the verified build-8 deploy-v3 bundle"; exit 2; }
+[ -d "$E" ] && [ -z "$(ls -A "$E" | grep -v '^sequence')" ] || { echo "SEQUENCE STOP: $E missing or not empty"; exit 2; }
+bash $G lock "$OWNER" || { echo "SEQUENCE STOP: lock"; exit 2; }
+CHOWNED=0
+stop_servers() {  # this block's servers only (guest run dirs from this block's run manifests)
+  local ip g
+  for ip in "${IPS[@]}"; do
+    for g in $(sed -n 's/^guest_run_dir=//p' "$E"/*/manifest.txt 2>/dev/null) $(cat "$E"/preload-*.dir 2>/dev/null); do
+      $SSH comsys@$ip "for k in 0 1; do [ -e $g/node\$k.pid ] && /home/comsys/rs3/bin/recsys-node.sh stop $g \$k; done; true" < /dev/null 2>&1 \
+        | sed "s|^|$ip $g |" >> "$E/rollback.out"
+    done
+    $SSH comsys@$ip 'echo procs=$(pgrep -c -x recsys-server)' < /dev/null 2>&1 | sed "s/^/$ip /" >> "$E/rollback.out"
+  done
+}
+shm_cleanup() {  # page MSI runs whose load was attempted and that have no "teardown PASS"
+  local r
+  for r in "$E"/shm-*/; do
+    r=${r%/}
+    [ -f "$r/load-vm0.txt" ] || continue
+    grep -q "teardown PASS" "$r/steps.log" 2>/dev/null && continue
+    echo "$(date -Is) cleanup teardown $r" >> "$E/cleanup.out"
+    if ! env K=$K8 GT=$GT8 C=$C8 R=$r bash $C8/p-popcorn-shm.sh teardown >> "$E/cleanup.out" 2>&1; then
+      if grep -q "instr_enabled=1 missing" "$r/steps.log" 2>/dev/null; then
+        env K=$K8 GT=$GT8 C=$C8 R=$r bash $C8/p-popcorn-shm.sh instr-on >> "$E/cleanup.out" 2>&1 \
+          && env K=$K8 GT=$GT8 C=$C8 R=$r bash $C8/p-popcorn-shm.sh teardown >> "$E/cleanup.out" 2>&1
+      fi
+    fi
+    grep -q "teardown PASS" "$r/steps.log" 2>/dev/null || echo "CLEANUP FAILED: $r (manual: P-popcorn packet §6)" | tee -a "$E/cleanup.out"
+  done
+}
+dax_root_all() {  # writes this check's results to a fresh file ($1, default a new numbered file) and to rollback.out
+  local ip f=${1:-$E/dax-root-$(date +%s%N).out}
+  for ip in "${IPS[@]}"; do
+    $SSH comsys@$ip 'sudo -n chown root:root /dev/dax0.0 && sudo -n chmod 600 /dev/dax0.0; echo stat=$(stat -c "%U:%G %a" /dev/dax0.0)' \
+      < /dev/null 2>&1 | sed "s/^/$ip /" | tee -a "$E/rollback.out" > "$f.$ip"
+  done
+  DAXF=$f
+}
+finish() { stop_servers; shm_cleanup; [ $CHOWNED = 1 ] && dax_root_all; bash $G unlock "$OWNER"; }
+trap finish EXIT
+trap 'echo "$(date -Is) SEQUENCE STOP: interrupted"; exit 130' INT TERM HUP
+dax_comsys() {  # before an all-HWcc / Megalon run
+  [ $CHOWNED = 1 ] && return 0
+  local ip
+  for ip in "${IPS[@]}"; do
+    $SSH comsys@$ip 'sudo -n chown comsys /dev/dax0.0 && stat -c "%U:%G %a" /dev/dax0.0' < /dev/null > "$E/chown-$ip.out" 2>&1
+    CHOWNED=1
+    grep -qx "comsys:root 600" "$E/chown-$ip.out" || { echo "SEQUENCE STOP: chown $ip"; exit 1; }
+  done
+}
+dax_root() {  # before a page MSI run (no server of ours runs between runs)
+  [ $CHOWNED = 1 ] || return 0
+  stop_servers; dax_root_all; CHOWNED=0
+  local ip
+  for ip in "${IPS[@]}"; do
+    [ "$(grep -o 'stat=.*' "$DAXF.$ip")" = "stat=root:root 600" ] || { echo "SEQUENCE STOP: dax0.0 on $ip not back to root:root 600"; exit 1; }
+  done
+}
+run() {  # system name, run name, env assignments...
+  local s=$1 name=$2; shift 2
+  case $s in hw|mg) dax_comsys;; pop) dax_root;; esac
+  local SE
+  case $s in
+    hw) SE=(SYS=all-HWcc);;
+    mg) SE=(SYS=Megalon VM_MEG=$VM_MEG HOST_MEG=$MB);;
+    pop) SE=(SYS=Popcorn C8=$C8 K8=$K8 GT8=$GT8 RECV_MODE=$RECV_MODE);;
+  esac
+  env "${SE[@]}" "$@" bash $X/pilot-run.sh "$name" "$E" 2>&1 | tee -a "$E/runs.log" | grep -E "^PILOTRUN"
+  local st=${PIPESTATUS[0]}
+  [ $st = 0 ] || { echo "$(date -Is) SEQUENCE STOP at $name"; exit 1; }
+}
+shuffle() { python3 -c 'import random,sys; v=sys.argv[2:]; random.Random(sys.argv[1]).shuffle(v); print(" ".join(v))' "$OWNER" "$@"; }
+confirm_half() {  # 0.5 x the confirm mean of an SLO run without a note (a noted run is never used for L)
+  python3 -c 'import json,sys; s=json.load(open(sys.argv[1])); c=s.get("confirm",{})
+if s.get("note"): sys.exit("note: " + s["note"])
+x=c.get("x_mean",0)
+if not x > 0: sys.exit("no confirm result")
+print(round(0.5 * x, 3))' "$1"
+}
+precheck() {  # kernel release
+  local i f files="rs3/bin/recsys-server rs3/bin/recsys-node.sh rs3/cfg/cxl_region.yaml ${VM_MEG#/home/comsys/}/bin/recsys-server ${VM_MEG#/home/comsys/}/bin/recsys-node.sh ${VM_MEG#/home/comsys/}/lib/libmegalon-objapi.so ${VM_MEG#/home/comsys/}/lib/libmegalon.so ${VM_MEG#/home/comsys/}/cfg/megalon.yaml ${VM_MEG#/home/comsys/}/cfg/cxl_region.yaml"
+  for i in 0 1; do
+    $SSH comsys@${IPS[$i]} "EXPECT_K=$1 INSTALL_FILES='$files' bash -s" < $X/precheck.sh > "$E/precheck-${IPS[$i]}.out" 2>&1
+    grep -q "^PRECHECK PASS" "$E/precheck-${IPS[$i]}.out" || { echo "SEQUENCE STOP: precheck ${IPS[$i]}"; exit 1; }
+    for f in "rs3/bin/recsys-server $P/builds/recsys/3/bin/recsys-server" "${VM_MEG#/home/comsys/}/bin/recsys-server $MB/bin/recsys-server" \
+             "${VM_MEG#/home/comsys/}/lib/libmegalon-objapi.so $MB/lib/libmegalon-objapi.so" "${VM_MEG#/home/comsys/}/lib/libmegalon.so $MB/lib/libmegalon.so" \
+             "${VM_MEG#/home/comsys/}/cfg/megalon.yaml $P/CXL_SWMC/systems/megalon/recsys-pilot-2vm.yaml" \
+             "rs3/cfg/cxl_region.yaml $P/CXL_SWMC/config/cxl_region.yaml" "${VM_MEG#/home/comsys/}/cfg/cxl_region.yaml $P/CXL_SWMC/config/cxl_region.yaml" \
+             "rs3/bin/recsys-node.sh $P/CXL_SWMC/scripts/guest/recsys-node.sh" "${VM_MEG#/home/comsys/}/bin/recsys-node.sh $P/CXL_SWMC/scripts/guest/recsys-node.sh"; do
+      set -- $f
+      grep -q "^$(sha256sum "$2" | cut -d' ' -f1)  /home/comsys/$1\$" "$E/precheck-${IPS[$i]}.out" \
+        || { echo "SEQUENCE STOP: ${IPS[$i]} /home/comsys/$1 != $2"; exit 1; }
+    done
+  done
+  (cd $P/workspaces/recsys-data/pilot && sha256sum -c --quiet <(grep -E '^[0-9a-f]{64}  ' MANIFEST.txt)) > "$E/inputs-check.out" 2>&1 \
+    || { echo "SEQUENCE STOP: pilot inputs differ from their manifest"; exit 1; }
+}
+tag() { case $1 in 60000) echo t60s;; 1000) echo t1s;; 0) echo t0;; *) echo t$1ms;; esac; }
+echo "$(date -Is) block $OWNER start (git $(git -C $P/CXL_SWMC rev-parse --short HEAD)) K8=$K8 RECV_MODE=$RECV_MODE MEG_BUILD=$MB"
+precheck "$K8"
+run hw hw-t60s-func T_MS=60000 KIND=functional GATE=0
+run mg mg-t60s-func T_MS=60000 KIND=functional GATE=0
+run pop pop-t60s-func T_MS=60000 KIND=functional GATE=0
+SET="hw:60000 hw:1000 hw:0 pop:60000 pop:1000 pop:0 mg:60000 mg:0"
+for st in $(shuffle $SET); do s=${st%:*} t=${st#*:}; run $s $s-$(tag $t)-slo T_MS=$t KIND=slo; done
+for st in $(shuffle $SET); do
+  s=${st%:*} t=${st#*:}
+  r=$(confirm_half $E/hw-$(tag $t)-slo/loadgen/summary.json) || { echo "SEQUENCE STOP: no all-HWcc result for T=$t"; exit 1; }
+  echo "$s T=$t L = 0.5 x hw-$(tag $t)-slo (this block, build 8) = $r query/s" >> "$E/fixed-load-L.txt"
+  run $s $s-$(tag $t)-fix T_MS=$t KIND=fixed RATE=$r
+done
+echo "$(date -Is) SEQUENCE DONE $OWNER"

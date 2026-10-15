@@ -8,6 +8,7 @@
 #pragma once
 
 #include <dlfcn.h>
+#include <time.h>
 
 #include <algorithm>
 #include <atomic>
@@ -16,6 +17,7 @@
 #include <thread>
 #include <vector>
 #include <fstream>
+#include <memory>
 #include <sstream>
 #include <string>
 #include <type_traits>
@@ -44,7 +46,8 @@ class PlainBackend {
   }
   std::string name() const { return "plain"; }
   uint8_t *slot(uint32_t k, uint64_t s) const { return map_ + base_ + (p_.slot_base[k] + s) * p_.slot_bytes; }
-  void thread_init(int) const {}
+  void thread_init(int, int = 0) const {}
+  void set_time_sample(uint32_t) {}
   template <class Par> bool create_objects(std::string *, Par &&) const { return true; }
   bool check_objects(std::string *, uint64_t) const { return true; }
   template <class F> auto read_slot(uint32_t k, uint64_t s, F f) const { return f(static_cast<const uint8_t *>(slot(k, s))); }
@@ -98,6 +101,27 @@ inline bool mapped_by(uint64_t va, uint64_t len, const std::string &path, std::s
   return false;
 }
 
+// Megalon coherence time (MOT1 §3.3: time inside Megalon calls + work re-executed after a failed read_end), per
+// thread role. Timing every section would distort the measurement (≈ 150k sections per query), so 1 in `sample`
+// sections per thread is timed with the steady clock (all of its calls, and its body if read_end fails); call
+// counts are exact. Estimated time = sampled time × sections / sampled sections (per role and kind).
+enum Role : int { kRoleMain = 0, kRolePrep = 1, kRoleUpdate = 2, kRoleServe = 3, kRoles = 4 };
+inline const char *role_name(int r) {
+  static const char *n[] = {"main", "prep", "update", "serve"};
+  return n[r];
+}
+struct alignas(64) MegThr {
+  int role = kRoleMain;
+  uint32_t tick = 0;
+  std::atomic<uint64_t> rsec{0}, rsec_sampled{0}, wsec{0}, wsec_sampled{0}, read_fail{0};
+  std::atomic<uint64_t> rs_ns{0}, re_ns{0}, ws_ns{0}, we_ns{0}, reexec_ns{0};  // sampled sections only
+};
+inline uint64_t mono_ns() {
+  timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return uint64_t(ts.tv_sec) * 1000000000ull + uint64_t(ts.tv_nsec);
+}
+
 class MegalonBackend {
  public:
   static constexpr const char *kLayoutTag = " backend=megalon";
@@ -111,7 +135,15 @@ class MegalonBackend {
   std::string name() const { return "megalon"; }
   static constexpr uint64_t kBase = 0x5253ull << 48;  // "RS"
   static uint64_t id(uint32_t k, uint64_t s) { return kBase | uint64_t(k) << 40 | s; }
-  void thread_init(int tid) const { api_->reg(tid); }
+  // tid: Megalon registration id; role: Role (per-thread timing slot)
+  void thread_init(int tid, int role = kRoleMain) const {
+    api_->reg(tid);
+    std::lock_guard<std::mutex> g(thr_mu_);
+    thr_.push_back(std::make_unique<MegThr>());
+    thr_.back()->role = role;
+    me_ = thr_.back().get();
+  }
+  void set_time_sample(uint32_t n) { sample_ = n; }
 
   // Node 0 at prepare: one object per slot (all slots, empty ones too: a probe that reaches an empty slot reads it).
   // par(f) runs f(i) on every thread of the server's registered prep pool (NR registrations are never freed, so
@@ -163,26 +195,50 @@ class MegalonBackend {
   template <class F> auto read_slot(uint32_t k, uint64_t s, F f) const {
     using R = decltype(f(static_cast<const uint8_t *>(nullptr)));
     const uint64_t oid = id(k, s);
+    MegThr *t = me_;
+    const bool timed = t && sample_ && ++t->tick % sample_ == 0;
+    if (t) t->rsec.fetch_add(1, std::memory_order_relaxed);
+    if (timed) t->rsec_sampled.fetch_add(1, std::memory_order_relaxed);
     for (;;) {
       mshim::Obj h;
+      const uint64_t a = timed ? mono_ns() : 0;
       const int rc = api_->read_start(oid, &h);
+      const uint64_t b = timed ? mono_ns() : 0;
       if (rc != 0) megalon_fatal("ObjectReadStart(" + std::to_string(oid) + ") = " + std::to_string(rc));
       if constexpr (std::is_void_v<R>) {
         f(static_cast<const uint8_t *>(h.ptr));
-        if (api_->read_end(&h)) return;
+        const uint64_t c = timed ? mono_ns() : 0;
+        const bool ok = api_->read_end(&h);
+        if (timed) account_read(t, a, b, c, ok);
+        if (ok) return;
       } else {
         R r = f(static_cast<const uint8_t *>(h.ptr));
-        if (api_->read_end(&h)) return r;
+        const uint64_t c = timed ? mono_ns() : 0;
+        const bool ok = api_->read_end(&h);
+        if (timed) account_read(t, a, b, c, ok);
+        if (ok) return r;
       }
+      if (t) t->read_fail.fetch_add(1, std::memory_order_relaxed);
     }
   }
   template <class F> void write_slot(uint32_t k, uint64_t s, F fill) const {
+    MegThr *t = me_;
+    const bool timed = t && sample_ && ++t->tick % sample_ == 0;
+    if (t) t->wsec.fetch_add(1, std::memory_order_relaxed);
+    if (timed) t->wsec_sampled.fetch_add(1, std::memory_order_relaxed);
     mshim::Obj h;
+    const uint64_t a = timed ? mono_ns() : 0;
     const int rc = api_->write_start(id(k, s), &h);
+    const uint64_t b = timed ? mono_ns() : 0;
     if (rc != 0) megalon_fatal("ObjectWriteStart = " + std::to_string(rc));
     if (h.size != p_.slot_bytes) megalon_fatal("object size " + std::to_string(h.size));
     fill(h.ptr);  // whole slot = whole lines (D3)
+    const uint64_t c = timed ? mono_ns() : 0;
     api_->write_end(&h);
+    if (timed) {
+      t->ws_ns.fetch_add(b - a, std::memory_order_relaxed);
+      t->we_ns.fetch_add(mono_ns() - c, std::memory_order_relaxed);
+    }
   }
   std::string usage() const {
     return "megalon objects=" + std::to_string(p_.total_slots) + " object_bytes=" +
@@ -200,12 +256,51 @@ class MegalonBackend {
       << "\nmegalon.flushes=" << s.flushes << "\nmegalon.flush_bytes=" << s.flush_bytes
       << "\nmegalon.replay_flushes=" << s.replay_flushes << "\nmegalon.replay_flush_bytes=" << s.replay_flush_bytes
       << "\n";
+    // per role: exact counts, sampled times and the estimate (sampled × total / sampled), see MegThr
+    uint64_t v[kRoles][10] = {};
+    {
+      std::lock_guard<std::mutex> g(thr_mu_);
+      for (auto &t : thr_) {
+        uint64_t *x = v[t->role];
+        x[0] += t->rsec, x[1] += t->rsec_sampled, x[2] += t->wsec, x[3] += t->wsec_sampled, x[4] += t->read_fail;
+        x[5] += t->rs_ns, x[6] += t->re_ns, x[7] += t->ws_ns, x[8] += t->we_ns, x[9] += t->reexec_ns;
+      }
+    }
+    o << "megalon_time.sample=" << sample_ << "\n";
+    for (int r = 0; r < kRoles; r++) {
+      const uint64_t *x = v[r];
+      const double fr = x[1] ? double(x[0]) / double(x[1]) : 0, fw = x[3] ? double(x[2]) / double(x[3]) : 0;
+      const std::string p = std::string("megalon_time.") + role_name(r) + ".";
+      o << p << "read_sections=" << x[0] << "\n" << p << "read_sampled=" << x[1] << "\n" << p << "write_sections=" << x[2]
+        << "\n" << p << "write_sampled=" << x[3] << "\n" << p << "read_fail=" << x[4] << "\n"
+        << p << "read_start_ns_sampled=" << x[5] << "\n" << p << "read_end_ns_sampled=" << x[6] << "\n"
+        << p << "write_start_ns_sampled=" << x[7] << "\n" << p << "write_end_ns_sampled=" << x[8] << "\n"
+        << p << "reexec_ns_sampled=" << x[9] << "\n"
+        << p << "est_check_ns=" << uint64_t(fr * double(x[5] + x[6]) + fw * double(x[7])) << "\n"
+        << p << "est_flush_ns=" << uint64_t(fw * double(x[8])) << "\n"
+        << p << "est_reexec_ns=" << uint64_t(fr * double(x[9])) << "\n";
+    }
     return o.str();
   }
 
  private:
+  static void account_read(MegThr *t, uint64_t a, uint64_t b, uint64_t c, bool ok) {
+    // read_start = [a, b); body = [b, c); read_end = [c, now). A failed attempt's start + body + end is re-executed
+    // work (the caller repeats it); the accepted attempt's start/end are section checks.
+    const uint64_t d = mono_ns();
+    if (ok) {
+      t->rs_ns.fetch_add(b - a, std::memory_order_relaxed);
+      t->re_ns.fetch_add(d - c, std::memory_order_relaxed);
+    } else {
+      t->reexec_ns.fetch_add(d - a, std::memory_order_relaxed);
+    }
+  }
   Params p_;
   const mshim::Api *api_;
+  uint32_t sample_ = 32;
+  mutable std::mutex thr_mu_;
+  mutable std::vector<std::unique_ptr<MegThr>> thr_;
+  static inline thread_local MegThr *me_ = nullptr;
 };
 
 }  // namespace rsys

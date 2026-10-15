@@ -69,6 +69,7 @@ struct Opts {
   uint64_t check_stride = 4096; // Megalon: ObjectLookup every n-th slot on every node
   bool warm_up = true, verify_rows = false, preload_only = false, preloaded = false;
   bool test_no_seqlock = false;  // negative test only: readers ignore the version words (torn rows must show up)
+  uint32_t megalon_time_sample = 32;  // Megalon: time 1 in N sections per thread (0 = off), backend.h MegThr
   std::string region, backend = "plain", megalon_lib;
   cxl::proc::Opts proc;
 };
@@ -205,8 +206,9 @@ class Server {
     if constexpr (std::is_same_v<Be, MegalonBackend>) be_ = std::make_unique<Be>(r_, map_, p_, api_);
     else be_ = std::make_unique<Be>(r_, map_, p_);
     if (!be_->fits(&err)) die(err);
+    be_->set_time_sample(o_.megalon_time_sample);
     be_->thread_init(0);
-    pool_.start(o_.load_threads, [this](int i) { be_->thread_init(1 + i); cxl::proc::name_thread("rs-prep"); });
+    pool_.start(o_.load_threads, [this](int i) { be_->thread_init(1 + i, kRolePrep); cxl::proc::name_thread("rs-prep"); });
     ModelSpec ms;
     ms.dim = p_.dim, ms.rank = o_.rank;
     model_.init(ms, p_.seed);
@@ -521,7 +523,7 @@ class Server {
   }
 
   void updater(uint32_t w) {
-    be_->thread_init(int(1 + o_.load_threads + w));
+    be_->thread_init(int(1 + o_.load_threads + w), kRoleUpdate);
     cxl::proc::name_thread("rs-update");
     std::unordered_map<uint64_t, Touched> touched;  // T > 0: key -> latest (dedup within one interval)
     std::vector<Touched> rows;
@@ -617,7 +619,7 @@ class Server {
   }
 
   void server(uint32_t i) {
-    be_->thread_init(int(1 + o_.load_threads + o_.update_threads + i));
+    be_->thread_init(int(1 + o_.load_threads + o_.update_threads + i), kRoleServe);
     cxl::proc::name_thread("rs-serve");
     for (;;) {
       QueryCtx *task = nullptr;
@@ -841,7 +843,7 @@ void usage() {
                "  [--publish-ms T | --publish-us T (0 = write each sample immediately)]\n"
                "  [--dim D (128)] [--row-cap R (26000000)] [--row-div N (1)] [--load-factor F (0.8)] [--group G (64)]\n"
                "  [--multi-hot-div N (1)] [--rank R (512)] [--seed N] [--verify-rows 0|1] [--warm-up 0|1]\n"
-               "  [--check-stride N (4096)] [--start-timeout-ms T] [--backend plain|megalon] [--megalon-lib PATH]\n"
+               "  [--check-stride N (4096)] [--megalon-time-sample N (32)] [--start-timeout-ms T] [--backend plain|megalon] [--megalon-lib PATH]\n"
                "  [--proc-kthread PREFIX]... [--proc-sysfs DIR]...\n"
                "  [--preload-only | --preloaded]   Popcorn init_state=shared: node 0 writes the tables before enable\n"
                "CXL_APP_HWCC_BYTES must equal the app layout size: recsys-server --print-app-bytes [params].\n"
@@ -883,6 +885,7 @@ int main(int argc, char **argv) {
     else if (a == "--verify-rows") o.verify_rows = std::stoul(v());
     else if (a == "--warm-up") o.warm_up = std::stoul(v());
     else if (a == "--test-no-seqlock") o.test_no_seqlock = true;
+    else if (a == "--megalon-time-sample") o.megalon_time_sample = std::stoul(v());
     else if (a == "--check-stride") o.check_stride = std::stoull(v());
     else if (a == "--start-timeout-ms") o.start_timeout_ms = std::stoull(v());
     else if (a == "--backend") o.backend = v();

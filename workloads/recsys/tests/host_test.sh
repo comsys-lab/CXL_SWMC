@@ -4,7 +4,7 @@
 # loadgen drives updates (node 0) and queries (node 1) over loopback.
 # A file region is physically coherent: this checks API use, layout, seqlock and torn-row detection, not a protocol.
 # usage: host_test.sh <build dir> <loadgen build dir> <work dir (new)> [plain|megalon] [publish_ms] [extra server args]
-# env: PRELOAD (1: --preload-only then --preloaded, plain only), PORT (27100), ROW_DIV (200), UPD_RATE (2000), Q_RATES (5,10), MEGALON_CFG (template), MEGALON_SCR (logical_scr_size, 64MB), CPUS0/CPUS1/CPUSL
+# env: STEP_S (5, measured seconds per step), PRELOAD (1: --preload-only then --preloaded, plain only), PORT (27100), ROW_DIV (200), UPD_RATE (2000), Q_RATES (5,10), MEGALON_CFG (template), MEGALON_SCR (logical_scr_size, 64MB), CPUS0/CPUS1/CPUSL
 set -euo pipefail
 B=$(cd "$1" && pwd); LG=$(cd "$2" && pwd); WD=$3; BACKEND=${4:-plain}; T=${5:-0}; shift $(( $# < 5 ? $# : 5 )); EXTRA=("$@")
 HERE=$(cd "$(dirname "$0")" && pwd); W=$(cd "$HERE/.." && pwd); ROOT=$(cd "$W/../.." && pwd)
@@ -69,7 +69,7 @@ set +e
 numactl --physcpubind="$CPUSL" --membind=1 "$LG/loadgen" --workload recsys --target 127.0.0.1:$PORT,127.0.0.1:$((PORT + 1)) \
   --out "$WD/lg" --opt samples="$WD/updates.smp" --opt queries="$WD/queries.smp" \
   --opt quantiles="$W/tools/dist_quantile.txt" --mode fixed --fixed update="$UPD_RATE" --mix query=1 --rates "$Q_RATES" \
-  --warmup-s 2 --step-warmup-s 1 --step-measure-s 5 --drain-s 5 --stats-op 10 > "$WD/loadgen.log" 2>&1
+  --warmup-s 2 --step-warmup-s 1 --step-measure-s "${STEP_S:-5}" --drain-s 5 --stats-op 10 > "$WD/loadgen.log" 2>&1
 LGRC=$?
 set -e
 kill -TERM "${PIDS[@]}"; wait 2>/dev/null || true; PIDS=()
