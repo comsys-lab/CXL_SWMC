@@ -147,7 +147,8 @@ preload)
   log "preload PASS (node 0 wrote $PPAGES pages from swcc page $PBASE through a plain mapping)" ;;
 shared-check)
   [ "$INIT_STATE" = shared ] || { echo "shared-check needs INIT_STATE=shared"; exit 2; }
-  for k in 0 1; do G $k status | grep -qx 'swmc.init_state=shared (initialized)'; done
+  # status to a file first: `ssh | grep -q` under pipefail fails with 255 (grep exits early, ssh gets EPIPE)
+  for k in 0 1; do G $k status > "$R/status-sharedcheck-vm$k.txt"; grep -qx 'swmc.init_state=shared (initialized)' "$R/status-sharedcheck-vm$k.txt"; done
   fl 1 p1_read_init access --op read --pages "$PPAGES" --page-offset "$PBASE" --expect $PA
   fl 0 p2_read_init access --op read --pages "$PPAGES" --page-offset "$PBASE" --expect $PA
   fl 1 p3_write access --op write --pages "$PPAGES" --page-offset "$PBASE" --pattern $PB
