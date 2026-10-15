@@ -3,27 +3,33 @@
 # the same kernel; all-HWcc and Megalon with cxl_shm unloaded, as the M5 HNSW pilots).
 # usage: pilot-block.sh <block> <evidence dir (exists, empty except sequence.*)>
 #   hm:  functional all-HWcc and Megalon (put ratio 0.5); pilot SLO searches all-HWcc and Megalon at put ratio
-#        0.05 (H1), 0 and 0.5 (H2) (order shuffled); then 30 s fixed-load windows at L = 0.5 x the all-HWcc result at
-#        the same ratio (shuffled; TRACE=1 at 0.5).
-#   pop: page MSI (C8 K8 GT8 RECV_MODE): functional (0.5), pilot SLO searches at 0.05 / 0 / 0.5 (shuffled), fixed-load
-#        windows at L from the hm block (LREF = its evidence dir; TRACE=1 at 0.5).
+#        0.05 (H1), 0 and 0.5 (H2) (order shuffled); then untraced 30 s fixed-load windows at L = 0.5 x the all-HWcc
+#        result at the same ratio (shuffled); then one traced window per system at 0.5 (ptrace, Figure 2c logs only).
+#   pop: page MSI (C8 K8 GT8 RECV_MODE): functional (0.5), pilot SLO searches at 0.05 / 0 / 0.5 (shuffled), untraced
+#        fixed-load windows at L from the hm block (LREF = its evidence dir), then the traced 0.5 window.
+# env: PIN (harness commit; every build manifest must name it with dirty=0), KV_CFG, K8.
 # Holds the measurement lock for the whole block; stops at the first PILOTRUN STOP; the hm block rolls /dev/dax0.0
 # back to root:root 600 at its end or on a stop; page MSI runs tear down per run (and leave dax0.0 root:root 600).
 set -uo pipefail
 B=$1 E=$2
 P=/home/comsys/sungsu/destijl-control X=$P/CXL_SWMC/experiments/kv G=$P/CXL_SWMC/experiments/vectordb/host-gate.sh
 K8=${K8:-6.14.0-famfs-de-stijl+-ds-popcorn-new-8}
-VP=${VM_PLAIN:-/home/comsys/kv2} VM=${VM_MEG:-/home/comsys/kvm2}
-BP=${PLAIN_BUILD:-$P/builds/kv/2} BM=${MEG_BUILD:-$P/builds/kv-megalon/2}
+VP=${VM_PLAIN:-/home/comsys/kv3} VM=${VM_MEG:-/home/comsys/kvm3}
+BP=${PLAIN_BUILD:-$P/builds/kv/3} BM=${MEG_BUILD:-$P/builds/kv-megalon/3} BL=${LOADGEN_BUILD:-$P/builds/kv-loadgen/3}
+: "${PIN:?PIN = harness commit}"
+export VM_PLAIN=$VP VM_MEG=$VM PLAIN_BUILD=$BP MEG_BUILD=$BM LOADGEN_BUILD=$BL
 CFG=${KV_CFG:?KV_CFG = the megalon.yaml install.sh wrote (<install log>.megalon.yaml)}
 SSH="ssh -o BatchMode=yes -o ConnectTimeout=8"
 IPS=(192.168.122.100 192.168.122.101)
 OWNER="KV-pilot-$B"
 [ -d "$E" ] && [ -z "$(ls -A "$E" | grep -v '^sequence')" ] || { echo "SEQUENCE STOP: $E missing or not empty"; exit 2; }
-grep -q "^megalon_build=$P/builds/megalon/70$" "$BM/manifest.txt" && grep -q "^source_commit=.* dirty=0$" "$BM/manifest.txt" \
-  || { echo "SEQUENCE STOP: $BM is not a clean build on builds/megalon/70"; exit 2; }
-grep -q "^source_commit=.* dirty=0$" "$BP/manifest.txt" && grep -q "^megalon.flavor=hwcc$" "$BP/manifest.txt" \
-  || { echo "SEQUENCE STOP: $BP is not a clean hwcc-flavor build"; exit 2; }
+grep -q "^megalon_build=$P/builds/megalon/70$" "$BM/manifest.txt" && grep -q "^source_commit=$PIN dirty=0$" "$BM/manifest.txt" \
+  || { echo "SEQUENCE STOP: $BM is not a clean build of $PIN on builds/megalon/70"; exit 2; }
+grep -q "^source_commit=$PIN dirty=0$" "$BP/manifest.txt" && grep -q "^megalon.flavor=hwcc$" "$BP/manifest.txt" \
+  || { echo "SEQUENCE STOP: $BP is not a clean hwcc-flavor build of $PIN"; exit 2; }
+grep -q "^cxl_swmc_commit=$PIN kv_dirty=0$" "$BL/kv-manifest.txt" \
+  && grep -q "^sha256 $(sha256sum "$BL/loadgen" | cut -d' ' -f1)  " "$BL/manifest.txt" \
+  || { echo "SEQUENCE STOP: $BL loadgen is not the recorded build of $PIN"; exit 2; }
 bash $G lock "$OWNER" || { echo "SEQUENCE STOP: lock"; exit 2; }
 CHOWNED=0
 finish() {
@@ -101,8 +107,12 @@ case "$B" in
       s=${su%:*} u=${su#*:}; [ $s = hw ] && S=all-HWcc || S=Megalon
       r=$(confirm_l $E/hw-$(tag $u)-pslo/loadgen/summary.json) || { echo "SEQUENCE STOP: no all-HWcc result for put ratio $u"; exit 1; }
       echo "$s u=$u L = 0.5 x hw-$(tag $u)-pslo = $r requests/s" >> "$E/fixed-load-L.txt"
-      tr=0; [ $u = 0.5 ] && tr=1
-      run $s-$(tag $u)-pfix SYS=$S PUT_RATIO=$u KIND=pfix RATE=$r TRACE=$tr
+      run $s-$(tag $u)-pfix SYS=$S PUT_RATIO=$u KIND=pfix RATE=$r
+    done
+    for s in $(shuffle hw mg); do  # traced windows (Figure 2c logs only; not compared)
+      [ $s = hw ] && S=all-HWcc || S=Megalon
+      r=$(confirm_l $E/hw-u50-pslo/loadgen/summary.json) || { echo "SEQUENCE STOP: no all-HWcc result for 0.5"; exit 1; }
+      run $s-u50-ptrace SYS=$S PUT_RATIO=0.5 KIND=ptrace RATE=$r
     done;;
   pop)
     : "${C8:?}" "${GT8:?}" "${RECV_MODE:?}" "${LREF:?}"
@@ -112,9 +122,10 @@ case "$B" in
     for u in $(shuffle 0.05 0 0.5); do
       r=$(confirm_l $LREF/hw-$(tag $u)-pslo/loadgen/summary.json) || { echo "SEQUENCE STOP: no all-HWcc result for $u in $LREF"; exit 1; }
       echo "pop u=$u L = 0.5 x $LREF/hw-$(tag $u)-pslo = $r requests/s" >> "$E/fixed-load-L.txt"
-      tr=0; [ $u = 0.5 ] && tr=1
-      run pop-$(tag $u)-pfix "${PE[@]}" PUT_RATIO=$u KIND=pfix RATE=$r TRACE=$tr
-    done;;
+      run pop-$(tag $u)-pfix "${PE[@]}" PUT_RATIO=$u KIND=pfix RATE=$r
+    done
+    r=$(confirm_l $LREF/hw-u50-pslo/loadgen/summary.json) || { echo "SEQUENCE STOP: no all-HWcc result for 0.5 in $LREF"; exit 1; }
+    run pop-u50-ptrace "${PE[@]}" PUT_RATIO=0.5 KIND=ptrace RATE=$r;;
   *) echo "SEQUENCE STOP: bad block"; exit 2;;
 esac
 echo "$(date -Is) SEQUENCE DONE $OWNER"

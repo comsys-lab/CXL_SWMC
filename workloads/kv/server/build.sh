@@ -22,8 +22,12 @@ DIRTY=$(git -C "$HERE" status --porcelain --untracked-files=all -- "${SRCS[@]}" 
 INFO="kv-megalon commit=${COMMIT:0:12} dirty=$DIRTY megalon=$(sed -n 's/^build_id=//p' "$MB/manifest.txt")/$FLAVOR/$(sed -n 's/^wmeta_layout=//p' "$MB/manifest.txt")"
 FLAGS=(-std=c++17 -O2 -g -pthread -Wall -Wextra -I"$W" -I"$HERE" -I"$ROOT/experiments/loadgen" -I"$ROOT/systems/common")
 c++ "${FLAGS[@]}" "$HERE/server.cc" -o "$OUT/bin/kv-server" -ldl -Wl,--enable-new-dtags,-rpath,'$ORIGIN/../lib'
-c++ -std=c++17 -O2 -g -fPIC -shared -Wall -Wextra -I"$HERE" -I"$MSRC/include" -DKV_SHIM_INFO="\"$INFO\"" \
-    -DKV_SHIM_FLAVOR="\"$FLAVOR\"" "$HERE/kv_shim.cc" -o "$OUT/lib/libkv-megalon.so" -L"$OUT/lib" -lmegalon \
+# the shim reads Megalon's counter block through its own header (cxl_port.h: C++23 + abseil), so it is compiled with
+# Megalon's toolchain (workspaces/toolchain clang 17, same libstdc++ as the server)
+SHIM_CXX=${SHIM_CXX:-$ROOT/../workspaces/toolchain/llvm/bin/clang++-17}
+"$SHIM_CXX" --gcc-install-dir=/usr/lib/gcc/x86_64-linux-gnu/11 -std=gnu++23 -O2 -g -fPIC -shared -Wall -Wextra \
+    -I"$HERE" -I"$MSRC/include" -I"$MSRC/src" -I"$ROOT/systems/common" -I"$MSRC/third-party/abseil-cpp" \
+    -DKV_SHIM_INFO="\"$INFO\"" -DKV_SHIM_FLAVOR="\"$FLAVOR\"" "$HERE/kv_shim.cc" -o "$OUT/lib/libkv-megalon.so" -L"$OUT/lib" -lmegalon \
     -Wl,--enable-new-dtags,-rpath,'$ORIGIN',--no-undefined,--no-as-needed
 LD_LIBRARY_PATH= ldd "$OUT/lib/libkv-megalon.so" | grep -q "not found" && { ldd "$OUT/lib/libkv-megalon.so"; exit 1; }
 cp -p "$ROOT/scripts/guest/kv-node.sh" "$OUT/bin/" 2>/dev/null || true
@@ -36,7 +40,7 @@ cp -p "$ROOT/scripts/guest/kv-node.sh" "$OUT/bin/" 2>/dev/null || true
   echo "megalon_build=$MB"
   grep -E '^(source_commit|source_dirty_diff_sha256|build_id|flavor|wmeta_layout|cmake_effective|build_sh|build_sh_sha256)=' "$MB/manifest.txt" | sed 's/^/megalon./'
   echo "megalon.manifest_sha256=$(sha256sum "$MB/manifest.txt" | cut -d' ' -f1)"
-  echo "cxx=$(c++ --version | head -1)"
+  echo "cxx=$(c++ --version | head -1)"; echo "shim_cxx=$("$SHIM_CXX" --version | head -1)"
   (cd "$OUT" && find bin lib -type f | sort | while read -r f; do echo "sha256[$f]=$(sha256sum "$f" | cut -d' ' -f1)"; done)
   for f in bin/kv-server lib/libkv-megalon.so; do echo "runpath[$f]=$(readelf -d "$OUT/$f" | sed -n 's/.*(RUNPATH).*\[\(.*\)\]/\1/p')"; done
   echo "glibc_max=$(objdump -T "$OUT"/bin/kv-server "$OUT"/lib/*.so* | grep -o 'GLIBC_[0-9.]*' | sort -Vu | tail -1)"

@@ -242,6 +242,13 @@ class Server {
       die("warm-up check: " + std::to_string(warm_miss_.load()) + " missing keys, " + std::to_string(warm_bad_.load()) +
           " bad values (the initial load did not store every key; Megalon slots/records too small?)");
     std::fprintf(stderr, "kv-server: warm-up read and checked %lu keys in %.1f s\n", (unsigned long)o_.keys, (now_ns() - t0) / 1e9);
+    {
+      kvshim::Counters c{};
+      api_->counters(&c);
+      std::fprintf(stderr, "kv-server: megalon counters after warm-up: wmeta_allocated=%lu wmeta_reclaim=%lu wmeta_allocate=%lu "
+                   "bitmap_count=%lu (keys %lu)\n", (unsigned long)c.wmeta_allocated, (unsigned long)c.wmeta_reclaim,
+                   (unsigned long)c.wmeta_allocate, (unsigned long)c.bitmap_count, (unsigned long)o_.keys);
+    }
     if (!o_.trace_dir.empty()) scan_slots();
     store_release(warmed(o_.node), o_.run_id);
     if (!cxl::hwcc::poll_until(
@@ -284,6 +291,10 @@ class Server {
       }
       o << "\ntrace.puts=" << np << "\ntrace.gets=" << ng << "\ntrace.dropped_puts=" << dp << "\ntrace.dropped_gets=" << dg;
     }
+    kvshim::Counters c{};
+    api_->counters(&c);  // Megalon's shared counter block (same values on every node)
+    o << "\nmegalon.wmeta_allocated=" << c.wmeta_allocated << "\nmegalon.wmeta_reclaim=" << c.wmeta_reclaim
+      << "\nmegalon.wmeta_allocate=" << c.wmeta_allocate << "\nmegalon.bitmap_count=" << c.bitmap_count;
     o << "\n" << cxl::proc::text(pst_);
     return o.str();
   }
@@ -685,15 +696,18 @@ int main(int argc, char **argv) {
     return 0;
   }
   if (print_sizes) {
-    // Megalon config for N keys: one slot per key (slots rounded up to 64 by Megalon); records =
-    // min(logical_scr_size / 4, slots * 100 / 90) (packed4: 4 B each, WMETA_WATERMARK 90), so every loaded key fits
-    // under the record watermark (no reclaim pressure in the megalon flavor; the hwcc flavor uses slot i's record).
-    const uint64_t slots = (o.keys + 63) / 64 * 64, records = slots * 100 / 90, lscr = (records + 1) * 4;
+    // Megalon config for N keys (kv-2vm.yaml): slots = N + N/1000 + 64 rounded up to 64 (Megalon rounds to 64);
+    // records = min(logical_scr_size / 4, slots * 100 / 90) = slots * 100 / 90 (packed4: 4 B); Megalon's record
+    // watermark threshold = records * 90 / 100 (c3.cc), so threshold >= N + N/1000 + 63 > N: every loaded key keeps
+    // its record in the megalon flavor without reclaim (the hwcc flavor uses slot i's static record).
+    const uint64_t slots = (o.keys + o.keys / 1000 + 64 + 63) / 64 * 64, records = slots * 100 / 90,
+                   lscr = (records + 1) * 4, threshold = records * 90 / 100;
     const uint64_t bitmaps = 4 * (((slots + 63) / 64 * 8 + 63) / 64 * 64);  // four slot bitmaps, 64 B aligned
-    std::printf("key_space=%lu\nslots=%lu\nlogical_scr_size=%lu\nrecords=%lu\nrecord_bytes=%lu\nbitmap_bytes=%lu\n"
-                "slot_data_bytes=%lu\n",
+    std::printf("key_space=%lu\nslots=%lu\nlogical_scr_size=%lu\nrecords=%lu\nrecord_threshold=%lu\n"
+                "record_margin=%lu\nrecord_bytes=%lu\nbitmap_bytes=%lu\nslot_data_bytes=%lu\n",
                 (unsigned long)o.keys, (unsigned long)slots, (unsigned long)lscr, (unsigned long)records,
-                (unsigned long)(records * 4), (unsigned long)bitmaps, (unsigned long)(slots * kValueBytes));
+                (unsigned long)threshold, (unsigned long)(threshold - o.keys), (unsigned long)(records * 4),
+                (unsigned long)bitmaps, (unsigned long)(slots * kValueBytes));
     return 0;
   }
   if (o.run_id == 0 || o.keys == 0 || (o.backend != "plain" && o.backend != "megalon")) usage();

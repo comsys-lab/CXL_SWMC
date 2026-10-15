@@ -3,12 +3,13 @@
 # 4M keys, 1 KiB values, Zipfian 0.99, requests of BATCH mixed ops (each op a put with probability PUT_RATIO),
 # SLO per request mixed p99 <= 1 ms.
 # usage: pilot-run.sh <name> <evidence dir>
-# env (required): SYS (all-HWcc | Megalon | Popcorn), PUT_RATIO (0 | 0.05 | 0.5), KIND (functional | pslo | pfix);
-#   KIND=pfix: RATE (requests/s = L)
+# env (required): SYS (all-HWcc | Megalon | Popcorn), PUT_RATIO (0 | 0.05 | 0.5), KIND (functional | pslo | pfix |
+#   ptrace); KIND=pfix|ptrace: RATE (requests/s = L). ptrace = a pfix window with TRACE=1 (put/get logs for the
+#   Figure 2c classification only; never used for throughput/latency comparisons). pfix forces TRACE=0.
 #   SYS=Popcorn: C8 (build-8 deploy bundle dir), K8 (release), GT8 (guest tools dir), RECV_MODE (poll | idle | sleep)
 # optional: KEYS (4000000), BATCH (16), SEED (20261016), GATE=0 (skip the Host gate: functional runs only),
-#   TRACE (0 | 1: put/get logs, fixed-load runs only), VM_PLAIN (/home/comsys/kv2), VM_MEG (/home/comsys/kvm2),
-#   PLAIN_BUILD (builds/kv/2), MEG_BUILD (builds/kv-megalon/2).
+#   VM_PLAIN (/home/comsys/kv3), VM_MEG (/home/comsys/kvm3), PLAIN_BUILD (builds/kv/3), MEG_BUILD (builds/kv-megalon/3),
+#   LOADGEN_BUILD (builds/kv-loadgen/3).
 # Page MSI (user decision A, 2026-10-16): cxl_shm is loaded and coherence ENABLED before kv-server starts, so node 0's
 # initial load and every warm-up read run under coherence (no --preload-only: the store's index replicas are
 # process-local). init_state=shared, as for the other workloads' page MSI runs.
@@ -18,16 +19,18 @@ NAME=$1 E=$2
 P=/home/comsys/sungsu/destijl-control
 X=$P/CXL_SWMC/experiments/kv
 : "${SYS:?}" "${PUT_RATIO:?}" "${KIND:?}"
-KEYS=${KEYS:-4000000} BATCH=${BATCH:-16} SEED=${SEED:-20261016} TRACE=${TRACE:-0}
-VM_PLAIN=${VM_PLAIN:-/home/comsys/kv2} VM_MEG=${VM_MEG:-/home/comsys/kvm2}
-PLAIN_BUILD=${PLAIN_BUILD:-$P/builds/kv/2} MEG_BUILD=${MEG_BUILD:-$P/builds/kv-megalon/2}
+KEYS=${KEYS:-4000000} BATCH=${BATCH:-16} SEED=${SEED:-20261016}
+TRACE=0; [ "$KIND" = ptrace ] && TRACE=1
+VM_PLAIN=${VM_PLAIN:-/home/comsys/kv3} VM_MEG=${VM_MEG:-/home/comsys/kvm3}
+PLAIN_BUILD=${PLAIN_BUILD:-$P/builds/kv/3} MEG_BUILD=${MEG_BUILD:-$P/builds/kv-megalon/3}
+LOADGEN_BUILD=${LOADGEN_BUILD:-$P/builds/kv-loadgen/3}
 stop() { echo "PILOTRUN $NAME STOP $*"; exit 1; }
 [ -d "$E" ] || stop "missing evidence dir $E"
 [ -e "$E/$NAME" ] && stop "$E/$NAME exists"
 [[ $PUT_RATIO =~ ^(0|0\.05|0\.2|0\.5)$ ]] || stop "bad PUT_RATIO"
 [[ $BATCH =~ ^(16|32|64)$ ]] || stop "bad BATCH"
 SA="--nodes 2 --keys $KEYS --threads 14 --start-timeout-ms 5400000"
-export LOADGEN=$P/builds/kv-loadgen/2/loadgen READY_TIMEOUT=5400 RUN_KIND=measurement STATS_OP=10 TRACE
+export LOADGEN=$LOADGEN_BUILD/loadgen READY_TIMEOUT=5400 RUN_KIND=measurement STATS_OP=10 TRACE
 [ "$KIND" = functional ] && RUN_KIND=functional
 export RUN_KIND
 case "$SYS" in
@@ -45,7 +48,7 @@ case "$KIND" in
   functional) LG+=(--mode fixed --rates 200,2000 --warmup-s 10 --step-warmup-s 5 --step-measure-s 30 --drain-s 10);;
   pslo) LG+=(--raw --mode slo --start 500 --factor 1.5 --precision 0.05 --max-steps 25 --warmup-s 10 --step-warmup-s 2
              --step-measure-s 8 --confirm-s 15 --confirm-reps 1 --fill none --overload none);;
-  pfix) : "${RATE:?}"; LG+=(--raw --mode fixed --rates "$RATE" --warmup-s 10 --step-warmup-s 5 --step-measure-s 30 --drain-s 10);;
+  pfix|ptrace) : "${RATE:?}"; LG+=(--raw --mode fixed --rates "$RATE" --warmup-s 10 --step-warmup-s 5 --step-measure-s 30 --drain-s 10);;
   *) stop "bad KIND";;
 esac
 SSH="ssh -o BatchMode=yes -o ConnectTimeout=8"
@@ -84,13 +87,15 @@ for k in 0 1; do  # clean stop and the workload's own invariants
   L=$R/node$k.log
   grep -q "kv-server: stopping" $L || stop "node$k: no clean stop"
   for kv in misses=0 short_reads=0 bad_requests=0; do grep -q "^$kv\$" $L || stop "node$k: $kv violated"; done
+  # Megalon: no record reclaim at all (sizing keeps every loaded key under the watermark; reports/M5-pilot-kv.md §1)
+  [ "$SYS" = Megalon ] && { grep -q "^megalon.wmeta_reclaim=0\$" $L || stop "node$k: Megalon record reclaim (record pressure)"; }
 done
 for kv in torn=0 wrong_key=0 bad_writer=0 future=0 stale=0 misses=0 get_errors=0 put_errors=0; do
   grep -q "^$kv\$" $R/loadgen/kv.txt || stop "value check: $kv violated"
 done
 [ "$TRACE" = 1 ] && { grep -q "KVLOG CHECK PASS" $R/kvlog-check.txt || stop "trace log check"; }
 { echo "# load times $NAME (s)"; echo "run_wall_s=$(( $(date +%s) - T0 ))"
-  grep -h "loaded .* keys\|warm-up read\|slot scan\|SCR used\|READY node" $R/node*.log
+  grep -h "loaded .* keys\|warm-up read\|megalon counters\|slot scan\|SCR used\|READY node" $R/node*.log
   grep -h "^start=\|^end=" $R/manifest.txt; } > $R/load-times.txt
 grep -q "workload_finish\":\"ok" $R/loadgen/summary.json || stop "loadgen workload finish"
 if [ $RC != 0 ]; then

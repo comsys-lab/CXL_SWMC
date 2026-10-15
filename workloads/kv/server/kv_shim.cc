@@ -2,6 +2,7 @@
 #include <rackobj.h>
 
 #include "kv_api.h"
+#include "shared_memory/cxl_port.h"  // existing counter block (read only; no Megalon change)
 
 #ifndef KV_SHIM_INFO
 #define KV_SHIM_INFO "unknown"
@@ -17,8 +18,14 @@ void reg(int tid) { rackobj::Register(tid); }
 void unreg() { rackobj::UnRegister(); }
 ssize_t put(const uint8_t *buf, uint64_t count, uint64_t key) { return rackobj::Put(buf, count, static_cast<off_t>(key)); }
 ssize_t get(uint8_t *buf, uint64_t count, uint64_t key) { return rackobj::Get(buf, count, static_cast<off_t>(key)); }
+void counters(kvshim::Counters *o) {
+  const rackobj::port::SharedCounters *c = rackobj::port::PortContext::Get().counters();
+  auto rd = [](const rackobj::port::PaddedCounter &x) { return uint64_t(x.v.load(std::memory_order_relaxed)); };
+  *o = kvshim::Counters{rd(c->wmeta_allocated), rd(c->wmeta_reclaim), rd(c->wmeta_allocate), rd(c->bitmap_count),
+                        rd(c->bitmap_dirty)};
+}
 
-const kvshim::Api kApi{kvshim::kApiVersion, KV_SHIM_INFO, KV_SHIM_FLAVOR, node_id, key_space, reg, unreg, put, get};
+const kvshim::Api kApi{kvshim::kApiVersion, KV_SHIM_INFO, KV_SHIM_FLAVOR, node_id, key_space, reg, unreg, put, get, counters};
 }  // namespace
 
 extern "C" __attribute__((visibility("default"))) const kvshim::Api *kv_megalon_api() { return &kApi; }

@@ -2,15 +2,16 @@
 # megalon = megalon-flavor build; same file, so both flavors get the same slots and records).
 # Same file on both VMs; node id, run id and region config come from kv-server (--node, --run-id, --region).
 # key_space, slots and logical_scr_size depend on the key count: experiments/kv/run.sh rewrites them from
-# `kv-server --print-sizes --keys N` (key_space = N; slots = N rounded up to 64, one 1 KiB slot per key;
-# logical_scr_size = 4 B x (slots x 100 / 90 + 1), so records = slots x 100 / 90 = the artifact's cap and every loaded
-# key stays under Megalon's 90 % record watermark: no reclaim pressure). Values below: the 4M-key pilot.
-# HWcc use: ~4.94 B per key (records 4.44 B + four slot bitmaps 0.5 B) + ~10 KiB; it must fit hwcc - msg_ring - app
+# `kv-server --print-sizes --keys N` (key_space = N; slots = N + N/1000 + 64 rounded up to 64, one 1 KiB slot per key;
+# logical_scr_size = 4 B x (slots x 100 / 90 + 1), so records = slots x 100 / 90 = the artifact's cap; Megalon's record
+# threshold = records x 90 / 100 (c3.cc) >= N + N/1000 + 63, so every loaded key keeps its record without reclaim).
+# Values below: the 4M-key pilot (threshold 4,004,095). 54M keys: slots 54,054,080, logical_scr_size 240,240,356.
+# HWcc use: ~4.95 B per key (records 4.45 B + four slot bitmaps 0.5 B) + ~10 KiB; it must fit hwcc - msg_ring - app
 # (Megalon prints "SCR footprint (upper bound)" and refuses otherwise). Slot data: 1 KiB per key in SWcc.
 mount_directory: /mydata        # required by the config parser; unused
 key_space: 4000000
-slots: 4000000
-logical_scr_size: 17777780
+slots: 4004096
+logical_scr_size: 17795984
 node_id: 0                      # overridden by MEGALON_NODE_ID (kv-server sets it from --node)
 region_config: ""               # $CXL_REGION_CONFIG
 reinit: false                   # node 0: MEGALON_REINIT=1

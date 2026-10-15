@@ -5,8 +5,9 @@
 #          <run_dir>/node<k>.{log,pid,env}. ENV:K=V tokens (before the server args) are exported to the server
 #          (e.g. ENV:RACKOBJ_CONFIG=... ENV:MEGALON_REINIT=1 for the Megalon backend).
 #        kv-node.sh ready <run_dir> <node_id> <timeout_s>   # node log shows "kv-server: READY"
-#        kv-node.sh stop  <run_dir> <node_id>               # SIGTERM to the node's session (server prints its
-#                                                            # stats and exits), KILL after 15 s, verify gone
+#        kv-node.sh stop  <run_dir> <node_id> [wait_s]      # SIGTERM to the node's session (server prints its
+#                                                            # stats, writes its trace logs, exits), KILL after
+#                                                            # wait_s (default 15; run.sh passes 300 with TRACE=1)
 set -euo pipefail
 case "${1:-}" in
   start)
@@ -44,9 +45,10 @@ ENV
       kill -0 "$(cat "$RUN/node$K.pid")" 2>/dev/null || { echo "node$K exited before READY"; exit 1; }
       sleep 1
     done; echo "node$K no READY within ${T}s"; exit 1;;
-  stop) RUN=$2 K=$3; SID=$(cat "$RUN/node$K.pid")
+  stop) RUN=$2 K=$3 WAIT=${4:-15}; SID=$(cat "$RUN/node$K.pid")
+    [[ $WAIT =~ ^[0-9]+$ ]] || { echo "bad wait_s" >&2; exit 2; }
     pkill -TERM -s "$SID" || true
-    for _ in $(seq 15); do pgrep -s "$SID" >/dev/null || { echo "node$K session $SID gone"; exit 0; }; sleep 1; done
+    for _ in $(seq "$WAIT"); do pgrep -s "$SID" >/dev/null || { echo "node$K session $SID gone"; exit 0; }; sleep 1; done
     pkill -KILL -s "$SID" || true; sleep 1
     pgrep -s "$SID" >/dev/null && { echo "node$K session $SID still alive"; exit 1; }
     echo "node$K session $SID killed"; exit 0;;

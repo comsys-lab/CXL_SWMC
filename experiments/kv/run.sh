@@ -41,7 +41,8 @@ host_check() {  # any compiler/linker/build tool running on the Host invalidates
 }
 STARTED=()  # node indices this run started (only these are stopped/collected)
 stop_nodes() {
-  for k in "${STARTED[@]}"; do $SSH comsys@"${NODE[$k]}" "$V/bin/kv-node.sh stop $GRUN $k" < /dev/null || true; done
+  local w=15; [ "$TRACE" = 1 ] && w=300  # trace logs are written at stop
+  for k in "${STARTED[@]}"; do $SSH comsys@"${NODE[$k]}" "$V/bin/kv-node.sh stop $GRUN $k $w" < /dev/null || true; done
 }
 collect() {
   for k in "${STARTED[@]}"; do scp -q "comsys@${NODE[$k]}:$GRUN/node$k.*" "$RUN/" 2>/dev/null || true; done

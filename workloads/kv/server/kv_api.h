@@ -14,7 +14,15 @@
 
 namespace kvshim {
 
-constexpr uint32_t kApiVersion = 1;
+constexpr uint32_t kApiVersion = 2;
+
+// Megalon's existing shared counter block (port::SharedCounters, HWcc, one copy for all nodes), read only.
+struct Counters {
+  uint64_t wmeta_allocated;  // records in use (DYN_WMETA reclaim gate; the hwcc flavor's static records do not use it)
+  uint64_t wmeta_reclaim;    // records reclaimed (record pressure)
+  uint64_t wmeta_allocate;   // record allocations
+  uint64_t bitmap_count, bitmap_dirty;
+};
 
 struct Api {
   uint32_t version;    // kApiVersion
@@ -26,6 +34,7 @@ struct Api {
   void (*unreg)();
   ssize_t (*put)(const uint8_t *buf, uint64_t count, uint64_t key);  // artifact: returns 0 (even when out of slots)
   ssize_t (*get)(uint8_t *buf, uint64_t count, uint64_t key);        // bytes read; 0 = no entry
+  void (*counters)(Counters *out);
 };
 
 }  // namespace kvshim
