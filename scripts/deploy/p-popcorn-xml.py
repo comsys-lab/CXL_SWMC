@@ -5,7 +5,7 @@ usage: p-popcorn-xml.py <current-inactive.xml> <images-dir> <release> <outdir>
 
 Writes <outdir>/rollback-inactive.xml (byte copy of the input),
 candidate-normal.xml and candidate-restricted.xml (= normal + init=/bin/sh).
-Only the three <os> lines <kernel>, <initrd>, <cmdline> change; every other
+Only the <os> lines <kernel>, <initrd> (always) and <cmdline> (if different) change; every other
 byte (memory, vCPUs, NUMA, every NVDIMM field) stays identical, which the
 script checks with a line diff. The cmdline keeps root=/ro/console from the
 current one and drops parameters of other variants (page_replication_ext is
@@ -46,7 +46,9 @@ for name, cand in (('candidate-normal.xml', normal), ('candidate-restricted.xml'
     changed = [l for l in difflib.ndiff(text.splitlines(), cand.splitlines()) if l[:1] in '+-']
     tags = sorted({re.search(r'<(kernel|initrd|cmdline)>', l).group(1) for l in changed
                    if re.search(r'<(kernel|initrd|cmdline)>', l)})
-    if len(changed) != 6 or tags != ['cmdline', 'initrd', 'kernel']:
+    # only <kernel>/<initrd>/<cmdline> may change; kernel and initrd must (cmdline may already be equal)
+    if any(not re.search(r'<(kernel|initrd|cmdline)>', l) for l in changed) or \
+            not {'kernel', 'initrd'} <= set(tags) or len(changed) not in (4, 6):
         raise SystemExit(f'{name}: unexpected diff {changed}')
 
 o = pathlib.Path(out)
