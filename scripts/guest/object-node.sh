@@ -31,7 +31,7 @@ EOF
 cd "$B"
 setsid nohup env RACKOBJ_CONFIG="$NODECFG" CXL_REGION_CONFIG="$REGION" MEGALON_NODE_ID="$K" \
   MEGALON_RUN_ID="$RID" MEGALON_REINIT="$REINIT" \
-  bash -c 'R=$0 N=$1; shift 2; timeout 900 bin/object-test "$@"; echo $? > "$R/node$N.rc"' \
+  bash -c 'R=$0 N=$1; shift; timeout 900 bin/object-test "$@"; echo $? > "$R/node$N.rc"' \
   "$RUN" "$K" "$@" > "$RUN/node$K.log" 2>&1 < /dev/null &
 echo $! > "$RUN/node$K.pid"
 echo "started node$K pid $(cat "$RUN/node$K.pid")"
