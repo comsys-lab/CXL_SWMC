@@ -21,7 +21,7 @@
 set -euo pipefail
 
 ROOT=/home/comsys/sungsu/destijl-control
-SRC=$ROOT/CXL_SWMC/systems/megalon/src
+SRC=${MEGALON_SRC:-$ROOT/CXL_SWMC/systems/megalon/src}   # MEGALON_SRC: e.g. a worktree of the submodule
 T=$ROOT/workspaces/toolchain
 TOOLCHAIN_FILE=$SRC/cmake-variant/toolchains/clang17-gcc.cmake
 
@@ -120,7 +120,7 @@ cmake -S "$SRC" -B "$OUT" \
     -DMEGALON_FLAVOR="$FLAVOR" \
     -DMEGALON_WMETA_LAYOUT="$WMETA" \
     -DMEGALON_NR_LIB="$NR_LIB" \
-    -DMEGALON_BUILD_ID="$BUILD_ID" > "$OUT/cmake.log" 2>&1 || { tail -40 "$OUT/cmake.log"; exit 1; }
+    -DMEGALON_BUILD_ID="$BUILD_ID" -DCXL_COMMON_DIR="$ROOT/CXL_SWMC/systems/common" -DMEGALON_DEPS_DIR="$ROOT/CXL_SWMC/systems/megalon/src/third-party" > "$OUT/cmake.log" 2>&1 || { tail -40 "$OUT/cmake.log"; exit 1; }
 grep -E 'MEGALON_FLAVOR=|linking nr lib' "$OUT/cmake.log" || true
 echo "== build"
 cmake --build "$OUT" -j "$JOBS" > "$OUT/make.log" 2>&1 || { grep -E 'error|Error' "$OUT/make.log" | head -40; exit 1; }
@@ -130,7 +130,7 @@ grep -cE 'warning:' "$OUT/make.log" | sed 's/^/compiler warnings: /' || true
 SHIP=$OUT/ship
 case $SHIP in "$ROOT"/builds/megalon/[1-9]*/ship) rm -rf "$SHIP" ;; *) echo "bad ship path" >&2; exit 1 ;; esac
 mkdir -p "$SHIP/bin" "$SHIP/lib"
-for b in kv-store ycsb_benchmark; do
+for b in kv-store ycsb_benchmark object-test; do
     [ -f "$OUT/benchmarks/$b" ] && cp -p "$OUT/benchmarks/$b" "$SHIP/bin/"
 done
 cp -p "$OUT/libmegalon.so" "$SHIP/lib/"
