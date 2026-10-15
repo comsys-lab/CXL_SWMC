@@ -96,11 +96,18 @@ def main():
     # Popcorn traffic: (remote write-backs + acquire flushes) x 4 KiB; wb_flush_count is not added
     import export_csv  # noqa: E402
     pd = {"sys.swmc.page_coherence.remote_writeback_count": 10, "sys.swmc.instr.serve.acquire_flush_count": 5,
-          "sys.swmc.instr.serve.wb_flush_count": 10}
+          "sys.swmc.instr.serve.wb_flush_count": 10, "sys.swmc.instr.enabled": 1}
     pm = export_csv.node_metrics({"window_s": 1.0}, pd)
     check(pm["traffic_bytes"] == 15 * 4096 and pm["traffic_src"] == "popcorn", "popcorn traffic")
     pm = export_csv.node_metrics({"window_s": 1.0}, {"sys.swmc.page_coherence.remote_writeback_count": 3})
     check(pm["traffic_bytes"] == 3 * 4096 and pm["traffic_src"] == "popcorn-wb", "popcorn traffic without instr")
+    pm = export_csv.node_metrics({"window_s": 1.0}, dict(pd, **{"sys.swmc.instr.enabled": 0}))
+    check(pm["traffic_bytes"] == 10 * 4096 and pm["traffic_src"] == "popcorn-wb", "popcorn traffic, instr disabled")
+    md = {"megt.sample": 64, "megt.rd_retries": 4, "megt.rd_failed_timed": 0, "megt.rd_sampled": 10,
+          "megt.rd_start_ns": 100, "megt.rd_body_ns": 200, "megt.rd_end_ns": 700}
+    mm = export_csv.node_metrics({"window_s": 1.0}, md)
+    check(abs(mm["meg_reexec_s"] - 4 * 100 / 1e9) < 1e-18 and mm["meg_reexec_src"] == "est_section", "reexec estimate")
+    check(x["n0_meg_reexec_src"] == "timed", "reexec timed")
     print("PASSED" if not fails else f"FAILED ({fails})")
     return 1 if fails else 0
 

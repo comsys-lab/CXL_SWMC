@@ -32,8 +32,12 @@ when the run has no snapshots or the counter is absent). Times in seconds of the
   n<k>_meg_rd_check_s      (megt.rd_start_ns + megt.rd_end_ns) x megt.sample   (successful read sections, estimate)
   n<k>_meg_wr_check_s      megt.wr_start_ns
   n<k>_meg_flush_s         megt.wr_end_ns (write_end includes the flush)
-  n<k>_meg_reexec_s        megt.rd_retries x (megt.rd_failed_ns / megt.rd_failed_timed): failed attempts, mean of the
-                           timed (sampled) ones times the exact retry count (empty if none was timed)
+  n<k>_meg_reexec_s        megt.rd_retries x mean failed-attempt time; source in n<k>_meg_reexec_src:
+                           timed      mean of the timed (sampled) failed attempts (megt.rd_failed_ns / rd_failed_timed)
+                           est_section  no failed attempt was timed: mean sampled accepted section
+                                      ((rd_start_ns + rd_body_ns + rd_end_ns) / rd_sampled), an underestimate when the
+                                      failed read_end flushes the object
+                           none       no retries (0)
   n<k>_meg_stall_s         sum of the four above
   n<k>_coh_stall_s         Popcorn: pop_search_fault_s + pop_writer_fault_s; Megalon: meg_stall_s
   n<k>_recv_cpu_s          kernel threads cxl_recv* (schedstat run_ns; cpu_ticks / 100 if absent)
@@ -42,8 +46,10 @@ when the run has no snapshots or the counter is absent). Times in seconds of the
   n<k>_tlb_ipi, n<k>_cal_ipi   /proc/interrupts TLB shootdowns / function-call IPIs (whole node)
   n<k>_traffic_bytes, n<k>_traffic_src   coherence traffic estimate and its source:
                            megalon       megalon.flush_bytes + megalon.replay_flush_bytes
-                           popcorn       (n<k>_pop_remote_wb + n<k>_pop_acquire_flush) x 4096 (MOT1 v4 Figure 2b)
-                           popcorn-wb    n<k>_pop_remote_wb x 4096 (kernel without instr/ counters)
+                           popcorn       (n<k>_pop_remote_wb + n<k>_pop_acquire_flush) x 4096 (MOT1 v4 Figure 2b;
+                                         only with sys.swmc.instr.enabled = 1 at the window end)
+                           popcorn-wb    n<k>_pop_remote_wb x 4096 (no instr/ counters or instr disabled:
+                                         acquire flushes not counted)
   n<k>_pop_remote_wb       sys.swmc.page_coherence.remote_writeback_count: pages this node wrote back for a peer =
                            Figure 2b terms "remote write-back" (FETCH on M: M -> S) + "remote invalidate with
                            write-back" (INVALIDATE on M: M -> I); one increment per pc_downgrade_m(), both cases.
@@ -52,6 +58,7 @@ when the run has no snapshots or the counter is absent). Times in seconds of the
                            mapped on the node).
   n<k>_pop_acquire_flush   sys.swmc.instr.serve.acquire_flush_count: Figure 2b "requester acquire-flush" (stale lines
                            dropped on I -> S/M or the first map of an init-S page)
+  n<k>_meg_reexec_src      see n<k>_meg_reexec_s
 """
 import argparse, csv, json, os, sys
 
@@ -67,7 +74,7 @@ NODE = ["window_s", "searches", "updates", "p_advance", "search_busy_frac", "wri
         "search_rq_wait_s", "writer_cpu_s", "cpu_busy_frac", "pop_search_fault_s", "pop_search_msg_wait_s",
         "pop_search_local_wait_s", "pop_writer_fault_s", "pop_node_fault_s", "meg_rd_check_s", "meg_wr_check_s",
         "meg_flush_s", "meg_reexec_s", "meg_stall_s", "coh_stall_s", "recv_cpu_s", "lib_bg_cpu_s", "coh_bg_cpu_s",
-        "tlb_ipi", "cal_ipi", "traffic_bytes", "traffic_src", "pop_remote_wb", "pop_acquire_flush"]
+        "tlb_ipi", "cal_ipi", "traffic_bytes", "traffic_src", "pop_remote_wb", "pop_acquire_flush", "meg_reexec_src"]
 PAGE = 4096
 
 
@@ -107,10 +114,16 @@ def node_metrics(fixed, d):
         m["meg_rd_check_s"] = (d.get("megt.rd_start_ns", 0) + d.get("megt.rd_end_ns", 0)) * smp / 1e9
         m["meg_wr_check_s"] = d.get("megt.wr_start_ns", 0) / 1e9
         m["meg_flush_s"] = d.get("megt.wr_end_ns", 0) / 1e9
-        if d.get("megt.rd_failed_timed"):
-            m["meg_reexec_s"] = d.get("megt.rd_retries", 0) * d["megt.rd_failed_ns"] / d["megt.rd_failed_timed"] / 1e9
-        elif d.get("megt.rd_retries", 0) == 0:
-            m["meg_reexec_s"] = 0.0
+        retries = d.get("megt.rd_retries", 0)
+        if retries == 0:
+            m["meg_reexec_s"], m["meg_reexec_src"] = 0.0, "none"
+        elif d.get("megt.rd_failed_timed"):
+            m["meg_reexec_s"] = retries * d["megt.rd_failed_ns"] / d["megt.rd_failed_timed"] / 1e9
+            m["meg_reexec_src"] = "timed"
+        elif d.get("megt.rd_sampled"):
+            sec = d.get("megt.rd_start_ns", 0) + d.get("megt.rd_body_ns", 0) + d.get("megt.rd_end_ns", 0)
+            m["meg_reexec_s"] = retries * sec / d["megt.rd_sampled"] / 1e9
+            m["meg_reexec_src"] = "est_section"
         m["meg_stall_s"] = sum(m[k] or 0 for k in ("meg_rd_check_s", "meg_wr_check_s", "meg_flush_s", "meg_reexec_s"))
     if m["pop_search_fault_s"] is not None or m["pop_writer_fault_s"] is not None:
         m["coh_stall_s"] = (m["pop_search_fault_s"] or 0) + (m["pop_writer_fault_s"] or 0)
@@ -130,7 +143,7 @@ def node_metrics(fixed, d):
     if "megalon.flush_bytes" in d:
         m["traffic_bytes"] = d["megalon.flush_bytes"] + d.get("megalon.replay_flush_bytes", 0)
         m["traffic_src"] = "megalon"
-    elif m["pop_remote_wb"] is not None and m["pop_acquire_flush"] is not None:
+    elif m["pop_remote_wb"] is not None and m["pop_acquire_flush"] is not None and d.get("sys.swmc.instr.enabled") == 1:
         m["traffic_bytes"] = (m["pop_remote_wb"] + m["pop_acquire_flush"]) * PAGE
         m["traffic_src"] = "popcorn"
     elif m["pop_remote_wb"] is not None:

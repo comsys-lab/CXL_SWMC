@@ -24,10 +24,11 @@ next read of the object.
 
 Window (optional): --stats LOADGEN_DIR --step N keeps only events (and counts writes) inside that step's
 measurement window on each node's own clock (t_mono_ns of stats/stepNNN-{begin,end}-t<k>.txt; the "node" key names
-the node) and compares, per node, the refetch counts with the Megalon counter delta megalon.read_retry_incoherent
-(which counts ObjectReadStart's incoherent retries AND failed ObjectReadEnd with PAGE_INCOHERENT): expected
-incoherent ≈ refetches with a peer write (+ incoherent failed read_ends); a large difference means the per-node
-cache does not track Megalon's own state (e.g. several threads flushing the same object concurrently).
+the node) and compares, per node, the Megalon counter delta megalon.read_retry_incoherent (ObjectReadStart's
+incoherent retries AND failed ObjectReadEnd with PAGE_INCOHERENT) with refetches that have a peer write +
+incoherent failed read_ends (= megt.rd_retries - megalon.read_retry_notify, window deltas); a large difference
+means the per-node cache does not track Megalon's own state (e.g. several threads flushing the same object
+concurrently).
 
 usage: classify_retries.py --trace DIR --out PREFIX [--slack 0] [--stats LOADGEN_DIR --step N]
 Output: PREFIX.events.csv (one row per event), PREFIX.summary.csv (per node, kind, class), PREFIX.summary.txt
@@ -65,13 +66,13 @@ def snapshot(path):
 
 
 def windows(stats_dir, step):
-    """node -> (t0, t1, read_retry_incoherent delta or None) from the step's begin/end snapshots."""
+    """node -> (t0, t1, {Megalon counter deltas}) from the step's begin/end snapshots."""
     w = {}
     for p in glob.glob(os.path.join(stats_dir, "stats", f"step{step:03d}-begin-t*.txt")):
         b, e = snapshot(p), snapshot(p.replace("-begin-", "-end-"))
-        k = "megalon.read_retry_incoherent"
-        inc = int(e[k]) - int(b[k]) if k in b and k in e else None
-        w[int(b["node"])] = (int(b["t_mono_ns"]), int(e["t_mono_ns"]), inc)
+        dd = {k: int(e[k]) - int(b[k]) for k in ("megalon.read_retry_incoherent", "megalon.read_retry_notify",
+                                                   "megt.rd_retries") if k in b and k in e}
+        w[int(b["node"])] = (int(b["t_mono_ns"]), int(e["t_mono_ns"]), dd)
     if not w:
         sys.exit(f"no snapshots for step {step} in {stats_dir}/stats")
     return w
@@ -150,7 +151,7 @@ def main():
                     c["local_only"] = 0
                 else:
                     c = counts.get((node, kind), zero)
-                inc = win[node][2] if win and node in win else ""
+                inc = win[node][2].get("megalon.read_retry_incoherent", "") if win and node in win else ""
                 w.writerow([node, kind, sum(c.values())] + [c[k] for k in CLASSES] +
                            [int((nw & (ws["node"] == node)).sum()), inc])
     with open(a.out + ".summary.txt", "w") as f:
@@ -171,10 +172,15 @@ def main():
             for kind in KINDS:
                 c = counts.get((node, kind), zero)
                 line += f" {kind}:" + ",".join(f"{k}={c[k]}" for k in CLASSES if kind == "refetch" or k != "local_only")
-            if win and node in win and win[node][2] is not None:
+            dd = win[node][2] if win and node in win else {}
+            if "megalon.read_retry_incoherent" in dd:
                 c = counts.get((node, "refetch"), zero)
                 peer = c["false_sharing"] + c["true_sharing"]
-                line += f" | megalon.read_retry_incoherent={win[node][2]} vs refetch_with_peer_write={peer}"
+                # failed read_ends = notify (META_OUTDATE) + incoherent (PAGE_INCOHERENT; also counted by Megalon)
+                inc_end = dd.get("megt.rd_retries", 0) - dd.get("megalon.read_retry_notify", 0)
+                line += (f" | megalon.read_retry_incoherent={dd['megalon.read_retry_incoherent']} vs refetch_with_peer"
+                         f"_write={peer} + incoherent_failed_read_end={inc_end} (= megt.rd_retries - read_retry_notify)"
+                         f" = {peer + inc_end}")
             f.write(line + "\n")
     print(open(a.out + ".summary.txt").read(), end="")
 

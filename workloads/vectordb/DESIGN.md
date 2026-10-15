@@ -311,12 +311,16 @@ indexing unit; Megalon flushes the whole object at write end (no dirty-line trac
   lines in the app layout of every backend (plain never touches them; Megalon only with --trace-dir): `wsec`
   (write sections completed by all nodes) and `objseq[o]`, one u64 per Megalon object (vector and link chunk per
   segment group, delete-log chunks per node; `Params::trace_objects()`), = wsec seq of the object's last write
-  section. Per write section (after write_end): wsec fetch-add, objseq[o] = seq (inside the segment write lock or
-  the node's own delete log, so one writer per object), log (seq, object, written ranges); if the node's cache for o
-  was current, it moves to seq (own writes do not make the node's copy stale). Per read section: one HWcc load of
-  objseq[o]; if it is past the node's cache (node-wide array, CAS: one thread per transition) a write section
-  completed on o since this node last saw it, so ObjectReadStart flushes and re-reads o (Megalon's "incoherent"
-  retry): refetch log (object, read range, old seq, new seq). Per read attempt: wsec load before read_start; a
+  section. The node's cache (node-wide array) mirrors Megalon's per-node local seq (src/core/c3.cc): 0 = none
+  (never seen here; Megalon's local seq is nullopt and its first read does not flush), set by an accepted read and,
+  unconditionally, by this node's own write_end (write_seq_end sets the local seq); after a failed read_end
+  (Megalon resets the local seq) the accepted re-read sets it to the objseq loaded before that attempt. Per write
+  section (after write_end): wsec fetch-add, objseq[o] = seq (inside the segment write lock or the node's own
+  delete log, so one writer per object), cache = seq, log (seq, object, written ranges). Per read section: one HWcc
+  load of objseq[o]; first sight (cache 0) only initialises the cache (megt.trace_first_sight); past a non-zero
+  cache (CAS: one thread per transition) a write section completed on o since this node last saw it, so
+  ObjectReadStart flushes and re-reads o (Megalon's "incoherent" retry): refetch log (object, read range, old seq,
+  new seq). Unit test: tests/megalon_trace_test.cc (fake object API). Per read attempt: wsec load before read_start; a
   failed read_end logs a retry (object, read range, s0, s1 = wsec after the failure). Dumped at stop as
   `node<K>.megalon-{wsec,retry,refetch}.bin`. `tools/classify_retries.py`: peer write sections with seq in (s0, s1]
   on the same object: overlapping range = true sharing, disjoint = false sharing, none = unexplained (refetch with
@@ -325,6 +329,13 @@ indexing unit; Megalon flushes the whole object at write end (no dirty-line trac
   read_ends) as a sanity check. Limits: a refetch carries the range of the first read after the change; a write
   between the objseq load and read_start is attributed to the next read; concurrent readers on one node may make
   Megalon flush more than once per transition (logged once).
+- Where the flush time lands: a refetch's flush and re-read are inside ObjectReadStart, i.e. in rd_start_ns
+  (export column meg_rd_check_s); a failed read_end's flush is inside the failed attempt (meg_reexec_s).
+- Cost. Wrapper counters are thread-local blocks summed at stats time (no shared writes); without a trace: per read
+  section an xorshift + branch, 1 in 64 sections 4 clock_gettime; per write section 4 clock_gettime. TRACE=1 adds per
+  read section one HWcc load (objseq) + a node-local cache load (CAS on a change), per attempt one HWcc load (wsec),
+  per write section one HWcc fetch-add + CAS, and log appends under one mutex (writes: writer thread; retries and
+  refetches: any thread) - fixed-load runs only.
 - Host smoke test: tests/host_smoke.sh (2 processes on a scratch file, plain or Megalon); unit tests
   tests/plugin_pairs_test.cc, tests/classify_retries_test.py, experiments/loadgen/test/stats_delta_test.py.
 

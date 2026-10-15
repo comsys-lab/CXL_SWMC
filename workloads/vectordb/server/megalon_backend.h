@@ -22,6 +22,7 @@
 #include <sstream>
 #include <string>
 #include <type_traits>
+#include <utility>
 #include <vector>
 
 #include "cxl_region.h"
@@ -95,6 +96,12 @@ class MegalonAcc;
 // of its last write section; a read that finds it past this node's cache logs a refetch (Megalon flushes and
 // re-reads the object in ObjectReadStart), classified the same way (node<K>.megalon-refetch.bin).
 // Without a trace dir none of the HWcc trace lines is touched.
+// Overhead without a trace dir (per read section): one xorshift and a branch; 1 in 64 sections 4 clock_gettime
+// (vDSO) + 4 thread-local counter updates; a failed read_end one thread-local update. Per write section: 4
+// clock_gettime + 4 thread-local updates. With a trace dir, in addition: per read section one HWcc load of objseq,
+// one HWcc load of wsec per attempt, a node-local cache load (a CAS on a change); per write section one HWcc
+// fetch-add (wsec) and CAS (objseq), and a log append under a mutex (writer thread only); retries and refetches
+// append under the same mutex.
 // Note: ObjectReadStart retries internally when the object's counter moved since this node last read it (flush the
 // whole object, retry; megalon.read_retry_incoherent): that time is inside rd_start_ns but is not a wrapper retry
 // (rd_retries / the retry log see only failed ObjectReadEnd calls).
@@ -113,9 +120,13 @@ struct __attribute__((packed)) RetryRec {  // 48 B
   uint32_t off, len;
   uint64_t s0, s1, t_ns, node;
 };
-struct MegTimers {
-  std::atomic<uint64_t> rd_sampled{0}, rd_start_ns{0}, rd_body_ns{0}, rd_end_ns{0}, rd_retries{0}, rd_failed_timed{0},
-      rd_failed_ns{0}, wr_sections{0}, wr_start_ns{0}, wr_body_ns{0}, wr_end_ns{0}, refetch{0};
+// Wrapper counters, one block per thread (owner-only relaxed load + store: no shared cache-line writes on the read
+// path), summed at stats time.
+struct alignas(64) MegTimers {
+  enum : int { kRdSampled, kRdStartNs, kRdBodyNs, kRdEndNs, kRdRetries, kRdFailedTimed, kRdFailedNs, kWrSections,
+               kWrStartNs, kWrBodyNs, kWrEndNs, kRefetch, kFirstSight, kN };
+  std::atomic<uint64_t> v[kN] = {};
+  void add(int k, uint64_t d) { v[k].store(v[k].load(std::memory_order_relaxed) + d, std::memory_order_relaxed); }
 };
 
 struct MegalonMem {
@@ -200,10 +211,14 @@ class MegalonBackend {
     thread_local uint64_t rs = 0x9e3779b97f4a7c15ull ^ uint64_t(reinterpret_cast<uintptr_t>(&rs));
     rs ^= rs << 13, rs ^= rs >> 7, rs ^= rs << 17;  // xorshift64
     const bool timed = (rs >> 32 & (kSample - 1)) == 0;
-    if (oseq_) note_read(id, off, len);
+    const uint64_t oi = oseq_ ? obj_index(id) : 0;
+    if (oseq_) note_read(oi, id, off, len);
+    bool failed = false;  // trace: Megalon resets its local seq on a failed read_end; the accepted re-read sets it
+    uint64_t va = 0;
     for (;;) {
       MegObj h;
       const uint64_t s0 = wsec_ ? cxl::hwcc::load_acquire(wsec_) : 0;
+      if (oseq_ && failed) va = cxl::hwcc::load_acquire(&oseq_[oi]);
       const uint64_t t0 = timed ? mono_ns() : 0;
       const int rc = api_->read_start(id, &h);
       if (rc != 0) megalon_fatal("ObjectReadStart(" + hex(id) + ") = " + std::to_string(rc));
@@ -214,15 +229,22 @@ class MegalonBackend {
         const uint64_t t2 = timed ? mono_ns() : 0;
         const bool ok = api_->read_end(&h);
         if (timed) account_read(t0, t1, t2, ok);
-        if (ok) return;
+        if (ok) {
+          if (failed && oseq_) raise_cache(oi, va);
+          return;
+        }
       } else {
         R r = f(static_cast<const uint8_t *>(h.ptr + off));
         const uint64_t t2 = timed ? mono_ns() : 0;
         const bool ok = api_->read_end(&h);
         if (timed) account_read(t0, t1, t2, ok);
-        if (ok) return r;
+        if (ok) {
+          if (failed && oseq_) raise_cache(oi, va);
+          return r;
+        }
       }
-      tm_.rd_retries++;
+      failed = true;
+      tm().add(MegTimers::kRdRetries, 1);
       if (trace_) log_retry(id, off, len, s0);
     }
   }
@@ -239,7 +261,9 @@ class MegalonBackend {
     const uint64_t t2 = mono_ns();
     api_->write_end(&h);
     const uint64_t t3 = mono_ns();
-    tm_.wr_sections++, tm_.wr_start_ns += t1 - t0, tm_.wr_body_ns += t2 - t1, tm_.wr_end_ns += t3 - t2;
+    MegTimers &t = tm();
+    t.add(MegTimers::kWrSections, 1), t.add(MegTimers::kWrStartNs, t1 - t0), t.add(MegTimers::kWrBodyNs, t2 - t1);
+    t.add(MegTimers::kWrEndNs, t3 - t2);
     if (wsec_) {
       const uint64_t seq = cxl::hwcc::fetch_add(wsec_, uint64_t(1)) + 1;
       note_write(id, seq);
@@ -310,12 +334,14 @@ class MegalonBackend {
       << "\nmegalon.write_retry=" << s.write_retry << "\nmegalon.switch_rw=" << s.switch_rw
       << "\nmegalon.flushes=" << s.flushes << "\nmegalon.flush_bytes=" << s.flush_bytes
       << "\nmegalon.replay_flushes=" << s.replay_flushes << "\nmegalon.replay_flush_bytes=" << s.replay_flush_bytes
-      << "\nmegt.sample=" << kSample << "\nmegt.rd_sampled=" << tm_.rd_sampled << "\nmegt.rd_start_ns=" << tm_.rd_start_ns
-      << "\nmegt.rd_body_ns=" << tm_.rd_body_ns << "\nmegt.rd_end_ns=" << tm_.rd_end_ns << "\nmegt.rd_retries=" << tm_.rd_retries
-      << "\nmegt.rd_failed_timed=" << tm_.rd_failed_timed << "\nmegt.rd_failed_ns=" << tm_.rd_failed_ns
-      << "\nmegt.wr_sections=" << tm_.wr_sections << "\nmegt.wr_start_ns=" << tm_.wr_start_ns
-      << "\nmegt.wr_body_ns=" << tm_.wr_body_ns << "\nmegt.wr_end_ns=" << tm_.wr_end_ns
-      << "\nmegt.trace_refetch=" << tm_.refetch << "\n";
+      << "\nmegt.sample=" << kSample;
+    static const char *const names[MegTimers::kN] = {"rd_sampled", "rd_start_ns", "rd_body_ns", "rd_end_ns",
+                                                      "rd_retries", "rd_failed_timed", "rd_failed_ns", "wr_sections",
+                                                      "wr_start_ns", "wr_body_ns", "wr_end_ns", "trace_refetch",
+                                                      "trace_first_sight"};
+    const std::vector<uint64_t> sum = timers();
+    for (int k = 0; k < MegTimers::kN; k++) o << "\nmegt." << names[k] << "=" << sum[k];
+    o << "\n";
     return o.str();
   }
 
@@ -353,10 +379,12 @@ class MegalonBackend {
   }
   void account_read(uint64_t t0, uint64_t t1, uint64_t t2, bool ok) const {
     const uint64_t t3 = mono_ns();
+    MegTimers &t = tm();
     if (ok) {
-      tm_.rd_sampled++, tm_.rd_start_ns += t1 - t0, tm_.rd_body_ns += t2 - t1, tm_.rd_end_ns += t3 - t2;
+      t.add(MegTimers::kRdSampled, 1), t.add(MegTimers::kRdStartNs, t1 - t0), t.add(MegTimers::kRdBodyNs, t2 - t1);
+      t.add(MegTimers::kRdEndNs, t3 - t2);
     } else {
-      tm_.rd_failed_timed++, tm_.rd_failed_ns += t3 - t0;
+      t.add(MegTimers::kRdFailedTimed, 1), t.add(MegTimers::kRdFailedNs, t3 - t0);
     }
   }
   // dense index of an object id (for_each_object order: vec/link per segment group, then delete-log chunks per node)
@@ -365,32 +393,67 @@ class MegalonBackend {
     if (kind == 1 || kind == 2) return (a * p_.g.groups() + b) * 2 + (kind - 1);
     return uint64_t(p_.segments) * p_.g.groups() * 2 + a * dlog_chunks_ + b;
   }
-  // Trace only. A read section whose object's HWcc objseq moved past this node's cache: a write section completed
-  // on the object since this node last saw it, so Megalon's ObjectReadStart flushes and re-reads the object (when
-  // that write came from a peer). One thread per node logs the transition (cache CAS): refetch record (object, this
-  // read's range, old seq, new seq); classify_retries.py classifies it like a retry.
-  void note_read(uint64_t id, uint64_t off, uint64_t len) const {
-    const uint64_t i = obj_index(id);
+  // Trace only; the node cache mirrors Megalon's per-node local seq of the object (c3.cc): 0 = none (never read or
+  // written here: Megalon's local seq is nullopt and its first read does not flush), set by an accepted read and,
+  // unconditionally, by this node's own write_end. A read section whose object's HWcc objseq is past a non-zero
+  // cache: a write section completed on the object since this node last saw it, so ObjectReadStart flushes and
+  // re-reads the object. One thread per node logs the transition (cache CAS): refetch record (object, this read's
+  // range, old seq, new seq); classify_retries.py classifies it like a retry.
+  void note_read(uint64_t i, uint64_t id, uint64_t off, uint64_t len) const {
     const uint64_t v = cxl::hwcc::load_acquire(&oseq_[i]);
     uint64_t c = ocache_[i].load(std::memory_order_relaxed);
     if (v <= c || !ocache_[i].compare_exchange_strong(c, v)) return;
-    tm_.refetch++;
+    if (c == 0) {  // first sight on this node: no flush in Megalon
+      tm().add(MegTimers::kFirstSight, 1);
+      return;
+    }
+    tm().add(MegTimers::kRefetch, 1);
     if (trace_) {
       std::lock_guard<std::mutex> g(tmu_);
       flog_.push_back(RetryRec{id, uint32_t(off), uint32_t(len), c, v, mono_ns(), node_});
     }
   }
   // Trace only, after write_end (inside the segment's HWcc write lock or the node's own delete log: one writer per
-  // object at a time): objseq = seq; if this node had seen every earlier write on the object, its own write does not
-  // make its copy stale (cache = seq).
+  // object at a time): objseq = seq; cache = seq unconditionally (Megalon's write_seq_end sets the node's local seq).
   void note_write(uint64_t id, uint64_t seq) const {
     if (!oseq_) return;
     const uint64_t i = obj_index(id);
     uint64_t prev = cxl::hwcc::load_acquire(&oseq_[i]);
     while (prev < seq && !cxl::hwcc::cas(&oseq_[i], &prev, seq)) {
     }
-    uint64_t c = prev;
-    ocache_[i].compare_exchange_strong(c, seq);
+    ocache_[i].store(seq);
+  }
+  // Trace only: after a failed read_end Megalon's local seq is reset and the accepted re-read sets it to the counter
+  // it read (va = objseq loaded before that attempt's read_start).
+  void raise_cache(uint64_t i, uint64_t va) const {
+    uint64_t c = ocache_[i].load(std::memory_order_relaxed);
+    while (c < va && !ocache_[i].compare_exchange_weak(c, va)) {
+    }
+  }
+  MegTimers &tm() const {  // this thread's block for this backend (a process has one backend; tests may have two)
+    thread_local const MegalonBackend *owner = nullptr;
+    thread_local MegTimers *mine = nullptr;
+    if (owner != this) {
+      thread_local std::vector<std::pair<const MegalonBackend *, MegTimers *>> all;
+      mine = nullptr;
+      for (auto &e : all)
+        if (e.first == this) mine = e.second;
+      if (!mine) {
+        mine = new MegTimers;  // lives as long as the process (threads are long-lived)
+        std::lock_guard<std::mutex> g(tmu_);
+        tblocks_.push_back(mine);
+        all.emplace_back(this, mine);
+      }
+      owner = this;
+    }
+    return *mine;
+  }
+  std::vector<uint64_t> timers() const {
+    std::vector<uint64_t> sum(MegTimers::kN, 0);
+    std::lock_guard<std::mutex> g(tmu_);
+    for (const MegTimers *t : tblocks_)
+      for (int k = 0; k < MegTimers::kN; k++) sum[k] += t->v[k].load(std::memory_order_relaxed);
+    return sum;
   }
   void log_retry(uint64_t id, uint64_t off, uint64_t len, uint64_t s0) const {
     const uint64_t s1 = wsec_ ? cxl::hwcc::load_acquire(wsec_) : 0;
@@ -405,7 +468,7 @@ class MegalonBackend {
   mutable std::unique_ptr<std::atomic<uint64_t>[]> ocache_;  // this node: last objseq value seen per object
   bool trace_ = false;
   uint32_t node_ = 0;
-  mutable MegTimers tm_;
+  mutable std::vector<MegTimers *> tblocks_;  // every thread's counter block (under tmu_)
   mutable std::mutex tmu_;
   mutable std::vector<WsecRec> wlog_;
   mutable std::vector<RetryRec> rlog_;
