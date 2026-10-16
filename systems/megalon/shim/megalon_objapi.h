@@ -27,12 +27,15 @@ struct Stats {  // subset of rackobj::ObjectStats (this node unless noted)
 
 // Per-thread coherence time of the CALLING thread since reg() (MOT1 v6 reports/MOT1-v6-redesign-draft.md §3.1, §4.1).
 // Durations in ns (plain rdtsc, no fences, converted with the TSC rate), counts in events. Every event is timed
-// except the section checks, which are timed 1 in check_sample (check_ns_sampled = sum over sampled sections only;
-// estimate = check_ns_sampled * check_sample). (A) stale copy at read_start, (B) version changed during the read
-// (read_end false), (C) NR metadata notification (read_end false), (D) spin while a writer holds the version.
+// except the READ-section checks, which are timed 1 in check_sample (check_ns_sampled = sum over the check_sampled
+// sampled read sections; estimate for all read sections = check_ns_sampled * read_sections / check_sampled, the
+// ratio estimator — preferred over * check_sample because each thread's first section is always sampled).
+// (A) stale copy at read_start, (B) version changed during the read (read_end false), (C) NR metadata notification
+// (read_end false), (D) contended waits inside ObjectReadStart/End: seqlock version odd (writer holds it), NR
+// combiner-lock waits and NR replica read-lock waits. Exact intervals: reports/M2-megalon-port-changes.md §13.
 struct CohSnap {
   uint64_t read_sections, write_sections;
-  uint64_t check_sample, check_ns_sampled, check_sampled;  // read/write start+end work when no retry happens
+  uint64_t check_sample, check_ns_sampled, check_sampled;  // READ sections only: start+end work when no retry happens
   uint64_t stale_cnt, stale_ns;                            // (A) incl. the whole-object flush and the restart
   uint64_t concur_cnt, concur_ns;                          // (B) flush + the discarded section body
   uint64_t meta_cnt, meta_ns;                              // (C) discarded section
