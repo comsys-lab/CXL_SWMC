@@ -11,8 +11,8 @@
 # optional: RECORDS (1000000), MAX_PAGES (600000), GET_THREADS (8), READERS (32), PREPARE_THREADS (Megalon node 0: 8),
 #   SEED (20261016), LOG (0; 1 = loadgen log=1 + check_log.py, functional runs), GATE=0 (skip the Host gate; refused
 #   unless KIND=functional), VM_PLAIN (/home/comsys/lmdb/plain), VM_MEG (/home/comsys/lmdb/megalon), IMAGE
-#   (/home/comsys/lmdb/img-$RECORDS on node 0), PLAIN_BUILD (builds/lmdb/3), MEG_BUILD (builds/lmdb-megalon/3),
-#   LOADGEN_BUILD (builds/lmdb-loadgen/2), RUN_KIND override.
+#   (/home/comsys/lmdb/img-$RECORDS on node 0), PLAIN_BUILD (builds/lmdb/5), MEG_BUILD (builds/lmdb-megalon/5, Megalon 72),
+#   LOADGEN_BUILD (builds/lmdb-loadgen/4), RUN_KIND override.
 # Prints "PILOTRUN <name> OK|NOTE|STOP <reason>"; exit 0 for OK/NOTE, 1 for STOP.
 set -uo pipefail
 NAME=$1 E=$2
@@ -23,8 +23,8 @@ RECORDS=${RECORDS:-1000000} MAX_PAGES=${MAX_PAGES:-600000} GET_THREADS=${GET_THR
 SEED=${SEED:-20261016} LOG=${LOG:-0} PREPARE_THREADS=${PREPARE_THREADS:-8}
 VM_PLAIN=${VM_PLAIN:-/home/comsys/lmdb/plain} VM_MEG=${VM_MEG:-/home/comsys/lmdb/megalon}
 IMAGE=${IMAGE:-/home/comsys/lmdb/img-$RECORDS}
-PLAIN_BUILD=${PLAIN_BUILD:-$P/builds/lmdb/3} MEG_BUILD=${MEG_BUILD:-$P/builds/lmdb-megalon/3}
-LOADGEN_BUILD=${LOADGEN_BUILD:-$P/builds/lmdb-loadgen/2}
+PLAIN_BUILD=${PLAIN_BUILD:-$P/builds/lmdb/5} MEG_BUILD=${MEG_BUILD:-$P/builds/lmdb-megalon/5}
+LOADGEN_BUILD=${LOADGEN_BUILD:-$P/builds/lmdb-loadgen/4}
 stop() { echo "PILOTRUN $NAME STOP $*"; exit 1; }
 [ -d "$E" ] || stop "missing evidence dir $E"
 [ -e "$E/$NAME" ] && stop "$E/$NAME exists"

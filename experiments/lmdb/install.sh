@@ -8,12 +8,12 @@
 #   cfg/megalon.yaml = workloads/lmdb/config/megalon-2vm.yaml with object_arena_size = ARENA (default 4GB; must be
 #   >= (MAX_PAGES - 2) x 4096), written to $LOG.megalon.yaml first.
 # usage: install.sh <log file>     env: L (/home/comsys/lmdb), RECORDS (1000000), IMG (Host image dir, required),
-#        PLAIN_BUILD (builds/lmdb/3), MEG_BUILD (builds/lmdb-megalon/3), MAX_PAGES (600000), ARENA (4GB)
+#        PLAIN_BUILD (builds/lmdb/5), MEG_BUILD (builds/lmdb-megalon/5, Megalon 72), MAX_PAGES (600000), ARENA (4GB)
 set -euo pipefail
 P=/home/comsys/sungsu/destijl-control C=$P/CXL_SWMC LOG=$1
 L=${L:-/home/comsys/lmdb} RECORDS=${RECORDS:-1000000} MAX_PAGES=${MAX_PAGES:-600000} ARENA=${ARENA:-4GB}
 : "${IMG:?IMG = Host image dir (lmdb-image --out)}"
-BP=${PLAIN_BUILD:-$P/builds/lmdb/3} BM=${MEG_BUILD:-$P/builds/lmdb-megalon/3}
+BP=${PLAIN_BUILD:-$P/builds/lmdb/5} BM=${MEG_BUILD:-$P/builds/lmdb-megalon/5}
 SSH="ssh -o BatchMode=yes -o ConnectTimeout=8"
 CFG=$LOG.megalon.yaml
 [ -e "$CFG" ] && { echo "refusing: $CFG exists"; exit 2; }
