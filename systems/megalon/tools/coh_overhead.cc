@@ -5,7 +5,9 @@
 //   coh-overhead <sections> <reps>
 // Node 0: one thread, one 64 B object, no contention; per rep: <sections> read sections, then <sections> write
 // sections (whole line), each timed with steady_clock around the loop. Node 1 only waits in the end barrier.
-// Output (stdout, one line per rep): COH-OV label=<COH_OV_LABEL> rep=<r> read_ns=<x> write_ns=<y>
+// Then <sections> KV Puts and Gets of one 1 KiB key (rackobj::Put/Get).
+// Output (stdout, one line per rep): COH-OV label=<COH_OV_LABEL> rep=<r> read_ns=<x> write_ns=<y> kvget_ns=<g>
+// kvput_ns=<p>
 #include <rackobj.h>
 
 #include <cerrno>
@@ -13,6 +15,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 
 int main(int argc, char **argv) {
     if (argc < 3) {
@@ -55,11 +58,20 @@ int main(int argc, char **argv) {
                 rackobj::ObjectWriteEnd(&h);
             }
             auto t2 = std::chrono::steady_clock::now();
+            static uint8_t val[1024];
+            const off_t key = 777001;
+            for (uint64_t i = 0; i < n; i++) {
+                std::memcpy(val, &i, sizeof(i));
+                (void)rackobj::Put(val, sizeof(val), key);
+            }
+            auto t3 = std::chrono::steady_clock::now();
+            for (uint64_t i = 0; i < n; i++) sink += rackobj::Get(val, sizeof(val), key) > 0;
+            auto t4 = std::chrono::steady_clock::now();
             auto ns = [&](auto a, auto b) {
                 return std::chrono::duration<double, std::nano>(b - a).count() / static_cast<double>(n);
             };
-            std::printf("COH-OV label=%s rep=%d read_ns=%.2f write_ns=%.2f sink=%lu\n", label, r, ns(t0, t1),
-                        ns(t1, t2), static_cast<unsigned long>(sink & 1));
+            std::printf("COH-OV label=%s rep=%d read_ns=%.2f write_ns=%.2f kvget_ns=%.2f kvput_ns=%.2f sink=%lu\n", label,
+                        r, ns(t0, t1), ns(t1, t2), ns(t3, t4), ns(t2, t3), static_cast<unsigned long>(sink & 1));
             std::fflush(stdout);
         }
     }

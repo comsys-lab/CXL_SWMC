@@ -57,7 +57,7 @@ cat "$OUT/manifest.txt"
 
 busy() { local c; c=$(pgrep -c -f '(cc1plus|cc1 |rustc|clang|/ld |ld\.lld|cargo build|ninja|gmake)' 2>/dev/null); echo "${c:-0}"; }
 
-echo "label,round,rep,read_ns,write_ns,host_busy_before,host_busy_after,loadavg" > "$OUT/raw.csv"
+echo "label,round,rep,read_ns,write_ns,kvget_ns,kvput_ns,host_busy_before,host_busy_after,loadavg" > "$OUT/raw.csv"
 run_one() {  # idx round
     local i=$1 r=$2 l=${LBL[$1]} d=${DIR[$1]} e=${ENVS[$1]} log=$OUT/run-$2-${LBL[$1]}
     local b0 b1 rc0 rc1=0
@@ -89,7 +89,7 @@ run_one() {  # idx round
     echo "round $r $l: rc0=$rc0 rc1=$rc1 host_busy=$b0/$b1"
     [ "$rc0" = 0 ] && [ "$rc1" = 0 ] || { echo "STOP: run failed ($log.*)"; exit 4; }
     local la; la=$(cut -d' ' -f1 /proc/loadavg)
-    sed -n 's/^COH-OV label=\([^ ]*\) rep=\([0-9]*\) read_ns=\([0-9.]*\) write_ns=\([0-9.]*\).*/\1,'"$r"',\2,\3,\4,'"$b0,$b1,$la"'/p' \
+    sed -n 's/^COH-OV label=\([^ ]*\) rep=\([0-9]*\) read_ns=\([0-9.]*\) write_ns=\([0-9.]*\) kvget_ns=\([0-9.]*\) kvput_ns=\([0-9.]*\).*/\1,'"$r"',\2,\3,\4,\5,\6,'"$b0,$b1,$la"'/p' \
         "$log".node*.log >> "$OUT/raw.csv"
 }
 
@@ -102,14 +102,16 @@ python3 -I - "$OUT/raw.csv" "$OUT/summary.csv" <<'EOF'
 import csv, statistics, sys
 rows = [r for r in csv.DictReader(open(sys.argv[1])) if int(r["rep"]) >= 1]  # rep 0 = warm-up
 out = csv.writer(open(sys.argv[2], "w"))
-out.writerow(["label", "n", "read_median_ns", "read_mean_ns", "read_stdev_ns", "write_median_ns", "write_mean_ns",
-              "write_stdev_ns", "runs_with_host_builds"])
+cols = ["read", "write", "kvget", "kvput"]
+out.writerow(["label", "n"] + [f"{c}_{k}_ns" for c in cols for k in ("median", "mean", "stdev")] + ["runs_with_host_builds"])
 for l in dict.fromkeys(r["label"] for r in rows):
     s = [r for r in rows if r["label"] == l]
-    rd = [float(r["read_ns"]) for r in s]; wr = [float(r["write_ns"]) for r in s]
     busy = len({r["round"] for r in s if r["host_busy_before"] != "0" or r["host_busy_after"] != "0"})
     sd = lambda x: statistics.stdev(x) if len(x) > 1 else 0.0
-    out.writerow([l, len(s), f"{statistics.median(rd):.1f}", f"{statistics.mean(rd):.1f}", f"{sd(rd):.1f}",
-                  f"{statistics.median(wr):.1f}", f"{statistics.mean(wr):.1f}", f"{sd(wr):.1f}", busy])
+    vals = []
+    for c in cols:
+        x = [float(r[f"{c}_ns"]) for r in s]
+        vals += [f"{statistics.median(x):.1f}", f"{statistics.mean(x):.1f}", f"{sd(x):.1f}"]
+    out.writerow([l, len(s)] + vals + [busy])
 EOF
 column -s, -t "$OUT/summary.csv"
