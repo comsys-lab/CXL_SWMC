@@ -1,7 +1,8 @@
 #!/bin/bash
 # The recommendation-system H1 MAIN block (reports/RECSYS-main-packet.md): full-size tables (26 tables, 26M cap,
 # 167,731,776 slots x 576 B = 89.98 GiB), T = 60 s, updater 2,100 samples/s on node 0, serving on node 1,
-# SLO query p99 <= 60 ms. Every system on Popcorn build 8 (K8): all-HWcc and Megalon with cxl_shm unloaded, page MSI
+# SLO = SLO_FACTOR (5) x all-HWcc's query p99 at the lowest load (user 2026-10-16; deviation from MOT1's 60 ms MLPerf
+# SLO), one SLO for all three systems of the block (<E>/slo.txt, every manifest). Every system on Popcorn build 8 (K8): all-HWcc and Megalon with cxl_shm unloaded, page MSI
 # with cxl_shm loaded once for its whole server lifetime (init_state=shared + preload, recv_mode RECV_MODE).
 # usage: main-block.sh <evidence dir (exists; only sequence* files)>
 # env (required): C8 (= builds/popcorn_new/8/deploy-v3), K8, GT8, RECV_MODE, D (inputs dir with MANIFEST.txt),
@@ -10,13 +11,17 @@
 #   ROUNDS (3), XT (server lifetime bound, s, default 28800).
 # Load once per system (recorded exception to "every run starts from the initial image"): per system one server
 # lifetime (session.sh) with, in this order,
-#   gate   1 query/s, 60 s: query p99 <= 60 ms checked explicitly (all-HWcc: a miss STOPs the block = methodology
-#          decision for the user; page MSI / Megalon: recorded, the block continues)
+#   warmup 1 query/s + the updater, 10 s + 70 s, unmeasured (results kept, never used): after the server's own read of
+#          every slot (both nodes, before READY; page MSI read first-touch faults happen there), the first T = 60 s
+#          publication round (updater write faults / page MSI invalidations) and the query path's first use
+#   gate   1 query/s, 60 s, no SLO abort: the lowest-load window. VALID = one step, keeps up, no errors/timeouts,
+#          >= 1 query (main_util.py gate). all-HWcc: INVALID STOPs the block; otherwise SLO_MS = SLO_FACTOR x its query
+#          p99 (main_util.py slo) -> <E>/slo.txt. page MSI / Megalon: recorded with within_slo (block continues)
 #   slo-r1, slo-r2, slo-r3   full MOT1 §3.3 SLO searches (PROFILE=main: warm-up 10 s, steps 3 s + 15 s, bisect 5%,
 #          confirm 3 x 30 s with step-down, fill 0.7/0.8/0.9, overload 1.05/1.1/1.2), loadgen seed SEED + round
 #   fixed  60 s at L = 0.5 x all-HWcc slo-r1 confirm mean (no SLO abort: the whole window is measured); breakdown.csv
 #          must have the system's coherence columns (check_breakdown.py)
-# System order: all-HWcc first (its gate decides whether the block continues and its slo-r1 gives every system's L),
+# System order: all-HWcc first (its gate sets the block's SLO and its slo-r1 gives every system's L),
 #   then page MSI and Megalon in an order shuffled with seed = the block owner (recorded in order.txt).
 # /dev/dax0.0: comsys for all-HWcc / Megalon, root:root 600 before page MSI (p-popcorn-shm.sh precheck; its teardown
 # restores it). Holds workspaces/MEASUREMENT.lock; Host gate before every measurement; stops at the first MAIN STOP.
@@ -28,7 +33,8 @@ E=${1:?evidence dir}
 P=/home/comsys/sungsu/destijl-control X=$P/CXL_SWMC/experiments/recsys G=$P/CXL_SWMC/experiments/vectordb/host-gate.sh
 : "${C8:?}" "${K8:?}" "${GT8:?}" "${RECV_MODE:?}" "${D:?}" "${VM_PLAIN:?}" "${VM_MEG:?}" "${MEG_BUILD:?}" "${LOADGEN:?}"
 MB=$MEG_BUILD SEED=${SEED:-20261016} UPD_RATE=${UPD_RATE:-2100} ROUNDS=${ROUNDS:-3} XT=${XT:-28800}
-T_MS=60000 SLO_MS=60
+T_MS=60000 SLO_FACTOR=${SLO_FACTOR:-5} SLO_MS=""
+export SLO_MS SLO_RULE="pending: ${SLO_FACTOR} x all-HWcc query p99 at 1 query/s (gate window)"
 HOST_PLAIN=$P/builds/recsys/3/bin/recsys-server
 SSH="ssh -o BatchMode=yes -o ConnectTimeout=8"
 IPS=(192.168.122.100 192.168.122.101)
@@ -110,7 +116,7 @@ dax_root() {  # before the page MSI lifetime (no server of ours runs then)
 }
 shuffle() { python3 -c 'import random,sys; v=sys.argv[2:]; random.Random(sys.argv[1]).shuffle(v); print(" ".join(v))' "$OWNER" "$@"; }
 confirm_half() { python3 $X/main_util.py half "$1"; }        # 0.5 x confirm mean of an SLO search without a note
-gate60() { python3 $X/main_util.py gate60 "$1" "$SLO_MS"; }  # explicit 60 ms check of the 1 query/s window
+gatechk() { python3 $X/main_util.py gate "$1" ${SLO_MS:+"$SLO_MS"}; }  # validity (+ within the block SLO once set)
 precheck() {
   local i f files="${VM_PLAIN#/home/comsys/}/bin/recsys-server ${VM_PLAIN#/home/comsys/}/bin/recsys-node.sh ${VM_PLAIN#/home/comsys/}/cfg/cxl_region.yaml ${VM_MEG#/home/comsys/}/bin/recsys-server ${VM_MEG#/home/comsys/}/bin/recsys-node.sh ${VM_MEG#/home/comsys/}/lib/libmegalon-objapi.so ${VM_MEG#/home/comsys/}/lib/libmegalon.so ${VM_MEG#/home/comsys/}/cfg/megalon.yaml ${VM_MEG#/home/comsys/}/cfg/cxl_region.yaml"
   for i in 0 1; do
@@ -179,20 +185,29 @@ system() {  # one server lifetime: hw | pop | mg
   tail -1 "$S.start.out"
   echo "$s prepare_wall_s=$(( $(date +%s) - t0 )) (incl. page MSI shm load + preload)" >> "$E/load-times.txt"
   sed "s/^/$s /" "$S/load-times.txt" >> "$E/load-times.txt"
-  # 1) lowest load: 1 query/s, 60 s, explicit 60 ms check
-  measure "$S" gate "${LGC[@]}" --opt seed=$SEED --seed $SEED --slo query:99:$SLO_MS --raw --mode fixed --rates 1 \
+  # 1) warm-up (unmeasured): 1 query/s with the updater for 70 s (>= one T = 60 s publication round)
+  measure "$S" warmup "${LGC[@]}" --opt seed=$((SEED + 100)) --seed $((SEED + 100)) --mode fixed --rates 1 \
+    --warmup-s 10 --step-warmup-s 0 --step-measure-s 70 --drain-s 10
+  rc=$?
+  [ $rc = 0 ] || stop "$s warm-up rc $rc"
+  # 2) lowest load: 1 query/s, 60 s, no SLO abort
+  measure "$S" gate "${LGC[@]}" --opt seed=$SEED --seed $SEED --raw --mode fixed --rates 1 \
     --step-warmup-s 3 --step-measure-s 60 --drain-s 10
   rc=$?
-  [ $rc = 0 ] || [ $rc = 1 ] || stop "$s gate measurement rc $rc"
-  grep -q 'workload_finish":"ok' "$S/gate/loadgen/summary.json" 2>/dev/null || stop "$s gate: loadgen workload finish"
-  g=$(gate60 "$S/gate/loadgen/steps.jsonl")
-  echo "$s gate 1 query/s: $g" | tee -a "$E/gate-60ms.txt"
-  case "$g" in
-    PASS*) ;;
-    *) [ $s = hw ] && stop "all-HWcc misses ${SLO_MS} ms at 1 query/s ($g): methodology decision for the user"
-       echo "MAIN NOTE $s misses ${SLO_MS} ms at 1 query/s (recorded; the block continues)";;
-  esac
-  # 2) SLO searches
+  [ $rc = 0 ] || stop "$s gate measurement rc $rc"
+  g=$(gatechk "$S/gate/loadgen/steps.jsonl")
+  echo "$s gate 1 query/s: $g" | tee -a "$E/gate.txt"
+  if [ $s = hw ]; then
+    case "$g" in VALID*) ;; *) stop "all-HWcc lowest-load window invalid ($g)";; esac
+    SLO_MS=$(python3 $X/main_util.py slo "$S/gate/loadgen/steps.jsonl" "$SLO_FACTOR") || stop "no SLO from the all-HWcc gate"
+    awk -v x="$SLO_MS" 'BEGIN{exit !(x > 0)}' || stop "bad SLO $SLO_MS"
+    SLO_RULE="${SLO_FACTOR} x all-HWcc query p99 at 1 query/s ($S/gate, $(echo "$g" | grep -o 'p99_ms=[^ ]*'))"
+    echo "slo_ms=$SLO_MS rule=$SLO_RULE (user 2026-10-16; deviation from MOT1's 60 ms)" | tee "$E/slo.txt"
+  else
+    case "$g" in VALID*) ;; *) echo "MAIN NOTE $s lowest-load window invalid (recorded; the block continues): $g";; esac
+  fi
+  [ -n "$SLO_MS" ] || stop "no block SLO"
+  # 3) SLO searches (block SLO)
   for r in $(seq 1 $ROUNDS); do
     measure "$S" slo-r$r "${LGC[@]}" --opt seed=$((SEED + r)) --seed $((SEED + r)) --slo query:99:$SLO_MS --raw \
       --mode slo --start 1 --factor 1.5 --precision 0.05 --max-steps 20
@@ -210,7 +225,7 @@ system() {  # one server lifetime: hw | pop | mg
       echo "L = 0.5 x all-HWcc slo-r1 confirm mean (this block, build 8, T = 60 s) = $L query/s" > "$E/fixed-load-L.txt"
     fi
   done
-  # 3) fixed load L, 60 s, whole window (no SLO abort)
+  # 4) fixed load L, 60 s, whole window (no SLO abort)
   L=$(sed -n 's/.* = \([0-9.]*\) query\/s$/\1/p' "$E/fixed-load-L.txt")
   [ -n "$L" ] || stop "no L"
   measure "$S" fixed "${LGC[@]}" --opt seed=$SEED --seed $SEED --raw --mode fixed --rates "$L" \

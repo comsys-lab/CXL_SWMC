@@ -5,6 +5,11 @@
                                                  the step passed (keeps up, no errors) AND query p99 <= limit (explicit,
                                                  not only loadgen's pass flag) AND it completed >= 1 query.
                                                  Prints "PASS|MISS p99_ms=... ..." (exit 0 either way).
+  main_util.py gate <steps.jsonl> [slo ms]      the lowest-load window (v2): exactly one measured "fixed" step; VALID when
+                                                 the step passed (keeps up, no errors/timeouts; no SLO is set) and >= 1
+                                                 query completed. Prints "VALID|INVALID p99_ms=... [within_slo=...]".
+  main_util.py slo <steps.jsonl> <factor>       SLO ms = factor x the query p99 of that window (rounded to 0.001 ms);
+                                                 exit 1 unless the window is VALID.
   main_util.py half <summary.json>               0.5 x the SLO search's confirm mean (L); exit 1 if the search has a
                                                  note or no confirm result (a noted search is never used for L).
 """
@@ -27,6 +32,32 @@ def gate60(steps, limit):
           f'update_offered={u["offered"]} update_achieved={u["achieved"]}')
 
 
+def gate_window(steps):
+    st = [json.loads(l) for l in open(steps) if l.strip()]
+    st = [d for d in st if d.get('phase') == 'fixed']
+    if len(st) != 1:
+        return False, None, f'measured_steps={len(st)} (need exactly 1)'
+    d = st[0]
+    q, u = d['streams']['query'], d['streams']['update']
+    ok = bool(d['pass']) and q['done'] > 0 and q['errors'] == 0 and q['timeouts'] == 0
+    return ok, q['p99_ms'], (f'p99_ms={q["p99_ms"]} pass={d["pass"]} reason={d.get("reason", "")!r} query_sent={q["sent"]} '
+                             f'query_done={q["done"]} query_p50_ms={q["p50_ms"]} query_max_ms={q["max_ms"]} '
+                             f'achieved_q_s={q["achieved"]} update_offered={u["offered"]} update_achieved={u["achieved"]}')
+
+
+def gate(steps, limit=None):
+    ok, p, txt = gate_window(steps)
+    extra = '' if limit is None or p is None else f' slo_ms={limit} within_slo={p <= limit}'
+    print(('VALID ' if ok else 'INVALID ') + txt + extra)
+
+
+def slo(steps, factor):
+    ok, p, txt = gate_window(steps)
+    if not ok or not p or p <= 0:
+        sys.exit('INVALID lowest-load window: ' + txt)
+    print(round(factor * p, 3))
+
+
 def half(summary):
     s = json.load(open(summary))
     if s.get('note'):
@@ -40,6 +71,10 @@ def half(summary):
 if __name__ == '__main__':
     if len(sys.argv) == 4 and sys.argv[1] == 'gate60':
         gate60(sys.argv[2], float(sys.argv[3]))
+    elif sys.argv[1:2] == ['gate'] and len(sys.argv) in (3, 4):
+        gate(sys.argv[2], float(sys.argv[3]) if len(sys.argv) == 4 else None)
+    elif len(sys.argv) == 4 and sys.argv[1] == 'slo':
+        slo(sys.argv[2], float(sys.argv[3]))
     elif len(sys.argv) == 3 and sys.argv[1] == 'half':
         half(sys.argv[2])
     else:

@@ -1,18 +1,18 @@
 #!/bin/bash
 # Host test of the main-run session harness (experiments/recsys/session.sh, main_util.py, check_breakdown.py) with
 # SESSION_LOCAL=1: two local recsys-server processes on a /dev/shm file region (as host_test.sh), one server lifetime,
-# the main block's measurement sequence scaled down: gate (1 query/s) -> slo-r1 -> slo-r2 -> fixed at 0.5 x r1 ->
+# the main block v2 sequence scaled down: warmup -> gate (1 query/s; SLO = 5 x its p99) -> slo-r1 -> slo-r2 -> fixed at 0.5 x r1 ->
 # stop. Checks: update seqs continue over the lifetime (seq_base of r2 = last seq of r1, published_seq rises),
-# window invariants, explicit 60 ms gate output, L from r1, breakdown columns, negative cases (existing name,
+# window invariants, gate validity + SLO in the manifests, L from r1, breakdown columns, negative cases (existing name,
 # measure after stop, seq_base given by the caller). No VM, no CXL device. Run pinned to Host node 1.
 # usage: session_host_test.sh <server build dir> <loadgen build dir> <work dir (new)> [plain|megalon]
-# env: ROW_DIV (200), T_MS (1000), PORT (27300), SLO_MS (60), LG_CPUS (30-31)
+# env: ROW_DIV (200), T_MS (1000), PORT (27300), LG_CPUS (30-31); SLO = 5 x the gate p99 (main block v2 rule)
 set -uo pipefail
 B=$(cd "$1" && pwd); LGB=$(cd "$2" && pwd); WD=$3; BACKEND=${4:-plain}
 HERE=$(cd "$(dirname "$0")" && pwd); W=$(cd "$HERE/.." && pwd); ROOT=$(cd "$W/../.." && pwd); X=$ROOT/experiments/recsys
 [ -e "$WD" ] && { echo "refusing: $WD exists"; exit 2; }
 mkdir -p "$WD"; WD=$(cd "$WD" && pwd)
-ROW_DIV=${ROW_DIV:-200} T_MS=${T_MS:-1000} PORT=${PORT:-27300} SLO_MS=${SLO_MS:-60}
+ROW_DIV=${ROW_DIV:-200} T_MS=${T_MS:-1000} PORT=${PORT:-27300}
 export LG_CPUS=${LG_CPUS:-30-31}
 IMG=/dev/shm/recsys-session-test-$$.img
 SA="--nodes 2 --row-div $ROW_DIV --serve-threads 12 --update-threads 4 --load-threads 8 --verify-rows 1 --start-timeout-ms 900000"
@@ -58,11 +58,16 @@ export LOADGEN=$LGB/loadgen PROFILE=pilot RUN_KIND=functional STATS_OP=10 IDLE_W
 LGC=(--opt samples=$WD/updates.smp --opt queries=$WD/queries.smp --opt quantiles=$W/tools/dist_quantile.txt
      --fixed update=2000 --mix query=1 --x-stream query --step-warmup-s 1 --drain-s 5)
 m() { SESSION_LOCAL=1 bash "$X/session.sh" measure "$S" "$@"; }
-m gate -- "${LGC[@]}" --slo query:99:$SLO_MS --raw --mode fixed --rates 1 --warmup-s 2 --step-measure-s 10; rc=$?
+m warmup -- "${LGC[@]}" --mode fixed --rates 1 --warmup-s 2 --step-warmup-s 0 --step-measure-s 5; rc=$?
+[ $rc = 0 ] || bad "warmup rc $rc"
+m gate -- "${LGC[@]}" --raw --mode fixed --rates 1 --warmup-s 2 --step-measure-s 10; rc=$?
 [ $rc = 0 ] || bad "gate rc $rc"
-echo "gate: $(python3 "$X/main_util.py" gate60 "$S/gate/loadgen/steps.jsonl" "$SLO_MS")"
-python3 "$X/main_util.py" gate60 "$S/gate/loadgen/steps.jsonl" "$SLO_MS" | grep -qE '^(PASS|MISS) p99_ms=' || bad "gate60 output"
-python3 "$X/main_util.py" gate60 "$S/gate/loadgen/steps.jsonl" 0.000001 | grep -q '^MISS' || bad "gate60 does not MISS at a tiny limit"
+echo "gate: $(python3 "$X/main_util.py" gate "$S/gate/loadgen/steps.jsonl")"
+python3 "$X/main_util.py" gate "$S/gate/loadgen/steps.jsonl" | grep -q '^VALID p99_ms=' || bad "gate not VALID"
+SLO_MS=$(python3 "$X/main_util.py" slo "$S/gate/loadgen/steps.jsonl" 5) || { bad "no SLO"; SLO_MS=60; }
+export SLO_MS SLO_RULE="5 x gate p99 (Host test)"
+echo "SLO_MS=$SLO_MS"
+python3 "$X/main_util.py" gate "$S/gate/loadgen/steps.jsonl" "$SLO_MS" | grep -q 'within_slo=True' || bad "gate not within its own SLO"
 for r in 1 2; do
   m slo-r$r -- "${LGC[@]}" --opt seed=$((20261016 + r)) --seed $((20261016 + r)) --slo query:99:$SLO_MS --raw --mode slo \
     --start 1 --factor 1.5 --precision 0.2 --max-steps 20 --warmup-s 2 --step-measure-s 5 --confirm-s 5; rc=$?
@@ -73,7 +78,7 @@ done
 s1=$(sed -n 's/^last_update_seq=//p' "$S/slo-r1/loadgen/recsys.txt"); b2=$(sed -n 's/^seq_base=//p' "$S/slo-r2/manifest.txt")
 b1=$(sed -n 's/^seq_base=//p' "$S/slo-r1/manifest.txt"); g1=$(sed -n 's/^last_update_seq=//p' "$S/gate/loadgen/recsys.txt")
 echo "seq: gate last=$g1, r1 base=$b1 last=$s1, r2 base=$b2"
-[ "$b1" = "$g1" ] && [ "$b2" = "$s1" ] && [ "$s1" -gt "$b1" ] || bad "seq_base does not continue"
+[ "$b1" = "$g1" ] && [ "$(sed -n "s/^slo_ms=//p" "$S/slo-r1/manifest.txt")" = "$SLO_MS" ] && [ "$b2" = "$s1" ] && [ "$s1" -gt "$b1" ] || bad "seq_base does not continue"
 p1=$(sed -n 's/^published_seq=//p' "$S/slo-r1/post-t0.txt"); p2=$(sed -n 's/^published_seq=//p' "$S/slo-r2/post-t0.txt")
 echo "published_seq after r1=$p1 after r2=$p2"
 [ "$p2" -gt "$p1" ] && [ "$p1" -gt "$b1" ] || bad "published_seq does not rise over the lifetime"

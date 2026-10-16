@@ -15,7 +15,8 @@
 #   SERVER_ARGS (every node; no --publish-*), T_MS (--publish-ms), optional NODE0_ARGS, NODE_ENV, NODE0_ENV (ENV:K=V
 #   tokens, e.g. ENV:XTIMEOUT=28800), READY_TIMEOUT (s, default 14400), NODES, PORT (7100).
 # env (measure): LOADGEN, optional LG_CPUS (56-63), STATS_OP (10), PROFILE (main | pilot, as run.sh), RUN_KIND
-#   (measurement | functional), IDLE_WAIT_S (900).
+#   (measurement | functional), IDLE_WAIT_S (900), SLO_MS / SLO_RULE (recorded in the manifest only; the SLO itself
+#   is the caller's --slo argument).
 # SESSION_LOCAL=1 is for Host tests only (tests/session_host_test.sh): guest commands run in a local shell, node k
 # listens on PORT+k, no virsh. Exit codes: 0 ok; 1 loadgen rc != 0 (caller reads summary.json note); 3 precondition
 # (servers gone, not idle, Host build, existing dir); 4 invariant violated; 2 usage.
@@ -154,7 +155,7 @@ measure)
     echo "host_server=$HOST_SERVER sha256=$(sha256sum "$HOST_SERVER" | cut -d' ' -f1)"
     echo "loadgen=$LOADGEN sha256=$(sha256sum "$LOADGEN" | cut -d' ' -f1)"
     echo "publish_ms=$T_MS"; echo "profile=${PROFILE:-main}"; echo "server_args=$SA"; echo "app_hwcc_bytes=$APP"
-    echo "seq_base=$SEQB"; echo "loadgen_args=$*"; echo "lg_cpus=$LG_CPUS"; echo "stats_op=$STATS_OP"
+    echo "seq_base=$SEQB"; echo "slo_ms=${SLO_MS:-none}"; echo "slo_rule=${SLO_RULE:-}"; echo "loadgen_args=$*"; echo "lg_cpus=$LG_CPUS"; echo "stats_op=$STATS_OP"
     for a in "$@"; do case "$a" in samples=*|queries=*|quantiles=*) echo "${a%%=*}_sha256=$(sha256sum "${a#*=}" | cut -d' ' -f1)";; esac; done
     grep -E '^(node[0-9]+|vm_xml_sha256\.[a-z0-9_]+|vm_xml_error\.[a-z0-9_]+)=' "$S/session-manifest.txt"
   } > "$M/manifest.txt"
