@@ -88,7 +88,8 @@ def main():
                 rows.append([load, op, v6.SYSTEMS[k], v6.r(rates[load][k], 2), ",".join(map(str, steps)), nodes, s["ops"], v6.r(T, 1), v6.r(C, 1),
                              v6.r(rest, 1), v6.r(base, 1), v6.r(nC), v6.r(nR), v6.r(v6.div(T, base)), v6.r(cexp, 1),
                              v6.r(v6.div(s["C_pop"], s["ops"]), 1), v6.r(v6.div(s["C_meg"], s["ops"]), 1),
-                             s["check_est_missing_nodes"], run.path])
+                             s["check_est_missing_nodes"],
+                             v6.r(v6.div(s["pop_nontrans_ns"], s["ops"]), 1) if "pop_nontrans_ns" in s else "", run.path])
             groups.append((op, bars))
         png = os.path.join(a.out, f"{a.tag}-fig2-{load}.png")
         v6.stacked(png, groups, COMPONENTS, "Normalized time\nper operation")
@@ -104,13 +105,13 @@ def main():
             f"{c}={'|'.join(sorted(k))}" for c, k in sorted(used_all.items()))),
         ("tags", "ops count measured; T_ns measured (rdtsc); C_ns derived from measured kernel/CohSnap durations, "
                  "Megalon check part sampled (ratio estimate); rest_ns, norm_* derived; c_exported_ns = the workload's own c_ns "
-                 "(audit, must equal C_ns for pop/mg)"),
+                 "(audit, must equal C_ns for pop/mg); nontrans_ns_not_in_C = Popcorn managed faults without a transition per op (own component, not in C; empty until a workload exports it)"),
         ("loads", "; ".join(f"{l}: offered " + ", ".join(f"{k}={v:g}" for k, v in rates[l].items()) for l in rates)
                   + (f"; L2/L1 = {min(rates['L2'].values()) / min(rates['L1'].values()):.3f} (decision: 0.5)"
                      if "L1" in rates and "L2" in rates else "")),
         ("inputs", "; ".join(f"{l}:{k} {r.path} steps {s}" for l, e in loads.items() for k, (r, s) in e.items())),
     ], ["load", "op", "system", "offered", "steps", "node_windows", "ops", "T_ns", "C_ns", "rest_ns", "hw_T_ns", "norm_C",
-        "norm_rest", "norm_T", "c_exported_ns", "C_pop_ns", "C_meg_ns", "check_est_missing_nodes", "run"], rows)
+        "norm_rest", "norm_T", "c_exported_ns", "C_pop_ns", "C_meg_ns", "check_est_missing_nodes", "nontrans_ns_not_in_C", "run"], rows)
     print(f"-> {csvp}")
 
 

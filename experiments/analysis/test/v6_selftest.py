@@ -129,9 +129,34 @@ def main():
     x = r[0]
     check(x["approximate_build8"] == "1" and "fault_read" in x["fallbacks"], "fig4a approximation flagged")
     check(float(x["F_us"]) == 10 and float(x["W_us"]) == 7.5 and float(x["local_us"]) == 2.5, "fig4a local = F - W")
-    check(float(x["H_us"]) == 2 and float(x["transport_us"]) == 5.5 and x["H_src"] == "owner sums", "fig4a transport = W - H")
-    check(float(x["mkclean_us"]) == 0.5 and float(x["wbflush_us"]) == 1 and float(x["reply_rest_us"]) == 0.5, "fig4a owner")
+    check(float(x["H_us"]) == 2 and float(x["transport_us"]) == 5.5, "fig4a b8 transport = W - H")
+    check(float(x["revoke_us"]) == 0.5 and float(x["wbflush_us"]) == 1 and float(x["rest_of_H_us"]) == 0.5, "fig4a b8 owner")
     check(float(x["F_p99_us"]) == 65.536 and float(x["is_faults_per_query"]) == 2, "fig4a p99 = upper bound of the bucket holding rank 396 of 400")
+    # build 9 (reports/P-popcorn-build9.md §1): per-thread keys over two thread groups + node-wide owner/histogram
+    b9 = {"op.query.n": 200, "op.query.t_ns": 20_000_000, "op.query.pc.fault_ns.is": 2_000_000,
+          "op.query.pc.fault_cnt.is": 400,
+          "thr.a.swmc.is_fault_ns": 3_000_000, "thr.b.swmc.is_fault_ns": 1_000_000, "thr.a.swmc.is_faults": 300,
+          "thr.b.swmc.is_faults": 100, "thr.a.swmc.read_transactions": 800, "thr.a.swmc.read_msg_wait_ns": 3_000_000,
+          "thr.a.swmc.read_owner_h_rounds": 800, "thr.a.swmc.read_owner_h_ns": 1_600_000,
+          "thr.a.swmc.read_xport_ns": 1_400_000, "thr.a.swmc.nontrans_faults": 4, "thr.a.swmc.nontrans_fault_ns": 400_000,
+          "sys.swmc.instr.serve_fetch.ack": 700, "sys.swmc.instr.serve_fetch.nack": 100,
+          "sys.swmc.instr.serve_fetch.revoke_ns": 400_000, "sys.swmc.instr.serve_fetch.wb_ns": 800_000,
+          "sys.swmc.instr.serve_fetch.reply_ns": 200_000, "sys.swmc.instr.serve_fetch.reply_count": 800,
+          "sys.swmc.instr.fault_full_is.lt_8192": 390, "sys.swmc.instr.fault_full_is.lt_65536": 10,
+          "thr.a.n": 3}
+    mkrun(os.path.join(S, "rs-b9"), ("query", 95, 100), curve, {1: [pair(b9)]})
+    run(os.path.join(AN, "v6_fig4_popcorn.py"), "a", "--out", out, "--tag", "rs9", f"avg={S}/rs-b9")
+    x = rows(os.path.join(out, "rs9-fig4a.csv"))[0][0]
+    f9 = lambda k: float(x[k])  # noqa: E731
+    check(x["approximate_build8"] == "0" and f9("F_us") == 10 and f9("rounds_per_fault") == 2, "fig4a b9 F, r (wildcard sum)")
+    check(f9("W_us") == 7.5 and f9("local_us") == 2.5 and f9("transport_us") == 3.5 and f9("H_us") == 4, "fig4a b9 W, local, xport, H")
+    check(f9("revoke_us") == 1 and f9("wbflush_us") == 2 and f9("reply_us") == 0.5 and f9("rest_of_H_us") == 0.5, "fig4a b9 owner")
+    check(abs(f9("local_us") + f9("transport_us") + f9("H_us") - f9("F_us")) < 1e-9, "fig4a b9 stack sums to F")
+    check(f9("nontrans_per_is") == 0.01 and x["p99_src"] == "sys.swmc.instr.fault_full_is", "fig4a b9 nontrans, histogram")
+    run(os.path.join(AN, "v6_fig4_popcorn.py"), "b", "--out", out, "--tag", "rs9", f"avg={S}/rs-b9")
+    x = rows(os.path.join(out, "rs9-fig4b.csv"))[0][0]
+    check(float(x["nontrans_window_us"]) == 2 and x["nontrans_op_us"] == "" and float(x["is_us"]) == 10,
+          "fig4b nontrans window value, not in C")
     run(os.path.join(AN, "v6_fig4_popcorn.py"), "b", "--out", out, "--tag", "rs", f"avg={S}/rs-avg", f"peak={S}/rs-peak")
     r, _ = rows(os.path.join(out, "rs-fig4b.csv"))
     x = r[0]

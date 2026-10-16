@@ -48,24 +48,48 @@ OPKEYS = {
     "mod_bytes": ["opt.{op}.mod_bytes", "op.{op}.mod_bytes", "opt.{op}.app_bytes", "op.{op}.app_bytes"],
 }
 OPKEYS.update({"pop_" + k: [f"opt.{{op}}.pop.{a}", f"op.{{op}}.pc.{b}"] for k, (a, b) in POP_F.items()})
+# managed faults that committed no transition: own component, NOT in C (coordinator, build 9; swmc_acct has no slot
+# yet, so no workload exports it per operation today)
+OPKEYS["pop_nontrans_ns"] = ["opt.{op}.pop.nontrans_ns", "op.{op}.pc.nontrans_ns", "op.{op}.pc.nontrans_fault_ns"]
+OPKEYS["pop_nontrans_cnt"] = ["opt.{op}.pop.nontrans_cnt", "op.{op}.pc.nontrans_faults"]
 OPKEYS.update({"meg_" + f: [f"opt.{{op}}.meg.{f}", f"op.{{op}}.mg.{f}"] for f in MEG_F})
 OP_DISCOVER = [re.compile(r"^opt\.([^.]+)\.ops$"), re.compile(r"^op\.([^.]+)\.n$"), re.compile(r"^op\.([^.]+)\.ops$")]
 
-# Node-wide Popcorn kernel counters (Fig 3b contrast, Fig 4a). PROVISIONAL build-9 names first, build-8 fallback.
+# Popcorn kernel counters (Fig 3b contrast, Fig 4a): Popcorn build 9 names, FINAL (reports/P-popcorn-build9.md §1,
+# §1.5). thr.*.swmc.<key> = per-thread /proc/<pid>/task/<tid>/swmc summed over every thread group the server reports
+# (systems/common/proc_stats.h); sys.swmc.instr.<file>.<key> = node-wide /sys/kernel/swmc/instr/<file>.
 NODEKEYS = {
     "pop_remote_wb": ["sys.swmc.page_coherence.remote_writeback_count"],  # pages written back for a peer [count]
-    # requester side, I->S coherence faults
-    "is_f_sum_ns": ["sys.swmc.acct.is.fault_sum_ns", "sys.swmc.instr.fault_read.sum_ns"],      # F
-    "is_f_cnt": ["sys.swmc.acct.is.fault_count", "sys.swmc.instr.fault_read.count"],
-    "is_w_sum_ns": ["sys.swmc.acct.is.wait_sum_ns", "sys.swmc.instr.tx_fetch.wait_sum_ns"],     # W (reply wait)
-    "is_h_sum_ns": ["sys.swmc.acct.is.owner_h_sum_ns"],      # H returned in the reply (build 9 only)
-    # owner side, FETCH requests served (I->S of a peer)
-    "own_h_sum_ns": ["sys.swmc.acct.serve_fetch.h_sum_ns", "sys.swmc.instr.serve_fetch.handle_sum_ns"],
-    "own_cnt": ["sys.swmc.acct.serve_fetch.count", "sys.swmc.instr.serve_fetch.handle_count"],
-    "own_mkclean_ns": ["sys.swmc.acct.serve_fetch.mkclean_ns", "sys.swmc.instr.serve.mkclean_ns"],
-    "own_wbflush_ns": ["sys.swmc.acct.serve_fetch.wbflush_ns", "sys.swmc.instr.serve.wb_flush_ns"],
+    # requester (per thread, server process): I->S faults, read request rounds
+    "is_f_sum_ns": ["thr.*.swmc.is_fault_ns"],             # F: exc_page_fault entry .. handler end, committed I->S
+    "is_f_cnt": ["thr.*.swmc.is_faults"],
+    "rd_w_sum_ns": ["thr.*.swmc.read_msg_wait_ns"],        # W, all read rounds
+    "rd_rounds": ["thr.*.swmc.read_transactions"],
+    "rd_h_sum_ns": ["thr.*.swmc.read_owner_h_ns"],         # H returned in the reply (owner clock)
+    "rd_h_rounds": ["thr.*.swmc.read_owner_h_rounds"],
+    "rd_xport_ns": ["thr.*.swmc.read_xport_ns"],           # sum of (W - H) over the rounds with H
+    "nontrans_faults": ["thr.*.swmc.nontrans_faults"],     # managed faults without a transition (reported, not in C)
+    "nontrans_fault_ns": ["thr.*.swmc.nontrans_fault_ns"],
+    # owner (node-wide), FETCH requests served
+    "own_revoke_ns": ["sys.swmc.instr.serve_fetch.revoke_ns"],  # mkclean/unmap incl. TLB-shootdown send + wait
+    "own_wb_ns": ["sys.swmc.instr.serve_fetch.wb_ns"],          # write-back flush on M downgrade
+    "own_reply_ns": ["sys.swmc.instr.serve_fetch.reply_ns"],
+    "own_reply_cnt": ["sys.swmc.instr.serve_fetch.reply_count"],
+    "own_ack": ["sys.swmc.instr.serve_fetch.ack"],
+    "own_nack": ["sys.swmc.instr.serve_fetch.nack"],
 }
-IS_F_HIST = ["sys.swmc.acct.is.fault", "sys.swmc.instr.fault_read"]  # <prefix>.lt_<2^k> buckets (p99 marker)
+FIG4A_B9 = ["is_f_sum_ns", "is_f_cnt", "rd_w_sum_ns", "rd_rounds", "rd_h_sum_ns", "rd_h_rounds", "rd_xport_ns",
+            "own_revoke_ns", "own_wb_ns", "own_reply_ns", "own_reply_cnt", "own_ack", "own_nack"]
+IS_F_HIST = ["sys.swmc.instr.fault_full_is"]  # build 9 <prefix>.lt_<2^k> buckets of F (p99 marker)
+# Build-8 approximation (v6_fig4_popcorn.py --approx-build8 only; refused otherwise): F = all read faults, W = FETCH
+# waits, owner timers over all served requests, H = the owners' own handling sums.
+NODEKEYS_B8 = {
+    "is_f_sum_ns": ["sys.swmc.instr.fault_read.sum_ns"], "is_f_cnt": ["sys.swmc.instr.fault_read.count"],
+    "is_w_sum_ns": ["sys.swmc.instr.tx_fetch.wait_sum_ns"],
+    "own_h_sum_ns": ["sys.swmc.instr.serve_fetch.handle_sum_ns"], "own_cnt": ["sys.swmc.instr.serve_fetch.handle_count"],
+    "own_mkclean_ns": ["sys.swmc.instr.serve.mkclean_ns"], "own_wbflush_ns": ["sys.swmc.instr.serve.wb_flush_ns"],
+}
+IS_F_HIST_B8 = ["sys.swmc.instr.fault_read"]
 
 
 def loadgen_dir(d):
@@ -204,16 +228,26 @@ def op_sums(run, steps, op):
     return out, used, nodes
 
 
-def node_sums(run, steps, names):
-    """Sum over steps and nodes of NODEKEYS quantities; (sums, keys used)."""
+def node_sums(run, steps, names, table=None):
+    """Sum over steps and nodes of NODEKEYS (or table) quantities; a '*' in a key sums every matching key (thread
+    groups). (sums, keys used)."""
+    table = table or NODEKEYS
     out, used = {}, {}
     for st in steps:
         for _, d in run.deltas().get(st, []):
             for c in names:
-                k = first_key(d, NODEKEYS[c])
-                if k is not None:
-                    out[c] = out.get(c, 0) + d[k]
-                    used.setdefault(c, k)
+                for cand in table[c]:
+                    if "*" in cand:
+                        rx = re.compile("^" + re.escape(cand).replace(r"\*", "[^.]+") + "$")
+                        ks = [k for k in d if rx.match(k)]
+                        if ks:
+                            out[c] = out.get(c, 0) + sum(d[k] for k in ks)
+                            used.setdefault(c, cand)
+                            break
+                    elif cand in d:
+                        out[c] = out.get(c, 0) + d[cand]
+                        used.setdefault(c, cand)
+                        break
     return out, used
 
 
@@ -283,7 +317,12 @@ def stacked(path, groups, components, ylabel, hatch_from=None, ref=None, logy=Fa
     from matplotlib.lines import Line2D
     plt = ps.plt
     n = len(components)
-    cols = ["#7f7f7f"] if n == 1 else ps.STACK[-n:] if n <= 5 else (ps.STACK + ps.STACK)[:n]
+    if n == 1:
+        cols = ["#7f7f7f"]
+    elif n <= 5:
+        cols = ps.STACK[-n:]
+    else:  # more components than paper_style gray levels: evenly spaced grays, white -> black
+        cols = ["#%02x%02x%02x" % ((round(255 * (1 - i / (n - 1))),) * 3) for i in range(n)]
     import matplotlib.patheffects as pe
     halo = [pe.Stroke(linewidth=7, foreground="white"), pe.Normal()]  # reference marker visible on dark bars
     nb = sum(len(b) for _, b in groups)
