@@ -1,0 +1,98 @@
+#!/usr/bin/env python3
+"""MOT1 v6 Fig 2 (H1): processing time per operation, coherence management vs the rest, per system x operation type,
+at each measurement load (reports/MOT1-v6-redesign-draft.md §3).
+
+  T_o   = (1/N_o) sum_ops sum_threads (end - start)            = t_ns / ops            (ops, t_ns summed over nodes)
+  C_o   = (1/N_o) sum_ops sum_threads delta C                  = C / ops
+          C: Popcorn  pop_is_ns + pop_sm_ns + pop_wp_ns + pop_ipi_ns (swmc_acct, kernel clock)
+             Megalon  meg_check_ns_sampled x check_sample + stale + concur + meta + spin + wstart + wflush (CohSnap)
+             all-HWcc 0 (no coherence actions)
+  Rest  = T_o - C_o
+  Bars normalized to all-HWcc T_o of the same operation and load: part / T_o(hw, o, load)
+Loads: free labels (e.g. own, weakest). A load's all-HWcc entry is its normalization base, so every label needs an hw
+entry: for "each system's own max" give one label per system with all-HWcc measured at that same rate (e.g.
+own-pop: pop + hw at Popcorn's max), or one label "own" if all-HWcc at its own max is the intended base.
+
+usage: v6_fig2_split.py --out DIR --tag kv-ycsb-b LOAD:SYS=DIR[:STEPS] ...
+       e.g. weakest:hw=R/hw-fix weakest:pop=R/pop-fix weakest:mg=R/mg-fix own-pop:hw=.. own-pop:pop=..
+One PNG per load (<tag>-fig2-<load>.png) and one CSV for all loads (<tag>-fig2.csv).
+"""
+import argparse, os, sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import v6_common as v6  # noqa: E402
+
+COMPONENTS = ["Coherence management", "Rest"]  # legend top -> bottom
+SHORT = {"hw": "All HWcc", "pop": "Popcorn", "mg": "Megalon"}
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("runs", nargs="+", help="LOAD:SYS=DIR[:STEPS]")
+    ap.add_argument("--out", required=True)
+    ap.add_argument("--tag", required=True)
+    ap.add_argument("--ops", help="operation order (default: discovered, sorted)")
+    a = ap.parse_args()
+    loads = {}
+    for spec in a.runs:
+        load, sep, rest = spec.partition(":")
+        if not sep:
+            sys.exit(f"bad spec {spec!r}: LOAD:SYS=DIR[:STEPS]")
+        k, d, steps = v6.parse_spec(rest)
+        run = v6.Run(d, k)
+        loads.setdefault(load, {})[k] = (run, run.select(steps))
+    os.makedirs(a.out, exist_ok=True)
+    rows, used_all = [], {}
+    for load, ent in loads.items():
+        if "hw" not in ent:
+            sys.exit(f"load {load}: no all-HWcc entry (normalization base)")
+        ops = a.ops.split(",") if a.ops else sorted(set().union(*[set(r.ops(s)) for r, s in ent.values()]))
+        S = {}
+        for k, (run, steps) in ent.items():
+            for op in ops:
+                s, used, nodes = v6.op_sums(run, steps, op)
+                for c, key in used.items():
+                    used_all.setdefault(c, set()).add(key)
+                S[(k, op)] = (s, nodes)
+        groups = []
+        for op in ops:
+            hs, _ = S[("hw", op)]
+            base = v6.div(hs["t_ns"], hs["ops"])
+            bars = []
+            for k in ["hw", "mg", "pop"]:
+                if k not in ent:
+                    continue
+                s, nodes = S[(k, op)]
+                run, steps = ent[k]
+                T, C = v6.div(s["t_ns"], s["ops"]), v6.div(s["C"], s["ops"])
+                rest = None if T is None else T - C
+                nC, nR = v6.div(C, base), v6.div(rest, base)
+                bars.append((SHORT[k], [nC, nR] if T is not None else None))
+                cexp = v6.div(s.get("c_ns_exported"), s["ops"])
+                rows.append([load, op, v6.SYSTEMS[k], ",".join(map(str, steps)), nodes, s["ops"], v6.r(T, 1), v6.r(C, 1),
+                             v6.r(rest, 1), v6.r(base, 1), v6.r(nC), v6.r(nR), v6.r(v6.div(T, base)), v6.r(cexp, 1),
+                             v6.r(v6.div(s["C_pop"], s["ops"]), 1), v6.r(v6.div(s["C_meg"], s["ops"]), 1), run.path])
+            groups.append((op, bars))
+        png = os.path.join(a.out, f"{a.tag}-fig2-{load}.png")
+        v6.stacked(png, groups, COMPONENTS, "Normalized time\nper operation")
+        print(f"-> {png}")
+    csvp = os.path.join(a.out, f"{a.tag}-fig2.csv")
+    v6.write_csv(csvp, [
+        ("figure", f"MOT1 v6 Fig 2 coherence management vs rest per operation ({a.tag}); PNGs {a.tag}-fig2-<load>.png"),
+        ("formula", "T_o = t_ns / ops; C_o = C / ops with C = pop_is_ns+pop_sm_ns+pop_wp_ns+pop_ipi_ns (Popcorn) | "
+                    "meg_check_ns_sampled*check_sample+meg_stale_ns+meg_concur_ns+meg_meta_ns+meg_spin_ns+meg_wstart_ns"
+                    "+meg_wflush_ns (Megalon) | 0 (all-HWcc); rest = T_o - C_o; norm_* = part / T_o(all-HWcc, same op, "
+                    "same load); sums over the listed steps and all nodes"),
+        ("sources", "stats/ snapshot deltas (loadgen --stats-op, stats_delta.py): " + "; ".join(
+            f"{c}={'|'.join(sorted(k))}" for c, k in sorted(used_all.items()))),
+        ("tags", "ops count measured; T_ns measured (rdtsc); C_ns derived from measured kernel/CohSnap durations, "
+                 "Megalon check part sampled x N; rest_ns, norm_* derived; c_exported_ns = the workload's own c_ns "
+                 "(audit, must equal C_ns for pop/mg)"),
+        ("inputs", "; ".join(f"{l}:{k} {r.path} steps {s}" for l, e in loads.items() for k, (r, s) in e.items())),
+    ], ["load", "op", "system", "steps", "node_windows", "ops", "T_ns", "C_ns", "rest_ns", "hw_T_ns", "norm_C",
+        "norm_rest", "norm_T", "c_exported_ns", "C_pop_ns", "C_meg_ns", "run"], rows)
+    print(f"-> {csvp}")
+
+
+if __name__ == "__main__":
+    main()
