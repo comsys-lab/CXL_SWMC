@@ -102,6 +102,12 @@ each system's API and measures its coherence actions; it cannot prove a coherenc
   max_row_seq, mean score) + `recsys.txt` (counts, max published seq).
 - 2-VM harness: CXL_SWMC/experiments/recsys/run.sh (Host) + scripts/guest/recsys-node.sh (guest), Megalon config
   systems/megalon/recsys-2vm.yaml; same structure as experiments/vectordb/run.sh.
+- Main runs (reports/RECSYS-main-packet.md): experiments/recsys/session.sh keeps one server lifetime per system and
+  runs several loadgen measurements against it (tables prepared once; recorded exception to "every run starts from
+  the initial image"). The plugin's `seq_base=N` continues the update seqs (and the trace position) after the
+  previous measurement's last seq, `wrap=1` wraps the trace instead of ending the stream; `recsys.txt` then reports
+  `updates_made` for this run, `seq_base`, `last_update_seq`, `trace_samples`, `trace_wraps`.
+  Host tests: tests/session_host_test.sh (SESSION_LOCAL=1), tests/check_breakdown_test.sh.
 
 ## 9. Deviations (from MOT1 §4.2 / MLPerf DLRMv2)
 - D1 Tables capped at 26M rows (5 tables), raw id mod 26M (MOT1 decision; folds MLPerf rows together).
