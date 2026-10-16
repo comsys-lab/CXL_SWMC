@@ -2,6 +2,8 @@
 # Host measurement environment (scripts/host/vm_setting/README.md §2.2, §2.3, §3.1): record/apply/restore run as
 # root (sudo); check needs no root (it only reads world-readable sysfs/procfs, systemctl show, read-only virsh).
 # usage: measure-env.sh record|apply|restore|check <state dir>
+#        measure-env.sh reapply <state dir> <new log dir>   (re-apply after VM restarts: same settings as apply, the
+#        record in <state dir> is only read; logs go to the new, empty log dir, so recovery files are never rewritten)
 #   record  save every setting apply changes (once, into an empty dir; restore reads it back)
 #   apply   Host C1E + C6 off on every CPU; irqbalance stopped; IRQs, unbound workqueues and the Host systemd slices
 #           (system, user, init) on the housekeeping CPUs HK; each VM's emulator threads (incl. vhost) pinned live
@@ -36,6 +38,14 @@ case $CMD in
   record)
     mkdir -p "$D"; [ -z "$(ls -A "$D")" ] || { echo "$D not empty"; exit 2; }
     state "$D"; date -Is > "$D/recorded-at.txt"; echo "RECORDED $D";;
+  reapply)
+    O=${3:?new log dir}; [ -s "$D/cstates.txt" ] || { echo "no record in $D"; exit 2; }
+    mkdir -p "$O"; [ -z "$(ls -A "$O")" ] || { echo "$O not empty"; exit 2; }
+    T=$(mktemp -d); cp "$D"/*.txt "$T"/; rm -f "$T/apply-irq-errors.txt" "$T/applied-at.txt"
+    bash "$0" apply "$T" > "$O/reapply.log" 2>&1; rc=$?
+    cp "$T/apply-irq-errors.txt" "$T/applied-at.txt" "$O"/ 2>/dev/null; rm -rf "$T"; cat "$O/reapply.log"
+    # the check against the original state dir uses its apply-irq-errors list; IRQs refused now are in $O
+    exit $rc;;
   apply)
     [ -s "$D/cstates.txt" ] || { echo "no record in $D (run record first)"; exit 2; }
     for d in /sys/devices/system/cpu/cpu[0-9]*/cpuidle/state*; do
