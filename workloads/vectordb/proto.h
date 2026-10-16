@@ -77,13 +77,14 @@ constexpr uint16_t kRespCoh = 1;
 // before the dequeue and the socket send of the reply are outside T.
 // t_ns = sum over sections of (end - start) [measured]; c_ns = pf_ns[0..2] + ipi_ns + mg_check_ns_sampled x
 // mg_read_sections / mg_check_sampled (ratio estimator, 0 if nothing sampled) + vcopy_ns_sampled x vcopy_cnt /
-// vcopy_sampled (Megalon validation copies, same estimator; user decision 2026-10-16) + mg_stale_ns + mg_concur_ns + mg_meta_ns + mg_spin_ns + mg_wstart_ns + mg_wflush_ns [derived;
+// vcopy_sampled (Megalon validation copies, same estimator; user decision 2026-10-16) + (an_read_lookup_ns_sampled +
+// an_read_nr_ns_sampled) x mg_read_sections / mg_check_sampled + an_write_lookup_ns + an_write_nr_ns + mg_stale_ns + mg_concur_ns + mg_meta_ns + mg_spin_ns + mg_wstart_ns + mg_wflush_ns [derived;
 // only one system's part is non-zero in practice]. mod_bytes (updates): bytes of the whole lines the application
 // stores in SWcc (vector record, zeroed link blocks, committed link blocks, delete-log entry) [measured].
 struct __attribute__((packed)) OpCoh {
   uint16_t version;   // kOpCohVersion
   uint16_t src;       // bits 0-1 Popcorn source: 0 none, 1 swmc_acct, 2 /proc/thread-self/swmc, 3 fake; bit 2 Megalon
-                      // CohSnap present (shim v2 with thread_coh)
+                      // CohSnap present (shim v2 with thread_coh); bit 3 Megalon AnchorSnap present (shim v3)
   uint16_t op;        // kOpSearch | kOpUpdate
   uint16_t sections;  // sections summed
   uint32_t tsc_khz;   // rdtsc rate used for t_ns (server start calibration)
@@ -106,8 +107,14 @@ struct __attribute__((packed)) OpCoh {
   uint32_t vcopy_cnt;     // Megalon validation copies into per-attempt scratch (every copy) [measured]
   uint64_t vcopy_ns_sampled;  // sum over the sampled copies (1 in kVcopySample, rdtsc) [sampled]
   uint32_t vcopy_sampled, pad2;
+  // Megalon anchor work (shim v3 AnchorSnap, Megalon >= 75; zeros otherwise; src bit 3 = present). Vector DB's all-HWcc
+  // has no Megalon, so all of it is C: read_lookup + read_nr (sampled read sections, ratio estimate x mg_read_sections
+  // / mg_check_sampled) and write_lookup + write_nr are excluded from check / wstart and ADDED to c_ns; rseq (inside
+  // check), wseq (inside wstart) and wseq_end (inside wflush) are already in c_ns (exported, not added).
+  uint64_t an_read_lookup_ns_sampled, an_read_nr_ns_sampled, an_rseq_ns_sampled, an_write_lookup_ns, an_write_nr_ns,
+      an_wseq_ns, an_wseq_end_ns;
 };
 constexpr uint16_t kOpCohVersion = 2;
-static_assert(sizeof(OpCoh) == 248, "OpCoh wire size (experiments/vectordb/opsplit.py)");
+static_assert(sizeof(OpCoh) == 304, "OpCoh wire size (experiments/vectordb/opsplit.py)");
 
 }  // namespace vdb

@@ -135,8 +135,8 @@ struct Stats {
 // experiments/analysis/v6_common.py): opt.<op>.{ops,t_ns,c_ns,mod_bytes}, opt.<op>.pop.<f>, opt.<op>.meg.<f>; sums over
 // the operations answered (the same values as the response blocks; the server's completion time decides the window).
 struct OpWin {
-  static constexpr int kPop = 10, kMeg = 23;
-  std::atomic<uint64_t> ops{0}, sections{0}, t_ns{0}, c_ns{0}, mod_bytes{0}, wait_ns{0}, pop[kPop]{}, meg[kMeg]{};
+  static constexpr int kPop = 10, kMeg = 23, kAn = 10;
+  std::atomic<uint64_t> ops{0}, sections{0}, t_ns{0}, c_ns{0}, mod_bytes{0}, wait_ns{0}, pop[kPop]{}, meg[kMeg]{}, an[kAn]{};
   void add(const OpCoh &b) {
     ops++, sections += b.sections, t_ns += b.t_ns, c_ns += b.c_ns, mod_bytes += b.mod_bytes, wait_ns += b.wait_ns;
     const uint64_t p[kPop] = {b.pf_ns[0], b.pf_ns[1], b.pf_ns[2], b.pf_cnt[0], b.pf_cnt[1], b.pf_cnt[2], b.ipi_ns, b.ipi_cnt,
@@ -148,6 +148,10 @@ struct OpWin {
                               b.mg_wflush_bytes, b.vcopy_ns_sampled, b.vcopy_sampled, b.vcopy_cnt};
     for (int i = 0; i < kPop; i++) pop[i] += p[i];
     for (int i = 0; i < kMeg; i++) meg[i] += m[i];
+    const uint64_t x[kAn] = {b.mg_read_sections, b.mg_write_sections, b.mg_check_sampled, b.an_read_lookup_ns_sampled,
+                             b.an_read_nr_ns_sampled, b.an_rseq_ns_sampled, b.an_write_lookup_ns, b.an_write_nr_ns,
+                             b.an_wseq_ns, b.an_wseq_end_ns};
+    for (int i = 0; i < kAn; i++) an[i] += x[i];
   }
   void print(std::ostream &o, const char *name) const {
     static const char *const pn[kPop] = {"is_ns", "sm_ns", "wp_ns", "is_cnt", "sm_cnt", "wp_cnt", "ipi_ns", "ipi_cnt",
@@ -162,6 +166,10 @@ struct OpWin {
       << "mod_bytes=" << mod_bytes << p << "wait_ns=" << wait_ns;
     for (int i = 0; i < kPop; i++) o << p << "pop." << pn[i] << "=" << pop[i];
     for (int i = 0; i < kMeg; i++) o << p << "meg." << mn[i] << "=" << meg[i];
+    static const char *const an_n[kAn] = {"read_sections", "write_sections", "check_sampled", "read_lookup_ns_sampled",
+                                          "read_nr_ns_sampled", "rseq_ns_sampled", "write_lookup_ns", "write_nr_ns",
+                                          "wseq_ns", "wseq_end_ns"};  // AnchorSnap field names (shim v3)
+    for (int i = 0; i < kAn; i++) o << p << "meg.anchor." << an_n[i] << "=" << an[i];
   }
 };
 
@@ -276,7 +284,7 @@ class Server {
       << "\nopcoh.unattributed_c_ns=" << st_.opc_unattributed_ns << "\nopcoh.unattributed_t_ns=" << st_.opc_unattributed_t_ns;
     o << "\nopt.version=1\nopt.c_source=" << (std::is_same_v<Be, MegalonBackend> ? "megalon" : "popcorn")
       << "\nopt.tsc_hz=" << uint64_t(tsc_khz_) * 1000 << "\nopt.meg_coh=" << int(oc_.mg_snap())
-      << "\nopt.meg_check_sample=" << oc_.mg_check_sample();
+      << "\nopt.meg_check_sample=" << oc_.mg_check_sample() << "\nopt.meg_anchor=" << int(oc_.an_snap());
     win_search_.print(o, "search");
     win_update_.print(o, "update");
     for (uint32_t v = 0; v < p_.nr_nodes; v++) o << "\ndlog_count." << v << "=" << load_acquire(&h_->nodes[v].dlog_count);
@@ -411,12 +419,15 @@ class Server {
     if constexpr (std::is_same_v<Be, MegalonBackend>) be_->set_clock_ns(clock_ns_);
     const char *fake = getenv("VDB_OPCOH_FAKE");
     CohSnapFn mg = nullptr;
-    if constexpr (std::is_same_v<Be, MegalonBackend>) mg = be_->thread_coh();
+    AnchorSnapFn an = nullptr;
+    if constexpr (std::is_same_v<Be, MegalonBackend>) mg = be_->thread_coh(), an = be_->thread_anchor();
     std::string why;
-    oc_.setup(o_.op_coh, fake && std::string(fake) == "1", mg, tsc_khz_, &why);
-    std::fprintf(stderr, "vdb-server: op coherence %s, popcorn source %s%s%s, megalon cohsnap %s, tsc %u kHz, clock_ns %u\n",
-                 oc_.on() ? "on" : "off", pop_src_name(oc_.src()), why.empty() ? "" : " (", why.empty() ? "" : (why + ")").c_str(),
-                 std::is_same_v<Be, MegalonBackend> ? (oc_.mg_snap() ? "on" : "absent") : "n/a", tsc_khz_, clock_ns_);
+    oc_.setup(o_.op_coh, fake && std::string(fake) == "1", mg, tsc_khz_, &why, an);
+    const bool meg = std::is_same_v<Be, MegalonBackend>;
+    std::fprintf(stderr, "vdb-server: op coherence %s, popcorn source %s%s%s, megalon cohsnap %s, megalon anchor %s, tsc %u kHz, "
+                 "clock_ns %u\n", oc_.on() ? "on" : "off", pop_src_name(oc_.src()), why.empty() ? "" : " (",
+                 why.empty() ? "" : (why + ")").c_str(), meg ? (oc_.mg_snap() ? "on" : "absent") : "n/a",
+                 meg ? (oc_.an_snap() ? "on" : "absent") : "n/a", tsc_khz_, clock_ns_);
   }
   // Worker thread start (after thread_init).
   void opc_thread_start() {
@@ -539,7 +550,7 @@ class Server {
     if (!oc_.on()) return reply_write(j, w);
     uint8_t out[sizeof(WriteResp) + sizeof(OpCoh)];
     WriteResp r{w, uint32_t(load_acquire(h_->P))};
-    const OpCoh b = op_block(a, kOpUpdate, oc_.src(), oc_.mg_snap(), tsc_khz_);
+    const OpCoh b = op_block(a, kOpUpdate, oc_.src(), oc_.mg_snap(), tsc_khz_, oc_.an_snap());
     std::memcpy(out, &r, sizeof(r));
     std::memcpy(out + sizeof(r), &b, sizeof(b));
     win_update_.add(b);
@@ -726,7 +737,7 @@ class Server {
     {
       std::lock_guard<std::mutex> lg(c->mu);
       c->oa.ticks += rdtsc() - m0;  // up to the response being ready (the reply send is outside T)
-      qb = op_block(c->oa, kOpSearch, oc_.src(), oc_.mg_snap(), tsc_khz_);
+      qb = op_block(c->oa, kOpSearch, oc_.src(), oc_.mg_snap(), tsc_khz_, oc_.an_snap());
     }
     if (oc_.on()) resp.flags |= kRespCoh;
     std::vector<uint8_t> out(sizeof(resp) + all.size() * 12 + (oc_.on() ? sizeof(qb) : 0));

@@ -398,7 +398,12 @@ indexing unit; Megalon flushes the whole object at write end (no dirty-line trac
   2026-10-16, MOT1 v6 §3.1: C = only work all-HWcc does not do; the Megalon accessor's copies of header / vector /
   link block / delete-log entries into per-attempt scratch, which the plain backend reads in place; every copy
   counted, 1 in 64 timed with rdtsc, ratio estimator; shm_hnsw.h validation_copy, opt.<op>.meg.vcopy_{ns_sampled,
-  sampled,cnt}; in-place distance computations are not copies) (switch_rw and reclaim are inside wstart;
+  sampled,cnt}; in-place distance computations are not copies) + Megalon anchor work (shim API v3 AnchorSnap, Megalon >= 75;
+  reports/M2-megalon-port-changes.md §16): vector DB's all-HWcc has no Megalon, so every Megalon call is C: read
+  lookup + read NR (sampled, ratio estimator x read_sections / check_sampled) and write lookup + write NR, which
+  Megalon excludes from check / wstart, are added; rseq (inside check), wseq (inside wstart), wseq_end (inside wflush)
+  are exported only. Stats `opt.<op>.meg.anchor.<AnchorSnap field>`, `opt.meg_anchor`; opsplit `mg_an_*`. Shim
+  versions >= 1 are accepted (fields are appended; thread_coh from v2, thread_anchor from v3) (switch_rw and reclaim are inside wstart;
   reports/M2-megalon-port-changes.md §13). Megalon background threads (nr-log-sync replay,
   WriteMetadataManager reclaim) are not in CohSnap: their CPU stays in the window counters (thr.megalon-lib.*,
   thr.nr-log-sync.*; Popcorn kthr.cxl_recv*), exported next to the split.
@@ -410,8 +415,8 @@ indexing unit; Megalon flushes the whole object at write end (no dirty-line trac
   the dequeue and the socket send of the reply are outside T (the copy of the few-hundred-byte reply into its buffer
   after the block is built is not counted). Popcorn no-transition coherence faults (swmc_acct reserved[0..1], build
   10) are exported as their own component (`pop_nontrans_*`, `opt.<op>.pop.nontrans_{ns,cnt}`), NOT part of C.
-- Transport: proto.h `OpCoh` v2 (248 B) after the search results (SearchResp.flags kRespCoh) and after WriteResp on
-  update responses; the loadgen plugin writes `op-coh.bin` (OpLog 272 B). Window counters in the stats text in the
+- Transport: proto.h `OpCoh` v2 (304 B) after the search results (SearchResp.flags kRespCoh) and after WriteResp on
+  update responses; the loadgen plugin writes `op-coh.bin` (OpLog 328 B). Window counters in the stats text in the
   KV convention (workloads/kv/server/opsplit.h): `opt.version`, `opt.tsc_hz`, `opt.meg_coh`, `opt.meg_check_sample`,
   `opt.<search|update>.{ops,sections,t_ns,c_ns,mod_bytes}`, `opt.<op>.pop.{is,sm,wp}_{ns,cnt}`, `.pop.ipi_{ns,cnt}`,
   `opt.<op>.meg.<CohSnap field>`; `opcoh.*` = source, errors, timed-out search sections (unattributed).

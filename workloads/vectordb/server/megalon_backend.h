@@ -46,8 +46,9 @@ using MegalonApi = mshim::Api;
   std::_Exit(2);
 }
 
-// dlopen the shim (loading it initialises Megalon: maps the device, joins the run, start barrier). Accepts API
-// version 1 (no thread_coh) and 2 (thread_coh, may be nullptr when the Megalon build has no per-thread accounting).
+// dlopen the shim (loading it initialises Megalon: maps the device, joins the run, start barrier). Accepts every API
+// version >= 1 (fields are only appended): 1 no thread_coh, 2 thread_coh (may be nullptr when the Megalon build has no
+// per-thread accounting), 3 thread_anchor (Megalon >= 75).
 inline const MegalonApi *megalon_load(const std::string &path, std::string *err) {
   void *h = dlopen(path.c_str(), RTLD_NOW | RTLD_LOCAL);
   if (!h) {
@@ -60,7 +61,7 @@ inline const MegalonApi *megalon_load(const std::string &path, std::string *err)
     return nullptr;
   }
   const MegalonApi *api = fn();
-  if (!api || api->version < 1 || api->version > mshim::kApiVersion) {
+  if (!api || api->version < 1) {
     *err = path + ": API version mismatch";
     return nullptr;
   }
@@ -69,6 +70,10 @@ inline const MegalonApi *megalon_load(const std::string &path, std::string *err)
 // thread_coh of a loaded API (nullptr for a v1 table, whose struct has no such field).
 inline void (*megalon_thread_coh(const MegalonApi *api))(mshim::CohSnap *) {
   return api && api->version >= 2 ? api->thread_coh : nullptr;
+}
+// thread_anchor of a loaded API (nullptr below version 3).
+inline void (*megalon_thread_anchor(const MegalonApi *api))(mshim::AnchorSnap *) {
+  return api && api->version >= 3 ? api->thread_anchor : nullptr;
 }
 
 // [va, va + len) must be covered by mappings of `path` (Megalon's mapping of the device at map_va).
@@ -214,6 +219,8 @@ class MegalonBackend {
   std::string name() const { return "megalon"; }
   // Megalon's per-thread coherence snapshot (shim v2 thread_coh), nullptr if the shim/Megalon build has none.
   void (*thread_coh() const)(mshim::CohSnap *) { return coh_; }
+  // Megalon's per-thread anchor snapshot (shim v3 thread_anchor), nullptr below v3.
+  void (*thread_anchor() const)(mshim::AnchorSnap *) { return megalon_thread_anchor(api_); }
 
   // ---- object ids (deterministic; < 2^63 as ObjectCreate requires)
   static constexpr uint64_t kBase = 0x5644ull << 48;  // "VD"

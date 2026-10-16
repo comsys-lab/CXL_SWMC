@@ -29,6 +29,10 @@ namespace vdb {
 
 inline uint64_t rdtsc() { return __rdtsc(); }
 using CohSnapFn = void (*)(mshim::CohSnap *);
+using AnchorSnapFn = void (*)(mshim::AnchorSnap *);
+constexpr int kAnWords = int(sizeof(mshim::AnchorSnap) / 8);
+inline uint64_t *words(mshim::AnchorSnap &s) { return reinterpret_cast<uint64_t *>(&s); }
+inline const uint64_t *words(const mshim::AnchorSnap &s) { return reinterpret_cast<const uint64_t *>(&s); }
 
 // rdtsc rate: ticks over >= 100 ms of CLOCK_MONOTONIC (spin; once at server start). Both clocks are invariant on the
 // Host and in the guests (constant_tsc, nonstop_tsc).
@@ -53,6 +57,7 @@ struct CohVals {  // cumulative values of one thread
   uint64_t pf_ns[3] = {}, pf_cnt[3] = {}, ipi_ns = 0, ipi_cnt = 0, nt_ns = 0, nt_cnt = 0;
   uint64_t vc_cnt = 0, vc_sampled = 0, vc_ticks = 0;  // validation copies (shm_hnsw.h t_vcopy)
   mshim::CohSnap mg{};
+  mshim::AnchorSnap an{};
 };
 
 // One operation's sums over its sections (ticks, then converted once).
@@ -63,6 +68,7 @@ struct OpAcc {
   uint64_t nt_ns = 0, nt_cnt = 0;  // Popcorn no-transition faults (swmc_acct reserved[0..1]); not part of C
   uint64_t vc_cnt = 0, vc_sampled = 0, vc_ticks = 0;  // Megalon validation copies (part of C, ratio estimate)
   mshim::CohSnap mg{};  // summed deltas; check_sample = the snapshot's value (not a delta)
+  mshim::AnchorSnap an{};  // summed deltas (shim v3)
   void add(const OpAcc &d) {
     ticks += d.ticks, wait_ticks += d.wait_ticks, sections += d.sections, nt_ns += d.nt_ns, nt_cnt += d.nt_cnt,
     vc_cnt += d.vc_cnt, vc_sampled += d.vc_sampled, vc_ticks += d.vc_ticks, ipi_ns += d.ipi_ns, ipi_cnt += d.ipi_cnt, mod_bytes += d.mod_bytes;
@@ -70,6 +76,7 @@ struct OpAcc {
     const uint64_t cs = mg.check_sample ? mg.check_sample : d.mg.check_sample;
     for (int k = 0; k < kSnapWords; k++) words(mg)[k] += words(d.mg)[k];
     mg.check_sample = cs;
+    for (int k = 0; k < kAnWords; k++) words(an)[k] += words(d.an)[k];
   }
 };
 
@@ -96,10 +103,18 @@ inline const char *pop_src_name(int s) {
   return n[s & 3];
 }
 
-inline OpCoh op_block(const OpAcc &a, uint16_t op, int pop_src, bool mg_snap, uint32_t tsc_khz) {
+// Megalon anchor work that vector DB counts in C (no Megalon in its all-HWcc): read lookup + NR (sampled, ratio
+// estimate over the operation's own read sections) + write lookup + NR. rseq / wseq / wseq_end are already inside
+// check / wstart / wflush.
+inline uint64_t an_coh_ns(const OpCoh &b) {
+  const uint64_t rd = b.an_read_lookup_ns_sampled + b.an_read_nr_ns_sampled;
+  return (b.mg_check_sampled ? uint64_t((unsigned __int128)rd * b.mg_read_sections / b.mg_check_sampled) : 0) +
+         b.an_write_lookup_ns + b.an_write_nr_ns;
+}
+inline OpCoh op_block(const OpAcc &a, uint16_t op, int pop_src, bool mg_snap, uint32_t tsc_khz, bool an_snap = false) {
   OpCoh b{};
   b.version = kOpCohVersion;
-  b.src = uint16_t((pop_src & 3) | (mg_snap ? 4 : 0));
+  b.src = uint16_t((pop_src & 3) | (mg_snap ? 4 : 0) | (an_snap ? 8 : 0));
   b.op = op;
   b.sections = uint16_t(a.sections > 0xffff ? 0xffff : a.sections);
   b.tsc_khz = tsc_khz;
@@ -121,7 +136,11 @@ inline OpCoh op_block(const OpAcc &a, uint16_t op, int pop_src, bool mg_snap, ui
   b.nontrans_ns = a.nt_ns, b.nontrans_cnt = uint32_t(a.nt_cnt);
   b.vcopy_cnt = uint32_t(a.vc_cnt), b.vcopy_sampled = uint32_t(a.vc_sampled);
   b.vcopy_ns_sampled = ticks_to_ns(a.vc_ticks, tsc_khz);
-  b.c_ns = pop_coh_ns(a) + mg_coh_ns(m) + vcopy_est_ns(b);
+  const mshim::AnchorSnap &n = a.an;
+  b.an_read_lookup_ns_sampled = n.read_lookup_ns_sampled, b.an_read_nr_ns_sampled = n.read_nr_ns_sampled;
+  b.an_rseq_ns_sampled = n.rseq_ns_sampled, b.an_write_lookup_ns = n.write_lookup_ns, b.an_write_nr_ns = n.write_nr_ns;
+  b.an_wseq_ns = n.wseq_ns, b.an_wseq_end_ns = n.wseq_end_ns;
+  b.c_ns = pop_coh_ns(a) + mg_coh_ns(m) + vcopy_est_ns(b) + an_coh_ns(b);
   return b;
 }
 
@@ -137,8 +156,8 @@ class OpCohSrc {
  public:
   // Main thread, once: pick the Popcorn source (fake if forced; else swmc_acct if the main thread can register; else
   // the build-8 file; else none) and the Megalon snapshot function (nullptr: none).
-  void setup(bool on, bool fake, CohSnapFn mg, uint32_t tsc_khz, std::string *why) {
-    on_ = on, mg_ = on ? mg : nullptr;
+  void setup(bool on, bool fake, CohSnapFn mg, uint32_t tsc_khz, std::string *why, AnchorSnapFn an = nullptr) {
+    on_ = on, mg_ = on ? mg : nullptr, an_ = on ? an : nullptr;
     tsc_khz_ = tsc_khz;
     if (mg_) {  // the main thread is registered with Megalon
       mshim::CohSnap s{};
@@ -188,6 +207,7 @@ class OpCohSrc {
       if (src_ == kPopFile) {
         s->v = thr().last_end;
         if (mg_) mg_(&s->v.mg);
+        if (an_) an_(&s->v.an);
       } else {
         read(&s->v, false);
       }
@@ -216,6 +236,8 @@ class OpCohSrc {
       for (int k = 0; k < kSnapWords; k++) words(a->mg)[k] += words(e.mg)[k] - words(s.v.mg)[k];
       a->mg.check_sample = cs;
     }
+    if (an_)
+      for (int k = 0; k < kAnWords; k++) words(a->an)[k] += words(e.an)[k] - words(s.v.an)[k];
     if (src_ == kPopFile && ok) thr().last_end = e;
     return ok;
   }
@@ -230,6 +252,7 @@ class OpCohSrc {
   bool on() const { return on_; }
   int src() const { return src_; }
   bool mg_snap() const { return mg_ != nullptr; }
+  bool an_snap() const { return an_ != nullptr; }
   uint64_t mg_check_sample() const { return mg_sample_; }  // CohSnap.check_sample (read at setup; 0 without CohSnap)
   uint32_t tsc_khz() const { return tsc_khz_; }
   static OpCohThread &thr() {
@@ -255,11 +278,13 @@ class OpCohSrc {
       ok = thr().file_ok && read_file(v);
     }
     if (mg_) mg_(&v->mg);
+    if (an_) an_(&v->an);
     return ok;
   }
   bool on_ = false;
   int src_ = kPopNone;
   CohSnapFn mg_ = nullptr;
+  AnchorSnapFn an_ = nullptr;
   uint32_t tsc_khz_ = 0;
   uint64_t mg_sample_ = 0;
 };

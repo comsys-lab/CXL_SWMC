@@ -29,6 +29,7 @@ std::map<uint64_t, std::vector<uint8_t>> g_obj;
 std::function<void()> g_fail_once;  // set: the next read_end runs it and fails
 bool g_stale_next = false;          // set: the next read_start is a stale copy (A)
 thread_local mshim::CohSnap g_snap{};
+thread_local mshim::AnchorSnap g_an{};  // fake v3: every write section adds 3 ns lookup + 4 ns NR anchor work
 uint64_t g_tok = 0;
 int obj(uint64_t id, MegObj *h) {
   auto &b = g_obj[id];
@@ -57,13 +58,17 @@ const MegalonApi kApi = {mshim::kApiVersion,
                            g_snap.concur_cnt++, g_snap.concur_ns += 50;
                            return false;
                          },
-                         obj,
+                         [](uint64_t id, MegObj *h) {
+                           g_an.write_lookup_ns += 3, g_an.write_nr_ns += 4, g_an.wseq_ns += 1;
+                           return obj(id, h);
+                         },
                          [](MegObj *) { g_snap.wflush_cnt++, g_snap.wflush_ns += 7, g_snap.wflush_bytes += 1 << 20; },
                          [](MegStats *s) { *s = MegStats{}; },
                          [](mshim::CohSnap *s) {
                            *s = g_snap;
                            s->check_sample = 64;
-                         }};
+                         },
+                         [](mshim::AnchorSnap *s) { *s = g_an; }};
 
 int fails = 0;
 #define CHECK(c)                                                                 \
@@ -143,7 +148,8 @@ int main(int argc, char **argv) {
   // per-operation arithmetic: one section around a write = wflush delta; mod bytes counted by dlog_write
   OpCohSrc src;
   std::string why;
-  src.setup(true, true, b0.thread_coh(), 1000000, &why);  // fake Popcorn source, the fake CohSnap
+  CHECK(b0.thread_anchor() != nullptr);
+  src.setup(true, true, b0.thread_coh(), 1000000, &why, b0.thread_anchor());  // fake Popcorn, fake CohSnap + AnchorSnap
   CHECK(src.thread_start() && src.mg_snap() && src.mg_check_sample() == 64);
   OpCohSrc::Start s;
   OpAcc a;
@@ -152,11 +158,13 @@ int main(int argc, char **argv) {
   b0.dlog_write(0, 3, DlogEntry{});
   src.fake_add(1, 1000, 30);
   CHECK(src.end(s, &a));
-  const OpCoh blk = op_block(a, kOpUpdate, src.src(), src.mg_snap(), src.tsc_khz());
+  const OpCoh blk = op_block(a, kOpUpdate, src.src(), src.mg_snap(), src.tsc_khz(), src.an_snap());
   CHECK(blk.mg_wflush_cnt == 2 && blk.mg_wflush_ns == 14 && blk.mg_wflush_bytes == 2u << 20);
   CHECK(blk.pf_ns[1] == 1000 && blk.pf_cnt[1] == 1 && blk.ipi_ns == 30 && blk.ipi_cnt == 1);
-  CHECK(blk.c_ns == 1000 + 30 + 14 && blk.mod_bytes == sizeof(DlogEntry) && blk.sections == 1);
-  CHECK(blk.src == (kPopFake | 4) && blk.mg_check_sample == 64 && blk.t_ns > 0);
+  // two write sections: anchor write lookup 6 + NR 8 added to C; wseq (inside wstart) exported, not added
+  CHECK(blk.an_write_lookup_ns == 6 && blk.an_write_nr_ns == 8 && blk.an_wseq_ns == 2);
+  CHECK(blk.c_ns == 1000 + 30 + 14 + 6 + 8 && blk.mod_bytes == sizeof(DlogEntry) && blk.sections == 1);
+  CHECK(blk.src == (kPopFake | 4 | 8) && blk.mg_check_sample == 64 && blk.t_ns > 0);
   // without a trace: no HWcc access
   MegalonBackend c0(r, nullptr, p, &kApi);
   c0.set_trace(nullptr, 0, 0, 0);

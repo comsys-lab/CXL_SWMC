@@ -1,6 +1,6 @@
 // Fallback object-API shim for Megalon builds without per-thread coherence accounting (build <= 70: libmegalon has no
 // rackobj::GetObjectThreadCoh). Same table and symbol as systems/megalon/shim/megalon_objapi.cc (API version 2) with
-// thread_coh = nullptr: vdb-server then reports zeros for Megalon's coherence time (DESIGN.md §15). Compiled by
+// thread_coh = nullptr (API version 2, no thread_anchor): vdb-server then reports zeros for Megalon's coherence time (DESIGN.md §15). Compiled by
 // build-megalon.sh against the rackobj.h of the Megalon build's own source commit (git show), never the working tree.
 // No logic here.
 #include <rackobj.h>
@@ -58,8 +58,8 @@ void stats(mshim::Stats *s) {
 #define MSHIM_INFO "unknown"
 #endif
 
-const mshim::Api kApi{mshim::kApiVersion, MSHIM_INFO, node_id, reg, unreg, create, lookup,
-                      read_start, read_end, write_start, write_end, stats, nullptr};
+const mshim::Api kApi{2, MSHIM_INFO, node_id, reg, unreg, create, lookup,
+                      read_start, read_end, write_start, write_end, stats, nullptr, nullptr};
 
 }  // namespace
 

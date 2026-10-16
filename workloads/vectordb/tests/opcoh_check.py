@@ -69,7 +69,9 @@ chk = np.array([int(x["mg_check_ns_sampled"]) * int(x["mg_read_sections"]) // in
                 if x["mg_check_sampled"] else 0 for x in c], dtype=np.uint64)
 vce = np.array([int(x["vcopy_ns_sampled"]) * int(x["vcopy_cnt"]) // int(x["vcopy_sampled"]) if x["vcopy_sampled"] else 0
                 for x in c], dtype=np.uint64)
-mg = (chk + vce + c["mg_stale_ns"] + c["mg_concur_ns"] + c["mg_meta_ns"]
+anr = np.array([(int(x["an_read_lookup_ns_sampled"]) + int(x["an_read_nr_ns_sampled"])) * int(x["mg_read_sections"])
+                // int(x["mg_check_sampled"]) if x["mg_check_sampled"] else 0 for x in c], dtype=np.uint64)
+mg = (chk + vce + anr + c["an_write_lookup_ns"] + c["an_write_nr_ns"] + c["mg_stale_ns"] + c["mg_concur_ns"] + c["mg_meta_ns"]
       + c["mg_spin_ns"] + c["mg_wstart_ns"] + c["mg_wflush_ns"])
 check((c["c_ns"] == c["pf_ns"].sum(axis=1) + c["ipi_ns"] + mg).all(), "c_ns = parts")
 for op, x in (("search", cs), ("update", cu)):
@@ -103,6 +105,13 @@ elif mode == "megalon":
     if snap:
         check((cs["mg_read_sections"] > 0).all() and (cu["mg_wflush_bytes"] > 0).all(), "CohSnap values present")
         check(((c["src"] & 4) == 4).all(), "src bit 2")
+        if all(s.get("opt.meg_anchor") == 1 for s in st):
+            check(((c["src"] & 8) == 8).all() and (cu["an_write_lookup_ns"] > 0).all() and
+                  c["an_read_nr_ns_sampled"].sum() > 0, "AnchorSnap values present")
+            for op, x in (("search", cs), ("update", cu)):
+                for f in ("read_lookup_ns_sampled", "write_nr_ns"):
+                    check(sum(s[f"opt.{op}.meg.anchor.{f}"] for s in st) == int(x["an_" + f].astype(np.uint64).sum()),
+                          f"opt.{op}.meg.anchor.{f}")
     else:
         mgf = [f for f in opsplit.OPCOH.names if f.startswith("mg_")]
         check(all((c[f] == 0).all() for f in mgf) and ((c["src"] & 4) == 0).all(), "no CohSnap: mg fields 0")
