@@ -626,9 +626,9 @@ class Server {
         touched.clear();
         std::sort(rows.begin(), rows.end(), [](const Touched &a, const Touched &b) { return a.gslot < b.gslot; });
         write_rows(rows, buf);
-        ot.end(&st_.op_row_update, rows.size());
         done_seq_[w] = accepted;
         publish();
+        ot.end(&st_.op_row_update, rows.size());  // T: round start .. rows visible (published_seq raised)
         const uint64_t d = now_ns() - f0;
         st_.flushes++;
         st_.flush_ns += d;
@@ -682,10 +682,10 @@ class Server {
       rows.erase(std::unique(rows.begin(), rows.end(), [](const Touched &a, const Touched &b) { return a.gslot == b.gslot; }),
                  rows.end());
       write_rows(rows, buf);
-      ot.end(&st_.op_row_update, rows.size());
       accepted = u->seq;
       done_seq_[w] = accepted;
       publish();
+      ot.end(&st_.op_row_update, rows.size());  // before the reply (send excluded from T)
       if (u->left.fetch_sub(1) == 1) {
         st_.samples++;
         UpdateResp r{u->seq, load_acquire(&h_->nodes[o_.node].published_seq)};
@@ -781,7 +781,7 @@ class Server {
     dense.resize(size_t(m) * kDense);
     tmp.resize(p_.dim);
     for (uint32_t r = 0; r < m; r++) std::memcpy(&dense[size_t(r) * kDense], c->s[r0 + r].dense, kDense * 4);
-    OpTimer ot(&tcoh_);  // Fig 2: this thread's work on the query (bottom MLP .. top MLP)
+    OpTimer ot(&tcoh_);  // Fig 2 T: this thread's work on the query, chunk claimed .. its part of the response ready
     ot.begin();
     const uint64_t t0 = now_ns();
     model_.bottom(dense.data(), m, &sc);
@@ -803,7 +803,6 @@ class Server {
     const uint64_t t2 = now_ns();
     model_.top(m, &sc, &c->score[r0]);
     const uint64_t t3 = now_ns();
-    ot.end(&st_.op_query, 0);  // N_query is counted once per query in finish_query
     c->lookup_ns += t2 - t1;
     c->mlp_ns += (t1 - t0) + (t3 - t2);
     c->lookups += lookups, c->probes += lc.probes, c->retries += lc.retries, c->misses += misses;
@@ -812,11 +811,20 @@ class Server {
     uint64_t ms = c->max_seq.load();
     while (lc.max_seq > ms && !c->max_seq.compare_exchange_weak(ms, lc.max_seq)) {
     }
-    if (c->done.fetch_add(1) + 1 == c->tasks) finish_query(c);
+    if (c->done.fetch_add(1) + 1 != c->tasks) {
+      ot.end(&st_.op_query, 0);  // N_query is counted once per query in finish_query
+      return true;
+    }
+    std::vector<uint8_t> out;
+    const uint64_t t_resp = build_response(c, &out);
+    ot.end(&st_.op_query, 0);  // response ready; the socket send below is excluded from T (all workloads)
+    finish_query(c, out, t_resp);
     return true;
   }
 
-  void finish_query(QueryCtx *c) {
+  // Last chunk: assemble the response (part of T)
+  uint64_t build_response(QueryCtx *c, std::vector<uint8_t> *outp) {
+    std::vector<uint8_t> &out = *outp;
     const uint64_t t = now_ns();
     QueryResp r{};
     r.pairs = c->pairs;
@@ -834,9 +842,13 @@ class Server {
     r.false_retries = uint32_t(c->false_retries);
     QueryReq rq;
     std::memcpy(&rq, c->job.p.data(), sizeof(rq));
-    std::vector<uint8_t> out(sizeof(r) + ((rq.flags & kQueryReturnScores) ? c->pairs * 4 : 0));
+    out.resize(sizeof(r) + ((rq.flags & kQueryReturnScores) ? c->pairs * 4 : 0));
     std::memcpy(out.data(), &r, sizeof(r));
     if (rq.flags & kQueryReturnScores) std::memcpy(out.data() + sizeof(r), c->score.data(), c->pairs * 4);
+    return t;
+  }
+
+  void finish_query(QueryCtx *c, const std::vector<uint8_t> &out, uint64_t t) {  // send + counters (not in T)
     c->job.c->reply(frame::kStatusOk, c->job.h.req_id, out.data(), uint32_t(out.size()));
     st_.queries++, st_.pairs += c->pairs, st_.lookups += c->lookups, st_.probes += c->probes;
     st_.seq_retries += c->retries, st_.misses += c->misses, st_.lookup_ns += c->lookup_ns, st_.mlp_ns += c->mlp_ns;

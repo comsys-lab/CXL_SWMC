@@ -45,12 +45,14 @@ inline uint64_t tsc_khz() {
 }
 inline uint64_t tsc_to_ns(uint64_t cyc) { return uint64_t(double(cyc) * 1e6 / double(tsc_khz())); }
 
-// Fields of one coherence snapshot: Popcorn swmc_acct (8) then Megalon CohSnap up to wflush_bytes (21).
-constexpr int kPcF = 8, kMgF = 21, kCohF = kPcF + kMgF;
+// Fields of one coherence snapshot: Popcorn swmc_acct (10: fault_ns/cnt[3], ipi_ns/cnt, and build 10's
+// no-transition faults reserved[0..1] = nontrans_ns/cnt, exported but NOT part of C) then Megalon CohSnap up to
+// wflush_bytes (21).
+constexpr int kPcF = 10, kMgF = 21, kCohF = kPcF + kMgF;
 inline const char *coh_field(int i) {
   static const char *n[kCohF] = {
       "pc.fault_ns.is", "pc.fault_ns.sm", "pc.fault_ns.wp", "pc.fault_cnt.is", "pc.fault_cnt.sm", "pc.fault_cnt.wp",
-      "pc.ipi_ns", "pc.ipi_cnt",
+      "pc.ipi_ns", "pc.ipi_cnt", "pc.nontrans_ns", "pc.nontrans_cnt",
       "mg.read_sections", "mg.write_sections", "mg.check_sample", "mg.check_ns_sampled", "mg.check_sampled",
       "mg.stale_cnt", "mg.stale_ns", "mg.concur_cnt", "mg.concur_ns", "mg.meta_cnt", "mg.meta_ns", "mg.spin_cnt",
       "mg.spin_ns", "mg.wstart_ns", "mg.switch_rw_cnt", "mg.switch_rw_ns", "mg.reclaim_cnt", "mg.reclaim_ns",
@@ -74,6 +76,7 @@ struct ThreadCoh {
     const volatile swmc_acct *a = &acct;
     for (int i = 0; i < 3; i++) v[i] = a->fault_ns[i], v[3 + i] = a->fault_cnt[i];
     v[6] = a->ipi_ns, v[7] = a->ipi_cnt;
+    v[8] = a->reserved[0], v[9] = a->reserved[1];  // build 10: nontrans_ns, nontrans_cnt (0 before)
     if (mg) {
       mshim::CohSnap s{};
       mg(&s);
@@ -138,7 +141,7 @@ struct OpTimer {
 
 // Column tags of the op.* stats (MOT1 v6 §6.3): measured / sampled x N / derived.
 inline const char *op_tags() {
-  return "op.tags=n:count:measured t_ns:duration:measured(rdtsc) pc.*:measured(kernel) mg.check_ns_sampled:sampled "
+  return "op.tags=n:count:measured t_ns:duration:measured(rdtsc) pc.*:measured(kernel;pc.nontrans_*_not_in_c) mg.check_ns_sampled:sampled "
          "mg.check_est_ns:sampledxN(check_ns_sampled*read_sections/check_sampled) mg.*_ns:measured mg.*_cnt:count:measured c_ns:derived(pc.c_ns+mg.check_est_ns+"
          "mg.{stale,concur,meta,spin,wstart,wflush}_ns)\n";
 }

@@ -94,10 +94,15 @@ each system's API and measures its coherence actions; it cannot prove a coherenc
 
 ### 6.1 Per-operation time split (MOT1 v6 Fig 2; server/optime.h)
 - Operations: query (serving node; N = queries) and row update (updater node; N = rows written).
-- T_o = sum over threads of (end - start), plain rdtsc (TSC rate calibrated at start, `tsc_khz`): query = each chunk
-  task (bottom MLP .. top MLP); row update = each worker's publication round (slot resolve + writes).
+- T_o = server processing from dispatch to response ready, socket send excluded (definition common to all workloads),
+  summed over threads, plain rdtsc (TSC rate calibrated at start, `tsc_khz`). Query: each thread's chunk task from
+  claiming the chunk (bottom MLP, lookups, top MLP) to its result; the last chunk also assembles the response; queue
+  wait before the first chunk and the reply send are excluded. Row update: each worker's publication round from its
+  start (slot resolve, writes under the stripes) to published_seq raised (rows visible); no per-row reply exists
+  (samples are acknowledged on acceptance, outside T).
 - C_o = delta of the thread's coherence accounting over the same intervals: Popcorn swmc_acct (fault_ns[3] + ipi_ns,
-  measured; registered per serving/update thread, zeros until build 9); Megalon shim v2 CohSnap: section checks by the
+  measured; registered per serving/update thread, zeros until build 9; build 10's faults without an MSI transition,
+  reserved[0..1], are exported as `op.<o>.pc.nontrans_{ns,cnt}` and are NOT part of C); Megalon shim v2 CohSnap: section checks by the
   ratio estimator check_ns_sampled x read_sections / check_sampled [sampled x N] + stale, concur, meta, spin, wstart,
   wflush ns [measured] (switch_rw and reclaim are inside wstart, exported raw only).
 - Stats keys: `op.<query|row_update>.{n,t_ns,c_ns,pc.c_ns,mg.check_est_ns}` and every raw field `op.<o>.pc.*`,
