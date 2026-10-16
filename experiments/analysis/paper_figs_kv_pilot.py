@@ -34,7 +34,7 @@ def main():
     for name in ("Popcorn", "Megalon", "HWcc"):
         xs = [float(r["achieved"]) / 1e3 for r in S[{"HWcc": "all-HWcc"}.get(name, name)]]
         ys = [float(r["p99_ms"]) / base for r in S[{"HWcc": "all-HWcc"}.get(name, name)]]
-        series.append((name, xs, ys))
+        series.append(({"HWcc": "All HWcc"}.get(name, name), xs, ys))
         rows += [[name, r["step"], r["phase"], r["offered"], r["achieved"], r["p99_ms"], round(y, 3), r["pass"]]
                  for r, y in zip(S[{"HWcc": "all-HWcc"}.get(name, name)], ys)]
     slo = 1.0 / base

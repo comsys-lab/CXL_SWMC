@@ -9,7 +9,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import paper_style as ps
 
 NAMES = {"hw": "HWcc", "pop": "Popcorn", "mg": "Megalon"}
-PS_KEY = {"HWcc": "HWcc", "Popcorn": "Popcorn", "Megalon": "Megalon"}
+PS_KEY = {"HWcc": "All HWcc", "Popcorn": "Popcorn", "Megalon": "Megalon"}
 
 
 def steps(path, stream):

@@ -13,7 +13,7 @@ plt.rcParams.update({"font.family": FONT, "font.weight": "bold", "font.size": 22
                      "axes.edgecolor": "black", "figure.facecolor": "white", "axes.facecolor": "white",
                      "savefig.facecolor": "white", "legend.frameon": False})
 # series order and gray levels as in the reference (worst = lightest, best = black)
-SERIES = {"Popcorn": "#bfbfbf", "Megalon": "#7f7f7f", "HWcc": "#000000"}
+SERIES = {"Popcorn": "#bfbfbf", "Megalon": "#7f7f7f", "All HWcc": "#000000"}
 STACK = ["white", "#d9d9d9", "#a6a6a6", "#595959", "black"]  # top -> bottom in the legend (5 gray levels)
 
 
