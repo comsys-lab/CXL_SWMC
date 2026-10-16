@@ -33,7 +33,7 @@ FNAME = re.compile(r"^step(\d+)-(begin|end)-t(\d+)\.txt$")
 POP = ["is_ns", "sm_ns", "wp_ns", "is_cnt", "sm_cnt", "wp_cnt", "ipi_ns", "ipi_cnt"]
 MEG_NS = ["stale_ns", "concur_ns", "meta_ns", "spin_ns", "wstart_ns", "switch_rw_ns", "reclaim_ns", "wflush_ns"]
 MEG_CNT = ["read_sections", "write_sections", "check_sampled", "stale_cnt", "concur_cnt", "meta_cnt", "spin_cnt",
-           "switch_rw_cnt", "reclaim_cnt", "wflush_cnt", "wflush_bytes"]
+           "switch_rw_cnt", "reclaim_cnt", "wflush_cnt", "wflush_bytes", "tsc_backwards"]
 MEG_IN_C = ["stale_ns", "concur_ns", "meta_ns", "spin_ns", "wstart_ns", "wflush_ns"]
 
 
