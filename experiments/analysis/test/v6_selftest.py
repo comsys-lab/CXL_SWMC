@@ -21,7 +21,8 @@ def mkrun(d, slo, steps, snaps):
     os.makedirs(os.path.join(d, "stats"))
     st, pct, ms = slo
     with open(os.path.join(d, "manifest.txt"), "w") as f:
-        f.write(f"target=a:1\ntarget=b:1\nslo={st}:{pct}:{ms}\n")
+        wl = {"mixed": "kv", "query": "recsys", "search": "vectordb"}[st]  # loadgen workload= (Megalon C rule)
+        f.write(f"workload={wl}\ntarget=a:1\ntarget=b:1\nslo={st}:{pct}:{ms}\n")
     with open(os.path.join(d, "summary.json"), "w") as f:
         json.dump({"slo": {"stream": st, "pct": pct, "ms": ms}}, f)
     with open(os.path.join(d, "steps.jsonl"), "w") as f:
@@ -109,8 +110,20 @@ def main():
     check(f("get", "Megalon", "C_ns") == (1000 * 64 + 100_000) / 1000, "fig2 meg get C = check x read_sections / check_sampled + stale (per node)")
     check(f("put", "Megalon", "C_ns") == 500 and f("put", "Megalon", "ops") == 200, "fig2 meg put C = wstart + wflush; ops over 2 nodes")
     check(f("get", "Popcorn", "c_exported_ns") == f("get", "Popcorn", "C_ns"), "fig2 audit c_ns")
-    check(d[("get", "Megalon")]["vcopy_est_missing_nodes"] == "0" and d[("get", "Megalon")]["lookup_not_excluded_nodes"] == "2",
-          "fig2: KV has no validation copy (0, not missing); no lookup key (pre-74) is marked")
+    check(d[("get", "Megalon")]["vcopy_est_missing_nodes"] == "0" and d[("get", "Megalon")]["anchor_split_unavailable_nodes"] == "2"
+          and d[("get", "Megalon")]["meg_rule"] == "hwcc_flavor",
+          "fig2: KV has no validation copy (0, not missing); no AnchorSnap (pre-75) is marked; KV rule hwcc_flavor")
+    # KV Megalon build 75 (AnchorSnap): seqlock parts all-HWcc (hwcc flavor) also does are removed; anchor not in C
+    m75 = dict(meg, **{"opt.get.meg.anchor.rseq_ns_sampled": 100, "opt.get.meg.anchor.read_lookup_ns_sampled": 999,
+                       "opt.put.meg.anchor.wseq_ns": 5000, "opt.put.meg.anchor.write_lookup_ns": 777})
+    gs = dict(g, **{"opt.meg_coh": 1})
+    mkrun(os.path.join(S, "kv-mg75"), ("mixed", 99, 1), curve + ramp, {1: [pair(m75, gs), pair(m75, gs)]})
+    run(os.path.join(AN, "v6_fig2_split.py"), "--out", out, "--tag", "kv75", f"L1:hw={S}/kv-hw", f"L1:pop={S}/kv-pop",
+        f"L1:mg={S}/kv-mg75")
+    r75 = {(x["op"], x["system"]): x for x in rows(os.path.join(out, "kv75-fig2.csv"))[0]}
+    check(float(r75[("get", "Megalon")]["C_ns"]) == (1000 * 64 - 100 * 64 + 100_000) / 1000
+          and r75[("get", "Megalon")]["anchor_split_unavailable_nodes"] == "0", "fig2 KV: C_check = check_est - rseq_est")
+    check(float(r75[("put", "Megalon")]["C_ns"]) == (20_000 - 5000 + 30_000) / 100, "fig2 KV: C_wstart = wstart - wseq")
     check(os.path.exists(os.path.join(out, "kv-fig2-L1.png")), "fig2 png")
     # ---- recsys-style (op.*): Popcorn, Fig 4a/4b; op.query.n must be differenced (counter), check_sample a gauge
     q = {"op.query.n": 200, "op.query.t_ns": 20_000_000, "op.query.c_ns": 0, "op.query.pc.fault_ns.is": 2_000_000,
@@ -173,6 +186,8 @@ def main():
              "op.search.mg.lookup_ns_sampled": 200, "op.search.mg.vcopy_ns_sampled": 3000, "op.search.mg.vcopy_sampled": 30,
              "op.search.mg.vcopy_cnt": 3000, "op.search.mg.stale_ns": 2e6,
              "op.search.mg.stale_cnt": 20, "op.search.mg.concur_ns": 1e6, "op.search.mg.meta_ns": 0, "op.search.mg.spin_ns": 5e5}
+        if share == 0:  # build 75: AnchorSnap read parts (plain rule: added to the checks)
+            v.update({"op.search.mg.anchor.read_lookup_ns_sampled": 200, "op.search.mg.anchor.read_nr_ns_sampled": 100})
         if share:
             v.update({"op.update.n": 100, "op.update.t_ns": 5e6, "op.update.mg.wstart_ns": 1e5, "op.update.mg.wflush_ns": 4e5,
                       "op.update.mg.wflush_bytes": 100 * 32 * 2**20, "op.update.mod_bytes": 100 * 4096})
@@ -181,9 +196,13 @@ def main():
     r, _ = rows(os.path.join(out, "vdb-fig3a.csv"))
     x = r[1]
     check(x["check_est_missing_nodes"] == "0", "fig3a check estimate inputs present")
-    check(float(x["vcopy_us"]) == 0.3 and float(x["lookup_us_not_in_C"]) == 0.0128 and x["lookup_not_excluded_nodes"] == "0",
-          "fig3a validation copy = 3000 x 3000/30 / 1000 ops; lookup 200 x 64 / 1000 reported, not in C")
-    check(float(x["check_us"]) == 0.0512, "fig3a check = (1000 - 200) x 640/10 / 1000 ops (lookup excluded)")
+    check(float(x["vcopy_us"]) == 0.3, "fig3a validation copy = 3000 x 3000/30 / 1000 ops")
+    check(float(x["check_us"]) == 0.0768 and float(x["anchor_read_us_in_check"]) == 0.0128
+          and x["anchor_split_unavailable_nodes"] == "1" and x["meg_rule"] == "plain",
+          "fig3a build 74: check = (1000 + lookup 200) x 64 / 1000 ops (plain rule), anchor split marked unavailable")
+    x0 = r[0]
+    check(float(x0["check_us"]) == 0.0832 and float(x0["anchor_read_us_in_check"]) == 0.0192
+          and x0["anchor_split_unavailable_nodes"] == "0", "fig3a build 75: check + (read lookup 200 + NR 100) x 64")
     check(float(x["stale_A_us"]) == 2 and float(x["waits_D_us"]) == 0.5, "fig3a search parts")
     check(float(x["wstart_us"]) == 1 and float(x["wflush_us"]) == 4 and r[0]["wflush_us"] == "", "fig3a update parts")
     mkrun(os.path.join(S, "vdb-miss"), ("search", 99, 100), curve,

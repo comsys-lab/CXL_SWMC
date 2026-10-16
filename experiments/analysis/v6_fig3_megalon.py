@@ -2,10 +2,12 @@
 """MOT1 v6 Fig 3 (H2): Megalon detail, vector DB, update share 0/5/10/20/50% (reports/MOT1-v6-redesign-draft.md §4).
 
 3a  Megalon coherence time per operation by mechanism (stacked durations, us per operation), per update share:
-      search bar:  section checks  (meg_check_ns_sampled - meg_lookup_ns_sampled) x read_sections / check_sampled
-                                   / N_search  [sampled, ratio estimator per node; read-section checks only (contract
-                                   2015a31f3); index lookup excluded (all-HWcc does it too, §3.1; CSV lookup_us, never
-                                   drawn; build < 74 has no lookup key: lookup_not_excluded_nodes > 0)]
+      search bar:  section checks  meg_check_C_ns / N_search = (check_ns_sampled + anchor read lookup + anchor read
+                                   NR, all sampled with the checks) x read_sections / check_sampled  [ratio estimator
+                                   per node; read-section checks only (2015a31f3)]. Vector DB rule "plain" (all-HWcc
+                                   = plain backend, every Megalon call is C, v6_common.MEG_RULE); the anchor part is
+                                   also in the CSV (anchor_read_us_in_check); Megalon < 75 has no AnchorSnap
+                                   (anchor_split_unavailable_nodes > 0: check slightly low)
                    validation copy meg_vcopy_ns_sampled x vcopy_cnt / vcopy_sampled / N_search  [sampled, ratio
                                    estimator per node; copy into the scratch buffer kept only because the data must
                                    outlive the read section (§3.1)]
@@ -14,7 +16,8 @@
                    metadata change (C)  meg_meta_ns   / N_search
                    contended waits (D) meg_spin_ns / N_search  (seqlock version odd + NR combiner / replica
                                    read-lock waits inside ObjectReadStart/End)
-      update bar:  write start     meg_wstart_ns / N_update   (incl. switch_rw, reclaim)
+      update bar:  write start     meg_wstart_C_ns / N_update = (wstart + anchor write lookup + NR) / N_update
+                                   (incl. switch_rw, reclaim)
                    write-end flush meg_wflush_ns / N_update
     (search-op components from the search operation's CohSnap deltas, update components from the update operation's)
 3b  bytes written back per update:  Megalon  meg_wflush_bytes(update) / N_update
@@ -46,11 +49,11 @@ import argparse, bisect, csv, glob, os, re, sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import v6_common as v6  # noqa: E402
 
-A_SEARCH = [("Section checks", "meg_check_est_ns", "sampled (ratio estimate)"),
+A_SEARCH = [("Section checks", "meg_check_C_ns", "sampled (ratio estimate)"),
             ("Validation copy", "meg_vcopy_est_ns", "sampled (ratio estimate)"), ("Stale copy (A)", "meg_stale_ns", "measured"),
             ("Concurrent write (B)", "meg_concur_ns", "measured"), ("Metadata change (C)", "meg_meta_ns", "measured"),
             ("Contended waits (D)", "meg_spin_ns", "measured")]
-A_UPDATE = [("Write start", "meg_wstart_ns", "measured"), ("Write-end flush", "meg_wflush_ns", "measured")]
+A_UPDATE = [("Write start", "meg_wstart_C_ns", "measured"), ("Write-end flush", "meg_wflush_ns", "measured")]
 
 
 def share_specs(specs, sysname):
@@ -94,27 +97,30 @@ def fig_a(a):
                        v6.r(v6.div(s.get("meg_spin_cnt", 0), s["ops"]) if s else None, 5),
                        v6.r(v6.div(u.get("meg_switch_rw_ns", 0), u["ops"]) / 1e3 if u and u["ops"] else None, 3),
                        v6.r(v6.div(u.get("meg_reclaim_ns", 0), u["ops"]) / 1e3 if u and u["ops"] else None, 3),
-                       v6.r(v6.div(s.get("meg_lookup_est_ns", 0), s["ops"]) / 1e3 if s and s["ops"] else None, 4),
+                       v6.r(v6.div(s.get("meg_anchor_rd_est_ns", 0), s["ops"]) / 1e3 if s and s["ops"] else None, 4),
                        s["check_est_missing_nodes"] if s else "", s["vcopy_est_missing_nodes"] if s else "",
-                       s["lookup_not_excluded_nodes"] if s else "", ",".join(map(str, steps)), run.path])
+                       s["anchor_split_unavailable_nodes"] if s else "", s["meg_rule"] if s else "",
+                       ",".join(map(str, steps)), run.path])
     png, csvp = (os.path.join(a.out, f"{a.tag}-fig3a.{e}") for e in ("png", "csv"))
     v6.stacked(png, groups, comps, "Coherence time\nper operation (us)", hatch_from=len(A_SEARCH),
                xlabel="Update share")
     v6.write_csv(csvp, [
         ("figure", f"MOT1 v6 Fig 3a Megalon coherence time per operation by mechanism ({a.tag}); PNG {os.path.basename(png)}"),
         ("formula", "search components = sum over steps and nodes of the search operation's CohSnap delta / N_search; "
-                    "update components = update operation's delta / N_update; section checks = (meg_check_ns_sampled - "
-                    "meg_lookup_ns_sampled) x read_sections / check_sampled (per node, read sections only); validation "
-                    "copy = meg_vcopy_ns_sampled x vcopy_cnt / vcopy_sampled (per node); lookup_us = meg_lookup_ns_sampled "
-                    "x read_sections / check_sampled / N_search (reported only, not in C, not drawn); us = ns / 1000; *_per_search counts = events / N_search"),
+                    "update components = update operation's delta / N_update; section checks = meg_check_C_ns (rule in "
+                    "column meg_rule; plain: (check_ns_sampled + anchor.read_lookup_ns_sampled + anchor.read_nr_ns_sampled)"
+                    " x read_sections / check_sampled per node; hwcc_flavor: (check_ns_sampled - anchor.rseq_ns_sampled) x "
+                    "read_sections / check_sampled); anchor_read_us_in_check = the anchor part (plain rule: inside section "
+                    "checks); write start = meg_wstart_C_ns (plain: wstart + anchor.write_lookup_ns + anchor.write_nr_ns); "
+                    "validation copy = meg_vcopy_ns_sampled x vcopy_cnt / vcopy_sampled (per node); us = ns / 1000; *_per_search counts = events / N_search"),
         ("sources", "; ".join(f"{c}={'|'.join(sorted(k))}" for c, k in sorted(used_all.items()))),
         ("tags", "; ".join(f"{n}: {t}" for n, _, t in A_SEARCH + A_UPDATE) + "; counts measured; all ratios derived"),
         ("inputs", "Megalon runs per update share, see the run column"),
     ], ["update_share_pct", "N_search", "N_update"] + [f"{c}_us" for c in
         ("check", "vcopy", "stale_A", "concur_B", "meta_C", "waits_D")] + ["wstart_us", "wflush_us", "stale_A_per_search",
         "concur_B_per_search", "meta_C_per_search", "waits_D_per_search", "switch_rw_us_per_update",
-        "reclaim_us_per_update", "lookup_us_not_in_C", "check_est_missing_nodes", "vcopy_est_missing_nodes",
-        "lookup_not_excluded_nodes", "steps", "run"], rows)
+        "reclaim_us_per_update", "anchor_read_us_in_check", "check_est_missing_nodes", "vcopy_est_missing_nodes",
+        "anchor_split_unavailable_nodes", "meg_rule", "steps", "run"], rows)
     print(f"-> {png}\n-> {csvp}")
 
 
