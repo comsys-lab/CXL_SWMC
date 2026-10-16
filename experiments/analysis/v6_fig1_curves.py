@@ -6,8 +6,8 @@
   y    = P(step s) / P(all-HWcc lowest-rate step), P = the run's SLO percentile of the SLO stream (pslo_ms: p99, DLRM
          p95), latency = response received - request scheduled on the loadgen clock
   SLO  = SLO ms / the same base
-Lowest-rate step = all-HWcc's measured non-warmup step with the smallest offered rate. Curve steps: every measured
-step except confirm repeats (ramp, bisect, fill, overload, fixed); paper_style.curve draws them (display cleanup only;
+Lowest-rate step = the all-HWcc curve step (as below: measured, not warmup, not a confirm repeat) with the smallest
+offered rate. Curve steps: every measured step except confirm repeats (ramp, bisect, fill, overload, fixed); paper_style.curve draws them (display cleanup only;
 the CSV keeps every step). All runs must share SLO stream and percentile.
 
 usage: v6_fig1_curves.py --out DIR --tag kv-ycsb-b [--xlabel ..] [--xscale 1e-3] [--x x|total]

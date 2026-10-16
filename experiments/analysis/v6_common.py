@@ -177,6 +177,11 @@ def op_sums(run, steps, op):
                 if k is not None:
                     vals[c] = d[k]
                     used.setdefault(c, k.replace(f".{op}.", ".<op>."))
+            if vals.get("meg_check_ns_sampled") and not vals.get("meg_check_sample"):
+                # sampled check time without its sampling factor: the estimate is unknown, not 0 (marked + warned)
+                out["check_sample_missing_nodes"] = out.get("check_sample_missing_nodes", 0) + 1
+                print(f"WARNING {run.path} step {st}: op {op} has meg_check_ns_sampled but no check_sample; "
+                      "section-check estimate counted as 0 (column check_sample_missing_nodes)", file=sys.stderr)
             vals["meg_check_est_ns"] = vals.get("meg_check_ns_sampled", 0) * vals.get("meg_check_sample", 0)
             for c, v in vals.items():
                 if c != "meg_check_sample":
@@ -186,6 +191,7 @@ def op_sums(run, steps, op):
     out["C_pop"] = g("pop_is_ns") + g("pop_sm_ns") + g("pop_wp_ns") + g("pop_ipi_ns")
     out["C_meg"] = (g("meg_check_est_ns") + g("meg_stale_ns") + g("meg_concur_ns") + g("meg_meta_ns") + g("meg_spin_ns")
                     + g("meg_wstart_ns") + g("meg_wflush_ns"))
+    out.setdefault("check_sample_missing_nodes", 0)
     out["C"] = {"pop": out["C_pop"], "mg": out["C_meg"], "hw": 0}[run.system]
     if "ops" not in out or "t_ns" not in out:
         sys.exit(f"{run.path}: operation {op!r} has no count/time keys in steps {steps} (OPKEYS)")
@@ -261,7 +267,7 @@ def nice_ticks(vmax, n=5):
     return [round(i * step, 10) for i in range(k + 1)]
 
 
-def stacked(path, groups, components, ylabel, hatch_from=None, ref=None, logy=False, xlabel=None):
+def stacked(path, groups, components, ylabel, hatch_from=None, ref=None, logy=False, xlabel=None, title=None):
     """Grouped stacked bars in paper_style (grayscale, thick black edges, font sizes of paper_style.breakdown).
     groups: [(group label, [(bar label, [values per component, legend order top -> bottom])])]; None values = no bar.
     components: legend names top -> bottom (gray levels of paper_style.STACK); hatch_from: component indices >= this
@@ -325,5 +331,7 @@ def stacked(path, groups, components, ylabel, hatch_from=None, ref=None, logy=Fa
         names.append(ref[None])
     ax.legend(handles, names, loc="center left", bbox_to_anchor=(1.02, 0.5), fontsize=16, handlelength=0.9,
               handleheight=0.9, labelspacing=0.6)
+    if title:
+        ax.set_title(title, fontsize=16)
     fig.savefig(path, dpi=150, bbox_inches="tight")
     ps.plt.close(fig)

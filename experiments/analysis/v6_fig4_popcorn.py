@@ -12,14 +12,16 @@
     secondary (CSV): I->S faults per query = pop_is_cnt(query op) / N_query
     Sums over the listed steps and all nodes (requester and owner roles of both VMs). Keys: v6_common.NODEKEYS; the
     build-9 names are PROVISIONAL, the build-8 fallbacks are not exact (fault_read = all read faults, serve.mkclean/
-    wb_flush = all served requests, H from the owners' own sums): the CSV names every key used. Without a
-    requester-side H key, transport is (sum W)/n_F - (sum own_H)/n_own (stated in the CSV).
+    wb_flush = all served requests, H from the owners' own sums; F covers all read faults but W only FETCH waits,
+    both divided by n_F). A run that needs any fallback (a build-8 key, the build-8 histogram, or H from the owners'
+    sums) is REFUSED unless --approx-build8 is given; then the CSV column approximate_build8 = 1 names the fallbacks
+    and the plot title says APPROXIMATE. Without a requester-side H key, transport is (sum W)/n_F - (sum own_H)/n_own.
 4b  coherence time per query (us): I->S       pop_is_ns / N_query
                                    S->M / wp  (pop_sm_ns + pop_wp_ns) / N_query
                                    IPI        pop_ipi_ns / N_query      (serving threads, query operation)
 
 usage: v6_fig4_popcorn.py a|b --out DIR --tag dlrm LOAD=DIR[:STEPS] ...    (Popcorn runs; LOAD e.g. avg, peak)
-       [--query-op query]
+       [--query-op query] [--approx-build8]   (4a only: allow build-8 fallbacks, flagged)
 """
 import argparse, os, sys
 
@@ -44,9 +46,13 @@ def specs(a):
 
 
 def fig_a(a):
-    rows, groups, ref, used_all = [], [], {None: "p99 of F"}, {}
+    rows, groups, ref, used_all, any_approx = [], [], {None: "p99 of F"}, {}, False
     for load, run, steps in specs(a):
         n, used = v6.node_sums(run, steps, list(v6.NODEKEYS))
+        need = ["is_f_sum_ns", "is_f_cnt", "is_w_sum_ns", "own_h_sum_ns", "own_cnt", "own_mkclean_ns", "own_wbflush_ns"]
+        fb = [f"{c}={used[c]}" for c in need if c in used and used[c] != v6.NODEKEYS[c][0]]
+        if "is_h_sum_ns" not in n:
+            fb.append("H=owner sums (no is_h_sum_ns)")
         for c, k in used.items():
             used_all.setdefault(c, set()).add(k)
         g = lambda k: n.get(k, 0)  # noqa: E731
@@ -61,15 +67,23 @@ def fig_a(a):
         rest = None if Hown is None else Hown - (mk or 0) - (wb or 0)
         vals = [rest, wb, mk, trans, local]
         p99, hpre = v6.hist_pct(run, steps, v6.IS_F_HIST, 99)
+        if hpre and hpre != v6.IS_F_HIST[0]:
+            fb.append(f"p99 histogram={hpre}")
+        if fb and not a.approx_build8:
+            sys.exit(f"fig 4a {load} ({run.path}): build-9 counters missing, fallbacks needed: {'; '.join(fb)}. "
+                     "Refused (build-8 F counts all read faults, W only FETCH waits); rerun with --approx-build8 to "
+                     "draw a flagged approximation")
+        any_approx |= bool(fb)
         q, _ = (v6.op_sums(run, steps, a.query_op)[:2] if a.query_op in run.ops(steps) else (None, None))
         per_q = v6.div(q.get("pop_is_cnt", 0), q["ops"]) if q else None
         groups.append((load, [("", [None if v is None else v / 1e3 for v in vals])]))
         ref[(load, "")] = p99 / 1e3 if p99 else None
         rows.append([load, nF, nO] + [v6.r(None if v is None else v / 1e3, 3) for v in [F, W, H] + vals]
                     + ["requester" if Hreq is not None else "owner sums", v6.r(None if p99 is None else p99 / 1e3, 3),
-                       hpre or "", v6.r(per_q, 4), ",".join(map(str, steps)), run.path])
+                       hpre or "", v6.r(per_q, 4), int(bool(fb)), "; ".join(fb), ",".join(map(str, steps)), run.path])
     png, csvp = (os.path.join(a.out, f"{a.tag}-fig4a.{e}") for e in ("png", "csv"))
-    v6.stacked(png, groups, A_COMP, "Time per I->S\nfault (us)", ref=ref)
+    v6.stacked(png, groups, A_COMP, "Time per I->S\nfault (us)", ref=ref,
+               title="APPROXIMATE (build-8 counters, see CSV)" if any_approx else None)
     v6.write_csv(csvp, [
         ("figure", f"MOT1 v6 Fig 4a one I->S coherence fault by phase ({a.tag}); PNG {os.path.basename(png)}"),
         ("formula", "local = (sum F - sum W)/n_F; transport = (sum W - sum H)/n_F (H from the reply if is_h_sum_ns "
@@ -82,7 +96,8 @@ def fig_a(a):
                  "from power-of-two buckets (upper bound)"),
         ("inputs", "Popcorn runs per load, see the run column"),
     ], ["load", "n_F", "n_own", "F_us", "W_us", "H_us", "reply_rest_us", "wbflush_us", "mkclean_us", "transport_us",
-        "local_us", "H_src", "F_p99_us", "p99_src", "is_faults_per_query", "steps", "run"], rows)
+        "local_us", "H_src", "F_p99_us", "p99_src", "is_faults_per_query", "approximate_build8", "fallbacks", "steps",
+        "run"], rows)
     print(f"-> {png}\n-> {csvp}")
 
 
@@ -120,6 +135,7 @@ def main():
     ap.add_argument("--out", required=True)
     ap.add_argument("--tag", required=True)
     ap.add_argument("--query-op", default="query")
+    ap.add_argument("--approx-build8", action="store_true", help="4a: allow build-8 fallbacks (flagged in CSV/title)")
     a = ap.parse_args()
     os.makedirs(a.out, exist_ok=True)
     {"a": fig_a, "b": fig_b}[a.panel](a)

@@ -9,12 +9,13 @@ at each measurement load (reports/MOT1-v6-redesign-draft.md §3).
              all-HWcc 0 (no coherence actions)
   Rest  = T_o - C_o
   Bars normalized to all-HWcc T_o of the same operation and load: part / T_o(hw, o, load)
-Loads: free labels (e.g. own, weakest). A load's all-HWcc entry is its normalization base, so every label needs an hw
-entry: for "each system's own max" give one label per system with all-HWcc measured at that same rate (e.g.
-own-pop: pop + hw at Popcorn's max), or one label "own" if all-HWcc at its own max is the intended base.
+Loads (user decision 2026-10-16, draft §3): all three systems at the SAME offered rate, two rates:
+  L1 = the weakest system's max throughput under SLO (primary), L2 = 0.5 x L1. No "own max" point.
+Each of L1 and L2 needs hw, pop and mg runs; a load whose runs' offered rates (mean offered_x of the selected steps)
+differ by more than 1% (max/min > 1.01) is refused. The CSV states the offered rates and L2/L1.
 
-usage: v6_fig2_split.py --out DIR --tag kv-ycsb-b LOAD:SYS=DIR[:STEPS] ...
-       e.g. weakest:hw=R/hw-fix weakest:pop=R/pop-fix weakest:mg=R/mg-fix own-pop:hw=.. own-pop:pop=..
+usage: v6_fig2_split.py --out DIR --tag kv-ycsb-b {L1|L2}:SYS=DIR[:STEPS] ...
+       e.g. L1:hw=R/hw-L1 L1:pop=R/pop-L1 L1:mg=R/mg-L1 L2:hw=R/hw-L2 L2:pop=R/pop-L2 L2:mg=R/mg-L2
 One PNG per load (<tag>-fig2-<load>.png) and one CSV for all loads (<tag>-fig2.csv).
 """
 import argparse, os, sys
@@ -24,6 +25,13 @@ import v6_common as v6  # noqa: E402
 
 COMPONENTS = ["Coherence management", "Rest"]  # legend top -> bottom
 SHORT = {"hw": "All HWcc", "pop": "Popcorn", "mg": "Megalon"}
+LOADS = ("L1", "L2")
+RATE_TOL = 1.01
+
+
+def offered(run, steps):
+    o = [s["offered_x"] for s in run.measured() if s["step"] in steps]
+    return sum(o) / len(o)
 
 
 def main():
@@ -36,16 +44,24 @@ def main():
     loads = {}
     for spec in a.runs:
         load, sep, rest = spec.partition(":")
-        if not sep:
-            sys.exit(f"bad spec {spec!r}: LOAD:SYS=DIR[:STEPS]")
+        if not sep or load not in LOADS:
+            sys.exit(f"bad spec {spec!r}: {{L1|L2}}:SYS=DIR[:STEPS]")
         k, d, steps = v6.parse_spec(rest)
         run = v6.Run(d, k)
         loads.setdefault(load, {})[k] = (run, run.select(steps))
+    rates = {}
+    for load, ent in loads.items():
+        miss = [k for k in ("hw", "pop", "mg") if k not in ent]
+        if miss:
+            sys.exit(f"load {load}: missing runs for {miss} (each load needs hw, pop and mg at the same rate)")
+        rates[load] = {k: offered(r, st) for k, (r, st) in ent.items()}
+        lo, hi = min(rates[load].values()), max(rates[load].values())
+        if hi > lo * RATE_TOL:
+            sys.exit(f"load {load}: offered rates differ by more than 1%: {rates[load]} (refused)")
     os.makedirs(a.out, exist_ok=True)
     rows, used_all = [], {}
-    for load, ent in loads.items():
-        if "hw" not in ent:
-            sys.exit(f"load {load}: no all-HWcc entry (normalization base)")
+    for load in [l for l in LOADS if l in loads]:
+        ent = loads[load]
         ops = a.ops.split(",") if a.ops else sorted(set().union(*[set(r.ops(s)) for r, s in ent.values()]))
         S = {}
         for k, (run, steps) in ent.items():
@@ -69,9 +85,10 @@ def main():
                 nC, nR = v6.div(C, base), v6.div(rest, base)
                 bars.append((SHORT[k], [nC, nR] if T is not None else None))
                 cexp = v6.div(s.get("c_ns_exported"), s["ops"])
-                rows.append([load, op, v6.SYSTEMS[k], ",".join(map(str, steps)), nodes, s["ops"], v6.r(T, 1), v6.r(C, 1),
+                rows.append([load, op, v6.SYSTEMS[k], v6.r(rates[load][k], 2), ",".join(map(str, steps)), nodes, s["ops"], v6.r(T, 1), v6.r(C, 1),
                              v6.r(rest, 1), v6.r(base, 1), v6.r(nC), v6.r(nR), v6.r(v6.div(T, base)), v6.r(cexp, 1),
-                             v6.r(v6.div(s["C_pop"], s["ops"]), 1), v6.r(v6.div(s["C_meg"], s["ops"]), 1), run.path])
+                             v6.r(v6.div(s["C_pop"], s["ops"]), 1), v6.r(v6.div(s["C_meg"], s["ops"]), 1),
+                             s["check_sample_missing_nodes"], run.path])
             groups.append((op, bars))
         png = os.path.join(a.out, f"{a.tag}-fig2-{load}.png")
         v6.stacked(png, groups, COMPONENTS, "Normalized time\nper operation")
@@ -88,9 +105,12 @@ def main():
         ("tags", "ops count measured; T_ns measured (rdtsc); C_ns derived from measured kernel/CohSnap durations, "
                  "Megalon check part sampled x N; rest_ns, norm_* derived; c_exported_ns = the workload's own c_ns "
                  "(audit, must equal C_ns for pop/mg)"),
+        ("loads", "; ".join(f"{l}: offered " + ", ".join(f"{k}={v:g}" for k, v in rates[l].items()) for l in rates)
+                  + (f"; L2/L1 = {min(rates['L2'].values()) / min(rates['L1'].values()):.3f} (decision: 0.5)"
+                     if "L1" in rates and "L2" in rates else "")),
         ("inputs", "; ".join(f"{l}:{k} {r.path} steps {s}" for l, e in loads.items() for k, (r, s) in e.items())),
-    ], ["load", "op", "system", "steps", "node_windows", "ops", "T_ns", "C_ns", "rest_ns", "hw_T_ns", "norm_C",
-        "norm_rest", "norm_T", "c_exported_ns", "C_pop_ns", "C_meg_ns", "run"], rows)
+    ], ["load", "op", "system", "offered", "steps", "node_windows", "ops", "T_ns", "C_ns", "rest_ns", "hw_T_ns", "norm_C",
+        "norm_rest", "norm_T", "c_exported_ns", "C_pop_ns", "C_meg_ns", "check_sample_missing_nodes", "run"], rows)
     print(f"-> {csvp}")
 
 

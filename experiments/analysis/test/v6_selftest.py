@@ -90,7 +90,13 @@ def main():
     check(any("SLO 1.0 ms -> 10.0000" in m for m in meta) and any(m.startswith("# formula") for m in meta), "fig1 meta")
     check(os.path.exists(os.path.join(out, "kv-fig1.png")), "fig1 png")
     # Fig 2 (one load label, all three systems; two nodes each)
-    run(os.path.join(AN, "v6_fig2_split.py"), "--out", out, "--tag", "kv", *[f"weak:{k}={S}/kv-{k}" for k in ("hw", "pop", "mg")])
+    run(os.path.join(AN, "v6_fig2_split.py"), "--out", out, "--tag", "kv", *[f"L1:{k}={S}/kv-{k}" for k in ("hw", "pop", "mg")])
+    p = subprocess.run([sys.executable, os.path.join(AN, "v6_fig2_split.py"), "--out", out, "--tag", "kvbad",
+                        f"L1:hw={S}/kv-hw:1", f"L1:pop={S}/kv-pop:3", f"L1:mg={S}/kv-mg:1"], capture_output=True, text=True)
+    check(p.returncode != 0 and "differ by more than 1%" in p.stderr, "fig2 refuses different offered rates")
+    p = subprocess.run([sys.executable, os.path.join(AN, "v6_fig2_split.py"), "--out", out, "--tag", "kvbad",
+                        f"L1:hw={S}/kv-hw", f"L1:pop={S}/kv-pop"], capture_output=True, text=True)
+    check(p.returncode != 0 and "missing runs" in p.stderr, "fig2 needs hw, pop, mg per load")
     r, meta = rows(os.path.join(out, "kv-fig2.csv"))
     d = {(x["op"], x["system"]): x for x in r}
     f = lambda o, s, k: float(d[(o, s)][k])  # noqa: E731
@@ -101,7 +107,7 @@ def main():
     check(f("get", "Megalon", "C_ns") == (1000 * 64 + 100_000) / 1000, "fig2 meg get C = check x 64 + stale (per node)")
     check(f("put", "Megalon", "C_ns") == 500 and f("put", "Megalon", "ops") == 200, "fig2 meg put C = wstart + wflush; ops over 2 nodes")
     check(f("get", "Popcorn", "c_exported_ns") == f("get", "Popcorn", "C_ns"), "fig2 audit c_ns")
-    check(os.path.exists(os.path.join(out, "kv-fig2-weak.png")), "fig2 png")
+    check(os.path.exists(os.path.join(out, "kv-fig2-L1.png")), "fig2 png")
     # ---- recsys-style (op.*): Popcorn, Fig 4a/4b; op.query.n must be differenced (counter), check_sample a gauge
     q = {"op.query.n": 200, "op.query.t_ns": 20_000_000, "op.query.c_ns": 0, "op.query.pc.fault_ns.is": 2_000_000,
          "op.query.pc.fault_ns.sm": 100_000, "op.query.pc.fault_ns.wp": 100_000, "op.query.pc.ipi_ns": 200_000,
@@ -113,9 +119,14 @@ def main():
          "sys.swmc.instr.fault_read.lt_65536": 10}
     for load in ("avg", "peak"):
         mkrun(os.path.join(S, f"rs-{load}"), ("query", 95, 100), curve, {1: [pair(q, {"op.query.mg.check_sample": 64})]})
-    run(os.path.join(AN, "v6_fig4_popcorn.py"), "a", "--out", out, "--tag", "rs", f"avg={S}/rs-avg", f"peak={S}/rs-peak")
+    p = subprocess.run([sys.executable, os.path.join(AN, "v6_fig4_popcorn.py"), "a", "--out", out, "--tag", "rs",
+                        f"avg={S}/rs-avg"], capture_output=True, text=True)
+    check(p.returncode != 0 and "Refused" in p.stderr, "fig4a refuses build-8 fallbacks by default")
+    run(os.path.join(AN, "v6_fig4_popcorn.py"), "a", "--approx-build8", "--out", out, "--tag", "rs", f"avg={S}/rs-avg",
+        f"peak={S}/rs-peak")
     r, meta = rows(os.path.join(out, "rs-fig4a.csv"))
     x = r[0]
+    check(x["approximate_build8"] == "1" and "fault_read" in x["fallbacks"], "fig4a approximation flagged")
     check(float(x["F_us"]) == 10 and float(x["W_us"]) == 7.5 and float(x["local_us"]) == 2.5, "fig4a local = F - W")
     check(float(x["H_us"]) == 2 and float(x["transport_us"]) == 5.5 and x["H_src"] == "owner sums", "fig4a transport = W - H")
     check(float(x["mkclean_us"]) == 0.5 and float(x["wbflush_us"]) == 1 and float(x["reply_rest_us"]) == 0.5, "fig4a owner")
@@ -136,11 +147,15 @@ def main():
     run(os.path.join(AN, "v6_fig3_megalon.py"), "a", "--out", out, "--tag", "vdb", f"0={S}/vdb-0", f"10={S}/vdb-10")
     r, _ = rows(os.path.join(out, "vdb-fig3a.csv"))
     x = r[1]
+    check(x["check_sample_missing_nodes"] == "0", "fig3a check_sample present")
     check(float(x["check_us"]) == 0.064 and float(x["stale_A_us"]) == 2 and float(x["spin_D_us"]) == 0.5, "fig3a search parts")
     check(float(x["wstart_us"]) == 1 and float(x["wflush_us"]) == 4 and r[0]["wflush_us"] == "", "fig3a update parts")
     run(os.path.join(AN, "v6_fig3_megalon.py"), "b", "--out", out, "--tag", "vdb", f"10={S}/vdb-10")
     r, _ = rows(os.path.join(out, "vdb-fig3b.csv"))
     check(float(r[0]["writeback_bytes_per_update"]) == 32 * 2**20 and float(r[0]["modified_bytes_per_update"]) == 4096, "fig3b")
+    run(os.path.join(AN, "v6_fig3_megalon.py"), "b", "--out", out, "--tag", "vdb0", f"0={S}/vdb-0", f"10={S}/vdb-10")
+    r, _ = rows(os.path.join(out, "vdb0-fig3b.csv"))
+    check(r[0]["writeback_bytes_per_update"] == "" and len(r) == 2, "fig3b: share without update op = no data")
     t = os.path.join(S, "trace10")
     os.makedirs(t)
     open(os.path.join(t, "writes.csv"), "w").write("object,element,wseq\nO1,e1,1\nO1,e2,2\nO1,e3,5\n")

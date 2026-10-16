@@ -82,7 +82,7 @@ def fig_a(a):
                        v6.r(v6.div(s.get("meg_spin_cnt", 0), s["ops"]) if s else None, 5),
                        v6.r(v6.div(u.get("meg_switch_rw_ns", 0), u["ops"]) / 1e3 if u and u["ops"] else None, 3),
                        v6.r(v6.div(u.get("meg_reclaim_ns", 0), u["ops"]) / 1e3 if u and u["ops"] else None, 3),
-                       ",".join(map(str, steps)), run.path])
+                       s["check_sample_missing_nodes"] if s else "", ",".join(map(str, steps)), run.path])
     png, csvp = (os.path.join(a.out, f"{a.tag}-fig3a.{e}") for e in ("png", "csv"))
     v6.stacked(png, groups, comps, "Coherence time\nper operation (us)", hatch_from=len(A_SEARCH),
                xlabel="Update share")
@@ -97,7 +97,7 @@ def fig_a(a):
     ], ["update_share_pct", "N_search", "N_update"] + [f"{c}_us" for c in
         ("check", "stale_A", "concur_B", "meta_C", "spin_D")] + ["wstart_us", "wflush_us", "stale_A_per_search",
         "concur_B_per_search", "meta_C_per_search", "spin_D_per_search", "switch_rw_us_per_update",
-        "reclaim_us_per_update", "steps", "run"], rows)
+        "reclaim_us_per_update", "check_sample_missing_nodes", "steps", "run"], rows)
     print(f"-> {png}\n-> {csvp}")
 
 
@@ -115,19 +115,22 @@ def fig_b(a):
         g = f"{share:g}%"
         mb = v6.div(u["meg_wflush_bytes"], u["ops"]) if "meg_wflush_bytes" in u else None
         mod = v6.div(u["mod_bytes"], u["ops"]) if "mod_bytes" in u else None
-        bars = [("Megalon", [mb / 1024 if mb is not None else 0.0])]
+        bars = [("Megalon", None if mb is None else [mb / 1024])]  # key absent = no data (no bar), not 0
         ref[(g, "Megalon")] = mod / 1024 if mod is not None else None
-        rows.append([share, "Megalon", u["ops"], v6.r(mb, 1), v6.r(mod, 1), "meg_wflush_bytes", run.path])
+        rows.append([share, "Megalon", u["ops"], v6.r(mb, 1), v6.r(mod, 1),
+                     "meg_wflush_bytes" if mb is not None else "NO DATA (meg_wflush_bytes absent)", run.path])
         if share in pop:
             pr, pst = pop[share]
             pu, _ = opsum(pr, pst, a.update_op)
             ns, nu = v6.node_sums(pr, pst, ["pop_remote_wb"])
             pb = v6.div(ns.get("pop_remote_wb", 0) * v6.PAGE, pu["ops"]) if pu and pu["ops"] else None
             pmod = v6.div(pu["mod_bytes"], pu["ops"]) if pu and "mod_bytes" in pu else None
-            bars.append(("Popcorn", [pb / 1024 if pb is not None else 0.0]))
+            pb = pb if "pop_remote_wb" in ns else None  # counter absent = no data (no bar), not 0
+            bars.append(("Popcorn", None if pb is None else [pb / 1024]))
             ref[(g, "Popcorn")] = pmod / 1024 if pmod is not None else None
             rows.append([share, "Popcorn", pu["ops"] if pu else 0, v6.r(pb, 1), v6.r(pmod, 1),
-                         nu.get("pop_remote_wb", "") + " x 4096", pr.path])
+                         nu["pop_remote_wb"] + " x 4096" if pb is not None else "NO DATA (remote_writeback_count absent)",
+                         pr.path])
         groups.append((g, bars))
     png, csvp = (os.path.join(a.out, f"{a.tag}-fig3b.{e}") for e in ("png", "csv"))
     if groups:
