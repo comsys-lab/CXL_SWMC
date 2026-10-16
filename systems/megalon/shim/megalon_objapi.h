@@ -43,7 +43,8 @@ struct Stats {  // subset of rackobj::ObjectStats (this node unless noted)
 // write_sections / write_sampled. Unsampled sections read no TSC. With MEGALON_COH_EVENTS=always (reserved[1] bit 2,
 // validation only) the read-side event durations (stale, concur, meta, spin) and all write-side durations are timed
 // in every section (full sums, do not scale them; write_sampled = write_sections), check and the read anchor split
-// stay sampled.
+// stay sampled. Build >= 76 also drops what no v6 figure uses unless MEGALON_COH_DETAIL=1: switch_rw_cnt/ns,
+// reclaim_cnt/ns (parts of wstart) and reserved[3..6] stay 0 by default.
 struct CohSnap {
   uint64_t read_sections, write_sections;
   uint64_t check_sample, check_ns_sampled, check_sampled;  // READ sections only: start+end work when no retry happens
