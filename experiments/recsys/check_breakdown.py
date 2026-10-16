@@ -21,16 +21,19 @@ COLS = {
     'msi': ['serve_fetch_wait_ms_per_query', 'serve_read_local_wait_ms_per_query', 'serve_read_other_ms_per_query',
             'serve_write_fault_ms_per_query', 'node1_invalidate_handling_ms_per_query', 'h3_coherence_ms_per_query',
             'node1_tlb_irqs_per_query'],
-    'megalon': ['serve_section_checks_ms_per_query', 'serve_flushes_ms_per_query', 'serve_reexec_ms_per_query',
-                'serve_read_sections', 'upd_write_sections'],
+    # v6: CohSnap-based Fig 2 columns (legacy app-timer columns only when --megalon-time-sample > 0)
+    'megalon': ['fig2_query_T_ms[measured]', 'fig2_query_C_ms[derived]', 'fig2_query_C_check_ms[sampledxN]',
+                'bg_cpu_ms_node1[measured]', 'serve_read_sections', 'upd_write_sections'],
 }
+MEGALON_LEGACY = ['serve_section_checks_ms_per_query', 'serve_flushes_ms_per_query', 'serve_reexec_ms_per_query']
 RAW = {  # keys that must exist in the serving node's (t1) end snapshot
     'hwcc': ['lookup_ns', 'mlp_ns', 'queries', 'thr.rs-serve.n'],
     'msi': ['lookup_ns', 'mlp_ns', 'queries', 'thr.rs-serve.n', 'thr.rs-serve.swmc.read_fault_ns',
             'thr.rs-serve.swmc.read_msg_wait_ns', 'thr.rs-serve.swmc.read_local_wait_ns',
             'thr.rs-serve.swmc.write_fault_ns', 'sys.swmc.instr.serve.unmap_ns', 'sys.swmc.instr.serve.mkclean_ns'],
-    'megalon': ['lookup_ns', 'mlp_ns', 'queries', 'thr.rs-serve.n', 'megalon_time.serve.read_sections',
-                'megalon_time.serve.read_sampled', 'megalon_time.serve.read_start_ns_sampled'],
+    'megalon': ['lookup_ns', 'mlp_ns', 'queries', 'thr.rs-serve.n', 'megalon_time.serve.read_sections', 'op.query.n',
+                'op.query.t_ns', 'op.query.c_ns', 'op.query.mg.read_sections', 'op.query.mg.check_sampled',
+                'thr.nr-log-sync.run_ns'],
 }
 
 
@@ -56,7 +59,8 @@ def main():
     if not rows:
         fail('no breakdown row with queries > 0')
     for r in rows:
-        for c in COMMON + COLS[kind]:
+        legacy = kind == 'megalon' and r.get('megalon_legacy_timers', '0') not in ('', '0')
+        for c in COMMON + COLS[kind] + (MEGALON_LEGACY if legacy else []):
             if r.get(c, '') == '':
                 fail(f'step {r.get("step")}: column {c} missing or empty')
         if kind == 'hwcc' and float(r['serve_coherence_ms_per_query']) != 0.0:
@@ -66,6 +70,10 @@ def main():
             fail(f'step {r.get("step")}: no end snapshot of the serving node')
         keys = {mm.group(1) for mm in (re.match(r'^([^=\s]+)=', l) for l in open(end[0])) if mm}
         missing = [k for k in RAW[kind] if k not in keys]
+        if kind == 'megalon' and 'op.coh_src' in keys:
+            src = [l for l in open(end[0]) if l.startswith('op.coh_src=')][-1]
+            if 'mg_threads:0' in src:
+                fail(f'step {r.get("step")}: CohSnap not live ({src.strip()}; v1 shim?)')
         if missing:
             fail(f'step {r.get("step")}: raw counters missing in {os.path.basename(end[0])}: {" ".join(missing)}')
     r = rows[-1]

@@ -49,6 +49,8 @@ using cxl::hwcc::store_release;
 
 namespace {
 
+volatile sig_atomic_t g_stop = 0;
+
 uint64_t now_ns() {
   timespec ts;
   clock_gettime(CLOCK_MONOTONIC, &ts);
@@ -74,7 +76,8 @@ struct Opts {
   uint64_t check_stride = 4096; // Megalon: ObjectLookup every n-th slot on every node
   bool warm_up = true, verify_rows = false, preload_only = false, preloaded = false;
   bool test_no_seqlock = false;  // negative test only: readers ignore the version words (torn rows must show up)
-  uint32_t megalon_time_sample = 32;  // Megalon: time 1 in N sections per thread (0 = off), backend.h MegThr
+  uint32_t megalon_time_sample = 0;  // legacy app-level Megalon timers, 1 in N sections (backend.h MegThr); v6: off
+                                     // by default (CohSnap replaces them; they perturb timing)
   std::string region, backend = "plain", megalon_lib;
   cxl::proc::Opts proc;
 };
@@ -236,20 +239,22 @@ class Server {
     if (o_.node == 0) {
       load_initial();
       store_release(h_->load_done, o_.run_id);
-    } else if (!cxl::hwcc::poll_until([&] { return load_acquire(h_->load_done) == o_.run_id; }, o_.start_timeout_ms)) {
-      die("node 0 did not finish the initial load in time");
+    } else if (!cxl::hwcc::poll_until([&] { return g_stop || load_acquire(h_->load_done) == o_.run_id; }, o_.start_timeout_ms) ||
+               g_stop) {
+      die(g_stop ? "stopped (signal) before node 0 finished the initial load" : "node 0 did not finish the initial load in time");
     }
     if (!be_->check_objects(&err, o_.check_stride)) die(err);
     if (o_.warm_up) warm_up();
     store_release(&h_->nodes[o_.node].loaded, o_.run_id);
     if (!cxl::hwcc::poll_until(
             [&] {
+              if (g_stop) return true;  // SIGTERM before every node is ready: stop instead of waiting the timeout
               for (uint32_t v = 0; v < p_.nr_nodes; v++)
                 if (load_acquire(&h_->nodes[v].loaded) != o_.run_id) return false;
               return true;
             },
-            o_.start_timeout_ms))
-      die("not every node became ready in time");
+            o_.start_timeout_ms) || g_stop)
+      die(g_stop ? "stopped (signal) before every node was ready" : "not every node became ready in time");
     done_seq_.reset(new std::atomic<uint64_t>[o_.update_threads]);
     for (uint32_t w = 0; w < o_.update_threads; w++) done_seq_[w] = 0;
     uq_.reset(new Queue<std::shared_ptr<UpdJob>>[o_.update_threads]);
@@ -918,8 +923,6 @@ class Server {
   std::deque<QueryCtx *> tasks_;
 };
 
-volatile sig_atomic_t g_stop = 0;
-
 template <class Be>
 int run(const Opts &o) {
   Server<Be> s(o);
@@ -944,7 +947,7 @@ void usage() {
                "  [--publish-ms T | --publish-us T (0 = write each sample immediately)] [--publish-frac F (target rows/T, reported)]\n"
                "  [--dim D (128)] [--row-cap R (26000000)] [--row-div N (1)] [--load-factor F (0.8)] [--ver-stripes S (65536)]\n"
                "  [--multi-hot-div N (1)] [--rank R (512)] [--seed N] [--verify-rows 0|1] [--warm-up 0|1]\n"
-               "  [--check-stride N (4096)] [--megalon-time-sample N (32)] [--start-timeout-ms T] [--backend plain|megalon] [--megalon-lib PATH]\n"
+               "  [--check-stride N (4096)] [--megalon-time-sample N (0 = off)] [--start-timeout-ms T] [--backend plain|megalon] [--megalon-lib PATH]\n"
                "  [--proc-kthread PREFIX]... [--proc-sysfs DIR]...\n"
                "  [--preload-only | --preloaded]   Popcorn init_state=shared: node 0 writes the tables before enable\n"
                "CXL_APP_HWCC_BYTES must equal the app layout size: recsys-server --print-app-bytes [params].\n"

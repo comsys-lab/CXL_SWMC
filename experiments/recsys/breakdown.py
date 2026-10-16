@@ -12,7 +12,9 @@ zeros, even without cxl_shm, so key presence says nothing about the system):
              read other = read_fault_ns - read_msg_wait_ns - read_local_wait_ns; write faults = write_fault_ns;
              node-wide on the serving node (receive context, not serving threads): INVALIDATE handling =
              sys.swmc.instr.serve.unmap_ns + mkclean_ns, TLB IPIs = irq.TLB, receive thread CPU = kthr.cxl_recv*.cpu_ticks
-  Megalon    serving role: section checks, flushes, re-executed work from the sampled counters (backend.h MegThr)
+  Megalon    v6 default (legacy app timers off, megalon_time.sample=0): serving coherence = CohSnap op.query.c_ns
+             (optime.h); with --megalon-time-sample N > 0 the legacy split (backend.h MegThr: section checks,
+             flushes, re-executed work) is added as before
 Serving application time = serving task wall time (server lookup_ns + mlp_ns, sum over a query's tasks) - serving
 coherence time (both are wall times; waits may sleep, so CPU run_ns is reported but never used for the split).
 H3 denominator (page MSI) = serving coherence + node-1 INVALIDATE handling, per query; TLB IPIs as counts per query.
@@ -109,14 +111,18 @@ def main():
                 return d, {'section_checks': fr * (d['read_start_ns_sampled'] + d['read_end_ns_sampled']) +
                            fw * d['write_start_ns_sampled'],
                            'flushes': fw * d['write_end_ns_sampled'], 'reexec': fr * d['reexec_ns_sampled']}
-            d, coh = est(b1, e1, 'serve')
-            r['serve_read_sections'] = d['read_sections']
-            r['serve_read_sampled'] = d['read_sampled']
-            r['serve_read_fail'] = d['read_fail']
-            du, cu = est(b0, e0, 'update')
-            r['upd_check_ms'] = round(cu['section_checks'] / 1e6, 3)
-            r['upd_flush_ms'] = round(cu['flushes'] / 1e6, 3)
-            r['upd_write_sections'] = du['write_sections']
+            r['megalon_legacy_timers'] = e1.get('megalon_time.sample', 0)
+            if e1.get('megalon_time.sample', 0) > 0:  # legacy app-level timers explicitly enabled
+                d, coh = est(b1, e1, 'serve')
+                r['serve_read_sampled'] = d['read_sampled']
+                r['serve_read_fail'] = d['read_fail']
+                du, cu = est(b0, e0, 'update')
+                r['upd_check_ms'] = round(cu['section_checks'] / 1e6, 3)
+                r['upd_flush_ms'] = round(cu['flushes'] / 1e6, 3)
+            else:  # CohSnap (shim v2): checks (ratio estimator) + stale/concur/meta/spin/wstart/wflush
+                coh = {'cohsnap': delta(b1, e1, 'op.query.c_ns')}
+            r['serve_read_sections'] = delta(b1, e1, 'megalon_time.serve.read_sections')  # exact counts either way
+            r['upd_write_sections'] = delta(b0, e0, 'megalon_time.update.write_sections')
             r['megalon_switch_rw_node0'] = delta(b0, e0, 'megalon.switch_rw')
         total_coh = sum(coh.values())
         per_q = (lambda ns: round(ns / q / 1e6, 4)) if q else (lambda ns: '')

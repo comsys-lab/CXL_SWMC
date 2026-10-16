@@ -115,7 +115,11 @@ each system's API and measures its coherence actions; it cannot prove a coherenc
 - Shim: the shared object-API shim `systems/megalon/shim` (`megalon_objapi.h`, `megalon_objapi.cc`, `build-shim.sh`
   -> `lib/libmegalon-objapi.so`, symbol `megalon_object_api`), generalised from vectordb's copy (which vectordb keeps);
   dlopen only for `--backend megalon`.
-- v6: built on Megalon 71 (CohSnap); `build-megalon.sh <out> builds/megalon/71`.
+- v6: built on Megalon 72 (CohSnap, clamped TSC intervals); `build-megalon.sh <out> builds/megalon/72`. The legacy
+  app-level timers (MegThr, clock_gettime 1 in N) are off by default (`--megalon-time-sample 0`); breakdown.py /
+  check_breakdown.py use the CohSnap columns and add the legacy split only when N > 0.
+- Stop: SIGTERM while waiting for the peer at start-up exits ("stopped (signal) ..."); a wait inside
+  cxl::hwcc::app_init (systems/common) is not interruptible (known issue).
 - Records: Megalon build >= 69 (deviation R1): with objects the record pool is logical_scr_size / 4 B, independent of
   the kv `slots` (systems/megalon/recsys-2vm.yaml: 245MB = 64.2M records at full size).
 - Megalon thread registrations are never freed (max 32 per process): prepare work runs on a persistent pool
