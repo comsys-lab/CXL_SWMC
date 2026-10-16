@@ -74,11 +74,12 @@ def main():
     pop = {**kv("get", 1000, 3_000_000, 1_500_000, {"pop.is_ns": 1_000_000, "pop.sm_ns": 0, "pop.wp_ns": 0,
                                                     "pop.ipi_ns": 500_000, "pop.is_cnt": 50}),
            **kv("put", 100, 1_000_000, 400_000, {"pop.is_ns": 0, "pop.sm_ns": 300_000, "pop.wp_ns": 100_000, "pop.ipi_ns": 0})}
-    meg = {**kv("get", 1000, 2_000_000, 0, {"meg.check_ns_sampled": 1000, "meg.stale_ns": 100_000, "meg.concur_ns": 0,
+    meg = {**kv("get", 1000, 2_000_000, 0, {"meg.check_ns_sampled": 1000, "meg.read_sections": 640, "meg.check_sampled": 10, "meg.stale_ns": 100_000, "meg.concur_ns": 0,
                                             "meg.meta_ns": 0, "meg.spin_ns": 0, "meg.wstart_ns": 0, "meg.wflush_ns": 0}),
            **kv("put", 100, 600_000, 0, {"meg.check_ns_sampled": 0, "meg.stale_ns": 0, "meg.wstart_ns": 20_000,
                                          "meg.wflush_ns": 30_000, "meg.wflush_bytes": 100 * 4096})}
-    g = {"opt.meg_check_sample": 64, "opt.tsc_hz": 2_000_000_000, "opt.threads": 14}
+    g = {"opt.meg_check_sample": 7,  # ignored: ratio estimator (contract 2015a31f3)
+          "opt.tsc_hz": 2_000_000_000, "opt.threads": 14}
     for name, end in (("hw", hw), ("pop", pop), ("mg", meg)):
         mkrun(os.path.join(S, f"kv-{name}"), ("mixed", 99, 1), curve + ramp, {1: [pair(end, g), pair(end, g)]})
     # Fig 1
@@ -104,7 +105,7 @@ def main():
     check(f("get", "Popcorn", "C_ns") == 1500 and f("get", "Popcorn", "norm_C") == 1.5 and f("get", "Popcorn", "norm_rest") == 1.5,
           "fig2 pop get C = (is + ipi) / ops, normalized to hw T")
     check(f("put", "Popcorn", "C_ns") == 4000 and f("put", "Popcorn", "norm_T") == 2.0, "fig2 pop put C = sm + wp")
-    check(f("get", "Megalon", "C_ns") == (1000 * 64 + 100_000) / 1000, "fig2 meg get C = check x 64 + stale (per node)")
+    check(f("get", "Megalon", "C_ns") == (1000 * 64 + 100_000) / 1000, "fig2 meg get C = check x read_sections / check_sampled + stale (per node)")
     check(f("put", "Megalon", "C_ns") == 500 and f("put", "Megalon", "ops") == 200, "fig2 meg put C = wstart + wflush; ops over 2 nodes")
     check(f("get", "Popcorn", "c_exported_ns") == f("get", "Popcorn", "C_ns"), "fig2 audit c_ns")
     check(os.path.exists(os.path.join(out, "kv-fig2-L1.png")), "fig2 png")
@@ -138,7 +139,8 @@ def main():
           "fig4b per query (op.query.n differenced)")
     # ---- vector DB Megalon, Fig 3a/3b (op.* names search/update), 3c trace
     for share in (0, 10):
-        v = {"op.search.n": 1000, "op.search.t_ns": 9e6, "op.search.mg.check_ns_sampled": 1000, "op.search.mg.stale_ns": 2e6,
+        v = {"op.search.n": 1000, "op.search.t_ns": 9e6, "op.search.mg.check_ns_sampled": 1000,
+             "op.search.mg.read_sections": 640, "op.search.mg.check_sampled": 10, "op.search.mg.stale_ns": 2e6,
              "op.search.mg.stale_cnt": 20, "op.search.mg.concur_ns": 1e6, "op.search.mg.meta_ns": 0, "op.search.mg.spin_ns": 5e5}
         if share:
             v.update({"op.update.n": 100, "op.update.t_ns": 5e6, "op.update.mg.wstart_ns": 1e5, "op.update.mg.wflush_ns": 4e5,
@@ -147,9 +149,14 @@ def main():
     run(os.path.join(AN, "v6_fig3_megalon.py"), "a", "--out", out, "--tag", "vdb", f"0={S}/vdb-0", f"10={S}/vdb-10")
     r, _ = rows(os.path.join(out, "vdb-fig3a.csv"))
     x = r[1]
-    check(x["check_sample_missing_nodes"] == "0", "fig3a check_sample present")
-    check(float(x["check_us"]) == 0.064 and float(x["stale_A_us"]) == 2 and float(x["spin_D_us"]) == 0.5, "fig3a search parts")
+    check(x["check_est_missing_nodes"] == "0", "fig3a check estimate inputs present")
+    check(float(x["check_us"]) == 0.064 and float(x["stale_A_us"]) == 2 and float(x["waits_D_us"]) == 0.5, "fig3a search parts")
     check(float(x["wstart_us"]) == 1 and float(x["wflush_us"]) == 4 and r[0]["wflush_us"] == "", "fig3a update parts")
+    mkrun(os.path.join(S, "vdb-miss"), ("search", 99, 100), curve,
+          {1: [pair({"op.search.n": 1000, "op.search.t_ns": 9e6, "op.search.mg.check_ns_sampled": 1000})]})
+    run(os.path.join(AN, "v6_fig3_megalon.py"), "a", "--out", out, "--tag", "vdbmiss", f"5={S}/vdb-miss")
+    r, _ = rows(os.path.join(out, "vdbmiss-fig3a.csv"))
+    check(r[0]["check_est_missing_nodes"] == "1" and float(r[0]["check_us"]) == 0, "fig3a: missing check_sampled marked")
     run(os.path.join(AN, "v6_fig3_megalon.py"), "b", "--out", out, "--tag", "vdb", f"10={S}/vdb-10")
     r, _ = rows(os.path.join(out, "vdb-fig3b.csv"))
     check(float(r[0]["writeback_bytes_per_update"]) == 32 * 2**20 and float(r[0]["modified_bytes_per_update"]) == 4096, "fig3b")

@@ -158,7 +158,9 @@ def first_key(d, cands, op=None):
 
 def op_sums(run, steps, op):
     """Sum over the steps and nodes of every canonical per-op quantity plus the v6 derived sums (all in ns or counts):
-      meg_check_est_ns = meg_check_ns_sampled x meg_check_sample   (per node, then summed) [sampled x N]
+      meg_check_est_ns = meg_check_ns_sampled x meg_read_sections / meg_check_sampled   (ratio estimator, per node,
+                         then summed; READ-section checks only; contract CXL_SWMC 2015a31f3: preferred over
+                         x check_sample because each thread's first section is always sampled) [sampled, estimated]
       C_pop  = pop_is_ns + pop_sm_ns + pop_wp_ns + pop_ipi_ns                                  (draft §3, §6.1)
       C_meg  = meg_check_est_ns + meg_stale_ns + meg_concur_ns + meg_meta_ns + meg_spin_ns + meg_wstart_ns
                + meg_wflush_ns    (switch_rw/reclaim are inside wstart: not added; draft §3.1, §4.1)
@@ -177,12 +179,16 @@ def op_sums(run, steps, op):
                 if k is not None:
                     vals[c] = d[k]
                     used.setdefault(c, k.replace(f".{op}.", ".<op>."))
-            if vals.get("meg_check_ns_sampled") and not vals.get("meg_check_sample"):
-                # sampled check time without its sampling factor: the estimate is unknown, not 0 (marked + warned)
-                out["check_sample_missing_nodes"] = out.get("check_sample_missing_nodes", 0) + 1
-                print(f"WARNING {run.path} step {st}: op {op} has meg_check_ns_sampled but no check_sample; "
-                      "section-check estimate counted as 0 (column check_sample_missing_nodes)", file=sys.stderr)
-            vals["meg_check_est_ns"] = vals.get("meg_check_ns_sampled", 0) * vals.get("meg_check_sample", 0)
+            if vals.get("meg_check_ns_sampled") and not (vals.get("meg_check_sampled") and "meg_read_sections" in vals):
+                # sampled check time without the sample count / section count: the estimate is unknown, not 0
+                out["check_est_missing_nodes"] = out.get("check_est_missing_nodes", 0) + 1
+                print(f"WARNING {run.path} step {st}: op {op} has meg_check_ns_sampled but no check_sampled/"
+                      "read_sections; section-check estimate counted as 0 (column check_est_missing_nodes)",
+                      file=sys.stderr)
+                vals["meg_check_est_ns"] = 0
+            else:
+                vals["meg_check_est_ns"] = (vals.get("meg_check_ns_sampled", 0) * vals.get("meg_read_sections", 0)
+                                            / vals["meg_check_sampled"] if vals.get("meg_check_sampled") else 0)
             for c, v in vals.items():
                 if c != "meg_check_sample":
                     out[c] = out.get(c, 0) + v
@@ -191,7 +197,7 @@ def op_sums(run, steps, op):
     out["C_pop"] = g("pop_is_ns") + g("pop_sm_ns") + g("pop_wp_ns") + g("pop_ipi_ns")
     out["C_meg"] = (g("meg_check_est_ns") + g("meg_stale_ns") + g("meg_concur_ns") + g("meg_meta_ns") + g("meg_spin_ns")
                     + g("meg_wstart_ns") + g("meg_wflush_ns"))
-    out.setdefault("check_sample_missing_nodes", 0)
+    out.setdefault("check_est_missing_nodes", 0)
     out["C"] = {"pop": out["C_pop"], "mg": out["C_meg"], "hw": 0}[run.system]
     if "ops" not in out or "t_ns" not in out:
         sys.exit(f"{run.path}: operation {op!r} has no count/time keys in steps {steps} (OPKEYS)")
