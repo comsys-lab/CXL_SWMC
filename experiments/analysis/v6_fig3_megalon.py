@@ -13,23 +13,25 @@
                    write-end flush meg_wflush_ns / N_update
     (search-op components from the search operation's CohSnap deltas, update components from the update operation's)
 3b  bytes written back per update:  Megalon  meg_wflush_bytes(update) / N_update
-                                    Popcorn  pop_remote_wb (node-wide, all nodes) x 4096 / N_update   (contrast)
-    reference line: modified bytes  mod_bytes(update) / N_update (bytes the application stored; NOT EXPORTED yet)
+                                    Popcorn  (pop_sm_cnt + pop_wp_cnt)(update) x 4096 / N_update   (contrast: one
+                                             page per S->M / I->M / wp fault of the update; coordinator 2026-10-16)
+    reference line: modified bytes  mod_bytes(update) / N_update (opt.update.mod_bytes: bytes the application stored)
 3c  false vs true sharing (trace runs, 32 MiB objects): classification by the draft's definition (Dubois et al.):
     an (A)/(B) event of node n on object O is TRUE sharing if, while that copy lives (until n's next (A)/(B) event on
     O, or the end of the log), n reads at least one element modified by the writes that caused the event (writes on O
     with seq_prev < wseq <= seq_seen); otherwise FALSE. y = events / N_search split false/true; secondary = false
     share of the (A)+(B) duration.
-    Trace input (PROVISIONAL format, task A6 until A3's trace lands; one dir per update share):
-      writes.csv        object,element,wseq                      one row per element written (writer node)
-      node<K>.log.csv   kind,object,a,b,c                        rows in the node's own order:
-                        R,<object>,<element>,,                   an element read in a read section
-                        E,<object>,<A|B>,<seq_prev>,<seq_seen>[,<dur_ns>]  a stale-copy / concurrent-write event
-      n_search.txt      N_search of the traced window (searches completed on the traced nodes)
+    Input per update share (vector DB, workloads/vectordb/tools/classify_sharing.py, CXL_SWMC 03d2a5391):
+      SHARE=PREFIX.csv  classify_sharing.py output (authoritative): row --role (default search): true = true_A+true_B,
+                        false = false_A+false_B, excluded = no_prior_copy+unexplained, ev_ns_*, searches
+      SHARE=DIR         its --a6-dir export, classified again here (cross-check, see classify()):
+        writes.csv        object,element,wseq        element "<kind>:<unit>" (vec, link, dlog) or "*" (whole object)
+        node<K>.log.csv   kind,object,a,b,c          R,<object>,<element>,,   E,<object>,<A|B>,<seq_prev>,<seq_seen>,<dur_ns>
+        n_search.txt      N_search of the traced window
 
 usage: v6_fig3_megalon.py a --out DIR --tag vdb SHARE=DIR[:STEPS] ...           (Megalon runs, SHARE in %)
        v6_fig3_megalon.py b --out DIR --tag vdb SHARE=DIR[:STEPS] ... [--pop SHARE=DIR[:STEPS] ...]
-       v6_fig3_megalon.py c --out DIR --tag vdb SHARE=TRACEDIR ...
+       v6_fig3_megalon.py c --out DIR --tag vdb SHARE=PREFIX.csv|A6DIR ... [--role search]
 Options: --search-op search --update-op update (operation names in the per-op stats).
 """
 import argparse, bisect, csv, glob, os, re, sys
@@ -123,15 +125,16 @@ def fig_b(a):
                      "meg_wflush_bytes" if mb is not None else "NO DATA (meg_wflush_bytes absent)", run.path])
         if share in pop:
             pr, pst = pop[share]
-            pu, _ = opsum(pr, pst, a.update_op)
-            ns, nu = v6.node_sums(pr, pst, ["pop_remote_wb"])
-            pb = v6.div(ns.get("pop_remote_wb", 0) * v6.PAGE, pu["ops"]) if pu and pu["ops"] else None
+            pu, pk = opsum(pr, pst, a.update_op)
+            for c, k in pk.items():
+                used_all.setdefault(c, set()).add(k)
+            have = pu and pu["ops"] and ("pop_sm_cnt" in pu or "pop_wp_cnt" in pu)  # absent = no data, not 0
+            pb = (pu.get("pop_sm_cnt", 0) + pu.get("pop_wp_cnt", 0)) * v6.PAGE / pu["ops"] if have else None
             pmod = v6.div(pu["mod_bytes"], pu["ops"]) if pu and "mod_bytes" in pu else None
-            pb = pb if "pop_remote_wb" in ns else None  # counter absent = no data (no bar), not 0
             bars.append(("Popcorn", None if pb is None else [pb / 1024]))
             ref[(g, "Popcorn")] = pmod / 1024 if pmod is not None else None
             rows.append([share, "Popcorn", pu["ops"] if pu else 0, v6.r(pb, 1), v6.r(pmod, 1),
-                         nu["pop_remote_wb"] + " x 4096" if pb is not None else "NO DATA (remote_writeback_count absent)",
+                         "(pop_sm_cnt + pop_wp_cnt) x 4096" if pb is not None else "NO DATA (pop sm/wp counts absent)",
                          pr.path])
         groups.append((g, bars))
     png, csvp = (os.path.join(a.out, f"{a.tag}-fig3b.{e}") for e in ("png", "csv"))
@@ -140,12 +143,12 @@ def fig_b(a):
                    xlabel="Update share")
     v6.write_csv(csvp, [
         ("figure", f"MOT1 v6 Fig 3b bytes written back per update ({a.tag}); PNG {os.path.basename(png)}"),
-        ("formula", "Megalon: sum meg_wflush_bytes(update op) / N_update; Popcorn: sum over nodes "
-                    "pop_remote_wb x 4096 / N_update (contrast); modified bytes: sum mod_bytes(update op) / N_update "
-                    "(reference line; empty while no workload exports it); sums over the listed steps and nodes"),
+        ("formula", "Megalon: sum meg_wflush_bytes(update op) / N_update; Popcorn: sum (pop_sm_cnt + pop_wp_cnt)"
+                    "(update op) x 4096 / N_update (contrast); modified bytes: sum mod_bytes(update op) / N_update "
+                    "(reference line); sums over the listed steps and nodes"),
         ("sources", "; ".join(f"{c}={'|'.join(sorted(k))}" for c, k in sorted(used_all.items()))
-                    + "; pop_remote_wb=" + "|".join(v6.NODEKEYS["pop_remote_wb"])),
-        ("tags", "wflush_bytes measured (every event); remote_writeback_count measured; per-update values derived"),
+),
+        ("tags", "wflush_bytes, mod_bytes, sm/wp fault counts measured (every event); per-update values derived"),
         ("inputs", "see the run column"),
     ], ["update_share_pct", "system", "N_update", "writeback_bytes_per_update", "modified_bytes_per_update",
         "writeback_source", "run"], rows)
@@ -153,7 +156,12 @@ def fig_b(a):
 
 
 def classify(trace):
-    """-> list of events (node, object, type, seq_prev, seq_seen, dur_ns, class)."""
+    """A6 join on classify_sharing.py --a6-dir output -> events [node, object, type, seq_prev, seq_seen, dur_ns, class].
+    Elements "<kind>:<unit>" (vec, link, dlog); "*" = the whole object (a whole-object write modifies every element, a
+    whole-object read reads every element). class: true | false | unexplained (no write in (seq_prev, seq_seen]:
+    excluded from true/false, as in classify_sharing.py). Cross-check only: writes.csv carries no writer node (own-node
+    writes are not excluded) and one E row per section (not the (A)/(B) multiplicity), so classify_sharing.py's
+    sharing.csv is the authoritative Fig 3c input."""
     writes = {}
     for row in csv.DictReader(open(os.path.join(trace, "writes.csv"))):
         writes.setdefault(row["object"], []).append((int(row["wseq"]), row["element"]))
@@ -163,7 +171,7 @@ def classify(trace):
     events = []
     for path in sorted(glob.glob(os.path.join(trace, "node*.log.csv"))):
         node = re.search(r"node(\d+)\.log\.csv$", path).group(1)
-        open_ev = {}  # object -> (event index, modified element set)
+        open_ev = {}  # object -> (event index, modified element set, whole object modified)
         for row in csv.reader(open(path)):
             if not row or row[0] == "kind":
                 continue
@@ -172,49 +180,67 @@ def classify(trace):
                 sp, ss = int(row[3]), int(row[4])
                 lo, hi = bisect.bisect_right(seqs.get(obj, []), sp), bisect.bisect_right(seqs.get(obj, []), ss)
                 mod = {e for _, e in writes.get(obj, [])[lo:hi]}
-                events.append([node, obj, row[2], sp, ss, int(row[5]) if len(row) > 5 and row[5] else 0, "false"])
-                open_ev[obj] = (len(events) - 1, mod)
+                cls = "false" if mod else "unexplained"
+                events.append([node, obj, row[2], sp, ss, int(row[5]) if len(row) > 5 and row[5] else 0, cls])
+                open_ev[obj] = (len(events) - 1, mod - {"*"}, "*" in mod) if mod else None
             elif kind == "R":
                 ev = open_ev.get(obj)
-                if ev and row[2] in ev[1]:
+                if ev and (ev[2] or row[2] == "*" or row[2] in ev[1]):
                     events[ev[0]][6] = "true"
-                    open_ev[obj] = (ev[0], set())  # classified; nothing more to find in this lifetime
+                    open_ev[obj] = None  # classified; nothing more to find in this lifetime
     return events
+
+
+def from_sharing_csv(path, role):
+    """classify_sharing.py PREFIX.csv row of the role -> (N_search, true, false, excluded, ev_ns_true, ev_ns_false)."""
+    for row in csv.DictReader(open(path)):
+        if row["role"] == role:
+            g = lambda k: float(row.get(k) or 0)  # noqa: E731
+            return (g("searches"), g("true_A") + g("true_B"), g("false_A") + g("false_B"),
+                    g("no_prior_copy") + g("unexplained"), g("ev_ns_true"), g("ev_ns_false"))
+    sys.exit(f"{path}: no row with role={role}")
 
 
 def fig_c(a):
     rows, groups = [], []
     for spec in a.runs:
-        share, _, trace = spec.partition("=")
+        share, _, src = spec.partition("=")
         share = float(share)
-        ev = classify(trace)
-        nsearch = float(open(os.path.join(trace, "n_search.txt")).read().split()[0])
-        nf = sum(1 for e in ev if e[6] == "false")
-        nt = len(ev) - nf
-        df = sum(e[5] for e in ev if e[6] == "false")
-        dt = sum(e[5] for e in ev)
-        with open(os.path.join(a.out, f"{a.tag}-fig3c-events-{share:g}.csv"), "w", newline="") as f:
-            w = csv.writer(f)
-            w.writerow(["node", "object", "type", "seq_prev", "seq_seen", "dur_ns", "class"])
-            w.writerows(ev)
-        rows.append([share, nsearch, len(ev), nf, nt, v6.r(v6.div(nf, nsearch), 6), v6.r(v6.div(nt, nsearch), 6),
-                     v6.r(v6.div(df, dt), 4), trace])
+        if src.endswith(".csv"):  # classify_sharing.py output (authoritative)
+            nsearch, nt, nf, nx, dtrue, dfalse = from_sharing_csv(src, a.role)
+            kind = f"classify_sharing.py role={a.role}"
+        else:  # A6 join on the --a6-dir export (cross-check)
+            ev = classify(src)
+            nsearch = float(open(os.path.join(src, "n_search.txt")).read().split()[0])
+            nf = sum(1 for e in ev if e[6] == "false")
+            nt = sum(1 for e in ev if e[6] == "true")
+            nx = len(ev) - nf - nt
+            dfalse = sum(e[5] for e in ev if e[6] == "false")
+            dtrue = sum(e[5] for e in ev if e[6] == "true")
+            kind = "A6 join (--a6-dir export)"
+            with open(os.path.join(a.out, f"{a.tag}-fig3c-events-{share:g}.csv"), "w", newline="") as f:
+                w = csv.writer(f)
+                w.writerow(["node", "object", "type", "seq_prev", "seq_seen", "dur_ns", "class"])
+                w.writerows(ev)
+        rows.append([share, nsearch, nt + nf + nx, nf, nt, nx, v6.r(v6.div(nf, nsearch), 6),
+                     v6.r(v6.div(nt, nsearch), 6), v6.r(v6.div(dfalse, dfalse + dtrue), 4), kind, src])
         groups.append((f"{share:g}%", [("", [v6.div(nf, nsearch), v6.div(nt, nsearch)])]))
     png, csvp = (os.path.join(a.out, f"{a.tag}-fig3c.{e}") for e in ("png", "csv"))
     v6.stacked(png, groups, ["False sharing", "True sharing"], "(A)+(B) events\nper search", xlabel="Update share")
     v6.write_csv(csvp, [
-        ("figure", f"MOT1 v6 Fig 3c false vs true sharing at 32 MiB ({a.tag}); PNG {os.path.basename(png)}; "
-                   f"per-event classes in {a.tag}-fig3c-events-<share>.csv"),
-        ("formula", "event TRUE if the node reads >= 1 element in {writes on the object with seq_prev < wseq <= "
-                    "seq_seen} before its next (A)/(B) event on the object (or log end), else FALSE; y = events / "
-                    "N_search; false_time_share = sum dur_ns(false) / sum dur_ns(all) (secondary, not drawn)"),
-        ("sources", "trace dir writes.csv (object, element, wseq), node<K>.log.csv (R/E rows), n_search.txt "
-                    "(PROVISIONAL format, see module docstring)"),
-        ("tags", "events count measured (trace); class derived (offline join by sequence numbers, no cross-VM clock); "
-                 "dur_ns measured"),
-        ("inputs", "see the trace column"),
-    ], ["update_share_pct", "N_search", "events", "false", "true", "false_per_search", "true_per_search",
-        "false_time_share", "trace"], rows)
+        ("figure", f"MOT1 v6 Fig 3c false vs true sharing at 32 MiB ({a.tag}); PNG {os.path.basename(png)}"),
+        ("formula", "event TRUE if the node reads >= 1 element modified by the causing writes (seq_prev < wseq <= "
+                    "seq_seen; '*' = whole object) before its next (A)/(B) event on the object (or trace end), else "
+                    "FALSE; no_prior_copy/unexplained excluded (column excluded); y = false|true / N_search; "
+                    "false_time_share = ev_ns_false / (ev_ns_false + ev_ns_true) (secondary, not drawn)"),
+        ("sources", "classify_sharing.py PREFIX.csv (true_A+true_B, false_A+false_B, no_prior_copy+unexplained, "
+                    "ev_ns_true, ev_ns_false, searches; row role) or its --a6-dir export (writes.csv, "
+                    "node<K>.log.csv, n_search.txt; cross-check join); column method"),
+        ("tags", "events and dur_ns measured (trace); class derived (offline join by sequence numbers, no cross-VM "
+                 "clock); per-search values derived"),
+        ("inputs", "see the source column"),
+    ], ["update_share_pct", "N_search", "events", "false", "true", "excluded", "false_per_search", "true_per_search",
+        "false_time_share", "method", "source"], rows)
     print(f"-> {png}\n-> {csvp}")
 
 
@@ -226,6 +252,7 @@ def main():
     ap.add_argument("--tag", required=True)
     ap.add_argument("--pop", nargs="*", help="3b: Popcorn runs SHARE=DIR[:STEPS] (contrast)")
     ap.add_argument("--search-op", default="search")
+    ap.add_argument("--role", default="search", help="3c: classify_sharing.py row (search, writer, main, all)")
     ap.add_argument("--update-op", default="update")
     a = ap.parse_args()
     os.makedirs(a.out, exist_ok=True)

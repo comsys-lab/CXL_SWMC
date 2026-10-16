@@ -188,16 +188,35 @@ def main():
     run(os.path.join(AN, "v6_fig3_megalon.py"), "b", "--out", out, "--tag", "vdb0", f"0={S}/vdb-0", f"10={S}/vdb-10")
     r, _ = rows(os.path.join(out, "vdb0-fig3b.csv"))
     check(r[0]["writeback_bytes_per_update"] == "" and len(r) == 2, "fig3b: share without update op = no data")
+    # Fig 3b Popcorn contrast in the A3 (opt.*) convention: (sm + wp faults of the update op) x 4 KiB
+    pv = {"opt.update.ops": 100, "opt.update.t_ns": 1e6, "opt.update.pop.sm_cnt": 150, "opt.update.pop.wp_cnt": 50,
+          "opt.update.mod_bytes": 100 * 4096, "opt.search.ops": 10, "opt.search.t_ns": 1e5}
+    mkrun(os.path.join(S, "vdb-pop10"), ("search", 99, 100), curve, {1: [pair(pv)]})
+    run(os.path.join(AN, "v6_fig3_megalon.py"), "b", "--out", out, "--tag", "vdbp", f"10={S}/vdb-10", "--pop",
+        f"10={S}/vdb-pop10")
+    r, _ = rows(os.path.join(out, "vdbp-fig3b.csv"))
+    check(len(r) == 2 and float(r[1]["writeback_bytes_per_update"]) == 2 * 4096 and r[1]["system"] == "Popcorn",
+          "fig3b popcorn = (sm + wp) x 4096 / N_update")
     t = os.path.join(S, "trace10")
     os.makedirs(t)
-    open(os.path.join(t, "writes.csv"), "w").write("object,element,wseq\nO1,e1,1\nO1,e2,2\nO1,e3,5\n")
+    open(os.path.join(t, "writes.csv"), "w").write("object,element,wseq\nO1,e1,1\nO1,e2,2\nO1,e3,5\nO2,*,1\n")
     open(os.path.join(t, "node0.log.csv"), "w").write(
-        "kind,object,a,b,c\nE,O1,A,0,2,100\nR,O1,e9,,\nR,O1,e2,,\nE,O1,B,2,5,300\nR,O1,e1,,\nE,O1,A,5,5,50\n")
+        "kind,object,a,b,c\nE,O1,A,0,2,100\nR,O1,e9,,\nR,O1,e2,,\nE,O1,B,2,5,300\nR,O1,e1,,\nE,O1,A,5,5,50\n"
+        "E,O2,A,0,1,40\nR,O2,vec:7,,\n")
     open(os.path.join(t, "n_search.txt"), "w").write("10\n")
     run(os.path.join(AN, "v6_fig3_megalon.py"), "c", "--out", out, "--tag", "vdb", f"10={t}")
     r, _ = rows(os.path.join(out, "vdb-fig3c.csv"))
-    check(r[0]["events"] == "3" and r[0]["true"] == "1" and r[0]["false"] == "2", "fig3c: e2 in {e1,e2} true; e1 not in {e3}")
-    check(abs(float(r[0]["false_time_share"]) - 350 / 450) < 1e-4, "fig3c false time share")
+    check(r[0]["events"] == "4" and r[0]["true"] == "2" and r[0]["false"] == "1" and r[0]["excluded"] == "1",
+          "fig3c join: e2 in {e1,e2} true; e1 not in {e3} false; no causing write excluded; '*' write -> true")
+    check(abs(float(r[0]["false_time_share"]) - 300 / 440) < 1e-4, "fig3c false time share (excluded left out)")
+    sc = os.path.join(S, "sharing.csv")
+    open(sc, "w").write("role,events_A,events_B,true_A,false_A,true_B,false_B,no_prior_copy,unexplained,ev_ns_true,"
+                        "ev_ns_false,ev_ns_excluded,searches\nsearch,6,2,1,4,1,1,1,0,100,300,5,100\n"
+                        "all,9,2,1,5,1,1,1,0,100,350,5,100\n")
+    run(os.path.join(AN, "v6_fig3_megalon.py"), "c", "--out", out, "--tag", "vdbs", f"10={sc}")
+    r, _ = rows(os.path.join(out, "vdbs-fig3c.csv"))
+    check(r[0]["true"] == "2.0" and r[0]["false"] == "5.0" and r[0]["excluded"] == "1.0" and
+          float(r[0]["false_per_search"]) == 0.05 and float(r[0]["false_time_share"]) == 0.75, "fig3c from sharing.csv (role search)")
     print("PASSED" if not fails else f"{fails} FAILED")
     sys.exit(1 if fails else 0)
 
