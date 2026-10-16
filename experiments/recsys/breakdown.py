@@ -53,11 +53,11 @@ def coh_src(path):
 
 
 def mg_check_window(b, e, o):
-    """Megalon section-check estimate over the window: (d(check_ns_sampled) - d(lookup_ns_sampled)) x d(read_sections)
-    / d(check_sampled); the index lookup (Megalon >= 74) is not coherence work (analysis 2f5a01d0b)."""
+    """Megalon section-check estimate over the window: d(check_ns_sampled) x d(read_sections) / d(check_sampled).
+    DLRM all-HWcc = plain backend, so the index lookup inside the checks stays in C (coordinator 2026-10-16)."""
     p = f'op.{o}.mg.'
     ds = delta(b, e, p + 'check_sampled')
-    ns = max(0, delta(b, e, p + 'check_ns_sampled') - delta(b, e, p + 'lookup_ns_sampled'))
+    ns = delta(b, e, p + 'check_ns_sampled')
     return ns * delta(b, e, p + 'read_sections') / ds if ds else 0.0
 
 

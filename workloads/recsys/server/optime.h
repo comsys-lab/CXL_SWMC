@@ -3,8 +3,10 @@
 // C_o = delta of the thread's coherence accounting over the same intervals:
 //   Popcorn  swmc_acct (systems/popcorn_new/include/swmc_acct.h): fault_ns[3] + ipi_ns, kernel TSC clock [measured]
 //   Megalon  CohSnap of the shim v2 (systems/megalon/shim/megalon_objapi.h thread_coh): section checks by the ratio
-//            estimator (check_ns_sampled - lookup_ns_sampled) x read_sections / check_sampled [sampled x N] (contract
-//            CXL_SWMC 2015a31f3; the index lookup, CohSnap.reserved[7] from Megalon 74, is excluded, 2f5a01d0b)
+//            estimator check_ns_sampled x read_sections / check_sampled [sampled x N] (contract CXL_SWMC 2015a31f3).
+//            DLRM's all-HWcc is the plain backend, so every Megalon call is C: the index lookup (CohSnap.reserved[7],
+//            Megalon 74, exported raw as mg.lookup_ns_sampled) is NOT subtracted. Megalon 75's anchor parts (shim v3
+//            thread_anchor) are to be added to C when that build lands.
 //            + stale/concur/meta/spin/wstart/wflush ns [measured]
 //            (switch_rw_ns and reclaim_ns are kept as raw columns only: they are inside write start, §4.1)
 // A source that is not available (kernel without build 9, cxl_shm not enabled, v1 shim) contributes zeros; the
@@ -98,11 +100,10 @@ struct OpAcc {
   OpAcc() {
     for (auto &x : f) x = 0;
   }
-  // Megalon section-check estimate (ratio estimator over the accumulated deltas): (check_ns_sampled - lookup_ns_sampled) x read_sections /
+  // Megalon section-check estimate (ratio estimator over the accumulated deltas): check_ns_sampled x read_sections /
   // check_sampled
   static uint64_t check_est(const uint64_t *v) {
-    const double ns = v[kPcF + 3] > v[kMgLookup] ? double(v[kPcF + 3] - v[kMgLookup]) : 0.0;
-    return v[kPcF + 4] ? uint64_t(ns * double(v[kPcF + 0]) / double(v[kPcF + 4])) : 0;
+    return v[kPcF + 4] ? uint64_t(double(v[kPcF + 3]) * double(v[kPcF + 0]) / double(v[kPcF + 4])) : 0;
   }
   // c_ns: Popcorn part + Megalon part (see the file comment)
   static uint64_t c_ns(const uint64_t *v) {
@@ -146,7 +147,7 @@ struct OpTimer {
 // Column tags of the op.* stats (MOT1 v6 §6.3): measured / sampled x N / derived.
 inline const char *op_tags() {
   return "op.tags=n:count:measured t_ns:duration:measured(rdtsc) pc.*:measured(kernel;pc.nontrans_*_not_in_c) mg.check_ns_sampled:sampled "
-         "mg.check_est_ns:sampledxN((check_ns_sampled-lookup_ns_sampled)*read_sections/check_sampled) mg.*_ns:measured mg.*_cnt:count:measured c_ns:derived(pc.c_ns+mg.check_est_ns+"
+         "mg.check_est_ns:sampledxN(check_ns_sampled*read_sections/check_sampled) mg.lookup_ns_sampled:sampled(raw,in_check) mg.*_ns:measured mg.*_cnt:count:measured c_ns:derived(pc.c_ns+mg.check_est_ns+"
          "mg.{stale,concur,meta,spin,wstart,wflush}_ns)\n";
 }
 

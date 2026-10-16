@@ -106,9 +106,11 @@ each system's API and measures its coherence actions; it cannot prove a coherenc
 - C_o = delta of the thread's coherence accounting over the same intervals: Popcorn swmc_acct (fault_ns[3] + ipi_ns,
   measured; registered per serving/update thread, zeros before build 9; build 10's faults without an MSI transition,
   reserved[0..1], are exported as `op.<o>.pc.nontrans_{ns,cnt}` and are NOT part of C); Megalon shim v2 CohSnap: section checks by the
-  ratio estimator (check_ns_sampled - lookup_ns_sampled) x read_sections / check_sampled [sampled x N] (the index
-  lookup, CohSnap.reserved[7] from Megalon 74, exported as `op.<o>.mg.lookup_ns_sampled`, is not in C; recsys has no
-  separate validation copy: the row copy inside the section is the application's own copy, as in all-HWcc) + stale, concur, meta, spin, wstart,
+  ratio estimator check_ns_sampled x read_sections / check_sampled [sampled x N]. DLRM's all-HWcc is the plain
+  backend, so every Megalon call counts as C, including the index lookup (CohSnap.reserved[7] from Megalon 74,
+  exported raw as `op.<o>.mg.lookup_ns_sampled`, not subtracted) and, from Megalon 75 (shim v3 thread_anchor), the
+  NR anchor parts (to be added). No separate validation copy: the row copy inside the section is the application's
+  own copy, as in all-HWcc + stale, concur, meta, spin, wstart,
   wflush ns [measured] (switch_rw and reclaim are inside wstart, exported raw only).
 - Stats keys: `op.<query|row_update>.{n,t_ns,c_ns,pc.c_ns,mg.check_est_ns}` and every raw field `op.<o>.pc.*`,
   `op.<o>.mg.*`; `op.coh_src` (threads with each source live), `op.tags` (measured / sampled / derived).
