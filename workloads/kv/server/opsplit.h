@@ -3,8 +3,11 @@
 // thread accumulated inside it:
 //   Popcorn  delta of swmc_acct_coh_ns() (systems/popcorn_new/include/swmc_acct.h; zeros while unsupported)
 //   Megalon  delta of the thread's CohSnap durations (systems/megalon/shim/megalon_objapi.h v2 thread_coh):
-//            check_ns_sampled x check_sample + stale_ns + concur_ns + meta_ns + spin_ns + wstart_ns + wflush_ns
+//            check estimate + stale_ns + concur_ns + meta_ns + spin_ns + wstart_ns + wflush_ns
 //            (switch_rw_ns and reclaim_ns are parts of wstart_ns and are reported separately, not added again);
+//            check estimate = ratio estimator check_ns_sampled x read_sections / check_sampled (contract
+//            CXL_SWMC 2015a31f3; read sections only), applied to the per-op-type sums: opt.<op>.c_ns at a snapshot uses
+//            the cumulative sums; tools/opsplit.py applies it to each step's deltas from the raw meg.* fields;
 //            a v1 shim (thread_coh absent) gives zeros and opt.meg_coh=0
 // opt.<op>.mod_bytes = bytes the application stored in the operations (Fig 3b reference line).
 // Aggregated per operation type over the threads of the process; stats text keys opt.* (cumulative; the analysis takes
@@ -56,8 +59,13 @@ static_assert(offsetof(mshim::CohSnap, reserved) == kMeg * 8, "CohSnap layout ch
 static_assert(offsetof(mshim::CohSnap, check_sample) == 2 * 8 && offsetof(mshim::CohSnap, wflush_bytes) == 20 * 8, "CohSnap");
 enum MegIdx { kCheckSample = 2, kCheckNs = 3, kStaleNs = 6, kConcurNs = 8, kMetaNs = 10, kSpinNs = 12, kWstartNs = 13, kWflushNs = 19 };
 
-inline uint64_t meg_coh_ns(const uint64_t *d, uint64_t check_sample) {
-  return d[kCheckNs] * check_sample + d[kStaleNs] + d[kConcurNs] + d[kMetaNs] + d[kSpinNs] + d[kWstartNs] + d[kWflushNs];
+enum MegIdx2 { kReadSections = 0, kCheckSampled = 4 };
+// exact (every-event) part of Megalon C; the section-check estimate is added on sums (ratio estimator)
+inline uint64_t meg_exact_ns(const uint64_t *d) {
+  return d[kStaleNs] + d[kConcurNs] + d[kMetaNs] + d[kSpinNs] + d[kWstartNs] + d[kWflushNs];
+}
+inline uint64_t meg_check_est_ns(uint64_t check_ns_sampled, uint64_t read_sections, uint64_t check_sampled) {
+  return check_sampled ? uint64_t(double(check_ns_sampled) * double(read_sections) / double(check_sampled)) : 0;
 }
 
 // Popcorn fields: fault_ns[3] (I->S, S->M, wp), fault_cnt[3], ipi_ns, ipi_cnt
@@ -106,6 +114,7 @@ class Table {
         for (int i = 0; i < kPop; i++) pop[i] += a.pop[i].load(std::memory_order_relaxed);
         for (int i = 0; i < kMeg; i++) meg[i] += a.meg[i].load(std::memory_order_relaxed);
       }
+      if (src_ == Source::kMegalon && meg_) c += meg_check_est_ns(meg[kCheckNs], meg[kReadSections], meg[kCheckSampled]);
       const std::string p = "opt." + ops_[op] + ".";
       o << p << "ops=" << ops << "\n" << p << "t_ns=" << ns(cyc) << "\n" << p << "t_max_ns=" << ns(mx) << "\n"
         << p << "c_ns=" << c << "\n" << p << "mod_bytes=" << mb << "\n";
@@ -172,7 +181,7 @@ class Thread {
       for (int i = 0; i < kMeg; i++) dm[i] = x1[i] - x0[i];
       for (int i = 0; i < kMeg; i++)
         if (i != kCheckSample) Acc::add(a.meg[i], dm[i]);
-      c = meg_coh_ns(dm, m1.check_sample);
+      c = meg_exact_ns(dm);
     }
     Acc::add(a.c_ns, c);
   }

@@ -10,15 +10,22 @@ One row per (step, operation type), summed over every target (node) with both sn
   T  = sum of per-operation durations (rdtsc at both ends of each operation) / operations
   C  = coherence-management time inside those operations / operations, by the run's SYSTEM:
        Popcorn / page MSI: fault time (I->S + S->M + write-protect) + TLB-shootdown IPI handling (swmc_acct)
-       Megalon:            section checks (sampled 1/N, x N) + stale copy (A) + concurrent write (B) + metadata (C)
+       Megalon:            section checks (ratio estimate check_ns_sampled x read_sections / check_sampled, read
+                           sections only; contract CXL_SWMC 2015a31f3) + stale copy (A) + concurrent write (B) + metadata (C)
                            + writer spin (D) + write start + write-end flush (CohSnap; switch_rw and reclaim are
                            parts of write start and shown separately)
        all-HWcc:           0 by definition (no coherence actions)
   rest = T - C
   mod_bytes = bytes the application stored per operation (put / update value; 0 for reads)
+Background coherence CPU (not inside any operation; same value on every op row of a step, summed over targets):
+  lib_bg_cpu_s     run time of the server's thread groups not named kv-* / lmdb-* (Megalon: megalon-lib, nr-log-sync,
+                   its reclaim thread; in the plain KV backend the same groups belong to the hwcc-flavor store)
+  recv_cpu_s       kernel threads cxl_recv* (Popcorn message receive)
+  coh_bg_cpu_s     by SYSTEM: Megalon lib_bg_cpu_s, Popcorn recv_cpu_s, all-HWcc 0;
+  coh_bg_us_per_op coh_bg_cpu_s / all operations of the step
 C is 0 with c_supported=0 when the source is not available (Popcorn kernel without swmc_acct, Megalon v1 shim).
 Every column name carries its tag: [measured] (a recorded quantity, possibly averaged per operation), [sampled_xN]
-(estimate from a 1-in-N sample, N in meg_check_sample), [derived] (formula of other columns).
+(estimate from a 1-in-N sample of read sections, N in meg_check_sample), [derived] (formula of other columns).
 """
 import argparse, csv, os, re, sys
 
@@ -70,6 +77,7 @@ def columns(ops_present):
          "T_max_us[measured]", "mod_bytes_per_op[measured]"]
     c += [f"pop_{k[:-3]}_us_per_op[measured]" for k in POP if k.endswith("_ns")]
     c += [f"pop_{k[:-4]}_per_op[measured]" for k in POP if k.endswith("_cnt")]
+    c += ["lib_bg_cpu_s[measured]", "recv_cpu_s[measured]", "coh_bg_cpu_s[derived]", "coh_bg_us_per_op[derived]"]
     c += ["meg_check_us_per_op[sampled_xN]", "meg_check_sample[measured]"]
     c += [f"meg_{k[:-3]}_us_per_op[measured]" for k in MEG_NS]
     c += [f"meg_{k}_per_op[measured]" for k in MEG_CNT]
@@ -101,6 +109,18 @@ def rows(run, system):
         elif src == "megalon":
             supported = int(all((num(e[1], "opt.meg_coh") or 0) > 0 for _, e in pairs))
         csample = max((num(e[1], "opt.meg_check_sample") or 0) for _, e in pairs)
+        def gsum(pred):
+            s = 0.0
+            for (_, b), (_, e) in pairs:
+                for k, ve in e.items():
+                    if pred(k) and k in b and num(e, k) is not None and num(b, k) is not None:
+                        s += num(e, k) - num(b, k)
+            return s
+        lib_bg = gsum(lambda k: k.startswith("thr.") and k.endswith(".run_ns") and not k.startswith(("thr.kv-", "thr.lmdb-"))) / 1e9
+        recv = gsum(lambda k: k.startswith("kthr.cxl_recv") and k.endswith(".run_ns")) / 1e9
+        coh_bg = lib_bg if src == "megalon" else recv if src == "popcorn" else 0.0
+        all_ops = sum(num(e, f"opt.{o}.ops") - num(b, f"opt.{o}.ops") for o in ops for (_, b), (_, e) in pairs
+                      if num(e, f"opt.{o}.ops") is not None and num(b, f"opt.{o}.ops") is not None)
         for op in ops:
             def dsum(key):
                 s = 0.0
@@ -116,7 +136,7 @@ def rows(run, system):
             T = per(dsum(p + "t_ns"))
             pop = {k: dsum(p + "pop." + k) for k in POP}
             meg = {k: dsum(p + "meg." + k) for k in MEG_NS + MEG_CNT + ["check_ns_sampled"]}
-            check_est = meg["check_ns_sampled"] * csample
+            check_est = meg["check_ns_sampled"] * meg["read_sections"] / meg["check_sampled"] if meg["check_sampled"] else 0.0
             if src == "popcorn":
                 C = per(pop["is_ns"] + pop["sm_ns"] + pop["wp_ns"] + pop["ipi_ns"])
             elif src == "megalon":
@@ -132,6 +152,7 @@ def rows(run, system):
                  round(cnt(dsum(p + "mod_bytes")), 3)]
             r += [round(per(pop[k]), 4) for k in POP if k.endswith("_ns")]
             r += [round(cnt(pop[k]), 6) for k in POP if k.endswith("_cnt")]
+            r += [round(lib_bg, 6), round(recv, 6), round(coh_bg, 6), round(coh_bg * 1e6 / all_ops, 4) if all_ops else ""]
             r += [round(per(check_est), 4), int(csample)]
             r += [round(per(meg[k]), 4) for k in MEG_NS]
             r += [round(cnt(meg[k]), 6) for k in MEG_CNT]
