@@ -10,7 +10,6 @@ import paper_style as ps
 
 NAMES = {"hw": "HWcc", "pop": "Popcorn", "mg": "Megalon"}
 PS_KEY = {"HWcc": "HWcc", "Popcorn": "Popcorn", "Megalon": "Megalon"}
-COMPS = ["Coherence processing", "Coherence wait", "Application"]  # legend top -> bottom
 
 
 def steps(path, stream):
@@ -19,10 +18,13 @@ def steps(path, stream):
 
 
 def common_step(S):
-    """highest offered rate passed by every system with an identical offered rate (same ramp ladder)."""
+    """highest identical offered rate passed by every system (same ramp ladder); if none, the highest rate all ran."""
     sets = [{r["offered"] for r in v if r["pass"] == "True"} for v in S.values()]
-    o = max(set.intersection(*sets), key=float)
-    return o, {k: next(r for r in v if r["offered"] == o and r["pass"] == "True") for k, v in S.items()}
+    common = set.intersection(*sets)
+    if not common:  # a system passed no step (e.g. DLRM Megalon: update stream saturated): rates all systems ran
+        common = set.intersection(*[{r["offered"] for r in v} for v in S.values()])
+    o = max(common, key=float)
+    return o, {k: next(r for r in v if r["offered"] == o) for k, v in S.items()}
 
 
 def write(path, header, rows, note):
@@ -40,27 +42,31 @@ def figure(out, tag, S, xscale, xlabel, slo_ms, xticks, ylim, yticks, comps_of, 
     for s in ("pop", "mg", "hw"):
         if s not in S:
             continue
-        v = sorted(S[s], key=lambda r: float(r["offered"]))
+        v = sorted(S[s], key=lambda r: float(r["achieved"]))
         xs, ys = [float(r["achieved"]) * xscale for r in v], [float(r["p99_ms"]) / base for r in v]
         series.append((PS_KEY[NAMES[s]], xs, ys))
         rows += [[NAMES[s], r["step"], r["phase"], r["offered"], r["achieved"], r["p99_ms"], round(y, 3), r["pass"]]
                  for r, y in zip(v, ys)]
-    ps.curve(os.path.join(out, f"{tag}-curve.png"), series, slo_ms / base, xlabel, "Normalized\np99 latency", ylim,
+    slo = slo_ms / base
+    if slo > ylim[1] * 0.85:  # keep the SLO line inside the plot (user: y max about 4 where the SLO allows it)
+        top = 2 * int(slo * 1.25 / 2 + 1)
+        ylim, yticks = (0, top), list(range(0, top + 1, 2 if top <= 12 else 4))
+    ps.curve(os.path.join(out, f"{tag}-curve.png"), series, slo, xlabel, "Normalized\np99 latency", ylim,
              xticks, yticks)
     write(os.path.join(out, f"{tag}-curve.csv"), ["system", "step", "phase", "offered", "achieved", "p99_ms",
           "p99_norm", "pass"], rows,
           f"p99 normalized to all-HWcc p99 at its lowest offered rate ({hw0['offered']}): {base} ms; SLO {slo_ms} ms -> {slo_ms / base:.3f}")
     o, m = common_step(S)
-    vals = {s: comps_of(s, m[s]) for s in S}
-    top = max(sum(v) for v in vals.values())
     order = [s for s in ("hw", "mg", "pop") if s in S]
-    ps.breakdown(os.path.join(out, f"{tag}-breakdown.png"), "Serving time breakdown",
-                 [(NAMES[s], [x / top for x in vals[s]]) for s in order], COMPS)
-    write(os.path.join(out, f"{tag}-breakdown.csv"), ["system", "step", "offered", "achieved"] + [c + unit for c in COMPS]
-          + ["total" + unit, "normalized_total"],
-          [[NAMES[s], m[s]["step"], o, m[s]["achieved"]] + [round(x, 4) for x in vals[s]] + [round(sum(vals[s]), 4),
-           round(sum(vals[s]) / top, 4)] for s in order],
-          f"identical offered rate {o} passed by all systems; normalized to the tallest bar ({top:.4f}{unit})")
+    raw = {NAMES[s]: comps_of(s, m[s]) for s in order}
+    norm = ps.compose(raw)
+    ps.breakdown(os.path.join(out, f"{tag}-breakdown.png"), [(NAMES[s], norm[NAMES[s]]) for s in order], ps.COMPONENTS)
+    note = f"identical offered rate {o} (steps: " + ", ".join(f"{NAMES[s]} pass={m[s]['pass']}" for s in order) + \
+        f"); raw values in {unit.strip('_')} per request; normalized to all-HWcc total = 1"
+    write(os.path.join(out, f"{tag}-breakdown.csv"), ["system", "step", "offered", "achieved", "app", "check", "msg",
+          "local"] + ["norm_" + c for c in ps.COMPONENTS] + ["norm_total"],
+          [[NAMES[s], m[s]["step"], o, m[s]["achieved"]] + [round(raw[NAMES[s]].get(k, 0.0), 4) for k in ("app", "check", "msg", "local")]
+           + [round(x, 4) for x in norm[NAMES[s]]] + [round(sum(norm[NAMES[s]]), 4)] for s in order], note)
     return o
 
 
@@ -82,11 +88,12 @@ def main():
         q = Q[s][st["step"]]
         f = lambda k: float(q[k] or 0)
         scale = f("server_ms_mean") / f("busy_mean_ms") if f("busy_mean_ms") else 0
-        wait = f("pf_msg_wait_mean_ms") * scale
-        proc = (f("coh_mean_ms") - f("pf_msg_wait_mean_ms")) * scale
-        return [proc, wait, f("server_ms_mean") - proc - wait]
-    o = figure(a.out, "vdb", S, 1.0, "Searches per second", 100.0, list(range(0, 211, 30)), (0, 40),
-               [0, 10, 20, 30, 40], vdb_comps, "_ms")
+        msg = f("pf_msg_wait_mean_ms") * scale
+        local = (f("pf_fault_mean_ms") - f("pf_msg_wait_mean_ms")) * scale
+        check = (f("mg_check_mean_ms") + f("mg_reexec_mean_ms")) * scale
+        return {"app": f("server_ms_mean") - msg - local - check, "msg": msg, "local": local, "check": check}
+    o = figure(a.out, "vdb", S, 1.0, "Searches per second", 100.0, list(range(0, 211, 30)), (0, 4),
+               [0, 1, 2, 3, 4], vdb_comps, "_ms")
     print("vdb common offered", o)
 
     # DLRM recommendation system (recovery/RECSYS-main-h1-v5 hw/pop, -v6 mg), query p99 <= 200 ms (user)
@@ -99,11 +106,13 @@ def main():
     def rs_comps(s, st):  # serving task time per query (sum over a query's parallel tasks)
         b = B[s][st["step"]]
         f = lambda k: float(b.get(k) or 0)
-        wait = f("serve_fetch_wait_ms_per_query")
         coh = f("serve_coherence_ms_per_query")
-        return [coh - wait, wait, f("serve_app_ms_per_query")]
-    o = figure(a.out, "dlrm", S, 1.0, "Queries per second", 200.0, list(range(0, 31, 5)), (0, 10),
-               [0, 2, 4, 6, 8, 10], rs_comps, "_ms")
+        if b["system"].startswith("Popcorn"):
+            return {"app": f("serve_app_ms_per_query"), "msg": f("serve_fetch_wait_ms_per_query"),
+                    "local": coh - f("serve_fetch_wait_ms_per_query")}
+        return {"app": f("serve_app_ms_per_query"), "check": coh}
+    o = figure(a.out, "dlrm", S, 1.0, "Queries per second", 200.0, list(range(0, 31, 5)), (0, 4),
+               [0, 1, 2, 3, 4], rs_comps, "_ms")
     print("dlrm common offered", o, "systems", sorted(S))
 
 

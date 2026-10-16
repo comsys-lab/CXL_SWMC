@@ -39,7 +39,7 @@ def main():
                  for r, y in zip(S[{"HWcc": "all-HWcc"}.get(name, name)], ys)]
     slo = 1.0 / base
     ps.curve(os.path.join(a.out, "kv-pilot-curve.png"), series, slo, "Requests per second (K)",
-             "Normalized\np99 latency", (0, 10), list(range(0, 161, 20)), [0, 2, 4, 6, 8, 10])
+             "Normalized\np99 latency", (0, 4), list(range(0, 161, 20)), [0, 1, 2, 3, 4])
     with open(os.path.join(a.out, "kv-pilot-curve.csv"), "w", newline="") as f:
         w = csv.writer(f)
         w.writerow([f"# p99 normalized to all-HWcc p99 at its lowest offered rate ({hw0['offered']} req/s): {base} ms; SLO 1 ms -> {slo:.3f}"])
@@ -51,28 +51,29 @@ def main():
     F = {k: v.replace("-pslo", "-pfix") for k, v in D.items()}
     m = {k: [r for r in csv.DictReader(open(os.path.join(F[k], "steps.csv"))) if r["stream"] == "mixed"][0] for k in F}
     o = float(m["all-HWcc"]["offered"])
-    comps = ["Fault handling", "Coherence transaction", "Application"]  # legend top -> bottom
-    vals, out = {}, []
-    for name in ("all-HWcc", "Megalon", "Popcorn"):
-        g = stats(F[name], m[name]["step"])
+    raw, out = {}, []
+    for name in ("HWcc", "Megalon", "Popcorn"):
+        key = {"HWcc": "all-HWcc"}.get(name, name)
+        g = stats(F[key], m[key]["step"])
         n = g("mixed_reqs")
         svc = g("mixed_svc_ns") / n / 1e3
         if name == "Popcorn":
             f = lambda k: sum(g(f"thr.{t}.swmc.{k}") for t in ("kv-worker", "kv-conn")) / n / 1e3
             msg = f("read_msg_wait_ns") + f("write_msg_wait_ns")
-            loc = f("read_fault_ns") + f("write_fault_ns") - msg
-            vals[name] = [loc, msg, svc - loc - msg]
-        else:
-            vals[name] = [0, 0, svc]  # Megalon KV pilot has no section timers: total only
-        out.append([name, m[name]["step"], m[name]["offered"], m[name]["achieved"], round(svc, 3)] + [round(v, 3) for v in vals[name]])
-    top = max(sum(v) for v in vals.values())
-    bars = [(("HWcc" if k == "all-HWcc" else k), [x / top for x in vals[k]]) for k in ("all-HWcc", "Megalon", "Popcorn")]
-    ps.breakdown(os.path.join(a.out, "kv-pilot-breakdown.png"), "Serving time breakdown", bars, comps)
+            local = f("read_fault_ns") + f("write_fault_ns") - msg
+            raw[name] = {"app": svc - msg - local, "msg": msg, "local": local}
+        else:  # the KV pilot's Megalon backend has no section timers: its coherence time is not separated
+            raw[name] = {"app": svc}
+        out.append([name, m[key]["step"], m[key]["offered"], m[key]["achieved"], round(svc, 3)]
+                   + [round(raw[name].get(k, 0.0), 3) for k in ("app", "msg", "local")])
+    norm = ps.compose(raw)
+    ps.breakdown(os.path.join(a.out, "kv-pilot-breakdown.png"), [(k, norm[k]) for k in ("HWcc", "Megalon", "Popcorn")],
+                 ps.COMPONENTS)
     with open(os.path.join(a.out, "kv-pilot-breakdown.csv"), "w", newline="") as f:
         w = csv.writer(f)
-        w.writerow([f"# fixed-load windows at {o:.1f} req/s (identical offered rate); normalized to the tallest bar ({top:.2f} us/request)"])
-        w.writerow(["system", "step", "offered", "achieved", "svc_us_per_req"] + [c + "_us" for c in comps])
-        w.writerows(out)
+        w.writerow([f"# fixed-load windows at {o:.1f} req/s (identical offered rate); us per request; normalized to all-HWcc = 1; Megalon not instrumented (no section timers in the KV pilot)"])
+        w.writerow(["system", "step", "offered", "achieved", "svc_us", "app_us", "msg_us", "local_us"] + ["norm_" + c for c in ps.COMPONENTS])
+        w.writerows([r + [round(x, 4) for x in norm[r[0]]] for r in out])
     print("common rate", o, "base p99", base, "SLO norm", round(slo, 3))
 
 

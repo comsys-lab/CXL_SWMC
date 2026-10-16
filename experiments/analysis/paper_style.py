@@ -14,7 +14,7 @@ plt.rcParams.update({"font.family": FONT, "font.weight": "bold", "font.size": 22
                      "savefig.facecolor": "white", "legend.frameon": False})
 # series order and gray levels as in the reference (worst = lightest, best = black)
 SERIES = {"Popcorn": "#bfbfbf", "Megalon": "#7f7f7f", "HWcc": "#000000"}
-STACK = ["white", "#bfbfbf", "#7f7f7f", "black"]  # top -> bottom in the legend, as in the reference
+STACK = ["white", "#d9d9d9", "#a6a6a6", "#595959", "black"]  # top -> bottom in the legend (5 gray levels)
 
 
 def curve(path, series, slo, xlabel, ylabel, ylim, xticks, yticks):
@@ -42,32 +42,56 @@ def curve(path, series, slo, xlabel, ylabel, ylim, xticks, yticks):
     plt.close(fig)
 
 
-def breakdown(path, title, bars, components, ymax=1.0):
-    """bars: [(name, [values per component])] already normalized; components: legend names, top -> bottom."""
+def breakdown(path, bars, components, ylabel="Normalized\nserving latency"):
+    """bars: [(name, [values per component])] normalized to all-HWcc = 1; components: legend names, top -> bottom
+    (the last one is drawn at the bottom). y axis up to the next 0.5 above the tallest bar."""
+    import math
     n = len(components)
-    aw = 1.45 * len(bars)  # axes width (in) per bar, legend to the right
-    fig = plt.figure(figsize=(1.1 + aw + 4.4, 5.6))
-    ax = fig.add_axes([1.1 / (5.5 + aw), 0.12, aw / (5.5 + aw), 0.76])
+    cols = STACK[-n:]
+    top = max(sum(v) for _, v in bars)
+    ymax = max(1.0, math.ceil(top * 2 + 1e-9) / 2)
+    step = 0.5 if ymax <= 3 else 1.0
+    aw = 1.45 * len(bars)
+    fig = plt.figure(figsize=(1.3 + aw + 4.6, 5.0))
+    ax = fig.add_axes([1.3 / (5.9 + aw), 0.13, aw / (5.9 + aw), 0.82])
     ax.yaxis.grid(True, color="#d9d9d9", linewidth=1.0)
     ax.set_axisbelow(True)
-    cols = STACK[-n:] if n <= len(STACK) else STACK
     for i, (name, vals) in enumerate(bars):
         b = 0
-        for j in range(n - 1, -1, -1):  # draw bottom component first
+        for j in range(n - 1, -1, -1):  # bottom component first
             v = vals[j]
-            if v > 0:
+            if v > 1e-9:
                 ax.bar(i, v, 0.55, bottom=b, color=cols[j], edgecolor="black", linewidth=2.5)
             b += v
     ax.set_xticks(range(len(bars)))
     ax.set_xticklabels([b[0] for b in bars], fontsize=19)
     ax.set_xlim(-0.6, len(bars) - 0.4)
     ax.set_ylim(0, ymax)
-    ticks = [round(x * 0.2, 1) for x in range(int(ymax / 0.2) + 1)]
+    ticks = [round(k * step, 2) for k in range(int(round(ymax / step)) + 1)]
     ax.set_yticks(ticks)
     ax.set_yticklabels(["%g" % t for t in ticks])
     ax.tick_params(axis="y", labelsize=18)
-    ax.set_title(title, fontsize=22, pad=14)
+    ax.set_ylabel(ylabel, fontsize=20, linespacing=0.95)
     ax.legend([Patch(facecolor=c, edgecolor="black", linewidth=2) for c in cols], components, loc="center left",
-              bbox_to_anchor=(1.02, 0.5), fontsize=19, handlelength=0.9, handleheight=0.9, labelspacing=0.6)
+              bbox_to_anchor=(1.02, 0.5), fontsize=18, handlelength=0.9, handleheight=0.9, labelspacing=0.6)
     fig.savefig(path, dpi=150, bbox_inches="tight")
     plt.close(fig)
+
+
+# Unified serving-latency components (legend top -> bottom). Raw per-system inputs: app (serving time minus the
+# measured coherence time), check (Megalon section checks + re-execution), msg (page MSI message wait, FETCH +
+# INVALIDATE), local (page MSI fault time minus message wait). The part of a system's app time above all-HWcc's is
+# "Other overhead" (not measured directly: e.g. cache misses after invalidations, untimed fault entry/exit, TLB
+# shootdown IPIs, polling vCPU); bars are normalized to all-HWcc's total = 1.
+COMPONENTS = ["Version check", "Coherence transaction", "Fault handling", "Other overhead", "Application"]
+
+
+def compose(raw, hw="HWcc"):
+    base_app = raw[hw]["app"]
+    base_tot = base_app
+    out = {}
+    for k, r in raw.items():
+        other = max(r["app"] - base_app, 0.0)
+        app = r["app"] - other
+        out[k] = [x / base_tot for x in (r.get("check", 0.0), r.get("msg", 0.0), r.get("local", 0.0), other, app)]
+    return out
