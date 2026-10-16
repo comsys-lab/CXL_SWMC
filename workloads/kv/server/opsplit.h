@@ -66,6 +66,16 @@ static_assert(offsetof(mshim::CohSnap, reserved) == kMeg * 8, "CohSnap layout ch
 static_assert(offsetof(mshim::CohSnap, check_sample) == 2 * 8 && offsetof(mshim::CohSnap, wflush_bytes) == 20 * 8, "CohSnap");
 enum MegIdx { kCheckSample = 2, kCheckNs = 3, kStaleNs = 6, kConcurNs = 8, kMetaNs = 10, kSpinNs = 12, kWstartNs = 13, kWflushNs = 19 };
 
+enum class Formula { kKV, kLMDB };  // Megalon C by the workload's all-HWcc (see the header comment)
+
+// AnchorSnap fields before reserved[], in declaration order (megalon_objapi.h v3)
+constexpr const char *kAncNames[] = {"read_sections",   "write_sections", "check_sampled", "read_lookup_ns_sampled",
+                                     "read_nr_ns_sampled", "rseq_ns_sampled", "write_lookup_ns", "write_nr_ns",
+                                     "wseq_ns",         "wseq_end_ns"};
+constexpr int kAnc = sizeof(kAncNames) / sizeof(kAncNames[0]);
+static_assert(offsetof(mshim::AnchorSnap, reserved) == kAnc * 8, "AnchorSnap layout changed: update kAncNames");
+enum AncIdx { kAReadLookup = 3, kAReadNr = 4, kARseq = 5, kAWriteLookup = 6, kAWriteNr = 7, kAWseq = 8, kAWseqEnd = 9 };
+
 enum MegIdx2 { kReadSections = 0, kCheckSampled = 4 };
 constexpr int kTscBackwards = 2;
 constexpr int kLookupNsSampled = 7;  // CohSnap.reserved[7] (Megalon >= 74): index-lookup part of the sampled checks; raw  // CohSnap.reserved[2] (Megalon >= 72: intervals clamped because the TSC went backwards)
@@ -95,15 +105,6 @@ constexpr const char *kPopNames[kPop] = {"is_ns",  "sm_ns",   "wp_ns",  "is_cnt"
                                          "wp_cnt", "ipi_ns",  "ipi_cnt", "nontrans_ns", "nontrans_cnt"};
 
 enum class Source { kPopcorn, kMegalon };
-enum class Formula { kKV, kLMDB };  // Megalon C by the workload's all-HWcc (see the header comment)
-
-// AnchorSnap fields before reserved[], in declaration order (megalon_objapi.h v3)
-constexpr const char *kAncNames[] = {"read_sections",   "write_sections", "check_sampled", "read_lookup_ns_sampled",
-                                     "read_nr_ns_sampled", "rseq_ns_sampled", "write_lookup_ns", "write_nr_ns",
-                                     "wseq_ns",         "wseq_end_ns"};
-constexpr int kAnc = sizeof(kAncNames) / sizeof(kAncNames[0]);
-static_assert(offsetof(mshim::AnchorSnap, reserved) == kAnc * 8, "AnchorSnap layout changed: update kAncNames");
-enum AncIdx { kAReadLookup = 3, kAReadNr = 4, kARseq = 5, kAWriteLookup = 6, kAWriteNr = 7, kAWseq = 8, kAWseqEnd = 9 };
 
 // Megalon-only application work timed by the workload itself (user decision MOT1 v6 §3.1: C = only work all-HWcc does
 // not do). lmdb: the "validation copy" = the 4 KiB page copy inside an accepted Megalon read section into the txn's
