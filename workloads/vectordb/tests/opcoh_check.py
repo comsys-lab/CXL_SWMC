@@ -17,7 +17,8 @@ usage: opcoh_check.py <run or scratch dir> fake|megalon|none|hwcc|popcorn|megalo
   VM modes (reports/VDB-V1-packet.md):
   hwcc:       all-HWcc (plain backend, cxl_shm unloaded): any Popcorn source, every Popcorn and Megalon part 0, c_ns 0.
   popcorn:    Popcorn (plain backend, cxl_shm loaded): source swmc_acct registered on both nodes (no register errors);
-              sum of c_ns > 0 over the updates (writer faults) and over the searches of ALL measured steps together; a
+              sum of c_ns > 0 over the measured updates (writer faults) and over the searches of ALL measured steps
+              together (warm-up excluded for both); a
               measured step whose searches have C = 0 prints "OPCOH_CHECK NOTE" (few invalidated pages read at a low
               rate), not a failure; no Megalon part.
   megalon-vm: Megalon with CohSnap + AnchorSnap (shim v3): both present on every record, sum of c_ns > 0 per op type,
@@ -118,8 +119,8 @@ if mode == "hwcc":
 elif mode == "popcorn":
     check(all(s["opcoh.pop_source"] == "swmc_acct" and s["opcoh.register_errors"] == 0 for s in st)
           and ((c["src"] & 3) == 1).all(), "swmc_acct registered on both nodes")
-    check(int(cu["c_ns"].sum()) > 0, "Popcorn update C > 0 (writer faults)")
-    meas = logs["measured"] == 1
+    meas = logs["measured"] == 1  # both sums over the measured steps only (warm-up excluded for both)
+    check(int(logs["c"]["c_ns"][(logs["op"] == 4) & meas].sum()) > 0, "Popcorn update C > 0 over all measured steps")
     check(int(logs["c"]["c_ns"][(logs["op"] == 3) & meas].sum()) > 0, "Popcorn search C > 0 over all measured steps")
     check(all((c[f] == 0).all() for f in mg_fields), "no Megalon part")
 elif mode in ("megalon-vm", "megalon-t0"):

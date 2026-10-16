@@ -7,7 +7,18 @@ CHOWNED=0
 # Stop this block's servers only: the guest run dirs recorded in this block's run manifests (run.sh writes
 # guest_run_dir before it starts a server).
 block_stop_servers() {
-  local ip g
+  local ip g f gip pf
+  # Popcorn --preload-only runs (m4-run.sh): kill a still running one (pid from its guest pid file, only if that pid
+  # is still a vdb-server --preload-only / its timeout wrapper), before servers, teardown and the dax rollback
+  for f in "$E"/preload-*.pid; do
+    [ -f "$f" ] || continue
+    gip=$(sed -n 's/^guest=\([^ ]*\) .*/\1/p' "$f") pf=$(sed -n 's/.* pidfile=\([^ ]*\) .*/\1/p' "$f")
+    [ -n "$gip" ] && [ -n "$pf" ] || continue
+    $SSH comsys@$gip "p=\$(cat $pf 2>/dev/null) || exit 0; ps -o args= -p \$p 2>/dev/null | grep -q -- '--preload-only' || { echo preload \$p not running; exit 0; }
+      kill -TERM \$p; for i in \$(seq 30); do kill -0 \$p 2>/dev/null || break; sleep 1; done
+      pkill -KILL -P \$p 2>/dev/null; kill -KILL \$p 2>/dev/null; sleep 1; echo preload \$p stopped procs=\$(pgrep -c -x vdb-server)" \
+      < /dev/null 2>&1 | sed "s|^|$gip $f |" >> "$E/rollback.out"
+  done
   for ip in "${IPS[@]}"; do
     for g in $(sed -n 's/^guest_run_dir=//p' "$E"/*/manifest.txt 2>/dev/null); do
       $SSH comsys@$ip "for k in 0 1; do [ -e $g/node\$k.pid ] && \$(dirname $g)/../bin/vdb-node.sh stop $g \$k; done; true" < /dev/null 2>&1 \

@@ -11,7 +11,11 @@
 #   writes-a1m-b1m-u1m.bin, image seg32c32m)
 #   Builds / guest install dirs (defaults = M4): LOADGEN_BIN (builds/loadgen/4/loadgen), PLAIN_BUILD (builds/vdb/8), VPLAIN (/home/comsys/vdb8),
 #   MEG_BUILD (builds/vdb-megalon/6), VMEG (/home/comsys/vdbm6-28m)
-#   SYS=Popcorn: C8 (build-8 deploy bundle dir), K8 (release), GT8 (guest tools dir), RECV_MODE (poll | idle | sleep)
+#   SYS=Popcorn: C8 / K8 / GT8 = the Popcorn deploy bundle dir, release and guest tools dir (names kept from build 8;
+#   any build >= 8 bundle, e.g. build 10 in reports/VDB-V1-packet.md), RECV_MODE (poll | idle | sleep);
+#   PRELOAD_TIMEOUT_S (default 1200): bound of the --preload-only run on node 0 (guest `timeout -k 30`); its pid is
+#   written to the guest file $V/runs/preload-<name>.pid and named in <evidence>/preload-<name>.pid, so the block
+#   cleanup (m4-lib.sh block_stop_servers) can kill it before teardown and the dax rollback.
 # optional: REP (repeat label, recorded), SEED (loadgen --seed, default 20261015), GATE=0 (skip the Host gate:
 #   refused unless KIND=functional), QCOH_EXPECT (none | swmc: per-query coherence, vdb build >= 9, DESIGN.md §14; both
 #   servers must log "query coherence on, page MSI source <QCOH_EXPECT>", end with qcoh.read_errors=0 and
@@ -100,7 +104,7 @@ servers_gone || stop "a vdb-server is running before the run"
 [ "${GATE:-1}" = 1 ] || [ "$KIND" = functional ] || stop "GATE=0 is allowed for KIND=functional only"
 if [ "${GATE:-1}" = 1 ]; then bash $X/host-gate.sh check "$E/gate-$NAME.txt" || stop "host gate"; fi
 T0=$(date +%s)
-if [ "$SYS" = Popcorn ]; then  # P-popcorn-deploy §6a cycle with build 8 (init_state=shared)
+if [ "$SYS" = Popcorn ]; then  # P-popcorn-deploy §6a cycle (bundle C8, build >= 8; init_state=shared)
   PS=(K=$K8 GT=$GT8 C=$C8 R=$E/shm-$NAME INIT_STATE=shared)
   SHM=0  # 1 from the load attempt until a successful teardown: any exit in between tears down (EXIT trap)
   shm_down() {
@@ -116,8 +120,11 @@ if [ "$SYS" = Popcorn ]; then  # P-popcorn-deploy §6a cycle with build 8 (init_
     [ "$($SSH comsys@$ip "test -f $V/cfg/cxl_region.yaml && test -f $GT8/cxl_region.yaml && sha256sum $V/cfg/cxl_region.yaml $GT8/cxl_region.yaml | cut -d' ' -f1 | sort -u | wc -l" < /dev/null)" = 1 ] \
       || stop "region config missing or different on $ip"
   done
-  t=$(date +%s)
-  $SSH comsys@${IPS[0]} "CXL_REGION_CONFIG=$V/cfg/cxl_region.yaml $V/bin/vdb-server --node 0 --preload-only --init-dir $INIT $SA" \
+  t=$(date +%s) PIDF=$V/runs/preload-$NAME.pid PT=${PRELOAD_TIMEOUT_S:-1200}
+  [[ $PT =~ ^[0-9]+$ ]] || stop "bad PRELOAD_TIMEOUT_S"
+  echo "guest=${IPS[0]} pidfile=$PIDF timeout_s=$PT" > "$E/preload-$NAME.pid"
+  # the remote shell writes its pid, then execs timeout (same pid), which runs the preload and forwards TERM to it
+  $SSH comsys@${IPS[0]} "mkdir -p $V/runs && echo \$\$ > $PIDF && exec timeout -k 30 $PT env CXL_REGION_CONFIG=$V/cfg/cxl_region.yaml $V/bin/vdb-server --node 0 --preload-only --init-dir $INIT $SA" \
     < /dev/null > "$E/preload-$NAME.log" 2>&1
   echo "preload_wall_s=$(( $(date +%s) - t ))" >> "$E/preload-$NAME.log"
   { grep -q "PRELOAD DONE" "$E/preload-$NAME.log" && servers_gone; } || stop "preload"
@@ -128,7 +135,7 @@ if [ "$SYS" = Popcorn ]; then  # P-popcorn-deploy §6a cycle with build 8 (init_
     [ "$m" = "$RECV_MODE" ] || stop "recv_mode on $ip = $m"
   done
   env "${PS[@]}" STATUS_TAG=pre bash $C8/p-popcorn-shm.sh status || stop "status pre"
-  for k in 0 1; do  # build-8 instrumentation must be on (per-query and window page MSI counters)
+  for k in 0 1; do  # Popcorn instrumentation (build >= 8) must be on (per-thread and window counters)
     grep -qx "instr_enabled=1" "$E/shm-$NAME/status-pre-vm$k.txt" || stop "instr_enabled != 1 on vm$k (status pre)"
   done
 fi

@@ -1,15 +1,17 @@
 #!/bin/bash
 # VDB-V1 block (reports/VDB-V1-packet.md v1): VM validation of the vector DB v6 builds (per-operation time split,
 # MOT1 v6 Fig 2/3), HNSW VectorDB 28M, all three systems on Popcorn build 10 (all-HWcc and Megalon with cxl_shm
-# unloaded; Popcorn with cxl_shm loaded per run, init_state=shared + preload, recv_mode poll). Not a measurement for
-# figures: checks that the blocks close and the coherence sources are right, and measures the Megalon timer overhead.
+# unloaded; Popcorn with cxl_shm loaded per run, init_state=shared + preload, recv_mode poll). Validation only, not
+# comparison data: checks that the blocks close and the coherence sources are right, and measures the Megalon timer
+# overhead.
 #   1. per system, order seeded "VDB-V1" over {hw, pop, mg}: one run, mix 95/5 (U=5), KIND=pfix (warm-up 10 s, per
 #      rate 5 s + 30 s), two rates in one server run: RATE_LOW (search 10/s) and RATE_L (0.5 x the v5 all-HWcc max,
 #      recovery/M4-vdb-h1-v2.1/main/hw-u5-slo-r1: 158.479 search/s). Runs <sys>-u5-v6.
 #      OPCOH_EXPECT / OPCOH_CHECK_MODE: hw none / hwcc, pop swmc_acct / popcorn, mg cohsnap / megalon-vm.
 #   2. Megalon timers off: mg-u5-t0 = step 1's Megalon run with MEGALON_COH_TIMERS=0 (same rates and seed), check mode
 #      megalon-t0. Overhead = step 1 Megalon (timers on) vs t0 at the same offered rates (one pair; noise stated).
-#   3. Sharing trace: mg-u90-trace, U=90, KIND=pfix, RATE_TRACE (search 2/s), TRACE=1, --trace-max-mb 1024; run.sh
+#   3. Sharing trace: mg-u90-trace, U=90, KIND=pfix, RATE_TRACE (search 2/s), TRACE=1, --trace-max-mb 512 (the dump at
+#      stop must fit vdb-node.sh's 15 s TERM grace: <= 512 MiB per node); run.sh
 #      classifies the trace on Host node 1 under a 16 GB address-space cap (sharing.csv); opsplit / opcoh_check
 #      megalon-vm as in step 1. trace.dropped must be 0 on both nodes.
 # usage: v6-block.sh <evidence dir (exists, holds only sequence* files)>
@@ -38,6 +40,10 @@ $VM/bin/vdb-server $MEG_BUILD/bin/vdb-server
 $VM/bin/vdb-node.sh $P/CXL_SWMC/scripts/guest/vdb-node.sh
 $VM/lib/libmegalon-objapi.so $MEG_BUILD/lib/libmegalon-objapi.so
 $VM/lib/libmegalon.so $MEG_BUILD/lib/libmegalon.so
+$VM/lib/libtbb.so.12 $MEG_BUILD/lib/libtbb.so.12
+$VM/lib/libtbbmalloc.so.2 $MEG_BUILD/lib/libtbbmalloc.so.2
+$VM/lib/libhwloc.so.15 $MEG_BUILD/lib/libhwloc.so.15
+$VM/lib/libatomic.so.1 $MEG_BUILD/lib/libatomic.so.1
 $VM/cfg/megalon.yaml $MEG_CFG
 $VM/cfg/cxl_region.yaml $P/CXL_SWMC/config/cxl_region.yaml"
 . $X/m4-lib.sh
@@ -74,7 +80,7 @@ for s in $ORD; do
   one $s $s-u5-v6 U=5 RATE=$RATE_LOW,$RATE_L REP=v6 $m
 done
 one mg mg-u5-t0 U=5 RATE=$RATE_LOW,$RATE_L REP=t0 OPCOH_CHECK_MODE=megalon-t0 XENV=ENV:MEGALON_COH_TIMERS=0
-one mg mg-u90-trace U=90 RATE=$RATE_TRACE REP=trace TRACE=1 OPCOH_CHECK_MODE=megalon-vm "XARGS=--trace-max-mb 1024"
+one mg mg-u90-trace U=90 RATE=$RATE_TRACE REP=trace TRACE=1 OPCOH_CHECK_MODE=megalon-vm "XARGS=--trace-max-mb 512"
 grep -q "^-> .*sharing.csv:" $E/mg-u90-trace/sharing.log || { echo "SEQUENCE STOP: trace not classified (see $E/mg-u90-trace/sharing.log)"; exit 1; }
 [ "$(grep -h '^trace.dropped=' $E/mg-u90-trace/node*.log | sort -u)" = "trace.dropped=0" ] \
   || { echo "SEQUENCE STOP: trace records dropped (see node logs)"; exit 1; }
