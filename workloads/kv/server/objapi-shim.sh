@@ -11,7 +11,7 @@ set -euo pipefail
 OUT=$1; MB=$(cd "$2" && pwd); PREFIX=$3
 HERE=$(cd "$(dirname "$0")" && pwd); ROOT=$(cd "$HERE/../../.." && pwd)
 S=$ROOT/systems/megalon/shim; MSRC=$ROOT/systems/megalon/src
-if nm -D --defined-only "$MB/ship/lib/libmegalon.so" | grep -q GetObjectThreadCoh; then
+if nm -D --defined-only "$MB/ship/lib/libmegalon.so" | grep GetObjectThreadCoh > /dev/null; then  # no -q: SIGPIPE + pipefail
   echo "info=$("$S/build-shim.sh" "$OUT" "$MB" "$PREFIX")"
   echo "source=working-tree"
   echo "cc_sha256=$(sha256sum "$S/megalon_objapi.cc" | cut -d' ' -f1)"
@@ -24,7 +24,10 @@ T=$OUT/objapi-v1-src; mkdir -p "$T" "$OUT/lib"
 git -C "$ROOT" show "$REF:systems/megalon/shim/megalon_objapi.cc" > "$T/megalon_objapi.cc"
 git -C "$ROOT" show "$REF:systems/megalon/shim/megalon_objapi.h" > "$T/megalon_objapi.h"
 grep -q thread_coh "$T/megalon_objapi.cc" && { echo "$REF shim already implements thread_coh (not a v1 fallback)" >&2; exit 1; }
-cmp -s "$T/megalon_objapi.h" "$S/megalon_objapi.h" || { echo "contract header changed since $REF: refusing the v1 fallback" >&2; exit 1; }
+# the v1 source is compiled against the current header: its code (comments stripped) must be unchanged since REF
+code() { sed -e 's://.*$::' -e 's:/\*.*\*/::' -e 's/[[:space:]]\+/ /g' -e '/^ *$/d' "$1"; }
+[ "$(code "$T/megalon_objapi.h")" = "$(code "$S/megalon_objapi.h")" ] || { echo "contract header code changed since $REF: refusing the v1 fallback" >&2; exit 1; }
+cp -p "$S/megalon_objapi.h" "$T/megalon_objapi.h"
 cp -p "$MB"/ship/lib/* "$OUT/lib/"
 INFO="$PREFIX megalon=$(sed -n 's/^build_id=//p' "$MB/manifest.txt")/$(sed -n 's/^flavor=//p' "$MB/manifest.txt")/$(sed -n 's/^wmeta_layout=//p' "$MB/manifest.txt") objapi=v1-fallback@$REF"
 c++ -std=c++17 -O2 -g -fPIC -shared -Wall -Wextra -Wno-missing-field-initializers -I"$T" -I"$MSRC/include" -DMSHIM_INFO="\"$INFO\"" \

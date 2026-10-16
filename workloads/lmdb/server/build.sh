@@ -30,7 +30,7 @@ c++ "${FLAGS[@]}" "$W/tools/lmdb_image.cc" "${LINK[@]}" -o "$OUT/bin/lmdb-image"
 c++ "${FLAGS[@]}" "$W/tools/lmdb_stress.cc" "${LINK[@]}" -o "$OUT/bin/lmdb-stress" "${RP[@]}"
 [ -z "$MB" ] || c++ "${FLAGS[@]}" "$W/tools/megalon_bench.cc" -ldl -o "$OUT/bin/megalon-bench" "${RP[@]}"
 COMMIT=$(git -C "$HERE" rev-parse HEAD)
-DEPS=("$W" "$ROOT/systems/common" "$ROOT/experiments/loadgen" "$MSHIM/megalon_objapi.h" "$ROOT/systems/popcorn_new/include" "$ROOT/workloads/kv/server/opsplit.h" "$ROOT/workloads/kv/server/objapi-shim.sh")
+DEPS=("$W" "$ROOT/systems/common" "$ROOT/experiments/loadgen/frame.h" "$MSHIM/megalon_objapi.h" "$ROOT/systems/popcorn_new/include" "$ROOT/workloads/kv/server/opsplit.h" "$ROOT/workloads/kv/server/objapi-shim.sh")
 DIRTY=$(git -C "$HERE" status --porcelain --untracked-files=all -- "${DEPS[@]}" | wc -l)
 SRCHASH=$(cd "$ROOT" && find workloads/lmdb/proto.h workloads/lmdb/server workloads/lmdb/tools systems/common \
             systems/megalon/shim/megalon_objapi.h systems/popcorn_new/include/swmc_acct.h workloads/kv/server/opsplit.h experiments/loadgen/frame.h \
