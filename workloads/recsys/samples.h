@@ -1,6 +1,6 @@
 // recsys sample files (tools/gen_samples.cc, tools/mlperf_npz_to_samples.py; read by the loadgen plugin).
-// Header (128 B) + count records of rsys::Sample (proto.h: 13 fp32 dense features, already log(1+x)-transformed as in
-// MLPerf preprocessing; 214 multi-hot ids, uncapped). Records are in file order = trace order (update trace).
+// Header (128 B) + count records of rsys::Sample (proto.h: 13 fp32 dense features, as preprocessed by MLPerf/torchrec
+// (log(x + 3), observed on day 23); 214 multi-hot ids, uncapped). Records are in file order = trace order (update trace).
 // Version 2 (v6, 908 B records); version-1 files (26 one-hot ids, 156 B) are rejected.
 #pragma once
 

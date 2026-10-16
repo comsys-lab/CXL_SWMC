@@ -42,6 +42,30 @@ def kv(path):
     return d
 
 
+def coh_src(path):
+    """op.coh_src=pc_threads:N,mg_threads:M of a snapshot -> (pc, mg) thread counts ((0, 0) if absent)."""
+    pc = mg = 0
+    for line in open(path):
+        if line.startswith('op.coh_src='):
+            d = dict(x.split(':', 1) for x in line.strip().split('=', 1)[1].split(',') if ':' in x)
+            pc, mg = int(d.get('pc_threads', 0)), int(d.get('mg_threads', 0))
+    return pc, mg
+
+
+def mg_check_window(b, e, o):
+    """Megalon section-check estimate over the window: (d(check_ns_sampled) - d(lookup_ns_sampled)) x d(read_sections)
+    / d(check_sampled); the index lookup (Megalon >= 74) is not coherence work (analysis 2f5a01d0b)."""
+    p = f'op.{o}.mg.'
+    ds = delta(b, e, p + 'check_sampled')
+    ns = max(0, delta(b, e, p + 'check_ns_sampled') - delta(b, e, p + 'lookup_ns_sampled'))
+    return ns * delta(b, e, p + 'read_sections') / ds if ds else 0.0
+
+
+def op_c_window(b, e, o):
+    """C over the window: additive parts of c_ns (c_ns - cumulative check estimate) + the window check estimate."""
+    return delta(b, e, f'op.{o}.c_ns') - delta(b, e, f'op.{o}.mg.check_est_ns') + mg_check_window(b, e, o)
+
+
 def delta(b, e, key):
     return e.get(key, 0) - b.get(key, 0)
 
@@ -120,7 +144,7 @@ def main():
                 r['upd_check_ms'] = round(cu['section_checks'] / 1e6, 3)
                 r['upd_flush_ms'] = round(cu['flushes'] / 1e6, 3)
             else:  # CohSnap (shim v2): checks (ratio estimator) + stale/concur/meta/spin/wstart/wflush
-                coh = {'cohsnap': delta(b1, e1, 'op.query.c_ns')}
+                coh = {'cohsnap': op_c_window(b1, e1, 'query')}
             r['serve_read_sections'] = delta(b1, e1, 'megalon_time.serve.read_sections')  # exact counts either way
             r['upd_write_sections'] = delta(b0, e0, 'megalon_time.update.write_sections')
             r['megalon_switch_rw_node0'] = delta(b0, e0, 'megalon.switch_rw')
@@ -139,16 +163,21 @@ def main():
         r['upd_rows_per_s'] = round(r['upd_rows_written'] / win_s, 1) if win_s else ''
         r['upd_busy_ms'] = round(delta(b0, e0, 'thr.rs-update.run_ns') / 1e6, 3)
         r['upd_flush_overruns'] = delta(b0, e0, 'flush_overruns')
-        for o, b, e in (('query', b1, e1), ('row_update', b0, e0)):  # MOT1 v6 Fig 2 (optime.h)
+        for o, b, e, ep in (('query', b1, e1, epath), ('row_update', b0, e0, e0p)):  # MOT1 v6 Fig 2 (optime.h)
             n = delta(b, e, f'op.{o}.n')
-            t, c = delta(b, e, f'op.{o}.t_ns'), delta(b, e, f'op.{o}.c_ns')
-            ctag = {'hwcc': 'none', 'msi': 'measured', 'megalon': 'derived'}[kind]
+            t, c = delta(b, e, f'op.{o}.t_ns'), op_c_window(b, e, o)
+            pc_live = coh_src(ep)[0] > 0
+            # Popcorn C needs swmc_acct (build >= 10, registered threads); without it the column is not-available
+            ctag = {'hwcc': 'none', 'msi': 'measured' if pc_live else 'not-available', 'megalon': 'derived'}[kind]
+            ok = n and ctag != 'not-available'
             r[f'fig2_{o}_n[count]'] = n
             r[f'fig2_{o}_T_ms[measured]'] = round(t / n / 1e6, 6) if n else ''
-            r[f'fig2_{o}_C_ms[{ctag}]'] = round(c / n / 1e6, 6) if n else ''
-            r[f'fig2_{o}_rest_ms[derived]'] = round((t - c) / n / 1e6, 6) if n else ''
+            r[f'fig2_{o}_C_ms[{ctag}]'] = round(c / n / 1e6, 6) if ok else ''
+            r[f'fig2_{o}_rest_ms[derived]'] = round((t - c) / n / 1e6, 6) if ok else ''
+            if kind == 'msi':
+                r[f'fig2_{o}_pc_nontrans_ms[measured, not in C]'] = round(delta(b, e, f'op.{o}.pc.nontrans_ns') / n / 1e6, 6) if ok else ''
             if kind == 'megalon':
-                r[f'fig2_{o}_C_check_ms[sampledxN]'] = round(delta(b, e, f'op.{o}.mg.check_est_ns') / n / 1e6, 6) if n else ''
+                r[f'fig2_{o}_C_check_ms[sampledxN]'] = round(mg_check_window(b, e, o) / n / 1e6, 6) if n else ''
         if kind == 'megalon':
             for k, b, e in ((0, b0, e0), (1, b1, e1)):
                 r[f'bg_cpu_ms_node{k}[measured]'] = round((delta(b, e, 'thr.nr-log-sync.run_ns') +

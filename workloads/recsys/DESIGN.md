@@ -35,8 +35,9 @@ each system's API and measures its coherence actions; it cannot prove a coherenc
   is a hash table so that new ids could be inserted (MOT1 §1.3); this setup does not exercise inserts.
 
 ## 3. Samples and queries (inputs)
-- Sample record v2 (proto.h `Sample`, 908 B; samples.h version 2): 13 dense fp32 (log(1+x) as in MLPerf
-  preprocessing) + the 214 multi-hot ids of the 26 features in table order (MLPerf sizes
+- Sample record v2 (proto.h `Sample`, 908 B; samples.h version 2): 13 dense fp32 as preprocessed by MLPerf/torchrec (log(x + 3):
+  observed on day 23, exp of every value is an integer >= 2, i.e. raw values shifted by the global minimum -1 plus 2;
+  torchrec source not checked locally) + the 214 multi-hot ids of the 26 features in table order (MLPerf sizes
   3,2,1,2,6,1,1,1,1,7,3,8,1,6,9,5,1,1,1,12,100,27,10,3,1,1), uncapped. The server uses them as is (row = id mod rows,
   D1); version-1 files (26 one-hot ids) are rejected.
 - Real data (v6 default): `tools/mlperf_npz_to_samples.py` copies records of the MLCommons preprocessed day 23
@@ -75,7 +76,9 @@ each system's API and measures its coherence actions; it cannot prove a coherenc
 - Operating point = fraction F of all rows published per T (`--publish-frac F`, reported as `rows_per_round_target`
   next to `round_rows` / `publish_rounds`): Ekko OSDI'22 average 3.08% of rows/hour -> F = 0.0308/60 per 60 s;
   peak 4.3%/10 min -> F = 0.043/10. The loadgen sample rate is computed by `recsys-rate` (tools/rate_calib.cc), which
-  replays the trace like the updater and counts samples until one interval's distinct rows reach F x rows. Full size,
+  replays the trace like the updater and counts samples until one interval's distinct rows reach F x rows.
+  The mapping is a lower bound: Ekko counts distinct rows over the hour (or 10 min), so the distinct rows of one
+  60 s interval are at least that fraction / intervals (re-touches across intervals would raise it). Full size,
   day-23 trace [0, 2M), T = 60 s, 20 windows: average 68,881 rows/T -> 883.4 samples/T = 14.72 samples/s; peak
   576,994 rows/T -> 11,325.6 samples/T = 188.76 samples/s (builds/recsys-inputs/1/rate-frac*.txt).
 - Row values are synthetic: emb = f(key, seq, seed) in [-0.05, 0.05) (D5).
@@ -101,9 +104,11 @@ each system's API and measures its coherence actions; it cannot prove a coherenc
   start (slot resolve, writes under the stripes) to published_seq raised (rows visible); no per-row reply exists
   (samples are acknowledged on acceptance, outside T).
 - C_o = delta of the thread's coherence accounting over the same intervals: Popcorn swmc_acct (fault_ns[3] + ipi_ns,
-  measured; registered per serving/update thread, zeros until build 9; build 10's faults without an MSI transition,
+  measured; registered per serving/update thread, zeros before build 9; build 10's faults without an MSI transition,
   reserved[0..1], are exported as `op.<o>.pc.nontrans_{ns,cnt}` and are NOT part of C); Megalon shim v2 CohSnap: section checks by the
-  ratio estimator check_ns_sampled x read_sections / check_sampled [sampled x N] + stale, concur, meta, spin, wstart,
+  ratio estimator (check_ns_sampled - lookup_ns_sampled) x read_sections / check_sampled [sampled x N] (the index
+  lookup, CohSnap.reserved[7] from Megalon 74, exported as `op.<o>.mg.lookup_ns_sampled`, is not in C; recsys has no
+  separate validation copy: the row copy inside the section is the application's own copy, as in all-HWcc) + stale, concur, meta, spin, wstart,
   wflush ns [measured] (switch_rw and reclaim are inside wstart, exported raw only).
 - Stats keys: `op.<query|row_update>.{n,t_ns,c_ns,pc.c_ns,mg.check_est_ns}` and every raw field `op.<o>.pc.*`,
   `op.<o>.mg.*`; `op.coh_src` (threads with each source live), `op.tags` (measured / sampled / derived).
@@ -120,7 +125,7 @@ each system's API and measures its coherence actions; it cannot prove a coherenc
 - Shim: the shared object-API shim `systems/megalon/shim` (`megalon_objapi.h`, `megalon_objapi.cc`, `build-shim.sh`
   -> `lib/libmegalon-objapi.so`, symbol `megalon_object_api`), generalised from vectordb's copy (which vectordb keeps);
   dlopen only for `--backend megalon`.
-- v6: built on Megalon 72 (CohSnap, clamped TSC intervals); `build-megalon.sh <out> builds/megalon/72`. The legacy
+- v6: built on Megalon 73 (CohSnap, clamped TSC intervals; >= 74 adds lookup_ns_sampled); `build-megalon.sh <out> builds/megalon/73`. The legacy
   app-level timers (MegThr, clock_gettime 1 in N) are off by default (`--megalon-time-sample 0`); breakdown.py /
   check_breakdown.py use the CohSnap columns and add the legacy split only when N > 0.
 - Stop: SIGTERM while waiting for the peer at start-up exits ("stopped (signal) ..."); a wait inside

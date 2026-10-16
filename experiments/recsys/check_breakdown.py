@@ -70,6 +70,13 @@ def main():
             fail(f'step {r.get("step")}: no end snapshot of the serving node')
         keys = {mm.group(1) for mm in (re.match(r'^([^=\s]+)=', l) for l in open(end[0])) if mm}
         missing = [k for k in RAW[kind] if k not in keys]
+        if kind == 'msi':  # v6 Fig 2: Popcorn C must come from swmc_acct (build >= 10); refuse C = 0 data
+            src = [l for l in open(end[0]) if l.startswith('op.coh_src=')]
+            if not src or 'pc_threads:0' in src[-1]:
+                fail(f'step {r.get("step")}: Popcorn swmc_acct not live ({src[-1].strip() if src else "no op.coh_src"}); '
+                     'Fig 2 C not available (needs Popcorn build >= 10)')
+            if r.get('fig2_query_C_ms[measured]', '') == '':
+                fail(f'step {r.get("step")}: column fig2_query_C_ms[measured] missing or empty')
         if kind == 'megalon' and 'op.coh_src' in keys:
             src = [l for l in open(end[0]) if l.startswith('op.coh_src=')][-1]
             if 'mg_threads:0' in src:

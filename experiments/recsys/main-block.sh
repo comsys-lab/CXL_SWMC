@@ -5,12 +5,13 @@
 #   updater on node 0 replays the real MLPerf day-23 multi-hot trace at the Ekko operating point EKKO=avg (3.08% of
 #   rows/hour -> PUBLISH_FRAC 0.0308/60 per T) or EKKO=peak (4.3%/10 min -> 0.043/10 per T); the sample rate is
 #   computed on the Host by recsys-rate from the trace (<E>/update-rate.txt) so that one T publishes that fraction.
-#   (v5 rule "SLO = 5 x all-HWcc p99 at the lowest load" and the fixed 2,100 samples/s are superseded.) Every system on Popcorn build 8 (K8): all-HWcc and Megalon with cxl_shm unloaded, page MSI
+#   (v5 rule "SLO = 5 x all-HWcc p99 at the lowest load" and the fixed 2,100 samples/s are superseded.) Every system on the Popcorn build POP_BUILD (>= 10) kernel (K8): all-HWcc and Megalon with cxl_shm unloaded, page MSI
 # with cxl_shm loaded once for its whole server lifetime (init_state=shared + preload, recv_mode RECV_MODE).
 # usage: main-block.sh <evidence dir (exists; only sequence* files)>
-# env (required): C8 (= builds/popcorn_new/8/deploy-v3), K8, GT8, RECV_MODE, D (inputs dir with MANIFEST.txt),
+# env (required): C8 (Popcorn deploy bundle dir, = builds/popcorn_new/10/deploy-v1), K8, GT8 (names kept from v5),
+#   RECV_MODE, optional POP_BUILD (10, >= 10), POP_BUNDLE_SHA (build-10 deploy-v1 packet hash), D (inputs dir with MANIFEST.txt),
 #   VM_PLAIN (guest dir: build-3 server, all-HWcc + page MSI), VM_MEG (guest dir: Megalon build + recsys-2vm.yaml),
-#   MEG_BUILD (recsys-megalon build on MEGALON_BASE, default builds/megalon/72), PLAIN_BUILD (v6 recsys build dir), EKKO
+#   MEG_BUILD (recsys-megalon build on MEGALON_BASE, default builds/megalon/73), PLAIN_BUILD (v6 recsys build dir), EKKO
 #   (avg | peak), LOADGEN; optional SEED (20261016), UPD_FILE / QRY_FILE (names in D; default the day-23 slices of
 #   builds/recsys-inputs/1),
 #   ROUNDS (3), FIXED (1; 0 = no fixed-load window), XT (server lifetime bound, s, default 28800),
@@ -42,7 +43,7 @@ P=/home/comsys/sungsu/destijl-control X=$P/CXL_SWMC/experiments/recsys G=$P/CXL_
 : "${C8:?}" "${K8:?}" "${GT8:?}" "${RECV_MODE:?}" "${D:?}" "${VM_PLAIN:?}" "${VM_MEG:?}" "${MEG_BUILD:?}" "${LOADGEN:?}"
 : "${PLAIN_BUILD:?}" "${EKKO:?}"
 MB=$MEG_BUILD SEED=${SEED:-20261016} ROUNDS=${ROUNDS:-3} FIXED=${FIXED:-1} XT=${XT:-28800}
-MEGALON_BASE=${MEGALON_BASE:-$P/builds/megalon/72}
+MEGALON_BASE=${MEGALON_BASE:-$P/builds/megalon/73}
 UPD_FILE=${UPD_FILE:-updates-day23-0-2M.smp} QRY_FILE=${QRY_FILE:-queries-day23-89137318-1M.smp}
 T_MS=60000 SLO_PCT=95 SLO_MS=100
 case $EKKO in
@@ -57,8 +58,9 @@ IPS=(192.168.122.100 192.168.122.101)
 OWNER="RECSYS-main-$(basename "$E")"
 [[ $RECV_MODE =~ ^(poll|idle|sleep)$ ]] || { echo "SEQUENCE STOP: bad RECV_MODE"; exit 2; }
 [[ $ROUNDS =~ ^[1-9]$ ]] || { echo "SEQUENCE STOP: bad ROUNDS"; exit 2; }
-# SYSTEMS (subset of "hw pop mg", default all) and SLO_MS_FROM (a previous block's slo.txt; required without hw):
-# a rerun of some systems (the SLO is fixed; L for the fixed window comes from L_FROM)
+# SYSTEMS (subset of "hw pop mg", default all): a rerun of some systems (the SLO is fixed; L for the fixed window
+# comes from L_FROM). SLO_MS_FROM (v5) is not used: refused if set.
+[ -z "${SLO_MS_FROM:-}" ] || { echo "SEQUENCE STOP: SLO_MS_FROM is a v5 option (v6 SLO is fixed)"; exit 2; }
 for s in ${SYSTEMS:-hw pop mg}; do case $s in hw|pop|mg) ;; *) echo "SEQUENCE STOP: bad SYSTEMS entry $s"; exit 2;; esac; done
 if [[ " ${SYSTEMS:-hw pop mg} " != *" hw "* ]]; then
   [ "${FIXED:-1}" = 0 ] || [ -f "${L_FROM:-}" ] || { echo "SEQUENCE STOP: SYSTEMS without hw and FIXED=1 needs L_FROM=<fixed-load-L.txt>"; exit 2; }
@@ -66,24 +68,21 @@ fi
 case $FIXED in 0|1) ;; *) echo "SEQUENCE STOP: bad FIXED"; exit 2;; esac
 grep -q "^megalon_build=$MEGALON_BASE$" $MB/manifest.txt || { echo "SEQUENCE STOP: $MB is not on $MEGALON_BASE"; exit 2; }
 [ -x "$HOST_PLAIN" ] && [ -x "$PLAIN_BUILD/bin/recsys-rate" ] || { echo "SEQUENCE STOP: $PLAIN_BUILD is not a v6 recsys build"; exit 2; }
-# update rate for the Ekko operating point: samples per T so that one round publishes PUBLISH_FRAC of all rows
-RATEF=$E/sequence-update-rate.txt
-nice -n 19 numactl --cpunodebind=1 --membind=1 "$PLAIN_BUILD/bin/recsys-rate" --samples "$D/$UPD_FILE" --frac $PUBLISH_FRAC \
-  --t-ms $T_MS --windows 20 > "$RATEF" || { echo "SEQUENCE STOP: recsys-rate"; exit 2; }
-UPD_RATE=$(sed -n 's/^rate_samples_per_s=//p' "$RATEF")
-awk -v x="$UPD_RATE" 'BEGIN{exit !(x > 0)}' || { echo "SEQUENCE STOP: bad update rate $UPD_RATE"; exit 2; }
-echo "EKKO=$EKKO publish_frac=$PUBLISH_FRAC update_rate=$UPD_RATE samples/s ($EKKO_RULE; $RATEF)"
-[ "$C8" = $P/builds/popcorn_new/8/deploy-v3 ] && [ ! -e $C8/SUPERSEDED.txt ] \
-  && [ "$(sha256sum < $C8/packet.sha256 | cut -d' ' -f1)" = c67fa82b8649c8de5afcfe65f48657555bef0fcb0e635fc36a751689afead5a4 ] \
-  && (cd $C8 && sha256sum -c --quiet packet.sha256) || { echo "SEQUENCE STOP: C8 is not the verified build-8 deploy-v3 bundle"; exit 2; }
+# Popcorn deploy bundle (v6: build >= 10, swmc_acct per-thread accounting; path and packet hash from the Popcorn
+# agent's verified bundle): POP_BUILD, POP_BUNDLE_SHA (sha256 of C8/packet.sha256). Build-8 bundles are refused.
+POP_BUILD=${POP_BUILD:-10} POP_BUNDLE_SHA=${POP_BUNDLE_SHA:-626f6a0eb265553aaa6efb2d67c185497121e77b8ab0ece2243a461bd4f291c6}
+# default: Popcorn build 10, builds/popcorn_new/10/deploy-v1 (release 6.14.0-famfs-de-stijl+-ds-popcorn-new-10;
+# sha256 of its packet.sha256 recorded 2026-10-16)
+[[ $POP_BUILD =~ ^[0-9]+$ ]] && [ "$POP_BUILD" -ge 10 ] || { echo "SEQUENCE STOP: POP_BUILD must be >= 10 (Fig 2 needs swmc_acct)"; exit 2; }
+[ -d "$C8" ] && [ ! -e $C8/SUPERSEDED.txt ] \
+  && [ "$(sha256sum < $C8/packet.sha256 | cut -d' ' -f1)" = "$POP_BUNDLE_SHA" ] \
+  && (cd $C8 && sha256sum -c --quiet packet.sha256) || { echo "SEQUENCE STOP: C8 is not the verified Popcorn build-$POP_BUILD bundle"; exit 2; }
 [ -d "$E" ] && [ -z "$(ls -A "$E" | grep -v '^sequence')" ] || { echo "SEQUENCE STOP: $E missing or not empty"; exit 2; }
 bash $G lock "$OWNER" || { echo "SEQUENCE STOP: lock"; exit 2; }
 SA="--nodes 2 --row-div 1 --serve-threads 14 --update-threads 4 --load-threads 8 --start-timeout-ms $((XT * 1000 / 2)) --publish-frac $PUBLISH_FRAC
  --verify-rows 1 --proc-sysfs /sys/kernel/swmc/instr --proc-sysfs /sys/kernel/cxl_shm/instr
  --proc-sysfs /sys/kernel/swmc/page_coherence --proc-kthread cxl_recv"
 SA=$(echo $SA)
-LGC=(--opt samples=$D/$UPD_FILE --opt queries=$D/$QRY_FILE --opt wrap=1
-     --opt quantiles=$D/dist_quantile.txt --fixed update=$UPD_RATE --mix query=1 --x-stream query)
 export LOADGEN PROFILE=main RUN_KIND=measurement STATS_OP=10 READY_TIMEOUT=$((XT / 2)) IDLE_WAIT_S=2400  # idle: an overrunning T = 60 s round may take > 10 min (Megalon)
 PS=(K=$K8 GT=$GT8 C=$C8 R=$E/shm-pop INIT_STATE=shared)
 CHOWNED=0
@@ -153,7 +152,7 @@ shuffle() { python3 -c 'import random,sys; v=sys.argv[2:]; random.Random(sys.arg
 confirm_half() { python3 $X/main_util.py half "$1"; }        # 0.5 x confirm mean of an SLO search without a note
 gatechk() { python3 $X/main_util.py gate "$1" "$SLO_MS" "$SLO_PCT"; }  # validity + within the SLO (p95)
 precheck() {
-  local i f files="${VM_PLAIN#/home/comsys/}/bin/recsys-server ${VM_PLAIN#/home/comsys/}/bin/recsys-node.sh ${VM_PLAIN#/home/comsys/}/cfg/cxl_region.yaml ${VM_MEG#/home/comsys/}/bin/recsys-server ${VM_MEG#/home/comsys/}/bin/recsys-node.sh ${VM_MEG#/home/comsys/}/lib/libmegalon-objapi.so ${VM_MEG#/home/comsys/}/lib/libmegalon.so ${VM_MEG#/home/comsys/}/cfg/megalon.yaml ${VM_MEG#/home/comsys/}/cfg/cxl_region.yaml"
+  local i f h files="${VM_PLAIN#/home/comsys/}/bin/recsys-server ${VM_PLAIN#/home/comsys/}/bin/recsys-node.sh ${VM_PLAIN#/home/comsys/}/cfg/cxl_region.yaml ${VM_MEG#/home/comsys/}/bin/recsys-server ${VM_MEG#/home/comsys/}/bin/recsys-node.sh ${VM_MEG#/home/comsys/}/lib/libmegalon-objapi.so ${VM_MEG#/home/comsys/}/lib/libmegalon.so ${VM_MEG#/home/comsys/}/cfg/megalon.yaml ${VM_MEG#/home/comsys/}/cfg/cxl_region.yaml"
   for i in 0 1; do
     $SSH comsys@${IPS[$i]} "EXPECT_K=$K8 MEM_MIN=60 INSTALL_FILES='$files' bash -s" < $X/precheck.sh > "$E/precheck-${IPS[$i]}.out" 2>&1
     grep -q "^PRECHECK PASS" "$E/precheck-${IPS[$i]}.out" || stop "precheck ${IPS[$i]}"
@@ -167,8 +166,10 @@ precheck() {
     done
   done
   (cd "$D" && sha256sum -c --quiet <(grep -E '^[0-9a-f]{64}  ' MANIFEST.txt)) > "$E/inputs-check.out" 2>&1 || stop "inputs differ from $D/MANIFEST.txt"
-  for f in updates-zipf105-s1-16M.smp queries-zipf105-s2-1M.smp dist_quantile.txt; do
-    grep -q "  $f\$" "$D/MANIFEST.txt" || stop "$f not in $D/MANIFEST.txt"
+  for f in "$UPD_FILE" "$QRY_FILE" dist_quantile.txt; do  # the inputs this block uses: listed and sha256-verified
+    h=$(sed -n "s/^\([0-9a-f]\{64\}\)  $f\$/\1/p" "$D/MANIFEST.txt")
+    [ -n "$h" ] || stop "$f not in $D/MANIFEST.txt"
+    [ "$(sha256sum "$D/$f" | cut -d' ' -f1)" = "$h" ] || stop "$D/$f sha256 != MANIFEST"
   done
 }
 measure() {  # session dir, name, loadgen args... -> rc of session.sh measure
@@ -180,7 +181,7 @@ measure() {  # session dir, name, loadgen args... -> rc of session.sh measure
   [ $rc = 5 ] && stop "$(basename "$S")/$n: $(grep -m1 '^STATS MISSING' "$S.$n.out") (session.sh rc 5)"
   return $rc
 }
-pop_setup() {  # P-popcorn-deploy §6a cycle with build 8 (init_state=shared), as pilot-run.sh, once per lifetime
+pop_setup() {  # P-popcorn-deploy §6a cycle with build POP_BUILD (init_state=shared), as pilot-run.sh, once per lifetime
   env "${PS[@]}" bash $C8/p-popcorn-shm.sh precheck || stop "shm precheck"
   local ip m i t
   for ph in load chown; do env "${PS[@]}" bash $C8/p-popcorn-shm.sh $ph || stop "shm $ph"; done
@@ -255,7 +256,7 @@ system() {  # one server lifetime: hw | pop | mg
       "$S/slo-r$r/loadgen/summary.json" "$s slo-r$r" | tee -a "$E/slo-results.txt"
     if [ $s = hw ] && [ $r = 1 ] && [ "$FIXED" = 1 ]; then
       L=$(confirm_half "$S/slo-r1/loadgen/summary.json") || stop "no all-HWcc slo-r1 confirm result for L"
-      echo "L = 0.5 x all-HWcc slo-r1 confirm mean (this block, build 8, T = 60 s) = $L query/s" > "$E/fixed-load-L.txt"
+      echo "L = 0.5 x all-HWcc slo-r1 confirm mean (this block, Popcorn build $POP_BUILD, T = 60 s) = $L query/s" > "$E/fixed-load-L.txt"
     fi
   done
   # 4) fixed load L, 60 s, whole window (no SLO abort); FIXED=0 skips it (user 2026-10-16: the breakdown is taken
@@ -284,8 +285,18 @@ system() {  # one server lifetime: hw | pop | mg
 }
 echo "$(date -Is) block $OWNER start (git $(git -C $P/CXL_SWMC rev-parse --short HEAD)) K8=$K8 RECV_MODE=$RECV_MODE MEG_BUILD=$MB VM_PLAIN=$VM_PLAIN VM_MEG=$VM_MEG D=$D SEED=$SEED ROUNDS=$ROUNDS FIXED=$FIXED XT=$XT"
 precheck
+# update rate for the Ekko operating point (Host compute, after the host-gate lock and the
+# input sha256 check in precheck): samples per T so that one round publishes PUBLISH_FRAC of all rows
+RATEF=$E/sequence-update-rate.txt
+nice -n 19 numactl --cpunodebind=1 --membind=1 "$PLAIN_BUILD/bin/recsys-rate" --samples "$D/$UPD_FILE" --frac $PUBLISH_FRAC \
+  --t-ms $T_MS --windows 20 > "$RATEF" || stop "recsys-rate"
+UPD_RATE=$(sed -n 's/^rate_samples_per_s=//p' "$RATEF")
+awk -v x="$UPD_RATE" 'BEGIN{exit !(x > 0)}' || stop "bad update rate $UPD_RATE"
+echo "EKKO=$EKKO publish_frac=$PUBLISH_FRAC update_rate=$UPD_RATE samples/s ($EKKO_RULE; $RATEF)"
+LGC=(--opt samples=$D/$UPD_FILE --opt queries=$D/$QRY_FILE --opt wrap=1
+     --opt quantiles=$D/dist_quantile.txt --fixed update=$UPD_RATE --mix query=1 --x-stream query)
 if [[ " ${SYSTEMS:-hw pop mg} " != *" hw "* ]]; then
-  { echo "slo_ms=$SLO_MS rule=$SLO_RULE"; echo "imported_file_sha256=$(sha256sum < "$SLO_MS_FROM" | cut -d' ' -f1)"; sed 's/^/imported: /' "$SLO_MS_FROM"; } | tee "$E/slo.txt"
+  echo "slo_ms=$SLO_MS pct=$SLO_PCT rule=$SLO_RULE (fixed; no all-HWcc in this block)" | tee "$E/slo.txt"
   [ -z "${L_FROM:-}" ] || { cp "$L_FROM" "$E/fixed-load-L.txt" && echo "L imported from $L_FROM: $(cat "$E/fixed-load-L.txt")"; }
 fi
 ORDER="hw $(shuffle pop mg)"

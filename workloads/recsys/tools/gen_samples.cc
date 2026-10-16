@@ -3,7 +3,7 @@
 // the rest uniform; deviation D2, synthetic inputs only). Sample format v2 (214 ids); the server applies its row cap.
 // usage: recsys-gen-samples --out FILE --n N [--seed S] [--dist uniform|zipf] [--alpha A (1.05)]
 //   zipf: rank drawn from a bounded power law with exponent alpha, then scattered over the id space by a hash
-//   (hot ids are not low numbers, as in Criteo's hashed ids). dense: log(1 + Exp(mean 2)) per feature.
+//   (hot ids are not low numbers, as in Criteo's hashed ids). dense: log(1 + Exp(mean 2)) per feature (synthetic; MLPerf data is log(x + 3)).
 #include <cmath>
 #include <cstdio>
 #include <cstring>

@@ -2,7 +2,7 @@
 """Convert the MLCommons DLRMv2 preprocessed day 23 (multi-hot, as is) into a recsys v2 samples file (samples.h).
 
 Input (https://inference.mlcommons-storage.org, dlrm_preprocessed/; reports/RECSYS-design.md §1.2):
-  day_23_dense.npy               float32 [N, 13]   (log(1 + x) as in the MLPerf preprocessing)
+  day_23_dense.npy               float32 [N, 13]   (MLPerf/torchrec preprocessing; observed log(x + 3))
   day_23_sparse_multi_hot.npz    members 0.npy .. 25.npy, int32 [N, h_k] with h_k = 3,2,1,2,6,...,1 (MLPerf sizes)
 The npz members are stored uncompressed, so each is memory-mapped at its offset inside the zip (no 152 GB load).
 Output records: 13 dense fp32 + the 214 multi-hot ids in table order (uncapped; the server applies id mod rows).

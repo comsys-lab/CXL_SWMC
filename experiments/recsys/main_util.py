@@ -5,13 +5,15 @@
                                                  the step passed (keeps up, no errors) AND query p99 <= limit (explicit,
                                                  not only loadgen's pass flag) AND it completed >= 1 query.
                                                  Prints "PASS|MISS p99_ms=... ..." (exit 0 either way).
-  main_util.py gate <steps.jsonl> [slo ms [pct]] the lowest-load window (v2; v6: pct 95 -> within_slo by p95): exactly one measured "fixed" step; VALID when
+  main_util.py gate <steps.jsonl> [slo ms [pct]] the lowest-load window (pct default 95 = DLRM p95 SLO, MOT1 v6;
+                                                 99 = the v5 p99 rule): exactly one measured "fixed" step; VALID when
                                                  the step passed (keeps up, no errors/timeouts; no SLO is set) and >= 1
                                                  query completed, no non-finite latency. Prints "VALID|INVALID" with the
-                                                 query count, p50/p90/p99/max (p99 of ~60 queries = the max), and whether
+                                                 query count, p50/p90/p95/p99/max (the tail of ~60 queries is the max), and whether
                                                  the updater wrote a publication round inside the window (node-0
                                                  rows_written delta from the loadgen stats snapshots) [+ within_slo].
-  main_util.py slo <steps.jsonl> <factor> [pct] SLO ms = factor x the query p99 (or p<pct>) of that window (rounded to 0.001 ms);
+  main_util.py slo <steps.jsonl> <factor> [pct] SLO ms = factor x the query p<pct> (default 95) of that window
+                                                 (Host tests only; the v6 main block uses the fixed 100 ms) (rounded to 0.001 ms);
                                                  exit 1 unless the window is VALID.
   main_util.py half <summary.json>               0.5 x the SLO search's confirm mean (L); exit 1 if the search has a
                                                  note or no confirm result (a noted search is never used for L).
@@ -55,7 +57,7 @@ def _kv(path):
     return d
 
 
-def gate_window(steps, pct=99):
+def gate_window(steps, pct=95):
     """(valid, p99 or None, text). Never raises on bad input: unparsable lines, inf/NaN latencies (timeouts) and
     missing keys give INVALID with the reason."""
     try:
@@ -108,13 +110,13 @@ def gate_window(steps, pct=99):
     return True, (lat['p99_ms'] if pct == 99 else p95), txt
 
 
-def gate(steps, limit=None, pct=99):
+def gate(steps, limit=None, pct=95):
     ok, p, txt = gate_window(steps, pct)
     extra = '' if limit is None or p is None else f' slo_ms={limit} slo_pct={pct:g} within_slo={p <= limit}'
     print(('VALID ' if ok else 'INVALID ') + txt + extra)
 
 
-def slo(steps, factor, pct=99):
+def slo(steps, factor, pct=95):
     ok, p, txt = gate_window(steps, pct)
     if not ok or not p or p <= 0:
         sys.exit('INVALID lowest-load window: ' + txt)
@@ -136,9 +138,9 @@ if __name__ == '__main__':
         gate60(sys.argv[2], float(sys.argv[3]))
     elif sys.argv[1:2] == ['gate'] and len(sys.argv) in (3, 4, 5):
         gate(sys.argv[2], float(sys.argv[3]) if len(sys.argv) >= 4 else None,
-             float(sys.argv[4]) if len(sys.argv) == 5 else 99)
+             float(sys.argv[4]) if len(sys.argv) == 5 else 95)
     elif len(sys.argv) in (4, 5) and sys.argv[1] == 'slo':
-        slo(sys.argv[2], float(sys.argv[3]), float(sys.argv[4]) if len(sys.argv) == 5 else 99)
+        slo(sys.argv[2], float(sys.argv[3]), float(sys.argv[4]) if len(sys.argv) == 5 else 95)
     elif len(sys.argv) == 3 and sys.argv[1] == 'half':
         half(sys.argv[2])
     else:
