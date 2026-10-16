@@ -48,9 +48,7 @@ def figure(out, tag, S, xscale, xlabel, slo_ms, xticks, ylim, yticks, comps_of, 
         rows += [[NAMES[s], r["step"], r["phase"], r["offered"], r["achieved"], r["p99_ms"], round(y, 3), r["pass"]]
                  for r, y in zip(v, ys)]
     slo = slo_ms / base
-    if slo > ylim[1] * 0.85:  # keep the SLO line inside the plot (user: y max about 4 where the SLO allows it)
-        top = 2 * int(slo * 1.25 / 2 + 1)
-        ylim, yticks = (0, top), list(range(0, top + 1, 2 if top <= 12 else 4))
+    ylim, yticks = ps.nice_ylim(slo)
     ps.curve(os.path.join(out, f"{tag}-curve.png"), series, slo, xlabel, "Normalized\np99 latency", ylim,
              xticks, yticks)
     write(os.path.join(out, f"{tag}-curve.csv"), ["system", "step", "phase", "offered", "achieved", "p99_ms",

@@ -23,6 +23,7 @@ def curve(path, series, slo, xlabel, ylabel, ylim, xticks, yticks):
     ax.yaxis.grid(True, color="#d9d9d9", linewidth=1.0)
     ax.set_axisbelow(True)
     for name, xs, ys in series:
+        xs, ys = clean_curve(xs, ys, ylim[1])
         ax.plot(xs, ys, color=SERIES[name], linewidth=2.5, marker="o", markersize=6, label=name, clip_on=True)
     ax.axhline(slo, color="black", linestyle=(0, (4, 2)), linewidth=2.5)
     ax.text(xticks[-1] - (xticks[-1] - xticks[0]) * 0.03, slo + (ylim[1] - ylim[0]) * 0.04, "SLO", ha="right",
@@ -95,3 +96,41 @@ def compose(raw, hw="HWcc"):
         app = r["app"] - other
         out[k] = [x / base_tot for x in (r.get("check", 0.0), r.get("msg", 0.0), r.get("local", 0.0), other, app)]
     return out
+
+
+def nice_ylim(slo):
+    """y max: the smallest 'nice' value >= 1.4 x the normalized SLO (SLO line visible with headroom); 4-5 ticks."""
+    for top, step in ((2, 0.5), (4, 1), (5, 1), (8, 2), (10, 2), (15, 5), (20, 5), (40, 10), (80, 20)):
+        if top >= 1.4 * slo:
+            return (0, top), [round(k * step, 2) for k in range(int(top / step) + 1)]
+    return (0, slo * 1.5), None
+
+
+def clean_curve(xs, ys, top):
+    """Display cleanup (user 2026-10-16: drop jagged points). Sorted by x: (1) points within 3% in x of each other
+    (repeated nearby rates: bisect/fill/overload) are merged into their mean; (2) an interior point that is a dip
+    (< 0.75 x both neighbours) or a spike (> 1.33 x both neighbours) is dropped; (3) after the first point above the
+    y range nothing more is drawn. Returns (xs, ys); the CSV keeps every measured step."""
+    pts = sorted(zip(xs, ys))
+    groups = []
+    for x, y in pts:
+        if groups and x <= groups[-1][0][0] * 1.03:
+            groups[-1].append((x, y))
+        else:
+            groups.append([(x, y)])
+    pts = [(sum(p[0] for p in g) / len(g), sum(p[1] for p in g) / len(g)) for g in groups]
+    changed = True
+    while changed and len(pts) > 2:
+        changed = False
+        for i in range(1, len(pts) - 1):
+            a, b, c = pts[i - 1][1], pts[i][1], pts[i + 1][1]
+            if b < 0.75 * min(a, c) or b > 1.33 * max(a, c):
+                del pts[i]
+                changed = True
+                break
+    out = []
+    for x, y in pts:
+        out.append((x, y))
+        if y > top:
+            break
+    return [p[0] for p in out], [p[1] for p in out]

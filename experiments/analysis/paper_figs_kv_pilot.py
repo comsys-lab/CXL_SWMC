@@ -39,7 +39,7 @@ def main():
                  for r, y in zip(S[{"HWcc": "all-HWcc"}.get(name, name)], ys)]
     slo = 1.0 / base
     ps.curve(os.path.join(a.out, "kv-pilot-curve.png"), series, slo, "Requests per second (K)",
-             "Normalized\np99 latency", (0, 4), list(range(0, 161, 20)), [0, 1, 2, 3, 4])
+             "Normalized\np99 latency", *(lambda l: (l[0], list(range(0, 161, 20)), l[1]))(ps.nice_ylim(slo)))
     with open(os.path.join(a.out, "kv-pilot-curve.csv"), "w", newline="") as f:
         w = csv.writer(f)
         w.writerow([f"# p99 normalized to all-HWcc p99 at its lowest offered rate ({hw0['offered']} req/s): {base} ms; SLO 1 ms -> {slo:.3f}"])
