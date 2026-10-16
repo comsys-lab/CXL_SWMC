@@ -3,8 +3,8 @@
 flavor of one source commit: median per case and field over every node log found, ratio b/a, and PASS if every
 ratio lies within [1/F, F] (F = --factor, default 2). Uncontended sections only (object-test phases 7/8).
 
-usage: anchor-compare.py <label_a>=<dir with node*.log files (searched recursively)> <label_b>=<dir> [--factor F]
-       [--csv out.csv]
+usage: anchor-compare.py <label_a>=<dir[,dir...] with node*.log files (searched recursively)> <label_b>=<dir[,dir...]>
+       [--factor F] [--csv out.csv]   (pass only runs with identical configs and arguments for both labels)
 """
 import argparse, csv, glob, os, re, statistics, sys
 
@@ -15,9 +15,10 @@ READ = [("read_lookup", "rl"), ("read_nr", "rn"), ("rseq", "rq")]
 WRITE = [("write_lookup", "wl"), ("write_nr", "wn"), ("wseq", "wq"), ("wseq_end", "we")]
 
 
-def load(d):
+def load(dirs):
     out = {}
-    for f in glob.glob(os.path.join(d, "**", "node*.log"), recursive=True):
+    files = [f for d in dirs.split(",") for f in glob.glob(os.path.join(d, "**", "node*.log"), recursive=True)]
+    for f in files:
         for line in open(f, errors="replace"):
             m = LINE.search(line)
             if not m:

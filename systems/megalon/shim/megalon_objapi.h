@@ -59,8 +59,9 @@ struct CohSnap {
 //   write_lookup_ns, write_nr_ns                are EXCLUDED from wstart_ns;
 //   wseq_ns                                     is INSIDE wstart_ns;  wseq_end_ns is INSIDE wflush_ns.
 // Fields:
-//   read_lookup_ns_sampled  index hash lookup (NR dispatch) of the first GetAnchor of a section outside (A)
-//   read_nr_ns_sampled      the rest of that GetAnchor: NR sync to the log tail, replay, combining, read lock, FFI;
+//   read_lookup_ns_sampled  index hash lookup (NR dispatch) of the GetAnchors excluded from check: object sections the
+//                           first attempt's anchor, KV Get the anchor of every attempt outside (A) incl. (B)/(C) retries
+//   read_nr_ns_sampled      the rest of those GetAnchors: NR sync to the log tail, replay, combining, read lock, FFI;
 //                           minus Megalon-only flushes inside it and minus (D) waits
 //   rseq_ns_sampled         seqlock version reads whose time is in check: RSeqBegin in read_seq_start (minus its (D)
 //                           spin) of attempts outside (A), RSeqRetry in read_seq_end of accepted sections
