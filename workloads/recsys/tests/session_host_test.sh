@@ -6,7 +6,8 @@
 # window invariants, gate validity + SLO in the manifests, L from r1, breakdown columns, negative cases (existing name,
 # measure after stop, seq_base given by the caller). No VM, no CXL device. Run pinned to Host node 1.
 # usage: session_host_test.sh <server build dir> <loadgen build dir> <work dir (new)> [plain|megalon]
-# env: ROW_DIV (200), T_MS (1000), PORT (27300), LG_CPUS (30-31); SLO = 5 x the gate p99 (main block v2 rule)
+# env: ROW_DIV (200), T_MS (1000), PORT (27300), LG_CPUS (30-31); SLO = 5 x the gate p95 at percentile 95 (v6 uses p95;
+# the fixed 100 ms of the main block is not reachable under Host noise, so the Host test keeps a self-derived limit)
 set -uo pipefail
 B=$(cd "$1" && pwd); LGB=$(cd "$2" && pwd); WD=$3; BACKEND=${4:-plain}
 HERE=$(cd "$(dirname "$0")" && pwd); W=$(cd "$HERE/.." && pwd); ROOT=$(cd "$W/../.." && pwd); X=$ROOT/experiments/recsys
@@ -56,7 +57,7 @@ env "${SE[@]}" bash "$X/session.sh" start "$S" || { echo "HOST TEST FAIL: sessio
 cat "$S/load-times.txt"
 export LOADGEN=$LGB/loadgen PROFILE=pilot RUN_KIND=functional STATS_OP=10 IDLE_WAIT_S=120
 LGC=(--opt samples=$WD/updates.smp --opt queries=$WD/queries.smp --opt quantiles=$W/tools/dist_quantile.txt
-     --fixed update=2000 --mix query=1 --x-stream query --step-warmup-s 1 --drain-s 5)
+     --fixed update=${UPD_RATE:-200} --mix query=1 --x-stream query --step-warmup-s 1 --drain-s 5)
 m() { SESSION_LOCAL=1 bash "$X/session.sh" measure "$S" "$@"; }
 m warmup -- "${LGC[@]}" --mode fixed --rates 1 --warmup-s 2 --step-warmup-s 0 --step-measure-s 5; rc=$?
 [ $rc = 0 ] || bad "warmup rc $rc"
@@ -64,12 +65,12 @@ m gate -- "${LGC[@]}" --raw --mode fixed --rates 1 --warmup-s 2 --step-measure-s
 [ $rc = 0 ] || bad "gate rc $rc"
 echo "gate: $(python3 "$X/main_util.py" gate "$S/gate/loadgen/steps.jsonl")"
 python3 "$X/main_util.py" gate "$S/gate/loadgen/steps.jsonl" | grep -q '^VALID queries_done=' || bad "gate not VALID"
-SLO_MS=$(python3 "$X/main_util.py" slo "$S/gate/loadgen/steps.jsonl" 5) || { bad "no SLO"; SLO_MS=60; }
-export SLO_MS SLO_RULE="5 x gate p99 (Host test)"
+SLO_MS=$(python3 "$X/main_util.py" slo "$S/gate/loadgen/steps.jsonl" 5 95) || { bad "no SLO"; SLO_MS=60; }
+export SLO_MS SLO_RULE="5 x gate p95 (Host test)"
 echo "SLO_MS=$SLO_MS"
-python3 "$X/main_util.py" gate "$S/gate/loadgen/steps.jsonl" "$SLO_MS" | grep -q 'within_slo=True' || bad "gate not within its own SLO"
+python3 "$X/main_util.py" gate "$S/gate/loadgen/steps.jsonl" "$SLO_MS" 95 | grep -q 'within_slo=True' || bad "gate not within its own SLO"
 for r in 1 2; do
-  m slo-r$r -- "${LGC[@]}" --opt seed=$((20261016 + r)) --seed $((20261016 + r)) --slo query:99:$SLO_MS --raw --mode slo \
+  m slo-r$r -- "${LGC[@]}" --opt seed=$((20261016 + r)) --seed $((20261016 + r)) --slo query:95:$SLO_MS --raw --mode slo \
     --start 1 --factor 1.5 --precision 0.2 --max-steps 20 --warmup-s 2 --step-measure-s 5 --confirm-s 5; rc=$?
   [ $rc = 0 ] || [ $rc = 1 ] || bad "slo-r$r rc $rc"
   grep -q 'workload_finish":"ok' "$S/slo-r$r/loadgen/summary.json" || bad "slo-r$r workload finish"

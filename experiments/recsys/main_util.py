@@ -11,7 +11,7 @@
                                                  query count, p50/p90/p99/max (p99 of ~60 queries = the max), and whether
                                                  the updater wrote a publication round inside the window (node-0
                                                  rows_written delta from the loadgen stats snapshots) [+ within_slo].
-  main_util.py slo <steps.jsonl> <factor>       SLO ms = factor x the query p99 of that window (rounded to 0.001 ms);
+  main_util.py slo <steps.jsonl> <factor> [pct] SLO ms = factor x the query p99 (or p<pct>) of that window (rounded to 0.001 ms);
                                                  exit 1 unless the window is VALID.
   main_util.py half <summary.json>               0.5 x the SLO search's confirm mean (L); exit 1 if the search has a
                                                  note or no confirm result (a noted search is never used for L).
@@ -114,8 +114,8 @@ def gate(steps, limit=None, pct=99):
     print(('VALID ' if ok else 'INVALID ') + txt + extra)
 
 
-def slo(steps, factor):
-    ok, p, txt = gate_window(steps)
+def slo(steps, factor, pct=99):
+    ok, p, txt = gate_window(steps, pct)
     if not ok or not p or p <= 0:
         sys.exit('INVALID lowest-load window: ' + txt)
     print(round(factor * p, 3))
@@ -137,8 +137,8 @@ if __name__ == '__main__':
     elif sys.argv[1:2] == ['gate'] and len(sys.argv) in (3, 4, 5):
         gate(sys.argv[2], float(sys.argv[3]) if len(sys.argv) >= 4 else None,
              float(sys.argv[4]) if len(sys.argv) == 5 else 99)
-    elif len(sys.argv) == 4 and sys.argv[1] == 'slo':
-        slo(sys.argv[2], float(sys.argv[3]))
+    elif len(sys.argv) in (4, 5) and sys.argv[1] == 'slo':
+        slo(sys.argv[2], float(sys.argv[3]), float(sys.argv[4]) if len(sys.argv) == 5 else 99)
     elif len(sys.argv) == 3 and sys.argv[1] == 'half':
         half(sys.argv[2])
     else:
