@@ -53,11 +53,12 @@ def coh_src(path):
 
 
 def mg_check_window(b, e, o):
-    """Megalon section-check estimate over the window: d(check_ns_sampled) x d(read_sections) / d(check_sampled).
-    DLRM all-HWcc = plain backend, so the index lookup inside the checks stays in C (coordinator 2026-10-16)."""
+    """Megalon section-check estimate over the window: d(check_ns_sampled + anchor.read_lookup_ns_sampled +
+    anchor.read_nr_ns_sampled) x d(read_sections) / d(check_sampled). DLRM all-HWcc = plain backend, so every Megalon
+    call is C (M2 §16 "all-HWcc without Megalon"; anchor keys 0 before Megalon 75)."""
     p = f'op.{o}.mg.'
     ds = delta(b, e, p + 'check_sampled')
-    ns = delta(b, e, p + 'check_ns_sampled')
+    ns = sum(delta(b, e, p + k) for k in ('check_ns_sampled', 'anchor.read_lookup_ns_sampled', 'anchor.read_nr_ns_sampled'))
     return ns * delta(b, e, p + 'read_sections') / ds if ds else 0.0
 
 

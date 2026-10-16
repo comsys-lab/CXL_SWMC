@@ -106,10 +106,12 @@ each system's API and measures its coherence actions; it cannot prove a coherenc
 - C_o = delta of the thread's coherence accounting over the same intervals: Popcorn swmc_acct (fault_ns[3] + ipi_ns,
   measured; registered per serving/update thread, zeros before build 9; build 10's faults without an MSI transition,
   reserved[0..1], are exported as `op.<o>.pc.nontrans_{ns,cnt}` and are NOT part of C); Megalon shim v2 CohSnap: section checks by the
-  ratio estimator check_ns_sampled x read_sections / check_sampled [sampled x N]. DLRM's all-HWcc is the plain
-  backend, so every Megalon call counts as C, including the index lookup (CohSnap.reserved[7] from Megalon 74,
-  exported raw as `op.<o>.mg.lookup_ns_sampled`, not subtracted) and, from Megalon 75 (shim v3 thread_anchor), the
-  NR anchor parts (to be added). No separate validation copy: the row copy inside the section is the application's
+  ratio estimator [sampled x N]. DLRM's all-HWcc is the plain backend, so every Megalon call counts as C (M2 §16,
+  "all-HWcc without Megalon"): C_read = (check_ns_sampled + anchor.read_lookup_ns_sampled + anchor.read_nr_ns_sampled)
+  x read_sections / check_sampled; C_write = wstart + anchor.write_lookup + anchor.write_nr + wflush; plus stale,
+  concur, meta, spin. Nothing is subtracted (rseq/wseq/wseq_end are inside check/wstart/wflush). The AnchorSnap
+  fields (shim v3, Megalon >= 75; zeros with a v2 shim) are exported as `op.<o>.mg.anchor.<field>`, CohSnap.reserved[7]
+  as `op.<o>.mg.lookup_ns_sampled` (raw). The server accepts shim API v2..v3. No separate validation copy: the row copy inside the section is the application's
   own copy, as in all-HWcc + stale, concur, meta, spin, wstart,
   wflush ns [measured] (switch_rw and reclaim are inside wstart, exported raw only).
 - Stats keys: `op.<query|row_update>.{n,t_ns,c_ns,pc.c_ns,mg.check_est_ns}` and every raw field `op.<o>.pc.*`,
@@ -127,7 +129,7 @@ each system's API and measures its coherence actions; it cannot prove a coherenc
 - Shim: the shared object-API shim `systems/megalon/shim` (`megalon_objapi.h`, `megalon_objapi.cc`, `build-shim.sh`
   -> `lib/libmegalon-objapi.so`, symbol `megalon_object_api`), generalised from vectordb's copy (which vectordb keeps);
   dlopen only for `--backend megalon`.
-- v6: built on Megalon 73 (CohSnap, clamped TSC intervals; >= 74 adds lookup_ns_sampled); `build-megalon.sh <out> builds/megalon/73`. The legacy
+- v6: built on Megalon 75 (CohSnap + AnchorSnap, shim API v3); `build-megalon.sh <out> builds/megalon/75`. The legacy
   app-level timers (MegThr, clock_gettime 1 in N) are off by default (`--megalon-time-sample 0`); breakdown.py /
   check_breakdown.py use the CohSnap columns and add the legacy split only when N > 0.
 - Stop: SIGTERM while waiting for the peer at start-up exits ("stopped (signal) ..."); a wait inside

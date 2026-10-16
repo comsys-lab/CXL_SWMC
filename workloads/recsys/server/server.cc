@@ -315,7 +315,7 @@ class Server {
     return o.str();
   }
   void coh_init() {  // on the worker thread itself, after the backend registered it
-    tcoh_.init(be_->coh_fn());
+    tcoh_.init(be_->coh_fn(), be_->anchor_fn());
     if (tcoh_.pc) st_.coh_pc_threads++;
     if (tcoh_.mg) st_.coh_mg_threads++;
   }

@@ -11,7 +11,7 @@
 # env (required): C8 (Popcorn deploy bundle dir, = builds/popcorn_new/10/deploy-v1), K8, GT8 (names kept from v5),
 #   RECV_MODE, optional POP_BUILD (10, >= 10), POP_BUNDLE_SHA (build-10 deploy-v1 packet hash), D (inputs dir with MANIFEST.txt),
 #   VM_PLAIN (guest dir: build-3 server, all-HWcc + page MSI), VM_MEG (guest dir: Megalon build + recsys-2vm.yaml),
-#   MEG_BUILD (recsys-megalon build on MEGALON_BASE, default builds/megalon/73), PLAIN_BUILD (v6 recsys build dir), EKKO
+#   MEG_BUILD (recsys-megalon build on MEGALON_BASE, default builds/megalon/75), PLAIN_BUILD (v6 recsys build dir), EKKO
 #   (avg | peak), LOADGEN; optional SEED (20261016), UPD_FILE / QRY_FILE (names in D; default the day-23 slices of
 #   builds/recsys-inputs/1),
 #   ROUNDS (3), FIXED (1; 0 = no fixed-load window), XT (server lifetime bound, s, default 28800),
@@ -43,7 +43,7 @@ P=/home/comsys/sungsu/destijl-control X=$P/CXL_SWMC/experiments/recsys G=$P/CXL_
 : "${C8:?}" "${K8:?}" "${GT8:?}" "${RECV_MODE:?}" "${D:?}" "${VM_PLAIN:?}" "${VM_MEG:?}" "${MEG_BUILD:?}" "${LOADGEN:?}"
 : "${PLAIN_BUILD:?}" "${EKKO:?}"
 MB=$MEG_BUILD SEED=${SEED:-20261016} ROUNDS=${ROUNDS:-3} FIXED=${FIXED:-1} XT=${XT:-28800}
-MEGALON_BASE=${MEGALON_BASE:-$P/builds/megalon/73}
+MEGALON_BASE=${MEGALON_BASE:-$P/builds/megalon/75}
 UPD_FILE=${UPD_FILE:-updates-day23-0-2M.smp} QRY_FILE=${QRY_FILE:-queries-day23-89137318-1M.smp}
 T_MS=60000 SLO_PCT=95 SLO_MS=100
 case $EKKO in

@@ -49,6 +49,7 @@ class PlainBackend {
   void thread_init(int, int = 0) const {}
   void set_time_sample(uint32_t) {}
   void (*coh_fn() const)(mshim::CohSnap *) { return nullptr; }  // no user-level coherence (Popcorn: swmc_acct)
+  void (*anchor_fn() const)(mshim::AnchorSnap *) { return nullptr; }
   template <class Par> bool create_objects(std::string *, Par &&) const { return true; }
   bool check_objects(std::string *, uint64_t) const { return true; }
   template <class F> auto read_slot(uint32_t k, uint64_t s, F f) const { return f(static_cast<const uint8_t *>(slot(k, s))); }
@@ -77,7 +78,10 @@ inline const mshim::Api *megalon_load(const std::string &path, std::string *err)
   auto fn = reinterpret_cast<megalon_object_api_fn>(dlsym(h, "megalon_object_api"));
   if (!fn) return *err = path + ": no megalon_object_api", nullptr;
   const mshim::Api *api = fn();
-  if (!api || api->version != mshim::kApiVersion) return *err = path + ": API version mismatch", nullptr;
+  // v2 (thread_coh) is the minimum for v6 Fig 2; v3 adds thread_anchor (read only when version >= 3)
+  if (!api || api->version < 2 || api->version > mshim::kApiVersion)
+    return *err = path + ": shim API version " + std::to_string(api ? api->version : 0) + " (need 2.." +
+                  std::to_string(mshim::kApiVersion) + ")", nullptr;
   return api;
 }
 
@@ -145,7 +149,8 @@ class MegalonBackend {
     me_ = thr_.back().get();
   }
   void set_time_sample(uint32_t n) { sample_ = n; }
-  void (*coh_fn() const)(mshim::CohSnap *) { return api_->thread_coh; }  // shim v2 CohSnap (nullptr: v1 shim)
+  void (*coh_fn() const)(mshim::CohSnap *) { return api_->thread_coh; }  // shim v2 CohSnap
+  void (*anchor_fn() const)(mshim::AnchorSnap *) { return api_->version >= 3 ? api_->thread_anchor : nullptr; }
 
   // Node 0 at prepare: one object per slot (all slots, empty ones too: a probe that reaches an empty slot reads it).
   // par(f) runs f(i) on every thread of the server's registered prep pool (NR registrations are never freed, so
