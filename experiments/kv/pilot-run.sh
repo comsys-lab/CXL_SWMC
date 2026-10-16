@@ -134,4 +134,18 @@ PY
   tr '\n' ' ' < $R/fix-result.txt; echo
   grep -q "^aborted=true" $R/fix-result.txt && { echo "PILOTRUN $NAME NOTE fixed window aborted: $(sed -n 's/^reason=//p' $R/fix-result.txt)"; exit 0; }
 fi
+if [ "$KIND" = ladder ]; then  # per-step table; an aborted step is a NOTE (fixed mode does not fail on it)
+  python3 - $R/loadgen/steps.jsonl > $R/ladder-result.txt <<'PY' || stop "ladder result"
+import json, sys
+st = [json.loads(l) for l in open(sys.argv[1]) if l.strip()]
+st = [s for s in st if s["phase"] == "fixed"]
+print("step offered_x achieved p50_ms p90_ms p99_ms max_ms done aborted reason")
+for s in st:
+    m = s["streams"]["mixed"]
+    print(s["step"], s["offered_x"], m["achieved"], m["p50_ms"], m.get("p90_ms"), m["p99_ms"], m["max_ms"], m.get("done"),
+          str(s["aborted"]).lower(), (s["reason"] or "-").replace(" ", "_"))
+PY
+  cat $R/ladder-result.txt
+  awk 'NR>1 && $9=="true"' $R/ladder-result.txt | grep -q . && { echo "PILOTRUN $NAME NOTE ladder step aborted"; exit 0; }
+fi
 echo "PILOTRUN $NAME OK"
