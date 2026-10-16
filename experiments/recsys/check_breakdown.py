@@ -18,8 +18,9 @@ COMMON = ['serve_task_wall_ms_per_query', 'serve_coherence_ms_per_query', 'serve
           'upd_samples', 'upd_rows_written']
 COLS = {
     'hwcc': [],
-    'msi': ['serve_fetch_wait_ms_per_query', 'serve_read_local_wait_ms_per_query', 'serve_read_other_ms_per_query',
-            'serve_write_fault_ms_per_query', 'node1_invalidate_handling_ms_per_query', 'h3_coherence_ms_per_query',
+    # build >= 12: always-on keys only (read_fault_ns / write_fault_ns / local waits are instr/detail only)
+    'msi': ['serve_read_msg_wait_ms_per_query', 'serve_is_fault_ms_per_query', 'serve_sm_fault_ms_per_query',
+            'serve_wpu_fault_ms_per_query', 'node1_invalidate_handling_ms_per_query', 'h3_coherence_ms_per_query',
             'node1_tlb_irqs_per_query'],
     # v6: CohSnap-based Fig 2 columns (legacy app-timer columns only when --megalon-time-sample > 0)
     'megalon': ['fig2_query_T_ms[measured]', 'fig2_query_C_ms[derived]', 'fig2_query_C_check_ms[sampledxN]',
@@ -28,9 +29,9 @@ COLS = {
 MEGALON_LEGACY = ['serve_section_checks_ms_per_query', 'serve_flushes_ms_per_query', 'serve_reexec_ms_per_query']
 RAW = {  # keys that must exist in the serving node's (t1) end snapshot
     'hwcc': ['lookup_ns', 'mlp_ns', 'queries', 'thr.rs-serve.n'],
-    'msi': ['lookup_ns', 'mlp_ns', 'queries', 'thr.rs-serve.n', 'thr.rs-serve.swmc.read_fault_ns',
-            'thr.rs-serve.swmc.read_msg_wait_ns', 'thr.rs-serve.swmc.read_local_wait_ns',
-            'thr.rs-serve.swmc.write_fault_ns', 'sys.swmc.instr.serve.unmap_ns', 'sys.swmc.instr.serve.mkclean_ns'],
+    'msi': ['lookup_ns', 'mlp_ns', 'queries', 'thr.rs-serve.n', 'op.query.n', 'op.query.c_ns', 'op.query.pc.fault_ns.is',
+            'thr.rs-serve.swmc.read_msg_wait_ns', 'thr.rs-serve.swmc.is_fault_ns', 'thr.rs-serve.swmc.sm_fault_ns',
+            'thr.rs-serve.swmc.wpu_fault_ns', 'sys.swmc.instr.serve.unmap_ns', 'sys.swmc.instr.serve.mkclean_ns'],
     'megalon': ['lookup_ns', 'mlp_ns', 'queries', 'thr.rs-serve.n', 'megalon_time.serve.read_sections', 'op.query.n',
                 'op.query.t_ns', 'op.query.c_ns', 'op.query.mg.read_sections', 'op.query.mg.check_sampled',
                 'thr.nr-log-sync.run_ns'],

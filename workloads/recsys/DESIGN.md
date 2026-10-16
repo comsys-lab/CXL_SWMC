@@ -104,7 +104,8 @@ each system's API and measures its coherence actions; it cannot prove a coherenc
   start (slot resolve, writes under the stripes) to published_seq raised (rows visible); no per-row reply exists
   (samples are acknowledged on acceptance, outside T).
 - C_o = delta of the thread's coherence accounting over the same intervals: Popcorn swmc_acct (fault_ns[3] + ipi_ns,
-  measured; registered per serving/update thread, zeros before build 9; build 10's faults without an MSI transition,
+  measured; registered per serving/update thread, zeros before build 9; read with swmc_acct_snapshot(), which uses
+  the build-12 update sequence in reserved[2] and is a plain copy before build 12; build 10's faults without an MSI transition,
   reserved[0..1], are exported as `op.<o>.pc.nontrans_{ns,cnt}` and are NOT part of C); Megalon shim v2 CohSnap: section checks by the
   ratio estimator [sampled x N]. DLRM's all-HWcc is the plain backend, so every Megalon call counts as C (M2 §16,
   "all-HWcc without Megalon"): C_read = (check_ns_sampled + anchor.read_lookup_ns_sampled + anchor.read_nr_ns_sampled)

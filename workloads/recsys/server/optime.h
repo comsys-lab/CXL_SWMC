@@ -86,10 +86,11 @@ struct ThreadCoh {
     mg = megalon_thread_coh;
   }
   void read(uint64_t *v) const {
-    const volatile swmc_acct *a = &acct;
-    for (int i = 0; i < 3; i++) v[i] = a->fault_ns[i], v[3 + i] = a->fault_cnt[i];
-    v[6] = a->ipi_ns, v[7] = a->ipi_cnt;
-    v[8] = a->reserved[0], v[9] = a->reserved[1];  // build 10: nontrans_ns, nontrans_cnt (0 before)
+    swmc_acct c;
+    swmc_acct_snapshot(&acct, &c);  // consistent copy (build 12 update sequence in reserved[2]; plain copy before)
+    for (int i = 0; i < 3; i++) v[i] = c.fault_ns[i], v[3 + i] = c.fault_cnt[i];
+    v[6] = c.ipi_ns, v[7] = c.ipi_cnt;
+    v[8] = c.reserved[0], v[9] = c.reserved[1];  // build 10: nontrans_ns, nontrans_cnt (0 before)
     if (mg) {
       mshim::CohSnap s{};
       mg(&s);

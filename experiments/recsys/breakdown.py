@@ -8,8 +8,10 @@ cxl::proc::text). Every value is a window delta (end - begin).
 The formula is selected by the run's system label, never by which keys exist (build 8 exposes /proc/<tid>/swmc, all
 zeros, even without cxl_shm, so key presence says nothing about the system):
   all-HWcc   coherence = 0 by definition
-  Popcorn-*  serving threads (rs-serve): FETCH wait = read_msg_wait_ns; read local wait = read_local_wait_ns;
-             read other = read_fault_ns - read_msg_wait_ns - read_local_wait_ns; write faults = write_fault_ns;
+  Popcorn-*  serving coherence = swmc_acct per-op C of the query op (op.query.c_ns window delta: transition faults
+             + coherence IPIs, always on). Diagnostics from always-on per-thread keys (build 12: read_fault_ns /
+             write_fault_ns / local waits are instr/detail only and read 0, so they are not used): FETCH wait =
+             read_msg_wait_ns, transition-fault time is_/sm_/wpu_fault_ns, nontrans_fault_ns;
              node-wide on the serving node (receive context, not serving threads): INVALIDATE handling =
              sys.swmc.instr.serve.unmap_ns + mkclean_ns, TLB IPIs = irq.TLB, receive thread CPU = kthr.cxl_recv*.cpu_ticks
   Megalon    v6 default (legacy app timers off, megalon_time.sample=0): serving coherence = CohSnap op.query.c_ns
@@ -111,18 +113,19 @@ def main():
         coh, node_inval = {}, 0
         if kind == 'msi':
             p = 'thr.rs-serve.swmc.'
-            rf, rw, rl = (delta(b1, e1, p + k) for k in ('read_fault_ns', 'read_msg_wait_ns', 'read_local_wait_ns'))
-            coh = {'fetch_wait': rw, 'read_local_wait': rl, 'read_other': rf - rw - rl,
-                   'write_fault': delta(b1, e1, p + 'write_fault_ns')}
-            r['serve_read_faults'] = delta(b1, e1, p + 'read_faults')
+            coh = {'swmc_acct': op_c_window(b1, e1, 'query')}  # always-on per-op accounting (optime.h)
+            per_qd = (lambda ns: round(ns / q / 1e6, 4)) if q else (lambda ns: '')
+            for k in ('read_msg_wait_ns', 'is_fault_ns', 'sm_fault_ns', 'wpu_fault_ns', 'nontrans_fault_ns'):
+                r[f'serve_{k[:-3]}_ms_per_query'] = per_qd(delta(b1, e1, p + k))
+            r['serve_is_faults'] = delta(b1, e1, p + 'is_faults')
             r['serve_read_transactions'] = delta(b1, e1, p + 'read_transactions')
             node_inval = delta(b1, e1, 'sys.swmc.instr.serve.unmap_ns') + delta(b1, e1, 'sys.swmc.instr.serve.mkclean_ns')
             r['node1_tlb_irqs_per_query'] = round(delta(b1, e1, 'irq.TLB') / q, 2) if q else ''
             r['node1_recv_cpu_ticks'] = sum_prefix(b1, e1, 'kthr.cxl_recv', '.cpu_ticks')
             u = 'thr.rs-update.swmc.'
-            r['upd_write_fault_ms'] = round(delta(b0, e0, u + 'write_fault_ns') / 1e6, 3)
-            r['upd_write_msg_wait_ms'] = round(delta(b0, e0, u + 'write_msg_wait_ns') / 1e6, 3)
-            r['upd_read_fault_ms'] = round(delta(b0, e0, u + 'read_fault_ns') / 1e6, 3)
+            r['upd_sm_wpu_fault_ms'] = round((delta(b0, e0, u + 'sm_fault_ns') + delta(b0, e0, u + 'wpu_fault_ns')) / 1e6, 3)
+            r['upd_is_fault_ms'] = round(delta(b0, e0, u + 'is_fault_ns') / 1e6, 3)
+            r['upd_row_update_C_ms'] = round(op_c_window(b0, e0, 'row_update') / 1e6, 3)
             r['node0_recv_cpu_ticks'] = sum_prefix(b0, e0, 'kthr.cxl_recv', '.cpu_ticks')
         elif kind == 'megalon':
             def est(b, e, role):  # estimates from window deltas of the raw counters (backend.h MegThr)

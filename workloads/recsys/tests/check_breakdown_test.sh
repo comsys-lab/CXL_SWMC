@@ -15,10 +15,10 @@ mk() {  # mk <dir> <with instr 0|1> [<swmc_acct live 0|1> (1)]
   sed -i 's/^system=.*/system=Popcorn-poll/' "$1/manifest.txt"
   for f in "$1"/loadgen/stats/step*-t*.txt; do
     case $f in *-begin-*) m=1;; *) m=2;; esac
-    { echo "thr.rs-serve.swmc.read_fault_ns=$((m * 9000000))"; echo "thr.rs-serve.swmc.read_msg_wait_ns=$((m * 5000000))"
-      echo "thr.rs-serve.swmc.read_local_wait_ns=$((m * 1000000))"; echo "thr.rs-serve.swmc.write_fault_ns=0"
+    { echo "thr.rs-serve.swmc.is_fault_ns=$((m * 9000000))"; echo "thr.rs-serve.swmc.read_msg_wait_ns=$((m * 5000000))"
+      echo "thr.rs-serve.swmc.sm_fault_ns=0"; echo "thr.rs-serve.swmc.wpu_fault_ns=0"; echo "thr.rs-serve.swmc.is_faults=$((m * 100))"
       echo "thr.rs-serve.swmc.read_faults=$((m * 100))"; echo "thr.rs-serve.swmc.read_transactions=$((m * 90))"
-      echo "thr.rs-update.swmc.write_fault_ns=$((m * 7000000))"; echo "irq.TLB=$((m * 50))"; echo "kthr.cxl_recv/0.cpu_ticks=$((m * 10))"
+      echo "thr.rs-update.swmc.sm_fault_ns=$((m * 7000000))"; echo "irq.TLB=$((m * 50))"; echo "kthr.cxl_recv/0.cpu_ticks=$((m * 10))"
       if [ "$2" = 1 ]; then echo "sys.swmc.instr.serve.unmap_ns=$((m * 400000))"; echo "sys.swmc.instr.serve.mkclean_ns=$((m * 100000))"; fi
       if [ "${3:-1}" = 1 ]; then echo "op.coh_src=pc_threads:16,mg_threads:0"; echo "op.query.c_ns=$((m * 8000000))"
         echo "op.query.pc.fault_ns.is=$((m * 8000000))"; echo "op.row_update.c_ns=$((m * 2000000))"; fi
