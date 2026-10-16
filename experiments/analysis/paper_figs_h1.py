@@ -44,7 +44,7 @@ def figure(out, tag, S, xscale, xlabel, slo_ms, xticks, ylim, yticks, comps_of, 
             continue
         v = sorted(S[s], key=lambda r: float(r["achieved"]))
         xs, ys = [float(r["achieved"]) * xscale for r in v], [float(r["p99_ms"]) / base for r in v]
-        series.append((PS_KEY[NAMES[s]], xs, ys))
+        series.append((PS_KEY[NAMES[s]], xs, ys, [r["pass"] == "True" for r in v]))
         rows += [[NAMES[s], r["step"], r["phase"], r["offered"], r["achieved"], r["p99_ms"], round(y, 3), r["pass"]]
                  for r, y in zip(v, ys)]
     slo = slo_ms / base

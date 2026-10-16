@@ -22,11 +22,17 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--root", required=True)
     ap.add_argument("--out", required=True)
+    ap.add_argument("--main", action="store_true", help="KV H1 main run (54M keys, recovery/KV-main-h1-v2): curve only")
     a = ap.parse_args()
     R = os.path.join(a.root, "recovery")
     os.makedirs(a.out, exist_ok=True)
     D = {"all-HWcc": f"{R}/M5-pilot-kv-hm-v2.1/hw-u5-pslo", "Megalon": f"{R}/M5-pilot-kv-hm-v2.1/mg-u5-pslo",
          "Popcorn": f"{R}/M5-pilot-kv-pop-v2.2/pop-u5-pslo"}
+    tag = "kv-pilot"
+    if a.main:
+        M = f"{R}/KV-main-h1-v2"
+        D = {"all-HWcc": f"{M}/hw-u5-slo", "Megalon": f"{M}/mg-u5-slo", "Popcorn": f"{M}/pop-u5-slo"}
+        tag = "kv-main"
     S = {k: sorted(steps(v), key=lambda r: float(r["achieved"])) for k, v in D.items()}
     hw0 = min(S["all-HWcc"], key=lambda r: float(r["offered"]))
     base = float(hw0["p99_ms"])
@@ -34,18 +40,21 @@ def main():
     for name in ("Popcorn", "Megalon", "HWcc"):
         xs = [float(r["achieved"]) / 1e3 for r in S[{"HWcc": "all-HWcc"}.get(name, name)]]
         ys = [float(r["p99_ms"]) / base for r in S[{"HWcc": "all-HWcc"}.get(name, name)]]
-        series.append(({"HWcc": "All HWcc"}.get(name, name), xs, ys))
+        series.append(({"HWcc": "All HWcc"}.get(name, name), xs, ys, [r["pass"] == "True" for r in S[{"HWcc": "all-HWcc"}.get(name, name)]]))
         rows += [[name, r["step"], r["phase"], r["offered"], r["achieved"], r["p99_ms"], round(y, 3), r["pass"]]
                  for r, y in zip(S[{"HWcc": "all-HWcc"}.get(name, name)], ys)]
     slo = 1.0 / base
-    ps.curve(os.path.join(a.out, "kv-pilot-curve.png"), series, slo, "Requests per second (K)",
+    ps.curve(os.path.join(a.out, f"{tag}-curve.png"), series, slo, "Requests per second (K)",
              "Normalized\np99 latency", *(lambda l: (l[0], list(range(0, 161, 20)), l[1]))(ps.nice_ylim(slo)))
-    with open(os.path.join(a.out, "kv-pilot-curve.csv"), "w", newline="") as f:
+    with open(os.path.join(a.out, f"{tag}-curve.csv"), "w", newline="") as f:
         w = csv.writer(f)
         w.writerow([f"# p99 normalized to all-HWcc p99 at its lowest offered rate ({hw0['offered']} req/s): {base} ms; SLO 1 ms -> {slo:.3f}"])
         w.writerow(["system", "step", "phase", "offered", "achieved", "p99_ms", "p99_norm", "pass"])
         w.writerows(rows)
 
+    if a.main:
+        print("curve only (main)", "base p99", base, "SLO norm", round(slo, 3))
+        return
     # breakdown at one identical rate: the pilot's fixed-load windows (L = 0.5 x all-HWcc max = 64.3k req/s; page MSI
     # kept up with the rate but its window stopped at 25 s on the p99 SLO, stats kept)
     F = {k: v.replace("-pslo", "-pfix") for k, v in D.items()}

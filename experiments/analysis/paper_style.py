@@ -23,8 +23,16 @@ def curve(path, series, slo, xlabel, ylabel, ylim, xticks, yticks):
     fig, ax = plt.subplots(figsize=(10.2, 4.4))
     ax.yaxis.grid(True, color="#d9d9d9", linewidth=1.0)
     ax.set_axisbelow(True)
-    for name, xs, ys in series:
-        xs, ys = clean_curve(xs, ys, ylim[1])
+    for item in series:
+        name, xs, ys = item[:3]
+        if len(item) > 3:  # pass flags: a failed step below the highest passing rate is superseded (display only)
+            ok = item[3]
+            xmax = max([x for x, p in zip(xs, ok) if p], default=0)
+            keep = [i for i in range(len(xs)) if ok[i] or xs[i] > xmax]
+            xs, ys, ok = [xs[i] for i in keep], [ys[i] for i in keep], [ok[i] for i in keep]
+        else:
+            ok = None
+        xs, ys = clean_curve(xs, ys, ylim[1], ok)
         ax.plot(xs, ys, color=SERIES[name], linewidth=2.5, marker="o", markersize=6, label=name, clip_on=True)
     ax.axhline(slo, color="black", linestyle=(0, (4, 2)), linewidth=2.5)
     above = slo + (ylim[1] - ylim[0]) * 0.16 < ylim[1]  # label above the line if it fits, else below
@@ -110,18 +118,19 @@ def nice_ylim(slo):
     return (0, slo * 1.5), None
 
 
-def clean_curve(xs, ys, top):
+def clean_curve(xs, ys, top, ok=None):
     """Display cleanup (user 2026-10-16: drop jagged points). Sorted by x: (1) points within 3% in x of each other
     (repeated nearby rates: bisect/fill/overload) are merged into their mean; (2) an interior point that is a dip
     (< 0.75 x both neighbours) or a spike (> 1.33 x both neighbours) is dropped; (3) after the first point above the
     y range nothing more is drawn. Returns (xs, ys); the CSV keeps every measured step."""
-    pts = sorted(zip(xs, ys))
+    ok = ok if ok is not None else [True] * len(xs)
+    pts = sorted(zip(xs, ys, ok))
     groups = []
-    for x, y in pts:
-        if groups and x <= groups[-1][0][0] * 1.03:
-            groups[-1].append((x, y))
+    for x, y, p in pts:  # passing and failing steps are never merged
+        if groups and x <= groups[-1][0][0] * 1.03 and p == groups[-1][0][2]:
+            groups[-1].append((x, y, p))
         else:
-            groups.append([(x, y)])
+            groups.append([(x, y, p)])
     pts = [(sum(p[0] for p in g) / len(g), sum(p[1] for p in g) / len(g)) for g in groups]
     changed = True
     while changed and len(pts) > 2:
