@@ -18,6 +18,9 @@ asyncio peer (e.g. for a LangChain VectorStore client).
   completions inside the measurement window / window.
 - **Step** = `--step-warmup-s` at the new rate (not measured) + `--step-measure-s` measured; then sending stops
   and the engine drains (`--drain-s`). A run starts with `--warmup-s` (not measured).
+- **SLO percentile.** `--slo s:pct:ms`, any pct in (0, 100), nearest rank: MOT1 v6 uses p99 (KV, LMDB, vector DB)
+  and p95 (DLRM, `--slo query:95:100`). The percentile drives pass/fail, the early abort (slow requests > (1 − pct/100)
+  × requests), the ramp step size and the confirm statistics; `export_csv.py` adds `slo_stream/slo_pct/slo_ms/p95_ms`.
 - **Pass** (per step): SLO percentile of the SLO stream ≤ SLO; every stream keeps up (completions in the window
   ≥ (1 − tol) × requests sent in it); errors + timeouts ≤ max-err. A step is aborted early (fail) when the
   outstanding count exceeds rate × `--abort-queue-s` (saturated) or the SLO stream already has more slow
@@ -41,8 +44,9 @@ confirm ≈ 4-6 min per (system, configuration). `--mode fixed --rates r1,r2,...
 
 ## Outputs (`--out DIR`, must not exist)
 `manifest.txt` (all parameters, workload description), `steps.jsonl` (one JSON per step: offered/achieved,
-p50/p90/p99/p99.9/SLO percentile/max, errors, timeouts, send lag, pass/abort reason, per stream),
-`summary.json`, optional `raw-step<N>.bin` (`--raw`: sched/send/done ns, stream/status per request), optional
+p50/p90/p95/p99/p99.9/SLO percentile (`pslo_ms`)/max, errors, timeouts, send lag, pass/abort reason, per stream;
+`p95_ms` since 2026-10-16), `summary.json` (`slo` = stream/pct/ms in every run with `--slo`, since 2026-10-16 also
+fixed mode and SLO runs without a passing step), optional `raw-step<N>.bin` (`--raw`: sched/send/done ns, stream/status per request), optional
 `stats/` (`--stats-op`, below), plus the
 workload's own files (e.g. vectordb search results for offline recall).
 Plot: `plot_slo.py --out fig.pdf runA=all-HWcc runB=Megalon ...` (x = throughput, y = tail latency).

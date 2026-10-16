@@ -56,7 +56,9 @@ def main():
     if slo_ms:
         ax.axhline(slo_ms, color="k", ls="--", lw=1, label=f"SLO {slo_ms} ms")
     ax.set_xlabel("throughput (req/s)")
-    ax.set_ylabel(f"{a.metric.replace('_ms', '')} latency (ms)")
+    pct = summ.get("slo", {}).get("pct")
+    name = f"p{pct:g}" if a.metric == "pslo_ms" and pct else a.metric.replace("_ms", "")
+    ax.set_ylabel(f"{name} latency (ms)")
     if a.logy:
         ax.set_yscale("log")
     else:

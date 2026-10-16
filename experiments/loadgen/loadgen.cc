@@ -149,6 +149,7 @@ Config parse(int argc, char **argv) {
       auto p = split(need(i), ':');
       if (p.size() != 3) die("--slo s:pct:ms");
       c.slo_stream = p[0], c.slo_pct = std::atof(p[1].c_str()), c.slo_ms = std::atof(p[2].c_str());
+      if (!(c.slo_pct > 0 && c.slo_pct < 100)) die("--slo: pct must be in (0, 100), e.g. 99 or 95");
     } else if (a == "--x-stream") c.x_stream = need(i);
     else if (a == "--rates") for (auto &r : split(need(i), ',')) c.rates.push_back(std::atof(r.c_str()));
     else if (a == "--start") c.start = std::atof(need(i).c_str());
@@ -240,7 +241,7 @@ struct StepResult {
   struct S {
     double offered = 0, achieved = 0;
     uint64_t sent = 0, done = 0, errors = 0, timeouts = 0;
-    double p50 = 0, p90 = 0, p99 = 0, p999 = 0, pslo = 0, max = 0;  // ms; inf if requests timed out
+    double p50 = 0, p90 = 0, p95 = 0, p99 = 0, p999 = 0, pslo = 0, max = 0;  // ms; inf if requests timed out
     double lag_p99_us = 0, lag_max_us = 0;
   };
   std::vector<S> s;
@@ -556,7 +557,8 @@ class Engine {
         return v[k];
       };
       st.p50 = pct(lat[s], 50), st.p90 = pct(lat[s], 90), st.p99 = pct(lat[s], 99), st.p999 = pct(lat[s], 99.9);
-      st.pslo = pct(lat[s], c_.slo_pct);
+      st.p95 = pct(lat[s], 95);
+      st.pslo = pct(lat[s], c_.slo_pct);  // the --slo percentile (e.g. p95 for DLRM, p99 otherwise)
       st.max = lat[s].empty() ? 0 : *std::max_element(lat[s].begin(), lat[s].end());
       st.lag_p99_us = pct(lag[s], 99);
       st.lag_max_us = lag[s].empty() ? 0 : *std::max_element(lag[s].begin(), lag[s].end());
@@ -649,7 +651,7 @@ class Engine {
         << ",\"errors\":" << st.errors << ",\"timeouts\":" << st.timeouts << ",\"p50_ms\":" << fmt(st.p50)
         << ",\"p90_ms\":" << fmt(st.p90) << ",\"p99_ms\":" << fmt(st.p99) << ",\"p999_ms\":" << fmt(st.p999)
         << ",\"pslo_ms\":" << fmt(st.pslo) << ",\"max_ms\":" << fmt(st.max) << ",\"lag_p99_us\":" << fmt(st.lag_p99_us)
-        << ",\"lag_max_us\":" << fmt(st.lag_max_us) << "}";
+        << ",\"lag_max_us\":" << fmt(st.lag_max_us) << ",\"p95_ms\":" << fmt(st.p95) << "}";
     }
     o << "}}";
     std::fprintf(steps_, "%s\n", o.str().c_str());
@@ -659,8 +661,9 @@ class Engine {
                  r.reason.empty() ? "" : " (", r.reason.empty() ? "" : (r.reason + ")").c_str());
     if (slo_idx_ != 0xff) {
       auto &st = r.s[slo_idx_];
-      std::fprintf(stderr, "        %s achieved %.1f/s p50 %.3f p99 %.3f ms, lag p99 %.0f us\n",
-                   specs_[slo_idx_].name.c_str(), st.achieved, st.p50, st.p99, st.lag_p99_us);
+      std::fprintf(stderr, "        %s achieved %.1f/s p50 %.3f p99 %.3f p%s(SLO) %.3f ms, lag p99 %.0f us\n",
+                   specs_[slo_idx_].name.c_str(), st.achieved, st.p50, st.p99, fmt(c_.slo_pct).c_str(), st.pslo,
+                   st.lag_p99_us);
     }
     steps_log_.push_back({phase, xval(r), r.pass, r.lag_flag});
   }
@@ -704,6 +707,9 @@ class Engine {
     std::ofstream s(c_.out + "/summary.json");
     s << "{\"mode\":\"" << c_.mode << "\",\"note\":\"" << note << "\",\"steps\":" << step_no_
       << ",\"unknown_responses\":" << unknown_.load();
+    if (!c_.slo_stream.empty())  // every run with --slo (also fixed mode and SLO runs without a passing step)
+      s << ",\"slo\":{\"stream\":\"" << c_.slo_stream << "\",\"pct\":" << fmt(c_.slo_pct) << ",\"ms\":" << fmt(c_.slo_ms)
+        << "}";
     if (c_.mode == "slo" && best_ > 0) {
       double sx = 0, sxx = 0, sp = 0, spp = 0;
       uint32_t n = 0, fails = 0;
@@ -713,8 +719,7 @@ class Engine {
         if (!r.pass) fails++;
       }
       auto sd = [&](double a, double aa) { return n > 1 ? std::sqrt(std::max(0.0, (aa - a * a / n) / (n - 1))) : 0; };
-      s << ",\"slo\":{\"stream\":\"" << c_.slo_stream << "\",\"pct\":" << fmt(c_.slo_pct) << ",\"ms\":" << fmt(c_.slo_ms)
-        << "},\"max_offered_x_pass\":" << fmt(best_) << ",\"min_offered_x_fail\":" << fmt(best_bad_)
+      s << ",\"max_offered_x_pass\":" << fmt(best_) << ",\"min_offered_x_fail\":" << fmt(best_bad_)
         << ",\"confirm\":{\"reps\":" << n << ",\"fails\":" << fails << ",\"x_mean\":" << fmt(n ? sx / n : 0)
         << ",\"x_sd\":" << fmt(sd(sx, sxx)) << ",\"pslo_mean_ms\":" << fmt(n ? sp / n : 0)
         << ",\"pslo_sd_ms\":" << fmt(sd(sp, spp)) << "}";

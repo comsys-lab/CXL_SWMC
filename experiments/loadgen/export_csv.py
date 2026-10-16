@@ -62,6 +62,10 @@ when the run has no snapshots or the counter is absent). Times in seconds of the
   n<k>_pop_acquire_flush   sys.swmc.instr.serve.acquire_flush_count: Figure 2b "requester acquire-flush" (stale lines
                            dropped on I -> S/M or the first map of an init-S page)
   n<k>_meg_reexec_src      see n<k>_meg_reexec_s
+Run SLO (appended after the per-node columns; from manifest.txt slo=stream:pct:ms, present in every run):
+  slo_stream, slo_pct, slo_ms   --slo of the run (pct 99 for KV/LMDB/vector DB, 95 for DLRM; MOT1 v6 §1);
+                                pslo_ms is the slo_pct percentile of this row's stream
+  p95_ms                        nearest-rank p95 of this row's stream (loadgen >= 2026-10-16; empty for older runs)
 """
 import argparse, csv, json, os, sys
 
@@ -73,6 +77,7 @@ BASE = ["label", "step", "phase", "measure_s", "pass", "aborted", "reason", "str
         "max_under_slo"]
 STEP = ["search_per_s", "update_per_s", "total_ops_per_s", "search_p50_ms", "search_p99_ms", "update_p50_ms",
         "update_p99_ms", "traffic_bytes", "traffic_per_update"]
+RUNSLO = ["slo_stream", "slo_pct", "slo_ms", "p95_ms"]
 NODE = ["window_s", "searches", "updates", "p_advance", "search_busy_frac", "writer_busy_frac", "search_cpu_s",
         "search_rq_wait_s", "writer_cpu_s", "cpu_busy_frac", "pop_search_fault_s", "pop_search_msg_wait_s",
         "pop_search_local_wait_s", "pop_writer_fault_s", "pop_node_fault_s", "meg_rd_check_s", "meg_wr_check_s",
@@ -202,6 +207,19 @@ def node_metrics(fixed, d, system=None):
     return m
 
 
+def run_slo(run):
+    """(stream, pct, ms) of the run's --slo, from manifest.txt (summary.json slo as fallback); blanks if none."""
+    mf = os.path.join(run, "manifest.txt")
+    if os.path.exists(mf):
+        for line in open(mf):
+            if line.startswith("slo="):
+                st, pct, ms = (line.strip()[4:].split(":") + ["", "", ""])[:3]
+                if st:
+                    return st, float(pct), float(ms)
+    slo = json.load(open(os.path.join(run, "summary.json"))).get("slo", {})
+    return slo.get("stream", ""), slo.get("pct", ""), slo.get("ms", "")
+
+
 def blank(v):
     return "" if v is None else v
 
@@ -222,13 +240,14 @@ def main():
             if os.path.exists(os.path.join(run, "manifest.txt")) else 0
         runs.append((run, label or os.path.basename(run.rstrip("/")), per_step, ntgt))
     nodes = max([2] + [r[3] for r in runs] + [max(t) + 1 for r in runs for t in r[2].values()])
-    cols = BASE + STEP + [f"n{k}_{c}" for k in range(nodes) for c in NODE]
+    cols = BASE + STEP + [f"n{k}_{c}" for k in range(nodes) for c in NODE] + RUNSLO
     with open(a.out, "w", newline="") as f:
         w = csv.writer(f)
         w.writerow(cols)
         for run, label, per_step, _ in runs:
             summ = json.load(open(os.path.join(run, "summary.json")))
             best = summ.get("confirm", {}).get("x_mean", "")
+            slo = list(run_slo(run))
             for line in open(os.path.join(run, "steps.jsonl")):
                 s = json.loads(line)
                 if s["phase"] == "warmup":
@@ -251,7 +270,7 @@ def main():
                     w.writerow([label, s["step"], s["phase"], s["measure_s"], s["pass"], s["aborted"], s["reason"], name,
                                 x["offered"], x["achieved"], x["sent"], x["done"], x["errors"], x["timeouts"],
                                 x["p50_ms"], x["p90_ms"], x["p99_ms"], x["p999_ms"], x["pslo_ms"], x["max_ms"],
-                                x["lag_p99_us"], best] + step_cols + node_cols)
+                                x["lag_p99_us"], best] + step_cols + node_cols + slo + [x.get("p95_ms", "")])
     print(f"-> {a.out}")
 
 
