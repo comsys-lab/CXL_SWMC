@@ -83,6 +83,22 @@ Example for the Popcorn kernel (root; grant-gated):
   `<step>.env` (kernel release, protocol, knobs, cxl_shm parameters, binary
   and config hashes, load average).
 
+## Instrumentation overhead check (faultlat-4, Popcorn build 9)
+
+`access` and `pingpong` register the measuring thread's `swmc_acct` area
+(systems/popcorn_new/include/swmc_acct.h; `--acct 0` skips it) and add an
+`instr` object to the step JSON: `/sys/kernel/swmc/instr/enabled` before and
+after the step, whether the registration succeeded, the area's deltas
+(`acct_{is,sm,wpu}_fault_ns/_faults`, `acct_ipi_ns/_count`) and the deltas of
+every `/proc/thread-self/swmc` counter of that thread (`thread_delta`; names
+ending in `_ns` are durations, the rest counts; `instr_clock_reads` /
+`is_faults` = clock reads per counted fault). On kernels without build 9 the
+registration fails (`acct_registered 0`) and the deltas are absent or zero.
+Overhead comparison (a later VM packet; writing `enabled` needs root): the
+same step with `instr/enabled` 1 and 0 (and 1 with `--acct 0`), comparing
+the latency percentiles; `parse.py` exports `instr_enabled`,
+`acct_registered` and the main build-9 deltas as CSV columns.
+
 ## Correctness smoke test (smoke.sh)
 
 `smoke.sh <run-id> <base-page> [--execute]` (same env as scenarios.sh, PAGES

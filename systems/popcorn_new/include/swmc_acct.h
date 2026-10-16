@@ -7,6 +7,9 @@
  * A kernel without support (or cxl_shm not enabled) leaves the area all zero; swmc_acct_register returns -1. */
 #pragma once
 #include <stdint.h>
+#include <stdio.h>
+#include <fcntl.h>
+#include <unistd.h>
 
 #define SWMC_ACCT_VERSION 1
 
@@ -21,9 +24,22 @@ struct swmc_acct {
 } __attribute__((aligned(64)));
 
 /* Register the calling thread's area (one per thread, lives until the thread exits). 0 = ok, -1 = unsupported.
- * Implementation (kernel interface, e.g. a write of the address to /proc/thread-self/swmc_acct) is provided below
- * by the build-9 owner; until then this stub returns -1 so workloads build and run with zeros. */
-static inline int swmc_acct_register(struct swmc_acct *a) { (void)a; return -1; }
+ * Kernel interface (Popcorn build 9): the thread writes the area's address to /proc/thread-self/swmc_acct (only
+ * the thread itself may; "0" unregisters). The kernel zeroes the area, sets version, and from then on copies the
+ * values (counted from 0 at registration) into it on every return to user mode after a counted fault/IPI. The
+ * area must stay mapped and writable until the thread exits or unregisters; registration ends at execve and is
+ * not inherited by new threads/processes. Any failure (older kernel: no such file; misaligned area) -> -1. */
+static inline int swmc_acct_register(struct swmc_acct *a) {
+  char buf[32];
+  int fd, n, ok;
+  if (!a || ((uintptr_t)a & 63)) return -1;
+  fd = open("/proc/thread-self/swmc_acct", O_WRONLY | O_CLOEXEC);
+  if (fd < 0) return -1;
+  n = snprintf(buf, sizeof(buf), "0x%llx\n", (unsigned long long)(uintptr_t)a);
+  ok = n > 0 && write(fd, buf, (size_t)n) == (ssize_t)n;
+  close(fd);
+  return ok && a->version == SWMC_ACCT_VERSION ? 0 : -1;
+}
 
 /* Total coherence management time of the thread so far (ns): Fig 2 C_o = delta of this across an operation. */
 static inline uint64_t swmc_acct_coh_ns(const volatile struct swmc_acct *a) {

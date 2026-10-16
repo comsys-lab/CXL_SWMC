@@ -11,7 +11,7 @@
 //   faultlat params [--nodes N] [--device-size B] [--init-state invalid|shared]
 //   faultlat access --op read|write|rw [--pages N] [--page-offset P] [--stride S]
 //                   [--passes K] [--shuffle] [--cpu C] [--out F] [--raw F]
-//                   [--pattern X] [--expect X]
+//                   [--pattern X] [--expect X] [--acct 0|1]
 //   faultlat pingpong --role R --nonce X [--nodes N] [--iters N] [--page-offset P]
 //                   [--cpu C] [--out F] [--raw F]
 //   faultlat contend --node K --nodes N --run-id X --threads T --pages H --page-offset P --read-pct R
@@ -56,12 +56,13 @@
 #include "../../systems/common/cxl_region.h"
 #include "../../systems/common/hwcc_app.h"
 #include "contend.h"
+#include "../../systems/popcorn_new/include/swmc_acct.h"
 
 namespace {
 
 constexpr uint64_t kPage = 4096;
 constexpr const char *kSysfs = "/sys/kernel/swmc/page_coherence";
-constexpr const char *kVersion = "faultlat-3";
+constexpr const char *kVersion = "faultlat-4";
 
 [[noreturn]] void die(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 void die(const char *fmt, ...) {
@@ -118,6 +119,7 @@ struct Args {
   uint64_t seed = 0;
   uint64_t max_ops = 0;   // contend: per-thread op limit (0 = duration only)
   uint64_t churn_us = 0;  // contend: churn thread period (0 = off)
+  int acct = 1;         // access/pingpong: register the Popcorn swmc_acct area (build 9); 0 = do not
   std::string inject;  // test only: stale|corrupt|lost|stall|sigbus:N (node 0, thread 0, N-th write)
 };
 
@@ -176,6 +178,7 @@ Args parse_args(int argc, char **argv) {
     else if (k == "--no-abort") a.abort_on_violation = false;
     else if (k == "--no-swmr-probe") a.swmr_probe = false;
     else if (k == "--seed") a.seed = parse_num(val("--seed"), "--seed");
+    else if (k == "--acct") a.acct = int(parse_num(val("--acct"), "--acct"));
     else if (k == "--inject") a.inject = val("--inject");
     else if (k == "--max-ops") a.max_ops = parse_num(val("--max-ops"), "--max-ops");
     else if (k == "--churn-us") a.churn_us = parse_num(val("--churn-us"), "--churn-us");
@@ -213,6 +216,61 @@ std::map<std::string, std::string> read_sysfs() {
 bool is_number(const std::string &s) {
   return !s.empty() && std::all_of(s.begin(), s.end(), ::isdigit);
 }
+
+// Popcorn build 9 instrumentation view of the measuring thread (overhead check: instr/enabled 1 vs 0):
+// /proc/thread-self/swmc ("name value", "_ns" = duration, else count) and the registered swmc_acct area.
+std::map<std::string, uint64_t> read_thread_swmc() {
+  std::map<std::string, uint64_t> m;
+  std::ifstream f("/proc/thread-self/swmc");
+  std::string k;
+  unsigned long long v;
+  while (f >> k >> v) m[k] = v;
+  return m;
+}
+
+std::string read_instr_enabled() {
+  std::ifstream f("/sys/kernel/swmc/instr/enabled");
+  std::string v;
+  if (!(f && std::getline(f, v))) v = "absent";
+  return v;
+}
+
+struct AcctView {
+  alignas(64) swmc_acct area{};
+  int registered = 0;  // swmc_acct_register() == 0
+  std::string instr_before, instr_after;
+  std::map<std::string, uint64_t> before, after;
+  swmc_acct a0{};
+  void start(bool reg) {
+    if (reg) registered = swmc_acct_register(&area) == 0;
+    instr_before = read_instr_enabled();
+    before = read_thread_swmc();
+    a0 = area;
+  }
+  void stop() {
+    after = read_thread_swmc();
+    instr_after = read_instr_enabled();
+  }
+  void json(FILE *f) const {
+    fprintf(f, "  \"instr\": {\"enabled_before\": \"%s\", \"enabled_after\": \"%s\", \"acct_registered\": %d",
+            instr_before.c_str(), instr_after.c_str(), registered);
+    static const char *cls[3] = {"is", "sm", "wpu"};
+    for (int i = 0; i < 3; i++)
+      fprintf(f, ", \"acct_%s_fault_ns\": %" PRIu64 ", \"acct_%s_faults\": %" PRIu64, cls[i],
+              area.fault_ns[i] - a0.fault_ns[i], cls[i], area.fault_cnt[i] - a0.fault_cnt[i]);
+    fprintf(f, ", \"acct_ipi_ns\": %" PRIu64 ", \"acct_ipi_count\": %" PRIu64, area.ipi_ns - a0.ipi_ns,
+            area.ipi_cnt - a0.ipi_cnt);
+    fprintf(f, ", \"thread_delta\": {");
+    bool first = true;
+    for (auto &kv : after) {
+      auto it = before.find(kv.first);
+      fprintf(f, "%s\"%s\": %" PRIu64, first ? "" : ", ", kv.first.c_str(),
+              kv.second - (it == before.end() ? 0 : it->second));
+      first = false;
+    }
+    fprintf(f, "}}");
+  }
+};
 
 // ---------------------------------------------------------------------------
 // Statistics
@@ -408,6 +466,8 @@ int cmd_access(const Args &a) {
   pin_cpu(a.cpu);
   auto sys_before = read_sysfs();
   Mapping m = map_window(r, a.page_offset, span);
+  AcctView acct;
+  acct.start(a.acct != 0);
 
   std::vector<uint64_t> order(a.pages);
   for (uint64_t i = 0; i < a.pages; i++) order[i] = i * a.stride;
@@ -460,6 +520,7 @@ int cmd_access(const Args &a) {
     faults[st] = minflt() - f0;
   }
   (void)sink;
+  acct.stop();
   auto sys_after = read_sysfs();
 
   FILE *f = open_out(a.out);
@@ -477,6 +538,8 @@ int cmd_access(const Args &a) {
             a.has_pattern ? std::to_string(a.pattern).c_str() : "null",
             a.has_expect ? std::to_string(a.expect).c_str() : "null", checked, mismatches, first_bad.c_str());
   json_sysfs(f, sys_before, sys_after);
+  fprintf(f, ",\n");
+  acct.json(f);
   fprintf(f, "\n}\n");
   if (f != stdout) fclose(f);
   write_raw(a.raw, lat);
@@ -510,6 +573,8 @@ int cmd_pingpong(const Args &a) {
   pin_cpu(a.cpu);
   auto sys_before = read_sysfs();
   Mapping m = map_window(r, a.page_offset, 1);
+  AcctView acct;
+  acct.start(a.acct != 0);
   PingPage *pg = reinterpret_cast<PingPage *>(m.base);
   uint64_t me = uint64_t(a.role), other = (me + 1) % uint64_t(a.nodes);
   const uint64_t timeout_ns = 60ull * 1000000000ull;
@@ -551,6 +616,7 @@ int cmd_pingpong(const Args &a) {
     pg->turn = other;
   }
   long faults = minflt() - f0;
+  acct.stop();
   auto sys_after = read_sysfs();
 
   FILE *f = open_out(a.out);
@@ -561,6 +627,8 @@ int cmd_pingpong(const Args &a) {
              ", \"first_seq_error\": \"%s\"\n  },\n",
           faults, uint64_t(pg->seq), seq_errors, first_bad.c_str());
   json_sysfs(f, sys_before, sys_after);
+  fprintf(f, ",\n");
+  acct.json(f);
   fprintf(f, "\n}\n");
   if (f != stdout) fclose(f);
   write_raw(a.raw, {rtt});
