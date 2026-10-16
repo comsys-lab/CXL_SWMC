@@ -39,12 +39,14 @@ MEG_F = ["read_sections", "write_sections", "check_ns_sampled", "check_sampled",
          "vcopy_ns_sampled", "vcopy_sampled", "vcopy_cnt", "lookup_ns_sampled"]
 # Megalon build 75 shim API v3 thread_anchor (AnchorSnap), exported as opt.<op>.meg.anchor.<f> / op.<op>.mg.anchor.<f>:
 # *_sampled fields are sampled with the read-section checks (ratio estimator), the others are timed every time
-ANCHOR_F = ["read_lookup_ns_sampled", "read_nr_ns_sampled", "write_lookup_ns", "write_nr_ns", "rseq_ns_sampled",
-            "wseq_ns"]
+# (systems/megalon/shim/megalon_objapi.h v3, CXL_SWMC 28749aee6; wseq_end_ns = WSeqEnd, inside wflush)
+ANCHOR_F = ["read_sections", "write_sections", "check_sampled", "read_lookup_ns_sampled", "read_nr_ns_sampled",
+            "rseq_ns_sampled", "write_lookup_ns", "write_nr_ns", "wseq_ns", "wseq_end_ns"]
 # Workload rule for Megalon C (user principle 2026-10-16: C = work the workload's own all-HWcc implementation does not
 # do), keyed by the loadgen manifest workload= name:
 #   hwcc_flavor  all-HWcc = Megalon hwcc flavor (same anchor + seqlock reads): anchor work NOT in C; the seqlock parts
-#                all-HWcc also does are taken out: C_check = check_est - rseq_est, C_wstart = wstart - wseq
+#                all-HWcc also does are taken out: C_check = check_est - rseq_est, C_wstart = wstart - wseq,
+#                C_wflush = wflush - wseq_end
 #   plain        all-HWcc = a plain backend without Megalon: every Megalon call is C:
 #                C_check = check_est + read anchor (lookup + NR) est, C_wstart = wstart + write anchor (lookup + NR)
 MEG_RULE = {"kv": "hwcc_flavor", "vectordb": "plain", "lmdb": "plain", "recsys": "plain"}
@@ -259,11 +261,14 @@ def op_sums(run, steps, op):
       meg_check_est_ns  = meg_check_ns_sampled x f   (build >= 74: excludes the index lookup and the NR anchor work)
       meg_anchor_rd_est_ns = (anchor.read_lookup_ns_sampled + anchor.read_nr_ns_sampled) x f   (build 74 without
                              AnchorSnap: lookup_ns_sampled x f, NR part missing)
+      (anchor *_sampled fields scale with the AnchorSnap's own read_sections / check_sampled when exported, else f)
       meg_rseq_est_ns   = anchor.rseq_ns_sampled x f;  meg_anchor_wr_ns = anchor.write_lookup_ns + anchor.write_nr_ns;
-      meg_wseq_ns       = anchor.wseq_ns
+      meg_wseq_ns       = anchor.wseq_ns;  meg_wseq_end_ns = anchor.wseq_end_ns (inside wflush)
       workload rule (MEG_RULE by the run's workload=):
-        hwcc_flavor (KV)  meg_check_C_ns = meg_check_est_ns - meg_rseq_est_ns, meg_wstart_C_ns = wstart - wseq
-        plain (others)    meg_check_C_ns = meg_check_est_ns + meg_anchor_rd_est_ns, meg_wstart_C_ns = wstart + anchor_wr
+        hwcc_flavor (KV)  meg_check_C_ns = meg_check_est_ns - meg_rseq_est_ns, meg_wstart_C_ns = wstart - wseq,
+                          meg_wflush_C_ns = wflush - wseq_end
+        plain (others)    meg_check_C_ns = meg_check_est_ns + meg_anchor_rd_est_ns, meg_wstart_C_ns = wstart + anchor_wr,
+                          meg_wflush_C_ns = wflush
       a node without AnchorSnap fields (Megalon build < 75) counts in anchor_split_unavailable_nodes: KV C slightly
       high (seqlock parts not removed), others slightly low (anchor work not added)
       meg_vcopy_est_ns = meg_vcopy_ns_sampled x meg_vcopy_cnt / meg_vcopy_sampled   (validation copy, ratio estimator
@@ -271,7 +276,7 @@ def op_sums(run, steps, op):
                          vcopy_ns_sampled > 0 without vcopy_sampled/vcopy_cnt is marked: vcopy_est_missing_nodes)
       C_pop  = pop_is_ns + pop_sm_ns + pop_wp_ns + pop_ipi_ns                                  (draft §3, §6.1)
       C_meg  = meg_check_C_ns + meg_vcopy_est_ns + meg_stale_ns + meg_concur_ns + meg_meta_ns + meg_spin_ns
-               + meg_wstart_C_ns + meg_wflush_ns    (switch_rw/reclaim are inside wstart: not added; draft §3.1, §4.1)
+               + meg_wstart_C_ns + meg_wflush_C_ns    (switch_rw/reclaim are inside wstart: not added; draft §3.1, §4.1)
       C      = C_pop (pop) | C_meg (mg) | 0 (hw: no coherence actions; measured values kept in the audit columns)
     Refuses a pop/mg run whose nodes do not report exactly that coherence source (check_source).
     Returns (sums dict, keys used dict canonical -> stats key, nodes counted)."""
@@ -307,19 +312,24 @@ def op_sums(run, steps, op):
             f = vals.get("meg_read_sections", 0) / cs if cs else 0
             av = lambda k: vals.get("meg_anchor_" + k, 0)  # noqa: E731
             has_anchor = any("meg_anchor_" + k in vals for k in ANCHOR_F)
+            if av("check_sampled"):  # the AnchorSnap's own sample set
+                f = av("read_sections") / av("check_sampled")
             rd_lookup = av("read_lookup_ns_sampled") if has_anchor else vals.get("meg_lookup_ns_sampled", 0)
             vals["meg_anchor_rd_est_ns"] = (rd_lookup + av("read_nr_ns_sampled")) * f
             vals["meg_rseq_est_ns"] = av("rseq_ns_sampled") * f
             vals["meg_anchor_wr_ns"] = av("write_lookup_ns") + av("write_nr_ns")
             vals["meg_wseq_ns"] = av("wseq_ns")
+            vals["meg_wseq_end_ns"] = av("wseq_end_ns")
             if run.system == "mg" and not has_anchor and (vals.get("meg_read_sections") or vals.get("meg_write_sections")):
                 out["anchor_split_unavailable_nodes"] = out.get("anchor_split_unavailable_nodes", 0) + 1
             if rule == "hwcc_flavor":
                 vals["meg_check_C_ns"] = vals["meg_check_est_ns"] - vals["meg_rseq_est_ns"]
                 vals["meg_wstart_C_ns"] = vals.get("meg_wstart_ns", 0) - vals["meg_wseq_ns"]
+                vals["meg_wflush_C_ns"] = vals.get("meg_wflush_ns", 0) - vals["meg_wseq_end_ns"]
             else:
                 vals["meg_check_C_ns"] = vals["meg_check_est_ns"] + vals["meg_anchor_rd_est_ns"]
                 vals["meg_wstart_C_ns"] = vals.get("meg_wstart_ns", 0) + vals["meg_anchor_wr_ns"]
+                vals["meg_wflush_C_ns"] = vals.get("meg_wflush_ns", 0)
             if vals.get("meg_vcopy_ns_sampled") and not (vals.get("meg_vcopy_sampled") and "meg_vcopy_cnt" in vals):
                 out["vcopy_est_missing_nodes"] = out.get("vcopy_est_missing_nodes", 0) + 1
                 print(f"WARNING {run.path} step {st}: op {op} has meg_vcopy_ns_sampled but no vcopy_sampled/vcopy_cnt;"
@@ -335,7 +345,7 @@ def op_sums(run, steps, op):
     g = lambda k: out.get(k, 0)  # noqa: E731
     out["C_pop"] = g("pop_is_ns") + g("pop_sm_ns") + g("pop_wp_ns") + g("pop_ipi_ns")
     out["C_meg"] = (g("meg_check_C_ns") + g("meg_vcopy_est_ns") + g("meg_stale_ns") + g("meg_concur_ns")
-                    + g("meg_meta_ns") + g("meg_spin_ns") + g("meg_wstart_C_ns") + g("meg_wflush_ns"))
+                    + g("meg_meta_ns") + g("meg_spin_ns") + g("meg_wstart_C_ns") + g("meg_wflush_C_ns"))
     out["meg_rule"] = rule or ""
     for k in ("check_est_missing_nodes", "vcopy_est_missing_nodes", "anchor_split_unavailable_nodes"):
         out.setdefault(k, 0)

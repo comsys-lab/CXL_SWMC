@@ -6,7 +6,7 @@ at each measurement load (reports/MOT1-v6-redesign-draft.md §3).
   C_o   = (1/N_o) sum_ops sum_threads delta C                  = C / ops
           C: Popcorn  pop_is_ns + pop_sm_ns + pop_wp_ns + pop_ipi_ns (swmc_acct, kernel clock)
              Megalon  C_check + vcopy_ns_sampled x vcopy_cnt / vcopy_sampled + stale + concur + meta + spin + C_wstart + wflush (CohSnap); C_check
-             and C_wstart by workload (v6_common.MEG_RULE): KV check_est - seqlock reads, wstart - wseq (all-HWcc =
+             and C_wstart by workload (v6_common.MEG_RULE): KV check_est - seqlock reads, wstart - wseq, wflush - wseq_end (all-HWcc =
              Megalon hwcc flavor); vector DB / LMDB / DLRM check_est + read anchor, wstart + write anchor (all-HWcc =
              plain backend); check_est = check_ns_sampled x read_sections / check_sampled
              all-HWcc 0 (no coherence actions)
@@ -104,8 +104,8 @@ def main():
         ("formula", "T_o = t_ns / ops; C_o = C / ops with C = pop_is_ns+pop_sm_ns+pop_wp_ns+pop_ipi_ns (Popcorn) | "
                     "meg_check_C_ns+meg_vcopy_ns_sampled*meg_vcopy_cnt/"
                     "meg_vcopy_sampled (per node)+meg_stale_ns+meg_concur_ns+meg_meta_ns+meg_spin_ns+meg_wstart_C_ns"
-                    "+meg_wflush_ns (Megalon; meg_check_C_ns / meg_wstart_C_ns by workload rule, column meg_rule: "
-                    "hwcc_flavor = check_est - rseq_est, wstart - wseq; plain = check_est + anchor read est, wstart + "
+                    "+meg_wflush_C_ns (Megalon; meg_check_C_ns / meg_wstart_C_ns by workload rule, column meg_rule: "
+                    "hwcc_flavor = check_est - rseq_est, wstart - wseq, wflush - wseq_end; plain = check_est + anchor read est, wstart + "
                     "anchor write; check_est = check_ns_sampled*read_sections/check_sampled) | 0 (all-HWcc); rest = T_o - C_o; norm_* = part / T_o(all-HWcc, same op, "
                     "same load); sums over the listed steps and all nodes"),
         ("sources", "stats/ snapshot deltas (loadgen --stats-op, stats_delta.py): " + "; ".join(

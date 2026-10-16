@@ -115,7 +115,8 @@ def main():
           "fig2: KV has no validation copy (0, not missing); no AnchorSnap (pre-75) is marked; KV rule hwcc_flavor")
     # KV Megalon build 75 (AnchorSnap): seqlock parts all-HWcc (hwcc flavor) also does are removed; anchor not in C
     m75 = dict(meg, **{"opt.get.meg.anchor.rseq_ns_sampled": 100, "opt.get.meg.anchor.read_lookup_ns_sampled": 999,
-                       "opt.put.meg.anchor.wseq_ns": 5000, "opt.put.meg.anchor.write_lookup_ns": 777})
+                       "opt.put.meg.anchor.wseq_ns": 5000, "opt.put.meg.anchor.wseq_end_ns": 2000,
+                       "opt.put.meg.anchor.write_lookup_ns": 777})
     gs = dict(g, **{"opt.meg_coh": 1})
     mkrun(os.path.join(S, "kv-mg75"), ("mixed", 99, 1), curve + ramp, {1: [pair(m75, gs), pair(m75, gs)]})
     run(os.path.join(AN, "v6_fig2_split.py"), "--out", out, "--tag", "kv75", f"L1:hw={S}/kv-hw", f"L1:pop={S}/kv-pop",
@@ -123,7 +124,8 @@ def main():
     r75 = {(x["op"], x["system"]): x for x in rows(os.path.join(out, "kv75-fig2.csv"))[0]}
     check(float(r75[("get", "Megalon")]["C_ns"]) == (1000 * 64 - 100 * 64 + 100_000) / 1000
           and r75[("get", "Megalon")]["anchor_split_unavailable_nodes"] == "0", "fig2 KV: C_check = check_est - rseq_est")
-    check(float(r75[("put", "Megalon")]["C_ns"]) == (20_000 - 5000 + 30_000) / 100, "fig2 KV: C_wstart = wstart - wseq")
+    check(float(r75[("put", "Megalon")]["C_ns"]) == (20_000 - 5000 + 30_000 - 2000) / 100,
+          "fig2 KV: C write = (wstart - wseq) + (wflush - wseq_end)")
     check(os.path.exists(os.path.join(out, "kv-fig2-L1.png")), "fig2 png")
     # ---- recsys-style (op.*): Popcorn, Fig 4a/4b; op.query.n must be differenced (counter), check_sample a gauge
     q = {"op.query.n": 200, "op.query.t_ns": 20_000_000, "op.query.c_ns": 0, "op.query.pc.fault_ns.is": 2_000_000,
@@ -187,7 +189,8 @@ def main():
              "op.search.mg.vcopy_cnt": 3000, "op.search.mg.stale_ns": 2e6,
              "op.search.mg.stale_cnt": 20, "op.search.mg.concur_ns": 1e6, "op.search.mg.meta_ns": 0, "op.search.mg.spin_ns": 5e5}
         if share == 0:  # build 75: AnchorSnap read parts (plain rule: added to the checks)
-            v.update({"op.search.mg.anchor.read_lookup_ns_sampled": 200, "op.search.mg.anchor.read_nr_ns_sampled": 100})
+            v.update({"op.search.mg.anchor.read_lookup_ns_sampled": 100, "op.search.mg.anchor.read_nr_ns_sampled": 50,
+                      "op.search.mg.anchor.read_sections": 640, "op.search.mg.anchor.check_sampled": 5})  # own set: x128
         if share:
             v.update({"op.update.n": 100, "op.update.t_ns": 5e6, "op.update.mg.wstart_ns": 1e5, "op.update.mg.wflush_ns": 4e5,
                       "op.update.mg.wflush_bytes": 100 * 32 * 2**20, "op.update.mod_bytes": 100 * 4096})

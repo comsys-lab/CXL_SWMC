@@ -53,7 +53,7 @@ A_SEARCH = [("Section checks", "meg_check_C_ns", "sampled (ratio estimate)"),
             ("Validation copy", "meg_vcopy_est_ns", "sampled (ratio estimate)"), ("Stale copy (A)", "meg_stale_ns", "measured"),
             ("Concurrent write (B)", "meg_concur_ns", "measured"), ("Metadata change (C)", "meg_meta_ns", "measured"),
             ("Contended waits (D)", "meg_spin_ns", "measured")]
-A_UPDATE = [("Write start", "meg_wstart_C_ns", "measured"), ("Write-end flush", "meg_wflush_ns", "measured")]
+A_UPDATE = [("Write start", "meg_wstart_C_ns", "measured"), ("Write-end flush", "meg_wflush_C_ns", "measured")]
 
 
 def share_specs(specs, sysname):
