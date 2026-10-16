@@ -6,8 +6,10 @@
 # usage: pilot-run.sh <name> <evidence dir>
 # env (required): SYS (all-HWcc | Megalon), UPDATE_RATIO (0 | 0.05 | 0.5 | 0.8), KIND (functional | pslo | slo | fix |
 #   ladder; same loadgen schedules as experiments/kv/pilot-run.sh; fix: RATE, ladder: RATES).
-#   SYS=Popcorn is refused here: it needs the preload path (lmdb-server --preload-only after the chown and before the
-#   cxl_shm enable, then run.sh PRELOADED=1) inside the p-popcorn-shm.sh cycle, i.e. its own packet.
+#   SYS=Popcorn (plain backend, Popcorn build >= 10): C8 (deploy bundle dir with p-popcorn-shm.sh), K8 (release), GT8
+#   (guest tools dir), RECV_MODE (poll | idle | sleep). As the KV pilot: cxl_shm loaded and coherence ENABLED
+#   (init_state=shared) before lmdb-server starts, so node 0's image copy and every warm-up read run under coherence (no
+#   --preload-only); /dev/dax0.0 must be root:root 600 before (p-popcorn-shm.sh chown/teardown own it).
 # optional: RECORDS (1000000), MAX_PAGES (600000), GET_THREADS (8), READERS (32), PREPARE_THREADS (Megalon node 0: 8),
 #   SEED (20261016), LOG (0; 1 = loadgen log=1 + check_log.py, functional runs), GATE=0 (skip the Host gate; refused
 #   unless KIND=functional), VM_PLAIN (/home/comsys/lmdb/plain), VM_MEG (/home/comsys/lmdb/megalon), IMAGE
@@ -43,7 +45,9 @@ case "$SYS" in
   all-HWcc) export SYSTEM=all-HWcc V=$VM_PLAIN HOST_SERVER=$PLAIN_BUILD/bin/lmdb-server SERVER_ARGS="$SA --backend plain";;
   Megalon)  export SYSTEM=Megalon V=$VM_MEG HOST_SERVER=$MEG_BUILD/bin/lmdb-server SERVER_ARGS="$SA --backend megalon"
             export NODE0_ARGS="--prepare-threads $PREPARE_THREADS";;
-  Popcorn)  stop "SYS=Popcorn needs the preload path in its own packet (see header)";;
+  Popcorn)  : "${C8:?}" "${K8:?}" "${GT8:?}" "${RECV_MODE:?}"
+            [[ $RECV_MODE =~ ^(poll|idle|sleep)$ ]] || stop "bad RECV_MODE"
+            export SYSTEM=Popcorn-$RECV_MODE V=$VM_PLAIN HOST_SERVER=$PLAIN_BUILD/bin/lmdb-server SERVER_ARGS="$SA --backend plain";;
   *) stop "bad SYS";;
 esac
 SLO_ARG=mixed:99:1; [[ $KIND =~ ^(fix|ladder)$ ]] && SLO_ARG=mixed:99:600000  # fix, ladder: no SLO abort (judged after)
@@ -71,8 +75,28 @@ grep -q "^owner=${LOCK_OWNER:?LOCK_OWNER = owner of the measurement lock held by
   || stop "measurement lock not held by $LOCK_OWNER ($(cat "$LOCKF" 2>/dev/null))"
 if [ "${GATE:-1}" = 1 ]; then bash $P/CXL_SWMC/experiments/vectordb/host-gate.sh check "$E/gate-$NAME.txt" || stop "host gate"; fi
 T0=$(date +%s)
+if [ "$SYS" = Popcorn ]; then  # same cycle as experiments/kv/pilot-run.sh; enable BEFORE the servers
+  PS=(K=$K8 GT=$GT8 C=$C8 R=$E/shm-$NAME INIT_STATE=shared)
+  for ph in precheck load chown; do env "${PS[@]}" bash $C8/p-popcorn-shm.sh $ph || stop "shm $ph"; done
+  for ip in "${IPS[@]}"; do
+    [ "$($SSH comsys@$ip "sha256sum $V/cfg/cxl_region.yaml $GT8/cxl_region.yaml | cut -d' ' -f1 | sort -u | wc -l" < /dev/null)" = 1 ] \
+      || { env "${PS[@]}" bash $C8/p-popcorn-shm.sh teardown; stop "region config differs on $ip"; }
+  done
+  env "${PS[@]}" bash $C8/p-popcorn-shm.sh enable || { env "${PS[@]}" bash $C8/p-popcorn-shm.sh teardown; stop "enable gate"; }
+  for ip in "${IPS[@]}"; do
+    m=$($SSH comsys@$ip "sudo -n sh -c 'echo $RECV_MODE > /sys/module/cxl_shm/parameters/recv_mode' && cat /sys/module/cxl_shm/parameters/recv_mode" < /dev/null)
+    echo "$ip recv_mode=$m" >> "$E/recv-mode-$NAME.txt"
+    [ "$m" = "$RECV_MODE" ] || { env "${PS[@]}" bash $C8/p-popcorn-shm.sh teardown; stop "recv_mode on $ip = $m"; }
+  done
+  env "${PS[@]}" STATUS_TAG=pre bash $C8/p-popcorn-shm.sh status || { env "${PS[@]}" bash $C8/p-popcorn-shm.sh teardown; stop "status pre"; }
+fi
 bash $X/run.sh "$NAME" "$E" -- "${LG[@]}"
 RC=$?
+if [ "$SYS" = Popcorn ]; then
+  env "${PS[@]}" STATUS_TAG=post bash $C8/p-popcorn-shm.sh status
+  servers_gone || stop "servers left (Popcorn teardown not attempted)"
+  env "${PS[@]}" bash $C8/p-popcorn-shm.sh teardown || stop "shm teardown"
+fi
 servers_gone || stop "servers left"
 R=$E/$NAME
 [ -d "$R" ] || stop "no run dir"

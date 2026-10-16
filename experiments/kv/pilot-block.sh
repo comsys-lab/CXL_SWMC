@@ -14,6 +14,8 @@
 #        three rates is a NOTE (recorded, the block continues); every other stop ends the block. FIX_RATE set: after
 #        each system's SLO search, a separate run <sys>-u5-fix = one 30 s fixed-load window at FIX_RATE req/s (KIND=fix:
 #        no SLO abort; an aborted (saturated) window is a NOTE and is reported).
+#   v1val: KV-V1 validation (reports/KV-V1-packet.md): per system (all-HWcc, Megalon timers on and off, Popcorn) and
+#        mix (put 0.05, 0.8) one ladder run (low rate, ~0.5 x v5 pilot max), closure checks v1-check.py after each.
 #   idle: low-rate latency check: one all-HWcc ladder run (KIND=ladder, RATES, KEYS) tagged CTAG (Host C-state setting,
 #        recorded from sysfs before the run).
 #   hmtrace: only the traced 0.5 windows of all-HWcc and Megalon (shuffled) at L from an earlier hm block (LREF), e.g.
@@ -40,7 +42,7 @@ export VM_PLAIN=$VP VM_MEG=$VM PLAIN_BUILD=$BP MEG_BUILD=$BM LOADGEN_BUILD=$BL
 CFG=${KV_CFG:?KV_CFG = the megalon.yaml install.sh wrote (<install log>.megalon.yaml)}
 SSH="ssh -o BatchMode=yes -o ConnectTimeout=8"
 IPS=(192.168.122.100 192.168.122.101)
-OWNER="KV-pilot-$B"; [ "$B" = main ] && OWNER="KV-main-h1"
+OWNER="KV-pilot-$B"; [ "$B" = main ] && OWNER="KV-main-h1"; [ "$B" = v1val ] && OWNER="KV-V1-v1"
 [ -d "$E" ] && [ -z "$(ls -A "$E" | grep -v '^sequence')" ] || { echo "SEQUENCE STOP: $E missing or not empty"; exit 2; }
 grep -q "^megalon_build=$P/builds/megalon/${MEGALON_BUILD_N:-75}$" "$BM/manifest.txt" && grep -q "^source_commit=$BPIN dirty=0$" "$BM/manifest.txt" \
   || { echo "SEQUENCE STOP: $BM is not a clean build of $BPIN on builds/megalon/${MEGALON_BUILD_N:-75}"; exit 2; }
@@ -105,13 +107,14 @@ x=c.get("x_mean",0); assert x > 0, "no confirm result"; print(round(0.5 * x, 3))
 }
 tag() { case $1 in 0) echo u0;; 0.05) echo u5;; 0.2) echo u20;; 0.5) echo u50;; 0.8) echo u80;; esac; }
 precheck() {
-  local i f files="${VP#/home/comsys/}/bin/kv-server ${VP#/home/comsys/}/bin/kv-node.sh ${VP#/home/comsys/}/lib/libkv-megalon.so ${VP#/home/comsys/}/lib/libmegalon.so ${VP#/home/comsys/}/cfg/cxl_region.yaml ${VP#/home/comsys/}/cfg/megalon.yaml ${VM#/home/comsys/}/bin/kv-server ${VM#/home/comsys/}/lib/libkv-megalon.so ${VM#/home/comsys/}/lib/libmegalon.so ${VM#/home/comsys/}/cfg/cxl_region.yaml ${VM#/home/comsys/}/cfg/megalon.yaml"
+  local i f files="${VP#/home/comsys/}/bin/kv-server ${VP#/home/comsys/}/bin/kv-node.sh ${VP#/home/comsys/}/lib/libkv-megalon.so ${VP#/home/comsys/}/lib/libmegalon.so ${VP#/home/comsys/}/cfg/cxl_region.yaml ${VP#/home/comsys/}/cfg/megalon.yaml ${VM#/home/comsys/}/bin/kv-server ${VM#/home/comsys/}/lib/libkv-megalon.so ${VM#/home/comsys/}/lib/libmegalon.so ${VM#/home/comsys/}/lib/libmegalon-objapi.so ${VM#/home/comsys/}/cfg/cxl_region.yaml ${VM#/home/comsys/}/cfg/megalon.yaml"
   for i in 0 1; do
     $SSH comsys@${IPS[$i]} "EXPECT_K=$K8 INSTALL_FILES='$files' bash -s" < $X/precheck.sh > "$E/precheck-${IPS[$i]}.out" 2>&1
     grep -q "^PRECHECK PASS" "$E/precheck-${IPS[$i]}.out" || { echo "SEQUENCE STOP: precheck ${IPS[$i]}"; exit 1; }
     for f in "${VP#/home/comsys/}/bin/kv-server $BP/bin/kv-server" "${VP#/home/comsys/}/lib/libkv-megalon.so $BP/lib/libkv-megalon.so" \
              "${VP#/home/comsys/}/lib/libmegalon.so $BP/lib/libmegalon.so" "${VM#/home/comsys/}/bin/kv-server $BM/bin/kv-server" \
              "${VM#/home/comsys/}/lib/libkv-megalon.so $BM/lib/libkv-megalon.so" "${VM#/home/comsys/}/lib/libmegalon.so $BM/lib/libmegalon.so" \
+             "${VM#/home/comsys/}/lib/libmegalon-objapi.so $BM/lib/libmegalon-objapi.so" \
              "${VP#/home/comsys/}/cfg/megalon.yaml $CFG" "${VM#/home/comsys/}/cfg/megalon.yaml $CFG" \
              "${VP#/home/comsys/}/cfg/cxl_region.yaml $P/CXL_SWMC/config/cxl_region.yaml" "${VM#/home/comsys/}/cfg/cxl_region.yaml $P/CXL_SWMC/config/cxl_region.yaml" \
              "${VP#/home/comsys/}/bin/kv-node.sh $P/CXL_SWMC/scripts/guest/kv-node.sh"; do
@@ -194,6 +197,38 @@ case "$B" in
     done
     r=$(confirm_l $LREF/hw-u50-pslo/loadgen/summary.json) || { echo "SEQUENCE STOP: no all-HWcc result for 0.5 in $LREF"; exit 1; }
     run pop-u50-ptrace "${PE[@]}" PUT_RATIO=0.5 KIND=ptrace RATE=$r;;
+  v1val)  # KV-V1 (reports/KV-V1-packet.md): MOT1 v6 KV validation on Popcorn build 10. Per system and mix (u5, u80)
+    # one ladder run (one server lifetime): a low step and one at ~0.5 x the v5 pilot max (u80: the u50 pilot max; no
+    # u80 pilot exists), no SLO abort; Megalon also with MEGALON_COH_TIMERS=0 at the same rates (instrumentation
+    # overhead); closure checks v1-check.py after every run (a FAIL stops the block). Order: all-HWcc / Megalon runs
+    # shuffled (dax0.0 comsys), then dax0.0 back to root:root 600, then Popcorn (its own shm cycle per run).
+    : "${C8:?}" "${GT8:?}" "${RECV_MODE:?}" "${KEYS:?}"
+    LOW=${V1_LOW:-2000}
+    hi() {  # system mix -> high rate (requests/s); V1_HI_<sys>_<mix> overrides
+      local v="V1_HI_$1_$2"; [ -n "${!v:-}" ] && { echo "${!v}"; return; }
+      case $1-$2 in hw-u5) echo 64300;; mg-u5) echo 63900;; pop-u5) echo 16400;;
+                    hw-u80) echo 44000;; mg-u80) echo 44000;; pop-u80) echo 9700;; esac; }
+    v1chk() {  # run name, system, [timers]
+      python3 -I $X/v1-check.py "$E/$1" --system $2 ${3:+--timers $3} | tee -a "$E/v1-check.log" | grep -q "V1 CHECK PASS" \
+        || { echo "$(date -Is) SEQUENCE STOP: v1-check $1"; exit 1; }
+    }
+    ORD=$(shuffle hw:u5 hw:u80 mg:u5 mg:u80 mgoff:u5 mgoff:u80)
+    echo "# KV-V1 order (shuffle seed $OWNER): $ORD then pop:u5 pop:u80; keys $KEYS batch 16; low $LOW req/s" | tee "$E/order.txt"
+    dax_comsys_all
+    for sm in $ORD; do
+      s=${sm%%:*} m=${sm#*:}; u=0.05; [ $m = u80 ] && u=0.8
+      case $s in
+        hw)    run hw-$m-val SYS=all-HWcc PUT_RATIO=$u KIND=ladder RATES=$LOW,$(hi hw $m) KEYS=$KEYS; v1chk hw-$m-val all-HWcc;;
+        mg)    run mg-$m-val SYS=Megalon PUT_RATIO=$u KIND=ladder RATES=$LOW,$(hi mg $m) KEYS=$KEYS COH_TIMERS=1; v1chk mg-$m-val Megalon on;;
+        mgoff) run mg-$m-val-toff SYS=Megalon PUT_RATIO=$u KIND=ladder RATES=$LOW,$(hi mg $m) KEYS=$KEYS COH_TIMERS=0; v1chk mg-$m-val-toff Megalon off;;
+      esac
+    done
+    dax_root_all || { echo "SEQUENCE STOP: dax0.0 not back to root:root 600 before Popcorn"; exit 1; }; CHOWNED=0
+    for m in u5 u80; do
+      u=0.05; [ $m = u80 ] && u=0.8
+      run pop-$m-val SYS=Popcorn C8=$C8 K8=$K8 GT8=$GT8 RECV_MODE=$RECV_MODE PUT_RATIO=$u KIND=ladder RATES=$LOW,$(hi pop $m) KEYS=$KEYS
+      v1chk pop-$m-val Popcorn
+    done;;
   *) echo "SEQUENCE STOP: bad block"; exit 2;;
 esac
 echo "$(date -Is) SEQUENCE DONE $OWNER"

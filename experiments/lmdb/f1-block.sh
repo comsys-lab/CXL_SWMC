@@ -4,12 +4,14 @@
 # block, from G1 (install.sh) to the rollback; on EVERY exit: this block's lmdb processes stopped on both VMs, /dev/dax0.0 back to root:root 600
 # on both VMs (fresh stat check per VM; "ROLLBACK FAIL" otherwise), lock released. Stops at the first unexpected result.
 # usage: f1-block.sh <evidence dir (exists; empty except gate-H0.txt / tasks-check.txt / image.log)>
-# env: IMG (Host image dir from H0; required), EXPECT_K (guest kernel release, as recorded in state/HANDOFF.md; required), PLAIN_BUILD / MEG_BUILD /
+# env: POPCORN (0; 1 adds Part P: Popcorn build >= 10 runs, needs C8 K8 GT8 RECV_MODE as experiments/kv/pilot-block),
+#   IMG (Host image dir from H0; required), EXPECT_K (guest kernel release, as recorded in state/HANDOFF.md; required), PLAIN_BUILD / MEG_BUILD /
 #   LOADGEN_BUILD (pilot-run.sh defaults; PLAIN_BUILD also gives the Host lmdb-server for --print-app-bytes)
 set -uo pipefail
 E=$1
 P=/home/comsys/sungsu/destijl-control X=$P/CXL_SWMC/experiments/lmdb G=$P/CXL_SWMC/experiments/vectordb/host-gate.sh
 : "${EXPECT_K:?EXPECT_K = guest kernel release}" "${IMG:?IMG = Host image dir (H0)}"
+[ "${POPCORN:-0}" = 0 ] || : "${C8:?}" "${K8:?}" "${GT8:?}" "${RECV_MODE:?}"
 OWNER=LMDB-F1-v1 L=/home/comsys/lmdb R=1000000 MAXP=600000
 SSH="ssh -o BatchMode=yes -o ConnectTimeout=8"
 IPS=(192.168.122.100 192.168.122.101)
@@ -17,6 +19,14 @@ IPS=(192.168.122.100 192.168.122.101)
 [ -s "$E/tasks-check.txt" ] || { echo "BLOCK STOP: $E/tasks-check.txt missing (state/TASKS.md: no other active VM user)"; exit 2; }
 bash $G lock $OWNER || { echo "BLOCK STOP: lock"; exit 2; }
 finish() {
+  if [ "${POPCORN:-0}" = 1 ]; then  # Popcorn: tear down every attempted cxl_shm load without "teardown PASS"
+    for r in "$E"/shm-*/; do
+      r=${r%/}; [ -f "$r/load-vm0.txt" ] || continue
+      grep -q "teardown PASS" "$r/steps.log" 2>/dev/null && continue
+      env K=$K8 GT=$GT8 C=$C8 R=$r bash $C8/p-popcorn-shm.sh teardown >> "$E/cleanup.out" 2>&1
+      grep -q "teardown PASS" "$r/steps.log" 2>/dev/null || echo "CLEANUP FAILED: $r" | tee -a "$E/cleanup.out"
+    done
+  fi
   for ip in "${IPS[@]}"; do
     $SSH comsys@$ip 'pkill -x lmdb-server; pkill -x lmdb-stress; sleep 2; echo procs=$(pgrep -c -x lmdb-server)/$(pgrep -c -x lmdb-stress)' < /dev/null 2>&1 | sed "s/^/$(date -Is) $ip /" >> "$E/rollback.out"
     out=$($SSH comsys@$ip 'sudo -n chown root:root /dev/dax0.0 && sudo -n chmod 600 /dev/dax0.0; echo stat=$(stat -c "%U:%G %a" /dev/dax0.0); dmesg | tail -n 5' < /dev/null 2>&1)
@@ -86,6 +96,10 @@ run() {  # name, env...
   env LOCK_OWNER=$OWNER "$@" bash $X/pilot-run.sh "$name" "$E" 2>&1 | tee -a "$E/runs.log" | grep -E "^PILOTRUN"
   [ ${PIPESTATUS[0]} = 0 ] || stop "$name"
   grep -q "^PILOTRUN $name OK" "$E/runs.log" || stop "$name not OK"
+  local sys; for x in "$@"; do case $x in SYS=*) sys=${x#SYS=};; esac; done
+  # closure checks (opsplit vs server counters; all-HWcc C = 0, Megalon C > 0, Popcorn C > 0 via swmc_acct)
+  python3 -I $P/CXL_SWMC/experiments/kv/v1-check.py "$E/$name" --system $sys --workload lmdb | tee -a "$E/v1-check.log" \
+    | grep -q "V1 CHECK PASS" || stop "$name: v1-check"
 }
 PL=(VM_PLAIN=$L/plain IMAGE=$L/img-$R RECORDS=$R MAX_PAGES=$MAXP KIND=functional GATE=0 RATES=200,1000)
 ML=(VM_MEG=$L/megalon IMAGE=$L/img-$R RECORDS=$R MAX_PAGES=$MAXP KIND=functional GATE=0 RATES=200,1000 PREPARE_THREADS=8)
@@ -97,4 +111,14 @@ step "B1 Megalon stress"; NODE0_STRESS="--prepare-threads 8" stress B1-stress-me
 run mg-u50-func SYS=Megalon UPDATE_RATIO=0.5 LOG=1 "${ML[@]}"
 run mg-u5-func SYS=Megalon UPDATE_RATIO=0.05 "${ML[@]}"
 run mg-u80-func SYS=Megalon UPDATE_RATIO=0.8 "${ML[@]}"
+if [ "${POPCORN:-0}" = 1 ]; then  # Part P: dax0.0 back to root:root 600 (p-popcorn-shm.sh owns chown/teardown)
+  step "P0 dax0.0 root before Popcorn"
+  for ip in "${IPS[@]}"; do
+    out=$($SSH comsys@$ip 'sudo -n chown root:root /dev/dax0.0 && sudo -n chmod 600 /dev/dax0.0; echo stat=$(stat -c "%U:%G %a" /dev/dax0.0)' < /dev/null 2>&1)
+    echo "$ip $out" >> "$E/block.log"; echo "$out" | grep -qx "stat=root:root 600" || stop "dax0.0 root on $ip"
+  done
+  PP=(C8=$C8 K8=$K8 GT8=$GT8 RECV_MODE=$RECV_MODE)
+  run pop-u50-func SYS=Popcorn UPDATE_RATIO=0.5 LOG=1 "${PL[@]}" "${PP[@]}"
+  run pop-u80-func SYS=Popcorn UPDATE_RATIO=0.8 "${PL[@]}" "${PP[@]}"
+fi
 step "BLOCK DONE"
