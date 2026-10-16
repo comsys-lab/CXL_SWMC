@@ -266,12 +266,15 @@ class Thread {
   }
 
  private:
+  // consistent copy (Popcorn build 12 update sequence in reserved[2]; a plain copy on builds 9-11); only the swmc_acct
+  // area is used (the per-thread read/write_fault_ns of /proc read 0 unless instr/detail=1 on build >= 11)
   void pop_snap(uint64_t *v) const {
-    const volatile swmc_acct *a = &acct_;
-    v[0] = a->fault_ns[0], v[1] = a->fault_ns[1], v[2] = a->fault_ns[2];
-    v[3] = a->fault_cnt[0], v[4] = a->fault_cnt[1], v[5] = a->fault_cnt[2];
-    v[6] = a->ipi_ns, v[7] = a->ipi_cnt;
-    v[8] = a->reserved[0], v[9] = a->reserved[1];
+    swmc_acct c;
+    swmc_acct_snapshot(&acct_, &c);
+    v[0] = c.fault_ns[0], v[1] = c.fault_ns[1], v[2] = c.fault_ns[2];
+    v[3] = c.fault_cnt[0], v[4] = c.fault_cnt[1], v[5] = c.fault_cnt[2];
+    v[6] = c.ipi_ns, v[7] = c.ipi_cnt;
+    v[8] = c.reserved[SWMC_ACCT_NONTRANS_NS], v[9] = c.reserved[SWMC_ACCT_NONTRANS_CNT];
   }
   swmc_acct acct_{};  // aligned(64) by its type
   Table *t_ = nullptr;
