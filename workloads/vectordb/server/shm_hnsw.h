@@ -46,6 +46,31 @@ namespace vdb {
 // link block (commit_links), each delete-log entry (backend dlog_write). The initial image copy is not counted.
 inline thread_local uint64_t t_mod_bytes = 0;
 
+// Validation copies (MOT1 v6 §3.1, user decision 2026-10-16: C = only work all-HWcc does not do): a backend whose
+// reads must outlive a read section (Megalon) copies the bytes into per-attempt scratch, where the plain backend
+// reads in place. Every copy is counted; 1 in kVcopySample (random per copy) is timed with plain rdtsc (no fences).
+// Estimate = ticks_sampled x cnt / sampled (ratio estimator). In-place computations (distance on the object) are
+// not copies and are not counted. Read by server/opcoh.h around each section.
+constexpr uint64_t kVcopySample = 64;  // power of two
+struct VcopyCtr {
+  uint64_t cnt = 0, sampled = 0, ticks_sampled = 0, rs = 0;
+};
+inline thread_local VcopyCtr t_vcopy;
+template <class F> inline void validation_copy(F f) {
+  VcopyCtr &v = t_vcopy;
+  if (!v.rs) v.rs = 0x9e3779b97f4a7c15ull ^ uint64_t(reinterpret_cast<uintptr_t>(&v));
+  v.rs ^= v.rs << 13, v.rs ^= v.rs >> 7, v.rs ^= v.rs << 17;  // xorshift64
+  v.cnt++;
+  if ((v.rs >> 32 & (kVcopySample - 1)) == 0) {
+    const uint64_t t0 = __rdtsc();
+    f();
+    v.ticks_sampled += __rdtsc() - t0;
+    v.sampled++;
+  } else {
+    f();
+  }
+}
+
 struct alignas(64) GraphMeta {  // HWcc, one line; written under the segment write lock
   uint64_t ep_level;   // entry point (low 32) | max level (high 32); kNoEntry = empty graph
   uint64_t count;      // elements [0, count) are complete

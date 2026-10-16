@@ -76,7 +76,8 @@ constexpr uint16_t kRespCoh = 1;
 // section, the segment tasks and the final merge/encode on the finishing thread; update: the writer section); queueing
 // before the dequeue and the socket send of the reply are outside T.
 // t_ns = sum over sections of (end - start) [measured]; c_ns = pf_ns[0..2] + ipi_ns + mg_check_ns_sampled x
-// mg_read_sections / mg_check_sampled (ratio estimator, 0 if nothing sampled) + mg_stale_ns + mg_concur_ns + mg_meta_ns + mg_spin_ns + mg_wstart_ns + mg_wflush_ns [derived;
+// mg_read_sections / mg_check_sampled (ratio estimator, 0 if nothing sampled) + vcopy_ns_sampled x vcopy_cnt /
+// vcopy_sampled (Megalon validation copies, same estimator; user decision 2026-10-16) + mg_stale_ns + mg_concur_ns + mg_meta_ns + mg_spin_ns + mg_wstart_ns + mg_wflush_ns [derived;
 // only one system's part is non-zero in practice]. mod_bytes (updates): bytes of the whole lines the application
 // stores in SWcc (vector record, zeroed link blocks, committed link blocks, delete-log entry) [measured].
 struct __attribute__((packed)) OpCoh {
@@ -102,9 +103,11 @@ struct __attribute__((packed)) OpCoh {
   uint64_t wait_ns;   // search: E1 wait (polling P >= ref_w) inside the start section, part of t_ns [measured]
   uint64_t nontrans_ns;   // Popcorn coherence faults without an MSI transition (swmc_acct reserved[0], build 10);
   uint32_t nontrans_cnt;  // reserved[1]; NOT part of c_ns [measured]
-  uint32_t pad;
+  uint32_t vcopy_cnt;     // Megalon validation copies into per-attempt scratch (every copy) [measured]
+  uint64_t vcopy_ns_sampled;  // sum over the sampled copies (1 in kVcopySample, rdtsc) [sampled]
+  uint32_t vcopy_sampled, pad2;
 };
 constexpr uint16_t kOpCohVersion = 2;
-static_assert(sizeof(OpCoh) == 232, "OpCoh wire size (experiments/vectordb/opsplit.py)");
+static_assert(sizeof(OpCoh) == 248, "OpCoh wire size (experiments/vectordb/opsplit.py)");
 
 }  // namespace vdb

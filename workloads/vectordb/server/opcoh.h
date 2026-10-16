@@ -51,6 +51,7 @@ inline const uint64_t *words(const mshim::CohSnap &s) { return reinterpret_cast<
 
 struct CohVals {  // cumulative values of one thread
   uint64_t pf_ns[3] = {}, pf_cnt[3] = {}, ipi_ns = 0, ipi_cnt = 0, nt_ns = 0, nt_cnt = 0;
+  uint64_t vc_cnt = 0, vc_sampled = 0, vc_ticks = 0;  // validation copies (shm_hnsw.h t_vcopy)
   mshim::CohSnap mg{};
 };
 
@@ -60,9 +61,11 @@ struct OpAcc {
   uint32_t sections = 0;
   uint64_t pf_ns[3] = {}, pf_cnt[3] = {}, ipi_ns = 0, ipi_cnt = 0, mod_bytes = 0;
   uint64_t nt_ns = 0, nt_cnt = 0;  // Popcorn no-transition faults (swmc_acct reserved[0..1]); not part of C
+  uint64_t vc_cnt = 0, vc_sampled = 0, vc_ticks = 0;  // Megalon validation copies (part of C, ratio estimate)
   mshim::CohSnap mg{};  // summed deltas; check_sample = the snapshot's value (not a delta)
   void add(const OpAcc &d) {
-    ticks += d.ticks, wait_ticks += d.wait_ticks, sections += d.sections, nt_ns += d.nt_ns, nt_cnt += d.nt_cnt, ipi_ns += d.ipi_ns, ipi_cnt += d.ipi_cnt, mod_bytes += d.mod_bytes;
+    ticks += d.ticks, wait_ticks += d.wait_ticks, sections += d.sections, nt_ns += d.nt_ns, nt_cnt += d.nt_cnt,
+    vc_cnt += d.vc_cnt, vc_sampled += d.vc_sampled, vc_ticks += d.vc_ticks, ipi_ns += d.ipi_ns, ipi_cnt += d.ipi_cnt, mod_bytes += d.mod_bytes;
     for (int i = 0; i < 3; i++) pf_ns[i] += d.pf_ns[i], pf_cnt[i] += d.pf_cnt[i];
     const uint64_t cs = mg.check_sample ? mg.check_sample : d.mg.check_sample;
     for (int k = 0; k < kSnapWords; k++) words(mg)[k] += words(d.mg)[k];
@@ -80,6 +83,10 @@ inline uint64_t mg_check_est_ns(const mshim::CohSnap &d) {
 }
 inline uint64_t mg_coh_ns(const mshim::CohSnap &d) {
   return mg_check_est_ns(d) + d.stale_ns + d.concur_ns + d.meta_ns + d.spin_ns + d.wstart_ns + d.wflush_ns;
+}
+// Validation-copy estimate of a block (ns): ratio estimator over the block's own counts (0 if nothing sampled).
+inline uint64_t vcopy_est_ns(const OpCoh &b) {
+  return b.vcopy_sampled ? uint64_t((unsigned __int128)b.vcopy_ns_sampled * b.vcopy_cnt / b.vcopy_sampled) : 0;
 }
 inline uint64_t pop_coh_ns(const OpAcc &a) { return a.pf_ns[0] + a.pf_ns[1] + a.pf_ns[2] + a.ipi_ns; }
 
@@ -112,7 +119,9 @@ inline OpCoh op_block(const OpAcc &a, uint16_t op, int pop_src, bool mg_snap, ui
   b.mod_bytes = a.mod_bytes;
   b.wait_ns = ticks_to_ns(a.wait_ticks, tsc_khz);
   b.nontrans_ns = a.nt_ns, b.nontrans_cnt = uint32_t(a.nt_cnt);
-  b.c_ns = pop_coh_ns(a) + mg_coh_ns(m);
+  b.vcopy_cnt = uint32_t(a.vc_cnt), b.vcopy_sampled = uint32_t(a.vc_sampled);
+  b.vcopy_ns_sampled = ticks_to_ns(a.vc_ticks, tsc_khz);
+  b.c_ns = pop_coh_ns(a) + mg_coh_ns(m) + vcopy_est_ns(b);
   return b;
 }
 
@@ -184,6 +193,7 @@ class OpCohSrc {
       }
     }
     s->mod = t_mod_bytes;
+    s->v.vc_cnt = t_vcopy.cnt, s->v.vc_sampled = t_vcopy.sampled, s->v.vc_ticks = t_vcopy.ticks_sampled;
     s->tsc = rdtsc();
   }
   // End of a section begun with s: adds the deltas (and one section) to *a. false: a counter read failed (the
@@ -193,6 +203,8 @@ class OpCohSrc {
     a->ticks += t1 - s.tsc;
     a->sections += 1;
     a->mod_bytes += t_mod_bytes - s.mod;
+    a->vc_cnt += t_vcopy.cnt - s.v.vc_cnt, a->vc_sampled += t_vcopy.sampled - s.v.vc_sampled;
+    a->vc_ticks += t_vcopy.ticks_sampled - s.v.vc_ticks;
     if (!on_) return true;
     CohVals e = s.v;
     const bool ok = read(&e, true);

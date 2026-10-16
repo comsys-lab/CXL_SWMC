@@ -135,7 +135,7 @@ struct Stats {
 // experiments/analysis/v6_common.py): opt.<op>.{ops,t_ns,c_ns,mod_bytes}, opt.<op>.pop.<f>, opt.<op>.meg.<f>; sums over
 // the operations answered (the same values as the response blocks; the server's completion time decides the window).
 struct OpWin {
-  static constexpr int kPop = 10, kMeg = 20;
+  static constexpr int kPop = 10, kMeg = 23;
   std::atomic<uint64_t> ops{0}, sections{0}, t_ns{0}, c_ns{0}, mod_bytes{0}, wait_ns{0}, pop[kPop]{}, meg[kMeg]{};
   void add(const OpCoh &b) {
     ops++, sections += b.sections, t_ns += b.t_ns, c_ns += b.c_ns, mod_bytes += b.mod_bytes, wait_ns += b.wait_ns;
@@ -145,7 +145,7 @@ struct OpWin {
                               b.mg_stale_cnt, b.mg_stale_ns, b.mg_concur_cnt, b.mg_concur_ns, b.mg_meta_cnt,
                               b.mg_meta_ns, b.mg_spin_cnt, b.mg_spin_ns, b.mg_wstart_ns, b.mg_switch_rw_cnt,
                               b.mg_switch_rw_ns, b.mg_reclaim_cnt, b.mg_reclaim_ns, b.mg_wflush_cnt, b.mg_wflush_ns,
-                              b.mg_wflush_bytes};
+                              b.mg_wflush_bytes, b.vcopy_ns_sampled, b.vcopy_sampled, b.vcopy_cnt};
     for (int i = 0; i < kPop; i++) pop[i] += p[i];
     for (int i = 0; i < kMeg; i++) meg[i] += m[i];
   }
@@ -155,7 +155,8 @@ struct OpWin {
     static const char *const mn[kMeg] = {"read_sections", "write_sections", "check_ns_sampled", "check_sampled",
                                          "stale_cnt", "stale_ns", "concur_cnt", "concur_ns", "meta_cnt", "meta_ns",
                                          "spin_cnt", "spin_ns", "wstart_ns", "switch_rw_cnt", "switch_rw_ns",
-                                         "reclaim_cnt", "reclaim_ns", "wflush_cnt", "wflush_ns", "wflush_bytes"};
+                                         "reclaim_cnt", "reclaim_ns", "wflush_cnt", "wflush_ns", "wflush_bytes",
+                                         "vcopy_ns_sampled", "vcopy_sampled", "vcopy_cnt"};
     const std::string p = std::string("\nopt.") + name + ".";
     o << p << "ops=" << ops << p << "sections=" << sections << p << "t_ns=" << t_ns << p << "c_ns=" << c_ns << p
       << "mod_bytes=" << mod_bytes << p << "wait_ns=" << wait_ns;

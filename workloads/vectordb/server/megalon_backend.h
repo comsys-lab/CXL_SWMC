@@ -373,7 +373,7 @@ class MegalonBackend {
       const uint64_t a = e % p_.dlog_chunk, n = std::min<uint64_t>(p_.dlog_chunk - a, to - e);
       buf.resize(n);
       read(dlog_id(node, e / p_.dlog_chunk), a * sizeof(DlogEntry), n * sizeof(DlogEntry),
-           [&](const uint8_t *src) { std::memcpy(buf.data(), src, n * sizeof(DlogEntry)); },
+           [&](const uint8_t *src) { validation_copy([&] { std::memcpy(buf.data(), src, n * sizeof(DlogEntry)); }); },
            Elem{uint32_t(a), uint16_t(n)});
       for (const DlogEntry &d : buf) f(d);
       e += n;
@@ -585,20 +585,21 @@ class MegalonAcc {
                        velem(i));
   }
   const ElemHeader &header(uint32_t i, ElemHeader &tmp) const {
-    m_.be->read(vid(i), voff(i), sizeof(ElemHeader), [&](const uint8_t *src) { std::memcpy(&tmp, src, sizeof(tmp)); },
-                velem(i));
+    m_.be->read(vid(i), voff(i), sizeof(ElemHeader),
+                [&](const uint8_t *src) { validation_copy([&] { std::memcpy(&tmp, src, sizeof(tmp)); }); }, velem(i));
     return tmp;
   }
   const float *vec(uint32_t i, float *tmp) const {
     m_.be->read(vid(i), voff(i) + sizeof(ElemHeader), uint64_t(p_.dim) * 4,
-                [&](const uint8_t *src) { std::memcpy(tmp, src, size_t(p_.dim) * 4); }, velem(i));
+                [&](const uint8_t *src) { validation_copy([&] { std::memcpy(tmp, src, size_t(p_.dim) * 4); }); },
+                velem(i));
     return tmp;
   }
   const uint32_t *links(uint32_t i, int level, uint64_t uo, uint32_t *tmp) const { return links_mut(i, level, uo, tmp); }
   uint32_t *links_mut(uint32_t i, int level, uint64_t uo, uint32_t *tmp) const {
     const uint64_t n = lbytes(level);
-    m_.be->read(lid(i), loff(i, level, uo), n, [&](const uint8_t *src) { std::memcpy(tmp, src, n); },
-                link_elem(i % N_, level));
+    m_.be->read(lid(i), loff(i, level, uo), n,
+                [&](const uint8_t *src) { validation_copy([&] { std::memcpy(tmp, src, n); }); }, link_elem(i % N_, level));
     return tmp;
   }
   void commit_links(uint32_t i, int level, uint64_t uo, const uint32_t *p) const {

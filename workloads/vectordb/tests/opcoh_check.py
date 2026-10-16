@@ -67,7 +67,9 @@ check((cs["sections"] == seg + 1).all() and (cu["sections"] == 1).all(), "sectio
 check((c["t_ns"] > 0).all(), "t_ns > 0")
 chk = np.array([int(x["mg_check_ns_sampled"]) * int(x["mg_read_sections"]) // int(x["mg_check_sampled"])
                 if x["mg_check_sampled"] else 0 for x in c], dtype=np.uint64)
-mg = (chk + c["mg_stale_ns"] + c["mg_concur_ns"] + c["mg_meta_ns"]
+vce = np.array([int(x["vcopy_ns_sampled"]) * int(x["vcopy_cnt"]) // int(x["vcopy_sampled"]) if x["vcopy_sampled"] else 0
+                for x in c], dtype=np.uint64)
+mg = (chk + vce + c["mg_stale_ns"] + c["mg_concur_ns"] + c["mg_meta_ns"]
       + c["mg_spin_ns"] + c["mg_wstart_ns"] + c["mg_wflush_ns"])
 check((c["c_ns"] == c["pf_ns"].sum(axis=1) + c["ipi_ns"] + mg).all(), "c_ns = parts")
 for op, x in (("search", cs), ("update", cu)):
@@ -76,6 +78,8 @@ for op, x in (("search", cs), ("update", cu)):
     for k, v in (("t_ns", x["t_ns"]), ("c_ns", x["c_ns"]), ("mod_bytes", x["mod_bytes"]), ("pop.is_ns", x["pf_ns"][:, 0]),
                  ("pop.sm_ns", x["pf_ns"][:, 1]), ("pop.ipi_ns", x["ipi_ns"]), ("meg.wflush_bytes", x["mg_wflush_bytes"])):
         check(tot(k) == int(v.astype(np.uint64).sum()), f"opt.{op}.{k} = records' sum ({tot(k)} vs {int(v.sum())})")
+for op, x in (("search", cs), ("update", cu)):
+    check(sum(s[f"opt.{op}.meg.vcopy_cnt"] for s in st) == int(x["vcopy_cnt"].astype(np.uint64).sum()), f"opt.{op}.meg.vcopy_cnt")
 check(all(s["opcoh.read_errors"] == 0 and s["opcoh.register_errors"] == 0 for s in st), "no counter read/register errors")
 check((cs["mod_bytes"] == 0).all(), "search mod_bytes 0")
 check((cs["wait_ns"] <= cs["t_ns"]).all() and (cu["wait_ns"] == 0).all(), "E1 wait inside search T, 0 for updates")
@@ -102,9 +106,12 @@ elif mode == "megalon":
     else:
         mgf = [f for f in opsplit.OPCOH.names if f.startswith("mg_")]
         check(all((c[f] == 0).all() for f in mgf) and ((c["src"] & 4) == 0).all(), "no CohSnap: mg fields 0")
+    check((cs["vcopy_cnt"] > 0).all() and c["vcopy_sampled"].sum() > 0, "validation copies counted and sampled")
     check(all(s["opcoh.pop_source"] == "none" for s in st), "popcorn source none on the Host")
     check(all(s["megt.writer.wr_sections"] > 0 for s in st), "writer write sections")
-elif mode == "none":
+if mode != "megalon":
+    check((c["vcopy_cnt"] == 0).all(), "plain backend: no validation copies")
+if mode == "none":
     check(all(s["opcoh.pop_source"] == "none" for s in st), "source none")
     check((c["c_ns"] == 0).all(), "c_ns 0")
 r = subprocess.run([sys.executable, os.path.join(ROOT, "experiments", "vectordb", "opsplit.py"), S],

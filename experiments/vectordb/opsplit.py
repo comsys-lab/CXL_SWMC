@@ -39,10 +39,11 @@ OPCOH = np.dtype([("version", "<u2"), ("src", "<u2"), ("op", "<u2"), ("sections"
                   ("mg_stale_ns", "<u8"), ("mg_concur_ns", "<u8"), ("mg_meta_ns", "<u8"), ("mg_spin_ns", "<u8"),
                   ("mg_wstart_ns", "<u8"), ("mg_switch_rw_ns", "<u8"), ("mg_reclaim_ns", "<u8"),
                   ("mg_wflush_ns", "<u8"), ("mg_wflush_bytes", "<u8"), ("mod_bytes", "<u8"), ("wait_ns", "<u8"),
-                  ("nontrans_ns", "<u8"), ("nontrans_cnt", "<u4"), ("pad2", "<u4")])
+                  ("nontrans_ns", "<u8"), ("nontrans_cnt", "<u4"), ("vcopy_cnt", "<u4"), ("vcopy_ns_sampled", "<u8"),
+                  ("vcopy_sampled", "<u4"), ("pad2", "<u4")])
 OPLOG = np.dtype([("seq", "<u8"), ("recv_ns", "<u8"), ("measured", "u1"), ("target", "u1"), ("status", "<u2"),
                   ("op", "<u2"), ("pad", "<u2"), ("c", OPCOH)])
-assert OPCOH.itemsize == 232 and OPLOG.itemsize == 256
+assert OPCOH.itemsize == 248 and OPLOG.itemsize == 272
 OP_SEARCH, OP_UPDATE = 3, 4
 OPS = {OP_SEARCH: "search", OP_UPDATE: "update"}
 POP_SRC = {0: "none", 1: "swmc_acct", 2: "swmc_file", 3: "fake"}
@@ -61,8 +62,8 @@ COLUMNS = [
      "from the worker's dequeue to the response being ready (search incl. the final merge); excludes queueing and the "
      "reply send"),
     ("wait_ms", "measured", "ms", "search: E1 wait (polling P >= ref_w) inside the start section, part of T_ms"),
-    ("C_ms", "derived", "ms", "C_o = Popcorn (pop_is + pop_sm + pop_wp + pop_ipi) + Megalon (mg_check + mg_stale + "
-     "mg_concur + mg_meta + mg_spin + mg_wstart + mg_wflush), step means"),
+    ("C_ms", "derived", "ms", "C_o = Popcorn (pop_is + pop_sm + pop_wp + pop_ipi) + Megalon (mg_check + mg_vcopy + "
+     "mg_stale + mg_concur + mg_meta + mg_spin + mg_wstart + mg_wflush), step means (only work all-HWcc does not do)"),
     ("rest_ms", "derived", "ms", "T_ms - C_ms"),
     ("C_frac", "derived", "", "C_ms / T_ms"),
     ("T_p50_ms", "measured", "ms", "per-operation T p50"),
@@ -82,6 +83,10 @@ COLUMNS = [
     ("pop_ipi_cnt", "measured", "count", "IPIs handled per operation"),
     ("mg_check_ms", "sampled", "ms", "Megalon section checks per operation, ratio estimator over the step: "
      "sum check_ns_sampled x sum mg_read_sections / sum check_sampled / N_o (read sections only)"),
+    ("mg_vcopy_ms", "sampled", "ms", "Megalon validation copies into per-attempt scratch (header / vector / link block / "
+     "delete-log reads that must outlive the section; plain reads in place), ratio estimator over the step: sum "
+     "vcopy_ns_sampled x sum vcopy_cnt / sum vcopy_sampled / N_o; part of C"),
+    ("mg_vcopy_cnt", "measured", "count", "validation copies per operation"),
     ("mg_stale_ms", "measured", "ms", "Megalon (A) stale copy: flush + restart"),
     ("mg_concur_ms", "measured", "ms", "Megalon (B) concurrent write: flush + discarded section body"),
     ("mg_meta_ms", "measured", "ms", "Megalon (C) metadata change: discarded section"),
@@ -222,9 +227,12 @@ def analyze(run, tol_us=20.0):
             ns_s, rs, cs_ = (float(x[k].astype(np.float64).sum()) for k in ("mg_check_ns_sampled", "mg_read_sections",
                                                                             "mg_check_sampled"))
             chk_total = ns_s * rs / cs_ if cs_ else 0.0
+            vs, vc, vn = (float(x[k].astype(np.float64).sum()) for k in ("vcopy_ns_sampled", "vcopy_cnt", "vcopy_sampled"))
+            vcopy_total = vs * vc / vn if vn else 0.0
+            chk_total_c = chk_total + vcopy_total
             other = (x["pf_ns"].sum(axis=1).astype(np.float64) + x["ipi_ns"] + x["mg_stale_ns"] + x["mg_concur_ns"]
                      + x["mg_meta_ns"] + x["mg_spin_ns"] + x["mg_wstart_ns"] + x["mg_wflush_ns"])
-            C_step = (float(other.sum()) + chk_total) / n if n else None
+            C_step = (float(other.sum()) + chk_total_c) / n if n else None
             w = win.get(s["step"], {})
             wn = w.get(f"opt.{name}.ops", 0)
             row = dict(step=s["step"], phase=s["phase"], op=name,
@@ -240,6 +248,7 @@ def analyze(run, tol_us=20.0):
                        pop_nontrans_cnt=cnt(x["nontrans_cnt"]), pop_is_cnt=cnt(x["pf_cnt"][:, 0]), pop_sm_cnt=cnt(x["pf_cnt"][:, 1]),
                        pop_wp_cnt=cnt(x["pf_cnt"][:, 2]), pop_ipi_cnt=cnt(x["ipi_cnt"]),
                        mg_check_ms=chk_total / n / 1e6 if n else None,
+                       mg_vcopy_ms=vcopy_total / n / 1e6 if n else None, mg_vcopy_cnt=cnt(x["vcopy_cnt"]),
                        wb_bytes_mg=cnt(x["mg_wflush_bytes"]),
                        m_acq_bytes_pop=cnt((x["pf_cnt"][:, 1].astype(np.float64) + x["pf_cnt"][:, 2]) * PAGE),
                        wb_bytes_pop=(w["remote_wb"] * PAGE / w["opt.update.ops"]
