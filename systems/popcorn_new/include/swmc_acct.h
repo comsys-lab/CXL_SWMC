@@ -32,11 +32,13 @@ struct swmc_acct {
 
 /* Register the calling thread's area (one per thread; it must stay valid until the thread exits or calls
  * swmc_acct_unregister()). 0 = ok, -1 = unsupported.
- * Kernel interface (Popcorn build 9): the thread writes the area's address to /proc/thread-self/swmc_acct (only
- * the thread itself may; "0" unregisters). The kernel zeroes the area, sets version, and from then on copies the
- * values (counted from 0 at registration) into it on every return to user mode after a counted fault/IPI. The
- * area must stay mapped and writable until the thread exits or unregisters; registration ends at execve and is
- * not inherited by new threads/processes. Any failure (older kernel: no such file; misaligned area) -> -1. */
+ * Kernel interface (Popcorn build 9+): the thread writes the area's address to /proc/thread-self/swmc_acct (only
+ * the thread itself may; "0" unregisters). The kernel zeroes the area, sets version, and from then on keeps the
+ * values (counted from 0 at registration) current: build 9/10 copy them on return to user mode, build 11 pins the
+ * area's page(s) and stores into them directly at the end of each counted fault/IPI (same values). The area must
+ * stay mapped and writable until the thread exits or unregisters; registration ends at execve and is not
+ * inherited by new threads/processes. Anonymous memory (heap, stack, static) is required for build 11 (the page
+ * is pinned; device mappings are refused). Any failure (older kernel: no such file; misaligned area) -> -1. */
 static inline int swmc_acct_register(struct swmc_acct *a) {
   char buf[32];
   int fd, n, ok;

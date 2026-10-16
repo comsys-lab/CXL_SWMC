@@ -18,7 +18,8 @@
 #             present and enabled, a comsys process touches one page of IPAGE
 #             (read, then write) and reads its own /proc/thread-self/swmc
 #             ("name value" lines, mode 0400, its uid; read/wp counts >= 1).
-#             Line count by build (from K): <= 8: 16, 9: 57, >= 10: 59.
+#             Line count by build (from K): <= 8: 16, 9: 57, 10: 59, >= 11: 62.
+#             Build >= 11 also: instr/detail = 0 and instr/sample_shift present.
 #             Build >= 9 also: the build-9 instr files, and the process
 #             registers a swmc_acct area (/proc/thread-self/swmc_acct, 0600)
 #             before the faults: version 1, is/wpu fault counts >= 1,
@@ -60,7 +61,7 @@ IPAGE=${IPAGE:-25019000} OBASE=${OBASE:-25020000} OREPS=${OREPS:-3} ORUN=${ORUN:
 # Popcorn build number from the release (…-ds-popcorn-new-<n>); selects the build-8/9/10 expectations.
 PBUILD=$(sed -n 's/.*-ds-popcorn-new-\([0-9]\{1,\}\)$/\1/p' <<<"$K")
 [ -n "$PBUILD" ] || PBUILD=0
-if [ "$PBUILD" -ge 10 ]; then SWMC_LINES=59; elif [ "$PBUILD" -ge 9 ]; then SWMC_LINES=57; else SWMC_LINES=16; fi
+if [ "$PBUILD" -ge 11 ]; then SWMC_LINES=62; elif [ "$PBUILD" -ge 10 ]; then SWMC_LINES=59; elif [ "$PBUILD" -ge 9 ]; then SWMC_LINES=57; else SWMC_LINES=16; fi
 fl() {  # fl <node> <step> <faultlat args...>: one faultlat step on a guest (results in popcorn-results/$PRUN)
   local k=$1; shift
   echo "[$(date +%T)] vm$k $1"
@@ -210,6 +211,12 @@ instr-check)
                swmc.serve_invalidate.revoke_ns cxl_shm.counters.kthread_work_ns; do
         grep -q "^$f " "$R/instr-before-vm$k.txt" || { log "STOP: $f missing on vm$k (build $PBUILD)"; exit 1; }
       done
+    fi
+    if [ "$PBUILD" -ge 11 ]; then
+      # instr-dump prints single-value files as <dir>.<file>.<value>
+      grep -qx "swmc.detail.0" "$R/instr-before-vm$k.txt" && grep -qx "swmc.sample_shift.[0-9]*" "$R/instr-before-vm$k.txt" &&
+        grep -qx "swmc.serve_fetch.phase_samples [0-9]*" "$R/instr-before-vm$k.txt" ||
+        { log "STOP: build-11 instr files (detail 0, sample_shift, phase_samples) missing on vm$k"; exit 1; }
     fi
   done
   for k in 0 1; do
