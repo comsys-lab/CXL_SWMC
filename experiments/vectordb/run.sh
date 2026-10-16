@@ -126,7 +126,10 @@ if [ -s "$RUN/loadgen/steps.jsonl" ] && [ -s "$RUN/loadgen/summary.json" ]; then
   [ ! -d "$RUN/loadgen/stats" ] || python3 "$ROOT/experiments/loadgen/stats_delta.py" "$RUN/loadgen" --out "$RUN/stats-steps.csv" || true
   python3 "$ROOT/experiments/loadgen/export_csv.py" --out "$RUN/steps.csv" "$RUN/loadgen=$SYSTEM" > /dev/null || true
   [ ! -s "$RUN/loadgen/op-coh.bin" ] || python3 "$HERE/opsplit.py" "$RUN" > "$RUN/opsplit.log" 2>&1 || true
-  ls "$RUN"/node*.vdbtrace.bin > /dev/null 2>&1 && { python3 "$ROOT/workloads/vectordb/tools/classify_sharing.py" "$RUN" > "$RUN/sharing.log" 2>&1 || true; }
+  # sharing trace classifier: Host node 1 only (CPUs and memory), nice 19, address-space cap CLASSIFY_MEM_GB (default
+  # 16; ~130 B per record: 2 x 1024 MiB traces need ~9 GB)
+  ls "$RUN"/node*.vdbtrace.bin > /dev/null 2>&1 && { (ulimit -v $(( ${CLASSIFY_MEM_GB:-16} * 1024 * 1024 )); exec nice -n 19 \
+    numactl --cpunodebind=1 --membind=1 python3 "$ROOT/workloads/vectordb/tools/classify_sharing.py" "$RUN") > "$RUN/sharing.log" 2>&1 || true; }
   python3 "$ROOT/experiments/loadgen/plot_slo.py" --out "$RUN/slo.png" "$RUN/loadgen=$SYSTEM" > "$RUN/slo-points.txt" 2>&1 || true
 fi
 grep -h "vdb-server: stopping" -A30 "$RUN"/node*.log | grep -E "^(node|P|elements|updates|inserts|deletes|searches|timeouts|bad_records)=" | tr '\n' ' '; echo

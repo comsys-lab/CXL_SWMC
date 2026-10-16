@@ -16,8 +16,10 @@ usage: opcoh_check.py <run or scratch dir> fake|megalon|none|hwcc|popcorn|megalo
   none:       plain backend, no counter source: c_ns = 0.
   VM modes (reports/VDB-V1-packet.md):
   hwcc:       all-HWcc (plain backend, cxl_shm unloaded): any Popcorn source, every Popcorn and Megalon part 0, c_ns 0.
-  popcorn:    Popcorn (plain backend, cxl_shm loaded): source swmc_acct; sum of c_ns > 0 over the searches and over the
-              updates; no Megalon part.
+  popcorn:    Popcorn (plain backend, cxl_shm loaded): source swmc_acct registered on both nodes (no register errors);
+              sum of c_ns > 0 over the updates (writer faults) and over the searches of ALL measured steps together; a
+              measured step whose searches have C = 0 prints "OPCOH_CHECK NOTE" (few invalidated pages read at a low
+              rate), not a failure; no Megalon part.
   megalon-vm: Megalon with CohSnap + AnchorSnap (shim v3): both present on every record, sum of c_ns > 0 per op type,
               validation copies counted; every Popcorn part 0 (cxl_shm unloaded).
   megalon-t0: as megalon-vm with MEGALON_COH_TIMERS=0: CohSnap/AnchorSnap present, Megalon durations may be 0 (counts
@@ -114,8 +116,11 @@ mg_fields = [f for f in opsplit.OPCOH.names if f.startswith("mg_") or f.startswi
 if mode == "hwcc":
     check(pop_zero and all((c[f] == 0).all() for f in mg_fields) and (c["c_ns"] == 0).all(), "all-HWcc: C = 0")
 elif mode == "popcorn":
-    check(all(s["opcoh.pop_source"] == "swmc_acct" for s in st) and ((c["src"] & 3) == 1).all(), "source swmc_acct")
-    check(int(cs["c_ns"].sum()) > 0 and int(cu["c_ns"].sum()) > 0, "Popcorn C > 0 for searches and updates")
+    check(all(s["opcoh.pop_source"] == "swmc_acct" and s["opcoh.register_errors"] == 0 for s in st)
+          and ((c["src"] & 3) == 1).all(), "swmc_acct registered on both nodes")
+    check(int(cu["c_ns"].sum()) > 0, "Popcorn update C > 0 (writer faults)")
+    meas = logs["measured"] == 1
+    check(int(logs["c"]["c_ns"][(logs["op"] == 3) & meas].sum()) > 0, "Popcorn search C > 0 over all measured steps")
     check(all((c[f] == 0).all() for f in mg_fields), "no Megalon part")
 elif mode in ("megalon-vm", "megalon-t0"):
     check(all(s["opt.meg_coh"] == 1 and s.get("opt.meg_anchor") == 1 for s in st), "CohSnap and AnchorSnap on both nodes")
@@ -163,6 +168,10 @@ if r.returncode == 0:
         check(all(x["match"] == "req_id" for x in rows), "id-based matching (rawid sidecars present)")
     check(tags.get("T_ms") == "measured" and tags.get("C_ms") == "derived" and tags.get("mg_check_ms", "").startswith("sampled×"),
           "column tags")
+    if mode == "popcorn":
+        for x in rows:
+            if x["op"] == "search" and x["n_ops"] not in ("", "0") and float(x["C_ms"] or 0) == 0:
+                print(f"OPCOH_CHECK NOTE: step {x['step']} ({x['achieved_per_s']} search/s): search C = 0")
     for x in rows:
         if x["op"] == "update" and x["win_n"]:
             check(abs(float(x["win_T_ms"]) - float(x["T_ms"])) <= 0.5 * float(x["T_ms"]) + 1e-6, "window T ~ record T")

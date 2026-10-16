@@ -9,8 +9,9 @@
 #      OPCOH_EXPECT / OPCOH_CHECK_MODE: hw none / hwcc, pop swmc_acct / popcorn, mg cohsnap / megalon-vm.
 #   2. Megalon timers off: mg-u5-t0 = step 1's Megalon run with MEGALON_COH_TIMERS=0 (same rates and seed), check mode
 #      megalon-t0. Overhead = step 1 Megalon (timers on) vs t0 at the same offered rates (one pair; noise stated).
-#   3. Sharing trace: mg-u90-trace, U=90, KIND=pfix, RATE_TRACE (search 2/s), TRACE=1, --trace-max-mb 2048; run.sh
-#      classifies the trace (sharing.csv); opsplit / opcoh_check megalon-vm as in step 1.
+#   3. Sharing trace: mg-u90-trace, U=90, KIND=pfix, RATE_TRACE (search 2/s), TRACE=1, --trace-max-mb 1024; run.sh
+#      classifies the trace on Host node 1 under a 16 GB address-space cap (sharing.csv); opsplit / opcoh_check
+#      megalon-vm as in step 1. trace.dropped must be 0 on both nodes.
 # usage: v6-block.sh <evidence dir (exists, holds only sequence* files)>
 # env (required, set by the packet's sequence.sh): K10 GT10 C10 (build-10 release, guest tools, deploy bundle),
 #   PLAIN_BUILD VPLAIN (vdb build + guest dir for all-HWcc and Popcorn), MEG_BUILD VMEG MEG_CFG (vdb-megalon build +
@@ -73,7 +74,9 @@ for s in $ORD; do
   one $s $s-u5-v6 U=5 RATE=$RATE_LOW,$RATE_L REP=v6 $m
 done
 one mg mg-u5-t0 U=5 RATE=$RATE_LOW,$RATE_L REP=t0 OPCOH_CHECK_MODE=megalon-t0 XENV=ENV:MEGALON_COH_TIMERS=0
-one mg mg-u90-trace U=90 RATE=$RATE_TRACE REP=trace TRACE=1 OPCOH_CHECK_MODE=megalon-vm "XARGS=--trace-max-mb 2048"
+one mg mg-u90-trace U=90 RATE=$RATE_TRACE REP=trace TRACE=1 OPCOH_CHECK_MODE=megalon-vm "XARGS=--trace-max-mb 1024"
 grep -q "^-> .*sharing.csv:" $E/mg-u90-trace/sharing.log || { echo "SEQUENCE STOP: trace not classified (see $E/mg-u90-trace/sharing.log)"; exit 1; }
+[ "$(grep -h '^trace.dropped=' $E/mg-u90-trace/node*.log | sort -u)" = "trace.dropped=0" ] \
+  || { echo "SEQUENCE STOP: trace records dropped (see node logs)"; exit 1; }
 python3 $X/v6_overhead.py $E/mg-u5-v6 $E/mg-u5-t0 > $E/timer-overhead.txt 2>&1 || { echo "SEQUENCE STOP: v6_overhead.py"; exit 1; }
 echo "$(date -Is) SEQUENCE DONE $OWNER"
