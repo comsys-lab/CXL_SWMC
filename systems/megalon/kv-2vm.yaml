@@ -16,7 +16,9 @@ node_id: 0                      # overridden by MEGALON_NODE_ID (kv-server sets 
 region_config: ""               # $CXL_REGION_CONFIG
 reinit: false                   # node 0: MEGALON_REINIT=1
 attach_mprotect: true
-stuck_timeout_ms: 10000
+stuck_timeout_ms: 600000        # 10 min (was 10 s; as recsys-2vm.yaml c5e03f00d). A replica stalls while its NR hash maps
+                                # double (rehash at 2^k x 7/8 entries; KV 54M Megalon: wmeta reverse map at 29.4M, Host 1.46 s;
+                                # reports/KV-main-packet.md §3); upstream NR waits without limit. Liveness guard only.
 log_sync_interval_us: 100
 nr_log_size: 64MB               # NR log: header in HWcc, 524,288 x 128 B entries in SWcc (cxl_port.h)
 attach_timeout_s: 600
