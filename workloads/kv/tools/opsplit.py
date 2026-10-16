@@ -11,8 +11,14 @@ One row per (step, operation type), summed over every target (node) with both sn
   C  = coherence-management time inside those operations / operations, by the run's SYSTEM:
        Popcorn / page MSI: fault time (I->S + S->M + write-protect) + TLB-shootdown IPI handling (swmc_acct);
                            faults without a transition (pop_nontrans_*, build 10) are exported but NOT in C
-       Megalon:            section checks (ratio estimate check_ns_sampled x read_sections / check_sampled, read
-                           sections only; contract CXL_SWMC 2015a31f3) + stale copy (A) + concurrent write (B) + metadata (C)
+       Megalon:            by the workload's all-HWcc (server gauge opt.c_formula; user decision MOT1 v6 §3.1):
+                           kv   (all-HWcc = Megalon hwcc flavor): (check - rseq) est + stale + concur + meta + spin
+                                + (wstart - wseq) + (wflush - wseq_end); anchor work NOT added
+                           lmdb (all-HWcc = plain, no Megalon): (check + read_lookup + read_nr) est + stale + concur
+                                + meta + spin + wstart + write_lookup + write_nr + wflush + validation copy est
+                           est = ratio estimate x read_sections / check_sampled (read sections only; anchor fields
+                           from AnchorSnap, Megalon >= 75, else 0). The text below describes the lmdb terms:
+                           section checks + stale copy (A) + concurrent write (B) + metadata (C)
                            + writer spin (D) + write start + write-end flush (CohSnap; switch_rw and reclaim are
                            parts of write start and shown separately) + the workload's validation copy (lmdb: 4 KiB
                            page copy of an accepted read section, which plain does not make; ratio estimate
@@ -85,6 +91,9 @@ def columns(ops_present):
     c += ["lib_bg_cpu_s[measured]", "recv_cpu_s[measured]", "coh_bg_cpu_s[derived]", "coh_bg_us_per_op[derived]"]
     c += ["meg_check_us_per_op[sampled_xN]", "meg_check_sample[measured]", "meg_vcopy_us_per_op[sampled_xN]",
           "meg_vcopy_per_op[measured]", "meg_lookup_us_per_op[sampled_xN]"]
+    c += ["c_formula", "meg_anc_read_lookup_us_per_op[sampled_xN]", "meg_anc_read_nr_us_per_op[sampled_xN]",
+          "meg_anc_rseq_us_per_op[sampled_xN]", "meg_anc_write_lookup_us_per_op[measured]",
+          "meg_anc_write_nr_us_per_op[measured]", "meg_anc_wseq_us_per_op[measured]", "meg_anc_wseq_end_us_per_op[measured]"]
     c += [f"meg_{k[:-3]}_us_per_op[measured]" for k in MEG_NS]
     c += [f"meg_{k}_per_op[measured]" for k in MEG_CNT]
     return c
@@ -115,6 +124,10 @@ def rows(run, system):
         elif src == "megalon":
             supported = int(all((num(e[1], "opt.meg_coh") or 0) > 0 for _, e in pairs))
         csample = max((num(e[1], "opt.meg_check_sample") or 0) for _, e in pairs)
+        forms = {e[1].get("opt.c_formula", "lmdb") for _, e in pairs}
+        if len(forms) != 1:
+            sys.exit(f"opsplit: step {step}: targets disagree on opt.c_formula {forms}")
+        formula = forms.pop()
         def gsum(pred):
             s = 0.0
             for (_, b), (_, e) in pairs:
@@ -143,12 +156,23 @@ def rows(run, system):
             pop = {k: dsum(p + "pop." + k) for k in POP}
             meg = {k: dsum(p + "meg." + k) for k in MEG_NS + MEG_CNT + ["check_ns_sampled", "vcopy_ns_sampled", "vcopy_sampled", "vcopy_cnt", "lookup_ns_sampled"]}
             lookup_est = meg["lookup_ns_sampled"] * meg["read_sections"] / meg["check_sampled"] if meg["check_sampled"] else 0.0
+            anc = {k: dsum(p + "meg.anchor." + k) for k in ("read_lookup_ns_sampled", "read_nr_ns_sampled", "rseq_ns_sampled",
+                                                           "write_lookup_ns", "write_nr_ns", "wseq_ns", "wseq_end_ns")}
+            est = (lambda x: x * meg["read_sections"] / meg["check_sampled"]) if meg["check_sampled"] else (lambda x: 0.0)
             vcopy_est = meg["vcopy_ns_sampled"] * meg["vcopy_cnt"] / meg["vcopy_sampled"] if meg["vcopy_sampled"] else 0.0
             check_est = meg["check_ns_sampled"] * meg["read_sections"] / meg["check_sampled"] if meg["check_sampled"] else 0.0
             if src == "popcorn":
                 C = per(pop["is_ns"] + pop["sm_ns"] + pop["wp_ns"] + pop["ipi_ns"])
             elif src == "megalon":
-                C = per(check_est + sum(meg[k] for k in MEG_IN_C) + vcopy_est)
+                rest_exact = sum(meg[k] for k in ("stale_ns", "concur_ns", "meta_ns", "spin_ns"))
+                if formula == "kv":
+                    C = per(max(0.0, est(meg["check_ns_sampled"] - anc["rseq_ns_sampled"])) + rest_exact
+                            + meg["wstart_ns"] - anc["wseq_ns"] + meg["wflush_ns"] - anc["wseq_end_ns"])
+                else:
+                    C = per(est(meg["check_ns_sampled"] + anc["read_lookup_ns_sampled"] + anc["read_nr_ns_sampled"])
+                            + rest_exact + meg["wstart_ns"] + anc["write_lookup_ns"] + anc["write_nr_ns"]
+                            + meg["wflush_ns"] + vcopy_est)
+                C = max(C, 0.0)
             else:
                 C = 0.0
             if not supported:
@@ -163,6 +187,9 @@ def rows(run, system):
             r += [round(lib_bg, 6), round(recv, 6), round(coh_bg, 6), round(coh_bg * 1e6 / all_ops, 4) if all_ops else ""]
             r += [round(per(check_est), 4), int(csample), round(per(vcopy_est), 4), round(cnt(meg["vcopy_cnt"]), 6),
                   round(per(lookup_est), 4)]
+            r += [formula, round(per(est(anc["read_lookup_ns_sampled"])), 4), round(per(est(anc["read_nr_ns_sampled"])), 4),
+                  round(per(est(anc["rseq_ns_sampled"])), 4), round(per(anc["write_lookup_ns"]), 4),
+                  round(per(anc["write_nr_ns"]), 4), round(per(anc["wseq_ns"]), 4), round(per(anc["wseq_end_ns"]), 4)]
             r += [round(per(meg[k]), 4) for k in MEG_NS]
             r += [round(cnt(meg[k]), 6) for k in MEG_CNT]
             out.append(r)

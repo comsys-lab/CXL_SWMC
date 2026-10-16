@@ -110,7 +110,7 @@ class Server {
     ws_.reset(new WorkerStats[o_.get_threads]);
     opt_.reset(new opsplit::Table({"get", "update"}, o_.get_threads + 1,
                                   std::is_same_v<Be, MegalonBackend> ? opsplit::Source::kMegalon : opsplit::Source::kPopcorn,
-                                  node_.backend().api()));
+                                  node_.backend().api(), opsplit::Formula::kLMDB));
     oth_.reset(new opsplit::Thread[o_.get_threads + 1]);
     std::fprintf(stderr, "lmdb-server: opsplit tsc_hz %.0f source %s megalon thread_coh %s\n", opt_->tsc_hz(),
                  opt_->source() == opsplit::Source::kMegalon ? "megalon" : "popcorn",

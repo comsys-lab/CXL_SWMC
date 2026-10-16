@@ -62,5 +62,33 @@ eq(m["get"]["coh_bg_us_per_op[derived]"], 1.01e6 / 2020, "bg per op (all ops)")
 eq(p["put"]["coh_bg_cpu_s[derived]"], 2.02, "popcorn bg = recv")
 h = run("all-HWcc")
 eq(h["get"]["C_us_per_op[derived]"], 0, "all-HWcc C")
+# MOT1 v6 §3.1 formulas with AnchorSnap (one target, 100 ops, check_sampled 10 of read_sections 100 -> x10)
+def scenario(name, formula):
+    d2 = os.path.join(d, name)
+    os.makedirs(os.path.join(d2, "stats"))
+    e = {"opt.tsc_hz": 2e9, "opt.meg_coh": 1, "opt.meg_anchor": 1, "opt.meg_check_sample": 64, "opt.c_formula": formula,
+         "opt.get.ops": 100, "opt.get.t_ns": 100 * 20000, "opt.get.meg.read_sections": 100, "opt.get.meg.check_sampled": 10,
+         "opt.get.meg.check_ns_sampled": 10 * 1000, "opt.get.meg.anchor.rseq_ns_sampled": 10 * 200,
+         "opt.get.meg.anchor.read_lookup_ns_sampled": 10 * 300, "opt.get.meg.anchor.read_nr_ns_sampled": 10 * 400,
+         "opt.get.meg.stale_ns": 100 * 50, "opt.get.meg.wstart_ns": 100 * 3000, "opt.get.meg.anchor.wseq_ns": 100 * 1000,
+         "opt.get.meg.wflush_ns": 100 * 2000, "opt.get.meg.anchor.wseq_end_ns": 100 * 500,
+         "opt.get.meg.anchor.write_lookup_ns": 100 * 700, "opt.get.meg.anchor.write_nr_ns": 100 * 800,
+         "opt.get.meg.vcopy_ns_sampled": 1000, "opt.get.meg.vcopy_sampled": 10, "opt.get.meg.vcopy_cnt": 100}
+    b = {k: (v if not k.startswith("opt.get.") else 0) for k, v in e.items()}
+    for when, kv, mono in (("begin", b, 0), ("end", e, 1_000_000_000)):
+        with open(os.path.join(d2, "stats", f"step001-{when}-t0.txt"), "w") as f:
+            f.write(f"# when={when} phase=fixed step=1 offered_x=1 target=0 addr=x status=0 wall_ns=0 mono_ns={mono} rtt_us=1\n")
+            f.writelines(f"{k}={v}\n" for k, v in kv.items())
+    out = os.path.join(d2, "o.csv")
+    subprocess.run([sys.executable, "-I", TOOL, d2, "--system", "Megalon", "--out", out], check=True, stdout=subprocess.DEVNULL)
+    return {r["op"]: r for r in csv.DictReader(open(out))}
+k = scenario("kv", "kv")["get"]
+# kv: (1000-200) x10 / per op... sums: check 10000, rseq 2000 -> (8000 x 10) = 80000 ns; + stale 5000 + (300000-100000)
+#     + (200000-50000) = 435000 ns / 100 ops = 4.35 us
+eq(k["C_us_per_op[derived]"], 4.35, "kv formula")
+l = scenario("lmdb", "lmdb")["get"]
+# lmdb: (10000+3000+4000) x10 = 170000 + 5000 + 300000 + 70000 + 80000 + 200000 + vcopy 1000x100/10 = 10000 -> 835000 / 100
+eq(l["C_us_per_op[derived]"], 8.35, "lmdb formula")
+eq(l["meg_anc_read_nr_us_per_op[sampled_xN]"], 0.4, "anchor read_nr est")
 print("OPSPLIT TEST " + ("PASS" if not fails else "FAIL: " + "; ".join(fails)))
 sys.exit(1 if fails else 0)

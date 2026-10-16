@@ -77,14 +77,14 @@ class PlainBackend {
   std::_Exit(2);
 }
 
-// API v1 (no thread_coh member) and v2 accepted; thread_coh is read only from v2 tables (opsplit.h)
+// Any API version >= 1 accepted (tables only grow); thread_coh is read only from v >= 2, thread_anchor from v >= 3 (opsplit.h)
 inline const mshim::Api *megalon_load(const std::string &path, std::string *err) {
   void *h = dlopen(path.c_str(), RTLD_NOW | RTLD_LOCAL);
   if (!h) return *err = std::string("dlopen ") + path + ": " + dlerror(), nullptr;
   auto fn = reinterpret_cast<megalon_object_api_fn>(dlsym(h, "megalon_object_api"));
   if (!fn) return *err = path + ": no megalon_object_api", nullptr;
   const mshim::Api *api = fn();
-  if (!api || api->version < 1 || api->version > mshim::kApiVersion) return *err = path + ": API version mismatch", nullptr;
+  if (!api || api->version < 1) return *err = path + ": API version mismatch", nullptr;  // tables only grow (append)
   return api;
 }
 

@@ -217,7 +217,7 @@ class Server {
       coh_info_ = coh->info;
     }
     opt_.reset(new opsplit::Table({"get", "put"}, o_.threads,
-                                  o_.backend == "megalon" ? opsplit::Source::kMegalon : opsplit::Source::kPopcorn, coh));
+                                  o_.backend == "megalon" ? opsplit::Source::kMegalon : opsplit::Source::kPopcorn, coh, opsplit::Formula::kKV));
     oth_.reset(new opsplit::Thread[o_.threads]);
     if (!cxl::hwcc::app_init(r_, map_, lay_.L, o_.run_id, o_.nodes, o_.node, o_.start_timeout_ms, &err)) die(err);
     app_ = cxl::hwcc::app_base(r_, map_);

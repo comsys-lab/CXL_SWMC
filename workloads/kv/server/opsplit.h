@@ -3,9 +3,15 @@
 // response ready, EXCLUDING the reply send and txn reset (same definition in every workload) and C = the coherence-management time the same
 // thread accumulated inside it:
 //   Popcorn  delta of swmc_acct_coh_ns() (systems/popcorn_new/include/swmc_acct.h; zeros while unsupported)
-//   Megalon  delta of the thread's CohSnap durations (systems/megalon/shim/megalon_objapi.h v2 thread_coh):
-//            check estimate + stale_ns + concur_ns + meta_ns + spin_ns + wstart_ns + wflush_ns
-//            (switch_rw_ns and reclaim_ns are parts of wstart_ns and are reported separately, not added again);
+//   Megalon  delta of the thread's CohSnap (v2 thread_coh) and AnchorSnap (v3 thread_anchor, Megalon >= 75)
+//            durations, by the workload's all-HWcc (user decision MOT1 v6 §3.1: C = only work all-HWcc does not do):
+//            Formula::kKV   (all-HWcc = Megalon hwcc flavor, which also does the anchor work and the seqlock reads):
+//                           (check - rseq) est + stale + concur + meta + spin + (wstart - wseq) + (wflush - wseq_end)
+//            Formula::kLMDB (all-HWcc = plain backend, no Megalon):
+//                           (check + read_lookup + read_nr) est + stale + concur + meta + spin + wstart + write_lookup
+//                           + write_nr + wflush + validation copy est
+//            (anchor lookup/NR parts are excluded from check/wstart in >= 74; rseq inside check, wseq inside wstart,
+//            wseq_end inside wflush; switch_rw_ns and reclaim_ns are parts of wstart_ns, reported separately);
 //            check estimate = ratio estimator check_ns_sampled x read_sections / check_sampled (contract
 //            CXL_SWMC 2015a31f3; read sections only), applied to the per-op-type sums: opt.<op>.c_ns at a snapshot uses
 //            the cumulative sums; tools/opsplit.py applies it to each step's deltas from the raw meg.* fields;
@@ -63,9 +69,20 @@ enum MegIdx { kCheckSample = 2, kCheckNs = 3, kStaleNs = 6, kConcurNs = 8, kMeta
 enum MegIdx2 { kReadSections = 0, kCheckSampled = 4 };
 constexpr int kTscBackwards = 2;
 constexpr int kLookupNsSampled = 7;  // CohSnap.reserved[7] (Megalon >= 74): index-lookup part of the sampled checks; raw  // CohSnap.reserved[2] (Megalon >= 72: intervals clamped because the TSC went backwards)
-// exact (every-event) part of Megalon C; the section-check estimate is added on sums (ratio estimator)
-inline uint64_t meg_exact_ns(const uint64_t *d) {
-  return d[kStaleNs] + d[kConcurNs] + d[kMetaNs] + d[kSpinNs] + d[kWstartNs] + d[kWflushNs];
+// exact (every-event) part of Megalon C per operation (d = CohSnap deltas, an = AnchorSnap deltas, zeros below v3);
+// the sampled read-section parts are added on sums (ratio estimator), see Table::text()
+inline uint64_t meg_exact_ns(const uint64_t *d, const uint64_t *an, Formula f) {
+  int64_t c = int64_t(d[kStaleNs] + d[kConcurNs] + d[kMetaNs] + d[kSpinNs]);
+  if (f == Formula::kKV)
+    c += int64_t(d[kWstartNs]) - int64_t(an[kAWseq]) + int64_t(d[kWflushNs]) - int64_t(an[kAWseqEnd]);
+  else
+    c += int64_t(d[kWstartNs] + an[kAWriteLookup] + an[kAWriteNr] + d[kWflushNs]);
+  return c > 0 ? uint64_t(c) : 0;
+}
+// sampled read-section ns (before the ratio estimate) in C
+inline int64_t meg_sampled_ns(uint64_t check_ns_sampled, const uint64_t *an, Formula f) {
+  return f == Formula::kKV ? int64_t(check_ns_sampled) - int64_t(an[kARseq])
+                           : int64_t(check_ns_sampled + an[kAReadLookup] + an[kAReadNr]);
 }
 inline uint64_t meg_check_est_ns(uint64_t check_ns_sampled, uint64_t read_sections, uint64_t check_sampled) {
   return check_sampled ? uint64_t(double(check_ns_sampled) * double(read_sections) / double(check_sampled)) : 0;
@@ -78,6 +95,15 @@ constexpr const char *kPopNames[kPop] = {"is_ns",  "sm_ns",   "wp_ns",  "is_cnt"
                                          "wp_cnt", "ipi_ns",  "ipi_cnt", "nontrans_ns", "nontrans_cnt"};
 
 enum class Source { kPopcorn, kMegalon };
+enum class Formula { kKV, kLMDB };  // Megalon C by the workload's all-HWcc (see the header comment)
+
+// AnchorSnap fields before reserved[], in declaration order (megalon_objapi.h v3)
+constexpr const char *kAncNames[] = {"read_sections",   "write_sections", "check_sampled", "read_lookup_ns_sampled",
+                                     "read_nr_ns_sampled", "rseq_ns_sampled", "write_lookup_ns", "write_nr_ns",
+                                     "wseq_ns",         "wseq_end_ns"};
+constexpr int kAnc = sizeof(kAncNames) / sizeof(kAncNames[0]);
+static_assert(offsetof(mshim::AnchorSnap, reserved) == kAnc * 8, "AnchorSnap layout changed: update kAncNames");
+enum AncIdx { kAReadLookup = 3, kAReadNr = 4, kARseq = 5, kAWriteLookup = 6, kAWriteNr = 7, kAWseq = 8, kAWseqEnd = 9 };
 
 // Megalon-only application work timed by the workload itself (user decision MOT1 v6 §3.1: C = only work all-HWcc does
 // not do). lmdb: the "validation copy" = the 4 KiB page copy inside an accepted Megalon read section into the txn's
@@ -97,22 +123,25 @@ inline uint64_t vcopy_est_ns(uint64_t ns_sampled, uint64_t sampled, uint64_t cnt
 struct alignas(64) Acc {
   std::atomic<uint64_t> ops{0}, t_cyc{0}, t_max_cyc{0}, c_ns{0}, mod_bytes{0}, pop[kPop]{}, meg[kMeg]{}, meg_tsc_back{0},
       vcopy[3]{},  // ns_sampled, sampled, cnt
-      meg_lookup{0};
+      meg_lookup{0}, anc[kAnc]{};
   static void add(std::atomic<uint64_t> &a, uint64_t d) { a.store(a.load(std::memory_order_relaxed) + d, std::memory_order_relaxed); }
 };
 
 // Process-wide: operation names, per-thread Acc arrays, sources. Create before the workers start.
 class Table {
  public:
-  Table(std::vector<std::string> ops, uint32_t threads, Source src, const mshim::Api *meg)
-      : ops_(std::move(ops)), threads_(threads), src_(src), acc_(new Acc[ops_.size() * threads]) {
-    // a v1 table has no thread_coh member: read it only from version >= 2
+  Table(std::vector<std::string> ops, uint32_t threads, Source src, const mshim::Api *meg, Formula f)
+      : ops_(std::move(ops)), threads_(threads), src_(src), f_(f), acc_(new Acc[ops_.size() * threads]) {
+    // a v1 table has no thread_coh member, a v2 table no thread_anchor: read each only from its version
     meg_ = (src == Source::kMegalon && meg && meg->version >= 2 && meg->thread_coh) ? meg : nullptr;
+    anc_ = meg_ && meg->version >= 3 && meg->thread_anchor;
     tsc_hz_ = calibrate_tsc_hz();
   }
   ~Table() { delete[] acc_; }
   Acc &acc(uint32_t thread, uint32_t op) { return acc_[size_t(thread) * ops_.size() + op]; }
   const mshim::Api *meg() const { return meg_; }
+  bool anchor() const { return anc_; }
+  Formula formula() const { return f_; }
   Source source() const { return src_; }
   double tsc_hz() const { return tsc_hz_; }
   std::atomic<uint32_t> pop_threads{0}, meg_threads{0};
@@ -123,10 +152,11 @@ class Table {
     std::ostringstream o;
     o << "opt.version=1\nopt.c_source=" << (src_ == Source::kMegalon ? "megalon" : "popcorn")
       << "\nopt.tsc_hz=" << uint64_t(tsc_hz_) << "\nopt.threads=" << threads_ << "\nopt.pop_threads=" << pop_threads.load()
-      << "\nopt.meg_coh=" << (meg_ ? 1 : 0) << "\nopt.meg_threads=" << meg_threads.load()
+      << "\nopt.meg_coh=" << (meg_ ? 1 : 0) << "\nopt.meg_anchor=" << (anc_ ? 1 : 0)
+      << "\nopt.c_formula=" << (f_ == Formula::kKV ? "kv" : "lmdb") << "\nopt.meg_threads=" << meg_threads.load()
       << "\nopt.meg_check_sample=" << check_sample.load() << "\n";
     for (size_t op = 0; op < ops_.size(); op++) {
-      uint64_t ops = 0, cyc = 0, mx = 0, c = 0, mb = 0, tb = 0, lk = 0, vc[3] = {}, pop[kPop] = {}, meg[kMeg] = {};
+      uint64_t ops = 0, cyc = 0, mx = 0, c = 0, mb = 0, tb = 0, lk = 0, vc[3] = {}, pop[kPop] = {}, meg[kMeg] = {}, an[kAnc] = {};
       for (uint32_t t = 0; t < threads_; t++) {
         const Acc &a = acc_[size_t(t) * ops_.size() + op];
         ops += a.ops.load(std::memory_order_relaxed), cyc += a.t_cyc.load(std::memory_order_relaxed);
@@ -136,9 +166,13 @@ class Table {
         for (int i = 0; i < 3; i++) vc[i] += a.vcopy[i].load(std::memory_order_relaxed);
         for (int i = 0; i < kPop; i++) pop[i] += a.pop[i].load(std::memory_order_relaxed);
         for (int i = 0; i < kMeg; i++) meg[i] += a.meg[i].load(std::memory_order_relaxed);
+        for (int i = 0; i < kAnc; i++) an[i] += a.anc[i].load(std::memory_order_relaxed);
       }
-      if (src_ == Source::kMegalon && meg_) c += meg_check_est_ns(meg[kCheckNs], meg[kReadSections], meg[kCheckSampled]);
-      if (src_ == Source::kMegalon) c += vcopy_est_ns(ns(vc[0]), vc[1], vc[2]);
+      if (src_ == Source::kMegalon && meg_) {
+        const int64_t sn = meg_sampled_ns(meg[kCheckNs], an, f_);
+        c += meg_check_est_ns(sn > 0 ? uint64_t(sn) : 0, meg[kReadSections], meg[kCheckSampled]);
+      }
+      if (src_ == Source::kMegalon && f_ == Formula::kLMDB) c += vcopy_est_ns(ns(vc[0]), vc[1], vc[2]);
       const std::string p = "opt." + ops_[op] + ".";
       o << p << "ops=" << ops << "\n" << p << "t_ns=" << ns(cyc) << "\n" << p << "t_max_ns=" << ns(mx) << "\n"
         << p << "c_ns=" << c << "\n" << p << "mod_bytes=" << mb << "\n";
@@ -147,6 +181,7 @@ class Table {
         if (i != kCheckSample) o << p << "meg." << kMegNames[i] << "=" << meg[i] << "\n";
       o << p << "meg.tsc_backwards=" << tb << "\n" << p << "meg.vcopy_ns_sampled=" << ns(vc[0]) << "\n" << p
         << "meg.vcopy_sampled=" << vc[1] << "\n" << p << "meg.vcopy_cnt=" << vc[2] << "\n" << p << "meg.lookup_ns_sampled=" << lk << "\n";
+      for (int i = 0; i < kAnc; i++) o << p << "meg.anchor." << kAncNames[i] << "=" << an[i] << "\n";
     }
     return o.str();
   }
@@ -157,7 +192,9 @@ class Table {
   std::vector<std::string> ops_;
   uint32_t threads_;
   Source src_;
+  Formula f_;
   const mshim::Api *meg_ = nullptr;
+  bool anc_ = false;
   Acc *acc_;
   double tsc_hz_ = 0;
 };
@@ -182,6 +219,7 @@ class Thread {
     v0_ = tl_vcopy;
     if (pop_ok_) pop_snap(p0_);
     if (t_->meg()) t_->meg()->thread_coh(&m0_);
+    if (t_->anchor()) t_->meg()->thread_anchor(&an0_);
     c0_ = tsc();
   }
   // mod_bytes: bytes the application stored in this operation (put/update value; 0 for reads)
@@ -203,12 +241,19 @@ class Thread {
     if (t_->meg()) {
       mshim::CohSnap m1;
       t_->meg()->thread_coh(&m1);
+      uint64_t da[kAnc] = {};
+      if (t_->anchor()) {
+        mshim::AnchorSnap a1;
+        t_->meg()->thread_anchor(&a1);
+        const uint64_t *y0 = reinterpret_cast<const uint64_t *>(&an0_), *y1 = reinterpret_cast<const uint64_t *>(&a1);
+        for (int i = 0; i < kAnc; i++) da[i] = y1[i] - y0[i], Acc::add(a.anc[i], da[i]);
+      }
       const uint64_t *x0 = reinterpret_cast<const uint64_t *>(&m0_), *x1 = reinterpret_cast<const uint64_t *>(&m1);
       uint64_t dm[kMeg];
       for (int i = 0; i < kMeg; i++) dm[i] = x1[i] - x0[i];
       for (int i = 0; i < kMeg; i++)
         if (i != kCheckSample) Acc::add(a.meg[i], dm[i]);
-      c = meg_exact_ns(dm);
+      c = meg_exact_ns(dm, da, t_->formula());
       Acc::add(a.meg_tsc_back, m1.reserved[kTscBackwards] - m0_.reserved[kTscBackwards]);
       Acc::add(a.meg_lookup, m1.reserved[kLookupNsSampled] - m0_.reserved[kLookupNsSampled]);  // exported, not used in C
     }
@@ -233,6 +278,7 @@ class Thread {
   bool pop_ok_ = false;
   uint64_t c0_ = 0, p0_[kPop] = {};
   mshim::CohSnap m0_{};
+  mshim::AnchorSnap an0_{};
   VCopy v0_{};
 };
 
