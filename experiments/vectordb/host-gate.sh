@@ -11,8 +11,14 @@
 # (command ^qemu-system) and the exact command names in GATE_IGNORE (comma list, e.g. cpptools; default empty).
 # Ignored processes above CPU_MAX are logged with their CPU% (ignored=[...]).
 # Waits up to GATE_WAIT_S (default 1800) re-probing every 60 s; exit 1 if still not quiet.
+# Measurement environment: every probe first runs `scripts/host/measure-env.sh check $MEASURE_ENV_DIR` (no root;
+# default dir recovery/HOST-measure-env-v1) and appends its full output to <log file> ("measure-env:" lines). The
+# gate fails at once (exit 1, no waiting: the setting does not recover by itself) unless the output ends in
+# CHECK PASS with exit 0 (C-states C1E/C6 off, IRQs, workqueues, slices, emulatorpin; vm_setting/README.md §5).
 set -uo pipefail
 LOCK=${LOCK:-/home/comsys/sungsu/destijl-control/workspaces/MEASUREMENT.lock}
+MEASURE_ENV=${MEASURE_ENV:-$(cd "$(dirname "$0")/../.." && pwd)/scripts/host/measure-env.sh}
+MEASURE_ENV_DIR=${MEASURE_ENV_DIR:-/home/comsys/sungsu/destijl-control/recovery/HOST-measure-env-v1}
 LOAD_MAX=${LOAD_MAX:-4} CPU_MAX=${CPU_MAX:-25} GATE_WAIT_S=${GATE_WAIT_S:-1800} GATE_IGNORE=${GATE_IGNORE:-}
 case "${1:-}" in
   lock)
@@ -27,6 +33,13 @@ case "${1:-}" in
     LOG=${2:?log file}
     deadline=$(( $(date +%s) + GATE_WAIT_S ))
     while :; do
+      env_out=$(bash "$MEASURE_ENV" check "$MEASURE_ENV_DIR" 2>&1); env_rc=$?
+      echo "$(date -Is) measure-env: check $MEASURE_ENV_DIR rc=$env_rc" >> "$LOG"
+      printf '%s\n' "$env_out" | sed 's/^/measure-env: /' >> "$LOG"
+      if [ $env_rc != 0 ] || [ "$(printf '%s\n' "$env_out" | tail -n1)" != "CHECK PASS" ]; then
+        echo "$(date -Is) gate ok=0 measure_env=FAIL" >> "$LOG"
+        echo "host gate: measure-env check did not pass (rc=$env_rc, see $LOG)"; exit 1
+      fi
       builds=$(pgrep -a -x 'make|cc1|cc1plus|ld|ld.gold|lld|cargo|rustc|ninja|cmake|conan' | tr '\n' ';')
       load=$(cut -d' ' -f1 /proc/loadavg)
       sample=$(top -b -n 2 -d 5 -w 200 | awk -v m="$CPU_MAX" -v ign=",$GATE_IGNORE," '/^top -/{n++}
@@ -39,7 +52,7 @@ case "${1:-}" in
       [ -z "$builds" ] || ok=0
       awk -v l="$load" -v m="$LOAD_MAX" 'BEGIN{exit !(l <= m)}' || ok=0
       [ -z "$hot" ] || ok=0
-      echo "$(date -Is) gate ok=$ok load1=$load builds=[$builds] hot=[$hot] ignored=[$ignored] ignore_list=[$GATE_IGNORE] lock=[$(cat "$LOCK" 2>/dev/null)]" >> "$LOG"
+      echo "$(date -Is) gate ok=$ok measure_env=PASS load1=$load builds=[$builds] hot=[$hot] ignored=[$ignored] ignore_list=[$GATE_IGNORE] lock=[$(cat "$LOCK" 2>/dev/null)]" >> "$LOG"
       [ $ok = 1 ] && exit 0
       [ "$(date +%s)" -lt $deadline ] || { echo "host gate: not quiet after ${GATE_WAIT_S}s (see $LOG)"; exit 1; }
       sleep 60

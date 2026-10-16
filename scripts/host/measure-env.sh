@@ -1,5 +1,6 @@
 #!/bin/bash
-# Host measurement environment (scripts/host/vm_setting/README.md §2.2, §2.3, §3.1): run as root (sudo).
+# Host measurement environment (scripts/host/vm_setting/README.md §2.2, §2.3, §3.1): record/apply/restore run as
+# root (sudo); check needs no root (it only reads world-readable sysfs/procfs, systemctl show, read-only virsh).
 # usage: measure-env.sh record|apply|restore|check <state dir>
 #   record  save every setting apply changes (once, into an empty dir; restore reads it back)
 #   apply   Host C1E + C6 off on every CPU; irqbalance stopped; IRQs, unbound workqueues and the Host systemd slices
@@ -12,7 +13,7 @@ CMD=${1:?record|apply|restore|check} D=${2:?state dir}
 EMU_cxl_vm0=16,48 EMU_cxl_vm1=17,49 HK=18-31,50-63
 VMS=(cxl_vm0 cxl_vm1) SLICES=(system.slice user.slice init.scope)
 V="virsh -c qemu:///system"
-[ "$(id -u)" = 0 ] || { echo "run as root"; exit 2; }
+[ "$CMD" = check ] || [ "$(id -u)" = 0 ] || { echo "run as root ($CMD)"; exit 2; }
 mask() {  # cpu list -> workqueue hex mask (comma-separated 32-bit words, as the kernel prints it)
   python3 -c 'import sys
 cpus=set()
@@ -77,7 +78,8 @@ case $CMD in
     for s in "${SLICES[@]}"; do [ "$(systemctl show -p AllowedCPUs --value $s | tr " " ",")" = "$HK" ] || { echo "CHECK FAIL: $s AllowedCPUs"; rc=1; }; done
     for vm in "${VMS[@]}"; do e=EMU_$vm; [ "$($V emulatorpin $vm | awk '/\*:/{print $2}')" = "${!e}" ] || { echo "CHECK FAIL: $vm emulatorpin"; rc=1; }; done
     systemctl is-active -q irqbalance && { echo "CHECK FAIL: irqbalance running"; rc=1; }
-    if [ -f "$D/apply-irq-errors.txt" ]; then
+    if [ ! -f "$D/apply-irq-errors.txt" ]; then echo "CHECK FAIL: no apply record in $D (apply-irq-errors.txt)"; rc=1
+    else
       bad=$(irqs | while read -r n l; do [ -z "$l" ] || [ "$l" = "$HK" ] || grep -q "^$n " "$D/apply-irq-errors.txt" || echo $n; done | wc -l)
       [ "$bad" = 0 ] || { echo "CHECK FAIL: $bad IRQs outside $HK (not kernel-managed)"; rc=1; }
     fi
