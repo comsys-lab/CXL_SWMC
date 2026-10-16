@@ -8,7 +8,7 @@
 # env (required): C8 (= builds/popcorn_new/8/deploy-v3), K8, GT8, RECV_MODE, D (inputs dir with MANIFEST.txt),
 #   VM_PLAIN (guest dir: build-3 server, all-HWcc + page MSI), VM_MEG (guest dir: Megalon build + recsys-2vm.yaml),
 #   MEG_BUILD (recsys-megalon build on builds/megalon/70), LOADGEN; optional SEED (20261016), UPD_RATE (2100),
-#   ROUNDS (3), XT (server lifetime bound, s, default 28800).
+#   ROUNDS (3), FIXED (1; 0 = no fixed-load window), XT (server lifetime bound, s, default 28800).
 # Load once per system (recorded exception to "every run starts from the initial image"): per system one server
 # lifetime (session.sh) with, in this order,
 #   warmup 1 query/s + the updater, 10 s + 70 s, unmeasured (results kept, never used): after the server's own read of
@@ -33,7 +33,7 @@ set -uo pipefail
 E=${1:?evidence dir}
 P=/home/comsys/sungsu/destijl-control X=$P/CXL_SWMC/experiments/recsys G=$P/CXL_SWMC/experiments/vectordb/host-gate.sh
 : "${C8:?}" "${K8:?}" "${GT8:?}" "${RECV_MODE:?}" "${D:?}" "${VM_PLAIN:?}" "${VM_MEG:?}" "${MEG_BUILD:?}" "${LOADGEN:?}"
-MB=$MEG_BUILD SEED=${SEED:-20261016} UPD_RATE=${UPD_RATE:-2100} ROUNDS=${ROUNDS:-3} XT=${XT:-28800}
+MB=$MEG_BUILD SEED=${SEED:-20261016} UPD_RATE=${UPD_RATE:-2100} ROUNDS=${ROUNDS:-3} FIXED=${FIXED:-1} XT=${XT:-28800}
 T_MS=60000 SLO_FACTOR=${SLO_FACTOR:-5} SLO_MS=""
 export SLO_MS SLO_RULE="pending: ${SLO_FACTOR} x all-HWcc query p99 at 1 query/s (gate window)"
 HOST_PLAIN=$P/builds/recsys/3/bin/recsys-server
@@ -42,6 +42,7 @@ IPS=(192.168.122.100 192.168.122.101)
 OWNER="RECSYS-main-$(basename "$E")"
 [[ $RECV_MODE =~ ^(poll|idle|sleep)$ ]] || { echo "SEQUENCE STOP: bad RECV_MODE"; exit 2; }
 [[ $ROUNDS =~ ^[1-9]$ ]] || { echo "SEQUENCE STOP: bad ROUNDS"; exit 2; }
+case $FIXED in 0|1) ;; *) echo "SEQUENCE STOP: bad FIXED"; exit 2;; esac
 grep -q "^megalon_build=$P/builds/megalon/70$" $MB/manifest.txt || { echo "SEQUENCE STOP: $MB is not on builds/megalon/70"; exit 2; }
 [ "$C8" = $P/builds/popcorn_new/8/deploy-v3 ] && [ ! -e $C8/SUPERSEDED.txt ] \
   && [ "$(sha256sum < $C8/packet.sha256 | cut -d' ' -f1)" = c67fa82b8649c8de5afcfe65f48657555bef0fcb0e635fc36a751689afead5a4 ] \
@@ -227,12 +228,14 @@ system() {  # one server lifetime: hw | pop | mg
     elif [ $rc != 0 ]; then stop "$s slo-r$r rc $rc"; fi
     python3 -c 'import json,sys; s=json.load(open(sys.argv[1])); c=s.get("confirm",{}); print(sys.argv[2], "note=%r" % s.get("note",""), "confirm_x_mean=%s sd=%s" % (c.get("x_mean"), c.get("x_sd")))' \
       "$S/slo-r$r/loadgen/summary.json" "$s slo-r$r" | tee -a "$E/slo-results.txt"
-    if [ $s = hw ] && [ $r = 1 ]; then
+    if [ $s = hw ] && [ $r = 1 ] && [ "$FIXED" = 1 ]; then
       L=$(confirm_half "$S/slo-r1/loadgen/summary.json") || stop "no all-HWcc slo-r1 confirm result for L"
       echo "L = 0.5 x all-HWcc slo-r1 confirm mean (this block, build 8, T = 60 s) = $L query/s" > "$E/fixed-load-L.txt"
     fi
   done
-  # 4) fixed load L, 60 s, whole window (no SLO abort)
+  # 4) fixed load L, 60 s, whole window (no SLO abort); FIXED=0 skips it (user 2026-10-16: the breakdown is taken
+  #    from the SLO-search steps at the highest rate all systems ran; every step has its own stats window)
+  if [ "$FIXED" = 1 ]; then
   L=$(sed -n 's/.* = \([0-9.]*\) query\/s$/\1/p' "$E/fixed-load-L.txt")
   [ -n "$L" ] || stop "no L"
   measure "$S" fixed "${LGC[@]}" --opt seed=$SEED --seed $SEED --raw --mode fixed --rates "$L" \
@@ -240,6 +243,9 @@ system() {  # one server lifetime: hw | pop | mg
   rc=$?
   [ $rc = 0 ] || stop "$s fixed rc $rc"
   python3 $X/check_breakdown.py "$S/fixed" | tee "$S/fixed/breakdown-check.txt" | grep -q "^BREAKDOWN PASS" || stop "$s fixed: $(cat "$S/fixed/breakdown-check.txt")"
+  else
+  [ -s "$S/slo-r1/stats-steps.csv" ] || stop "$s slo-r1: no per-step stats (stats-steps.csv)"
+  fi
   bash $X/session.sh stop "$S" > "$S.stop.out" 2>&1 || { tail -5 "$S.stop.out"; stop "$s session stop / final checks"; }
   tail -1 "$S.stop.out"
   if [ $s = pop ]; then
@@ -251,7 +257,7 @@ system() {  # one server lifetime: hw | pop | mg
   servers_gone || stop "servers left after $s"
   echo "$(date -Is) MAIN $s DONE ($(( $(date +%s) - t0 )) s)"
 }
-echo "$(date -Is) block $OWNER start (git $(git -C $P/CXL_SWMC rev-parse --short HEAD)) K8=$K8 RECV_MODE=$RECV_MODE MEG_BUILD=$MB VM_PLAIN=$VM_PLAIN VM_MEG=$VM_MEG D=$D SEED=$SEED ROUNDS=$ROUNDS XT=$XT"
+echo "$(date -Is) block $OWNER start (git $(git -C $P/CXL_SWMC rev-parse --short HEAD)) K8=$K8 RECV_MODE=$RECV_MODE MEG_BUILD=$MB VM_PLAIN=$VM_PLAIN VM_MEG=$VM_MEG D=$D SEED=$SEED ROUNDS=$ROUNDS FIXED=$FIXED XT=$XT"
 precheck
 ORDER="hw $(shuffle pop mg)"
 echo "system order: $ORDER (all-HWcc first; page MSI / Megalon shuffled with seed $OWNER)" | tee "$E/order.txt"
