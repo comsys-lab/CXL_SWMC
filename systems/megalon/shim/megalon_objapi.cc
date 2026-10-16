@@ -51,12 +51,42 @@ void stats(mshim::Stats *s) {
                     t.replay_flushes, t.replay_flush_bytes};
 }
 
+// v2 (build 71): the calling thread's coherence time; rackobj::ObjectThreadCoh has CohSnap's field order
+void thread_coh(mshim::CohSnap *s) {
+  static_assert(sizeof(mshim::CohSnap) == sizeof(rackobj::ObjectThreadCoh), "CohSnap != ObjectThreadCoh");
+  rackobj::ObjectThreadCoh t{};
+  rackobj::GetObjectThreadCoh(&t);
+  *s = mshim::CohSnap{};
+  s->read_sections = t.read_sections;
+  s->write_sections = t.write_sections;
+  s->check_sample = t.check_sample;
+  s->check_ns_sampled = t.check_ns_sampled;
+  s->check_sampled = t.check_sampled;
+  s->stale_cnt = t.stale_cnt;
+  s->stale_ns = t.stale_ns;
+  s->concur_cnt = t.concur_cnt;
+  s->concur_ns = t.concur_ns;
+  s->meta_cnt = t.meta_cnt;
+  s->meta_ns = t.meta_ns;
+  s->spin_cnt = t.spin_cnt;
+  s->spin_ns = t.spin_ns;
+  s->wstart_ns = t.wstart_ns;
+  s->switch_rw_cnt = t.switch_rw_cnt;
+  s->switch_rw_ns = t.switch_rw_ns;
+  s->reclaim_cnt = t.reclaim_cnt;
+  s->reclaim_ns = t.reclaim_ns;
+  s->wflush_cnt = t.wflush_cnt;
+  s->wflush_ns = t.wflush_ns;
+  s->wflush_bytes = t.wflush_bytes;
+  for (size_t i = 0; i < 8; i++) s->reserved[i] = t.reserved[i];
+}
+
 #ifndef MSHIM_INFO
 #define MSHIM_INFO "unknown"
 #endif
 
 const mshim::Api kApi{mshim::kApiVersion, MSHIM_INFO, node_id, reg, unreg, create, lookup,
-                      read_start, read_end, write_start, write_end, stats};
+                      read_start, read_end, write_start, write_end, stats, thread_coh};
 
 }  // namespace
 
