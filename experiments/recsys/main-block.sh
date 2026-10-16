@@ -37,12 +37,18 @@
 # tear down page MSI if loaded without "teardown PASS" (instr-on retry), /dev/dax0.0 back to root:root 600
 # UNCONDITIONALLY on both VMs ("ROLLBACK FAIL" if a stat line is not root:root 600 or a recsys-server survived), unlock.
 # A measurement whose stats key/file is missing stops the block with "STATS MISSING <key>" (session.sh rc 5).
+# BLOCK=v1 (reports/RECSYS-V1-packet.md): validation block instead of the H1 measurements: per system one lifetime
+#   with the warm-up and one fixed-load window at V1_RATE (1) query/s for V1_WINDOW_S (130 s, >= 2 rounds of T = 60 s),
+#   then v1_check.py (FAIL stops) and check_breakdown.py; systems hw pop mg mgoff (mgoff = Megalon with
+#   MEGALON_COH_TIMERS=0, same load, for the timer on/off comparison); no SLO search, no gate, no fixed-L window.
 set -uo pipefail
 E=${1:?evidence dir}
 P=/home/comsys/sungsu/destijl-control X=$P/CXL_SWMC/experiments/recsys G=$P/CXL_SWMC/experiments/vectordb/host-gate.sh
 : "${C8:?}" "${K8:?}" "${GT8:?}" "${RECV_MODE:?}" "${D:?}" "${VM_PLAIN:?}" "${VM_MEG:?}" "${MEG_BUILD:?}" "${LOADGEN:?}"
 : "${PLAIN_BUILD:?}" "${EKKO:?}"
 MB=$MEG_BUILD SEED=${SEED:-20261016} ROUNDS=${ROUNDS:-3} FIXED=${FIXED:-1} XT=${XT:-28800}
+BLOCK=${BLOCK:-main} V1_RATE=${V1_RATE:-1} V1_WINDOW_S=${V1_WINDOW_S:-130}
+case $BLOCK in main|v1) ;; *) echo "SEQUENCE STOP: BLOCK must be main or v1"; exit 2;; esac
 MEGALON_BASE=${MEGALON_BASE:-$P/builds/megalon/75}
 UPD_FILE=${UPD_FILE:-updates-day23-0-2M.smp} QRY_FILE=${QRY_FILE:-queries-day23-89137318-1M.smp}
 T_MS=60000 SLO_PCT=95 SLO_MS=100
@@ -55,14 +61,14 @@ export SLO_MS SLO_RULE="DeepRecSys ISCA'20: query p${SLO_PCT} <= ${SLO_MS} ms (M
 HOST_PLAIN=$PLAIN_BUILD/bin/recsys-server
 SSH="ssh -o BatchMode=yes -o ConnectTimeout=8"
 IPS=(192.168.122.100 192.168.122.101)
-OWNER="RECSYS-main-$(basename "$E")"
+OWNER="RECSYS-$BLOCK-$(basename "$E")"
 [[ $RECV_MODE =~ ^(poll|idle|sleep)$ ]] || { echo "SEQUENCE STOP: bad RECV_MODE"; exit 2; }
 [[ $ROUNDS =~ ^[1-9]$ ]] || { echo "SEQUENCE STOP: bad ROUNDS"; exit 2; }
 # SYSTEMS (subset of "hw pop mg", default all): a rerun of some systems (the SLO is fixed; L for the fixed window
 # comes from L_FROM). SLO_MS_FROM (v5) is not used: refused if set.
 [ -z "${SLO_MS_FROM:-}" ] || { echo "SEQUENCE STOP: SLO_MS_FROM is a v5 option (v6 SLO is fixed)"; exit 2; }
-for s in ${SYSTEMS:-hw pop mg}; do case $s in hw|pop|mg) ;; *) echo "SEQUENCE STOP: bad SYSTEMS entry $s"; exit 2;; esac; done
-if [[ " ${SYSTEMS:-hw pop mg} " != *" hw "* ]]; then
+for s in ${SYSTEMS:-hw pop mg}; do case $s in hw|pop|mg) ;; mgoff) [ $BLOCK = v1 ] || { echo "SEQUENCE STOP: mgoff only with BLOCK=v1"; exit 2; };; *) echo "SEQUENCE STOP: bad SYSTEMS entry $s"; exit 2;; esac; done
+if [ $BLOCK = main ] && [[ " ${SYSTEMS:-hw pop mg} " != *" hw "* ]]; then
   [ "${FIXED:-1}" = 0 ] || [ -f "${L_FROM:-}" ] || { echo "SEQUENCE STOP: SYSTEMS without hw and FIXED=1 needs L_FROM=<fixed-load-L.txt>"; exit 2; }
 fi
 case $FIXED in 0|1) ;; *) echo "SEQUENCE STOP: bad FIXED"; exit 2;; esac
@@ -214,6 +220,8 @@ system() {  # one server lifetime: hw | pop | mg
     hw) dax_comsys; SE=(SYSTEM=all-HWcc V=$VM_PLAIN HOST_SERVER=$HOST_PLAIN "SERVER_ARGS=$SA" "NODE_ENV=ENV:XTIMEOUT=$XT");;
     mg) dax_comsys; SE=(SYSTEM=Megalon V=$VM_MEG HOST_SERVER=$MB/bin/recsys-server "SERVER_ARGS=--backend megalon $SA"
                         "NODE_ENV=ENV:RACKOBJ_CONFIG=$VM_MEG/cfg/megalon.yaml ENV:XTIMEOUT=$XT" "NODE0_ENV=ENV:MEGALON_REINIT=1");;
+    mgoff) dax_comsys; SE=(SYSTEM=Megalon V=$VM_MEG HOST_SERVER=$MB/bin/recsys-server "SERVER_ARGS=--backend megalon $SA"
+                        "NODE_ENV=ENV:RACKOBJ_CONFIG=$VM_MEG/cfg/megalon.yaml ENV:MEGALON_COH_TIMERS=0 ENV:XTIMEOUT=$XT" "NODE0_ENV=ENV:MEGALON_REINIT=1");;
     pop) dax_root; pop_setup
          SE=(SYSTEM=Popcorn-$RECV_MODE V=$VM_PLAIN HOST_SERVER=$HOST_PLAIN "SERVER_ARGS=$SA" NODE0_ARGS=--preloaded "NODE_ENV=ENV:XTIMEOUT=$XT");;
   esac
@@ -227,6 +235,15 @@ system() {  # one server lifetime: hw | pop | mg
     --warmup-s 10 --step-warmup-s 0 --step-measure-s 70 --drain-s 10
   rc=$?
   [ $rc = 0 ] || stop "$s warm-up rc $rc"
+  if [ $BLOCK = v1 ]; then  # validation window (reports/RECSYS-V1-packet.md §3)
+    measure "$S" val "${LGC[@]}" --opt seed=$SEED --seed $SEED --raw --mode fixed --rates "$V1_RATE" \
+      --step-warmup-s 5 --step-measure-s "$V1_WINDOW_S" --drain-s 10
+    rc=$?
+    [ $rc = 0 ] || stop "$s val rc $rc"
+    python3 $X/v1_check.py "$S/val" $s | tee "$S/val/v1-check.txt" | tee -a "$E/v1-checks.txt"
+    grep -q "^V1CHECK PASS" "$S/val/v1-check.txt" || stop "$s: $(cat "$S/val/v1-check.txt")"
+    python3 $X/check_breakdown.py "$S/val" | tee "$S/val/breakdown-check.txt" | grep -q "^BREAKDOWN PASS" || stop "$s val: $(cat "$S/val/breakdown-check.txt")"
+  else
   # 2) lowest load: 1 query/s, 60 s, no SLO abort
   measure "$S" gate "${LGC[@]}" --opt seed=$SEED --seed $SEED --raw --mode fixed --rates 1 \
     --step-warmup-s 3 --step-measure-s 60 --drain-s 10
@@ -272,6 +289,7 @@ system() {  # one server lifetime: hw | pop | mg
   else
   [ -s "$S/slo-r1/stats-steps.csv" ] || stop "$s slo-r1: no per-step stats (stats-steps.csv)"
   fi
+  fi  # BLOCK
   bash $X/session.sh stop "$S" > "$S.stop.out" 2>&1 || { tail -5 "$S.stop.out"; stop "$s session stop / final checks"; }
   tail -1 "$S.stop.out"
   if [ $s = pop ]; then
@@ -295,11 +313,11 @@ awk -v x="$UPD_RATE" 'BEGIN{exit !(x > 0)}' || stop "bad update rate $UPD_RATE"
 echo "EKKO=$EKKO publish_frac=$PUBLISH_FRAC update_rate=$UPD_RATE samples/s ($EKKO_RULE; $RATEF)"
 LGC=(--opt samples=$D/$UPD_FILE --opt queries=$D/$QRY_FILE --opt wrap=1
      --opt quantiles=$D/dist_quantile.txt --fixed update=$UPD_RATE --mix query=1 --x-stream query)
-if [[ " ${SYSTEMS:-hw pop mg} " != *" hw "* ]]; then
+if [ $BLOCK = main ] && [[ " ${SYSTEMS:-hw pop mg} " != *" hw "* ]]; then
   echo "slo_ms=$SLO_MS pct=$SLO_PCT rule=$SLO_RULE (fixed; no all-HWcc in this block)" | tee "$E/slo.txt"
   [ -z "${L_FROM:-}" ] || { cp "$L_FROM" "$E/fixed-load-L.txt" && echo "L imported from $L_FROM: $(cat "$E/fixed-load-L.txt")"; }
 fi
-ORDER="hw $(shuffle pop mg)"
+if [ $BLOCK = v1 ]; then ORDER="hw pop mg mgoff"; else ORDER="hw $(shuffle pop mg)"; fi
 echo "system order: $ORDER (all-HWcc first; page MSI / Megalon shuffled with seed $OWNER)" | tee "$E/order.txt"
 if [ -n "${SYSTEMS:-}" ]; then  # subset rerun: keep the seeded order, drop the others
   O2=""; for s in $ORDER; do [[ " $SYSTEMS " == *" $s "* ]] && O2="$O2 $s"; done; ORDER=${O2# }
