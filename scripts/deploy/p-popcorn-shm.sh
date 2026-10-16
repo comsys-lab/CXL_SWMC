@@ -16,14 +16,22 @@
 #   status    counters and state of both guests -> $R/status-<STATUS_TAG>-vm<k>.txt
 #   instr-check  (build >= 8, after enable + chown) both guests: instr/ sysfs
 #             present and enabled, a comsys process touches one page of IPAGE
-#             (read, then write) and reads its own /proc/thread-self/swmc (16
-#             "name value" lines, mode 0400, its uid; read/wp counts >= 1)
+#             (read, then write) and reads its own /proc/thread-self/swmc
+#             ("name value" lines, mode 0400, its uid; read/wp counts >= 1).
+#             Line count by build (from K): <= 8: 16, 9: 57, >= 10: 59.
+#             Build >= 9 also: the build-9 instr files, and the process
+#             registers a swmc_acct area (/proc/thread-self/swmc_acct, 0600)
+#             before the faults: version 1, is/wpu fault counts >= 1,
+#             acct_syncs >= 1, acct_errors 0; unregistered afterwards.
 #   instr-on  (build >= 8) set instrumentation enabled=1 (ONLY=<k>: one VM); recovery
 #             after an interrupted `overhead` (teardown refuses instr_enabled != 1)
 #   overhead  (build >= 8) faultlat with instrumentation on vs off on both
 #             nodes (/sys/kernel/swmc/instr/enabled), OREPS repeats per
 #             setting in ABBA order, fresh pages from OBASE; prints a table
-#             (numbers only; stops only on errors); ends with enabled=1
+#             (numbers only; stops only on errors); ends with enabled=1.
+#             Build >= 9 (faultlat >= 4): a third setting "a" = enabled 1
+#             with faultlat --acct 0 (no user area: notify-resume cost);
+#             settings per repeat 1 0 a / a 0 1 alternating.
 #   teardown  waits (<= 120 s) for faultlat to exit; no user of /dev/dax0.0
 #             left; dax0.0 back to root:root 600; disable coherence and unload
 #             cxl_shm (VM1, then VM0). ONLY=<k> tears down that VM alone (the
@@ -49,6 +57,10 @@ INIT_STATE=${INIT_STATE:-invalid}
 PBASE=${PBASE:-25010000} PPAGES=${PPAGES:-1024} PRUN=${PRUN:-preload-v1}
 PA=0x7777000000000000 PB=0x8888000000000000
 IPAGE=${IPAGE:-25019000} OBASE=${OBASE:-25020000} OREPS=${OREPS:-3} ORUN=${ORUN:-overhead-v1} OPAGES=${OPAGES:-1024}
+# Popcorn build number from the release (…-ds-popcorn-new-<n>); selects the build-8/9/10 expectations.
+PBUILD=$(sed -n 's/.*-ds-popcorn-new-\([0-9]\{1,\}\)$/\1/p' <<<"$K")
+[ -n "$PBUILD" ] || PBUILD=0
+if [ "$PBUILD" -ge 10 ]; then SWMC_LINES=59; elif [ "$PBUILD" -ge 9 ]; then SWMC_LINES=57; else SWMC_LINES=16; fi
 fl() {  # fl <node> <step> <faultlat args...>: one faultlat step on a guest (results in popcorn-results/$PRUN)
   local k=$1; shift
   echo "[$(date +%T)] vm$k $1"
@@ -193,14 +205,27 @@ instr-check)
              cxl_shm.ring_rtt.count cxl_shm.counters.tsc_khz; do
       grep -q "^$f " "$R/instr-before-vm$k.txt" || { log "STOP: $f missing on vm$k"; exit 1; }
     done
+    if [ "$PBUILD" -ge 9 ]; then
+      for f in swmc.fault_full_is.count swmc.fault_full_nontrans.count swmc.ipi.coh_ns swmc.serve_fetch.reply_ns \
+               swmc.serve_invalidate.revoke_ns cxl_shm.counters.kthread_work_ns; do
+        grep -q "^$f " "$R/instr-before-vm$k.txt" || { log "STOP: $f missing on vm$k (build $PBUILD)"; exit 1; }
+      done
+    fi
   done
   for k in 0 1; do
     page=$((IPAGE + k))   # one fresh page per node
-    ssh -T "${FLAGS[@]}" "comsys@${IP[$k]}" "python3 -I - $GT/popcorn.env $page" > "$R/thread-swmc-vm$k.txt" <<'PY'
-import mmap, os, re, sys
-env, page = open(sys.argv[1]).read(), int(sys.argv[2])
+    ssh -T "${FLAGS[@]}" "comsys@${IP[$k]}" "python3 -I - $GT/popcorn.env $page $PBUILD" > "$R/thread-swmc-vm$k.txt" <<'PY'
+import ctypes, mmap, os, re, struct, sys
+env, page, pbuild = open(sys.argv[1]).read(), int(sys.argv[2]), int(sys.argv[3])
 swcc = int(re.search(r'^MANAGED_BASE_OFF=(\d+)$', env, re.M).group(1))   # = managed_offset = swcc start
 off = swcc + page * 4096
+acct = None
+if pbuild >= 9:   # register a struct swmc_acct (128 B, 64-aligned: an anonymous page) before the faults
+    acct = mmap.mmap(-1, 4096)
+    addr = ctypes.addressof(ctypes.c_char.from_buffer(acct))
+    ast = os.stat('/proc/thread-self/swmc_acct')
+    with open('/proc/thread-self/swmc_acct', 'w') as f:
+        f.write(hex(addr))
 fd = os.open('/dev/dax0.0', os.O_RDWR)
 m = mmap.mmap(fd, 4096, mmap.MAP_SHARED, mmap.PROT_READ | mmap.PROT_WRITE, offset=off)
 _ = m[0:8]                         # read fault (I -> S, FETCH)
@@ -208,17 +233,34 @@ m[8:16] = (page ^ 0x9999).to_bytes(8, 'little')   # write-protect fault (S -> M,
 p = '/proc/thread-self/swmc'
 st = os.stat(p)
 lines = open(p).read().splitlines()
+area = struct.unpack_from('<II10Q', acct, 0) if acct is not None else None
+if acct is not None:
+    with open('/proc/thread-self/swmc_acct', 'w') as f:
+        f.write('0')               # unregister before the buffer goes away
 m.close(); os.close(fd)
 print('mode=%o uid=%d me=%d lines=%d' % (st.st_mode & 0o777, st.st_uid, os.getuid(), len(lines)))
 for l in lines:
     print(l)
+if area is not None:
+    print('@acct_mode %o' % (ast.st_mode & 0o777))
+    print('@acct_area ' + ' '.join(str(x) for x in area))
 PY
-    python3 -I - "$R/thread-swmc-vm$k.txt" <<'PY' || { log "STOP: per-thread file check failed on vm$k"; exit 1; }
+    python3 -I - "$R/thread-swmc-vm$k.txt" "$SWMC_LINES" "$PBUILD" <<'PY' || { log "STOP: per-thread file check failed on vm$k"; exit 1; }
 import re, sys
 t = open(sys.argv[1]).read().splitlines()
+nlines, pbuild = sys.argv[2], int(sys.argv[3])
 h = dict(re.findall(r'(\w+)=(\d+)', t[0]))
-kv = dict(l.split(' ') for l in t[1:])
-assert h['mode'] == '400' and h['uid'] == h['me'] and h['lines'] == '16', h
+extra = {l.split(' ', 1)[0][1:]: l.split(' ', 1)[1] for l in t[1:] if l.startswith('@')}
+kv = dict(l.split(' ') for l in t[1:] if not l.startswith('@'))
+assert h['mode'] == '400' and h['uid'] == h['me'] and h['lines'] == nlines, h
+if pbuild >= 9:
+    a = [int(x) for x in extra['acct_area'].split()]   # version, flags, fault_ns[3], fault_cnt[3], ipi_ns, ipi_cnt, r0, r1
+    assert extra['acct_mode'] == '600', extra
+    assert a[0] == 1 and a[1] == 0, a
+    assert a[5] >= 1 and a[7] >= 1 and a[2] > 0 and a[4] > 0, a           # is and wpu counted, with time
+    assert int(kv['is_faults']) >= 1 and int(kv['wpu_faults']) >= 1, kv
+    assert int(kv['acct_syncs']) >= 1 and int(kv['acct_errors']) == 0, kv
+    print('acct area OK:', a)
 assert all(re.fullmatch(r'[a-z0-9_]+', k) and v.isdigit() for k, v in kv.items()), kv
 assert int(kv['read_faults']) >= 1 and int(kv['wp_faults']) >= 1 and int(kv['write_faults']) >= 1, kv
 assert int(kv['fault_errors']) == 0, kv
@@ -231,18 +273,23 @@ PY
 overhead)
   PRUN=$ORUN   # fl() writes to popcorn-results/$PRUN
   for k in 0 1; do G $k status > "$R/status-overhead-before-vm$k.txt"; done
-  order=(); for ((r = 0; r < OREPS; r++)); do if ((r % 2)); then order+=(0 1); else order+=(1 0); fi; done
+  order=()
+  for ((r = 0; r < OREPS; r++)); do
+    if [ "$PBUILD" -ge 9 ]; then if ((r % 2)); then order+=(a 0 1); else order+=(1 0 a); fi
+    elif ((r % 2)); then order+=(0 1); else order+=(1 0); fi
+  done
   i=0; rc=0
   for e in "${order[@]}"; do
     w=$((OBASE + i * 3 * OPAGES)); tag=o$(printf %02d $i)_e$e
-    for k in 0 1; do G $k instr "$e" > /dev/null || { rc=1; break 2; }; done
+    ie=$e; xa=(); if [ "$e" = a ]; then ie=1; xa=(--acct 0); fi   # "a": instr on, no user area
+    for k in 0 1; do G $k instr "$ie" > /dev/null || { rc=1; break 2; }; done
     if ! {
-      fl 1 ${tag}_prep access --op write --pages "$OPAGES" --page-offset "$w" &&
-      fl 0 ${tag}_readM access --op read --pages "$OPAGES" --page-offset "$w" &&
-      fl 0 ${tag}_writeI access --op write --pages "$OPAGES" --page-offset $((w + OPAGES)) &&
+      fl 1 ${tag}_prep access --op write --pages "$OPAGES" --page-offset "$w" "${xa[@]}" &&
+      fl 0 ${tag}_readM access --op read --pages "$OPAGES" --page-offset "$w" "${xa[@]}" &&
+      fl 0 ${tag}_writeI access --op write --pages "$OPAGES" --page-offset $((w + OPAGES)) "${xa[@]}" &&
       nonce=$(( $(date +%s) * 1000 + i )) && pp=$((w + 2 * OPAGES)) &&
-      { fl 1 ${tag}_pp1 pingpong --role 1 --nonce $nonce --iters 10000 --page-offset $pp & x=$!;
-        a=0; fl 0 ${tag}_pp0 pingpong --role 0 --nonce $nonce --iters 10000 --page-offset $pp || a=$?;
+      { fl 1 ${tag}_pp1 pingpong --role 1 --nonce $nonce --iters 10000 --page-offset $pp "${xa[@]}" & x=$!;
+        a=0; fl 0 ${tag}_pp0 pingpong --role 0 --nonce $nonce --iters 10000 --page-offset $pp "${xa[@]}" || a=$?;
         wait $x && [ $a = 0 ]; }
     } 2>&1 | tee -a "$R/overhead.log"; then rc=1; break; fi
     i=$((i + 1))
@@ -264,7 +311,7 @@ overhead)
   python3 -I - "$R/$ORUN-vm0" <<'PY' | tee "$R/overhead.txt"
 import json, pathlib, statistics, sys
 d = pathlib.Path(sys.argv[1]); rows = {}
-for f in sorted(d.glob('o*_e[01]_*.json')):
+for f in sorted(d.glob('o*_e[01a]_*.json')):
     j = json.loads(f.read_text()); tag, e, kind = f.stem.split('_', 2); e = e[1:]
     key = {'readM': 'pass0_read', 'writeI': 'pass0_write', 'pp0': 'round_trip'}.get(kind)
     if key:
@@ -278,6 +325,9 @@ for kind in ('readM', 'writeI', 'pp0'):
     if (kind, '1') in rows and (kind, '0') in rows:
         a = statistics.mean(x[0] for x in rows[(kind, '1')]); b = statistics.mean(x[0] for x in rows[(kind, '0')])
         print('%s overhead mean: %+.0f ns (%+.1f%%)' % (kind, a - b, 100 * (a - b) / b))
+    if (kind, 'a') in rows and (kind, '1') in rows:
+        a = statistics.mean(x[0] for x in rows[(kind, '1')]); c = statistics.mean(x[0] for x in rows[(kind, 'a')])
+        print('%s user-area (notify-resume) cost mean: %+.0f ns (%+.1f%%)' % (kind, a - c, 100 * (a - c) / c))
 PY
   log "overhead done ($((i)) runs; numbers in overhead.txt; instrumentation enabled=1 on both)" ;;
 instr-on)

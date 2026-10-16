@@ -42,7 +42,9 @@ K=$(rec release); COMMIT=$(rec source_commit)
 test ! -e "$OUT"
 mkdir -p "$SCR"; trap 'rm -rf "$SCR"' EXIT
 
-# 1. stage: kernel modules + cxl_shm (updates/), signed by kbuild with this build's key.
+# 1. stage: kernel modules + cxl_shm (updates/), signed by kbuild with this build's key
+#    (modules_install signs; the bundle records the signed cxl_shm.ko sha256 = KO_SHA, which the guest checks,
+#    next to the unsigned build-output sha256 of build-record.json).
 #    A stage from an earlier bundle of the same build is reused (every module is re-verified in step 2).
 if [ -e "$ST" ]; then
   echo "reusing existing stage $ST"
@@ -152,8 +154,11 @@ cat > "$OUT/package-record.json" <<JSON
   "bzImage_sha256": "$(rec bzImage_sha256)",
   "modules_staged": $(python3 -I -c 'import json,sys; print(len(json.load(open(sys.argv[1]))["modules"]))' "$OUT/modules-manifest.json"),
   "cxl_shm_ko_sha256": "$(sha256sum "$MD/updates/cxl_shm.ko" | cut -d' ' -f1)",
+  "cxl_shm_ko_signed": "$(tail -c 28 "$MD/updates/cxl_shm.ko" | grep -q 'Module signature appended' && echo yes || echo no)",
+  "cxl_shm_ko_build_output_sha256": "$(rec cxl_shm_ko_sha256)",
   "cxl_swmc_commit": "$(git -C "$SW" rev-parse HEAD)", "cxl_swmc_dirty_files": $(git -C "$SW" status --porcelain -- scripts/deploy workloads/faultlat config | wc -l),
   "faultlat_sha256": "$(sha256sum "$OUT/tools/faultlat" | cut -d' ' -f1)",
+  "faultlat_version": "$(grep -aoE 'faultlat-[0-9]+' "$OUT/tools/faultlat" | sort -u | head -1)",
   "cxl_shm_params": "$PARAMS",
   "xml_source": "${XML_SRC:-virsh dumpxml --inactive (read-only, at packaging)}",
   "created": "$(date -Is)"

@@ -83,13 +83,14 @@ Example for the Popcorn kernel (root; grant-gated):
   `<step>.env` (kernel release, protocol, knobs, cxl_shm parameters, binary
   and config hashes, load average).
 
-## Instrumentation overhead check (faultlat-4, Popcorn build 9)
+## Instrumentation overhead check (faultlat-5, Popcorn build 9/10)
 
 `access` and `pingpong` register the measuring thread's `swmc_acct` area
 (systems/popcorn_new/include/swmc_acct.h; `--acct 0` skips it) and add an
 `instr` object to the step JSON: `/sys/kernel/swmc/instr/enabled` before and
 after the step, whether the registration succeeded, the area's deltas
-(`acct_{is,sm,wpu}_fault_ns/_faults`, `acct_ipi_ns/_count`) and the deltas of
+(`acct_{is,sm,wpu}_fault_ns/_faults`, `acct_ipi_ns/_count`, `acct_nontrans_ns/_count` = reserved[0..1],
+build 10; the area is unregistered again at the end of the step) and the deltas of
 every `/proc/thread-self/swmc` counter of that thread (`thread_delta`; names
 ending in `_ns` are durations, the rest counts; `instr_clock_reads` /
 `is_faults` = clock reads per counted fault). On kernels without build 9 the

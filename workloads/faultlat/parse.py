@@ -4,7 +4,7 @@
 Usage: parse.py <outdir> [more dirs...]  > summary.csv
 One row per (dir, step, pass): count, minflt, p50/p90/p99/p999/mean/stdev (ns),
 and the kernel transaction/nack deltas recorded by the step.
-faultlat-4 (Popcorn build 9): instr/enabled at the step and the measuring thread's
+faultlat-4/5 (Popcorn build 9/10): instr/enabled at the step and the measuring thread's
 build-9 counter deltas (per step, repeated on every pass row; "_ns" = duration).
 """
 import csv

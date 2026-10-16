@@ -62,7 +62,7 @@ namespace {
 
 constexpr uint64_t kPage = 4096;
 constexpr const char *kSysfs = "/sys/kernel/swmc/page_coherence";
-constexpr const char *kVersion = "faultlat-4";
+constexpr const char *kVersion = "faultlat-5";
 
 [[noreturn]] void die(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 void die(const char *fmt, ...) {
@@ -250,6 +250,15 @@ struct AcctView {
   void stop() {
     after = read_thread_swmc();
     instr_after = read_instr_enabled();
+    // The kernel copies into the area on every return to user: unregister before it goes out of scope.
+    if (registered) {
+      swmc_acct_unregister();
+      registered_done = true;
+    }
+  }
+  bool registered_done = false;
+  ~AcctView() {
+    if (registered && !registered_done) swmc_acct_unregister();
   }
   void json(FILE *f) const {
     fprintf(f, "  \"instr\": {\"enabled_before\": \"%s\", \"enabled_after\": \"%s\", \"acct_registered\": %d",
@@ -260,6 +269,9 @@ struct AcctView {
               area.fault_ns[i] - a0.fault_ns[i], cls[i], area.fault_cnt[i] - a0.fault_cnt[i]);
     fprintf(f, ", \"acct_ipi_ns\": %" PRIu64 ", \"acct_ipi_count\": %" PRIu64, area.ipi_ns - a0.ipi_ns,
             area.ipi_cnt - a0.ipi_cnt);
+    fprintf(f, ", \"acct_nontrans_ns\": %" PRIu64 ", \"acct_nontrans_count\": %" PRIu64,
+            swmc_acct_nontrans_ns(&area) - a0.reserved[SWMC_ACCT_NONTRANS_NS],
+            swmc_acct_nontrans_cnt(&area) - a0.reserved[SWMC_ACCT_NONTRANS_CNT]);
     fprintf(f, ", \"thread_delta\": {");
     bool first = true;
     for (auto &kv : after) {
