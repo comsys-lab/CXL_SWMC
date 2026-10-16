@@ -8,7 +8,8 @@ step=.. offered_x=.. target=.. addr=.. status=.. wall_ns=.. mono_ns=.. rtt_us=..
 Output: one row per (step, target) that has both snapshots. Fixed columns: step, phase, offered_x, target, addr,
 begin_wall_ns, end_wall_ns, window_s (loadgen clock: end mono_ns - begin mono_ns), srv_window_s (server clock:
 t_mono_ns delta, if the server emits it), then one column per numeric key (sorted): end - begin, except gauges
-(identity values, current sizes and maxima: see GAUGE below), which keep the end value. Non-numeric keys are ignored.
+(identity values, current sizes and maxima: see GAUGE below), which keep the end value; per-operation counts
+op.<op>.n / opt.<op>.n are counters despite the ".n" gauge suffix. Non-numeric keys are ignored.
 A key missing in one snapshot of a pair is left empty for that row.
 """
 import argparse, csv, os, re, sys
@@ -16,10 +17,16 @@ import argparse, csv, os, re, sys
 FNAME = re.compile(r"^step(\d+)-(begin|end)-t(\d+)\.txt$")
 # keys reported as their end value (not differenced)
 GAUGE_EXACT = {"node", "write_queue", "search_queue", "megt.sample"}
-GAUGE_SUFFIX = (".n", "max_ns", ".in_flight_transaction_count", ".enabled")
+GAUGE_SUFFIX = (".n", "max_ns", ".in_flight_transaction_count", ".enabled",
+                # identity values of the MOT1 v6 per-operation stats (sampling factor, TSC rate, thread counts)
+                "check_sample", "tsc_hz", ".threads", "_threads", ".version", ".meg_coh")
+# MOT1 v6 per-operation namespaces op.<op>.* / opt.<op>.*: the operation count "<prefix>.<op>.n" is a counter
+OP_COUNT = re.compile(r"^opt?\.[^.]+\.n$")
 
 
 def is_gauge(k):
+    if OP_COUNT.match(k):
+        return False
     return k in GAUGE_EXACT or k.endswith(GAUGE_SUFFIX)
 
 

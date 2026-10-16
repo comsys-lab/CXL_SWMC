@@ -58,6 +58,11 @@ def main():
     check(d["P"] == 40 and d["updates"] == 20 and d["searches"] == 2000, "counter deltas")
     check(d["node"] == 0 and d["thr.vdb-search.n"] == 4 and d["megt.sample"] == 64, "gauges keep end value")
     check(d["sys.instr.fault_read.max_ns"] == 9, "max_ns is a gauge")
+    # MOT1 v6 per-operation stats: op.<op>.n is a counter, sampling factors / TSC rate / thread counts are gauges
+    check(not stats_delta.is_gauge("op.query.n") and not stats_delta.is_gauge("opt.get.ops"), "per-op counts")
+    check(all(stats_delta.is_gauge(k) for k in ("op.query.mg.check_sample", "opt.meg_check_sample", "opt.tsc_hz",
+                                                "opt.threads", "opt.pop_threads", "opt.version", "thr.x.n")),
+          "per-op identity values")
     check("backend" not in d and "only_begin" not in d, "non-numeric / one-sided keys dropped")
     subprocess.run([sys.executable, os.path.join(LG, "stats_delta.py"), run], check=True)
     hdr = next(csv.reader(open(os.path.join(run, "stats-steps.csv"))))
