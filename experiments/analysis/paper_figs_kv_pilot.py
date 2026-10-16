@@ -61,18 +61,18 @@ def main():
             f = lambda k: sum(g(f"thr.{t}.swmc.{k}") for t in ("kv-worker", "kv-conn")) / n / 1e3
             msg = f("read_msg_wait_ns") + f("write_msg_wait_ns")
             local = f("read_fault_ns") + f("write_fault_ns") - msg
-            raw[name] = {"app": svc - msg - local, "msg": msg, "local": local}
-        else:  # the KV pilot's Megalon backend has no section timers: its coherence time is not separated
-            raw[name] = {"app": svc}
+            raw[name] = {"total": svc, "msg": msg, "local": local}
+        else:
+            raw[name] = {"total": svc}
         out.append([name, m[key]["step"], m[key]["offered"], m[key]["achieved"], round(svc, 3)]
-                   + [round(raw[name].get(k, 0.0), 3) for k in ("app", "msg", "local")])
+                   + [round(raw[name].get(k, 0.0), 3) for k in ("total", "msg", "local")])
     norm = ps.compose(raw)
     ps.breakdown(os.path.join(a.out, "kv-pilot-breakdown.png"), [(k, norm[k]) for k in ("HWcc", "Megalon", "Popcorn")],
                  ps.COMPONENTS)
     with open(os.path.join(a.out, "kv-pilot-breakdown.csv"), "w", newline="") as f:
         w = csv.writer(f)
-        w.writerow([f"# fixed-load windows at {o:.1f} req/s (identical offered rate); us per request; normalized to all-HWcc = 1; Megalon not instrumented (no section timers in the KV pilot)"])
-        w.writerow(["system", "step", "offered", "achieved", "svc_us", "app_us", "msg_us", "local_us"] + ["norm_" + c for c in ps.COMPONENTS])
+        w.writerow([f"# fixed-load windows at {o:.1f} req/s (identical offered rate); us per request; normalized to all-HWcc = 1"])
+        w.writerow(["system", "step", "offered", "achieved", "svc_us", "total_us", "msg_us", "local_us"] + ["norm_" + c for c in ps.COMPONENTS])
         w.writerows([r + [round(x, 4) for x in norm[r[0]]] for r in out])
     print("common rate", o, "base p99", base, "SLO norm", round(slo, 3))
 

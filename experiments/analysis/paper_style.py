@@ -80,22 +80,23 @@ def breakdown(path, bars, components, ylabel="Normalized\nserving latency"):
     plt.close(fig)
 
 
-# Unified serving-latency components (legend top -> bottom). Raw per-system inputs: app (serving time minus the
-# measured coherence time), check (Megalon section checks + re-execution), msg (page MSI message wait, FETCH +
-# INVALIDATE), local (page MSI fault time minus message wait). The part of a system's app time above all-HWcc's is
-# "Other overhead" (not measured directly: e.g. cache misses after invalidations, untimed fault entry/exit, TLB
-# shootdown IPIs, polling vCPU); bars are normalized to all-HWcc's total = 1.
-COMPONENTS = ["Version check", "Coherence transaction", "Fault handling", "Other overhead", "Application"]
+# Serving-latency components (user 2026-10-16: two parts per bar, Popcorn one level finer; same legend in every
+# figure; legend top -> bottom). Every value is measured: total = the system's serving time per request at the same
+# offered rate; Application = all-HWcc's serving time (same binary, kernel and rate; no coherence actions);
+# Coherence overhead = system total - all-HWcc total; for Popcorn the measured message wait (FETCH + INVALIDATE
+# requester wait, kernel per-thread counters) is drawn as its own part of the coherence overhead. Normalized to
+# all-HWcc = 1.
+COMPONENTS = ["Coherence message wait (Popcorn)", "Coherence overhead", "Application (HWcc time)"]
 
 
 def compose(raw, hw="HWcc"):
-    base_app = raw[hw]["app"]
-    base_tot = base_app
+    """raw: {system: {"total": t, "msg": m (Popcorn only)}} -> {system: [msg, overhead - msg, 1]} normalized."""
+    base = raw[hw]["total"]
     out = {}
     for k, r in raw.items():
-        other = max(r["app"] - base_app, 0.0)
-        app = r["app"] - other
-        out[k] = [x / base_tot for x in (r.get("check", 0.0), r.get("msg", 0.0), r.get("local", 0.0), other, app)]
+        over = (r["total"] - base) / base
+        msg = r.get("msg", 0.0) / base
+        out[k] = [msg, max(over - msg, 0.0), 1.0] if k != hw else [0.0, 0.0, 1.0]
     return out
 
 
