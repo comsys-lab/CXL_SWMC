@@ -13,8 +13,10 @@
                    write-end flush meg_wflush_ns / N_update
     (search-op components from the search operation's CohSnap deltas, update components from the update operation's)
 3b  bytes written back per update:  Megalon  meg_wflush_bytes(update) / N_update
-                                    Popcorn  (pop_sm_cnt + pop_wp_cnt)(update) x 4096 / N_update   (contrast: one
-                                             page per S->M / I->M / wp fault of the update; coordinator 2026-10-16)
+                                    Popcorn  remote_writeback_count (window delta, all nodes) x 4096 / N_update
+                                             (contrast: the real write-back counter; verifier 2026-10-16); secondary
+                                             CSV column "M acquisitions x 4 KiB" = (pop_sm_cnt + pop_wp_cnt)(update)
+                                             x 4096 / N_update
     reference line: modified bytes  mod_bytes(update) / N_update (opt.update.mod_bytes: bytes the application stored)
 3c  false vs true sharing (trace runs, 32 MiB objects): classification by the draft's definition (Dubois et al.):
     an (A)/(B) event of node n on object O is TRUE sharing if, while that copy lives (until n's next (A)/(B) event on
@@ -114,27 +116,29 @@ def fig_b(a):
         for c, k in uu.items():
             used_all.setdefault(c, set()).add(k)
         if not u or not u["ops"]:
-            rows.append([share, "Megalon", 0, "", "", "", run.path])
+            rows.append([share, "Megalon", 0, "", "", "", "", run.path])
             continue
         g = f"{share:g}%"
         mb = v6.div(u["meg_wflush_bytes"], u["ops"]) if "meg_wflush_bytes" in u else None
         mod = v6.div(u["mod_bytes"], u["ops"]) if "mod_bytes" in u else None
         bars = [("Megalon", None if mb is None else [mb / 1024])]  # key absent = no data (no bar), not 0
         ref[(g, "Megalon")] = mod / 1024 if mod is not None else None
-        rows.append([share, "Megalon", u["ops"], v6.r(mb, 1), v6.r(mod, 1),
+        rows.append([share, "Megalon", u["ops"], v6.r(mb, 1), v6.r(mod, 1), "",
                      "meg_wflush_bytes" if mb is not None else "NO DATA (meg_wflush_bytes absent)", run.path])
         if share in pop:
             pr, pst = pop[share]
             pu, pk = opsum(pr, pst, a.update_op)
             for c, k in pk.items():
                 used_all.setdefault(c, set()).add(k)
+            ns, nu = v6.node_sums(pr, pst, ["pop_remote_wb"])  # real write-back counter, all nodes, per window
+            pb = ns["pop_remote_wb"] * v6.PAGE / pu["ops"] if pu and pu["ops"] and "pop_remote_wb" in ns else None
             have = pu and pu["ops"] and ("pop_sm_cnt" in pu or "pop_wp_cnt" in pu)  # absent = no data, not 0
-            pb = (pu.get("pop_sm_cnt", 0) + pu.get("pop_wp_cnt", 0)) * v6.PAGE / pu["ops"] if have else None
+            macq = (pu.get("pop_sm_cnt", 0) + pu.get("pop_wp_cnt", 0)) * v6.PAGE / pu["ops"] if have else None
             pmod = v6.div(pu["mod_bytes"], pu["ops"]) if pu and "mod_bytes" in pu else None
             bars.append(("Popcorn", None if pb is None else [pb / 1024]))
             ref[(g, "Popcorn")] = pmod / 1024 if pmod is not None else None
-            rows.append([share, "Popcorn", pu["ops"] if pu else 0, v6.r(pb, 1), v6.r(pmod, 1),
-                         "(pop_sm_cnt + pop_wp_cnt) x 4096" if pb is not None else "NO DATA (pop sm/wp counts absent)",
+            rows.append([share, "Popcorn", pu["ops"] if pu else 0, v6.r(pb, 1), v6.r(pmod, 1), v6.r(macq, 1),
+                         nu["pop_remote_wb"] + " x 4096" if pb is not None else "NO DATA (remote_writeback_count absent)",
                          pr.path])
         groups.append((g, bars))
     png, csvp = (os.path.join(a.out, f"{a.tag}-fig3b.{e}") for e in ("png", "csv"))
@@ -143,15 +147,17 @@ def fig_b(a):
                    xlabel="Update share")
     v6.write_csv(csvp, [
         ("figure", f"MOT1 v6 Fig 3b bytes written back per update ({a.tag}); PNG {os.path.basename(png)}"),
-        ("formula", "Megalon: sum meg_wflush_bytes(update op) / N_update; Popcorn: sum (pop_sm_cnt + pop_wp_cnt)"
-                    "(update op) x 4096 / N_update (contrast); modified bytes: sum mod_bytes(update op) / N_update "
-                    "(reference line); sums over the listed steps and nodes"),
+        ("formula", "Megalon: sum meg_wflush_bytes(update op) / N_update; Popcorn: sum over nodes of the window "
+                    "delta of sys.swmc.page_coherence.remote_writeback_count x 4096 / N_update (contrast; pages "
+                    "written back for a peer); secondary column M_acquisitions_x4KiB_per_update = (pop_sm_cnt + "
+                    "pop_wp_cnt)(update op) x 4096 / N_update ('M acquisitions x 4 KiB', not drawn); modified bytes: "
+                    "sum mod_bytes(update op) / N_update (reference line); sums over the listed steps and nodes"),
         ("sources", "; ".join(f"{c}={'|'.join(sorted(k))}" for c, k in sorted(used_all.items()))
-),
-        ("tags", "wflush_bytes, mod_bytes, sm/wp fault counts measured (every event); per-update values derived"),
+                    + "; pop_remote_wb=" + "|".join(v6.NODEKEYS["pop_remote_wb"])),
+        ("tags", "wflush_bytes, mod_bytes, remote_writeback_count, sm/wp fault counts measured (every event); per-update values derived"),
         ("inputs", "see the run column"),
     ], ["update_share_pct", "system", "N_update", "writeback_bytes_per_update", "modified_bytes_per_update",
-        "writeback_source", "run"], rows)
+        "M_acquisitions_x4KiB_per_update", "writeback_source", "run"], rows)
     print(f"-> {png}\n-> {csvp}")
 
 

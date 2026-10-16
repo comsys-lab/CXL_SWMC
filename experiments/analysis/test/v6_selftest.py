@@ -81,7 +81,8 @@ def main():
     g = {"opt.meg_check_sample": 7,  # ignored: ratio estimator (contract 2015a31f3)
           "opt.tsc_hz": 2_000_000_000, "opt.threads": 14}
     for name, end in (("hw", hw), ("pop", pop), ("mg", meg)):
-        mkrun(os.path.join(S, f"kv-{name}"), ("mixed", 99, 1), curve + ramp, {1: [pair(end, g), pair(end, g)]})
+        gs = dict(g, **{"pop": {"opt.pop_threads": 14}, "mg": {"opt.meg_coh": 1}, "hw": {}}[name])  # coherence source
+        mkrun(os.path.join(S, f"kv-{name}"), ("mixed", 99, 1), curve + ramp, {1: [pair(end, gs), pair(end, gs)]})
     # Fig 1
     run(os.path.join(AN, "v6_fig1_curves.py"), "--out", out, "--tag", "kv", *[f"{k}={S}/kv-{k}" for k in ("hw", "pop", "mg")])
     r, meta = rows(os.path.join(out, "kv-fig1.csv"))
@@ -119,7 +120,8 @@ def main():
          "sys.swmc.instr.serve.wb_flush_ns": 400_000, "sys.swmc.instr.fault_read.lt_8192": 390,
          "sys.swmc.instr.fault_read.lt_65536": 10}
     for load in ("avg", "peak"):
-        mkrun(os.path.join(S, f"rs-{load}"), ("query", 95, 100), curve, {1: [pair(q, {"op.query.mg.check_sample": 64})]})
+        mkrun(os.path.join(S, f"rs-{load}"), ("query", 95, 100), curve, {1: [pair(q, {"op.query.mg.check_sample": 64,
+                                                                             "op.coh_src": "pc_threads:14,mg_threads:0"})]})
     p = subprocess.run([sys.executable, os.path.join(AN, "v6_fig4_popcorn.py"), "a", "--out", out, "--tag", "rs",
                         f"avg={S}/rs-avg"], capture_output=True, text=True)
     check(p.returncode != 0 and "Refused" in p.stderr, "fig4a refuses build-8 fallbacks by default")
@@ -144,7 +146,7 @@ def main():
           "sys.swmc.instr.serve_fetch.reply_ns": 200_000, "sys.swmc.instr.serve_fetch.reply_count": 800,
           "sys.swmc.instr.fault_full_is.lt_8192": 390, "sys.swmc.instr.fault_full_is.lt_65536": 10,
           "thr.a.n": 3}
-    mkrun(os.path.join(S, "rs-b9"), ("query", 95, 100), curve, {1: [pair(b9)]})
+    mkrun(os.path.join(S, "rs-b9"), ("query", 95, 100), curve, {1: [pair(b9, {"op.coh_src": "pc_threads:14,mg_threads:0"})]})
     run(os.path.join(AN, "v6_fig4_popcorn.py"), "a", "--out", out, "--tag", "rs9", f"avg={S}/rs-b9")
     x = rows(os.path.join(out, "rs9-fig4a.csv"))[0][0]
     f9 = lambda k: float(x[k])  # noqa: E731
@@ -170,7 +172,7 @@ def main():
         if share:
             v.update({"op.update.n": 100, "op.update.t_ns": 5e6, "op.update.mg.wstart_ns": 1e5, "op.update.mg.wflush_ns": 4e5,
                       "op.update.mg.wflush_bytes": 100 * 32 * 2**20, "op.update.mod_bytes": 100 * 4096})
-        mkrun(os.path.join(S, f"vdb-{share}"), ("search", 99, 100), curve, {1: [pair(v, {"op.search.mg.check_sample": 64})]})
+        mkrun(os.path.join(S, f"vdb-{share}"), ("search", 99, 100), curve, {1: [pair(v, {"op.search.mg.check_sample": 64, "opt.meg_coh": 1})]})
     run(os.path.join(AN, "v6_fig3_megalon.py"), "a", "--out", out, "--tag", "vdb", f"0={S}/vdb-0", f"10={S}/vdb-10")
     r, _ = rows(os.path.join(out, "vdb-fig3a.csv"))
     x = r[1]
@@ -178,7 +180,7 @@ def main():
     check(float(x["check_us"]) == 0.064 and float(x["stale_A_us"]) == 2 and float(x["waits_D_us"]) == 0.5, "fig3a search parts")
     check(float(x["wstart_us"]) == 1 and float(x["wflush_us"]) == 4 and r[0]["wflush_us"] == "", "fig3a update parts")
     mkrun(os.path.join(S, "vdb-miss"), ("search", 99, 100), curve,
-          {1: [pair({"op.search.n": 1000, "op.search.t_ns": 9e6, "op.search.mg.check_ns_sampled": 1000})]})
+          {1: [pair({"op.search.n": 1000, "op.search.t_ns": 9e6, "op.search.mg.check_ns_sampled": 1000}, {"opt.meg_coh": 1})]})
     run(os.path.join(AN, "v6_fig3_megalon.py"), "a", "--out", out, "--tag", "vdbmiss", f"5={S}/vdb-miss")
     r, _ = rows(os.path.join(out, "vdbmiss-fig3a.csv"))
     check(r[0]["check_est_missing_nodes"] == "1" and float(r[0]["check_us"]) == 0, "fig3a: missing check_sampled marked")
@@ -190,13 +192,29 @@ def main():
     check(r[0]["writeback_bytes_per_update"] == "" and len(r) == 2, "fig3b: share without update op = no data")
     # Fig 3b Popcorn contrast in the A3 (opt.*) convention: (sm + wp faults of the update op) x 4 KiB
     pv = {"opt.update.ops": 100, "opt.update.t_ns": 1e6, "opt.update.pop.sm_cnt": 150, "opt.update.pop.wp_cnt": 50,
-          "opt.update.mod_bytes": 100 * 4096, "opt.search.ops": 10, "opt.search.t_ns": 1e5}
-    mkrun(os.path.join(S, "vdb-pop10"), ("search", 99, 100), curve, {1: [pair(pv)]})
+          "opt.update.mod_bytes": 100 * 4096, "opt.search.ops": 10, "opt.search.t_ns": 1e5,
+          "sys.swmc.page_coherence.remote_writeback_count": 300}
+    mkrun(os.path.join(S, "vdb-pop10"), ("search", 99, 100), curve, {1: [pair(pv, {"opcoh.pop_source": "swmc_acct"})]})
     run(os.path.join(AN, "v6_fig3_megalon.py"), "b", "--out", out, "--tag", "vdbp", f"10={S}/vdb-10", "--pop",
         f"10={S}/vdb-pop10")
     r, _ = rows(os.path.join(out, "vdbp-fig3b.csv"))
-    check(len(r) == 2 and float(r[1]["writeback_bytes_per_update"]) == 2 * 4096 and r[1]["system"] == "Popcorn",
-          "fig3b popcorn = (sm + wp) x 4096 / N_update")
+    check(len(r) == 2 and float(r[1]["writeback_bytes_per_update"]) == 3 * 4096 and r[1]["system"] == "Popcorn",
+          "fig3b popcorn = remote_writeback_count x 4096 / N_update")
+    check(float(r[1]["M_acquisitions_x4KiB_per_update"]) == 2 * 4096, "fig3b secondary: M acquisitions x 4 KiB")
+    # guards: wrong coherence source (build-8 file fallback) and trace runs are refused
+    mkrun(os.path.join(S, "vdb-popfile"), ("search", 99, 100), curve, {1: [pair(pv, {"opcoh.pop_source": "swmc_file"})]})
+    p = subprocess.run([sys.executable, os.path.join(AN, "v6_fig3_megalon.py"), "b", "--out", out, "--tag", "x",
+                        f"10={S}/vdb-10", "--pop", f"10={S}/vdb-popfile"], capture_output=True, text=True)
+    check(p.returncode != 0 and "coherence source" in p.stderr, "op_sums refuses swmc_file (build-8 fallback)")
+    p = subprocess.run([sys.executable, os.path.join(AN, "v6_fig2_split.py"), "--out", out, "--tag", "x",
+                        f"L1:hw={S}/kv-hw", f"L1:pop={S}/kv-mg", f"L1:mg={S}/kv-mg"], capture_output=True, text=True)
+    check(p.returncode != 0 and "coherence source" in p.stderr, "op_sums refuses a pop run reporting the Megalon source")
+    tr = os.path.join(S, "trace-run")
+    mkrun(os.path.join(tr, "loadgen"), ("search", 99, 100), curve, {1: [pair(v, {"opt.meg_coh": 1})]})
+    open(os.path.join(tr, "manifest.txt"), "w").write("system=Megalon\ntrace=1 stats_op=9\n")
+    p = subprocess.run([sys.executable, os.path.join(AN, "v6_fig3_megalon.py"), "a", "--out", out, "--tag", "x",
+                        f"10={tr}"], capture_output=True, text=True)
+    check(p.returncode != 0 and "trace run" in p.stderr, "Run refuses trace=1 runs")
     t = os.path.join(S, "trace10")
     os.makedirs(t)
     open(os.path.join(t, "writes.csv"), "w").write("object,element,wseq\nO1,e1,1\nO1,e2,2\nO1,e3,5\nO2,*,1\n")

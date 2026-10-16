@@ -44,7 +44,7 @@ OPKEYS = {
     "t_ns": ["opt.{op}.t_ns", "op.{op}.t_ns"],                    # sum over ops and threads of (end - start) [rdtsc]
     "c_ns_exported": ["opt.{op}.c_ns", "op.{op}.c_ns"],           # the workload's own C sum (audit column only)
     "meg_check_sample": ["op.{op}.mg.check_sample", "opt.meg_check_sample"],  # sampling factor N (gauge)
-    # Fig 3b reference line: bytes the application stored in the update. NOT EXPORTED by any workload yet.
+    # Fig 3b reference line: bytes the application stored in the update (vector DB opt.update.mod_bytes, 03d2a5391)
     "mod_bytes": ["opt.{op}.mod_bytes", "op.{op}.mod_bytes", "opt.{op}.app_bytes", "op.{op}.app_bytes"],
 }
 OPKEYS.update({"pop_" + k: [f"opt.{{op}}.pop.{a}", f"op.{{op}}.pc.{b}"] for k, (a, b) in POP_F.items()})
@@ -131,10 +131,16 @@ class Run:
         self.slo_ms = float(ms) if ms else slo.get("ms")
         self.harness_system = None
         hp = os.path.join(os.path.dirname(self.path), "manifest.txt")
+        trace = [v for k, v in self.manifest.items() if k in ("trace", "opt.trace")]
         if os.path.exists(hp):
             for line in open(hp):
                 if line.startswith("system="):
                     self.harness_system = line.strip().split("=", 1)[1]
+                trace += re.findall(r"(?:^|\s)trace=(\S+)", line)
+        if any(t not in ("", "0") for t in trace):
+            # trace runs (Fig 3c only) are perturbed by the trace buffers: never input of Fig 1/2/3a/3b/4
+            sys.exit(f"{self.path}: trace run (manifest trace={','.join(trace)}): refused as figure input "
+                     "(trace runs feed Fig 3c through classify_sharing.py only)")
         self._deltas = None
 
     def measured(self):
@@ -180,6 +186,56 @@ def first_key(d, cands, op=None):
     return None
 
 
+def snapshot_text(run, step):
+    """[(target, {key: raw string})] of the step's END snapshots (string keys such as opcoh.pop_source, which
+    stats_delta drops)."""
+    out = []
+    d = os.path.join(run.path, "stats")
+    for name in sorted(os.listdir(d)) if os.path.isdir(d) else []:
+        m = re.match(r"^step(\d+)-end-t(\d+)\.txt$", name)
+        if m and int(m.group(1)) == step:
+            kv = {}
+            for line in open(os.path.join(d, name)):
+                k, sep, v = line.rstrip("\n").partition("=")
+                if sep and not k.startswith("#"):
+                    kv[k] = v.strip()
+            out.append((int(m.group(2)), kv))
+    return out
+
+
+def coh_source(kv):
+    """Coherence sources a node reports (per-op exporters): {'pop', 'mg'} subset.
+      pop  vector DB opcoh.pop_source=swmc_acct | KV/LMDB opt.pop_threads > 0 | recsys op.coh_src pc_threads:N > 0
+           (swmc_acct registered = build-9 per-thread area; swmc_file / fake / none are not accepted)
+      mg   opt.meg_coh=1 (vector DB, KV/LMDB) | recsys op.coh_src mg_threads:N > 0 (shim v2 thread_coh live)"""
+    src = set()
+    num = lambda v: int(float(v)) if re.match(r"^-?[0-9.]+$", v or "") else 0  # noqa: E731
+    cs = dict(p.split(":", 1) for p in kv.get("op.coh_src", "").split(",") if ":" in p)
+    if kv.get("opcoh.pop_source") == "swmc_acct" or num(kv.get("opt.pop_threads")) > 0 or num(cs.get("pc_threads")) > 0:
+        src.add("pop")
+    if num(kv.get("opt.meg_coh")) == 1 or num(cs.get("mg_threads")) > 0:
+        src.add("mg")
+    return src
+
+
+def check_source(run, steps):
+    """Refuse a pop/mg run unless every node of every step reports exactly the run's coherence source (no build-8
+    file fallback, no fallback shim with C = 0, no mixed sources)."""
+    if run.system == "hw":
+        return
+    for st in steps:
+        snaps = snapshot_text(run, st)
+        if not snaps:
+            sys.exit(f"{run.path}: step {st} has no end snapshot")
+        for t, kv in snaps:
+            src = coh_source(kv)
+            if src != {run.system}:
+                sys.exit(f"{run.path}: step {st} node {t}: coherence source {sorted(src) or 'none'} "
+                         f"(opcoh.pop_source={kv.get('opcoh.pop_source')}, opt.pop_threads={kv.get('opt.pop_threads')}, "
+                         f"opt.meg_coh={kv.get('opt.meg_coh')}, op.coh_src={kv.get('op.coh_src')}); this {run.system} "
+                         f"run needs exactly {{'{run.system}'}}: refused (no build-8 / fallback-shim / C = 0 data)")
+
+
 def op_sums(run, steps, op):
     """Sum over the steps and nodes of every canonical per-op quantity plus the v6 derived sums (all in ns or counts):
       meg_check_est_ns = meg_check_ns_sampled x meg_read_sections / meg_check_sampled   (ratio estimator, per node,
@@ -189,7 +245,9 @@ def op_sums(run, steps, op):
       C_meg  = meg_check_est_ns + meg_stale_ns + meg_concur_ns + meg_meta_ns + meg_spin_ns + meg_wstart_ns
                + meg_wflush_ns    (switch_rw/reclaim are inside wstart: not added; draft §3.1, §4.1)
       C      = C_pop (pop) | C_meg (mg) | 0 (hw: no coherence actions; measured values kept in the audit columns)
+    Refuses a pop/mg run whose nodes do not report exactly that coherence source (check_source).
     Returns (sums dict, keys used dict canonical -> stats key, nodes counted)."""
+    check_source(run, steps)
     out, used, nodes = {}, {}, 0
     for st in steps:
         rows = run.deltas().get(st, [])
