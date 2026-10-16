@@ -26,8 +26,9 @@ def curve(path, series, slo, xlabel, ylabel, ylim, xticks, yticks):
         xs, ys = clean_curve(xs, ys, ylim[1])
         ax.plot(xs, ys, color=SERIES[name], linewidth=2.5, marker="o", markersize=6, label=name, clip_on=True)
     ax.axhline(slo, color="black", linestyle=(0, (4, 2)), linewidth=2.5)
-    ax.text(xticks[-1] - (xticks[-1] - xticks[0]) * 0.03, slo + (ylim[1] - ylim[0]) * 0.04, "SLO", ha="right",
-            va="bottom", fontsize=18)
+    above = slo + (ylim[1] - ylim[0]) * 0.16 < ylim[1]  # label above the line if it fits, else below
+    ax.text(xticks[-1] - (xticks[-1] - xticks[0]) * 0.03, slo + (ylim[1] - ylim[0]) * (0.04 if above else -0.04),
+            "SLO", ha="right", va="bottom" if above else "top", fontsize=18)
     ax.set_xlim(xticks[0], xticks[-1])
     ax.set_ylim(*ylim)
     ax.set_xticks(xticks)

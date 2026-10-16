@@ -35,7 +35,7 @@ def write(path, header, rows, note):
         w.writerows(rows)
 
 
-def figure(out, tag, S, xscale, xlabel, slo_ms, xticks, ylim, yticks, comps_of, unit):
+def figure(out, tag, S, xscale, xlabel, slo_ms, xticks, ylim, yticks, comps_of, unit, fixed_y=False):
     hw0 = min(S["hw"], key=lambda r: float(r["offered"]))
     base = float(hw0["p99_ms"])
     series, rows = [], []
@@ -48,7 +48,8 @@ def figure(out, tag, S, xscale, xlabel, slo_ms, xticks, ylim, yticks, comps_of, 
         rows += [[NAMES[s], r["step"], r["phase"], r["offered"], r["achieved"], r["p99_ms"], round(y, 3), r["pass"]]
                  for r, y in zip(v, ys)]
     slo = slo_ms / base
-    ylim, yticks = ps.nice_ylim(slo)
+    if not fixed_y:
+        ylim, yticks = ps.nice_ylim(slo)
     ps.curve(os.path.join(out, f"{tag}-curve.png"), series, slo, xlabel, "Normalized\np99 latency", ylim,
              xticks, yticks)
     write(os.path.join(out, f"{tag}-curve.csv"), ["system", "step", "phase", "offered", "achieved", "p99_ms",
@@ -90,8 +91,8 @@ def main():
         local = (f("pf_fault_mean_ms") - f("pf_msg_wait_mean_ms")) * scale
         check = (f("mg_check_mean_ms") + f("mg_reexec_mean_ms")) * scale
         return {"app": f("server_ms_mean") - msg - local - check, "msg": msg, "local": local, "check": check}
-    o = figure(a.out, "vdb", S, 1.0, "Searches per second", 100.0, list(range(0, 211, 30)), (0, 4),
-               [0, 1, 2, 3, 4], vdb_comps, "_ms")
+    o = figure(a.out, "vdb", S, 1.0, "Searches per second", 100.0, list(range(0, 211, 30)), (0, 12),
+               list(range(0, 13, 2)), vdb_comps, "_ms", fixed_y=True)  # user: y max 12, step 2
     print("vdb common offered", o)
 
     # DLRM recommendation system (recovery/RECSYS-main-h1-v5 hw/pop, -v6 mg), query p99 <= 200 ms (user)
