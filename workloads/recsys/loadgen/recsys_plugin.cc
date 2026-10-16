@@ -56,9 +56,9 @@ struct SampleFile {
     SamplesHeader h;
     if (size_t(st.st_size) < sizeof(h)) return *err = path + ": too small", false;
     std::memcpy(&h, m, sizeof(h));
-    if (h.magic != kSamplesMagic || h.version != 1 || h.record_bytes != sizeof(Sample) ||
+    if (h.magic != kSamplesMagic || h.version != kSamplesVersion || h.record_bytes != sizeof(Sample) ||
         uint64_t(st.st_size) != sizeof(h) + h.count * sizeof(Sample))
-      return *err = path + ": not a recsys samples file (or size mismatch)", false;
+      return *err = path + ": not a recsys v" + std::to_string(kSamplesVersion) + " samples file (908 B multi-hot records) or size mismatch", false;
     n = h.count;
     rows = reinterpret_cast<const Sample *>(static_cast<const uint8_t *>(m) + sizeof(h));
     source.assign(h.source, strnlen(h.source, sizeof(h.source)));
@@ -174,21 +174,24 @@ class Recsys : public loadgen::Workload {
   bool finish(const std::string &dir, std::string *err) override {
     FILE *f = std::fopen((dir + "/queries.bin").c_str(), "wb");
     if (!f) return *err = "cannot write queries.bin", false;
-    uint64_t pairs = 0, lookups = 0, retries = 0, misses = 0;
+    uint64_t pairs = 0, lookups = 0, retries = 0, false_retries = 0, misses = 0;
     {
       std::lock_guard<std::mutex> g(mu_);
       std::fwrite(logs_.data(), sizeof(QueryLog), logs_.size(), f);
-      for (auto &l : logs_) pairs += l.r.pairs, lookups += l.r.lookups, retries += l.r.seq_retries, misses += l.r.misses;
+      for (auto &l : logs_)
+        pairs += l.r.pairs, lookups += l.r.lookups, retries += l.r.seq_retries, false_retries += l.r.false_retries,
+            misses += l.r.misses;
     }
     std::fclose(f);
     FILE *t = std::fopen((dir + "/recsys.txt").c_str(), "w");
     std::fprintf(t,
                  "updates_made=%lu\nqueries_made=%lu\nupdate_errors=%lu\nquery_errors=%lu\nbad_query_responses=%lu\n"
-                 "max_published_seq=%lu\nquery_pairs=%lu\nquery_lookups=%lu\nquery_seq_retries=%lu\nquery_misses=%lu\n"
+                 "max_published_seq=%lu\nquery_pairs=%lu\nquery_lookups=%lu\nquery_seq_retries=%lu\nquery_false_retries=%lu\nquery_misses=%lu\n"
                  "query_log_record_bytes=%zu\nseq_base=%lu\nlast_update_seq=%lu\ntrace_samples=%lu\ntrace_wraps=%lu\n",
                  (unsigned long)(next_u_ - seq_base_), (unsigned long)next_q_, (unsigned long)update_errors_.load(),
                  (unsigned long)query_errors_.load(), (unsigned long)bad_responses_.load(), (unsigned long)published_.load(),
-                 (unsigned long)pairs, (unsigned long)lookups, (unsigned long)retries, (unsigned long)misses,
+                 (unsigned long)pairs, (unsigned long)lookups, (unsigned long)retries, (unsigned long)false_retries,
+                 (unsigned long)misses,
                  sizeof(QueryLog), (unsigned long)seq_base_, (unsigned long)next_u_, (unsigned long)upd_.n,
                  (unsigned long)(next_u_ ? (next_u_ - 1) / upd_.n : 0));
     std::fclose(t);

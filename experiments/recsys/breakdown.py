@@ -18,6 +18,10 @@ coherence time (both are wall times; waits may sleep, so CPU run_ns is reported 
 H3 denominator (page MSI) = serving coherence + node-1 INVALIDATE handling, per query; TLB IPIs as counts per query.
 Megalon estimates are computed from the window deltas of the raw sampled counters. The updater (node 0, rs-update
 threads / Megalon role update) is reported in separate columns, never added to the serving time.
+MOT1 v6 Fig 2 columns (server op.* keys, optime.h; tag in brackets): per operation o in {query (node 1), row_update
+(node 0)}: fig2_<o>_n [count], fig2_<o>_T_ms [measured: rdtsc, summed over threads], fig2_<o>_C_ms [Popcorn:
+measured swmc_acct; Megalon: derived = sampled x N check estimate + measured intervals], fig2_<o>_rest_ms [derived T-C],
+per operation. Megalon background threads (not in CohSnap): bg_cpu_ms_node<k> = thr.nr-log-sync + thr.mg-bg run_ns.
 usage: breakdown.py <run dir> [--out file.csv]
 """
 import csv
@@ -129,6 +133,26 @@ def main():
         r['upd_rows_per_s'] = round(r['upd_rows_written'] / win_s, 1) if win_s else ''
         r['upd_busy_ms'] = round(delta(b0, e0, 'thr.rs-update.run_ns') / 1e6, 3)
         r['upd_flush_overruns'] = delta(b0, e0, 'flush_overruns')
+        for o, b, e in (('query', b1, e1), ('row_update', b0, e0)):  # MOT1 v6 Fig 2 (optime.h)
+            n = delta(b, e, f'op.{o}.n')
+            t, c = delta(b, e, f'op.{o}.t_ns'), delta(b, e, f'op.{o}.c_ns')
+            ctag = {'hwcc': 'none', 'msi': 'measured', 'megalon': 'derived'}[kind]
+            r[f'fig2_{o}_n[count]'] = n
+            r[f'fig2_{o}_T_ms[measured]'] = round(t / n / 1e6, 6) if n else ''
+            r[f'fig2_{o}_C_ms[{ctag}]'] = round(c / n / 1e6, 6) if n else ''
+            r[f'fig2_{o}_rest_ms[derived]'] = round((t - c) / n / 1e6, 6) if n else ''
+            if kind == 'megalon':
+                r[f'fig2_{o}_C_check_ms[sampledxN]'] = round(delta(b, e, f'op.{o}.mg.check_est_ns') / n / 1e6, 6) if n else ''
+        if kind == 'megalon':
+            for k, b, e in ((0, b0, e0), (1, b1, e1)):
+                r[f'bg_cpu_ms_node{k}[measured]'] = round((delta(b, e, 'thr.nr-log-sync.run_ns') +
+                                                           delta(b, e, 'thr.mg-bg.run_ns')) / 1e6, 3)
+        r['upd_publish_rounds'] = delta(b0, e0, 'publish_rounds')
+        r['upd_round_rows'] = delta(b0, e0, 'round_rows')
+        r['upd_rows_per_round_target'] = e0.get('rows_per_round_target', '')
+        r['upd_rate_sustained'] = 0 if r['upd_flush_overruns'] else 1
+        r['serve_seq_retries'] = delta(b1, e1, 'seq_retries')
+        r['serve_false_retries'] = delta(b1, e1, 'false_retries')
         rows.append(r)
     if not rows:
         sys.exit('no complete stats snapshot pairs')

@@ -1,19 +1,20 @@
 // recsys request/response payloads (inside experiments/loadgen/frame.h frames). Little-endian, packed.
-// A sample is the Criteo/MLPerf record: 13 dense features (fp32) and 26 one-hot sparse ids (raw, uncapped; the
-// server applies the table cap and the multi-hot expansion, DESIGN.md §3).
+// A sample is the MLPerf DLRMv2 multi-hot record (v6, DESIGN.md §3): 13 dense features (fp32) and the 214 multi-hot
+// ids of the 26 sparse features in table order (MLPerf sizes 3,2,1,2,6,...; ids over the uncapped MLPerf rows; the
+// server applies only the table cap, id mod rows). Real data: MLPerf day_23_sparse_multi_hot.npz as is.
 #pragma once
 
 #include <cstdint>
 
 namespace rsys {
 
-constexpr uint32_t kDense = 13, kSparse = 26;
+constexpr uint32_t kDense = 13, kSparse = 26, kMultiHot = 214;  // kMultiHot = sum of the MLPerf multi-hot sizes
 
 struct __attribute__((packed)) Sample {
   float dense[kDense];
-  uint32_t sparse[kSparse];
+  uint32_t ids[kMultiHot];  // feature k: ids[hot_off(k) .. hot_off(k) + mlperf size k)
 };
-static_assert(sizeof(Sample) == 156, "sample record");
+static_assert(sizeof(Sample) == 908, "sample record");
 
 enum Op : uint16_t {
   kOpUpdate = 1,  // UpdateReq + Sample            -> UpdateResp (updater node; samples in time order)
@@ -45,11 +46,11 @@ struct __attribute__((packed)) QueryResp {
   uint32_t total_us;     // arrival -> reply
   uint32_t lookups;      // rows read (pairs x 214 for MLPerf sizes)
   uint32_t probes;       // slots inspected by linear probing
-  uint32_t seq_retries;  // version-word (seqlock) re-reads
+  uint32_t seq_retries;  // version-word (seqlock) re-reads (all; false ones in false_retries)
   uint32_t misses;       // ids not found (0 with a fully loaded table)
   uint64_t max_row_seq;  // newest update seq seen in any row read (staleness diagnostics)
   float mean_score;      // mean predicted CTR
-  uint32_t pad;
+  uint32_t false_retries;  // re-reads where the row itself was not rewritten (striped-version false retry)
 };
 
 }  // namespace rsys

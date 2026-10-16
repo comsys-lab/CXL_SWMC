@@ -1,24 +1,29 @@
 #!/bin/bash
 # The recommendation-system H1 MAIN block (reports/RECSYS-main-packet.md): full-size tables (26 tables, 26M cap,
-# 167,731,776 slots x 576 B = 89.98 GiB), T = 60 s, updater 2,100 samples/s on node 0, serving on node 1,
-# SLO = SLO_FACTOR (5) x all-HWcc's query p99 at the lowest load (user 2026-10-16; deviation from MOT1's 60 ms MLPerf
-# SLO), one SLO for all three systems of the block (<E>/slo.txt, every manifest). Every system on Popcorn build 8 (K8): all-HWcc and Megalon with cxl_shm unloaded, page MSI
+# 167,731,776 slots x 576 B = 89.98 GiB), T = 60 s, serving on node 1, MOT1 v6 (user 2026-10-16):
+#   SLO query p95 <= 100 ms (DeepRecSys ISCA'20; reports/MOT1-v6-sources.md §1), fixed for every system (<E>/slo.txt);
+#   updater on node 0 replays the real MLPerf day-23 multi-hot trace at the Ekko operating point EKKO=avg (3.08% of
+#   rows/hour -> PUBLISH_FRAC 0.0308/60 per T) or EKKO=peak (4.3%/10 min -> 0.043/10 per T); the sample rate is
+#   computed on the Host by recsys-rate from the trace (<E>/update-rate.txt) so that one T publishes that fraction.
+#   (v5 rule "SLO = 5 x all-HWcc p99 at the lowest load" and the fixed 2,100 samples/s are superseded.) Every system on Popcorn build 8 (K8): all-HWcc and Megalon with cxl_shm unloaded, page MSI
 # with cxl_shm loaded once for its whole server lifetime (init_state=shared + preload, recv_mode RECV_MODE).
 # usage: main-block.sh <evidence dir (exists; only sequence* files)>
 # env (required): C8 (= builds/popcorn_new/8/deploy-v3), K8, GT8, RECV_MODE, D (inputs dir with MANIFEST.txt),
 #   VM_PLAIN (guest dir: build-3 server, all-HWcc + page MSI), VM_MEG (guest dir: Megalon build + recsys-2vm.yaml),
-#   MEG_BUILD (recsys-megalon build on builds/megalon/70), LOADGEN; optional SEED (20261016), UPD_RATE (2100),
+#   MEG_BUILD (recsys-megalon build on MEGALON_BASE, default builds/megalon/71), PLAIN_BUILD (v6 recsys build dir), EKKO
+#   (avg | peak), LOADGEN; optional SEED (20261016), UPD_FILE / QRY_FILE (names in D; default the day-23 slices of
+#   builds/recsys-inputs/1),
 #   ROUNDS (3), FIXED (1; 0 = no fixed-load window), XT (server lifetime bound, s, default 28800),
-#   SYSTEMS (subset of "hw pop mg", seeded order kept), SLO_MS_FROM (slo.txt of an earlier block; required when hw is
-#   not in SYSTEMS: its slo_ms is the block SLO), L_FROM (fixed-load-L.txt; needed then only with FIXED=1).
+#   SYSTEMS (subset of "hw pop mg", seeded order kept), L_FROM (fixed-load-L.txt; needed when hw is not in SYSTEMS
+#   and FIXED=1).
 # Load once per system (recorded exception to "every run starts from the initial image"): per system one server
 # lifetime (session.sh) with, in this order,
 #   warmup 1 query/s + the updater, 10 s + 70 s, unmeasured (results kept, never used): after the server's own read of
 #          every slot (both nodes, before READY; page MSI read first-touch faults happen there), the first T = 60 s
 #          publication round (updater write faults / page MSI invalidations) and the query path's first use
 #   gate   1 query/s, 60 s, no SLO abort: the lowest-load window. VALID = one step, keeps up, no errors/timeouts,
-#          >= 1 query (main_util.py gate). all-HWcc: INVALID STOPs the block; otherwise SLO_MS = SLO_FACTOR x its query
-#          p99 (main_util.py slo) -> <E>/slo.txt. page MSI / Megalon: recorded with within_slo (block continues)
+#          >= 1 query (main_util.py gate, within_slo by p95). all-HWcc: INVALID STOPs the block. page MSI / Megalon:
+#          recorded with within_slo (block continues)
 #   slo-r1, slo-r2, slo-r3   full MOT1 §3.3 SLO searches (PROFILE=main: warm-up 10 s, steps 3 s + 15 s, bisect 5%,
 #          confirm 3 x 30 s with step-down, fill 0.7/0.8/0.9, overload 1.05/1.1/1.2), loadgen seed SEED + round
 #   fixed  60 s at L = 0.5 x all-HWcc slo-r1 confirm mean (no SLO abort: the whole window is measured); breakdown.csv
@@ -35,39 +40,49 @@ set -uo pipefail
 E=${1:?evidence dir}
 P=/home/comsys/sungsu/destijl-control X=$P/CXL_SWMC/experiments/recsys G=$P/CXL_SWMC/experiments/vectordb/host-gate.sh
 : "${C8:?}" "${K8:?}" "${GT8:?}" "${RECV_MODE:?}" "${D:?}" "${VM_PLAIN:?}" "${VM_MEG:?}" "${MEG_BUILD:?}" "${LOADGEN:?}"
-MB=$MEG_BUILD SEED=${SEED:-20261016} UPD_RATE=${UPD_RATE:-2100} ROUNDS=${ROUNDS:-3} FIXED=${FIXED:-1} XT=${XT:-28800}
-T_MS=60000 SLO_FACTOR=${SLO_FACTOR:-5} SLO_MS=""
-export SLO_MS SLO_RULE="pending: ${SLO_FACTOR} x all-HWcc query p99 at 1 query/s (gate window)"
-if [[ " ${SYSTEMS:-hw pop mg} " != *" hw "* ]]; then  # imported block SLO (rerun without all-HWcc)
-  SLO_MS=$(sed -n 's/^slo_ms=\([0-9.]*\) .*/\1/p' "$SLO_MS_FROM" | head -1)
-  awk -v x="$SLO_MS" 'BEGIN{exit !(x > 0)}' || { echo "SEQUENCE STOP: no slo_ms in $SLO_MS_FROM"; exit 2; }
-  SLO_RULE="imported from $SLO_MS_FROM ($(sed -n 's/^slo_ms=[0-9.]* rule=//p' "$SLO_MS_FROM" | head -1))"
-fi
-HOST_PLAIN=$P/builds/recsys/3/bin/recsys-server
+: "${PLAIN_BUILD:?}" "${EKKO:?}"
+MB=$MEG_BUILD SEED=${SEED:-20261016} ROUNDS=${ROUNDS:-3} FIXED=${FIXED:-1} XT=${XT:-28800}
+MEGALON_BASE=${MEGALON_BASE:-$P/builds/megalon/71}
+UPD_FILE=${UPD_FILE:-updates-day23-0-2M.smp} QRY_FILE=${QRY_FILE:-queries-day23-89137318-1M.smp}
+T_MS=60000 SLO_PCT=95 SLO_MS=100
+case $EKKO in
+  avg) PUBLISH_FRAC=0.000513333333; EKKO_RULE="Ekko OSDI'22 average: 3.08% of rows per hour -> 0.0308/60 per T = 60 s";;
+  peak) PUBLISH_FRAC=0.0043; EKKO_RULE="Ekko OSDI'22 peak: 4.3% of rows per 10 min -> 0.043/10 per T = 60 s";;
+  *) echo "SEQUENCE STOP: EKKO must be avg or peak"; exit 2;;
+esac
+export SLO_MS SLO_RULE="DeepRecSys ISCA'20: query p${SLO_PCT} <= ${SLO_MS} ms (MOT1 v6, user 2026-10-16)"
+HOST_PLAIN=$PLAIN_BUILD/bin/recsys-server
 SSH="ssh -o BatchMode=yes -o ConnectTimeout=8"
 IPS=(192.168.122.100 192.168.122.101)
 OWNER="RECSYS-main-$(basename "$E")"
 [[ $RECV_MODE =~ ^(poll|idle|sleep)$ ]] || { echo "SEQUENCE STOP: bad RECV_MODE"; exit 2; }
 [[ $ROUNDS =~ ^[1-9]$ ]] || { echo "SEQUENCE STOP: bad ROUNDS"; exit 2; }
 # SYSTEMS (subset of "hw pop mg", default all) and SLO_MS_FROM (a previous block's slo.txt; required without hw):
-# a rerun of some systems against the block SLO set by an earlier all-HWcc gate (user 2026-10-16, Megalon rerun)
+# a rerun of some systems (the SLO is fixed; L for the fixed window comes from L_FROM)
 for s in ${SYSTEMS:-hw pop mg}; do case $s in hw|pop|mg) ;; *) echo "SEQUENCE STOP: bad SYSTEMS entry $s"; exit 2;; esac; done
 if [[ " ${SYSTEMS:-hw pop mg} " != *" hw "* ]]; then
-  [ -f "${SLO_MS_FROM:-}" ] || { echo "SEQUENCE STOP: SYSTEMS without hw needs SLO_MS_FROM=<slo.txt>"; exit 2; }
   [ "${FIXED:-1}" = 0 ] || [ -f "${L_FROM:-}" ] || { echo "SEQUENCE STOP: SYSTEMS without hw and FIXED=1 needs L_FROM=<fixed-load-L.txt>"; exit 2; }
 fi
 case $FIXED in 0|1) ;; *) echo "SEQUENCE STOP: bad FIXED"; exit 2;; esac
-grep -q "^megalon_build=$P/builds/megalon/70$" $MB/manifest.txt || { echo "SEQUENCE STOP: $MB is not on builds/megalon/70"; exit 2; }
+grep -q "^megalon_build=$MEGALON_BASE$" $MB/manifest.txt || { echo "SEQUENCE STOP: $MB is not on $MEGALON_BASE"; exit 2; }
+[ -x "$HOST_PLAIN" ] && [ -x "$PLAIN_BUILD/bin/recsys-rate" ] || { echo "SEQUENCE STOP: $PLAIN_BUILD is not a v6 recsys build"; exit 2; }
+# update rate for the Ekko operating point: samples per T so that one round publishes PUBLISH_FRAC of all rows
+RATEF=$E/sequence-update-rate.txt
+nice -n 19 numactl --cpunodebind=1 --membind=1 "$PLAIN_BUILD/bin/recsys-rate" --samples "$D/$UPD_FILE" --frac $PUBLISH_FRAC \
+  --t-ms $T_MS --windows 20 > "$RATEF" || { echo "SEQUENCE STOP: recsys-rate"; exit 2; }
+UPD_RATE=$(sed -n 's/^rate_samples_per_s=//p' "$RATEF")
+awk -v x="$UPD_RATE" 'BEGIN{exit !(x > 0)}' || { echo "SEQUENCE STOP: bad update rate $UPD_RATE"; exit 2; }
+echo "EKKO=$EKKO publish_frac=$PUBLISH_FRAC update_rate=$UPD_RATE samples/s ($EKKO_RULE; $RATEF)"
 [ "$C8" = $P/builds/popcorn_new/8/deploy-v3 ] && [ ! -e $C8/SUPERSEDED.txt ] \
   && [ "$(sha256sum < $C8/packet.sha256 | cut -d' ' -f1)" = c67fa82b8649c8de5afcfe65f48657555bef0fcb0e635fc36a751689afead5a4 ] \
   && (cd $C8 && sha256sum -c --quiet packet.sha256) || { echo "SEQUENCE STOP: C8 is not the verified build-8 deploy-v3 bundle"; exit 2; }
 [ -d "$E" ] && [ -z "$(ls -A "$E" | grep -v '^sequence')" ] || { echo "SEQUENCE STOP: $E missing or not empty"; exit 2; }
 bash $G lock "$OWNER" || { echo "SEQUENCE STOP: lock"; exit 2; }
-SA="--nodes 2 --row-div 1 --serve-threads 14 --update-threads 4 --load-threads 8 --start-timeout-ms $((XT * 1000 / 2))
+SA="--nodes 2 --row-div 1 --serve-threads 14 --update-threads 4 --load-threads 8 --start-timeout-ms $((XT * 1000 / 2)) --publish-frac $PUBLISH_FRAC
  --verify-rows 1 --proc-sysfs /sys/kernel/swmc/instr --proc-sysfs /sys/kernel/cxl_shm/instr
  --proc-sysfs /sys/kernel/swmc/page_coherence --proc-kthread cxl_recv"
 SA=$(echo $SA)
-LGC=(--opt samples=$D/updates-zipf105-s1-16M.smp --opt queries=$D/queries-zipf105-s2-1M.smp
+LGC=(--opt samples=$D/$UPD_FILE --opt queries=$D/$QRY_FILE --opt wrap=1
      --opt quantiles=$D/dist_quantile.txt --fixed update=$UPD_RATE --mix query=1 --x-stream query)
 export LOADGEN PROFILE=main RUN_KIND=measurement STATS_OP=10 READY_TIMEOUT=$((XT / 2)) IDLE_WAIT_S=2400  # idle: an overrunning T = 60 s round may take > 10 min (Megalon)
 PS=(K=$K8 GT=$GT8 C=$C8 R=$E/shm-pop INIT_STATE=shared)
@@ -136,7 +151,7 @@ dax_root() {  # before the page MSI lifetime (no server of ours runs then)
 }
 shuffle() { python3 -c 'import random,sys; v=sys.argv[2:]; random.Random(sys.argv[1]).shuffle(v); print(" ".join(v))' "$OWNER" "$@"; }
 confirm_half() { python3 $X/main_util.py half "$1"; }        # 0.5 x confirm mean of an SLO search without a note
-gatechk() { python3 $X/main_util.py gate "$1" ${SLO_MS:+"$SLO_MS"}; }  # validity (+ within the block SLO once set)
+gatechk() { python3 $X/main_util.py gate "$1" "$SLO_MS" "$SLO_PCT"; }  # validity + within the SLO (p95)
 precheck() {
   local i f files="${VM_PLAIN#/home/comsys/}/bin/recsys-server ${VM_PLAIN#/home/comsys/}/bin/recsys-node.sh ${VM_PLAIN#/home/comsys/}/cfg/cxl_region.yaml ${VM_MEG#/home/comsys/}/bin/recsys-server ${VM_MEG#/home/comsys/}/bin/recsys-node.sh ${VM_MEG#/home/comsys/}/lib/libmegalon-objapi.so ${VM_MEG#/home/comsys/}/lib/libmegalon.so ${VM_MEG#/home/comsys/}/cfg/megalon.yaml ${VM_MEG#/home/comsys/}/cfg/cxl_region.yaml"
   for i in 0 1; do
@@ -220,18 +235,14 @@ system() {  # one server lifetime: hw | pop | mg
   echo "$s gate 1 query/s: $g" | tee -a "$E/gate.txt"
   if [ $s = hw ]; then
     case "$g" in VALID*) ;; *) stop "all-HWcc lowest-load window invalid ($g)";; esac
-    SLO_MS=$(python3 $X/main_util.py slo "$S/gate/loadgen/steps.jsonl" "$SLO_FACTOR") || stop "no SLO from the all-HWcc gate"
-    awk -v x="$SLO_MS" 'BEGIN{exit !(x > 0)}' || stop "bad SLO $SLO_MS"
-    SLO_RULE="${SLO_FACTOR} x all-HWcc query p99 at 1 query/s ($S/gate, $(echo "$g" | grep -o 'p99_ms=[^ ]*'))"
-    { echo "slo_ms=$SLO_MS rule=$SLO_RULE (user 2026-10-16; deviation from MOT1's 60 ms)"
-      echo "source_window: $g"; } | tee "$E/slo.txt"  # p99 of ~60 queries = the window max; round overlap recorded
+    { echo "slo_ms=$SLO_MS pct=$SLO_PCT rule=$SLO_RULE"; echo "all-HWcc lowest-load window: $g"; } | tee "$E/slo.txt"
   else
     case "$g" in VALID*) ;; *) echo "MAIN NOTE $s lowest-load window invalid (recorded; the block continues): $g";; esac
   fi
   [ -n "$SLO_MS" ] || stop "no block SLO"
   # 3) SLO searches (block SLO)
   for r in $(seq 1 $ROUNDS); do
-    measure "$S" slo-r$r "${LGC[@]}" --opt seed=$((SEED + r)) --seed $((SEED + r)) --slo query:99:$SLO_MS --raw \
+    measure "$S" slo-r$r "${LGC[@]}" --opt seed=$((SEED + r)) --seed $((SEED + r)) --slo query:$SLO_PCT:$SLO_MS --raw \
       --mode slo --start 1 --factor 1.5 --precision 0.05 --max-steps 20
     rc=$?
     grep -q 'workload_finish":"ok' "$S/slo-r$r/loadgen/summary.json" 2>/dev/null || stop "$s slo-r$r: loadgen workload finish (rc $rc)"

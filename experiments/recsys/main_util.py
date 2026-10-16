@@ -5,7 +5,7 @@
                                                  the step passed (keeps up, no errors) AND query p99 <= limit (explicit,
                                                  not only loadgen's pass flag) AND it completed >= 1 query.
                                                  Prints "PASS|MISS p99_ms=... ..." (exit 0 either way).
-  main_util.py gate <steps.jsonl> [slo ms]      the lowest-load window (v2): exactly one measured "fixed" step; VALID when
+  main_util.py gate <steps.jsonl> [slo ms [pct]] the lowest-load window (v2; v6: pct 95 -> within_slo by p95): exactly one measured "fixed" step; VALID when
                                                  the step passed (keeps up, no errors/timeouts; no SLO is set) and >= 1
                                                  query completed, no non-finite latency. Prints "VALID|INVALID" with the
                                                  query count, p50/p90/p99/max (p99 of ~60 queries = the max), and whether
@@ -55,7 +55,7 @@ def _kv(path):
     return d
 
 
-def gate_window(steps):
+def gate_window(steps, pct=99):
     """(valid, p99 or None, text). Never raises on bad input: unparsable lines, inf/NaN latencies (timeouts) and
     missing keys give INVALID with the reason."""
     try:
@@ -72,7 +72,9 @@ def gate_window(steps):
     try:
         q, u = d['streams']['query'], d['streams']['update']
         lat = {k: _num(q.get(k)) for k in ('p50_ms', 'p90_ms', 'p99_ms', 'max_ms')}
+        p95 = _num(q.get('p95_ms'))
         txt = (f'queries_done={q["done"]} query_sent={q["sent"]} p50_ms={q.get("p50_ms")} p90_ms={q.get("p90_ms")} '
+               f'p95_ms={q.get("p95_ms")} '
                f'p99_ms={q.get("p99_ms")} max_ms={q.get("max_ms")} p99_is_max={lat["p99_ms"] == lat["max_ms"]} '
                f'pass={d["pass"]} reason={d.get("reason", "")!r} errors={q["errors"]} timeouts={q["timeouts"]} '
                f'achieved_q_s={q["achieved"]} update_offered={u["offered"]} update_achieved={u["achieved"]}')
@@ -85,6 +87,8 @@ def gate_window(steps):
             why.append('errors/timeouts')
         if any(v is None for v in lat.values()):
             why.append('non-finite or missing latency')
+        if pct != 99 and p95 is None:
+            why.append('missing p95_ms (loadgen without the p95 column)')
     except (KeyError, TypeError) as e:
         return False, None, f'missing key in steps file: {e}'
     # publication round overlap: node-0 (updater) counter deltas over the measured window (loadgen stats snapshots)
@@ -101,12 +105,12 @@ def gate_window(steps):
         txt += ' publication_round_in_window=unknown (no node-0 snapshots)'
     if why:
         return False, None, txt + ' invalid=' + ','.join(why)
-    return True, lat['p99_ms'], txt
+    return True, (lat['p99_ms'] if pct == 99 else p95), txt
 
 
-def gate(steps, limit=None):
-    ok, p, txt = gate_window(steps)
-    extra = '' if limit is None or p is None else f' slo_ms={limit} within_slo={p <= limit}'
+def gate(steps, limit=None, pct=99):
+    ok, p, txt = gate_window(steps, pct)
+    extra = '' if limit is None or p is None else f' slo_ms={limit} slo_pct={pct:g} within_slo={p <= limit}'
     print(('VALID ' if ok else 'INVALID ') + txt + extra)
 
 
@@ -130,8 +134,9 @@ def half(summary):
 if __name__ == '__main__':
     if len(sys.argv) == 4 and sys.argv[1] == 'gate60':
         gate60(sys.argv[2], float(sys.argv[3]))
-    elif sys.argv[1:2] == ['gate'] and len(sys.argv) in (3, 4):
-        gate(sys.argv[2], float(sys.argv[3]) if len(sys.argv) == 4 else None)
+    elif sys.argv[1:2] == ['gate'] and len(sys.argv) in (3, 4, 5):
+        gate(sys.argv[2], float(sys.argv[3]) if len(sys.argv) >= 4 else None,
+             float(sys.argv[4]) if len(sys.argv) == 5 else 99)
     elif len(sys.argv) == 4 and sys.argv[1] == 'slo':
         slo(sys.argv[2], float(sys.argv[3]))
     elif len(sys.argv) == 3 and sys.argv[1] == 'half':

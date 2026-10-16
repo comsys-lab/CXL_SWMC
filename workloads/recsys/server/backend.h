@@ -4,7 +4,7 @@
 // Interface used by server.cc (Server<Backend>): fits, name, usage, stats, thread_init(tid), create_objects (node 0),
 // check_objects (every node), read_slot(k, s, f) (f(const uint8_t *slot) may run more than once and must only
 // produce its result), write_slot(k, s, fill) (fill(uint8_t *slot) writes the whole slot, whole lines, reads nothing).
-// The HWcc version words (seqlock per 64 slots) wrap these calls in server.cc identically for every backend.
+// The HWcc striped version table (MemC3, S = 2^16) wraps these calls in server.cc identically for every backend.
 #pragma once
 
 #include <dlfcn.h>
@@ -48,6 +48,7 @@ class PlainBackend {
   uint8_t *slot(uint32_t k, uint64_t s) const { return map_ + base_ + (p_.slot_base[k] + s) * p_.slot_bytes; }
   void thread_init(int, int = 0) const {}
   void set_time_sample(uint32_t) {}
+  void (*coh_fn() const)(mshim::CohSnap *) { return nullptr; }  // no user-level coherence (Popcorn: swmc_acct)
   template <class Par> bool create_objects(std::string *, Par &&) const { return true; }
   bool check_objects(std::string *, uint64_t) const { return true; }
   template <class F> auto read_slot(uint32_t k, uint64_t s, F f) const { return f(static_cast<const uint8_t *>(slot(k, s))); }
@@ -144,6 +145,7 @@ class MegalonBackend {
     me_ = thr_.back().get();
   }
   void set_time_sample(uint32_t n) { sample_ = n; }
+  void (*coh_fn() const)(mshim::CohSnap *) { return api_->thread_coh; }  // shim v2 CohSnap (nullptr: v1 shim)
 
   // Node 0 at prepare: one object per slot (all slots, empty ones too: a probe that reaches an empty slot reads it).
   // par(f) runs f(i) on every thread of the server's registered prep pool (NR registrations are never freed, so

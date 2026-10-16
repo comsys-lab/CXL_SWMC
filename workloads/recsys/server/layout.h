@@ -1,8 +1,9 @@
 // recsys shared layout (DESIGN.md §2-§4, docs/hwcc-contract.md).
 // SWcc: one open-addressing linear-probing hash table per sparse feature; a slot is one cache-line-aligned record
 //   {key, embedding[dim], seq, csum} (576 B for dim 128). Tables are contiguous, table k after table k-1.
-// HWcc (region.app): header, parameter tag, per-node lines, one 32-bit version word (seqlock) per `group` (64)
-//   consecutive slots of a table. Identical in every system.
+// HWcc (region.app): header, parameter tag, per-node lines, a striped version table (MemC3 NSDI'13 §3.2.1): S = 2^16
+//   u32 counters, row key -> counter hash(table, key) mod S (v6, user 2026-10-16; replaced one word per 64 slots).
+//   Identical in every system.
 #pragma once
 
 #include <algorithm>
@@ -42,35 +43,37 @@ struct Params {
   uint32_t dim = 128;
   uint64_t row_cap = 26000000;  // rows per table are min(MLPerf rows, row_cap) (MOT1 §4.2: 5 tables capped at 26M)
   uint64_t row_div = 1;         // test scaling: rows = max(1, min(MLPerf, cap) / row_div)
-  double load_factor = 0.8;     // slots = ceil(rows / load_factor), rounded up to whole groups
-  uint32_t group = 64;          // slots per version word
+  double load_factor = 0.8;     // slots = ceil(rows / load_factor), rounded up to a multiple of slot_round
+  uint32_t slot_round = 64;     // slot count granularity (SWcc layout kept from v5: 167,731,776 slots at full size)
+  uint32_t ver_stripes = 1u << 16;  // S: striped version counters (power of two; libcuckoo kMaxNumLocks)
   uint64_t seed = 20261016;     // initial embeddings, multi-hot expansion, model weights
   uint32_t multi_hot_div = 1;   // test scaling of multi-hot sizes (>= 1 each)
   // derived
-  std::vector<uint64_t> rows, slots, slot_base, group_base;  // per table; slot_base in slots, group_base in groups
-  std::vector<uint32_t> hot;
-  uint64_t total_rows = 0, total_slots = 0, total_groups = 0, slot_bytes = 0;
+  std::vector<uint64_t> rows, slots, slot_base;  // per table; slot_base in slots
+  std::vector<uint32_t> hot, hot_off;           // ids used per sample per table; offset of table k in Sample::ids
+  uint64_t total_rows = 0, total_slots = 0, slot_bytes = 0;
   uint32_t lookups_per_sample = 0;
 
   void derive() {
     const auto &R = mlperf_rows();
     const auto &H = mlperf_multi_hot();
-    rows.clear(), slots.clear(), slot_base.clear(), group_base.clear(), hot.clear();
-    total_rows = total_slots = total_groups = 0;
+    rows.clear(), slots.clear(), slot_base.clear(), hot.clear(), hot_off.clear();
+    total_rows = total_slots = 0;
     lookups_per_sample = 0;
+    uint32_t off = 0;
     for (uint32_t k = 0; k < kSparse; k++) {
       uint64_t r = std::max<uint64_t>(1, std::min(R[k], row_cap) / row_div);
       uint64_t s = uint64_t(double(r) / load_factor + 0.999999);
       if (s <= r) s = r + 1;  // at least one empty slot: a miss terminates
-      s = (s + group - 1) / group * group;
+      s = (s + slot_round - 1) / slot_round * slot_round;
       rows.push_back(r);
       slots.push_back(s);
       slot_base.push_back(total_slots);
-      group_base.push_back(total_groups);
       total_rows += r;
       total_slots += s;
-      total_groups += s / group;
-      hot.push_back(std::max<uint32_t>(1, H[k] / multi_hot_div));
+      hot.push_back(std::max<uint32_t>(1, H[k] / multi_hot_div));  // the first hot[k] ids of the sample's H[k]
+      hot_off.push_back(off);
+      off += H[k];
       lookups_per_sample += hot.back();
     }
     slot_bytes = (8 + uint64_t(dim) * 4 + 16 + 63) / 64 * 64;  // key + emb + seq + csum/pad, whole lines
@@ -79,8 +82,9 @@ struct Params {
   std::string describe() const {
     std::ostringstream o;
     o << "nr_nodes=" << nr_nodes << " dim=" << dim << " row_cap=" << row_cap << " row_div=" << row_div
-      << " load_factor=" << load_factor << " group=" << group << " seed=" << seed << " multi_hot_div=" << multi_hot_div
-      << " rows=" << total_rows << " slots=" << total_slots << " groups=" << total_groups << " slot_bytes=" << slot_bytes
+      << " load_factor=" << load_factor << " slot_round=" << slot_round << " ver_stripes=" << ver_stripes
+      << " seed=" << seed << " multi_hot_div=" << multi_hot_div
+      << " rows=" << total_rows << " slots=" << total_slots << " slot_bytes=" << slot_bytes
       << " swcc_bytes=" << swcc_bytes() << " lookups_per_sample=" << lookups_per_sample;
     return o.str();
   }
@@ -90,16 +94,20 @@ struct Params {
   static uint64_t key(uint32_t k, uint64_t row) { return (uint64_t(k) + 1) << 56 | row; }
   static uint32_t key_table(uint64_t key) { return uint32_t(key >> 56) - 1; }
   uint64_t home(uint32_t k, uint64_t key) const { return mix64(key ^ seed) % slots[k]; }
-  uint64_t group_of(uint32_t k, uint64_t s) const { return group_base[k] + s / group; }
-  // MLPerf multi-hot expansion of one-hot raw id `raw` of table k: element 0 = the id itself (capped: raw mod
-  // rows), elements j >= 1 uniform over the rows (MLPerf: a fixed random lookup table generated with numpy seed 0;
-  // here a hash of (seed, k, id, j), same distribution, not the same values; DESIGN.md §9 deviation D2).
-  uint64_t multi_hot(uint32_t k, uint32_t raw, uint32_t j) const {
-    const uint64_t id = raw % rows[k];
-    if (j == 0) return id;
-    return mix64(seed * 0x9e3779b97f4a7c15ull ^ (uint64_t(k) << 48) ^ (id << 8) ^ j) % rows[k];
-  }
+  // Striped version counter of a row (MemC3): hash(table, key) mod S. The key carries the table; a second salt keeps
+  // the stripe independent of the home slot.
+  uint32_t stripe(uint64_t key) const { return uint32_t(mix64(key ^ seed ^ 0x5eed5a17c0ffee11ull) & (ver_stripes - 1)); }
+  // Row of the j-th multi-hot id of table k in sample s (MLPerf ids as is; table cap / row_div: id mod rows, D1)
+  uint64_t row_of(uint32_t k, const Sample &s, uint32_t j) const { return s.ids[hot_off[k] + j] % rows[k]; }
 };
+
+// Synthetic multi-hot expansion (tools/gen_samples.cc only; real data carries MLPerf's own ids): element 0 = the one-hot
+// id, elements j >= 1 uniform over the uncapped MLPerf rows of table k by a hash of (seed, k, id, j) — the distribution
+// of MLPerf's numpy-generated table (`uniform`), not its values (deviation D2, synthetic inputs only).
+inline uint32_t synth_multi_hot(uint64_t seed, uint32_t k, uint32_t id, uint32_t j) {
+  if (j == 0) return id;
+  return uint32_t(mix64(seed * 0x9e3779b97f4a7c15ull ^ (uint64_t(k) << 48) ^ (uint64_t(id) << 8) ^ j) % mlperf_rows()[k]);
+}
 
 // Slot record in SWcc (slot_bytes, whole lines): key | emb[dim] | seq | csum | pad
 struct SlotView {
@@ -153,7 +161,7 @@ struct HwccLayout {
     L.add(("recsys " + p.describe() + backend_tag).c_str(), 0, 8);  // parameters go into the layout hash
     off_nodes = L.add("nodes", uint64_t(p.nr_nodes) * sizeof(NodeLine));
     off_load = L.add("load_done", 64);  // node 0: run_id once every slot is written (initial image)
-    off_ver = L.add("versions", p.total_groups * 4);
+    off_ver = L.add("versions", uint64_t(p.ver_stripes) * 4);
   }
 };
 

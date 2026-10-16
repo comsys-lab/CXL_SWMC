@@ -9,9 +9,10 @@
 #     /dev/dax0.0 must be root:root 600 (p-popcorn-shm.sh precheck; its teardown restores it)
 #   SYS=all-HWcc / Megalon: /dev/dax0.0 owned by comsys (the block chowns it)
 #   SYS=Megalon: VM_MEG (guest install dir, default /home/comsys/rsm4), HOST_MEG (default builds/recsys-megalon/4)
-# optional: SEED (default 20261016), GATE=0 (skip the Host gate: functional runs only), UPD_RATE (default 2100).
+# optional: SEED (default 20261016), GATE=0 (skip the Host gate; refused unless KIND=functional), UPD_RATE (default 2100).
+# SLO: query p95 <= 100 ms (MOT1 v6, DeepRecSys ISCA'20; reports/MOT1-v6-sources.md §1).
 # KIND=functional checks the invariants only (clean stop, torn rows 0, misses 0, no bad requests, loadgen finish ok);
-# its p99 is recorded in <run>/functional-slo.txt but a step over 60 ms does not stop the block.
+# its p95 is recorded in <run>/functional-slo.txt but a step over 100 ms does not stop the block.
 # Prints "PILOTRUN <name> OK|NOTE|STOP <reason>"; exit 0 for OK/NOTE, 1 for STOP (the sequence stops).
 set -uo pipefail
 NAME=$1 E=$2
@@ -55,7 +56,7 @@ case "$SYS" in
 esac
 LG=(--opt samples=$D/updates-zipf105-s1-2M.smp --opt queries=$D/queries-zipf105-s2-1M.smp
     --opt quantiles=$D/dist_quantile.txt --opt seed=$SEED --seed "$SEED" --fixed update=$UPD_RATE --mix query=1
-    --slo query:99:60 --x-stream query)
+    --slo query:95:100 --x-stream query)
 case "$KIND" in
   functional) LG+=(--mode fixed --rates 1 --step-warmup-s 5 --step-measure-s 30 --drain-s 30);;
   slo) LG+=(--raw --mode slo --start 1 --factor 1.5 --precision 0.05 --max-steps 20);;
@@ -63,6 +64,7 @@ case "$KIND" in
   *) stop "bad KIND";;
 esac
 echo "$(date -Is) $NAME: SYS=$SYS T_MS=$T_MS KIND=$KIND RATE=${RATE:-} RECV_MODE=${RECV_MODE:-} SEED=$SEED UPD_RATE=$UPD_RATE V=$V"
+[ "${GATE:-1}" = 1 ] || [ "$KIND" = functional ] || stop "GATE=0 is allowed only for KIND=functional"
 servers_gone || stop "a recsys-server is running before the run"
 if [ "${GATE:-1}" = 1 ]; then bash $P/CXL_SWMC/experiments/vectordb/host-gate.sh check "$E/gate-$NAME.txt" || stop "host gate"; fi
 T0=$(date +%s)

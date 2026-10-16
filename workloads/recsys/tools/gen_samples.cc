@@ -1,5 +1,6 @@
-// Synthetic sample trace for bring-up and Host tests (NOT Criteo; DESIGN.md §3 options). Raw one-hot ids per table
-// over the MLPerf (uncapped) row counts; the server applies its row cap and the multi-hot expansion.
+// Synthetic sample trace for bring-up and Host tests (NOT Criteo; DESIGN.md §3 options). One-hot id per table over the
+// MLPerf (uncapped) row counts, expanded to the MLPerf multi-hot sizes (layout.h synth_multi_hot: element 0 = the id,
+// the rest uniform; deviation D2, synthetic inputs only). Sample format v2 (214 ids); the server applies its row cap.
 // usage: recsys-gen-samples --out FILE --n N [--seed S] [--dist uniform|zipf] [--alpha A (1.05)]
 //   zipf: rank drawn from a bounded power law with exponent alpha, then scattered over the id space by a hash
 //   (hot ids are not low numbers, as in Criteo's hashed ids). dense: log(1 + Exp(mean 2)) per feature.
@@ -36,18 +37,20 @@ int main(int argc, char **argv) {
   FILE *f = std::fopen(out.c_str(), "wb");
   if (!f) return std::perror(out.c_str()), 1;
   SamplesHeader h{};
-  h.magic = kSamplesMagic, h.version = 1, h.record_bytes = sizeof(Sample), h.count = n, h.seed = seed;
+  h.magic = kSamplesMagic, h.version = kSamplesVersion, h.record_bytes = sizeof(Sample), h.count = n, h.seed = seed;
   std::snprintf(h.source, sizeof(h.source), "synthetic %s alpha=%.3f (not Criteo)", dist.c_str(), dist == "zipf" ? alpha : 0.0);
   std::fwrite(&h, sizeof(h), 1, f);
   std::mt19937_64 rng(seed);
   std::uniform_real_distribution<double> U(0.0, 1.0);
   const auto &R = mlperf_rows();
+  const auto &H = mlperf_multi_hot();
   std::vector<Sample> buf(65536);
   for (uint64_t done = 0; done < n;) {
     const uint64_t m = std::min<uint64_t>(buf.size(), n - done);
     for (uint64_t i = 0; i < m; i++) {
       Sample &s = buf[i];
       for (uint32_t d = 0; d < kDense; d++) s.dense[d] = float(std::log1p(-2.0 * std::log(1.0 - U(rng))));
+      uint32_t off = 0;
       for (uint32_t k = 0; k < kSparse; k++) {
         const double N = double(R[k]);
         uint64_t rank;
@@ -55,7 +58,9 @@ int main(int argc, char **argv) {
         else if (std::fabs(alpha - 1.0) < 1e-9) rank = uint64_t(std::pow(N, U(rng))) - 1;
         else rank = uint64_t(std::pow((std::pow(N, 1 - alpha) - 1) * U(rng) + 1, 1 / (1 - alpha))) - 1;
         if (rank >= R[k]) rank = R[k] - 1;
-        s.sparse[k] = uint32_t(dist == "uniform" ? rank : mix64(rank * 0x9e3779b97f4a7c15ull ^ (uint64_t(k) << 52) ^ seed) % R[k]);
+        const uint32_t id = uint32_t(dist == "uniform" ? rank : mix64(rank * 0x9e3779b97f4a7c15ull ^ (uint64_t(k) << 52) ^ seed) % R[k]);
+        for (uint32_t j = 0; j < H[k]; j++) s.ids[off + j] = synth_multi_hot(seed, k, id, j);
+        off += H[k];
       }
     }
     std::fwrite(buf.data(), sizeof(Sample), m, f);
