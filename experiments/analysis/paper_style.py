@@ -7,6 +7,7 @@ import matplotlib.pyplot as plt
 from matplotlib.patches import Patch
 
 FONT = "Liberation Sans"  # metric-compatible with Arial
+FS = 24  # one font size for axis titles, tick labels and legend (user 2026-10-16)
 plt.rcParams.update({"font.family": FONT, "font.weight": "bold", "font.size": 22, "axes.labelweight": "bold",
                      "axes.titleweight": "bold", "axes.linewidth": 2.0, "xtick.major.width": 2.0,
                      "ytick.major.width": 2.0, "xtick.major.size": 5, "ytick.major.size": 5,
@@ -19,7 +20,7 @@ STACK = ["white", "#d9d9d9", "#a6a6a6", "#595959", "black"]  # top -> bottom in 
 
 def curve(path, series, slo, xlabel, ylabel, ylim, xticks, yticks):
     """series: [(name, xs, ys)] in legend order; ys already normalized; slo normalized (dashed line)."""
-    fig, ax = plt.subplots(figsize=(10.2, 4.0))
+    fig, ax = plt.subplots(figsize=(10.2, 4.4))
     ax.yaxis.grid(True, color="#d9d9d9", linewidth=1.0)
     ax.set_axisbelow(True)
     for name, xs, ys in series:
@@ -28,16 +29,17 @@ def curve(path, series, slo, xlabel, ylabel, ylim, xticks, yticks):
     ax.axhline(slo, color="black", linestyle=(0, (4, 2)), linewidth=2.5)
     above = slo + (ylim[1] - ylim[0]) * 0.16 < ylim[1]  # label above the line if it fits, else below
     ax.text(xticks[-1] - (xticks[-1] - xticks[0]) * 0.03, slo + (ylim[1] - ylim[0]) * (0.04 if above else -0.04),
-            "SLO", ha="right", va="bottom" if above else "top", fontsize=18)
+            "SLO", ha="right", va="bottom" if above else "top", fontsize=FS)
     ax.set_xlim(xticks[0], xticks[-1])
     ax.set_ylim(*ylim)
     ax.set_xticks(xticks)
     ax.set_yticks(yticks)
-    ax.set_xlabel(xlabel, fontsize=26)
-    ax.set_ylabel(ylabel, fontsize=24, linespacing=0.95)
+    ax.set_xlabel(xlabel, fontsize=FS)
+    ax.set_ylabel(ylabel, fontsize=FS, linespacing=0.95)
+    ax.tick_params(labelsize=FS)
     for s in ax.spines.values():
         s.set_visible(True)
-    ax.legend(ncol=len(series), loc="lower center", bbox_to_anchor=(0.5, 0.98), fontsize=24, handlelength=1.2,
+    ax.legend(ncol=len(series), loc="lower center", bbox_to_anchor=(0.5, 0.98), fontsize=FS, handlelength=1.2,
               columnspacing=2.0, handletextpad=0.3, borderaxespad=0.1)
     fig.tight_layout()
     fig.savefig(path, dpi=150)

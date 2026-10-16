@@ -90,7 +90,7 @@ def main():
         return {"total": f("server_ms_mean"), "msg": f("pf_msg_wait_mean_ms") * scale,
                 "local": (f("pf_fault_mean_ms") - f("pf_msg_wait_mean_ms")) * scale,
                 "check": (f("mg_check_mean_ms") + f("mg_reexec_mean_ms")) * scale}
-    o = figure(a.out, "vdb", S, 1.0, "Searches per second", 100.0, list(range(0, 211, 30)), (0, 12),
+    o = figure(a.out, "vdb", S, 1.0, "Search requests per second", 100.0, list(range(0, 211, 30)), (0, 12),
                list(range(0, 13, 2)), vdb_comps, "_ms", fixed_y=True)  # user: y max 12, step 2
     print("vdb common offered", o)
 
