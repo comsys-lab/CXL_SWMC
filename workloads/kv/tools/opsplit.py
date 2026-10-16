@@ -14,7 +14,9 @@ One row per (step, operation type), summed over every target (node) with both sn
        Megalon:            section checks (ratio estimate check_ns_sampled x read_sections / check_sampled, read
                            sections only; contract CXL_SWMC 2015a31f3) + stale copy (A) + concurrent write (B) + metadata (C)
                            + writer spin (D) + write start + write-end flush (CohSnap; switch_rw and reclaim are
-                           parts of write start and shown separately)
+                           parts of write start and shown separately) + the workload's validation copy (lmdb: 4 KiB
+                           page copy of an accepted read section, which plain does not make; ratio estimate
+                           vcopy_ns_sampled x vcopy_cnt / vcopy_sampled; user decision MOT1 v6 §3.1)
        all-HWcc:           0 by definition (no coherence actions)
   rest = T - C
   mod_bytes = bytes the application stored per operation (put / update value; 0 for reads)
@@ -79,7 +81,8 @@ def columns(ops_present):
     c += [f"pop_{k[:-3]}_us_per_op[measured]" for k in POP if k.endswith("_ns")]
     c += [f"pop_{k[:-4]}_per_op[measured]" for k in POP if k.endswith("_cnt")]
     c += ["lib_bg_cpu_s[measured]", "recv_cpu_s[measured]", "coh_bg_cpu_s[derived]", "coh_bg_us_per_op[derived]"]
-    c += ["meg_check_us_per_op[sampled_xN]", "meg_check_sample[measured]"]
+    c += ["meg_check_us_per_op[sampled_xN]", "meg_check_sample[measured]", "meg_vcopy_us_per_op[sampled_xN]",
+          "meg_vcopy_per_op[measured]"]
     c += [f"meg_{k[:-3]}_us_per_op[measured]" for k in MEG_NS]
     c += [f"meg_{k}_per_op[measured]" for k in MEG_CNT]
     return c
@@ -136,12 +139,13 @@ def rows(run, system):
             cnt = (lambda x: x / n) if n else (lambda x: 0.0)
             T = per(dsum(p + "t_ns"))
             pop = {k: dsum(p + "pop." + k) for k in POP}
-            meg = {k: dsum(p + "meg." + k) for k in MEG_NS + MEG_CNT + ["check_ns_sampled"]}
+            meg = {k: dsum(p + "meg." + k) for k in MEG_NS + MEG_CNT + ["check_ns_sampled", "vcopy_ns_sampled", "vcopy_sampled", "vcopy_cnt"]}
+            vcopy_est = meg["vcopy_ns_sampled"] * meg["vcopy_cnt"] / meg["vcopy_sampled"] if meg["vcopy_sampled"] else 0.0
             check_est = meg["check_ns_sampled"] * meg["read_sections"] / meg["check_sampled"] if meg["check_sampled"] else 0.0
             if src == "popcorn":
                 C = per(pop["is_ns"] + pop["sm_ns"] + pop["wp_ns"] + pop["ipi_ns"])
             elif src == "megalon":
-                C = per(check_est + sum(meg[k] for k in MEG_IN_C))
+                C = per(check_est + sum(meg[k] for k in MEG_IN_C) + vcopy_est)
             else:
                 C = 0.0
             if not supported:
@@ -154,7 +158,7 @@ def rows(run, system):
             r += [round(per(pop[k]), 4) for k in POP if k.endswith("_ns")]
             r += [round(cnt(pop[k]), 6) for k in POP if k.endswith("_cnt")]
             r += [round(lib_bg, 6), round(recv, 6), round(coh_bg, 6), round(coh_bg * 1e6 / all_ops, 4) if all_ops else ""]
-            r += [round(per(check_est), 4), int(csample)]
+            r += [round(per(check_est), 4), int(csample), round(per(vcopy_est), 4), round(cnt(meg["vcopy_cnt"]), 6)]
             r += [round(per(meg[k]), 4) for k in MEG_NS]
             r += [round(cnt(meg[k]), 6) for k in MEG_CNT]
             out.append(r)

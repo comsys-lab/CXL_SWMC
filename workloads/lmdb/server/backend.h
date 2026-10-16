@@ -22,6 +22,7 @@
 
 #include "cxl_region.h"
 #include "layout.h"
+#include "opsplit.h"          // validation-copy timer (workloads/kv/server)
 #include "megalon_objapi.h"  // systems/megalon/shim (shared object-API shim, lib/libmegalon-objapi.so)
 
 namespace lmdbw {
@@ -171,15 +172,23 @@ class MegalonBackend {
     }
     return true;
   }
-  // one read section: copy the whole page; re-run until ObjectReadEnd accepts
+  // one read section: copy the whole page; re-run until ObjectReadEnd accepts. The copy of an accepted section is the
+  // "validation copy" (Megalon-only work: plain reads pages in place), timed 1 in kVcopySample with plain rdtsc
+  // (opsplit::tl_vcopy, cycles; added to C); copies of discarded sections are inside CohSnap's (B)/(C).
   int read(uint64_t pgno, void *dst) const {
+    opsplit::VCopy &vc = opsplit::tl_vcopy;
+    const bool sampled = vc.tick++ % opsplit::kVcopySample == 0;
     for (uint32_t a = 0;; a++) {
       mshim::Obj h;
       const int rc = api_->read_start(id(pgno), &h);
       if (rc != 0) megalon_fatal("ObjectReadStart(page " + std::to_string(pgno) + ") = " + std::to_string(rc));
+      const uint64_t c0 = sampled ? opsplit::tsc() : 0;
       std::memcpy(dst, h.ptr, MDB_CXL_PSIZE);
+      const uint64_t c1 = sampled ? opsplit::tsc() : 0;
       if (api_->read_end(&h)) {
         if (a) retries_.fetch_add(a, std::memory_order_relaxed);
+        vc.cnt++;
+        if (sampled) vc.ns_sampled += c1 - c0, vc.sampled++;  // cycles (field name: ns after conversion in opsplit)
         return 0;
       }
     }

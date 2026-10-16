@@ -23,7 +23,8 @@ for t in (0, 1):
                       "opt.get.meg.check_ns_sampled": 1000 * 10, "opt.get.meg.check_sampled": 15, "opt.get.meg.read_sections": 960, "opt.get.meg.stale_ns": 1000 * 1000,
                       "opt.get.meg.switch_rw_ns": 7777,
                       "opt.put.ops": 10, "opt.put.t_ns": 10 * 50000, "opt.put.mod_bytes": 10 * 1024,
-                      "opt.put.meg.wstart_ns": 10 * 3000, "thr.nr-log-sync.run_ns": 505_000_000, "thr.kv-worker.run_ns": 9e9,
+                      "opt.put.meg.wstart_ns": 10 * 3000, "opt.put.meg.vcopy_ns_sampled": 1000, "opt.put.meg.vcopy_sampled": 2,
+                      "opt.put.meg.vcopy_cnt": 40, "thr.nr-log-sync.run_ns": 505_000_000, "thr.kv-worker.run_ns": 9e9,
                       "kthr.cxl_recv0.run_ns": 1010_000_000, "opt.put.meg.wflush_ns": 10 * 2000, "opt.get.t_max_ns": 99000})
     b = dict({k: 0 for k in e}, **b)  # a server emits every key in both snapshots
     snap(t, "begin", 0, b)
@@ -53,7 +54,8 @@ eq(p["get"]["T_max_us[measured]"], 99, "T max")
 m = run("Megalon")
 eq(m["get"]["C_us_per_op[derived]"], 0.64 + 1.0, "meg C = check x 64 + stale (switch_rw not added)")
 eq(m["get"]["meg_check_us_per_op[sampled_xN]"], 0.64, "check est")
-eq(m["put"]["C_us_per_op[derived]"], 5.0, "meg put C = wstart + wflush")
+eq(m["put"]["C_us_per_op[derived]"], 7.0, "meg put C = wstart + wflush + vcopy (1000 x 40 / 2 = 20 us / 10 ops)")
+eq(m["put"]["meg_vcopy_us_per_op[sampled_xN]"], 2.0, "vcopy est")
 eq(m["put"]["mod_bytes_per_op[measured]"], 1024, "mod bytes")
 eq(m["get"]["lib_bg_cpu_s[measured]"], 1.01, "lib bg (2 targets x 0.505 s, kv-* excluded)")
 eq(m["get"]["coh_bg_us_per_op[derived]"], 1.01e6 / 2020, "bg per op (all ops)")

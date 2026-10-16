@@ -78,9 +78,24 @@ constexpr const char *kPopNames[kPop] = {"is_ns",  "sm_ns",   "wp_ns",  "is_cnt"
 
 enum class Source { kPopcorn, kMegalon };
 
+// Megalon-only application work timed by the workload itself (user decision MOT1 v6 §3.1: C = only work all-HWcc does
+// not do). lmdb: the "validation copy" = the 4 KiB page copy inside an accepted Megalon read section into the txn's
+// private copy (the plain backend reads pages in place). Thread-local, written by the workload's own code; copies of
+// discarded sections are not counted here (they are inside CohSnap's (B)/(C) intervals). Sampled 1 in kVcopySample;
+// estimate = ns_sampled x cnt / sampled (ratio estimator). Added to C for --backend megalon.
+constexpr uint64_t kVcopySample = 64;
+struct VCopy {
+  uint64_t ns_sampled = 0, sampled = 0, cnt = 0, tick = 0;
+};
+inline thread_local VCopy tl_vcopy;
+inline uint64_t vcopy_est_ns(uint64_t ns_sampled, uint64_t sampled, uint64_t cnt) {
+  return sampled ? uint64_t(double(ns_sampled) * double(cnt) / double(sampled)) : 0;
+}
+
 // One operation type's sums (one writer thread per Acc: plain load + store, no locked RMW)
 struct alignas(64) Acc {
-  std::atomic<uint64_t> ops{0}, t_cyc{0}, t_max_cyc{0}, c_ns{0}, mod_bytes{0}, pop[kPop]{}, meg[kMeg]{}, meg_tsc_back{0};
+  std::atomic<uint64_t> ops{0}, t_cyc{0}, t_max_cyc{0}, c_ns{0}, mod_bytes{0}, pop[kPop]{}, meg[kMeg]{}, meg_tsc_back{0},
+      vcopy[3]{};  // ns_sampled, sampled, cnt
   static void add(std::atomic<uint64_t> &a, uint64_t d) { a.store(a.load(std::memory_order_relaxed) + d, std::memory_order_relaxed); }
 };
 
@@ -109,24 +124,27 @@ class Table {
       << "\nopt.meg_coh=" << (meg_ ? 1 : 0) << "\nopt.meg_threads=" << meg_threads.load()
       << "\nopt.meg_check_sample=" << check_sample.load() << "\n";
     for (size_t op = 0; op < ops_.size(); op++) {
-      uint64_t ops = 0, cyc = 0, mx = 0, c = 0, mb = 0, tb = 0, pop[kPop] = {}, meg[kMeg] = {};
+      uint64_t ops = 0, cyc = 0, mx = 0, c = 0, mb = 0, tb = 0, vc[3] = {}, pop[kPop] = {}, meg[kMeg] = {};
       for (uint32_t t = 0; t < threads_; t++) {
         const Acc &a = acc_[size_t(t) * ops_.size() + op];
         ops += a.ops.load(std::memory_order_relaxed), cyc += a.t_cyc.load(std::memory_order_relaxed);
         mx = std::max<uint64_t>(mx, a.t_max_cyc.load(std::memory_order_relaxed));
         c += a.c_ns.load(std::memory_order_relaxed), mb += a.mod_bytes.load(std::memory_order_relaxed);
         tb += a.meg_tsc_back.load(std::memory_order_relaxed);
+        for (int i = 0; i < 3; i++) vc[i] += a.vcopy[i].load(std::memory_order_relaxed);
         for (int i = 0; i < kPop; i++) pop[i] += a.pop[i].load(std::memory_order_relaxed);
         for (int i = 0; i < kMeg; i++) meg[i] += a.meg[i].load(std::memory_order_relaxed);
       }
       if (src_ == Source::kMegalon && meg_) c += meg_check_est_ns(meg[kCheckNs], meg[kReadSections], meg[kCheckSampled]);
+      if (src_ == Source::kMegalon) c += vcopy_est_ns(ns(vc[0]), vc[1], vc[2]);
       const std::string p = "opt." + ops_[op] + ".";
       o << p << "ops=" << ops << "\n" << p << "t_ns=" << ns(cyc) << "\n" << p << "t_max_ns=" << ns(mx) << "\n"
         << p << "c_ns=" << c << "\n" << p << "mod_bytes=" << mb << "\n";
       for (int i = 0; i < kPop; i++) o << p << "pop." << kPopNames[i] << "=" << pop[i] << "\n";
       for (int i = 0; i < kMeg; i++)
         if (i != kCheckSample) o << p << "meg." << kMegNames[i] << "=" << meg[i] << "\n";
-      o << p << "meg.tsc_backwards=" << tb << "\n";
+      o << p << "meg.tsc_backwards=" << tb << "\n" << p << "meg.vcopy_ns_sampled=" << ns(vc[0]) << "\n" << p
+        << "meg.vcopy_sampled=" << vc[1] << "\n" << p << "meg.vcopy_cnt=" << vc[2] << "\n";
     }
     return o.str();
   }
@@ -159,6 +177,7 @@ class Thread {
     }
   }
   void begin() {
+    v0_ = tl_vcopy;
     if (pop_ok_) pop_snap(p0_);
     if (t_->meg()) t_->meg()->thread_coh(&m0_);
     c0_ = tsc();
@@ -191,6 +210,10 @@ class Thread {
       Acc::add(a.meg_tsc_back, m1.reserved[kTscBackwards] - m0_.reserved[kTscBackwards]);
     }
     Acc::add(a.c_ns, c);
+    const VCopy &v1 = tl_vcopy;  // cycles; converted at text()
+    Acc::add(a.vcopy[0], v1.ns_sampled - v0_.ns_sampled);
+    Acc::add(a.vcopy[1], v1.sampled - v0_.sampled);
+    Acc::add(a.vcopy[2], v1.cnt - v0_.cnt);
   }
 
  private:
@@ -207,6 +230,7 @@ class Thread {
   bool pop_ok_ = false;
   uint64_t c0_ = 0, p0_[kPop] = {};
   mshim::CohSnap m0_{};
+  VCopy v0_{};
 };
 
 }  // namespace opsplit
