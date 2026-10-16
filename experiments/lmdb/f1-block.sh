@@ -32,7 +32,7 @@ step() { echo "$(date -Is) == $*" | tee -a "$E/block.log"; }
 step "G1 install"
 IMG=$IMG bash $X/install.sh "$E/install.log" > "$E/install.out" 2>&1 || stop "install"
 grep -q "^ldd_not_found=0$" "$E/install.log" && [ "$(grep -c '^ldd_not_found=0$' "$E/install.log")" = 2 ] || stop "install: ldd"
-BP=${PLAIN_BUILD:-$P/builds/lmdb/5} BM=${MEG_BUILD:-$P/builds/lmdb-megalon/5}
+BP=${PLAIN_BUILD:-$P/builds/lmdb/6} BM=${MEG_BUILD:-$P/builds/lmdb-megalon/6}
 want="$(sha256sum < $BP/bin/lmdb-server | cut -c1-64) $(sha256sum < $BM/bin/lmdb-server | cut -c1-64) $(sha256sum < $BM/lib/libmegalon-objapi.so | cut -c1-64) $(sha256sum < $BM/lib/libmegalon.so | cut -c1-64) $(sha256sum < $P/CXL_SWMC/config/cxl_region.yaml | cut -c1-64) $(sha256sum < $E/install.log.megalon.yaml | cut -c1-64)"
 for i in 0 1; do
   got=$($SSH comsys@${IPS[$i]} "cd $L && for f in plain/bin/lmdb-server megalon/bin/lmdb-server megalon/lib/libmegalon-objapi.so megalon/lib/libmegalon.so plain/cfg/cxl_region.yaml megalon/cfg/megalon.yaml; do sha256sum < \$f | cut -c1-64; done | tr '\n' ' '" < /dev/null)
@@ -60,7 +60,7 @@ done
 stress() {
   local tag=$1 bd=$2 to=$3; shift 3
   local rid=0x$(openssl rand -hex 6) app ev0="" ev1=""
-  app=$(${PLAIN_BUILD:-$P/builds/lmdb/5}/bin/lmdb-server --print-app-bytes --nodes 2 --readers 32 --max-pages $MAXP --records $R)
+  app=$(${PLAIN_BUILD:-$P/builds/lmdb/6}/bin/lmdb-server --print-app-bytes --nodes 2 --readers 32 --max-pages $MAXP --records $R)
   [ "$bd" = megalon ] && ev0="RACKOBJ_CONFIG=$L/megalon/cfg/megalon.yaml MEGALON_REINIT=1" ev1="RACKOBJ_CONFIG=$L/megalon/cfg/megalon.yaml"
   local A="--nodes 2 --run-id $rid --region $L/$bd/cfg/cxl_region.yaml --max-pages $MAXP --records $R --seconds 30 --reader-threads 4 --hold-us 2000 --keys-per-txn 4 --backend $bd $*"
   echo "$tag run_id=$rid app=$app args=$A" >> "$E/block.log"
