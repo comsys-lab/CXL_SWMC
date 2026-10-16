@@ -385,9 +385,11 @@ indexing unit; Megalon flushes the whole object at write end (no dirty-line trac
   + one per segment task, on any search thread; update = one section on the writer (delete, publish, insert, publish).
   Per section, on the thread that runs it: plain rdtsc at start and end (no fences; T) and the thread's coherence
   counters at start and end (C). Sums over the operation's sections (server/opcoh.h OpAcc).
-- C sources: Popcorn `struct swmc_acct` registered per worker thread (systems/popcorn_new/include/swmc_acct.h, build
-  9; register stub returns -1 until then), else /proc/thread-self/swmc (build 8; read at the section end only, delta
-  since the thread's previous section end; read/write fault time, no IPI), else none; Host tests `VDB_OPCOH_FAKE=1`
+- C sources: Popcorn `struct swmc_acct` registered per worker thread (systems/popcorn_new/include/swmc_acct.h,
+  build >= 9), read with `swmc_acct_snapshot()` (build 12 update sequence in reserved[2]); only if registration
+  fails, /proc/thread-self/swmc at the section end (delta since the thread's previous section end) with the
+  transition-fault keys is_/sm_/wpu_fault_ns + nontrans_* (build >= 9; read_/write_fault_ns read 0 on build 12
+  without instr/detail=1) or, on build 8, read_/write_fault_ns (no IPI); else none; Host tests `VDB_OPCOH_FAKE=1`
   (the server adds dists of a segment task as I->S ns, dists/8 as IPI ns, 1000 ns S->M per update). Megalon:
   `mshim::CohSnap` via the shared shim (systems/megalon/shim, libmegalon-objapi.so; API v2 `thread_coh`). Megalon <= 70
   has no per-thread accounting: build-megalon.sh then builds server/megalon_objapi_fallback.cc (thread_coh = nullptr,

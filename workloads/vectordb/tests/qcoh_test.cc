@@ -5,6 +5,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <string>
+#include <vector>
 
 #include "qcoh.h"
 
@@ -71,6 +72,34 @@ int main() {
   const uint32_t c = vdb::calibrate_clock_ns(20000);
   std::printf("clock_ns=%u\n", c);
   CHECK(c > 0 && c < 2000);
+  {  // SwmcKeyReader (opcoh.h file source): build-9+ keys found among other lines; a missing key refuses open
+    const std::string p = std::string(getenv("TMPDIR") ? getenv("TMPDIR") : "/tmp") + "/swmc-keys.txt";
+    auto put = [&](unsigned long long b, bool with_f) {
+      FILE *f = std::fopen(p.c_str(), "w");
+      for (int i = 0; i < 16; i++) std::fprintf(f, "%s %llu\n", kOrder[i], b + i);
+      if (with_f) {
+        const char *nf[] = {"is_faults", "is_fault_ns", "sm_faults", "sm_fault_ns", "wpu_faults", "wpu_fault_ns",
+                            "nontrans_faults", "nontrans_fault_ns"};
+        for (int i = 0; i < 8; i++) std::fprintf(f, "%s %llu\n", nf[i], b * 10 + i);
+      }
+      std::fclose(f);
+    };
+    const std::vector<std::string> F = {"is_faults", "is_fault_ns", "sm_faults", "sm_fault_ns", "wpu_faults",
+                                        "wpu_fault_ns", "nontrans_faults", "nontrans_fault_ns"};
+    std::string err;
+    put(5, true);
+    vdb::SwmcKeyReader r;
+    CHECK(r.open(p.c_str(), F, &err));
+    uint64_t x[8] = {};
+    CHECK(r.read(x) && x[0] == 50 && x[1] == 51 && x[7] == 57);
+    put(7, true);  // same layout, new values: re-read at offset 0
+    CHECK(r.read(x) && x[3] == 73);
+    put(9, false);  // build 8 file: no build-9 keys
+    vdb::SwmcKeyReader r8;
+    CHECK(!r8.open(p.c_str(), F, &err));
+    CHECK(r8.open(p.c_str(), {"read_faults", "read_fault_ns", "write_faults", "write_fault_ns"}, &err));
+    CHECK(r8.read(x) && x[0] == 9 && x[1] == 10 && x[2] == 15 && x[3] == 16);
+  }
   std::printf("%s (%d failures)\n", fails ? "QCOH_TEST FAIL" : "QCOH_TEST PASS", fails);
   return fails ? 1 : 0;
 }

@@ -2,10 +2,12 @@
 // An operation (search, update) is a set of sections, each run by one thread. Per section the thread takes plain
 // rdtsc at start and end (no fences; T) and reads its own coherence counters at start and end (C):
 //   Popcorn  struct swmc_acct registered for the thread (swmc_acct.h, Popcorn build 9; plain loads), or the Host-test
-//            fake (VDB_OPCOH_FAKE=1: the server adds deterministic values to the thread's own area), or on older
-//            kernels /proc/thread-self/swmc (build 8; an expensive pread, so read only at the section end: the delta
-//            since the thread's previous section end, as in DESIGN.md §14; between sections a thread touches no
-//            shared memory), else none (zeros).
+//            fake (VDB_OPCOH_FAKE=1: the server adds deterministic values to the thread's own area); the area is read
+//            with swmc_acct_snapshot() (build 12 update sequence; a plain copy before). Only if registration fails:
+//            /proc/thread-self/swmc (an expensive pread, so read only at the section end: the delta since the thread's
+//            previous section end; between sections a thread touches no shared memory) with the transition-fault
+//            keys is_/sm_/wpu_fault_ns (+ nontrans_*; build >= 9) or, on build 8, read_/write_fault_ns (these read 0
+//            on build 12 unless instr/detail=1, so they are never used when the build-9 keys exist); else none.
 //   Megalon  mshim::CohSnap of the calling thread (megalon_objapi.h v2 thread_coh; nullptr in a v1 shim or on a
 //            Megalon build without it: zeros).
 // Deltas are summed per operation (OpAcc) and sent in the response (proto.h OpCoh), and summed per operation type in
@@ -147,8 +149,8 @@ inline OpCoh op_block(const OpAcc &a, uint16_t op, int pop_src, bool mg_snap, ui
 // Per-thread source state (thread_local in the server).
 struct alignas(64) OpCohThread {
   swmc_acct acct{};  // registered with the kernel (kPopAcct) or written by the server (kPopFake)
-  SwmcReader file;
-  bool file_ok = false;
+  SwmcKeyReader file;
+  bool file_ok = false, file_f = false;  // file_f: build >= 9 transition-fault keys (else build-8 read/write keys)
   CohVals last_end;  // kPopFile: values at this thread's previous section end
 };
 
@@ -174,8 +176,8 @@ class OpCohSrc {
       src_ = kPopAcct;
     } else {
       std::string err;
-      SwmcReader r;
-      if (r.open("/proc/thread-self/swmc", &err)) {
+      SwmcKeyReader r;
+      if (r.open("/proc/thread-self/swmc", kFileF, &err) || r.open("/proc/thread-self/swmc", kFile8, &err)) {
         src_ = kPopFile;
       } else {
         src_ = kPopNone;
@@ -192,7 +194,8 @@ class OpCohSrc {
     if (src_ == kPopAcct) ok = swmc_acct_register(&t.acct) == 0;
     if (src_ == kPopFile) {
       std::string err;
-      t.file_ok = t.file.open("/proc/thread-self/swmc", &err);
+      t.file_f = t.file.open("/proc/thread-self/swmc", kFileF, &err);
+      t.file_ok = t.file_f || t.file.open("/proc/thread-self/swmc", kFile8, &err);
       ok = t.file_ok && read_file(&t.last_end);
     }
     return ok;
@@ -261,19 +264,31 @@ class OpCohSrc {
   }
 
  private:
+  inline static const std::vector<std::string> kFileF = {"is_faults", "is_fault_ns", "sm_faults", "sm_fault_ns",
+                                                         "wpu_faults", "wpu_fault_ns", "nontrans_faults",
+                                                         "nontrans_fault_ns"};
+  inline static const std::vector<std::string> kFile8 = {"read_faults", "read_fault_ns", "write_faults",
+                                                         "write_fault_ns"};
   bool read_file(CohVals *v) const {
-    SwmcVals f;
-    if (!thr().file.read(&f)) return false;
-    v->pf_ns[0] = f.rd_fault_ns, v->pf_ns[1] = f.wr_fault_ns, v->pf_cnt[0] = f.rd_faults, v->pf_cnt[1] = f.wr_faults;
+    const OpCohThread &t = thr();
+    uint64_t x[8] = {};
+    if (!t.file.read(x)) return false;
+    if (t.file_f) {  // build >= 9: the same transition faults as swmc_acct [0..2] + no-transition faults
+      for (int i = 0; i < 3; i++) v->pf_cnt[i] = x[2 * i], v->pf_ns[i] = x[2 * i + 1];
+      v->nt_cnt = x[6], v->nt_ns = x[7];
+    } else {  // build 8: read faults in [0], write faults in [1]
+      v->pf_cnt[0] = x[0], v->pf_ns[0] = x[1], v->pf_cnt[1] = x[2], v->pf_ns[1] = x[3];
+    }
     return true;
   }
   bool read(CohVals *v, bool at_end) const {
     bool ok = true;
     if (src_ == kPopAcct || src_ == kPopFake) {
-      const volatile swmc_acct *a = &thr().acct;
-      for (int i = 0; i < 3; i++) v->pf_ns[i] = a->fault_ns[i], v->pf_cnt[i] = a->fault_cnt[i];
-      v->ipi_ns = a->ipi_ns, v->ipi_cnt = a->ipi_cnt;
-      v->nt_ns = a->reserved[0], v->nt_cnt = a->reserved[1];  // build 10 no-transition faults (0 on build 9)
+      swmc_acct a;
+      swmc_acct_snapshot(&thr().acct, &a);  // consistent copy (build 12 update sequence; plain copy before)
+      for (int i = 0; i < 3; i++) v->pf_ns[i] = a.fault_ns[i], v->pf_cnt[i] = a.fault_cnt[i];
+      v->ipi_ns = a.ipi_ns, v->ipi_cnt = a.ipi_cnt;
+      v->nt_ns = a.reserved[SWMC_ACCT_NONTRANS_NS], v->nt_cnt = a.reserved[SWMC_ACCT_NONTRANS_CNT];  // build >= 10
     } else if (src_ == kPopFile && at_end) {
       ok = thr().file_ok && read_file(v);
     }

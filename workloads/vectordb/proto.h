@@ -90,8 +90,8 @@ struct __attribute__((packed)) OpCoh {
   uint32_t tsc_khz;   // rdtsc rate used for t_ns (server start calibration)
   uint32_t mg_check_sample;  // CohSnap.check_sample (0: no CohSnap)
   uint64_t t_ns, c_ns;
-  uint64_t pf_ns[3];  // Popcorn coherence-fault time: [0] I->S, [1] S->M, [2] write-protect upgrade (file source:
-                      // read faults in [0], write faults in [1])
+  uint64_t pf_ns[3];  // Popcorn coherence-fault time: [0] I->S, [1] S->M, [2] write-protect upgrade (swmc_acct, or
+                      // the file's is_/sm_/wpu_fault_ns; build-8 file: read faults in [0], write faults in [1])
   uint32_t pf_cnt[3];
   uint32_t ipi_cnt;
   uint64_t ipi_ns;    // TLB-shootdown IPI handling on the thread's CPU

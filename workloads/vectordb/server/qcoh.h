@@ -142,4 +142,64 @@ class SwmcReader {
   uint8_t want_[kMaxLines] = {};  // line -> field + 1 (0: not needed)
 };
 
+// Generic reader of named counters in a "name value" per-line file (e.g. /proc/thread-self/swmc): open() learns the
+// line of every requested name (all must exist), read() fills out[i] for names[i]. Same parsing rules as SwmcReader.
+class SwmcKeyReader {
+ public:
+  ~SwmcKeyReader() {
+    if (fd_ >= 0) ::close(fd_);
+  }
+  bool open(const char *path, const std::vector<std::string> &names, std::string *err) {
+    if (fd_ >= 0) ::close(fd_), fd_ = -1;
+    n_ = int(names.size());
+    if (n_ > kMaxNames) return *err = "too many names", false;
+    fd_ = ::open(path, O_RDONLY | O_CLOEXEC);
+    if (fd_ < 0) return *err = std::string("cannot open ") + path, false;
+    char buf[kBuf];
+    const ssize_t n = pread(fd_, buf, sizeof(buf) - 1, 0);
+    if (n <= 0) return *err = std::string("cannot read ") + path, false;
+    buf[n] = 0;
+    for (int &x : idx_) x = -1;
+    int line = 0;
+    for (char *p = buf; *p && line < kMaxLines; line++) {
+      char *sp = std::strchr(p, ' '), *nl = std::strchr(p, '\n');
+      if (!sp || !nl || sp > nl) return *err = std::string(path) + ": line is not 'name value'", false;
+      const std::string name(p, size_t(sp - p));
+      for (int f = 0; f < n_; f++)
+        if (name == names[size_t(f)]) idx_[f] = line;
+      p = nl + 1;
+    }
+    lines_ = line;
+    for (int f = 0; f < n_; f++)
+      if (idx_[f] < 0) return *err = std::string(path) + ": no counter " + names[size_t(f)], false;
+    for (int &w : want_) w = 0;
+    for (int f = 0; f < n_; f++) want_[idx_[f]] = f + 1;
+    return true;
+  }
+  bool read(uint64_t *out) const {
+    char buf[kBuf];
+    const ssize_t n = pread(fd_, buf, sizeof(buf) - 1, 0);
+    if (n <= 0) return false;
+    buf[n] = 0;
+    int line = 0;
+    for (char *p = buf; *p && line < kMaxLines; line++) {
+      char *sp = std::strchr(p, ' ');
+      if (!sp) return false;
+      char *end;
+      const uint64_t val = std::strtoull(sp + 1, &end, 10);
+      if (want_[line]) out[want_[line] - 1] = val;
+      if (*end != '\n') return false;
+      p = end + 1;
+    }
+    return line == lines_;
+  }
+  bool ok() const { return fd_ >= 0; }
+
+ private:
+  static constexpr int kBuf = 8192, kMaxLines = 160, kMaxNames = 16;
+  int fd_ = -1, lines_ = 0, n_ = 0;
+  int idx_[kMaxNames];
+  int want_[kMaxLines] = {};
+};
+
 }  // namespace vdb
