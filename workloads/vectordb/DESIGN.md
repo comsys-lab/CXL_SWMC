@@ -415,13 +415,15 @@ indexing unit; Megalon flushes the whole object at write end (no dirty-line trac
   the dequeue and the socket send of the reply are outside T (the copy of the few-hundred-byte reply into its buffer
   after the block is built is not counted). Popcorn no-transition coherence faults (swmc_acct reserved[0..1], build
   10) are exported as their own component (`pop_nontrans_*`, `opt.<op>.pop.nontrans_{ns,cnt}`), NOT part of C.
-- Transport: proto.h `OpCoh` v2 (304 B) after the search results (SearchResp.flags kRespCoh) and after WriteResp on
-  update responses; the loadgen plugin writes `op-coh.bin` (OpLog 328 B). Window counters in the stats text in the
+- Transport: proto.h `OpCoh` v2 (312 B; carries the frame req_id) after the search results (SearchResp.flags kRespCoh) and after WriteResp on
+  update responses; the loadgen plugin writes `op-coh.bin` (OpLog 336 B). Window counters in the stats text in the
   KV convention (workloads/kv/server/opsplit.h): `opt.version`, `opt.tsc_hz`, `opt.meg_coh`, `opt.meg_check_sample`,
   `opt.<search|update>.{ops,sections,t_ns,c_ns,mod_bytes}`, `opt.<op>.pop.{is,sm,wp}_{ns,cnt}`, `.pop.ipi_{ns,cnt}`,
   `opt.<op>.meg.<CohSnap field>`; `opcoh.*` = source, errors, timed-out search sections (unattributed).
 - Offline: `experiments/vectordb/opsplit.py RUN` -> `opsplit-steps.csv` (one row per measured step and operation
-  type) + `opsplit-steps.columns.csv` (tag per column: measured / sampled×N / derived, unit, formula). No proportional
+  type) + `opsplit-steps.columns.csv` (tag per column: measured / sampled×N / derived, unit, formula). Op records are joined to
+  loadgen raw rows by the frame req_id (OpCoh.req_id = loadgen rawid-step<N>.bin, loadgen >= dd934dbd9); runs without
+  the sidecar fall back to the response time window (column `match` = time). No proportional
   wall-equivalent columns; no per-operation C percentiles or window C (the per-operation ratio estimate of Megalon's
   checks is biased; C means use the step's sums). A run whose records carry more than one coherence source is
   refused; pop_source / mg_cohsnap are exported per step. Search E1 wait (polling P) is a separate column `wait_ms`

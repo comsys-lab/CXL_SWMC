@@ -113,8 +113,9 @@ struct __attribute__((packed)) OpCoh {
   // check), wseq (inside wstart) and wseq_end (inside wflush) are already in c_ns (exported, not added).
   uint64_t an_read_lookup_ns_sampled, an_read_nr_ns_sampled, an_rseq_ns_sampled, an_write_lookup_ns, an_write_nr_ns,
       an_wseq_ns, an_wseq_end_ns;
+  uint64_t req_id;  // the request's frame req_id (loadgen --raw rawid-step<N>.bin: id-based matching, opsplit.py)
 };
 constexpr uint16_t kOpCohVersion = 2;
-static_assert(sizeof(OpCoh) == 304, "OpCoh wire size (experiments/vectordb/opsplit.py)");
+static_assert(sizeof(OpCoh) == 312, "OpCoh wire size (experiments/vectordb/opsplit.py)");
 
 }  // namespace vdb

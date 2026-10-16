@@ -11,8 +11,10 @@ Input per operation (loadgen/op-coh.bin = vectordb_plugin.cc OpLog: seq, recv_ns
 server's proto.h OpCoh v2 block): T = sum over the operation's sections of (end - start) rdtsc on the thread that ran
 the section (search: start section + one per segment task; update: one section on the writer), C = change of the
 thread's coherence counters across the same sections (Popcorn swmc_acct / build-8 file; Megalon CohSnap). Each record
-is matched to the loadgen raw record of the same request (same stream; the latest done time <= recv_ns within
---tol-us); its step is the raw file's step and its latency done - sched.
+is matched to the loadgen raw record of the same request: by the frame req_id the server puts in the block when the
+raw files have their rawid-step<N>.bin sidecars (loadgen >= dd934dbd9), else (old runs, column match = time) by the
+latest done time <= recv_ns within --tol-us in the same stream; its step is the raw file's step and its latency
+done - sched.
 
 Output: one row per (measured step, operation type) in --out and a column table <out without .csv>.columns.csv
 (column, tag, unit, meaning). Tags: measured = sum of timed intervals / counted events / bytes; sampled×N = sum over
@@ -42,10 +44,10 @@ OPCOH = np.dtype([("version", "<u2"), ("src", "<u2"), ("op", "<u2"), ("sections"
                   ("nontrans_ns", "<u8"), ("nontrans_cnt", "<u4"), ("vcopy_cnt", "<u4"), ("vcopy_ns_sampled", "<u8"),
                   ("vcopy_sampled", "<u4"), ("pad2", "<u4")] + [(f, "<u8") for f in (
                       "an_read_lookup_ns_sampled", "an_read_nr_ns_sampled", "an_rseq_ns_sampled", "an_write_lookup_ns",
-                      "an_write_nr_ns", "an_wseq_ns", "an_wseq_end_ns")])
+                      "an_write_nr_ns", "an_wseq_ns", "an_wseq_end_ns")] + [("req_id", "<u8")])
 OPLOG = np.dtype([("seq", "<u8"), ("recv_ns", "<u8"), ("measured", "u1"), ("target", "u1"), ("status", "<u2"),
                   ("op", "<u2"), ("pad", "<u2"), ("c", OPCOH)])
-assert OPCOH.itemsize == 304 and OPLOG.itemsize == 328
+assert OPCOH.itemsize == 312 and OPLOG.itemsize == 336
 OP_SEARCH, OP_UPDATE = 3, 4
 OPS = {OP_SEARCH: "search", OP_UPDATE: "update"}
 POP_SRC = {0: "none", 1: "swmc_acct", 2: "swmc_file", 3: "fake"}
@@ -139,6 +141,8 @@ COLUMNS = [
     ("mg_cohsnap", "", "", "1 = Megalon CohSnap present in the step's records (shim v2 with thread_coh)"),
     ("mg_anchor", "", "", "1 = Megalon AnchorSnap present in the step's records (shim v3 with thread_anchor)"),
     ("unmatched", "measured", "count", "run-level: measured op records without a raw record (same on every row)"),
+    ("match", "", "", "how op records were joined to loadgen raw rows: req_id (server echoes the frame req_id; loadgen "
+     "rawid-step sidecar) or time (old runs without the sidecar: latest done <= recv within --tol-us; flagged)"),
 ]
 COLS = [c[0] for c in COLUMNS]
 
@@ -157,18 +161,36 @@ def match(recv, raw_done, tol_ns):
 
 
 def load_raws(lg, stream_idx):
-    recs = []
+    """measured OK raw rows of one stream (sched, done, step, id) and whether every raw file has its rawid sidecar
+    (loadgen >= dd934dbd9: rawid-step<N>.bin, one u64 frame req_id per raw row, same order)"""
+    recs, have_ids = [], True
     for p in sorted(glob.glob(os.path.join(lg, "raw-step*.bin"))):
         step = int(re.search(r"raw-step(\d+)\.bin$", p).group(1))
         r = np.fromfile(p, dtype=np.uint64).reshape(-1, 4)
+        q = p.replace("raw-step", "rawid-step")
+        ids = np.fromfile(q, dtype=np.uint64) if os.path.exists(q) else None
+        if ids is None or len(ids) != len(r):
+            have_ids, ids = False, np.full(len(r), np.iinfo(np.uint64).max, np.uint64)
         meas = ((r[:, 3] >> 40) & 1) == 1
         strm = (r[:, 3] >> 32) & 0xff
         ok = meas & (strm == stream_idx) & (r[:, 2] > 0) & ((r[:, 3] & 0xffff) == 0)
         recs.append(np.rec.fromarrays([r[ok, 0].astype(np.int64), r[ok, 2].astype(np.int64),
-                                       np.full(int(ok.sum()), step, dtype=np.int64)], names="sched,done,step"))
+                                       np.full(int(ok.sum()), step, dtype=np.int64), ids[ok]],
+                                      names="sched,done,step,id"))
     if not recs:
-        return np.rec.fromarrays([np.zeros(0, np.int64)] * 3, names="sched,done,step")
-    return np.concatenate(recs).view(np.recarray)
+        return np.rec.fromarrays([np.zeros(0, np.int64)] * 3 + [np.zeros(0, np.uint64)], names="sched,done,step,id"), False
+    return np.concatenate(recs).view(np.recarray), have_ids
+
+
+def match_ids(req, raw_ids):
+    """index of the raw row with the same frame req_id (-1 = none), duplicate count"""
+    order = np.argsort(raw_ids, kind="stable")
+    s = raw_ids[order]
+    pos = np.clip(np.searchsorted(s, req), 0, max(len(s) - 1, 0))
+    hit = (s[pos] == req) if len(s) else np.zeros(len(req), bool)
+    idx = np.where(hit, order[pos] if len(s) else -1, -1)
+    m = idx[idx >= 0]
+    return idx, int(len(m) - len(np.unique(m)))
 
 
 def pct(v, q):
@@ -210,15 +232,20 @@ def analyze(run, tol_us=20.0):
             if fixed.get("window_s") not in ("", None):
                 w["window_s"] = max(w.get("window_s", 0), float(fixed["window_s"]))
     sample = int(c["mg_check_sample"].max()) if len(logs) else 0
-    rows, unmatched, ambiguous, matched = [], 0, 0, 0
+    rows, unmatched, ambiguous, matched, methods = [], 0, 0, 0, set()
     per_op = {}
     for op, name in OPS.items():
         if name not in names:
             continue
         sel_op = logs["op"] == op
         L = logs[sel_op]
-        raws = load_raws(lg, names.index(name))
-        idx, amb = match(L["recv_ns"], raws["done"], int(tol_us * 1000))
+        raws, have_ids = load_raws(lg, names.index(name))
+        if have_ids:  # id-based: the server echoes the frame req_id in the block
+            idx, amb = match_ids(L["c"]["req_id"], raws["id"])
+            methods.add("req_id")
+        else:  # old runs: latest done time <= recv_ns within the tolerance
+            idx, amb = match(L["recv_ns"], raws["done"], int(tol_us * 1000))
+            methods.add("time")
         ambiguous += amb
         matched += int((idx >= 0).sum())
         unmatched += int(((L["measured"] == 1) & (idx < 0)).sum())
@@ -292,13 +319,15 @@ def analyze(run, tol_us=20.0):
                       "spin_cnt", "switch_rw_cnt", "reclaim_cnt", "wflush_cnt"):
                 row[f"mg_{k}"] = cnt(x[f"mg_{k}"])
             rows.append(row)
+    method = "+".join(sorted(methods)) or "none"
     for r in rows:
         r["unmatched"] = unmatched
+        r["match"] = method
     tag = lambda t: f"sampled×{sample or 64}" if t == "sampled" else t  # noqa: E731
     table = [(col, tag(t), u, m) for col, t, u, m in COLUMNS]
     summary = (f"{len(rows)} rows, {len(logs)} op records ({int((logs['op'] == OP_SEARCH).sum())} search, "
                f"{int((logs['op'] == OP_UPDATE).sum())} update), matched {matched}, ambiguous {ambiguous}, "
-               f"unmatched measured {unmatched}, bad version {bad}, popcorn source {POP_SRC.get(src & 3)}, "
+               f"unmatched measured {unmatched}, match {method}, bad version {bad}, popcorn source {POP_SRC.get(src & 3)}, "
                f"megalon cohsnap {(src >> 2) & 1}")
     return rows, table, summary
 

@@ -14,7 +14,7 @@ usage: opcoh_check.py <scratch dir> fake|megalon|none
               Popcorn source none; with CohSnap: mg_read_sections > 0 on searches, mg_wflush_bytes > 0 on updates.
   none:       plain backend, no counter source: c_ns = 0.
 """
-import csv, os, subprocess, sys
+import csv, glob, os, subprocess, sys
 
 import numpy as np
 
@@ -132,6 +132,8 @@ if r.returncode == 0:
     tags = {x["column"]: x["tag"] for x in csv.DictReader(open(os.path.join(S, "opsplit-steps.columns.csv")))}
     check({x["op"] for x in rows} == {"search", "update"}, "rows for search and update")
     check(all(x["unmatched"] == "0" for x in rows), "every measured record matched")
+    if glob.glob(os.path.join(lg, "rawid-step*.bin")):
+        check(all(x["match"] == "req_id" for x in rows), "id-based matching (rawid sidecars present)")
     check(tags.get("T_ms") == "measured" and tags.get("C_ms") == "derived" and tags.get("mg_check_ms", "").startswith("sampled×"),
           "column tags")
     for x in rows:

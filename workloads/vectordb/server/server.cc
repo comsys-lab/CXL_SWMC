@@ -550,7 +550,8 @@ class Server {
     if (!oc_.on()) return reply_write(j, w);
     uint8_t out[sizeof(WriteResp) + sizeof(OpCoh)];
     WriteResp r{w, uint32_t(load_acquire(h_->P))};
-    const OpCoh b = op_block(a, kOpUpdate, oc_.src(), oc_.mg_snap(), tsc_khz_, oc_.an_snap());
+    OpCoh b = op_block(a, kOpUpdate, oc_.src(), oc_.mg_snap(), tsc_khz_, oc_.an_snap());
+    b.req_id = j.h.req_id;
     std::memcpy(out, &r, sizeof(r));
     std::memcpy(out + sizeof(r), &b, sizeof(b));
     win_update_.add(b);
@@ -738,6 +739,7 @@ class Server {
       std::lock_guard<std::mutex> lg(c->mu);
       c->oa.ticks += rdtsc() - m0;  // up to the response being ready (the reply send is outside T)
       qb = op_block(c->oa, kOpSearch, oc_.src(), oc_.mg_snap(), tsc_khz_, oc_.an_snap());
+      qb.req_id = c->job.h.req_id;
     }
     if (oc_.on()) resp.flags |= kRespCoh;
     std::vector<uint8_t> out(sizeof(resp) + all.size() * 12 + (oc_.on() ? sizeof(qb) : 0));
