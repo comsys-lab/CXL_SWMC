@@ -89,5 +89,5 @@ after 12k gives the same 0.45 ms). Cause: wake-up from deep idle between request
 ## 5. Checklist per measurement block
 1. No Host build running (`workspaces/MEASUREMENT.lock`, host-gate.sh).
 2. Host C1E/C6 disabled, settings recorded (§3.1).
-3. `sudo measure-env.sh check recovery/HOST-measure-env-v1` prints CHECK PASS (C-states, IRQs, workqueues, slices, emulatorpin).
+3. `measure-env.sh check recovery/HOST-measure-env-v1` (no root needed; host-gate.sh runs it on every probe) prints CHECK PASS (C-states, IRQs, workqueues, slices, emulatorpin).
 4. Restore only when the measurement campaign ends: `sudo measure-env.sh restore recovery/HOST-measure-env-v1`.
