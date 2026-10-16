@@ -85,8 +85,14 @@ struct AnchorSnap {
   uint64_t read_sections, write_sections, check_sampled;
   uint64_t read_lookup_ns_sampled, read_nr_ns_sampled, rseq_ns_sampled;
   uint64_t write_lookup_ns, write_nr_ns, wseq_ns, wseq_end_ns;
-  uint64_t reserved[6];  // [0] write_sampled: timed write sections (build >= 76; 0 before)
+  uint64_t reserved[6];  // [0] write_sampled: timed write sections (build >= 76; 0 before); build >= 77: [1] probe_ns,
+                         // [2] probe_ps, [3] timed (A) events, [4] timed (B)+(C) events, [5] timed (D) episodes
 };
+// Probe correction (build >= 77; reports/M2-megalon-port-changes.md §19): every timed interval also measures
+// the TSC reads inside it. p = AnchorSnap.reserved[2] / 1000 ns (per-thread median of back-to-back TSC pairs at reg()).
+// Subtract p x k from each sum before scaling: per sampled read section (check_sampled): check 7, read_lookup 1,
+// read_nr 2, rseq 2; per timed write section (write_sampled): wstart 4, wflush 3, write_lookup 1, write_nr 2, wseq 1,
+// wseq_end 1; per timed event: stale 1 x reserved[3], concur+meta 4 x reserved[4], spin 1 x reserved[5].
 static_assert(sizeof(CohSnap) == 29 * 8, "CohSnap layout is fixed (v2)");
 static_assert(sizeof(AnchorSnap) == 16 * 8, "AnchorSnap layout is fixed (v3)");
 

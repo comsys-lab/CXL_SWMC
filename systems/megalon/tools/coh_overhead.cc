@@ -16,6 +16,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <string>
 
 int main(int argc, char **argv) {
     if (argc < 3) {
@@ -23,7 +24,7 @@ int main(int argc, char **argv) {
         return 1;
     }
     const uint64_t n = std::strtoull(argv[1], nullptr, 10);
-    const int reps = std::atoi(argv[2]);
+    int reps = std::atoi(argv[2]);
     const char *label = std::getenv("COH_OV_LABEL") ? std::getenv("COH_OV_LABEL") : "unlabelled";
     const size_t node = rackobj::GetConfigSize_t("node_id");
     rackobj::Register(0);
@@ -36,6 +37,22 @@ int main(int argc, char **argv) {
             rc = 2;
         }
         rackobj::ObjectHandle h;
+        // COH_OV_ONLY=kvget: only the KV Get loop (after one Put), for perf stat attribution
+        const bool only_kvget = std::getenv("COH_OV_ONLY") && std::string(std::getenv("COH_OV_ONLY")) == "kvget";
+        if (only_kvget) {
+            static uint8_t v[1024];
+            (void)rackobj::Put(v, sizeof(v), 777001);
+            uint64_t sink = 0;
+            for (int r = 0; r < reps; r++) {
+                auto t0 = std::chrono::steady_clock::now();
+                for (uint64_t i = 0; i < n; i++) sink += rackobj::Get(v, sizeof(v), 777001) > 0;
+                auto t1 = std::chrono::steady_clock::now();
+                std::printf("COH-OV-KVGET rep=%d ns=%.2f sink=%lu\n", r,
+                            std::chrono::duration<double, std::nano>(t1 - t0).count() / static_cast<double>(n),
+                            static_cast<unsigned long>(sink & 1));
+            }
+            reps = 0;
+        }
         for (int r = 0; rc == 0 && r < reps; r++) {
             uint64_t sink = 0;
             auto t0 = std::chrono::steady_clock::now();
