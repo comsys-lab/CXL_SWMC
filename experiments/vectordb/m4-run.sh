@@ -107,6 +107,9 @@ if [ "$SYS" = Popcorn ]; then  # P-popcorn-deploy §6a cycle with build 8 (init_
     [ "$m" = "$RECV_MODE" ] || stop "recv_mode on $ip = $m"
   done
   env "${PS[@]}" STATUS_TAG=pre bash $C8/p-popcorn-shm.sh status || stop "status pre"
+  for k in 0 1; do  # build-8 instrumentation must be on (per-query and window page MSI counters)
+    grep -qx "instr_enabled=1" "$E/shm-$NAME/status-pre-vm$k.txt" || stop "instr_enabled != 1 on vm$k (status pre)"
+  done
 fi
 bash $X/run.sh "$NAME" "$E" -- "${LG[@]}"
 RC=$?

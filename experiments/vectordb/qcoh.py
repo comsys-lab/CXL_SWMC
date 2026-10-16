@@ -5,9 +5,14 @@ attribution, search-serving threads only, writer reported separately, window tim
 usage: qcoh.py RUN_DIR [--out RUN_DIR/qcoh-steps.csv] [--queries RUN_DIR/qcoh-queries.csv] [--tol-us 20]
 RUN_DIR = a run.sh result dir (loadgen/ with search-coh.bin, searches.bin, raw-step*.bin, steps.jsonl, stats/).
 
+Megalon per-query values come from 1-in-64 sampled read sections: per-query means (and step means) are robust;
+per-query p50/p99 of a Megalon run (coh_p50_ms, coh_p99_ms) are distributions of sampled estimates (sampling noise
+included), labelled as such in fig1b-query.csv (coh_pct_note).
 Per query (loadgen/search-coh.bin, vectordb_plugin.cc CohLog = seq, recv_ns, measured, target, status + proto.h
-SearchCoh): coh_ns as computed by the server (page MSI: managed-fault handler time of the query's sections;
-Megalon: sampled read-section checks minus the timer overhead x kSample + re-executed failed attempts). Each record
+SearchCoh): coherence time = pf_fault_ns (page MSI: managed-fault handler time of the query's sections) +
+mg_check_est_ns (Megalon: sampled read-section checks minus 2 clock reads each, x kSample) + re-executed failed
+attempts recomputed here from the raw sums (mg_estimate: 3 clock reads per timed failed attempt; the server's
+mg_reexec_est_ns and coh_ns subtract only 1 and are not used). Each record
 is matched to the loadgen raw record of the same request: the search-stream record of a raw-step file whose done time
 is the latest one <= recv_ns within --tol-us (the engine takes done just before it calls the plugin on the same
 thread); its step is the raw file's step, its latency done - sched. Records with more than one candidate in the
@@ -58,11 +63,14 @@ def search_dtype(k):  # vectordb_plugin.cc SearchLog (same as e1_check.py)
 
 
 def mg_estimate(start, body, end, sampled, retries, failed_timed, failed_ns, c, sample):
-    """Megalon read-section coherence time (ns) from sampled sums, timer overhead c ns per interval: checks
-    (read_start + read_end) x sample + retries x mean failed attempt (same rule as server/qcoh.h mg_estimate)."""
+    """Megalon read-section coherence time (ns) from sampled sums, timer overhead c ns per clock read: checks
+    (read_start + read_end - 2c per sampled section) x sample + retries x mean failed attempt. A timed failed
+    attempt (megalon_backend.h read/account_read: t3 - t0) contains three clock reads (t1, t2 inside, t3 closing),
+    so 3c per failed attempt. server/qcoh.h mg_estimate subtracts only 1c there: the server's mg_reexec_est_ns and
+    coh_ns overstate by ~2c per retry and are NOT used; this function recomputes from the raw sums."""
     chk = max(0.0, start + end - 2 * c * sampled) * sample
     if retries and failed_timed:
-        reexec = retries * max(0.0, failed_ns - c * failed_timed) / failed_timed
+        reexec = retries * max(0.0, failed_ns - 3 * c * failed_timed) / failed_timed
     elif retries and sampled:
         reexec = retries * max(0.0, start + body + end - 3 * c * sampled) / sampled
     else:
@@ -183,12 +191,19 @@ def analyze(run, tol_us=20.0, want_queries=False):
                        if len(raws) else 0, np.nan)
     step_of = np.where(idx >= 0, raws["step"][np.clip(idx, 0, None)] if len(raws) else -1, -1)
     c = logs["c"]
+    # Megalon re-executed work recomputed from the raw sums (3 clock reads per timed failed attempt, mg_estimate);
+    # the server's mg_reexec_est_ns / coh_ns are not used. coh = page MSI fault time + Megalon checks + re-exec.
+    rx = np.array([mg_estimate(float(x["mg_rd_start_ns"]), float(x["mg_rd_body_ns"]), float(x["mg_rd_end_ns"]),
+                               float(x["mg_rd_sampled"]), float(x["mg_rd_retries"]), float(x["mg_rd_failed_timed"]),
+                               float(x["mg_rd_failed_ns"]), float(x["clock_ns"]), float(x["mg_sample"]))[1]
+                   if x["mg_rd_retries"] else 0.0 for x in c], dtype=np.float64)
+    cohv = c["pf_fault_ns"].astype(np.float64) + c["mg_check_est_ns"] + rx
     for s in steps:
         if s["phase"] == "warmup" or s.get("measure_s", 0) <= 0:
             continue
         sel = step_of == s["step"]
         lat = lat_all[sel]
-        coh = c["coh_ns"][sel] / 1e6
+        coh = cohv[sel] / 1e6
         f = lambda col: float((c[col][sel] / 1e6).mean()) if sel.any() else None  # noqa: E731
         w = win.get(s["step"], {})
         nsr = w.get("searches", 0)
@@ -202,7 +217,7 @@ def analyze(run, tol_us=20.0, want_queries=False):
         wr = w.get("wr_mg") if w.get("wr_mg") is not None else (w.get("wr_pf") if w.get("pf") else None)
         srvm = [srv_ms[q] for q in logs["seq"][sel].tolist() if q in srv_ms]
         busy = c["busy_ns"][sel].astype(np.float64)
-        frac = np.divide(c["coh_ns"][sel].astype(np.float64), busy, out=np.zeros(len(busy)), where=busy > 0)
+        frac = np.divide(cohv[sel], busy, out=np.zeros(len(busy)), where=busy > 0)
         srv_sel = np.array([srv_ms.get(q, np.nan) for q in logs["seq"][sel].tolist()])
         wall = frac * srv_sel
         rows.append(dict(step=s["step"], phase=s["phase"], achieved=s["streams"]["search"]["achieved"],
@@ -216,11 +231,11 @@ def analyze(run, tol_us=20.0, want_queries=False):
                                                   - c["pf_local_wait_ns"][sel]) / 1e6).mean()) if sel.any() else None,
                          pf_faults_mean=float(c["pf_faults"][sel].mean()) if sel.any() else None,
                          pf_transactions_mean=float(c["pf_transactions"][sel].mean()) if sel.any() else None,
-                         mg_check_mean_ms=f("mg_check_est_ns"), mg_reexec_mean_ms=f("mg_reexec_est_ns"),
+                         mg_check_mean_ms=f("mg_check_est_ns"), mg_reexec_mean_ms=float((rx[sel] / 1e6).mean()) if sel.any() else None,
                          mg_retries_mean=float(c["mg_rd_retries"][sel].mean()) if sel.any() else None,
                          server_ms_mean=float(np.mean(srvm)) if srvm else None,
                          busy_mean_ms=float(busy.mean() / 1e6) if sel.any() else None,
-                         coh_frac_of_busy=float(c["coh_ns"][sel].sum() / busy.sum()) if sel.any() and busy.sum() else None,
+                         coh_frac_of_busy=float(cohv[sel].sum() / busy.sum()) if sel.any() and busy.sum() else None,
                          coh_wall_equiv_mean_ms=float(np.nanmean(wall)) if sel.any() and np.isfinite(wall).any() else None,
                          ts_search_coh_ms=ts,
                          ts_search_msg_wait_ms=w["ts_pf_msg"] / nsr / 1e6 if w.get("pf") and nsr else None,
@@ -231,10 +246,10 @@ def analyze(run, tol_us=20.0, want_queries=False):
         if a.queries:
             for i in np.flatnonzero(sel):
                 qrows.append(dict(step=s["step"], seq=int(logs["seq"][i]), target=int(logs["target"][i]),
-                                  latency_ms=float(lat_all[i]), coh_ms=float(c["coh_ns"][i] / 1e6),
+                                  latency_ms=float(lat_all[i]), coh_ms=float(cohv[i] / 1e6),
                                   pf_fault_ms=float(c["pf_fault_ns"][i] / 1e6), pf_msg_wait_ms=float(c["pf_msg_wait_ns"][i] / 1e6),
                                   pf_faults=int(c["pf_faults"][i]), mg_check_ms=float(c["mg_check_est_ns"][i] / 1e6),
-                                  mg_reexec_ms=float(c["mg_reexec_est_ns"][i] / 1e6), mg_retries=int(c["mg_rd_retries"][i]),
+                                  mg_reexec_ms=float(rx[i] / 1e6), mg_retries=int(c["mg_rd_retries"][i]),
                                   sections=int(c["sections"][i]), server_ms=srv_ms.get(int(logs["seq"][i])),
                                   busy_ms=float(c["busy_ns"][i] / 1e6)))
     gap = (logs["recv_ns"].astype(np.int64) - raws["done"][np.clip(idx, 0, None)])[idx >= 0] / 1e3 if len(raws) else np.zeros(0)

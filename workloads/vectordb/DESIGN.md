@@ -357,8 +357,12 @@ indexing unit; Megalon flushes the whole object at write end (no dirty-line trac
     fault handler time, message wait, local wait, faults, transactions (read + write).
   - Megalon: deltas of the thread's own MegTimers block (owner-only writes). Estimate per query: checks =
     max(0, read_start + read_end - 2 clock_ns x sampled) x 64; re-executed work = retries x mean failed attempt
-    (timed failed attempts minus clock_ns each; none timed: mean sampled section minus 3 clock_ns). Raw sums travel
-    in the block too.
+    (timed failed attempts minus 3 clock_ns each: the t3 - t0 interval holds three clock reads; none timed: mean
+    sampled section minus 3 clock_ns). Raw sums travel in the block. Known deviation (vdb build 9, not rebuilt):
+    the server's mg_reexec_est_ns and coh_ns subtract only 1 clock_ns per timed failed attempt (overstate by ~2
+    clock_ns per retry); experiments/vectordb/qcoh.py recomputes re-executed work and coh from the raw sums and
+    never uses those two fields. Per-query Megalon p50/p99 are distributions of sampled (1 in 64) estimates; means
+    are the robust quantity.
 - Timer fix (Megalon): `clock_ns` = median of back-to-back CLOCK_MONOTONIC reads at server start (`megt.clock_ns`,
   `qcoh.clock_ns`); every timed interval contains about one read's cost, subtracted in the estimates (the counters
   stay raw). Wrapper blocks carry their thread's role (thread_init: 0 main, 1 writer, >= 2 search): stats print

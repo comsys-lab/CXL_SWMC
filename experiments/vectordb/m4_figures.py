@@ -261,7 +261,8 @@ def main():
             for x in rows_q:
                 if x["phase"] == "fixed":
                     fq.append(dict(x, block=r["block"], run=r["run"], system=r["system"], u=r["u"],
-                                   hw_latency_same_L_ms=None))
+                                   hw_latency_same_L_ms=None,
+                                   coh_pct_note="sampled estimate (1 in 64 sections): use means" if r["system"] == "Megalon" else ""))
     hwq = {x["u"]: x["latency_mean_ms"] for x in fq if x["system"] == "all-HWcc"}
     for x in fq:
         x["hw_latency_same_L_ms"] = hwq.get(x["u"])
@@ -270,7 +271,7 @@ def main():
           "hw_latency_same_L_ms", "queries", "coh_mean_ms", "coh_p50_ms", "coh_p99_ms", "pf_msg_wait_mean_ms",
           "pf_local_wait_mean_ms", "pf_other_mean_ms", "mg_check_mean_ms", "mg_reexec_mean_ms", "busy_mean_ms",
           "coh_frac_of_busy", "coh_wall_equiv_mean_ms", "server_ms_mean", "ts_search_coh_ms", "ts_vs_query",
-          "writer_coh_ms_per_update", "writer_wr_flush_ms_per_update", "ambiguous", "unmatched_measured"], fq)
+          "writer_coh_ms_per_update", "writer_wr_flush_ms_per_update", "ambiguous", "unmatched_measured", "coh_pct_note"], fq)
     print(f"{len(R)} runs -> {a.out}")
 
 

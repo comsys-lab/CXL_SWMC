@@ -35,20 +35,24 @@ block_shm_cleanup() {
     grep -q "teardown PASS" "$r/steps.log" 2>/dev/null || echo "CLEANUP FAILED: $r (manual: packet §6)" | tee -a "$E/cleanup.out"
   done
 }
-# dax0.0 back to root:root 600 (blocks that chowned it)
+# dax0.0 back to root:root 600 on both guests; checks this call's fresh stat output per VM (not earlier lines of the
+# append-only rollback.out). Returns 1 and prints "ROLLBACK FAIL" if a VM is not root:root 600 afterwards.
 block_dax_root() {
-  local ip
+  local ip out rc=0
   for ip in "${IPS[@]}"; do
-    $SSH comsys@$ip 'sudo -n chown root:root /dev/dax0.0 && sudo -n chmod 600 /dev/dax0.0; echo stat=$(stat -c "%U:%G %a" /dev/dax0.0)' \
-      < /dev/null 2>&1 | sed "s/^/$ip /" >> "$E/rollback.out"
+    out=$($SSH comsys@$ip 'sudo -n chown root:root /dev/dax0.0 && sudo -n chmod 600 /dev/dax0.0; echo stat=$(stat -c "%U:%G %a" /dev/dax0.0)' < /dev/null 2>&1)
+    echo "$out" | sed "s/^/$ip /" >> "$E/rollback.out"
+    echo "$out" | grep -qx "stat=root:root 600" || { echo "ROLLBACK FAIL: $ip dax0.0 not root:root 600" | tee -a "$E/rollback.out"; rc=1; }
   done
+  return $rc
 }
 block_rollback() { block_stop_servers; block_dax_root; }
-# On every block exit: stop this block's servers, clean up page MSI, then dax rollback, then the lock.
+# On every block exit: stop this block's servers, clean up page MSI, then dax rollback (unconditionally: page MSI runs
+# chown dax0.0 through p-popcorn-shm.sh without CHOWNED, and a failed teardown may leave it comsys), then the lock.
 block_finish() {
   block_stop_servers
   block_shm_cleanup
-  [ $CHOWNED = 1 ] && block_dax_root
+  block_dax_root
   bash $X/host-gate.sh unlock "$OWNER"
 }
 block_start() {
