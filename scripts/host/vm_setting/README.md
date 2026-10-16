@@ -26,7 +26,7 @@ is not told this (no `<topology>` in `<cpu>`), so its scheduler treats the 16 vC
 libvirt: "The optional vcpupin element specifies which of host's physical CPUs the domain vCPU will be pinned to."
 (https://libvirt.org/formatdomain.html#cpu-tuning)
 
-### 2.2 Emulator, I/O and vhost threads — PROPOSED (needed)
+### 2.2 Emulator, I/O and vhost threads — APPLIED live 2026-10-16 (scripts/host/measure-env.sh; XML persistence: reports/VM-topology-packet.md)
 Not pinned today: the QEMU processes have affinity 0-63, and their non-vCPU threads (main loop, IO, vhost-net,
 VNC) were observed running on CPUs 1, 9 (cxl_vm1's vCPU cores), 46 (a cxl_vm0 vCPU core), 21, 26, 48. A packet's
 virtio-net processing or QEMU's own work can therefore preempt a vCPU of either VM.
@@ -39,7 +39,7 @@ virtio-net processing or QEMU's own work can therefore preempt a vCPU of either 
   18-19 + 50-51 for cxl_vm1). Live change, no reboot: `virsh emulatorpin <vm> <cpuset> --live`; persistent:
   `--config` (XML change = VM configuration grant).
 
-### 2.3 Keep Host work off the vCPU CPUs — PROPOSED (needed)
+### 2.3 Keep Host work off the vCPU CPUs — APPLIED at runtime 2026-10-16 (measure-env.sh; boot-time isolation not applied)
 Host processes (loadgen, shells, agents, system services) may run on node0 CPUs today (affinity 0-63).
 - Runtime, reversible (preferred first): restrict Host cgroups to node1 during measurements, e.g.
   `systemctl set-property --runtime system.slice AllowedCPUs=16-31,48-63` (same for user.slice and init.scope;
@@ -56,7 +56,7 @@ Host processes (loadgen, shells, agents, system services) may run on node0 CPUs 
   runtime cpuset/IRQ steps leave measurable noise.
 
 ## 3. Power management
-### 3.1 Host deep C-states — REQUIRED off during measurements
+### 3.1 Host deep C-states — REQUIRED off during measurements; APPLIED 2026-10-16 (measure-env.sh, state recorded in recovery/HOST-measure-env-v1)
 Measured 2026-10-16 (reports/KV-idle-check.md, recovery/KV-idle-check-v1): with Host intel_idle C1E (2 µs) and C6
 (290 µs exit latency) enabled, KV all-HWcc p99 at 500 req/s is 0.466 ms vs 0.141 ms at 12k req/s (U-shaped curve);
 with C1E and C6 disabled p99 is flat at 0.13-0.15 ms from 500 to 12k req/s. Warm-up was ruled out (a 500 req/s step
@@ -72,6 +72,12 @@ after 12k gives the same 0.45 ms). Cause: wake-up from deep idle between request
 - KVM halt polling: `halt_poll_ns` = 200000 (default; as found).
 - Guest: no cpuidle driver (`current_driver` = none), idle = HLT exit to the Host (as found).
 
+### 3.3 Remaining noise sources on the vCPU CPUs (observed after apply, 2026-10-16)
+- 34 kernel-managed IRQs (NVMe queue IRQs) refuse a new affinity and stay on node0 vCPU CPUs (apply-irq-errors.txt).
+- KVM's per-VM `kvm-nx-lpage-recovery` kernel thread is affine to one vCPU CPU (vm0: CPU 46, vm1: CPU 3); it wakes
+  periodically to recover NX huge pages. Option (not applied): KVM parameter nx_huge_pages_recovery_ratio=0.
+- Per-CPU kernel threads (ksoftirqd, kworker/N, migration) cannot move; boot-time nohz_full/rcu_nocbs would reduce them.
+
 ## 4. Memory
 - Guest RAM on node0 (strict), THP-backed (APPLIED). Explicit 1 GiB/2 MiB hugepages are PROPOSED only if THP
   splitting/compaction shows up in measurements.
@@ -81,5 +87,5 @@ after 12k gives the same 0.45 ms). Cause: wake-up from deep idle between request
 ## 5. Checklist per measurement block
 1. No Host build running (`workspaces/MEASUREMENT.lock`, host-gate.sh).
 2. Host C1E/C6 disabled, settings recorded (§3.1).
-3. (when applied) emulator threads pinned to node1 (§2.2), Host slices on node1 and loadgen pinned (§2.3).
-4. After the block: restore C-states (and slices/IRQ masks) to the recorded values and diff.
+3. `sudo measure-env.sh check recovery/HOST-measure-env-v1` prints CHECK PASS (C-states, IRQs, workqueues, slices, emulatorpin).
+4. Restore only when the measurement campaign ends: `sudo measure-env.sh restore recovery/HOST-measure-env-v1`.
