@@ -36,6 +36,14 @@ struct Stats {  // subset of rackobj::ObjectStats (this node unless noted)
 // Build >= 73: KV Get/Put are counted in the same fields (one Get = one read section, one Put = one write section;
 // §14). Build >= 74: check_ns_sampled and wstart_ns exclude the GetAnchor work a Megalon-hwcc all-HWcc also does (index
 // lookup and NR anchor sync/replay; Megalon-only flushes inside the anchor stay in), see AnchorSnap (§15, §16).
+// Build >= 76 (reserved[1] bit 1 set; §18): counts are exact in every section; EVERY duration (check, stale/concur/
+// meta/spin, wstart, switch_rw, reclaim, wflush, KV create ns, AnchorSnap) is a sum over timed sections only: a
+// jittered 1 in check_sample of the read sections (check_sampled of them) and, separately, of the write sections
+// (AnchorSnap.reserved[0] = write_sampled). Estimates: read-side ns * read_sections / check_sampled; write-side ns *
+// write_sections / write_sampled. Unsampled sections read no TSC. With MEGALON_COH_EVENTS=always (reserved[1] bit 2,
+// validation only) the read-side event durations (stale, concur, meta, spin) and all write-side durations are timed
+// in every section (full sums, do not scale them; write_sampled = write_sections), check and the read anchor split
+// stay sampled.
 struct CohSnap {
   uint64_t read_sections, write_sections;
   uint64_t check_sample, check_ns_sampled, check_sampled;  // READ sections only: start+end work when no retry happens
@@ -45,14 +53,16 @@ struct CohSnap {
   uint64_t spin_cnt, spin_ns;                              // (D) contended only
   uint64_t wstart_ns, switch_rw_cnt, switch_rw_ns, reclaim_cnt, reclaim_ns;
   uint64_t wflush_cnt, wflush_ns, wflush_bytes;            // whole-object flush at write_end
-  uint64_t reserved[8];  // [0] TSC kHz, [1] timers on, [2] clamped negative intervals (>= 72), [3] KV creates,
-                         // [4] their ns (inside wstart), [5] KV Gets, [6] KV Puts (>= 73), [7] = read_lookup_ns_sampled (>= 74)
+  uint64_t reserved[8];  // [0] TSC kHz, [1] bit 0 timers on, bit 1 lean sampling (>= 76), bit 2 events_always (>= 76),
+                         // [2] clamped negative intervals (>= 72), [3] KV creates, [4] their ns (inside wstart; >= 76
+                         // write-sampled), [5] KV Gets, [6] KV Puts (>= 73), [7] = read_lookup_ns_sampled (>= 74)
 };
 
 // v3 (Megalon build >= 75): work of the CALLING thread since reg() that a Megalon-hwcc (FULL_COHERENCE) all-HWcc also
 // executes, in ns, so each workload can apply "C = work its all-HWcc does not do". Sampled fields cover the same
 // sampled read sections as CohSnap.check_ns_sampled (estimate for all read sections: x * read_sections /
-// check_sampled). Relation to CohSnap (build >= 74):
+// check_sampled). Build >= 76: the write_* fields are sums over the timed write sections too (estimate x *
+// write_sections / write_sampled, write_sampled = reserved[0]). Relation to CohSnap (build >= 74):
 //   read_lookup_ns_sampled, read_nr_ns_sampled  are EXCLUDED from check_ns_sampled (add them back if the workload's
 //                                               all-HWcc has no Megalon index);
 //   rseq_ns_sampled                             is INSIDE check_ns_sampled;
@@ -69,12 +79,12 @@ struct CohSnap {
 //   wseq_ns                 lock/version CAS (WSeqBegin, incl. its wait) of the final attempt's write_seq_start
 //   wseq_end_ns             unlock/version store (WSeqEnd) in write_seq_end
 // read_sections, write_sections, check_sampled are copies of the CohSnap values (same counters).
-// Exact intervals: reports/M2-megalon-port-changes.md §16.
+// Exact intervals: reports/M2-megalon-port-changes.md §16, §18.
 struct AnchorSnap {
   uint64_t read_sections, write_sections, check_sampled;
   uint64_t read_lookup_ns_sampled, read_nr_ns_sampled, rseq_ns_sampled;
   uint64_t write_lookup_ns, write_nr_ns, wseq_ns, wseq_end_ns;
-  uint64_t reserved[6];
+  uint64_t reserved[6];  // [0] write_sampled: timed write sections (build >= 76; 0 before)
 };
 static_assert(sizeof(CohSnap) == 29 * 8, "CohSnap layout is fixed (v2)");
 static_assert(sizeof(AnchorSnap) == 16 * 8, "AnchorSnap layout is fixed (v3)");
