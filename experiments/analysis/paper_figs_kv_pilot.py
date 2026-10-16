@@ -66,13 +66,20 @@ def main():
             raw[name] = {"total": svc}
         out.append([name, m[key]["step"], m[key]["offered"], m[key]["achieved"], round(svc, 3)]
                    + [round(raw[name].get(k, 0.0), 3) for k in ("total", "msg", "local")])
-    norm = ps.compose(raw)
+    # A partition of each system's own serving time (no subtraction across systems): time inside the page-fault
+    # handler while waiting for the peer's reply / the rest of the handler / everything outside the handler.
+    # Kernel per-thread counters cover dev_dax_swmc_insert (the coherence fault handler); all-HWcc and Megalon take
+    # no coherence faults (the KV Megalon backend has no section timers, so its library time stays in the last part).
+    comps = ["Remote reply wait", "Fault handling", "Request processing"]
+    hw = raw["HWcc"]["total"]
+    norm = {k: [r.get("msg", 0.0) / hw, r.get("local", 0.0) / hw,
+                (r["total"] - r.get("msg", 0.0) - r.get("local", 0.0)) / hw] for k, r in raw.items()}
     ps.breakdown(os.path.join(a.out, "kv-pilot-breakdown.png"), [(k, norm[k]) for k in ("HWcc", "Megalon", "Popcorn")],
-                 ps.COMPONENTS)
+                 comps)
     with open(os.path.join(a.out, "kv-pilot-breakdown.csv"), "w", newline="") as f:
         w = csv.writer(f)
         w.writerow([f"# fixed-load windows at {o:.1f} req/s (identical offered rate); us per request; normalized to all-HWcc = 1"])
-        w.writerow(["system", "step", "offered", "achieved", "svc_us", "total_us", "msg_us", "local_us"] + ["norm_" + c for c in ps.COMPONENTS])
+        w.writerow(["system", "step", "offered", "achieved", "svc_us", "total_us", "msg_us", "local_us"] + ["norm_" + c for c in comps])
         w.writerows([r + [round(x, 4) for x in norm[r[0]]] for r in out])
     print("common rate", o, "base p99", base, "SLO norm", round(slo, 3))
 
