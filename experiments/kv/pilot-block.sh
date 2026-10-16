@@ -18,7 +18,7 @@
 #        recorded from sysfs before the run).
 #   hmtrace: only the traced 0.5 windows of all-HWcc and Megalon (shuffled) at L from an earlier hm block (LREF), e.g.
 #        after an hm block that stopped at its ptrace runs.
-# env: MEGALON_BUILD_N (72 = CohSnap + TSC clamp; 73 once Megalon's KV-path timers land: the Megalon build the kv-megalon
+# env: MEGALON_BUILD_N (75 = CohSnap incl. the KV path + AnchorSnap; the Megalon build the kv-megalon
 #   build must name), MIXES (main block: put ratios, default MOT1 v6 "0.05 0.5 0.8" = get/put 95/5, 50/50, 20/80),
 #   PIN (harness commit), BUILD_PIN (commit the builds were made from; default PIN; every build manifest must name
 #   it with dirty=0, and the server/loadgen sources must not differ between BUILD_PIN and PIN), KV_CFG, K8.
@@ -42,10 +42,11 @@ SSH="ssh -o BatchMode=yes -o ConnectTimeout=8"
 IPS=(192.168.122.100 192.168.122.101)
 OWNER="KV-pilot-$B"; [ "$B" = main ] && OWNER="KV-main-h1"
 [ -d "$E" ] && [ -z "$(ls -A "$E" | grep -v '^sequence')" ] || { echo "SEQUENCE STOP: $E missing or not empty"; exit 2; }
-grep -q "^megalon_build=$P/builds/megalon/${MEGALON_BUILD_N:-72}$" "$BM/manifest.txt" && grep -q "^source_commit=$BPIN dirty=0$" "$BM/manifest.txt" \
-  || { echo "SEQUENCE STOP: $BM is not a clean build of $BPIN on builds/megalon/${MEGALON_BUILD_N:-72}"; exit 2; }
+grep -q "^megalon_build=$P/builds/megalon/${MEGALON_BUILD_N:-75}$" "$BM/manifest.txt" && grep -q "^source_commit=$BPIN dirty=0$" "$BM/manifest.txt" \
+  || { echo "SEQUENCE STOP: $BM is not a clean build of $BPIN on builds/megalon/${MEGALON_BUILD_N:-75}"; exit 2; }
 grep -q "^source_commit=$BPIN dirty=0$" "$BP/manifest.txt" && grep -q "^megalon.flavor=hwcc$" "$BP/manifest.txt" \
-  || { echo "SEQUENCE STOP: $BP is not a clean hwcc-flavor build of $BPIN"; exit 2; }
+  && grep -q "^megalon_build=$P/builds/megalon/${MEGALON_BUILD_N:-75}-hwcc$" "$BP/manifest.txt" \
+  || { echo "SEQUENCE STOP: $BP is not a clean hwcc-flavor build of $BPIN on builds/megalon/${MEGALON_BUILD_N:-75}-hwcc (all-HWcc and Megalon KV share the library version)"; exit 2; }
 grep -q "^cxl_swmc_commit=$BPIN kv_dirty=0$" "$BL/kv-manifest.txt" \
   && grep -q "^sha256 $(sha256sum "$BL/loadgen" | cut -d' ' -f1)  " "$BL/manifest.txt" \
   || { echo "SEQUENCE STOP: $BL loadgen is not the recorded build of $BPIN"; exit 2; }
