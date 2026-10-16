@@ -97,6 +97,7 @@ void thread_anchor(mshim::AnchorSnap *s) {
   s->write_nr_ns = t.write_nr_ns;
   s->wseq_ns = t.wseq_ns;
   s->wseq_end_ns = t.wseq_end_ns;
+  for (size_t i = 0; i < 6; i++) s->reserved[i] = t.reserved[i];  // [0] write_sampled (build >= 76)
 }
 
 #ifndef MSHIM_INFO
