@@ -5,7 +5,8 @@
 # A file region is physically coherent: this checks the API use, layout, value checks and tooling, not a protocol.
 # usage: host_test.sh <kv build dir> <loadgen build dir> <work dir (new)> [plain|megalon]
 # env: KEYS (1000000), MIX (mixed=1; or get=..,put=..), PUT_RATIO (0.5, mixed stream), RATES (2000,5000 requests/s), BATCH (32), STEP_S (5), THREADS (6), LOADER (node0),
-#      TRACE (0), LG_ARGS (loadgen mode args, default --mode fixed --rates $RATES), NEG (0: 1 = second generator run that must fail the value check), PORT (27300), CPUS0/CPUS1/CPUSL, KEEP_IMG (0)
+#      TRACE (0), LG_ARGS (loadgen mode args, default --mode fixed --rates $RATES), NEG (0: 1 = second generator run that must fail the value check), PORT (27300), CPUS0/CPUS1/CPUSL, KEEP_IMG (0),
+#      NR_LOG_SIZE (Megalon nr_log_size, e.g. 1MB: the shared NR log wraps every 8192 entries), STUCK_MS (stuck_timeout_ms)
 set -euo pipefail
 B=$(cd "$1" && pwd); LG=$(cd "$2" && pwd); WD=$3; BACKEND=${4:-plain}
 HERE=$(cd "$(dirname "$0")" && pwd); W=$(cd "$HERE/.." && pwd); ROOT=$(cd "$W/../.." && pwd)
@@ -35,6 +36,7 @@ APP=$("$B/bin/kv-server" "${SA[@]}" --print-app-bytes)
 eval "$("$B/bin/kv-server" --print-sizes --keys "$KEYS" | grep -E '^(key_space|slots|logical_scr_size)=')"
 sed -e "s/^key_space:.*/key_space: $key_space/" -e "s/^slots:.*/slots: $slots/" \
     -e "s/^logical_scr_size:.*/logical_scr_size: $logical_scr_size/" -e "s|^region_config:.*|region_config: \"$WD/region.yaml\"|" \
+    ${NR_LOG_SIZE:+-e "s/^nr_log_size:.*/nr_log_size: $NR_LOG_SIZE/"} ${STUCK_MS:+-e "s/^stuck_timeout_ms:.*/stuck_timeout_ms: $STUCK_MS/"} \
     "$ROOT/systems/megalon/kv-2vm.yaml" > "$WD/megalon.yaml"
 truncate -s "$DEV" "$IMG"
 cleanup() { for p in "${PIDS[@]:-}"; do kill "$p" 2>/dev/null || true; done; wait 2>/dev/null || true; [ "${KEEP_IMG:-0}" = 1 ] || rm -f "$IMG"; }

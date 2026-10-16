@@ -3,8 +3,10 @@
 # 4M keys, 1 KiB values, Zipfian 0.99, requests of BATCH mixed ops (each op a put with probability PUT_RATIO),
 # SLO per request mixed p99 <= 1 ms.
 # usage: pilot-run.sh <name> <evidence dir>
-# env (required): SYS (all-HWcc | Megalon | Popcorn), PUT_RATIO (0 | 0.05 | 0.5), KIND (functional | pslo | pfix |
-#   ptrace); KIND=pfix|ptrace: RATE (requests/s = L). ptrace = a pfix window with TRACE=1 (put/get logs for the
+# env (required): SYS (all-HWcc | Megalon | Popcorn), PUT_RATIO (0 | 0.05 | 0.5), KIND (functional | pslo | slo | pfix |
+#   ptrace); slo = the full MOT1 v5 §3.3 SLO search (main runs, reports/KV-main-packet.md: 10 s warm-up, steps 3 s +
+#   15 s, adaptive ramp from 500 req/s, bisect to 5 %, confirm 3 x 30 s with up to two -5 % step-downs, fill 0.7/0.8/0.9
+#   x result, overload 1.05/1.1/1.2 x first fail; every measured step has a stats snapshot pair); KIND=pfix|ptrace: RATE (requests/s = L). ptrace = a pfix window with TRACE=1 (put/get logs for the
 #   Figure 2c classification only; never used for throughput/latency comparisons). pfix forces TRACE=0.
 #   SYS=Popcorn: C8 (build-8 deploy bundle dir), K8 (release), GT8 (guest tools dir), RECV_MODE (poll | idle | sleep)
 # optional: KEYS (4000000), BATCH (16), SEED (20261016), GATE=0 (skip the Host gate: functional runs only),
@@ -29,6 +31,7 @@ stop() { echo "PILOTRUN $NAME STOP $*"; exit 1; }
 [ -e "$E/$NAME" ] && stop "$E/$NAME exists"
 [[ $PUT_RATIO =~ ^(0|0\.05|0\.2|0\.5)$ ]] || stop "bad PUT_RATIO"
 [[ $BATCH =~ ^(16|32|64)$ ]] || stop "bad BATCH"
+[[ $KEYS =~ ^[1-9][0-9]*$ ]] || stop "bad KEYS"
 SA="--nodes 2 --keys $KEYS --threads 14 --start-timeout-ms 5400000"
 export LOADGEN=$LOADGEN_BUILD/loadgen READY_TIMEOUT=5400 RUN_KIND=measurement STATS_OP=10 TRACE
 [ "$KIND" = functional ] && RUN_KIND=functional
@@ -48,6 +51,8 @@ case "$KIND" in
   functional) LG+=(--mode fixed --rates 200,2000 --warmup-s 10 --step-warmup-s 5 --step-measure-s 30 --drain-s 10);;
   pslo) LG+=(--raw --mode slo --start 500 --factor 1.5 --precision 0.05 --max-steps 25 --warmup-s 10 --step-warmup-s 2
              --step-measure-s 8 --confirm-s 15 --confirm-reps 1 --fill none --overload none);;
+  slo) LG+=(--raw --mode slo --start 500 --factor 1.5 --precision 0.05 --max-steps 25 --warmup-s 10 --step-warmup-s 3
+            --step-measure-s 15 --drain-s 5 --confirm-s 30 --confirm-reps 3 --fill 0.7,0.8,0.9 --overload 1.05,1.1,1.2);;
   pfix|ptrace) : "${RATE:?}"; LG+=(--raw --mode fixed --rates "$RATE" --warmup-s 10 --step-warmup-s 5 --step-measure-s 30 --drain-s 10);;
   *) stop "bad KIND";;
 esac
@@ -100,7 +105,7 @@ done
 grep -q "workload_finish\":\"ok" $R/loadgen/summary.json || stop "loadgen workload finish"
 if [ $RC != 0 ]; then
   note=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("note",""))' $R/loadgen/summary.json 2>/dev/null)
-  [ "$KIND" = pslo ] && [ -n "$note" ] && { echo "PILOTRUN $NAME NOTE $note"; exit 0; }
+  [[ $KIND =~ ^p?slo$ ]] && [ -n "$note" ] && { echo "PILOTRUN $NAME NOTE $note"; exit 0; }
   stop "run.sh rc $RC ($note)"
 fi
 [ "$KIND" = functional ] && ! grep -q '"pass":true' $R/loadgen/steps.jsonl && stop "functional step not PASS"

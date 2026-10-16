@@ -7,11 +7,17 @@
 #        result at the same ratio (shuffled); then one traced window per system at 0.5 (ptrace, Figure 2c logs only).
 #   pop: page MSI (C8 K8 GT8 RECV_MODE): functional (0.5), pilot SLO searches at 0.05 / 0 / 0.5 (shuffled), untraced
 #        fixed-load windows at L from the hm block (LREF = its evidence dir), then the traced 0.5 window.
+#   main: H1 MAIN run (reports/KV-main-packet.md): one full SLO search (KIND=slo) per system at put ratio 0.05, KEYS
+#        (54000000), order = [hw mg pop] shuffled with seed "KV-main-h1" (order.txt before the first run); dax0.0
+#        comsys for all-HWcc/Megalon, back to root:root 600 (fresh stat check) before page MSI. A confirm failure at
+#        three rates is a NOTE (recorded, the block continues); every other stop ends the block.
 #   hmtrace: only the traced 0.5 windows of all-HWcc and Megalon (shuffled) at L from an earlier hm block (LREF), e.g.
 #        after an hm block that stopped at its ptrace runs.
-# env: PIN (harness commit; every build manifest must name it with dirty=0), KV_CFG, K8.
-# Holds the measurement lock for the whole block; stops at the first PILOTRUN STOP; the hm block rolls /dev/dax0.0
-# back to root:root 600 at its end or on a stop; page MSI runs tear down per run (and leave dax0.0 root:root 600).
+# env: PIN (harness commit), BUILD_PIN (commit the builds were made from; default PIN; every build manifest must name
+#   it with dirty=0, and the server/loadgen sources must not differ between BUILD_PIN and PIN), KV_CFG, K8.
+# Holds the measurement lock for the whole block; stops at the first PILOTRUN STOP. On every exit: this block's servers
+# stopped, page MSI teardown of every attempted load, /dev/dax0.0 back to root:root 600 on both VMs UNCONDITIONALLY
+# (fresh stat check per VM; "ROLLBACK FAIL" otherwise), lock released.
 set -uo pipefail
 B=$1 E=$2
 P=/home/comsys/sungsu/destijl-control X=$P/CXL_SWMC/experiments/kv G=$P/CXL_SWMC/experiments/vectordb/host-gate.sh
@@ -19,19 +25,23 @@ K8=${K8:-6.14.0-famfs-de-stijl+-ds-popcorn-new-8}
 VP=${VM_PLAIN:-/home/comsys/kv3} VM=${VM_MEG:-/home/comsys/kvm3}
 BP=${PLAIN_BUILD:-$P/builds/kv/3} BM=${MEG_BUILD:-$P/builds/kv-megalon/3} BL=${LOADGEN_BUILD:-$P/builds/kv-loadgen/3}
 : "${PIN:?PIN = harness commit}"
+BPIN=${BUILD_PIN:-$PIN}
+[ "$BPIN" = "$PIN" ] || git -C $P/CXL_SWMC diff --quiet "$BPIN" "$PIN" -- workloads/kv/server workloads/kv/loadgen workloads/kv/proto.h \
+  systems/common experiments/loadgen/loadgen.cc experiments/loadgen/workload.h experiments/loadgen/frame.h \
+  || { echo "SEQUENCE STOP: server/loadgen sources differ between BUILD_PIN $BPIN and PIN $PIN"; exit 2; }
 export VM_PLAIN=$VP VM_MEG=$VM PLAIN_BUILD=$BP MEG_BUILD=$BM LOADGEN_BUILD=$BL
 CFG=${KV_CFG:?KV_CFG = the megalon.yaml install.sh wrote (<install log>.megalon.yaml)}
 SSH="ssh -o BatchMode=yes -o ConnectTimeout=8"
 IPS=(192.168.122.100 192.168.122.101)
-OWNER="KV-pilot-$B"
+OWNER="KV-pilot-$B"; [ "$B" = main ] && OWNER="KV-main-h1"
 [ -d "$E" ] && [ -z "$(ls -A "$E" | grep -v '^sequence')" ] || { echo "SEQUENCE STOP: $E missing or not empty"; exit 2; }
-grep -q "^megalon_build=$P/builds/megalon/70$" "$BM/manifest.txt" && grep -q "^source_commit=$PIN dirty=0$" "$BM/manifest.txt" \
-  || { echo "SEQUENCE STOP: $BM is not a clean build of $PIN on builds/megalon/70"; exit 2; }
-grep -q "^source_commit=$PIN dirty=0$" "$BP/manifest.txt" && grep -q "^megalon.flavor=hwcc$" "$BP/manifest.txt" \
-  || { echo "SEQUENCE STOP: $BP is not a clean hwcc-flavor build of $PIN"; exit 2; }
-grep -q "^cxl_swmc_commit=$PIN kv_dirty=0$" "$BL/kv-manifest.txt" \
+grep -q "^megalon_build=$P/builds/megalon/70$" "$BM/manifest.txt" && grep -q "^source_commit=$BPIN dirty=0$" "$BM/manifest.txt" \
+  || { echo "SEQUENCE STOP: $BM is not a clean build of $BPIN on builds/megalon/70"; exit 2; }
+grep -q "^source_commit=$BPIN dirty=0$" "$BP/manifest.txt" && grep -q "^megalon.flavor=hwcc$" "$BP/manifest.txt" \
+  || { echo "SEQUENCE STOP: $BP is not a clean hwcc-flavor build of $BPIN"; exit 2; }
+grep -q "^cxl_swmc_commit=$BPIN kv_dirty=0$" "$BL/kv-manifest.txt" \
   && grep -q "^sha256 $(sha256sum "$BL/loadgen" | cut -d' ' -f1)  " "$BL/manifest.txt" \
-  || { echo "SEQUENCE STOP: $BL loadgen is not the recorded build of $PIN"; exit 2; }
+  || { echo "SEQUENCE STOP: $BL loadgen is not the recorded build of $BPIN"; exit 2; }
 bash $G lock "$OWNER" || { echo "SEQUENCE STOP: lock"; exit 2; }
 CHOWNED=0
 finish() {
@@ -51,13 +61,26 @@ finish() {
       grep -q "teardown PASS" "$r/steps.log" 2>/dev/null || echo "CLEANUP FAILED: $r (manual: reports/M5-pilot-kv.md §6)" | tee -a "$E/cleanup.out"
     done
   fi
-  if [ $CHOWNED = 1 ]; then
-    for ip in "${IPS[@]}"; do
-      $SSH comsys@$ip 'sudo -n chown root:root /dev/dax0.0 && sudo -n chmod 600 /dev/dax0.0; echo stat=$(stat -c "%U:%G %a" /dev/dax0.0)' \
-        < /dev/null 2>&1 | sed "s/^/$ip /" >> "$E/rollback.out"
-    done
-  fi
+  dax_root_all || true  # unconditional (page MSI chowns through p-popcorn-shm.sh; a failed teardown may leave comsys)
   bash $G unlock "$OWNER"
+}
+# dax0.0 back to root:root 600 on both VMs; judged on this call's fresh stat output per VM (not on rollback.out)
+dax_root_all() {
+  local ip out rc=0
+  for ip in "${IPS[@]}"; do
+    out=$($SSH comsys@$ip 'sudo -n chown root:root /dev/dax0.0 && sudo -n chmod 600 /dev/dax0.0; echo stat=$(stat -c "%U:%G %a" /dev/dax0.0)' < /dev/null 2>&1)
+    echo "$out" | sed "s/^/$(date -Is) $ip /" >> "$E/rollback.out"
+    echo "$out" | grep -qx "stat=root:root 600" || { echo "ROLLBACK FAIL: $ip dax0.0 not root:root 600" | tee -a "$E/rollback.out"; rc=1; }
+  done
+  return $rc
+}
+dax_comsys_all() {
+  local ip
+  for ip in "${IPS[@]}"; do
+    $SSH comsys@$ip 'sudo -n chown comsys /dev/dax0.0 && stat -c "%U:%G %a" /dev/dax0.0' < /dev/null > "$E/chown-$ip.out" 2>&1
+    CHOWNED=1
+    grep -qx "comsys:root 600" "$E/chown-$ip.out" || { echo "SEQUENCE STOP: chown $ip"; exit 1; }
+  done
 }
 trap finish EXIT
 run() {  # name, env assignments...
@@ -94,11 +117,7 @@ echo "$(date -Is) block $OWNER start (git $(git -C $P/CXL_SWMC rev-parse --short
 precheck
 case "$B" in
   hm|hmtrace)
-    for ip in "${IPS[@]}"; do
-      $SSH comsys@$ip 'sudo -n chown comsys /dev/dax0.0 && stat -c "%U:%G %a" /dev/dax0.0' < /dev/null > "$E/chown-$ip.out" 2>&1
-      CHOWNED=1
-      grep -qx "comsys:root 600" "$E/chown-$ip.out" || { echo "SEQUENCE STOP: chown $ip"; exit 1; }
-    done
+    dax_comsys_all
     if [ "$B" = hmtrace ]; then
       : "${LREF:?}"
       for s in $(shuffle hw mg); do
@@ -126,6 +145,19 @@ case "$B" in
       [ $s = hw ] && S=all-HWcc || S=Megalon
       r=$(confirm_l $E/hw-u50-pslo/loadgen/summary.json) || { echo "SEQUENCE STOP: no all-HWcc result for 0.5"; exit 1; }
       run $s-u50-ptrace SYS=$S PUT_RATIO=0.5 KIND=ptrace RATE=$r
+    done;;
+  main)
+    : "${C8:?}" "${GT8:?}" "${RECV_MODE:?}" "${KEYS:?}"
+    ORD=$(shuffle hw mg pop)
+    [ $(echo $ORD | wc -w) = 3 ] || { echo "SEQUENCE STOP: run order"; exit 1; }
+    echo "# KV H1 main order (shuffle seed $OWNER): $ORD; keys $KEYS batch 16 put 0.05 Zipf 0.99 request seed ${SEED:-20261016}" | tee "$E/order.txt"
+    for s in $ORD; do
+      case $s in
+        hw)  [ $CHOWNED = 1 ] || dax_comsys_all; run hw-u5-slo SYS=all-HWcc PUT_RATIO=0.05 KIND=slo KEYS=$KEYS;;
+        mg)  [ $CHOWNED = 1 ] || dax_comsys_all; run mg-u5-slo SYS=Megalon PUT_RATIO=0.05 KIND=slo KEYS=$KEYS;;
+        pop) if [ $CHOWNED = 1 ]; then dax_root_all || { echo "SEQUENCE STOP: dax0.0 not back to root:root 600 before page MSI"; exit 1; }; CHOWNED=0; fi
+             run pop-u5-slo SYS=Popcorn C8=$C8 K8=$K8 GT8=$GT8 RECV_MODE=$RECV_MODE PUT_RATIO=0.05 KIND=slo KEYS=$KEYS;;
+      esac
     done;;
   pop)
     : "${C8:?}" "${GT8:?}" "${RECV_MODE:?}" "${LREF:?}"
