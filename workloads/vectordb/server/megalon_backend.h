@@ -105,7 +105,7 @@ class MegalonAcc;
 // Sharing trace (--trace-dir, MOT1 v6 Fig 3c; dedicated runs only, off by default; DESIGN.md §16): per section one
 // TraceRec in the thread's own memory buffer (chunks of kTraceChunk records; no shared writes), dumped at stop:
 //   write section: (object, element, units, seq) with seq = global write-section sequence number from the HWcc
-//                  counter wsec (fetch-add after ObjectWriteEnd);
+//                  counter wsec (fetch-add inside the section, before ObjectWriteEnd);
 //   read section:  (object, element, units, seq = wsec loaded after the accepted attempt's ObjectReadStart) and the
 //                  event flags of the section: (A) = CohSnap.stale_cnt advanced (stale copy at read_start), (B) = failed
 //                  ObjectReadEnd (CohSnap.concur_cnt when thread_coh exists, else the wrapper's own count, which then
@@ -131,7 +131,8 @@ inline Elem link_elem(uint64_t slot, int level, uint32_t levels = 1) {
 
 struct __attribute__((packed)) TraceRec {  // 32 B (workloads/vectordb/tools/classify_sharing.py)
   uint64_t tsc;    // rdtsc at the end of the section (node-local order)
-  uint32_t seq;    // write: global write-section seq; read: wsec loaded after the accepted attempt's read_start
+  uint32_t seq;    // write: global write-section seq (taken before write_end); read: wsec loaded after the accepted
+                   // attempt's read_start
   uint32_t obj;    // dense object index (MegalonBackend::obj_index)
   uint32_t elem;   // Elem.elem
   uint16_t n;      // Elem.n
@@ -317,6 +318,11 @@ class MegalonBackend {
     if (rc != 0) megalon_fatal("ObjectWriteStart(" + hex(id) + ") = " + std::to_string(rc));
     const uint64_t t1 = mono_ns();
     f(h.ptr, h.size);
+    // trace: the write's sequence number is taken inside the section (after the body, before ObjectWriteEnd), so a
+    // reader whose section is accepted and that loads wsec after its ObjectReadStart has seen every write on the
+    // object with seq <= its value and none with a larger one (a write that took its seq before the load but ends
+    // after the reader's start overlaps the reader's section, which then fails): each write once (DESIGN.md §16)
+    const uint64_t seq = wsec_ ? cxl::hwcc::fetch_add(wsec_, uint64_t(1)) + 1 : 0;
     const uint64_t t2 = mono_ns();
     api_->write_end(&h);
     const uint64_t t3 = mono_ns();
@@ -324,7 +330,6 @@ class MegalonBackend {
     t.add(MegTimers::kWrSections, 1), t.add(MegTimers::kWrStartNs, t1 - t0), t.add(MegTimers::kWrBodyNs, t2 - t1);
     t.add(MegTimers::kWrEndNs, t3 - t2);
     if (wsec_) {
-      const uint64_t seq = cxl::hwcc::fetch_add(wsec_, uint64_t(1)) + 1;
       TraceRec r{};
       r.tsc = __rdtsc(), r.seq = uint32_t(seq), r.obj = uint32_t(obj_index(id)), r.elem = e.elem, r.n = e.n;
       r.type = kTraceWrite;

@@ -90,14 +90,15 @@ struct __attribute__((packed)) OpCoh {
   uint32_t pf_cnt[3];
   uint32_t ipi_cnt;
   uint64_t ipi_ns;    // TLB-shootdown IPI handling on the thread's CPU
-  uint64_t mg_check_ns_sampled;  // section checks, sampled sections only (estimate = x mg_check_sample)
+  uint64_t mg_check_ns_sampled;  // section checks, sampled sections only (estimate: x mg_read_sections / mg_check_sampled)
   uint32_t mg_check_sampled, mg_read_sections, mg_write_sections, mg_stale_cnt, mg_concur_cnt, mg_meta_cnt,
       mg_spin_cnt, mg_switch_rw_cnt, mg_reclaim_cnt, mg_wflush_cnt;
   uint64_t mg_stale_ns, mg_concur_ns, mg_meta_ns, mg_spin_ns, mg_wstart_ns, mg_switch_rw_ns, mg_reclaim_ns,
       mg_wflush_ns, mg_wflush_bytes;
   uint64_t mod_bytes;
+  uint64_t wait_ns;   // search: E1 wait (polling P >= ref_w) inside the start section, part of t_ns [measured]
 };
 constexpr uint16_t kOpCohVersion = 2;
-static_assert(sizeof(OpCoh) == 208, "OpCoh wire size (experiments/vectordb/opsplit.py)");
+static_assert(sizeof(OpCoh) == 216, "OpCoh wire size (experiments/vectordb/opsplit.py)");
 
 }  // namespace vdb

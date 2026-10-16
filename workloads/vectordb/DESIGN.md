@@ -401,14 +401,21 @@ indexing unit; Megalon flushes the whole object at write end (no dirty-line trac
 - Modified bytes (Fig 3b reference line): thread-local `t_mod_bytes` (shm_hnsw.h) counts the whole lines the
   application stores: vector record + zeroed level-0/upper link blocks (write_elem), each committed link block,
   each 64 B delete-log entry. Written back (Fig 3b): Megalon CohSnap wflush_bytes; Popcorn (S->M + wp faults) x 4 KiB.
-- Transport: proto.h `OpCoh` v2 (208 B) after the search results (SearchResp.flags kRespCoh) and after WriteResp on
-  update responses; the loadgen plugin writes `op-coh.bin` (OpLog 232 B). Window counters in the stats text in the
+- Transport: proto.h `OpCoh` v2 (216 B) after the search results (SearchResp.flags kRespCoh) and after WriteResp on
+  update responses; the loadgen plugin writes `op-coh.bin` (OpLog 240 B). Window counters in the stats text in the
   KV convention (workloads/kv/server/opsplit.h): `opt.version`, `opt.tsc_hz`, `opt.meg_coh`, `opt.meg_check_sample`,
   `opt.<search|update>.{ops,sections,t_ns,c_ns,mod_bytes}`, `opt.<op>.pop.{is,sm,wp}_{ns,cnt}`, `.pop.ipi_{ns,cnt}`,
   `opt.<op>.meg.<CohSnap field>`; `opcoh.*` = source, errors, timed-out search sections (unattributed).
 - Offline: `experiments/vectordb/opsplit.py RUN` -> `opsplit-steps.csv` (one row per measured step and operation
   type) + `opsplit-steps.columns.csv` (tag per column: measured / sampled×N / derived, unit, formula). No proportional
-  wall-equivalent columns. `--op-coh off` disables reads and blocks.
+  wall-equivalent columns; no per-operation C percentiles or window C (the per-operation ratio estimate of Megalon's
+  checks is biased; C means use the step's sums). A run whose records carry more than one coherence source is
+  refused; pop_source / mg_cohsnap are exported per step. Search E1 wait (polling P) is a separate column `wait_ms`
+  inside T (OpCoh.wait_ns, `opt.<op>.wait_ns`). Fig 3b Popcorn written-back bytes per update = window delta of
+  `sys.swmc.page_coherence.remote_writeback_count` (nodes summed) x 4 KiB / opt.update.ops; (S->M + wp) x 4 KiB is
+  exported only as `m_acq_bytes_pop` ("M acquisitions x 4 KiB"). m4-run.sh requires OPCOH_EXPECT for measurement
+  runs, bound to the system (Popcorn swmc_acct, Megalon cohsnap, all-HWcc none). `--op-coh off` disables reads and
+  blocks.
 - Cost per section: two rdtsc, two reads of the thread's area (Popcorn: plain loads; Megalon: two thread_coh calls).
 
 ## 16. Sharing trace (vdb build >= 10; MOT1 v6 Fig 3c, draft §4.3; dedicated runs only, off by default)
@@ -417,7 +424,8 @@ indexing unit; Megalon flushes the whole object at write end (no dirty-line trac
   thread's own buffer (2 MiB chunks, cap `--trace-max-mb`, default 4096 per node; overflow counted as dropped),
   dumped at stop as `node<K>.vdbtrace.bin` (TraceFileHdr, then per thread TraceThreadHdr + records).
   - write section: object (dense index), element, units, seq = global write-section number (HWcc `wsec` fetch-add
-    after ObjectWriteEnd);
+    inside the section, after the body and before ObjectWriteEnd: an accepted reader that loads wsec after its
+    ObjectReadStart has seen exactly the writes on the object with seq <= its value);
   - read section: object, element, units, seq = wsec loaded after the accepted attempt's ObjectReadStart, flags =
     (A) CohSnap.stale_cnt delta | (B) CohSnap.concur_cnt delta << 4 (without CohSnap: failed read_ends), ev_ns =
     stale_ns + concur_ns delta, tsc. Identical consecutive flagless reads of a thread are kept once.
@@ -427,7 +435,9 @@ indexing unit; Megalon flushes the whole object at write end (no dirty-line trac
   element modified by the causing writes (peer writes on O with seq in (seq_prev, seq_seen], seq_prev = n's latest
   refresh point on O: previous event, own write, or first read) before n's next event on O; counts per role and
   (A)/(B), time shares (ev_ns), events per search. `--a6-dir` writes the CSV input of
-  experiments/analysis/v6_fig3_megalon.py c. HWcc `objseq` lines are no longer used (stay 0).
+  experiments/analysis/v6_fig3_megalon.py c. HWcc `objseq` lines are no longer used (stay 0). numpy implementation:
+  1.6M records in 1.0 s, ~130 B per record peak (two nodes at the 4096 MiB default cap ~35 GB; use --trace-max-mb
+  <= 2048 or run it pinned to node 1).
 - Overhead (Host, tiny dataset, 10/90 mix, load average ~38, single runs): Megalon 70 (no CohSnap): search T p50
   +9-14 %, update +4-14 %; Megalon 71 (two thread_coh calls per read section): search T p50 +31-86 %, update +27 %;
   server-measured per-read-section cost 12-22 ns (70) / 211-474 ns (71). Trace runs therefore never feed Fig 1/2.

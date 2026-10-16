@@ -16,10 +16,13 @@
 #   refused unless KIND=functional), QCOH_EXPECT (none | swmc: per-query coherence, vdb build >= 9, DESIGN.md §14; both
 #   servers must log "query coherence on, page MSI source <QCOH_EXPECT>", end with qcoh.read_errors=0 and
 #   qcoh.open_errors=0, and every OK search response must carry the block (vectordb.txt ok_without_coh=0,
-#   bad_coh_version=0); then qcoh.py writes <run>/qcoh-steps.csv). vdb builds >= 10: OPCOH_EXPECT (none | swmc_acct |
-#   swmc_file: per-operation time split, DESIGN.md §15; servers log "op coherence on, popcorn source <it>", end with
-#   opcoh.read_errors=0 and opcoh.register_errors=0, every OK search/update carries the v2 block; then opsplit.py
-#   writes <run>/opsplit-steps.csv + .columns.csv). Use QCOH_EXPECT only with builds <= 9.
+#   bad_coh_version=0); then qcoh.py writes <run>/qcoh-steps.csv). Use QCOH_EXPECT only with builds <= 9.
+#   OPCOH_EXPECT (vdb builds >= 10; per-operation time split, DESIGN.md §15): the system's own coherence source,
+#   mandatory for every non-functional run (unless QCOH_EXPECT is given for an old build) and bound to SYS:
+#   Popcorn = swmc_acct (servers log "popcorn source swmc_acct"), Megalon = cohsnap ("megalon cohsnap on"),
+#   all-HWcc = none (no source required). Servers must end with opcoh.read_errors=0 and opcoh.register_errors=0 and
+#   every OK search/update must carry the v2 block; then opsplit.py writes <run>/opsplit-steps.csv + .columns.csv and
+#   must succeed (it refuses runs with mixed coherence sources).
 # Prints "M4RUN <name> OK|NOTE|STOP <reason>"; exit 0 for OK/NOTE (NOTE = a loadgen SLO-search outcome that is a
 # result, not an error: "confirm failed at three rates"), 1 for STOP (the sequence stops).
 set -uo pipefail
@@ -58,6 +61,11 @@ case "$SYS" in
   *) stop "bad SYS";;
 esac
 [ "$SYS" = Megalon ] || [ "$TRACE" = 0 ] || stop "TRACE=1 is for Megalon only"
+case "$SYS" in Popcorn) OPC_SYS=swmc_acct;; Megalon) OPC_SYS=cohsnap;; *) OPC_SYS=none;; esac
+if [ "$KIND" != functional ] && [ -z "${QCOH_EXPECT:-}" ]; then
+  [ -n "${OPCOH_EXPECT:-}" ] || stop "OPCOH_EXPECT is mandatory for measurement runs ($SYS: $OPC_SYS)"
+fi
+[ -z "${OPCOH_EXPECT:-}" ] || [ "$OPCOH_EXPECT" = "$OPC_SYS" ] || stop "OPCOH_EXPECT=$OPCOH_EXPECT does not match $SYS ($OPC_SYS)"
 case "$U" in
   0) MIX=search=1;; 5) MIX=update=5,search=95;; 10) MIX=update=10,search=90;; 20) MIX=update=20,search=80;;
   50) MIX=update=50,search=50;; 90) MIX=update=90,search=10;;
@@ -147,12 +155,16 @@ if [ -n "${QCOH_EXPECT:-}" ]; then  # per-query coherence (DESIGN.md §14)
 fi
 if [ -n "${OPCOH_EXPECT:-}" ]; then  # per-operation time split (vdb build >= 10, DESIGN.md §15)
   for k in 0 1; do
-    grep -qE "^vdb-server: op coherence on, popcorn source $OPCOH_EXPECT[ ,]" $R/node$k.log || stop "node$k: op coherence source != $OPCOH_EXPECT"
+    grep -q "^vdb-server: op coherence on," $R/node$k.log || stop "node$k: op coherence not on"
+    case $OPCOH_EXPECT in
+      swmc_acct) grep -qE "^vdb-server: op coherence on, popcorn source swmc_acct[ ,]" $R/node$k.log || stop "node$k: popcorn source != swmc_acct";;
+      cohsnap) grep -qE "^vdb-server: op coherence on, .*megalon cohsnap on," $R/node$k.log || stop "node$k: megalon cohsnap not on";;
+    esac
     { grep -qx "opcoh.read_errors=0" $R/node$k.log && grep -qx "opcoh.register_errors=0" $R/node$k.log; } || stop "node$k: opcoh read/register errors"
   done
   { grep -qx "ok_without_coh=0" $R/loadgen/vectordb.txt && grep -qx "updates_ok_without_coh=0" $R/loadgen/vectordb.txt &&
     grep -qx "bad_coh_version=0" $R/loadgen/vectordb.txt; } || stop "responses without an op coherence block"
-  python3 $X/opsplit.py $R > $R/opsplit.log 2>&1 || echo "M4RUN $NAME: opsplit.py failed (analysis only; see $R/opsplit.log)"
+  python3 $X/opsplit.py $R > $R/opsplit.log 2>&1 || stop "opsplit.py failed (see $R/opsplit.log)"
 fi
 python3 $X/e1_check.py --writes $W --na $NA --nb $NB --searches $R/loadgen/searches.bin --out $R/e1 --sample 500 > /dev/null \
   || stop "E1 violation (see $R/e1.e1.txt)"

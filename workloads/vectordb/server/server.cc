@@ -136,9 +136,9 @@ struct Stats {
 // the operations answered (the same values as the response blocks; the server's completion time decides the window).
 struct OpWin {
   static constexpr int kPop = 8, kMeg = 20;
-  std::atomic<uint64_t> ops{0}, sections{0}, t_ns{0}, c_ns{0}, mod_bytes{0}, pop[kPop]{}, meg[kMeg]{};
+  std::atomic<uint64_t> ops{0}, sections{0}, t_ns{0}, c_ns{0}, mod_bytes{0}, wait_ns{0}, pop[kPop]{}, meg[kMeg]{};
   void add(const OpCoh &b) {
-    ops++, sections += b.sections, t_ns += b.t_ns, c_ns += b.c_ns, mod_bytes += b.mod_bytes;
+    ops++, sections += b.sections, t_ns += b.t_ns, c_ns += b.c_ns, mod_bytes += b.mod_bytes, wait_ns += b.wait_ns;
     const uint64_t p[kPop] = {b.pf_ns[0], b.pf_ns[1], b.pf_ns[2], b.pf_cnt[0], b.pf_cnt[1], b.pf_cnt[2], b.ipi_ns, b.ipi_cnt};
     const uint64_t m[kMeg] = {b.mg_read_sections, b.mg_write_sections, b.mg_check_ns_sampled, b.mg_check_sampled,
                               b.mg_stale_cnt, b.mg_stale_ns, b.mg_concur_cnt, b.mg_concur_ns, b.mg_meta_cnt,
@@ -156,7 +156,7 @@ struct OpWin {
                                          "reclaim_cnt", "reclaim_ns", "wflush_cnt", "wflush_ns", "wflush_bytes"};
     const std::string p = std::string("\nopt.") + name + ".";
     o << p << "ops=" << ops << p << "sections=" << sections << p << "t_ns=" << t_ns << p << "c_ns=" << c_ns << p
-      << "mod_bytes=" << mod_bytes;
+      << "mod_bytes=" << mod_bytes << p << "wait_ns=" << wait_ns;
     for (int i = 0; i < kPop; i++) o << p << "pop." << pn[i] << "=" << pop[i];
     for (int i = 0; i < kMeg; i++) o << p << "meg." << mn[i] << "=" << meg[i];
   }
@@ -650,6 +650,7 @@ class Server {
       return nullptr;
     }
     c->t1 = now_ns();
+    c->oa.wait_ticks += rdtsc() - os.tsc;  // E1 wait, part of the start section
     for (uint32_t u = 0; u < p_.nr_nodes; u++) {
       uint64_t n = load_acquire(&h_->nodes[u].dlog_count);
       if (__atomic_load_n(&dcursor_[u], __ATOMIC_ACQUIRE) < n) replay(u, n);

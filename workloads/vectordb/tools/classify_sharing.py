@@ -22,9 +22,15 @@ the trace), n reads at least one element modified by the writes that caused the 
   causing write is "unexplained"; both are counted and excluded from true/false.
   reads of the copy = n's read records on O (any thread) with tsc in [event, next event); the event's own record is
   the accepted re-read and counts.
-Known limits: seq is loaded after read_start, so a write whose ObjectWriteEnd finished before the read but whose
-fetch-add came after the load gets a seq > seq_seen and is attributed to the next event; reads by several threads of
-one node are ordered by tsc (one VM, invariant TSC).
+Sequence numbers: a write takes its seq inside its section (before ObjectWriteEnd) and a reader loads wsec after its
+accepted ObjectReadStart, so an accepted read has seen exactly the writes on its object with seq <= its value (a write
+that took its seq before the load but ended after the read's start overlaps the read section, which then fails).
+Reads by several threads of one node are ordered by tsc (one VM, invariant TSC).
+Implementation: numpy (sort by object and tsc, running maxima for refresh points and copy owners, searchsorted counts of
+peer writes per (object, element) in (seq_prev, seq_seen]). Measured (Host, 2026-10-16): 1.6M records in 1.0 s and
+210 MB peak (~130 B per record), identical to the earlier per-record Python version. Two nodes at the server's default
+cap (--trace-max-mb 4096 = 134M records each) would need ~35 GB: run it pinned to node 1 or use --trace-max-mb <= 2048.
+The --a6-dir export is plain Python and only for small traces.
 
 Output: PREFIX.csv (one row per role: search, writer, main, all) with columns
   events_A, events_B [measured counts], sections_with_events, true_A, false_A, true_B, false_B, no_prior_copy,
@@ -79,10 +85,133 @@ def units(kind, elem, n):
     return {int(elem) + k * step for k in range(int(n))}
 
 
+def arrays(nodes):
+    """per node: records of all threads concatenated (+ role), sorted by (object, tsc)"""
+    out = {}
+    for node, (hdr, parts) in nodes.items():
+        r = np.concatenate([p for _, p in parts]) if parts else np.zeros(0, REC)
+        role = np.concatenate([np.full(len(p), ro, np.uint8) for ro, p in parts]) if parts else np.zeros(0, np.uint8)
+        o = np.lexsort((r["tsc"], r["obj"]))
+        out[node] = (r[o], role[o])
+    return out
+
+
+def link_mask(hdr, obj):
+    return (obj < hdr["segments"] * hdr["groups"] * 2) & (obj % 2 == 1)
+
+
+def expand(hdr, r):
+    """(record index, unit) for records with n > 0 (link: levels of the slot, others: consecutive elements)"""
+    n = r["n"].astype(np.int64)
+    rep = np.repeat(np.arange(len(r)), n)
+    k = np.arange(len(rep)) - np.repeat(np.cumsum(n) - n, n)
+    step = np.where(link_mask(hdr, r["obj"].astype(np.int64)), 1 << 24, 1)[rep]
+    return rep, r["elem"].astype(np.int64)[rep] + k * step
+
+
+def count_between(keys_sorted, base, lo, hi):
+    """number of keys base<<32 | s with lo < s <= hi (keys_sorted: sorted uint64)"""
+    b = base.astype(np.uint64) << np.uint64(32)
+    return (np.searchsorted(keys_sorted, b | hi.astype(np.uint64), side="right")
+            - np.searchsorted(keys_sorted, b | lo.astype(np.uint64), side="right"))
+
+
 def classify(nodes):
-    """nodes: {node: (hdr, parts)} -> per-role counters, list of A6 rows"""
-    writes = defaultdict(list)  # obj -> [(seq, node, units)]
-    per = defaultdict(lambda: defaultdict(list))  # node -> obj -> [(tsc, kind, seq, units, flags, ev_ns, role)]
+    """nodes: {node: (hdr, parts)} -> per-role counters (vectorized; definition in the module doc)"""
+    hdr0 = next(iter(nodes.values()))[0]
+    A = arrays(nodes)
+    # writes of all nodes: per (object, unit) and per object (whole-object writes and any write)
+    w_pair, w_seq, w_node, o_key_all, o_key_whole = [], [], [], [], []
+    for node, (r, _) in A.items():
+        wr = r[r["type"] == WRITE]
+        ri, u = expand(hdr0, wr)
+        w_pair.append((wr["obj"][ri].astype(np.uint64) << np.uint64(32)) | u.astype(np.uint64))
+        w_seq.append(wr["seq"][ri].astype(np.uint64))
+        w_node.append(np.full(len(ri), node, np.int64))
+        o_key_all.append((wr["obj"].astype(np.uint64) << np.uint64(32)) | wr["seq"].astype(np.uint64))
+        wh = wr[wr["n"] == 0]
+        o_key_whole.append(((wh["obj"].astype(np.uint64) << np.uint64(32)) | wh["seq"].astype(np.uint64),
+                            np.full(len(wh), node, np.int64)))
+    w_pair, w_seq, w_node = np.concatenate(w_pair), np.concatenate(w_seq), np.concatenate(w_node)
+    pairs = np.unique(w_pair)
+    dense = np.searchsorted(pairs, w_pair).astype(np.uint64)
+    key = (dense << np.uint64(32)) | w_seq
+    key_all = np.sort(key)
+    key_node = {n: np.sort(key[w_node == n]) for n in A}
+    oall = np.sort(np.concatenate(o_key_all))
+    oown = {n: np.sort(k) for n, k in zip(A, o_key_all)}
+    wh_all = np.sort(np.concatenate([k for k, _ in o_key_whole]))
+    wh_own = {n: np.sort(k) for n, (k, _) in zip(A, o_key_whole)}
+    keys = ["events_A", "events_B", "sections_with_events", "true_A", "false_A", "true_B", "false_B", "no_prior_copy",
+            "unexplained", "ev_ns_true", "ev_ns_false", "ev_ns_excluded"]
+    cnt = {r: dict.fromkeys(keys, 0) for r in ("search", "writer", "main", "other", "all")}
+    for node, (r, role) in A.items():
+        N = len(r)
+        if not N:
+            continue
+        idx = np.arange(N)
+        obj = r["obj"].astype(np.int64)
+        gstart = np.ones(N, bool)
+        gstart[1:] = obj[1:] != obj[:-1]
+        g0 = np.maximum.accumulate(np.where(gstart, idx, 0))
+        is_read, is_write = r["type"] == READ, r["type"] == WRITE
+        is_ev = is_read & (r["flags"] != 0)
+        ev = np.flatnonzero(is_ev)
+        if not len(ev):
+            continue
+        refresh = is_write | is_ev | gstart  # own write, event, first record of the object (first read)
+        last_ref = np.maximum.accumulate(np.where(refresh, idx, -1))
+        prev = np.where(ev > 0, last_ref[np.maximum(ev - 1, 0)], -1)
+        has_prev = (prev >= g0[ev]) & (ev > 0)
+        seq = r["seq"].astype(np.int64)
+        lo, hi = np.where(has_prev, seq[np.maximum(prev, 0)], 0), seq[ev]
+        o_ev = obj[ev].astype(np.uint64)
+        any_peer = count_between(oall, o_ev, lo, hi) - count_between(oown[node], o_ev, lo, hi)
+        whole_peer = count_between(wh_all, o_ev, lo, hi) - count_between(wh_own[node], o_ev, lo, hi)
+        # reads of each event's copy: owner = latest event at or before the read in the same object
+        last_ev = np.maximum.accumulate(np.where(is_ev, idx, -1))
+        rd = np.flatnonzero(is_read & (last_ev >= g0))
+        owner = np.searchsorted(ev, last_ev[rd])  # position in ev
+        ok = has_prev[owner]
+        rd, owner = rd[ok], owner[ok]
+        hit = whole_peer > 0
+        whole_rd = r["n"][rd] == 0  # a whole-object read meets any peer write
+        hit[np.unique(owner[whole_rd][any_peer[owner[whole_rd]] > 0])] = True
+        sub = r[rd[~whole_rd]]
+        so = owner[~whole_rd]
+        ri, u = expand(hdr0, sub)
+        q = (sub["obj"][ri].astype(np.uint64) << np.uint64(32)) | u.astype(np.uint64)
+        pos = np.clip(np.searchsorted(pairs, q), 0, max(len(pairs) - 1, 0))
+        found = (pairs[pos] == q) if len(pairs) else np.zeros(len(q), bool)
+        qo = so[ri][found]
+        d = pos[found].astype(np.uint64)
+        c = count_between(key_all, d, lo[qo], hi[qo]) - count_between(key_node[node], d, lo[qo], hi[qo])
+        hit[np.unique(qo[c > 0])] = True
+        cls = np.where(~has_prev, 0, np.where(any_peer == 0, 1, np.where(hit, 2, 3)))  # no_prior, unexpl, true, false
+        fl = r["flags"][ev].astype(np.int64)
+        nA, nB, ens, rl = fl & 15, fl >> 4, r["ev_ns"][ev].astype(np.int64), role[ev]
+        for rr in list(ROLES) + [None]:
+            m = np.ones(len(ev), bool) if rr is None else rl == rr
+            c_ = cnt["all" if rr is None else ROLES[rr]]
+            c_["events_A"] += int(nA[m].sum())
+            c_["events_B"] += int(nB[m].sum())
+            c_["sections_with_events"] += int(m.sum())
+            for k, nm in ((2, "true"), (3, "false")):
+                mm = m & (cls == k)
+                c_[f"{nm}_A"] += int(nA[mm].sum())
+                c_[f"{nm}_B"] += int(nB[mm].sum())
+                c_[f"ev_ns_{nm}"] += int(ens[mm].sum())
+            for k, nm in ((0, "no_prior_copy"), (1, "unexplained")):
+                mm = m & (cls == k)
+                c_[nm] += int((nA[mm] + nB[mm]).sum())
+                c_["ev_ns_excluded"] += int(ens[mm].sum())
+    return cnt
+
+
+def per_lists(nodes):
+    """record lists for the A6 export (Python; slow on large traces)"""
+    writes = defaultdict(list)
+    per = defaultdict(lambda: defaultdict(list))
     for node, (hdr, parts) in nodes.items():
         for role, r in parts:
             for x in r:
@@ -94,68 +223,10 @@ def classify(nodes):
                                        int(x["ev_ns"]), role))
     for w in writes.values():
         w.sort(key=lambda t: t[0])
-    keys = ["events_A", "events_B", "sections_with_events", "true_A", "false_A", "true_B", "false_B", "no_prior_copy",
-            "unexplained", "ev_ns_true", "ev_ns_false", "ev_ns_excluded"]
-    cnt = {r: dict.fromkeys(keys, 0) for r in ("search", "writer", "main", "other", "all")}
-    for node, objs in per.items():
-        for obj, recs in objs.items():
+    for objs in per.values():
+        for recs in objs.values():
             recs.sort(key=lambda t: t[0])
-            ev_idx = [i for i, t in enumerate(recs) if t[1] == READ and t[4]]
-            if not ev_idx:
-                continue
-            wo = writes.get(obj, [])
-            wseqs = [w[0] for w in wo]
-            refresh_seq = None  # seq of the latest refresh point so far
-            nxt = 0
-            for k, i in enumerate(ev_idx):
-                while nxt < i:  # refresh points before the event: own writes, first read
-                    t = recs[nxt]
-                    if t[1] == WRITE or (t[1] == READ and refresh_seq is None):
-                        refresh_seq = t[2]
-                    nxt += 1
-                tsc, _, seq, _, flags, ev_ns, role = recs[i]
-                nA, nB = flags & 15, flags >> 4
-                rn = ROLES.get(role, "other")
-                for r in (rn, "all"):
-                    cnt[r]["events_A"] += nA
-                    cnt[r]["events_B"] += nB
-                    cnt[r]["sections_with_events"] += 1
-                prev = refresh_seq
-                refresh_seq = seq  # the event refreshes the copy
-                nxt = i + 1
-                if prev is None:
-                    cls = "no_prior_copy"
-                else:
-                    lo = np.searchsorted(wseqs, prev, side="right")
-                    hi = np.searchsorted(wseqs, seq, side="right")
-                    cause = [w for w in wo[lo:hi] if w[1] != node]
-                    if not cause:
-                        cls = "unexplained"
-                    else:
-                        mod = set()
-                        whole = False
-                        for w in cause:
-                            if w[2] is ALL:
-                                whole = True
-                                break
-                            mod |= w[2]
-                        end = ev_idx[k + 1] if k + 1 < len(ev_idx) else len(recs)
-                        hit = False
-                        for t in recs[i:end]:
-                            if t[1] == READ and (whole or t[3] is ALL or (t[3] & mod)):
-                                hit = True
-                                break
-                        cls = "true" if hit else "false"
-                for r in (rn, "all"):
-                    c = cnt[r]
-                    if cls in ("true", "false"):
-                        c[f"{cls}_A"] += nA
-                        c[f"{cls}_B"] += nB
-                        c[f"ev_ns_{cls}"] += ev_ns
-                    else:
-                        c[cls] += nA + nB
-                        c["ev_ns_excluded"] += ev_ns
-    return cnt, per, writes
+    return per, writes
 
 
 def searches_from_logs(d):
@@ -221,7 +292,7 @@ def main():
     for p in files:
         hdr, parts = load(p)
         nodes[hdr["node"]] = (hdr, parts)
-    cnt, per, writes = classify(nodes)
+    cnt = classify(nodes)
     ns = a.searches or searches_from_logs(a.trace_dir)
     out = a.out or os.path.join(a.trace_dir, "sharing")
     cols = ["role"] + list(cnt["all"]) + ["false_time_share", "searches", "events_per_search_true",
@@ -239,11 +310,12 @@ def main():
     drop = sum(h["dropped"] for h, _ in nodes.values())
     c = cnt["all"]
     txt = (f"nodes {sorted(nodes)}, records {recs}, dropped {drop}, thread_coh {[h['has_coh'] for h, _ in nodes.values()]}, "
-           f"writes {sum(len(v) for v in writes.values())}, events A {c['events_A']} B {c['events_B']}: "
+           f"writes {sum(int((p['type'] == WRITE).sum()) for h, ps in nodes.values() for _, p in ps)}, events A {c['events_A']} B {c['events_B']}: "
            f"true {c['true_A'] + c['true_B']} false {c['false_A'] + c['false_B']} no_prior_copy {c['no_prior_copy']} "
            f"unexplained {c['unexplained']}, searches {ns}")
     open(out + ".txt", "w").write(txt + "\n")
     if a.a6_dir:
+        per, writes = per_lists(nodes)
         write_a6(a.a6_dir, nodes, per, writes, ns)
     print(f"-> {out}.csv: {txt}")
     return 0

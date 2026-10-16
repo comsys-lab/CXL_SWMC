@@ -78,6 +78,9 @@ for op, x in (("search", cs), ("update", cu)):
         check(tot(k) == int(v.astype(np.uint64).sum()), f"opt.{op}.{k} = records' sum ({tot(k)} vs {int(v.sum())})")
 check(all(s["opcoh.read_errors"] == 0 and s["opcoh.register_errors"] == 0 for s in st), "no counter read/register errors")
 check((cs["mod_bytes"] == 0).all(), "search mod_bytes 0")
+check((cs["wait_ns"] <= cs["t_ns"]).all() and (cu["wait_ns"] == 0).all(), "E1 wait inside search T, 0 for updates")
+for op, x in (("search", cs), ("update", cu)):
+    check(sum(s[f"opt.{op}.wait_ns"] for s in st) == int(x["wait_ns"].sum()), f"opt.{op}.wait_ns = records' sum")
 check((cu["mod_bytes"] >= 3136 + 192 + 64).all(), "update mod_bytes >= record + level-0 block + delete-log entry")
 by = {int(q): i for i, q in enumerate(ok["seq"])}
 oi = np.array([by[int(q)] for q in srch["seq"]], dtype=np.int64)

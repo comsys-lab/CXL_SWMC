@@ -56,12 +56,12 @@ struct CohVals {  // cumulative values of one thread
 
 // One operation's sums over its sections (ticks, then converted once).
 struct OpAcc {
-  uint64_t ticks = 0;
+  uint64_t ticks = 0, wait_ticks = 0;  // wait_ticks: search E1 wait (part of ticks)
   uint32_t sections = 0;
   uint64_t pf_ns[3] = {}, pf_cnt[3] = {}, ipi_ns = 0, ipi_cnt = 0, mod_bytes = 0;
   mshim::CohSnap mg{};  // summed deltas; check_sample = the snapshot's value (not a delta)
   void add(const OpAcc &d) {
-    ticks += d.ticks, sections += d.sections, ipi_ns += d.ipi_ns, ipi_cnt += d.ipi_cnt, mod_bytes += d.mod_bytes;
+    ticks += d.ticks, wait_ticks += d.wait_ticks, sections += d.sections, ipi_ns += d.ipi_ns, ipi_cnt += d.ipi_cnt, mod_bytes += d.mod_bytes;
     for (int i = 0; i < 3; i++) pf_ns[i] += d.pf_ns[i], pf_cnt[i] += d.pf_cnt[i];
     const uint64_t cs = mg.check_sample ? mg.check_sample : d.mg.check_sample;
     for (int k = 0; k < kSnapWords; k++) words(mg)[k] += words(d.mg)[k];
@@ -109,6 +109,7 @@ inline OpCoh op_block(const OpAcc &a, uint16_t op, int pop_src, bool mg_snap, ui
   b.mg_wstart_ns = m.wstart_ns, b.mg_switch_rw_ns = m.switch_rw_ns, b.mg_reclaim_ns = m.reclaim_ns;
   b.mg_wflush_ns = m.wflush_ns, b.mg_wflush_bytes = m.wflush_bytes;
   b.mod_bytes = a.mod_bytes;
+  b.wait_ns = ticks_to_ns(a.wait_ticks, tsc_khz);
   b.c_ns = pop_coh_ns(a) + mg_coh_ns(m);
   return b;
 }

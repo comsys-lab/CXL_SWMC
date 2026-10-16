@@ -18,7 +18,9 @@ Output: one row per (measured step, operation type) in --out and a column table 
 (column, tag, unit, meaning). Tags: measured = sum of timed intervals / counted events / bytes; sampled×N = sum over
 sampled intervals × N (N = the CohSnap check_sample in the records, e.g. sampled×64); derived = computed from other
 columns (formula in the table). Means are per operation of that type: (1/N_o) sum_ops sum_threads. No proportional
-"wall-equivalent" columns (thread-time sums are reported as they are).
+"wall-equivalent" columns (thread-time sums are reported as they are). Per-operation C percentiles and the window C
+are not exported (the per-operation Megalon check ratio estimate is biased; C means use the step's sums). A run whose
+records carry more than one coherence source (mixed nodes or builds) is refused.
 """
 import argparse, csv, glob, json, os, re, sys
 
@@ -36,10 +38,10 @@ OPCOH = np.dtype([("version", "<u2"), ("src", "<u2"), ("op", "<u2"), ("sections"
                   ("mg_switch_rw_cnt", "<u4"), ("mg_reclaim_cnt", "<u4"), ("mg_wflush_cnt", "<u4"),
                   ("mg_stale_ns", "<u8"), ("mg_concur_ns", "<u8"), ("mg_meta_ns", "<u8"), ("mg_spin_ns", "<u8"),
                   ("mg_wstart_ns", "<u8"), ("mg_switch_rw_ns", "<u8"), ("mg_reclaim_ns", "<u8"),
-                  ("mg_wflush_ns", "<u8"), ("mg_wflush_bytes", "<u8"), ("mod_bytes", "<u8")])
+                  ("mg_wflush_ns", "<u8"), ("mg_wflush_bytes", "<u8"), ("mod_bytes", "<u8"), ("wait_ns", "<u8")])
 OPLOG = np.dtype([("seq", "<u8"), ("recv_ns", "<u8"), ("measured", "u1"), ("target", "u1"), ("status", "<u2"),
                   ("op", "<u2"), ("pad", "<u2"), ("c", OPCOH)])
-assert OPCOH.itemsize == 208 and OPLOG.itemsize == 232
+assert OPCOH.itemsize == 216 and OPLOG.itemsize == 240
 OP_SEARCH, OP_UPDATE = 3, 4
 OPS = {OP_SEARCH: "search", OP_UPDATE: "update"}
 POP_SRC = {0: "none", 1: "swmc_acct", 2: "swmc_file", 3: "fake"}
@@ -55,14 +57,13 @@ COLUMNS = [
     ("lat_p50_ms", "measured", "ms", "loadgen latency (done - scheduled) p50 of the matched operations"),
     ("lat_p99_ms", "measured", "ms", "loadgen latency p99 of the matched operations"),
     ("T_ms", "measured", "ms", "T_o = (1/N_o) sum_ops sum_threads (end - start), rdtsc per section"),
+    ("wait_ms", "measured", "ms", "search: E1 wait (polling P >= ref_w) inside the start section, part of T_ms"),
     ("C_ms", "derived", "ms", "C_o = Popcorn (pop_is + pop_sm + pop_wp + pop_ipi) + Megalon (mg_check + mg_stale + "
      "mg_concur + mg_meta + mg_spin + mg_wstart + mg_wflush), step means"),
     ("rest_ms", "derived", "ms", "T_ms - C_ms"),
     ("C_frac", "derived", "", "C_ms / T_ms"),
     ("T_p50_ms", "measured", "ms", "per-operation T p50"),
     ("T_p99_ms", "measured", "ms", "per-operation T p99"),
-    ("C_p99_ms", "derived", "ms", "per-operation C p99 (c_ns of the block; Megalon check part = the operation's own "
-     "ratio estimate)"),
     ("sections", "measured", "count", "sections per operation (search: 1 + segments)"),
     ("pop_is_ms", "measured", "ms", "Popcorn I->S coherence-fault time per operation (swmc_acct fault_ns[0]; "
      "build-8 file source: read faults)"),
@@ -94,19 +95,23 @@ COLUMNS = [
     ("mg_reclaim_cnt", "measured", "count", "reclaims per operation"),
     ("mg_wflush_cnt", "measured", "count", "write-end flushes per operation"),
     ("wb_bytes_mg", "measured", "B", "Fig 3b: bytes written back per operation, Megalon (CohSnap wflush_bytes)"),
-    ("wb_bytes_pop", "derived", "B", "Fig 3b: bytes written back per operation, Popcorn = (pop_sm_cnt + pop_wp_cnt) x 4096"),
+    ("wb_bytes_pop", "derived", "B", "Fig 3b (update rows): Popcorn bytes written back per update = window delta of "
+     "sys.swmc.page_coherence.remote_writeback_count (pages written back for a peer, nodes summed) x 4096 / "
+     "opt.update.ops of the window"),
+    ("m_acq_bytes_pop", "derived", "B", "Popcorn M acquisitions x 4 KiB per operation = (pop_sm_cnt + pop_wp_cnt) x 4096 "
+     "(pages taken to M, not bytes written back)"),
     ("mod_bytes", "measured", "B", "Fig 3b: bytes the application stored per operation (whole lines of the vector "
      "record, zeroed and committed link blocks, delete-log entry)"),
     ("win_n", "measured", "count", "server window counter opt.<op>.ops (stats deltas, nodes summed; server completion time)"),
     ("win_T_ms", "measured", "ms", "server window opt.<op>.t_ns / opt.<op>.ops"),
-    ("win_C_ms", "derived", "ms", "server window opt.<op>.c_ns / opt.<op>.ops"),
     ("bg_lib_run_s", "measured", "s", "Megalon background threads (thr.megalon-lib: WriteMetadataManager etc. + "
      "thr.nr-log-sync: NR replay) run time in the window, nodes summed (schedstat; NOT in CohSnap/C)"),
     ("bg_kthr_run_s", "measured", "s", "Popcorn message receive kernel threads (kthr.cxl_recv*) run time in the window, "
      "nodes summed (not in C)"),
     ("bg_cpu_frac", "derived", "", "(bg_lib_run_s + bg_kthr_run_s) / window_s (CPUs busy with background coherence)"),
-    ("pop_source", "", "", "Popcorn counter source of the run (none | swmc_acct | swmc_file | fake)"),
-    ("mg_cohsnap", "", "", "1 = Megalon CohSnap present (shim v2 with thread_coh)"),
+    ("pop_source", "", "", "Popcorn counter source of the step's records (none | swmc_acct | swmc_file | fake); one "
+     "source per run is enforced"),
+    ("mg_cohsnap", "", "", "1 = Megalon CohSnap present in the step's records (shim v2 with thread_coh)"),
     ("unmatched", "measured", "count", "run-level: measured op records without a raw record (same on every row)"),
 ]
 COLS = [c[0] for c in COLUMNS]
@@ -157,6 +162,10 @@ def analyze(run, tol_us=20.0):
     logs = np.fromfile(path, dtype=OPLOG) if os.path.exists(path) else np.zeros(0, OPLOG)
     c = logs["c"]
     bad = int((c["version"] != 2).sum()) if len(logs) else 0
+    srcs = sorted(set(int(x) for x in c["src"])) if len(logs) else []
+    if len(srcs) > 1:  # one coherence source per run (every record of every node)
+        raise SystemExit(f"opsplit: mixed coherence sources in {path}: " +
+                         ", ".join(f"{POP_SRC.get(x & 3)}/cohsnap={x >> 2 & 1}" for x in srcs))
     win = {}
     if os.path.isdir(os.path.join(lg, "stats")):
         for fixed, d in stats_delta.deltas(lg):
@@ -168,6 +177,8 @@ def analyze(run, tol_us=20.0):
                     w[k] = w.get(k, 0) + v
                 elif k.endswith(".run_ns") and (k.startswith("thr.megalon-lib.") or k.startswith("thr.nr-log-sync.")):
                     w["bg_lib"] = w.get("bg_lib", 0) + v
+                elif k == "sys.swmc.page_coherence.remote_writeback_count":
+                    w["remote_wb"] = w.get("remote_wb", 0) + v
                 elif k.endswith(".run_ns") and k.startswith("kthr.cxl_recv"):
                     w["bg_kthr"] = w.get("bg_kthr", 0) + v
             if fixed.get("window_s") not in ("", None):
@@ -216,22 +227,24 @@ def analyze(run, tol_us=20.0):
                        T_ms=ms(T), C_ms=C_step / 1e6 if n else None,
                        rest_ms=(float(T.mean()) - C_step) / 1e6 if n else None,
                        C_frac=C_step * n / float(T.sum()) if n and T.sum() else None,
-                       T_p50_ms=pct(T / 1e6, 50), T_p99_ms=pct(T / 1e6, 99), C_p99_ms=pct(C / 1e6, 99),
+                       T_p50_ms=pct(T / 1e6, 50), T_p99_ms=pct(T / 1e6, 99), wait_ms=ms(x["wait_ns"]),
                        sections=cnt(x["sections"]),
                        pop_is_ms=ms(x["pf_ns"][:, 0]), pop_sm_ms=ms(x["pf_ns"][:, 1]), pop_wp_ms=ms(x["pf_ns"][:, 2]),
                        pop_ipi_ms=ms(x["ipi_ns"]), pop_is_cnt=cnt(x["pf_cnt"][:, 0]), pop_sm_cnt=cnt(x["pf_cnt"][:, 1]),
                        pop_wp_cnt=cnt(x["pf_cnt"][:, 2]), pop_ipi_cnt=cnt(x["ipi_cnt"]),
                        mg_check_ms=chk_total / n / 1e6 if n else None,
                        wb_bytes_mg=cnt(x["mg_wflush_bytes"]),
-                       wb_bytes_pop=cnt((x["pf_cnt"][:, 1].astype(np.float64) + x["pf_cnt"][:, 2]) * PAGE),
+                       m_acq_bytes_pop=cnt((x["pf_cnt"][:, 1].astype(np.float64) + x["pf_cnt"][:, 2]) * PAGE),
+                       wb_bytes_pop=(w["remote_wb"] * PAGE / w["opt.update.ops"]
+                                     if name == "update" and "remote_wb" in w and w.get("opt.update.ops") else None),
                        mod_bytes=cnt(x["mod_bytes"]),
                        win_n=wn if w else None, win_T_ms=w[f"opt.{name}.t_ns"] / wn / 1e6 if wn else None,
-                       win_C_ms=w[f"opt.{name}.c_ns"] / wn / 1e6 if wn else None,
                        bg_lib_run_s=w.get("bg_lib", 0) / 1e9 if w else None,
                        bg_kthr_run_s=w.get("bg_kthr", 0) / 1e9 if w else None,
                        bg_cpu_frac=(w.get("bg_lib", 0) + w.get("bg_kthr", 0)) / 1e9 / w["window_s"]
                        if w.get("window_s") else None,
-                       pop_source=POP_SRC.get(src & 3, "?"), mg_cohsnap=(src >> 2) & 1, unmatched=None)
+                       pop_source=POP_SRC.get(int(x["src"][0]) & 3, "?") if n else None,
+                       mg_cohsnap=(int(x["src"][0]) >> 2) & 1 if n else None, unmatched=None)
             for k in ("stale", "concur", "meta", "spin", "wstart", "switch_rw", "reclaim", "wflush"):
                 row[f"mg_{k}_ms"] = ms(x[f"mg_{k}_ns"])
             for k in ("read_sections", "write_sections", "check_sampled", "stale_cnt", "concur_cnt", "meta_cnt",
