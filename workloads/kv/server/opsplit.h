@@ -61,7 +61,8 @@ static_assert(offsetof(mshim::CohSnap, check_sample) == 2 * 8 && offsetof(mshim:
 enum MegIdx { kCheckSample = 2, kCheckNs = 3, kStaleNs = 6, kConcurNs = 8, kMetaNs = 10, kSpinNs = 12, kWstartNs = 13, kWflushNs = 19 };
 
 enum MegIdx2 { kReadSections = 0, kCheckSampled = 4 };
-constexpr int kTscBackwards = 2;  // CohSnap.reserved[2] (Megalon >= 72: intervals clamped because the TSC went backwards)
+constexpr int kTscBackwards = 2;
+constexpr int kLookupNsSampled = 7;  // CohSnap.reserved[7] (Megalon >= 74): index-lookup part of the sampled checks; raw  // CohSnap.reserved[2] (Megalon >= 72: intervals clamped because the TSC went backwards)
 // exact (every-event) part of Megalon C; the section-check estimate is added on sums (ratio estimator)
 inline uint64_t meg_exact_ns(const uint64_t *d) {
   return d[kStaleNs] + d[kConcurNs] + d[kMetaNs] + d[kSpinNs] + d[kWstartNs] + d[kWflushNs];
@@ -95,7 +96,8 @@ inline uint64_t vcopy_est_ns(uint64_t ns_sampled, uint64_t sampled, uint64_t cnt
 // One operation type's sums (one writer thread per Acc: plain load + store, no locked RMW)
 struct alignas(64) Acc {
   std::atomic<uint64_t> ops{0}, t_cyc{0}, t_max_cyc{0}, c_ns{0}, mod_bytes{0}, pop[kPop]{}, meg[kMeg]{}, meg_tsc_back{0},
-      vcopy[3]{};  // ns_sampled, sampled, cnt
+      vcopy[3]{},  // ns_sampled, sampled, cnt
+      meg_lookup{0};
   static void add(std::atomic<uint64_t> &a, uint64_t d) { a.store(a.load(std::memory_order_relaxed) + d, std::memory_order_relaxed); }
 };
 
@@ -124,13 +126,13 @@ class Table {
       << "\nopt.meg_coh=" << (meg_ ? 1 : 0) << "\nopt.meg_threads=" << meg_threads.load()
       << "\nopt.meg_check_sample=" << check_sample.load() << "\n";
     for (size_t op = 0; op < ops_.size(); op++) {
-      uint64_t ops = 0, cyc = 0, mx = 0, c = 0, mb = 0, tb = 0, vc[3] = {}, pop[kPop] = {}, meg[kMeg] = {};
+      uint64_t ops = 0, cyc = 0, mx = 0, c = 0, mb = 0, tb = 0, lk = 0, vc[3] = {}, pop[kPop] = {}, meg[kMeg] = {};
       for (uint32_t t = 0; t < threads_; t++) {
         const Acc &a = acc_[size_t(t) * ops_.size() + op];
         ops += a.ops.load(std::memory_order_relaxed), cyc += a.t_cyc.load(std::memory_order_relaxed);
         mx = std::max<uint64_t>(mx, a.t_max_cyc.load(std::memory_order_relaxed));
         c += a.c_ns.load(std::memory_order_relaxed), mb += a.mod_bytes.load(std::memory_order_relaxed);
-        tb += a.meg_tsc_back.load(std::memory_order_relaxed);
+        tb += a.meg_tsc_back.load(std::memory_order_relaxed), lk += a.meg_lookup.load(std::memory_order_relaxed);
         for (int i = 0; i < 3; i++) vc[i] += a.vcopy[i].load(std::memory_order_relaxed);
         for (int i = 0; i < kPop; i++) pop[i] += a.pop[i].load(std::memory_order_relaxed);
         for (int i = 0; i < kMeg; i++) meg[i] += a.meg[i].load(std::memory_order_relaxed);
@@ -144,7 +146,7 @@ class Table {
       for (int i = 0; i < kMeg; i++)
         if (i != kCheckSample) o << p << "meg." << kMegNames[i] << "=" << meg[i] << "\n";
       o << p << "meg.tsc_backwards=" << tb << "\n" << p << "meg.vcopy_ns_sampled=" << ns(vc[0]) << "\n" << p
-        << "meg.vcopy_sampled=" << vc[1] << "\n" << p << "meg.vcopy_cnt=" << vc[2] << "\n";
+        << "meg.vcopy_sampled=" << vc[1] << "\n" << p << "meg.vcopy_cnt=" << vc[2] << "\n" << p << "meg.lookup_ns_sampled=" << lk << "\n";
     }
     return o.str();
   }
@@ -208,6 +210,7 @@ class Thread {
         if (i != kCheckSample) Acc::add(a.meg[i], dm[i]);
       c = meg_exact_ns(dm);
       Acc::add(a.meg_tsc_back, m1.reserved[kTscBackwards] - m0_.reserved[kTscBackwards]);
+      Acc::add(a.meg_lookup, m1.reserved[kLookupNsSampled] - m0_.reserved[kLookupNsSampled]);  // exported, not used in C
     }
     Acc::add(a.c_ns, c);
     const VCopy &v1 = tl_vcopy;  // cycles; converted at text()
