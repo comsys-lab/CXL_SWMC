@@ -19,6 +19,7 @@
 #   VERIFY (1: verify op on both nodes after the load, expect entries = --records, no bad/misordered values).
 # Stops (and stops the servers) on the first error. Measurement hygiene: no Host build before/after (pgrep).
 set -euo pipefail
+export PYTHONDONTWRITEBYTECODE=1  # never write __pycache__ (harness snapshots live in recovery/); every python3 call also has -B
 NAME=$1 OUT=$2; shift 2; [ "${1:-}" = "--" ] && shift
 : "${SYSTEM:?}" "${V:?}" "${IMAGE:?}" "${HOST_SERVER:?}" "${LOADGEN:?}" "${SERVER_ARGS:?}"
 read -r -a NODE <<< "${NODES:-192.168.122.100 192.168.122.101}"
@@ -124,7 +125,7 @@ cpu_snap after
 VRC=0
 if [ "$VERIFY" = 1 ]; then  # full scan of the latest snapshot on both nodes (after the load, before the stop)
   for k in "${!NODE[@]}"; do
-    python3 -I "$W/tools/lmdb_ctl.py" "${NODE[$k]}:$PORT" verify --expect verify.entries="$RECORDS" verify.bad_values=0 \
+    python3 -I -B "$W/tools/lmdb_ctl.py" "${NODE[$k]}:$PORT" verify --expect verify.entries="$RECORDS" verify.bad_values=0 \
       verify.misordered=0 verify.end=ok > "$RUN/verify-node$k.txt" 2>&1 || { VRC=1; echo "node$k verify FAILED"; }
     tr '\n' ' ' < "$RUN/verify-node$k.txt"; echo
   done
@@ -135,16 +136,16 @@ host_check after
 echo "end=$(date -Is) loadgen_rc=$LG verify_rc=$VRC" >> "$RUN/manifest.txt"
 if [ -s "$RUN/loadgen/steps.jsonl" ] && [ -s "$RUN/loadgen/summary.json" ]; then
   if [ -d "$RUN/loadgen/stats" ]; then
-    python3 "$ROOT/experiments/loadgen/stats_delta.py" "$RUN/loadgen" --out "$RUN/stats-steps.csv" || true
+    python3 -B "$ROOT/experiments/loadgen/stats_delta.py" "$RUN/loadgen" --out "$RUN/stats-steps.csv" || true
     # MOT1 v6 Fig 2: per-operation split (T, C, rest per get / update per step; tagged columns)
-    python3 -I "$ROOT/workloads/kv/tools/opsplit.py" "$RUN/loadgen" --system "$SYSTEM" --out "$RUN/opsplit.csv" || true
+    python3 -I -B "$ROOT/workloads/kv/tools/opsplit.py" "$RUN/loadgen" --system "$SYSTEM" --out "$RUN/opsplit.csv" || true
   fi
-  python3 "$ROOT/experiments/loadgen/export_csv.py" --out "$RUN/steps.csv" "$RUN/loadgen=$SYSTEM" > /dev/null || true
-  python3 "$ROOT/experiments/loadgen/plot_slo.py" --out "$RUN/slo.png" "$RUN/loadgen=$SYSTEM" > "$RUN/slo-points.txt" 2>&1 || true
+  python3 -B "$ROOT/experiments/loadgen/export_csv.py" --out "$RUN/steps.csv" "$RUN/loadgen=$SYSTEM" > /dev/null || true
+  python3 -B "$ROOT/experiments/loadgen/plot_slo.py" --out "$RUN/slo.png" "$RUN/loadgen=$SYSTEM" > "$RUN/slo-points.txt" 2>&1 || true
 fi
 CRC=skip
 if [ -s "$RUN/loadgen/gets.bin" ]; then  # loadgen --opt log=1: exact MVCC check
-  CRC=0; python3 -I "$W/tools/check_log.py" "$RUN/loadgen" > "$RUN/check-log.txt" 2>&1 || CRC=$?
+  CRC=0; python3 -I -B "$W/tools/check_log.py" "$RUN/loadgen" > "$RUN/check-log.txt" 2>&1 || CRC=$?
   echo "check_log rc=$CRC" >> "$RUN/check-log.txt"; tail -n 2 "$RUN/check-log.txt"
 fi
 grep -h "lmdb-server: stopping" -A40 "$RUN"/node*.log | grep -E "^(node|gets|updates|get_not_found|update_not_found|get_errors|update_errors)=" | tr '\n' ' '; echo

@@ -19,6 +19,7 @@
 #   logical_scr_size equal to `kv-server --print-sizes --keys N` (read-only).
 # Stops (and stops the servers) on the first error. Measurement hygiene: no Host build before/after (pgrep).
 set -euo pipefail
+export PYTHONDONTWRITEBYTECODE=1  # never write __pycache__ (harness snapshots live in recovery/); every python3 call also has -B
 NAME=$1 OUT=$2; shift 2; [ "${1:-}" = "--" ] && shift
 : "${SYSTEM:?}" "${V:?}" "${HOST_SERVER:?}" "${LOADGEN:?}" "${SERVER_ARGS:?}"
 read -r -a NODE <<< "${NODES:-192.168.122.100 192.168.122.101}"
@@ -127,13 +128,13 @@ collect
 host_check after
 echo "end=$(date -Is) loadgen_rc=$LG" >> "$RUN/manifest.txt"
 if [ -s "$RUN/loadgen/steps.jsonl" ] && [ -s "$RUN/loadgen/summary.json" ]; then
-  [ ! -d "$RUN/loadgen/stats" ] || python3 "$ROOT/experiments/loadgen/stats_delta.py" "$RUN/loadgen" --out "$RUN/stats-steps.csv" || true
+  [ ! -d "$RUN/loadgen/stats" ] || python3 -B "$ROOT/experiments/loadgen/stats_delta.py" "$RUN/loadgen" --out "$RUN/stats-steps.csv" || true
   # MOT1 v6 Fig 2: per-operation time split (T, C, rest per get / put per step; tagged columns)
-  [ ! -d "$RUN/loadgen/stats" ] || python3 -I "$ROOT/workloads/kv/tools/opsplit.py" "$RUN/loadgen" --system "$SYSTEM" --out "$RUN/opsplit.csv" || true
-  python3 "$ROOT/experiments/loadgen/export_csv.py" --out "$RUN/steps.csv" "$RUN/loadgen=$SYSTEM" > /dev/null || true
-  python3 "$ROOT/experiments/loadgen/plot_slo.py" --out "$RUN/slo.png" "$RUN/loadgen=$SYSTEM" > "$RUN/slo-points.txt" 2>&1 || true
+  [ ! -d "$RUN/loadgen/stats" ] || python3 -I -B "$ROOT/workloads/kv/tools/opsplit.py" "$RUN/loadgen" --system "$SYSTEM" --out "$RUN/opsplit.csv" || true
+  python3 -B "$ROOT/experiments/loadgen/export_csv.py" --out "$RUN/steps.csv" "$RUN/loadgen=$SYSTEM" > /dev/null || true
+  python3 -B "$ROOT/experiments/loadgen/plot_slo.py" --out "$RUN/slo.png" "$RUN/loadgen=$SYSTEM" > "$RUN/slo-points.txt" 2>&1 || true
 fi
-[ "$TRACE" = 1 ] && { python3 "$ROOT/workloads/kv/tools/kvlog.py" check "$RUN" > "$RUN/kvlog-check.txt" 2>&1 || true; tail -1 "$RUN/kvlog-check.txt"; }
+[ "$TRACE" = 1 ] && { python3 -B "$ROOT/workloads/kv/tools/kvlog.py" check "$RUN" > "$RUN/kvlog-check.txt" 2>&1 || true; tail -1 "$RUN/kvlog-check.txt"; }
 grep -h "kv-server: stopping" -A20 "$RUN"/node*.log | grep -E "^(node|gets|puts|misses|short_reads|bad_requests)=" | tr '\n' ' '; echo
 [ -f "$RUN/loadgen/kv.txt" ] && grep -E "^(checked|remote_values|misses|torn|wrong_key|future|stale)=" "$RUN/loadgen/kv.txt" | tr '\n' ' ' && echo
 [ "$LG" = 0 ] || { echo "run $NAME: loadgen rc=$LG"; exit 1; }

@@ -18,6 +18,7 @@
 #   measurement lock (experiments/vectordb/host-gate.sh lock <owner>); refused otherwise.
 # Prints "PILOTRUN <name> OK|NOTE|STOP <reason>"; exit 0 for OK/NOTE, 1 for STOP.
 set -uo pipefail
+export PYTHONDONTWRITEBYTECODE=1  # never write __pycache__ (harness snapshots live in recovery/); every python3 call also has -B
 NAME=$1 E=$2
 P=/home/comsys/sungsu/destijl-control
 X=$P/CXL_SWMC/experiments/lmdb
@@ -110,7 +111,7 @@ for kv in not_found=0 errors=0 bad_values=0 stale_snapshots=0; do grep -q "^$kv\
   grep -h "loaded image\|published\|warm-up read\|READY node\|opsplit" $R/node*.log; grep -h "^start=\|^end=" $R/manifest.txt; } > $R/load-times.txt
 grep -q "workload_finish\":\"ok" $R/loadgen/summary.json || stop "loadgen workload finish"
 if [ $RC != 0 ]; then
-  note=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("note",""))' $R/loadgen/summary.json 2>/dev/null)
+  note=$(python3 -B -c 'import json,sys; print(json.load(open(sys.argv[1])).get("note",""))' $R/loadgen/summary.json 2>/dev/null)
   [[ $KIND =~ ^p?slo$ ]] && [ -n "$note" ] && { echo "PILOTRUN $NAME NOTE $note"; exit 0; }
   stop "run.sh rc $RC ($note)"
 fi

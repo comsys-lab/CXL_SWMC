@@ -10,6 +10,7 @@
 #   IMG (Host image dir to create in G0; must not exist; required), EXPECT_K (guest kernel release, as recorded in state/HANDOFF.md; required), PLAIN_BUILD / MEG_BUILD /
 #   LOADGEN_BUILD (pilot-run.sh defaults; PLAIN_BUILD also gives the Host lmdb-server for --print-app-bytes)
 set -uo pipefail
+export PYTHONDONTWRITEBYTECODE=1  # never write __pycache__ (harness snapshots live in recovery/); every python3 call also has -B
 E=$1
 P=/home/comsys/sungsu/destijl-control X=$P/CXL_SWMC/experiments/lmdb G=$P/CXL_SWMC/experiments/vectordb/host-gate.sh
 : "${EXPECT_K:?EXPECT_K = guest kernel release}" "${IMG:?IMG = Host image dir to create (G0)}"
@@ -22,6 +23,7 @@ IPS=(192.168.122.100 192.168.122.101)
 [ -s "$E/tasks-check.txt" ] || { echo "BLOCK STOP: $E/tasks-check.txt missing (state/TASKS.md: no other active VM user)"; exit 2; }
 bash $G lock $OWNER || { echo "BLOCK STOP: lock"; exit 2; }
 finish() {  # order as experiments/kv/pilot-block.sh: servers first, then Popcorn teardown, then dax0.0, then unlock
+  set +eu  # nothing in the trap may abort it before the unlock
   for ip in "${IPS[@]}"; do
     $SSH comsys@$ip 'pkill -x lmdb-server; pkill -x lmdb-stress; sleep 2; echo procs=$(pgrep -c -x lmdb-server)/$(pgrep -c -x lmdb-stress)' < /dev/null 2>&1 | sed "s/^/$(date -Is) $ip /" >> "$E/rollback.out"
   done
@@ -40,20 +42,36 @@ finish() {  # order as experiments/kv/pilot-block.sh: servers first, then Popcor
     echo "$out" | sed "s/^/$(date -Is) $ip /" >> "$E/rollback.out"
     echo "$out" | grep -qx "stat=root:root 600" || echo "ROLLBACK FAIL: $ip dax0.0 not root:root 600" | tee -a "$E/rollback.out"
   done
-  [ -n "${DMESG_BASE_DONE:-}" ] && dmesg_check final  # recorded only (the block has already ended)
+  if [ -n "${DMESG_BASE_DONE:-}" ]; then  # recorded only (the block has already ended); never skips the unlock
+    ( dmesg_check final ) > "$E/dmesg-final.out" 2>&1 || echo "$(date -Is) final dmesg check: see dmesg-final.out" >> "$E/rollback.out"
+  fi
   bash $G unlock $OWNER
 }
 # dmesg stop rule: line counts at the block start; after every step, new lines matching DMESG_BAD on either VM stop
 DMESG_BAD='BUG:|Oops|WARNING:|Call Trace|general protection|segfault|[Ee]rror|ERROR|soft lockup|hung_task'
+dmesg_count() {  # vm -> prints the integer line count of that VM's dmesg; rc 1 on an ssh failure or a non-integer
+  local c
+  c=$($SSH comsys@${IPS[$1]} 'dmesg | wc -l' < /dev/null 2>/dev/null) || return 1
+  [[ $c =~ ^[0-9]+$ ]] || return 1
+  echo "$c"
+}
 dmesg_base() {
-  for i in 0 1; do $SSH comsys@${IPS[$i]} 'dmesg | wc -l' < /dev/null > "$E/dmesg-base-vm$i.txt" 2>&1 || stop "dmesg vm$i"; done
+  local i c
+  for i in 0 1; do
+    c=$(dmesg_count $i) || stop "dmesg baseline vm$i: ssh failed or the count is not an integer"
+    echo "$c" > "$E/dmesg-base-vm$i.txt"
+  done
   DMESG_BASE_DONE=1
 }
-dmesg_check() {  # tag; returns 1 (and writes dmesg-new-<tag>-vm<k>.txt) on a new bad line
-  local i n bad=0
+dmesg_check() {  # tag; returns 1 on a new bad line, an ssh failure, a bad stored count or a ring-buffer wrap
+  local i n c bad=0
   for i in 0 1; do
-    n=$(cat "$E/dmesg-base-vm$i.txt")
-    $SSH comsys@${IPS[$i]} "dmesg | tail -n +$((n + 1))" < /dev/null > "$E/dmesg-new-$1-vm$i.txt" 2>&1
+    n=$(cat "$E/dmesg-base-vm$i.txt" 2>/dev/null)
+    [[ $n =~ ^[0-9]+$ ]] || { echo "dmesg vm$i ($1): stored baseline '$n' is not an integer" | tee -a "$E/block.log"; bad=1; continue; }
+    c=$(dmesg_count $i) || { echo "dmesg vm$i ($1): ssh failed or the count is not an integer" | tee -a "$E/block.log"; bad=1; continue; }
+    [ "$c" -ge "$n" ] || { echo "dmesg vm$i ($1): line count went down ($n -> $c): ring buffer wrapped, new lines unknown" | tee -a "$E/block.log"; bad=1; continue; }
+    $SSH comsys@${IPS[$i]} "dmesg | tail -n +$((n + 1))" < /dev/null > "$E/dmesg-new-$1-vm$i.txt" 2>&1 \
+      || { echo "dmesg vm$i ($1): ssh failed reading the new lines" | tee -a "$E/block.log"; bad=1; continue; }
     grep -E "$DMESG_BAD" "$E/dmesg-new-$1-vm$i.txt" > /dev/null && { echo "dmesg vm$i ($1): $(grep -E "$DMESG_BAD" "$E/dmesg-new-$1-vm$i.txt" | head -3)" | tee -a "$E/block.log"; bad=1; }
   done
   return $bad
@@ -120,7 +138,7 @@ stress() {
   grep -h "RESULT\|final scan\|write_txn_us" "$E/$tag.0.out" "$E/$tag.1.out" | tee -a "$E/block.log"
   [ $r0 = 0 ] && [ $r1 = 0 ] && [ "$(grep -c 'RESULT PASS' "$E/$tag.0.out" "$E/$tag.1.out" | awk -F: '{s+=$2} END {print s}')" = 2 ] \
     && grep -q "final scan .* entries=$R .*bad=0 end=ok" "$E/$tag.0.out" || stop "$tag"
-  dmesg_check "$tag" || stop "$tag: new dmesg error/warning"
+  dmesg_check "$tag" || stop "$tag: dmesg check failed (new error/warning line, ssh failure or wrap; see block.log)"
 }
 run() {  # name, env...
   local name=$1; shift
@@ -130,9 +148,9 @@ run() {  # name, env...
   grep -q "^PILOTRUN $name OK" "$E/runs.log" || stop "$name not OK"
   local sys; for x in "$@"; do case $x in SYS=*) sys=${x#SYS=};; esac; done
   # closure checks (opsplit vs server counters; all-HWcc C = 0, Megalon C > 0, Popcorn C > 0 via swmc_acct)
-  python3 -I $P/CXL_SWMC/experiments/kv/v1-check.py "$E/$name" --system $sys --workload lmdb | tee -a "$E/v1-check.log" \
+  python3 -I -B $P/CXL_SWMC/experiments/kv/v1-check.py "$E/$name" --system $sys --workload lmdb | tee -a "$E/v1-check.log" \
     | grep -q "V1 CHECK PASS" || stop "$name: v1-check"
-  dmesg_check "$name" || stop "$name: new dmesg error/warning"
+  dmesg_check "$name" || stop "$name: dmesg check failed (new error/warning line, ssh failure or wrap; see block.log)"
 }
 PL=(VM_PLAIN=$L/plain IMAGE=$L/img-$R RECORDS=$R MAX_PAGES=$MAXP KIND=functional GATE=0 RATES=200,1000)
 ML=(VM_MEG=$L/megalon IMAGE=$L/img-$R RECORDS=$R MAX_PAGES=$MAXP KIND=functional GATE=0 RATES=200,1000 PREPARE_THREADS=8)

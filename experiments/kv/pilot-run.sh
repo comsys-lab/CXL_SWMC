@@ -23,6 +23,7 @@
 # process-local). init_state=shared, as for the other workloads' page MSI runs.
 # Prints "PILOTRUN <name> OK|NOTE|STOP <reason>"; exit 0 for OK/NOTE, 1 for STOP (the sequence stops).
 set -uo pipefail
+export PYTHONDONTWRITEBYTECODE=1  # never write __pycache__ (harness snapshots live in recovery/); every python3 call also has -B
 NAME=$1 E=$2
 P=/home/comsys/sungsu/destijl-control
 X=$P/CXL_SWMC/experiments/kv
@@ -119,7 +120,7 @@ done
   grep -h "^start=\|^end=" $R/manifest.txt; } > $R/load-times.txt
 grep -q "workload_finish\":\"ok" $R/loadgen/summary.json || stop "loadgen workload finish"
 if [ $RC != 0 ]; then
-  note=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("note",""))' $R/loadgen/summary.json 2>/dev/null)
+  note=$(python3 -B -c 'import json,sys; print(json.load(open(sys.argv[1])).get("note",""))' $R/loadgen/summary.json 2>/dev/null)
   [[ $KIND =~ ^p?slo$ ]] && [ -n "$note" ] && { echo "PILOTRUN $NAME NOTE $note"; exit 0; }
   stop "run.sh rc $RC ($note)"
 fi
@@ -129,7 +130,7 @@ fi
 # MOT1 v6 Fig 2: per-operation split per step (run.sh writes opsplit.csv; servers without opt.* keys fail here)
 [ -s $R/opsplit.csv ] && [ "$(wc -l < $R/opsplit.csv)" -ge 2 ] || stop "no opsplit.csv rows"
 if [ "$KIND" = fix ]; then
-  python3 - $R/loadgen/steps.jsonl > $R/fix-result.txt <<'PY' || stop "fixed window result"
+  python3 -B - $R/loadgen/steps.jsonl > $R/fix-result.txt <<'PY' || stop "fixed window result"
 import json, sys
 st = [json.loads(l) for l in open(sys.argv[1]) if l.strip()]
 st = [s for s in st if s["phase"] == "fixed"]
@@ -144,7 +145,7 @@ PY
   grep -q "^aborted=true" $R/fix-result.txt && { echo "PILOTRUN $NAME NOTE fixed window aborted: $(sed -n 's/^reason=//p' $R/fix-result.txt)"; exit 0; }
 fi
 if [ "$KIND" = ladder ]; then  # per-step table; an aborted step is a NOTE (fixed mode does not fail on it)
-  python3 - $R/loadgen/steps.jsonl > $R/ladder-result.txt <<'PY' || stop "ladder result"
+  python3 -B - $R/loadgen/steps.jsonl > $R/ladder-result.txt <<'PY' || stop "ladder result"
 import json, sys
 st = [json.loads(l) for l in open(sys.argv[1]) if l.strip()]
 st = [s for s in st if s["phase"] == "fixed"]

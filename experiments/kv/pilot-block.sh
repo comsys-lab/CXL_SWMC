@@ -28,6 +28,7 @@
 # stopped, page MSI teardown of every attempted load, /dev/dax0.0 back to root:root 600 on both VMs UNCONDITIONALLY
 # (fresh stat check per VM; "ROLLBACK FAIL" otherwise), lock released.
 set -uo pipefail
+export PYTHONDONTWRITEBYTECODE=1  # never write __pycache__ (harness snapshots live in recovery/); every python3 call also has -B
 B=$1 E=$2
 P=/home/comsys/sungsu/destijl-control X=$P/CXL_SWMC/experiments/kv G=$P/CXL_SWMC/experiments/vectordb/host-gate.sh
 K8=${K8:-6.14.0-famfs-de-stijl+-ds-popcorn-new-8}
@@ -55,6 +56,7 @@ grep -q "^cxl_swmc_commit=$BPIN kv_dirty=0$" "$BL/kv-manifest.txt" \
 bash $G lock "$OWNER" || { echo "SEQUENCE STOP: lock"; exit 2; }
 CHOWNED=0
 finish() {
+  set +eu  # nothing in the trap may abort it before the unlock
   for ip in "${IPS[@]}"; do
     for g in $(sed -n 's/^guest_run_dir=//p' "$E"/*/manifest.txt 2>/dev/null); do
       $SSH comsys@$ip "for k in 0 1; do [ -e $g/node\$k.pid ] && \$(dirname $g)/../bin/kv-node.sh stop $g \$k; done; true" < /dev/null 2>&1 | sed "s|^|$ip |" >> "$E/rollback.out"
@@ -99,9 +101,9 @@ run() {  # name, env assignments...
   local st=${PIPESTATUS[0]}
   [ $st = 0 ] || { echo "$(date -Is) SEQUENCE STOP at $name"; exit 1; }
 }
-shuffle() { python3 -c 'import random,sys; v=sys.argv[2:]; random.Random(sys.argv[1]).shuffle(v); print(" ".join(v))' "$OWNER" "$@"; }
+shuffle() { python3 -B -c 'import random,sys; v=sys.argv[2:]; random.Random(sys.argv[1]).shuffle(v); print(" ".join(v))' "$OWNER" "$@"; }
 confirm_l() {  # 0.5 x the confirm mean of an SLO run without a note (a noted run is never used for L)
-  python3 -c 'import json,sys; s=json.load(open(sys.argv[1])); c=s.get("confirm",{})
+  python3 -B -c 'import json,sys; s=json.load(open(sys.argv[1])); c=s.get("confirm",{})
 if s.get("note"): sys.exit("note: " + s["note"])
 x=c.get("x_mean",0); assert x > 0, "no confirm result"; print(round(0.5 * x, 3))' "$1"
 }
@@ -210,14 +212,25 @@ case "$B" in
                     hw-u80) echo 44000;; mg-u80) echo 44000;; pop-u80) echo 9700;; esac; }
     # dmesg stop rule: line counts after the precheck; after every run, new lines matching BAD on either VM stop
     BAD='BUG:|Oops|WARNING:|Call Trace|general protection|segfault|[Ee]rror|ERROR|soft lockup|hung_task'
-    for i in 0 1; do $SSH comsys@${IPS[$i]} 'dmesg | wc -l' < /dev/null > "$E/dmesg-base-vm$i.txt" 2>&1 || { echo "SEQUENCE STOP: dmesg vm$i"; exit 1; }; done
+    dcount() {  # vm -> integer dmesg line count; rc 1 on an ssh failure or a non-integer
+      local c; c=$($SSH comsys@${IPS[$1]} 'dmesg | wc -l' < /dev/null 2>/dev/null) || return 1
+      [[ $c =~ ^[0-9]+$ ]] || return 1; echo "$c"
+    }
+    for i in 0 1; do
+      c=$(dcount $i) || { echo "SEQUENCE STOP: dmesg baseline vm$i: ssh failed or the count is not an integer"; exit 1; }
+      echo "$c" > "$E/dmesg-base-vm$i.txt"
+    done
     v1chk() {  # run name, system, [timers]
-      python3 -I $X/v1-check.py "$E/$1" --system $2 ${3:+--timers $3} | tee -a "$E/v1-check.log" | grep -q "V1 CHECK PASS" \
+      python3 -I -B $X/v1-check.py "$E/$1" --system $2 ${3:+--timers $3} | tee -a "$E/v1-check.log" | grep -q "V1 CHECK PASS" \
         || { echo "$(date -Is) SEQUENCE STOP: v1-check $1"; exit 1; }
-      local i n
+      local i n c
       for i in 0 1; do
-        n=$(cat "$E/dmesg-base-vm$i.txt")
-        $SSH comsys@${IPS[$i]} "dmesg | tail -n +$((n + 1))" < /dev/null > "$E/dmesg-new-$1-vm$i.txt" 2>&1
+        n=$(cat "$E/dmesg-base-vm$i.txt" 2>/dev/null)
+        [[ $n =~ ^[0-9]+$ ]] || { echo "$(date -Is) SEQUENCE STOP: dmesg baseline of vm$i ('$n') is not an integer"; exit 1; }
+        c=$(dcount $i) || { echo "$(date -Is) SEQUENCE STOP: dmesg vm$i after $1: ssh failed or the count is not an integer"; exit 1; }
+        [ "$c" -ge "$n" ] || { echo "$(date -Is) SEQUENCE STOP: dmesg vm$i after $1: line count went down ($n -> $c), ring buffer wrapped"; exit 1; }
+        $SSH comsys@${IPS[$i]} "dmesg | tail -n +$((n + 1))" < /dev/null > "$E/dmesg-new-$1-vm$i.txt" 2>&1 \
+          || { echo "$(date -Is) SEQUENCE STOP: dmesg vm$i after $1: ssh failed reading the new lines"; exit 1; }
         grep -E "$BAD" "$E/dmesg-new-$1-vm$i.txt" > /dev/null \
           && { echo "$(date -Is) SEQUENCE STOP: new dmesg error/warning on vm$i after $1: $(grep -E "$BAD" "$E/dmesg-new-$1-vm$i.txt" | head -3)"; exit 1; }
       done
