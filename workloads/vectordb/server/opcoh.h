@@ -50,7 +50,7 @@ inline uint64_t *words(mshim::CohSnap &s) { return reinterpret_cast<uint64_t *>(
 inline const uint64_t *words(const mshim::CohSnap &s) { return reinterpret_cast<const uint64_t *>(&s); }
 
 struct CohVals {  // cumulative values of one thread
-  uint64_t pf_ns[3] = {}, pf_cnt[3] = {}, ipi_ns = 0, ipi_cnt = 0;
+  uint64_t pf_ns[3] = {}, pf_cnt[3] = {}, ipi_ns = 0, ipi_cnt = 0, nt_ns = 0, nt_cnt = 0;
   mshim::CohSnap mg{};
 };
 
@@ -59,9 +59,10 @@ struct OpAcc {
   uint64_t ticks = 0, wait_ticks = 0;  // wait_ticks: search E1 wait (part of ticks)
   uint32_t sections = 0;
   uint64_t pf_ns[3] = {}, pf_cnt[3] = {}, ipi_ns = 0, ipi_cnt = 0, mod_bytes = 0;
+  uint64_t nt_ns = 0, nt_cnt = 0;  // Popcorn no-transition faults (swmc_acct reserved[0..1]); not part of C
   mshim::CohSnap mg{};  // summed deltas; check_sample = the snapshot's value (not a delta)
   void add(const OpAcc &d) {
-    ticks += d.ticks, wait_ticks += d.wait_ticks, sections += d.sections, ipi_ns += d.ipi_ns, ipi_cnt += d.ipi_cnt, mod_bytes += d.mod_bytes;
+    ticks += d.ticks, wait_ticks += d.wait_ticks, sections += d.sections, nt_ns += d.nt_ns, nt_cnt += d.nt_cnt, ipi_ns += d.ipi_ns, ipi_cnt += d.ipi_cnt, mod_bytes += d.mod_bytes;
     for (int i = 0; i < 3; i++) pf_ns[i] += d.pf_ns[i], pf_cnt[i] += d.pf_cnt[i];
     const uint64_t cs = mg.check_sample ? mg.check_sample : d.mg.check_sample;
     for (int k = 0; k < kSnapWords; k++) words(mg)[k] += words(d.mg)[k];
@@ -110,6 +111,7 @@ inline OpCoh op_block(const OpAcc &a, uint16_t op, int pop_src, bool mg_snap, ui
   b.mg_wflush_ns = m.wflush_ns, b.mg_wflush_bytes = m.wflush_bytes;
   b.mod_bytes = a.mod_bytes;
   b.wait_ns = ticks_to_ns(a.wait_ticks, tsc_khz);
+  b.nontrans_ns = a.nt_ns, b.nontrans_cnt = uint32_t(a.nt_cnt);
   b.c_ns = pop_coh_ns(a) + mg_coh_ns(m);
   return b;
 }
@@ -196,6 +198,7 @@ class OpCohSrc {
     const bool ok = read(&e, true);
     for (int i = 0; i < 3; i++) a->pf_ns[i] += e.pf_ns[i] - s.v.pf_ns[i], a->pf_cnt[i] += e.pf_cnt[i] - s.v.pf_cnt[i];
     a->ipi_ns += e.ipi_ns - s.v.ipi_ns, a->ipi_cnt += e.ipi_cnt - s.v.ipi_cnt;
+    a->nt_ns += e.nt_ns - s.v.nt_ns, a->nt_cnt += e.nt_cnt - s.v.nt_cnt;
     if (mg_) {
       const uint64_t cs = e.mg.check_sample;
       for (int k = 0; k < kSnapWords; k++) words(a->mg)[k] += words(e.mg)[k] - words(s.v.mg)[k];
@@ -205,10 +208,11 @@ class OpCohSrc {
     return ok;
   }
   // Host-test fake (kPopFake): the calling thread's coherence counters advance by these values.
-  void fake_add(int kind, uint64_t ns, uint64_t ipi_ns) const {
+  void fake_add(int kind, uint64_t ns, uint64_t ipi_ns, uint64_t nontrans_ns = 0) const {
     if (src_ != kPopFake) return;
     swmc_acct &a = thr().acct;
     a.fault_ns[kind] += ns, a.fault_cnt[kind] += 1;
+    if (nontrans_ns) a.reserved[0] += nontrans_ns, a.reserved[1] += 1;
     if (ipi_ns) a.ipi_ns += ipi_ns, a.ipi_cnt += 1;
   }
   bool on() const { return on_; }
@@ -234,6 +238,7 @@ class OpCohSrc {
       const volatile swmc_acct *a = &thr().acct;
       for (int i = 0; i < 3; i++) v->pf_ns[i] = a->fault_ns[i], v->pf_cnt[i] = a->fault_cnt[i];
       v->ipi_ns = a->ipi_ns, v->ipi_cnt = a->ipi_cnt;
+      v->nt_ns = a->reserved[0], v->nt_cnt = a->reserved[1];  // build 10 no-transition faults (0 on build 9)
     } else if (src_ == kPopFile && at_end) {
       ok = thr().file_ok && read_file(v);
     }

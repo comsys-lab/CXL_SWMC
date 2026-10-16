@@ -89,6 +89,10 @@ if mode == "fake":
     check(np.array_equal(cs["pf_ns"][:, 0], ok["dists"][oi].astype(np.uint64)), "search pf_ns[0] = dists")
     check((cs["pf_cnt"][:, 0] == seg).all() and (cs["ipi_ns"] <= cs["pf_ns"][:, 0] // 8).all(), "search fake counts")
     check((cu["pf_ns"][:, 1] == 1000).all() and (cu["pf_cnt"][:, 1] == 1).all(), "update fake S->M 1000 ns")
+    check((cu["nontrans_ns"] == 500).all() and (cu["nontrans_cnt"] == 1).all() and (cs["nontrans_ns"] == 0).all(),
+          "update fake no-transition 500 ns")
+    check((cu["c_ns"] == 1000).all(), "no-transition faults are not part of C")
+    check(sum(s["opt.update.pop.nontrans_ns"] for s in st) == 500 * len(cu), "opt.update.pop.nontrans_ns")
 elif mode == "megalon":
     snap = all(s["opt.meg_coh"] == 1 for s in st)
     print(f"megalon cohsnap {snap}")

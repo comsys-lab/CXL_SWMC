@@ -401,8 +401,13 @@ indexing unit; Megalon flushes the whole object at write end (no dirty-line trac
 - Modified bytes (Fig 3b reference line): thread-local `t_mod_bytes` (shm_hnsw.h) counts the whole lines the
   application stores: vector record + zeroed level-0/upper link blocks (write_elem), each committed link block,
   each 64 B delete-log entry. Written back (Fig 3b): Megalon CohSnap wflush_bytes; Popcorn (S->M + wp faults) x 4 KiB.
-- Transport: proto.h `OpCoh` v2 (216 B) after the search results (SearchResp.flags kRespCoh) and after WriteResp on
-  update responses; the loadgen plugin writes `op-coh.bin` (OpLog 240 B). Window counters in the stats text in the
+- T = server processing from the worker's dequeue of the request to the response being ready (search: start
+  section, segment tasks and the final merge on the finishing thread; update: the writer section); queueing before
+  the dequeue and the socket send of the reply are outside T (the copy of the few-hundred-byte reply into its buffer
+  after the block is built is not counted). Popcorn no-transition coherence faults (swmc_acct reserved[0..1], build
+  10) are exported as their own component (`pop_nontrans_*`, `opt.<op>.pop.nontrans_{ns,cnt}`), NOT part of C.
+- Transport: proto.h `OpCoh` v2 (232 B) after the search results (SearchResp.flags kRespCoh) and after WriteResp on
+  update responses; the loadgen plugin writes `op-coh.bin` (OpLog 256 B). Window counters in the stats text in the
   KV convention (workloads/kv/server/opsplit.h): `opt.version`, `opt.tsc_hz`, `opt.meg_coh`, `opt.meg_check_sample`,
   `opt.<search|update>.{ops,sections,t_ns,c_ns,mod_bytes}`, `opt.<op>.pop.{is,sm,wp}_{ns,cnt}`, `.pop.ipi_{ns,cnt}`,
   `opt.<op>.meg.<CohSnap field>`; `opcoh.*` = source, errors, timed-out search sections (unattributed).

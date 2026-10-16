@@ -135,11 +135,12 @@ struct Stats {
 // experiments/analysis/v6_common.py): opt.<op>.{ops,t_ns,c_ns,mod_bytes}, opt.<op>.pop.<f>, opt.<op>.meg.<f>; sums over
 // the operations answered (the same values as the response blocks; the server's completion time decides the window).
 struct OpWin {
-  static constexpr int kPop = 8, kMeg = 20;
+  static constexpr int kPop = 10, kMeg = 20;
   std::atomic<uint64_t> ops{0}, sections{0}, t_ns{0}, c_ns{0}, mod_bytes{0}, wait_ns{0}, pop[kPop]{}, meg[kMeg]{};
   void add(const OpCoh &b) {
     ops++, sections += b.sections, t_ns += b.t_ns, c_ns += b.c_ns, mod_bytes += b.mod_bytes, wait_ns += b.wait_ns;
-    const uint64_t p[kPop] = {b.pf_ns[0], b.pf_ns[1], b.pf_ns[2], b.pf_cnt[0], b.pf_cnt[1], b.pf_cnt[2], b.ipi_ns, b.ipi_cnt};
+    const uint64_t p[kPop] = {b.pf_ns[0], b.pf_ns[1], b.pf_ns[2], b.pf_cnt[0], b.pf_cnt[1], b.pf_cnt[2], b.ipi_ns, b.ipi_cnt,
+                              b.nontrans_ns, b.nontrans_cnt};
     const uint64_t m[kMeg] = {b.mg_read_sections, b.mg_write_sections, b.mg_check_ns_sampled, b.mg_check_sampled,
                               b.mg_stale_cnt, b.mg_stale_ns, b.mg_concur_cnt, b.mg_concur_ns, b.mg_meta_cnt,
                               b.mg_meta_ns, b.mg_spin_cnt, b.mg_spin_ns, b.mg_wstart_ns, b.mg_switch_rw_cnt,
@@ -149,7 +150,8 @@ struct OpWin {
     for (int i = 0; i < kMeg; i++) meg[i] += m[i];
   }
   void print(std::ostream &o, const char *name) const {
-    static const char *const pn[kPop] = {"is_ns", "sm_ns", "wp_ns", "is_cnt", "sm_cnt", "wp_cnt", "ipi_ns", "ipi_cnt"};
+    static const char *const pn[kPop] = {"is_ns", "sm_ns", "wp_ns", "is_cnt", "sm_cnt", "wp_cnt", "ipi_ns", "ipi_cnt",
+                                         "nontrans_ns", "nontrans_cnt"};  // nontrans: not part of c_ns
     static const char *const mn[kMeg] = {"read_sections", "write_sections", "check_ns_sampled", "check_sampled",
                                          "stale_cnt", "stale_ns", "concur_cnt", "concur_ns", "meta_cnt", "meta_ns",
                                          "spin_cnt", "spin_ns", "wstart_ns", "switch_rw_cnt", "switch_rw_ns",
@@ -469,7 +471,7 @@ class Server {
         publish(rq.w_del);
         do_insert(rq.w_ins, rq.ins_id, reinterpret_cast<const float *>(j.p.data() + sizeof(rq)));
         publish(rq.w_ins);
-        oc_.fake_add(1, 1000, 0);  // Host-test fake: 1000 ns S->M per update
+        oc_.fake_add(1, 1000, 0, 500);  // Host-test fake: 1000 ns S->M and 500 ns no-transition fault per update
         opc_end(os, &oa);
         reply_update(j, rq.w_ins, oa);
         st_.update_ns += now_ns() - t0;
@@ -705,6 +707,7 @@ class Server {
   }
 
   void finish_query(QueryCtx *c) {
+    const uint64_t m0 = rdtsc();  // merge + encode on the finishing thread: part of T (no shared memory, no C)
     const uint64_t t3 = now_ns();
     auto &all = c->all;
     std::sort(all.begin(), all.end());
@@ -721,6 +724,7 @@ class Server {
     OpCoh qb{};
     {
       std::lock_guard<std::mutex> lg(c->mu);
+      c->oa.ticks += rdtsc() - m0;  // up to the response being ready (the reply send is outside T)
       qb = op_block(c->oa, kOpSearch, oc_.src(), oc_.mg_snap(), tsc_khz_);
     }
     if (oc_.on()) resp.flags |= kRespCoh;

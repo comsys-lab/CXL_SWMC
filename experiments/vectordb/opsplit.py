@@ -38,10 +38,11 @@ OPCOH = np.dtype([("version", "<u2"), ("src", "<u2"), ("op", "<u2"), ("sections"
                   ("mg_switch_rw_cnt", "<u4"), ("mg_reclaim_cnt", "<u4"), ("mg_wflush_cnt", "<u4"),
                   ("mg_stale_ns", "<u8"), ("mg_concur_ns", "<u8"), ("mg_meta_ns", "<u8"), ("mg_spin_ns", "<u8"),
                   ("mg_wstart_ns", "<u8"), ("mg_switch_rw_ns", "<u8"), ("mg_reclaim_ns", "<u8"),
-                  ("mg_wflush_ns", "<u8"), ("mg_wflush_bytes", "<u8"), ("mod_bytes", "<u8"), ("wait_ns", "<u8")])
+                  ("mg_wflush_ns", "<u8"), ("mg_wflush_bytes", "<u8"), ("mod_bytes", "<u8"), ("wait_ns", "<u8"),
+                  ("nontrans_ns", "<u8"), ("nontrans_cnt", "<u4"), ("pad2", "<u4")])
 OPLOG = np.dtype([("seq", "<u8"), ("recv_ns", "<u8"), ("measured", "u1"), ("target", "u1"), ("status", "<u2"),
                   ("op", "<u2"), ("pad", "<u2"), ("c", OPCOH)])
-assert OPCOH.itemsize == 216 and OPLOG.itemsize == 240
+assert OPCOH.itemsize == 232 and OPLOG.itemsize == 256
 OP_SEARCH, OP_UPDATE = 3, 4
 OPS = {OP_SEARCH: "search", OP_UPDATE: "update"}
 POP_SRC = {0: "none", 1: "swmc_acct", 2: "swmc_file", 3: "fake"}
@@ -56,7 +57,9 @@ COLUMNS = [
     ("n_ops", "measured", "count", "operations of this type matched to the step (N_o)"),
     ("lat_p50_ms", "measured", "ms", "loadgen latency (done - scheduled) p50 of the matched operations"),
     ("lat_p99_ms", "measured", "ms", "loadgen latency p99 of the matched operations"),
-    ("T_ms", "measured", "ms", "T_o = (1/N_o) sum_ops sum_threads (end - start), rdtsc per section"),
+    ("T_ms", "measured", "ms", "T_o = (1/N_o) sum_ops sum_threads (end - start), rdtsc per section; server processing "
+     "from the worker's dequeue to the response being ready (search incl. the final merge); excludes queueing and the "
+     "reply send"),
     ("wait_ms", "measured", "ms", "search: E1 wait (polling P >= ref_w) inside the start section, part of T_ms"),
     ("C_ms", "derived", "ms", "C_o = Popcorn (pop_is + pop_sm + pop_wp + pop_ipi) + Megalon (mg_check + mg_stale + "
      "mg_concur + mg_meta + mg_spin + mg_wstart + mg_wflush), step means"),
@@ -70,6 +73,9 @@ COLUMNS = [
     ("pop_sm_ms", "measured", "ms", "Popcorn S->M fault time (fault_ns[1]; file source: write faults)"),
     ("pop_wp_ms", "measured", "ms", "Popcorn write-protect upgrade fault time (fault_ns[2])"),
     ("pop_ipi_ms", "measured", "ms", "Popcorn TLB-shootdown IPI handling time on the thread's CPU (ipi_ns)"),
+    ("pop_nontrans_ms", "measured", "ms", "Popcorn coherence faults without an MSI transition (NACKed rounds, wait "
+     "behind a local holder; swmc_acct reserved[0], build 10): own component, NOT part of C_ms"),
+    ("pop_nontrans_cnt", "measured", "count", "no-transition coherence faults per operation (reserved[1])"),
     ("pop_is_cnt", "measured", "count", "I->S faults per operation"),
     ("pop_sm_cnt", "measured", "count", "S->M faults per operation"),
     ("pop_wp_cnt", "measured", "count", "write-protect upgrades per operation"),
@@ -230,7 +236,8 @@ def analyze(run, tol_us=20.0):
                        T_p50_ms=pct(T / 1e6, 50), T_p99_ms=pct(T / 1e6, 99), wait_ms=ms(x["wait_ns"]),
                        sections=cnt(x["sections"]),
                        pop_is_ms=ms(x["pf_ns"][:, 0]), pop_sm_ms=ms(x["pf_ns"][:, 1]), pop_wp_ms=ms(x["pf_ns"][:, 2]),
-                       pop_ipi_ms=ms(x["ipi_ns"]), pop_is_cnt=cnt(x["pf_cnt"][:, 0]), pop_sm_cnt=cnt(x["pf_cnt"][:, 1]),
+                       pop_ipi_ms=ms(x["ipi_ns"]), pop_nontrans_ms=ms(x["nontrans_ns"]),
+                       pop_nontrans_cnt=cnt(x["nontrans_cnt"]), pop_is_cnt=cnt(x["pf_cnt"][:, 0]), pop_sm_cnt=cnt(x["pf_cnt"][:, 1]),
                        pop_wp_cnt=cnt(x["pf_cnt"][:, 2]), pop_ipi_cnt=cnt(x["ipi_cnt"]),
                        mg_check_ms=chk_total / n / 1e6 if n else None,
                        wb_bytes_mg=cnt(x["mg_wflush_bytes"]),
