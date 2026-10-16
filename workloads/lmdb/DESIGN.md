@@ -109,9 +109,10 @@ Same layout on every system (the backend only enters the hash).
   `--opt update_ratio=R`, else a get; mixes get/update 95/5 (R 0.05, YCSB B), 50/50 (0.5, YCSB A), 20/80 (0.8, Twitter
   OSDI'20). SLO (user decision 2026-10-16): request p99 < 1 ms over both kinds (`--mix mixed=1 --slo mixed:99:1`), as
   the kv store. Throughput = completed requests/s (one request = one op).
-- Per-operation split (MOT1 v6 Fig 2; `opsplit.h`): every get/update is one operation; T = rdtsc (no fences) from the
-  start of its transaction to the end of its thread's work on it (get: renew .. mdb_get .. reply .. reset; update:
-  txn_begin incl. the cross-node writer-lock wait .. put .. commit .. reply); C = the thread's coherence time inside it
+- Per-operation split (MOT1 v6 Fig 2; `opsplit.h`): every get/update is one operation; T = rdtsc (no fences) = server
+  processing from request dispatch to response ready, excluding the reply send and the read-txn reset (the definition
+  of every workload; kv: the library Get/Put call): get = renew + mdb_get; update = txn_begin incl. the cross-node
+  writer-lock wait + put + commit; C = the thread's coherence time inside it
   (plain: Popcorn swmc_acct; megalon: CohSnap via thread_coh). Stats keys `opt.get.*`, `opt.update.*` ({ops, t_ns,
   t_max_ns, c_ns, mod_bytes, pop.*, meg.*}; mod_bytes = 1,000 B per committed update), gauges `opt.tsc_hz`,
   `opt.pop_threads`, `opt.meg_coh`, `opt.meg_check_sample`; per-step CSV by `workloads/kv/tools/opsplit.py`.

@@ -1,5 +1,6 @@
 // Per-operation time split (MOT1 v6 Fig 2, reports/MOT1-v6-redesign-draft.md §3): for every operation a worker thread
-// executes, T = its duration (plain rdtsc at both ends, no fences, §0) and C = the coherence-management time the same
+// executes, T = its duration (plain rdtsc at both ends, no fences, §0) = server processing from request dispatch to
+// response ready, EXCLUDING the reply send and txn reset (same definition in every workload) and C = the coherence-management time the same
 // thread accumulated inside it:
 //   Popcorn  delta of swmc_acct_coh_ns() (systems/popcorn_new/include/swmc_acct.h; zeros while unsupported)
 //   Megalon  delta of the thread's CohSnap durations (systems/megalon/shim/megalon_objapi.h v2 thread_coh):
@@ -69,9 +70,11 @@ inline uint64_t meg_check_est_ns(uint64_t check_ns_sampled, uint64_t read_sectio
   return check_sampled ? uint64_t(double(check_ns_sampled) * double(read_sections) / double(check_sampled)) : 0;
 }
 
-// Popcorn fields: fault_ns[3] (I->S, S->M, wp), fault_cnt[3], ipi_ns, ipi_cnt
-constexpr int kPop = 8;
-constexpr const char *kPopNames[kPop] = {"is_ns", "sm_ns", "wp_ns", "is_cnt", "sm_cnt", "wp_cnt", "ipi_ns", "ipi_cnt"};
+// Popcorn fields: fault_ns[3] (I->S, S->M, wp), fault_cnt[3], ipi_ns, ipi_cnt, and reserved[0..1] = nontrans_ns /
+// nontrans_cnt (build 10: coherence faults without an MSI transition; exported, NOT part of C; 0 before build 10)
+constexpr int kPop = 10;
+constexpr const char *kPopNames[kPop] = {"is_ns",  "sm_ns",   "wp_ns",  "is_cnt",      "sm_cnt",
+                                         "wp_cnt", "ipi_ns",  "ipi_cnt", "nontrans_ns", "nontrans_cnt"};
 
 enum class Source { kPopcorn, kMegalon };
 
@@ -196,6 +199,7 @@ class Thread {
     v[0] = a->fault_ns[0], v[1] = a->fault_ns[1], v[2] = a->fault_ns[2];
     v[3] = a->fault_cnt[0], v[4] = a->fault_cnt[1], v[5] = a->fault_cnt[2];
     v[6] = a->ipi_ns, v[7] = a->ipi_cnt;
+    v[8] = a->reserved[0], v[9] = a->reserved[1];
   }
   swmc_acct acct_{};  // aligned(64) by its type
   Table *t_ = nullptr;

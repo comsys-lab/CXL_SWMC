@@ -9,7 +9,8 @@ plus gauges opt.tsc_hz, opt.pop_threads, opt.meg_coh, opt.meg_check_sample.
 One row per (step, operation type), summed over every target (node) with both snapshots of the step:
   T  = sum of per-operation durations (rdtsc at both ends of each operation) / operations
   C  = coherence-management time inside those operations / operations, by the run's SYSTEM:
-       Popcorn / page MSI: fault time (I->S + S->M + write-protect) + TLB-shootdown IPI handling (swmc_acct)
+       Popcorn / page MSI: fault time (I->S + S->M + write-protect) + TLB-shootdown IPI handling (swmc_acct);
+                           faults without a transition (pop_nontrans_*, build 10) are exported but NOT in C
        Megalon:            section checks (ratio estimate check_ns_sampled x read_sections / check_sampled, read
                            sections only; contract CXL_SWMC 2015a31f3) + stale copy (A) + concurrent write (B) + metadata (C)
                            + writer spin (D) + write start + write-end flush (CohSnap; switch_rw and reclaim are
@@ -30,7 +31,7 @@ Every column name carries its tag: [measured] (a recorded quantity, possibly ave
 import argparse, csv, os, re, sys
 
 FNAME = re.compile(r"^step(\d+)-(begin|end)-t(\d+)\.txt$")
-POP = ["is_ns", "sm_ns", "wp_ns", "is_cnt", "sm_cnt", "wp_cnt", "ipi_ns", "ipi_cnt"]
+POP = ["is_ns", "sm_ns", "wp_ns", "is_cnt", "sm_cnt", "wp_cnt", "ipi_ns", "ipi_cnt", "nontrans_ns", "nontrans_cnt"]
 MEG_NS = ["stale_ns", "concur_ns", "meta_ns", "spin_ns", "wstart_ns", "switch_rw_ns", "reclaim_ns", "wflush_ns"]
 MEG_CNT = ["read_sections", "write_sections", "check_sampled", "stale_cnt", "concur_cnt", "meta_cnt", "spin_cnt",
            "switch_rw_cnt", "reclaim_cnt", "wflush_cnt", "wflush_bytes", "tsc_backwards"]

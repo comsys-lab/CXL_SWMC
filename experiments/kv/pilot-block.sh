@@ -7,7 +7,8 @@
 #        result at the same ratio (shuffled); then one traced window per system at 0.5 (ptrace, Figure 2c logs only).
 #   pop: page MSI (C8 K8 GT8 RECV_MODE): functional (0.5), pilot SLO searches at 0.05 / 0 / 0.5 (shuffled), untraced
 #        fixed-load windows at L from the hm block (LREF = its evidence dir), then the traced 0.5 window.
-#   main: H1 MAIN run (reports/KV-main-packet.md): one full SLO search (KIND=slo) per system at put ratio 0.05, KEYS
+#   main: H1 MAIN run (reports/KV-main-packet.md; MOT1 v6: per system one full SLO search (KIND=slo) per mix in MIXES,
+#        mix order shuffled per system with the same seed; v5 = MIXES=0.05) at put ratio u, KEYS
 #        (54000000), order = [hw mg pop] shuffled with seed "KV-main-h1" (order.txt before the first run); dax0.0
 #        comsys for all-HWcc/Megalon, back to root:root 600 (fresh stat check) before page MSI. A confirm failure at
 #        three rates is a NOTE (recorded, the block continues); every other stop ends the block. FIX_RATE set: after
@@ -17,7 +18,8 @@
 #        recorded from sysfs before the run).
 #   hmtrace: only the traced 0.5 windows of all-HWcc and Megalon (shuffled) at L from an earlier hm block (LREF), e.g.
 #        after an hm block that stopped at its ptrace runs.
-# env: MEGALON_BUILD_N (70; 71 once the CohSnap build exists: the Megalon build the kv-megalon build must name),
+# env: MEGALON_BUILD_N (72 = CohSnap + TSC clamp; 73 once Megalon's KV-path timers land: the Megalon build the kv-megalon
+#   build must name), MIXES (main block: put ratios, default MOT1 v6 "0.05 0.5 0.8" = get/put 95/5, 50/50, 20/80),
 #   PIN (harness commit), BUILD_PIN (commit the builds were made from; default PIN; every build manifest must name
 #   it with dirty=0, and the server/loadgen sources must not differ between BUILD_PIN and PIN), KV_CFG, K8.
 # Holds the measurement lock for the whole block; stops at the first PILOTRUN STOP. On every exit: this block's servers
@@ -40,8 +42,8 @@ SSH="ssh -o BatchMode=yes -o ConnectTimeout=8"
 IPS=(192.168.122.100 192.168.122.101)
 OWNER="KV-pilot-$B"; [ "$B" = main ] && OWNER="KV-main-h1"
 [ -d "$E" ] && [ -z "$(ls -A "$E" | grep -v '^sequence')" ] || { echo "SEQUENCE STOP: $E missing or not empty"; exit 2; }
-grep -q "^megalon_build=$P/builds/megalon/${MEGALON_BUILD_N:-70}$" "$BM/manifest.txt" && grep -q "^source_commit=$BPIN dirty=0$" "$BM/manifest.txt" \
-  || { echo "SEQUENCE STOP: $BM is not a clean build of $BPIN on builds/megalon/${MEGALON_BUILD_N:-70}"; exit 2; }
+grep -q "^megalon_build=$P/builds/megalon/${MEGALON_BUILD_N:-72}$" "$BM/manifest.txt" && grep -q "^source_commit=$BPIN dirty=0$" "$BM/manifest.txt" \
+  || { echo "SEQUENCE STOP: $BM is not a clean build of $BPIN on builds/megalon/${MEGALON_BUILD_N:-72}"; exit 2; }
 grep -q "^source_commit=$BPIN dirty=0$" "$BP/manifest.txt" && grep -q "^megalon.flavor=hwcc$" "$BP/manifest.txt" \
   || { echo "SEQUENCE STOP: $BP is not a clean hwcc-flavor build of $BPIN"; exit 2; }
 grep -q "^cxl_swmc_commit=$BPIN kv_dirty=0$" "$BL/kv-manifest.txt" \
@@ -156,7 +158,9 @@ case "$B" in
     ORD=$(shuffle hw mg pop)
     [ $(echo $ORD | wc -w) = 3 ] || { echo "SEQUENCE STOP: run order"; exit 1; }
     [ -z "${FIX_RATE:-}" ] || [[ $FIX_RATE =~ ^[1-9][0-9]*$ ]] || { echo "SEQUENCE STOP: bad FIX_RATE"; exit 2; }
-    echo "# KV H1 main order (shuffle seed $OWNER): $ORD; keys $KEYS batch 16 put 0.05 Zipf 0.99 request seed ${SEED:-20261016}; per system: slo${FIX_RATE:+, then fix at $FIX_RATE req/s}" | tee "$E/order.txt"
+    MX=${MIXES:-0.05 0.5 0.8}
+    for u in $MX; do [[ $u =~ ^(0\.05|0\.5|0\.8)$ ]] || { echo "SEQUENCE STOP: bad mix $u"; exit 2; }; done
+    echo "# KV H1 main order (shuffle seed $OWNER): $ORD; mixes [$MX] shuffled per system; keys $KEYS batch 16 Zipf 0.99 request seed ${SEED:-20261016}; per system and mix: slo${FIX_RATE:+, then fix at $FIX_RATE req/s}" | tee "$E/order.txt"
     for s in $ORD; do
       case $s in
         hw)  [ $CHOWNED = 1 ] || dax_comsys_all; SE=(SYS=all-HWcc);;
@@ -164,8 +168,11 @@ case "$B" in
         pop) if [ $CHOWNED = 1 ]; then dax_root_all || { echo "SEQUENCE STOP: dax0.0 not back to root:root 600 before page MSI"; exit 1; }; CHOWNED=0; fi
              SE=(SYS=Popcorn C8=$C8 K8=$K8 GT8=$GT8 RECV_MODE=$RECV_MODE);;
       esac
-      run $s-u5-slo "${SE[@]}" PUT_RATIO=0.05 KIND=slo KEYS=$KEYS
-      [ -z "${FIX_RATE:-}" ] || run $s-u5-fix "${SE[@]}" PUT_RATIO=0.05 KIND=fix RATE=$FIX_RATE KEYS=$KEYS
+      for u in $(shuffle $MX); do
+        echo "$s $u" >> "$E/order.txt"
+        run $s-$(tag $u)-slo "${SE[@]}" PUT_RATIO=$u KIND=slo KEYS=$KEYS
+        [ -z "${FIX_RATE:-}" ] || run $s-$(tag $u)-fix "${SE[@]}" PUT_RATIO=$u KIND=fix RATE=$FIX_RATE KEYS=$KEYS
+      done
     done;;
   idle)  # low-rate latency check (reports/KV-idle-check.md): one all-HWcc ladder run; CTAG names the Host C-state setting
     : "${CTAG:?}" "${RATES:?}" "${KEYS:?}"

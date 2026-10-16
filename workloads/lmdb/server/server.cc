@@ -7,9 +7,9 @@
 // Threads: listen, one reader per connection, --get-threads get workers (reader slots 0..n-1 of this node), one
 // writer. Backend (--backend plain|megalon): Server<Backend> is compiled once per backend.
 // Per-operation split (MOT1 v6 Fig 2; workloads/kv/server/opsplit.h): every get / update is one operation, T = rdtsc
-// from the start of its transaction (after request validation) to the end of its thread's work on it (get: renew ..
-// reply .. reset; update: txn_begin incl. the cross-node writer-lock wait .. commit .. reply), C = the thread's
-// coherence time inside it (Popcorn swmc_acct for --backend plain, Megalon thread_coh for --backend megalon).
+// server processing from request dispatch (after request validation) to response ready, EXCLUDING the reply send and
+// the read-txn reset (same definition in every workload): get = renew + mdb_get; update = txn_begin incl. the
+// cross-node writer-lock wait + put + commit (published), C = the thread's coherence time inside it (Popcorn swmc_acct for --backend plain, Megalon thread_coh for --backend megalon).
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <signal.h>
@@ -169,6 +169,7 @@ class Server {
       if ((rc = mdb_txn_renew(txn)) != 0) die(std::string("txn_renew: ") + mdb_strerror(rc));
       MDB_val k{rq.klen, j.p.data() + sizeof(rq)}, v{0, nullptr};
       rc = mdb_get(txn, node_.dbi(), &k, &v);
+      ot.end(kGetOp);  // response ready (value located in the txn's view); reply and reset excluded
       GetResp rs{mdb_txn_id(txn), 0, 0};
       if (rc == 0) {
         rs.vlen = uint32_t(v.mv_size);
@@ -176,7 +177,6 @@ class Server {
         // the value is this txn's view (in place for plain, the txn's page copy for Megalon); valid until reset
         j.c->reply(frame::kStatusOk, j.h.req_id, &rs, sizeof(rs), v.mv_data, rs.vlen);
         mdb_txn_reset(txn);
-        ot.end(kGetOp);
         st.gets.fetch_add(1, std::memory_order_relaxed);
       } else {
         mdb_txn_reset(txn);
@@ -189,7 +189,6 @@ class Server {
           std::fprintf(stderr, "lmdb-server: get: %s\n", mdb_strerror(rc));
           j.c->reply(frame::kStatusServerError, j.h.req_id, nullptr, 0);
         }
-        ot.end(kGetOp);
       }
       st.ns.fetch_add(now_ns() - t0, std::memory_order_relaxed);
     }
@@ -230,15 +229,16 @@ class Server {
       UpdateResp rs{mdb_txn_id(txn), uint32_t(lock_ns / 1000), 0};
       if (rc == 0 && after.ms_entries != before.ms_entries) {  // the key did not exist: not an update
         mdb_txn_abort(txn);
+        ot.end(kUpdateOp);  // response ready; reply excluded
         wst_.not_found.fetch_add(1, std::memory_order_relaxed);
         rs.service_us = uint32_t((now_ns() - t0) / 1000);
         j.c->reply(kStatusNotFound, j.h.req_id, &rs, sizeof(rs));
-        ot.end(kUpdateOp);
         continue;
       }
       const uint64_t c0 = now_ns();
       if (rc == 0) rc = mdb_txn_commit(txn);  // pages -> meta slot -> committed -> unlock
       else mdb_txn_abort(txn);
+      ot.end(kUpdateOp, rc == 0 ? rq.vlen : 0);  // response ready (committed and published); reply excluded
       wst_.commit_ns.fetch_add(now_ns() - c0, std::memory_order_relaxed);
       wst_.lock_ns.fetch_add(lock_ns, std::memory_order_relaxed);
       rs.service_us = uint32_t((now_ns() - t0) / 1000);
@@ -252,7 +252,6 @@ class Server {
         node_.hwcc().nodes[o_.n.node].updates++;
         j.c->reply(frame::kStatusOk, j.h.req_id, &rs, sizeof(rs));
       }
-      ot.end(kUpdateOp, rc == 0 ? rq.vlen : 0);
       wst_.ns.fetch_add(now_ns() - t0, std::memory_order_relaxed);
     }
   }

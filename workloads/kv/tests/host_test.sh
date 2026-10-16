@@ -6,7 +6,8 @@
 # Per-operation split (opsplit.h, MOT1 v6 Fig 2): tools/opsplit.py over the stats snapshots must give get and put rows
 # with T > 0, and at the clean stop opt.get.ops / opt.put.ops must equal the gets / puts counters on every node.
 # C on the Host: swmc_acct unsupported (no Popcorn build 9) and, until Megalon build 71, the v1 object shim -> C = 0,
-# c_supported = 0 (EXPECT_COH=1 requires c_supported = 1 on the megalon backend: a v2 shim with thread_coh).
+# c_supported = 0. EXPECT_COH=1 requires c_supported = 1 (a v2 shim with thread_coh) and reports the KNOWN GAP when C = 0
+# for every op (Megalon <= 72 does not time the KV Put/Get path); EXPECT_COH=2 (from Megalon 73) also requires C > 0.
 # usage: host_test.sh <kv build dir> <loadgen build dir> <work dir (new)> [plain|megalon]
 # env: KEYS (1000000), MIX (mixed=1; or get=..,put=..), PUT_RATIO (0.5, mixed stream), RATES (2000,5000 requests/s), BATCH (32), STEP_S (5), THREADS (6), LOADER (node0),
 #      TRACE (0), LG_ARGS (loadgen mode args, default --mode fixed --rates $RATES), NEG (0: 1 = second generator run that must fail the value check), PORT (27300), CPUS0/CPUS1/CPUSL, KEEP_IMG (0),
@@ -90,7 +91,7 @@ python3 -I "$W/tools/opsplit.py" "$WD/lg" --system "$OSYS" --out "$WD/opsplit.cs
 OPSPLIT=$(python3 -I - "$WD/opsplit.csv" "$MIX" "$PUT_RATIO" "${EXPECT_COH:-0}" <<'PY'
 import csv, sys
 rows = list(csv.DictReader(open(sys.argv[1])))
-mix, pr, want_coh = sys.argv[2], float(sys.argv[3]), sys.argv[4] == "1"
+mix, pr, want_coh, want_c = sys.argv[2], float(sys.argv[3]), sys.argv[4] in ("1", "2"), sys.argv[4] == "2"
 ops = {r["op"] for r in rows}
 need = {"get", "put"} if (mix != "mixed=1" or 0 < pr < 1) else ({"put"} if pr == 1 else {"get"})
 bad = []
@@ -102,6 +103,10 @@ for r in rows:
     c, t = float(r["C_us_per_op[derived]"]), float(r["T_us_per_op[measured]"])
     if c < 0 or (int(r["ops[measured]"]) and c > t * 1.0001 + 0.01): bad.append(f"step {r['step']} {r['op']}: C {c} outside [0, T {t}]")
     if want_coh and r["c_supported"] != "1": bad.append(f"step {r['step']} {r['op']}: c_supported 0")
+    if want_c and int(r["ops[measured]"]) and c <= 0: bad.append(f"step {r['step']} {r['op']}: C = 0 (Megalon KV path not timed)")
+gap = want_coh and not want_c and all(float(r["C_us_per_op[derived]"]) == 0 for r in rows)
+if gap: print("KNOWN GAP: Megalon C = 0 for every KV op (Megalon <= 72 times object sections only, not rackobj Put/Get; "
+              "EXPECT_COH=2 requires C > 0 from Megalon 73)", file=sys.stderr)
 summ = " ".join(f"{r['step']}:{r['op']}:n={r['ops[measured]']}:T={r['T_us_per_op[measured]']}us:C={r['C_us_per_op[derived]']}us:sup={r['c_supported']}" for r in rows)
 print(("OK " if not bad else "BAD " + "; ".join(bad) + " | ") + summ)
 PY

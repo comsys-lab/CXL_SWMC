@@ -12,7 +12,8 @@
 #   SEED (20261016), LOG (0; 1 = loadgen log=1 + check_log.py, functional runs), GATE=0 (skip the Host gate; refused
 #   unless KIND=functional), VM_PLAIN (/home/comsys/lmdb/plain), VM_MEG (/home/comsys/lmdb/megalon), IMAGE
 #   (/home/comsys/lmdb/img-$RECORDS on node 0), PLAIN_BUILD (builds/lmdb/5), MEG_BUILD (builds/lmdb-megalon/5, Megalon 72),
-#   LOADGEN_BUILD (builds/lmdb-loadgen/4), RUN_KIND override.
+#   LOADGEN_BUILD (builds/lmdb-loadgen/4), RUN_KIND override. LOCK_OWNER (required): the calling block must hold the
+#   measurement lock (experiments/vectordb/host-gate.sh lock <owner>); refused otherwise.
 # Prints "PILOTRUN <name> OK|NOTE|STOP <reason>"; exit 0 for OK/NOTE, 1 for STOP.
 set -uo pipefail
 NAME=$1 E=$2
@@ -64,6 +65,10 @@ IPS=(192.168.122.100 192.168.122.101)
 servers_gone() { for ip in "${IPS[@]}"; do [ "$($SSH comsys@$ip 'pgrep -c -x lmdb-server' < /dev/null)" = 0 ] || return 1; done; }
 echo "$(date -Is) $NAME: SYS=$SYS UPDATE_RATIO=$UPDATE_RATIO KIND=$KIND RATE=${RATE:-} RECORDS=$RECORDS MAX_PAGES=$MAX_PAGES LOG=$LOG SEED=$SEED"
 servers_gone || stop "an lmdb-server is running before the run"
+# the caller (f1-block.sh or a later block) holds the measurement/VM lock for the whole block (host-gate.sh lock)
+LOCKF=$P/workspaces/MEASUREMENT.lock
+grep -q "^owner=${LOCK_OWNER:?LOCK_OWNER = owner of the measurement lock held by the calling block} " "$LOCKF" 2>/dev/null \
+  || stop "measurement lock not held by $LOCK_OWNER ($(cat "$LOCKF" 2>/dev/null))"
 if [ "${GATE:-1}" = 1 ]; then bash $P/CXL_SWMC/experiments/vectordb/host-gate.sh check "$E/gate-$NAME.txt" || stop "host gate"; fi
 T0=$(date +%s)
 bash $X/run.sh "$NAME" "$E" -- "${LG[@]}"

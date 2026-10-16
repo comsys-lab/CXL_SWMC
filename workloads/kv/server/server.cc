@@ -485,8 +485,9 @@ class Server {
     return v;
   }
 
-  // One library Get / Put = one operation of the per-operation split (opsplit.h: T = rdtsc around the library call,
-  // C = this thread's coherence time inside it; every operation, every backend). Returns 1 on a miss (value zeroed).
+  // One library Get / Put = one operation of the per-operation split (opsplit.h: T = rdtsc around the library call =
+  // server processing from dispatch to response ready (the get copies the value into the reply buffer), excluding the
+  // reply send, the definition of every workload; C = this thread's coherence time inside it; every op, every backend). Returns 1 on a miss (value zeroed).
   uint32_t do_get(uint64_t key, uint8_t *v, WorkerStats &ws, opsplit::Thread &ot, TraceBuf *tb) {
     const uint64_t t0 = tb ? now_ns() : 0;
     ot.begin();

@@ -19,7 +19,7 @@ base = {"opt.tsc_hz": 2e9, "opt.pop_threads": 4, "opt.meg_coh": 1, "opt.meg_chec
 for t in (0, 1):
     b = dict(base, **{"opt.get.ops": 100, "opt.get.t_ns": 1000, "opt.put.ops": 0, "opt.put.t_ns": 0})
     e = dict(base, **{"opt.get.ops": 1100, "opt.get.t_ns": 1000 + 1000 * 10000,   # 10 us per get
-                      "opt.get.pop.is_ns": 1000 * 2000, "opt.get.pop.ipi_ns": 1000 * 500, "opt.get.pop.is_cnt": 500,
+                      "opt.get.pop.is_ns": 1000 * 2000, "opt.get.pop.ipi_ns": 1000 * 500, "opt.get.pop.is_cnt": 500, "opt.get.pop.nontrans_ns": 1000 * 9000,
                       "opt.get.meg.check_ns_sampled": 1000 * 10, "opt.get.meg.check_sampled": 15, "opt.get.meg.read_sections": 960, "opt.get.meg.stale_ns": 1000 * 1000,
                       "opt.get.meg.switch_rw_ns": 7777,
                       "opt.put.ops": 10, "opt.put.t_ns": 10 * 50000, "opt.put.mod_bytes": 10 * 1024,
@@ -48,6 +48,7 @@ eq(p["get"]["T_us_per_op[measured]"], 10, "T")
 eq(p["get"]["C_us_per_op[derived]"], 2.5, "pop C = is + ipi")
 eq(p["get"]["rest_us_per_op[derived]"], 7.5, "rest")
 eq(p["get"]["pop_is_per_op[measured]"], 0.5, "pop is count")
+eq(p["get"]["pop_nontrans_us_per_op[measured]"], 9, "nontrans exported (not in C)")
 eq(p["get"]["T_max_us[measured]"], 99, "T max")
 m = run("Megalon")
 eq(m["get"]["C_us_per_op[derived]"], 0.64 + 1.0, "meg C = check x 64 + stale (switch_rw not added)")
