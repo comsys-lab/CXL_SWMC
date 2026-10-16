@@ -32,7 +32,10 @@ PAGE = 4096
 # CohSnap fields (systems/megalon/shim/megalon_objapi.h v2 thread_coh), check_sample handled separately
 MEG_F = ["read_sections", "write_sections", "check_ns_sampled", "check_sampled", "stale_cnt", "stale_ns", "concur_cnt",
          "concur_ns", "meta_cnt", "meta_ns", "spin_cnt", "spin_ns", "wstart_ns", "switch_rw_cnt", "switch_rw_ns",
-         "reclaim_cnt", "reclaim_ns", "wflush_cnt", "wflush_ns", "wflush_bytes"]
+         "reclaim_cnt", "reclaim_ns", "wflush_cnt", "wflush_ns", "wflush_bytes",
+         # MOT1 v6 §3.1 (user 2026-10-16): validation copy (vector DB, LMDB export it; KV/DLRM have none = 0 by
+         # definition) and the index lookup (Megalon build 74 CohSnap.reserved[7], sampled with the checks; never in C)
+         "vcopy_ns_sampled", "vcopy_sampled", "vcopy_cnt", "lookup_ns_sampled"]
 # swmc_acct (systems/popcorn_new/include/swmc_acct.h): canonical -> (opt name, op name)
 POP_F = {"is_ns": ("is_ns", "fault_ns.is"), "sm_ns": ("sm_ns", "fault_ns.sm"), "wp_ns": ("wp_ns", "fault_ns.wp"),
          "is_cnt": ("is_cnt", "fault_cnt.is"), "sm_cnt": ("sm_cnt", "fault_cnt.sm"), "wp_cnt": ("wp_cnt", "fault_cnt.wp"),
@@ -238,11 +241,17 @@ def check_source(run, steps):
 
 def op_sums(run, steps, op):
     """Sum over the steps and nodes of every canonical per-op quantity plus the v6 derived sums (all in ns or counts):
-      meg_check_est_ns = meg_check_ns_sampled x meg_read_sections / meg_check_sampled   (ratio estimator, per node,
-                         then summed; READ-section checks only; contract CXL_SWMC 2015a31f3: preferred over
-                         x check_sample because each thread's first section is always sampled) [sampled, estimated]
+      meg_check_est_ns = (meg_check_ns_sampled - meg_lookup_ns_sampled) x meg_read_sections / meg_check_sampled
+                         (ratio estimator, per node, then summed; READ-section checks only; contract 2015a31f3; the
+                         index lookup is sampled with the checks and subtracted: all-HWcc does it too, §3.1; before
+                         Megalon build 74 lookup_ns_sampled is absent and the estimate still includes the lookup:
+                         column lookup_not_excluded_nodes) [sampled, estimated]
+      meg_lookup_est_ns = meg_lookup_ns_sampled x meg_read_sections / meg_check_sampled   (reported, never in C)
+      meg_vcopy_est_ns = meg_vcopy_ns_sampled x meg_vcopy_cnt / meg_vcopy_sampled   (validation copy, ratio estimator
+                         per node; workloads without the keys (KV, DLRM) have no validation copy: 0 by definition;
+                         vcopy_ns_sampled > 0 without vcopy_sampled/vcopy_cnt is marked: vcopy_est_missing_nodes)
       C_pop  = pop_is_ns + pop_sm_ns + pop_wp_ns + pop_ipi_ns                                  (draft §3, §6.1)
-      C_meg  = meg_check_est_ns + meg_stale_ns + meg_concur_ns + meg_meta_ns + meg_spin_ns + meg_wstart_ns
+      C_meg  = meg_check_est_ns + meg_vcopy_est_ns + meg_stale_ns + meg_concur_ns + meg_meta_ns + meg_spin_ns + meg_wstart_ns
                + meg_wflush_ns    (switch_rw/reclaim are inside wstart: not added; draft §3.1, §4.1)
       C      = C_pop (pop) | C_meg (mg) | 0 (hw: no coherence actions; measured values kept in the audit columns)
     Refuses a pop/mg run whose nodes do not report exactly that coherence source (check_source).
@@ -269,17 +278,31 @@ def op_sums(run, steps, op):
                       file=sys.stderr)
                 vals["meg_check_est_ns"] = 0
             else:
-                vals["meg_check_est_ns"] = (vals.get("meg_check_ns_sampled", 0) * vals.get("meg_read_sections", 0)
-                                            / vals["meg_check_sampled"] if vals.get("meg_check_sampled") else 0)
+                cs = vals.get("meg_check_sampled", 0)
+                lk = vals.get("meg_lookup_ns_sampled")
+                if vals.get("meg_check_ns_sampled") and lk is None:
+                    out["lookup_not_excluded_nodes"] = out.get("lookup_not_excluded_nodes", 0) + 1
+                f = vals.get("meg_read_sections", 0) / cs if cs else 0
+                vals["meg_check_est_ns"] = (vals.get("meg_check_ns_sampled", 0) - (lk or 0)) * f
+                vals["meg_lookup_est_ns"] = (lk or 0) * f
+            if vals.get("meg_vcopy_ns_sampled") and not (vals.get("meg_vcopy_sampled") and "meg_vcopy_cnt" in vals):
+                out["vcopy_est_missing_nodes"] = out.get("vcopy_est_missing_nodes", 0) + 1
+                print(f"WARNING {run.path} step {st}: op {op} has meg_vcopy_ns_sampled but no vcopy_sampled/vcopy_cnt;"
+                      " validation-copy estimate counted as 0 (column vcopy_est_missing_nodes)", file=sys.stderr)
+                vals["meg_vcopy_est_ns"] = 0
+            else:
+                vs = vals.get("meg_vcopy_sampled", 0)
+                vals["meg_vcopy_est_ns"] = vals.get("meg_vcopy_ns_sampled", 0) * vals.get("meg_vcopy_cnt", 0) / vs if vs else 0
             for c, v in vals.items():
                 if c != "meg_check_sample":
                     out[c] = out.get(c, 0) + v
             out["meg_check_sample"] = vals.get("meg_check_sample", out.get("meg_check_sample", 0))
     g = lambda k: out.get(k, 0)  # noqa: E731
     out["C_pop"] = g("pop_is_ns") + g("pop_sm_ns") + g("pop_wp_ns") + g("pop_ipi_ns")
-    out["C_meg"] = (g("meg_check_est_ns") + g("meg_stale_ns") + g("meg_concur_ns") + g("meg_meta_ns") + g("meg_spin_ns")
+    out["C_meg"] = (g("meg_check_est_ns") + g("meg_vcopy_est_ns") + g("meg_stale_ns") + g("meg_concur_ns") + g("meg_meta_ns") + g("meg_spin_ns")
                     + g("meg_wstart_ns") + g("meg_wflush_ns"))
-    out.setdefault("check_est_missing_nodes", 0)
+    for k in ("check_est_missing_nodes", "vcopy_est_missing_nodes", "lookup_not_excluded_nodes"):
+        out.setdefault(k, 0)
     out["C"] = {"pop": out["C_pop"], "mg": out["C_meg"], "hw": 0}[run.system]
     if "ops" not in out or "t_ns" not in out:
         sys.exit(f"{run.path}: operation {op!r} has no count/time keys in steps {steps} (OPKEYS)")
@@ -375,12 +398,16 @@ def stacked(path, groups, components, ylabel, hatch_from=None, ref=None, logy=Fa
     from matplotlib.lines import Line2D
     plt = ps.plt
     n = len(components)
+    def grays(k, dark=0):  # k evenly spaced grays from white to the gray level `dark` (0 = black)
+        return ["#%02x%02x%02x" % ((round(255 - (255 - dark) * i / max(k - 1, 1)),) * 3) for i in range(k)]
     if n == 1:
         cols = ["#7f7f7f"]
+    elif hatch_from is not None:  # two families: plain grays, then hatched grays no darker than #595959 (hatch visible)
+        cols = (ps.STACK[-hatch_from:] if hatch_from <= 5 else grays(hatch_from)) + grays(n - hatch_from, 0x59)
     elif n <= 5:
         cols = ps.STACK[-n:]
     else:  # more components than paper_style gray levels: evenly spaced grays, white -> black
-        cols = ["#%02x%02x%02x" % ((round(255 * (1 - i / (n - 1))),) * 3) for i in range(n)]
+        cols = grays(n)
     import matplotlib.patheffects as pe
     halo = [pe.Stroke(linewidth=7, foreground="white"), pe.Normal()]  # reference marker visible on dark bars
     nb = sum(len(b) for _, b in groups)

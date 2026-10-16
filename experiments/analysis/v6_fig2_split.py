@@ -5,7 +5,8 @@ at each measurement load (reports/MOT1-v6-redesign-draft.md §3).
   T_o   = (1/N_o) sum_ops sum_threads (end - start)            = t_ns / ops            (ops, t_ns summed over nodes)
   C_o   = (1/N_o) sum_ops sum_threads delta C                  = C / ops
           C: Popcorn  pop_is_ns + pop_sm_ns + pop_wp_ns + pop_ipi_ns (swmc_acct, kernel clock)
-             Megalon  meg_check_ns_sampled x read_sections / check_sampled + stale + concur + meta + spin + wstart + wflush (CohSnap)
+             Megalon  (check_ns_sampled - lookup_ns_sampled) x read_sections / check_sampled
+                      + vcopy_ns_sampled x vcopy_cnt / vcopy_sampled + stale + concur + meta + spin + wstart + wflush (CohSnap)
              all-HWcc 0 (no coherence actions)
   Rest  = T_o - C_o
   Bars normalized to all-HWcc T_o of the same operation and load: part / T_o(hw, o, load)
@@ -88,7 +89,7 @@ def main():
                 rows.append([load, op, v6.SYSTEMS[k], v6.r(rates[load][k], 2), ",".join(map(str, steps)), nodes, s["ops"], v6.r(T, 1), v6.r(C, 1),
                              v6.r(rest, 1), v6.r(base, 1), v6.r(nC), v6.r(nR), v6.r(v6.div(T, base)), v6.r(cexp, 1),
                              v6.r(v6.div(s["C_pop"], s["ops"]), 1), v6.r(v6.div(s["C_meg"], s["ops"]), 1),
-                             s["check_est_missing_nodes"],
+                             s["check_est_missing_nodes"], s["vcopy_est_missing_nodes"], s["lookup_not_excluded_nodes"],
                              v6.r(v6.div(s["pop_nontrans_ns"], s["ops"]), 1) if "pop_nontrans_ns" in s else "", run.path])
             groups.append((op, bars))
         png = os.path.join(a.out, f"{a.tag}-fig2-{load}.png")
@@ -98,7 +99,8 @@ def main():
     v6.write_csv(csvp, [
         ("figure", f"MOT1 v6 Fig 2 coherence management vs rest per operation ({a.tag}); PNGs {a.tag}-fig2-<load>.png"),
         ("formula", "T_o = t_ns / ops; C_o = C / ops with C = pop_is_ns+pop_sm_ns+pop_wp_ns+pop_ipi_ns (Popcorn) | "
-                    "meg_check_ns_sampled*meg_read_sections/meg_check_sampled (per node)+meg_stale_ns+meg_concur_ns+meg_meta_ns+meg_spin_ns+meg_wstart_ns"
+                    "(meg_check_ns_sampled-meg_lookup_ns_sampled)*meg_read_sections/meg_check_sampled+meg_vcopy_ns_sampled*meg_vcopy_cnt/"
+                    "meg_vcopy_sampled (per node)+meg_stale_ns+meg_concur_ns+meg_meta_ns+meg_spin_ns+meg_wstart_ns"
                     "+meg_wflush_ns (Megalon) | 0 (all-HWcc); rest = T_o - C_o; norm_* = part / T_o(all-HWcc, same op, "
                     "same load); sums over the listed steps and all nodes"),
         ("sources", "stats/ snapshot deltas (loadgen --stats-op, stats_delta.py): " + "; ".join(
@@ -111,7 +113,8 @@ def main():
                      if "L1" in rates and "L2" in rates else "")),
         ("inputs", "; ".join(f"{l}:{k} {r.path} steps {s}" for l, e in loads.items() for k, (r, s) in e.items())),
     ], ["load", "op", "system", "offered", "steps", "node_windows", "ops", "T_ns", "C_ns", "rest_ns", "hw_T_ns", "norm_C",
-        "norm_rest", "norm_T", "c_exported_ns", "C_pop_ns", "C_meg_ns", "check_est_missing_nodes", "nontrans_ns_not_in_C", "run"], rows)
+        "norm_rest", "norm_T", "c_exported_ns", "C_pop_ns", "C_meg_ns", "check_est_missing_nodes", "vcopy_est_missing_nodes",
+        "lookup_not_excluded_nodes", "nontrans_ns_not_in_C", "run"], rows)
     print(f"-> {csvp}")
 
 

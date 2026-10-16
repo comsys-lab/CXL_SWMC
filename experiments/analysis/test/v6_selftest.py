@@ -109,6 +109,8 @@ def main():
     check(f("get", "Megalon", "C_ns") == (1000 * 64 + 100_000) / 1000, "fig2 meg get C = check x read_sections / check_sampled + stale (per node)")
     check(f("put", "Megalon", "C_ns") == 500 and f("put", "Megalon", "ops") == 200, "fig2 meg put C = wstart + wflush; ops over 2 nodes")
     check(f("get", "Popcorn", "c_exported_ns") == f("get", "Popcorn", "C_ns"), "fig2 audit c_ns")
+    check(d[("get", "Megalon")]["vcopy_est_missing_nodes"] == "0" and d[("get", "Megalon")]["lookup_not_excluded_nodes"] == "2",
+          "fig2: KV has no validation copy (0, not missing); no lookup key (pre-74) is marked")
     check(os.path.exists(os.path.join(out, "kv-fig2-L1.png")), "fig2 png")
     # ---- recsys-style (op.*): Popcorn, Fig 4a/4b; op.query.n must be differenced (counter), check_sample a gauge
     q = {"op.query.n": 200, "op.query.t_ns": 20_000_000, "op.query.c_ns": 0, "op.query.pc.fault_ns.is": 2_000_000,
@@ -167,7 +169,9 @@ def main():
     # ---- vector DB Megalon, Fig 3a/3b (op.* names search/update), 3c trace
     for share in (0, 10):
         v = {"op.search.n": 1000, "op.search.t_ns": 9e6, "op.search.mg.check_ns_sampled": 1000,
-             "op.search.mg.read_sections": 640, "op.search.mg.check_sampled": 10, "op.search.mg.stale_ns": 2e6,
+             "op.search.mg.read_sections": 640, "op.search.mg.check_sampled": 10,
+             "op.search.mg.lookup_ns_sampled": 200, "op.search.mg.vcopy_ns_sampled": 3000, "op.search.mg.vcopy_sampled": 30,
+             "op.search.mg.vcopy_cnt": 3000, "op.search.mg.stale_ns": 2e6,
              "op.search.mg.stale_cnt": 20, "op.search.mg.concur_ns": 1e6, "op.search.mg.meta_ns": 0, "op.search.mg.spin_ns": 5e5}
         if share:
             v.update({"op.update.n": 100, "op.update.t_ns": 5e6, "op.update.mg.wstart_ns": 1e5, "op.update.mg.wflush_ns": 4e5,
@@ -177,7 +181,10 @@ def main():
     r, _ = rows(os.path.join(out, "vdb-fig3a.csv"))
     x = r[1]
     check(x["check_est_missing_nodes"] == "0", "fig3a check estimate inputs present")
-    check(float(x["check_us"]) == 0.064 and float(x["stale_A_us"]) == 2 and float(x["waits_D_us"]) == 0.5, "fig3a search parts")
+    check(float(x["vcopy_us"]) == 0.3 and float(x["lookup_us_not_in_C"]) == 0.0128 and x["lookup_not_excluded_nodes"] == "0",
+          "fig3a validation copy = 3000 x 3000/30 / 1000 ops; lookup 200 x 64 / 1000 reported, not in C")
+    check(float(x["check_us"]) == 0.0512, "fig3a check = (1000 - 200) x 640/10 / 1000 ops (lookup excluded)")
+    check(float(x["stale_A_us"]) == 2 and float(x["waits_D_us"]) == 0.5, "fig3a search parts")
     check(float(x["wstart_us"]) == 1 and float(x["wflush_us"]) == 4 and r[0]["wflush_us"] == "", "fig3a update parts")
     mkrun(os.path.join(S, "vdb-miss"), ("search", 99, 100), curve,
           {1: [pair({"op.search.n": 1000, "op.search.t_ns": 9e6, "op.search.mg.check_ns_sampled": 1000}, {"opt.meg_coh": 1})]})

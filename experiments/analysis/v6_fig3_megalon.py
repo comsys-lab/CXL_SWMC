@@ -2,8 +2,13 @@
 """MOT1 v6 Fig 3 (H2): Megalon detail, vector DB, update share 0/5/10/20/50% (reports/MOT1-v6-redesign-draft.md §4).
 
 3a  Megalon coherence time per operation by mechanism (stacked durations, us per operation), per update share:
-      search bar:  section checks  meg_check_ns_sampled x read_sections / check_sampled / N_search  [sampled, ratio
-                                   estimator per node; read-section checks only (contract 2015a31f3)]
+      search bar:  section checks  (meg_check_ns_sampled - meg_lookup_ns_sampled) x read_sections / check_sampled
+                                   / N_search  [sampled, ratio estimator per node; read-section checks only (contract
+                                   2015a31f3); index lookup excluded (all-HWcc does it too, §3.1; CSV lookup_us, never
+                                   drawn; build < 74 has no lookup key: lookup_not_excluded_nodes > 0)]
+                   validation copy meg_vcopy_ns_sampled x vcopy_cnt / vcopy_sampled / N_search  [sampled, ratio
+                                   estimator per node; copy into the scratch buffer kept only because the data must
+                                   outlive the read section (§3.1)]
                    stale copy (A)  meg_stale_ns  / N_search
                    concurrent write (B) meg_concur_ns / N_search
                    metadata change (C)  meg_meta_ns   / N_search
@@ -41,7 +46,8 @@ import argparse, bisect, csv, glob, os, re, sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import v6_common as v6  # noqa: E402
 
-A_SEARCH = [("Section checks", "meg_check_est_ns", "sampled (ratio estimate)"), ("Stale copy (A)", "meg_stale_ns", "measured"),
+A_SEARCH = [("Section checks", "meg_check_est_ns", "sampled (ratio estimate)"),
+            ("Validation copy", "meg_vcopy_est_ns", "sampled (ratio estimate)"), ("Stale copy (A)", "meg_stale_ns", "measured"),
             ("Concurrent write (B)", "meg_concur_ns", "measured"), ("Metadata change (C)", "meg_meta_ns", "measured"),
             ("Contended waits (D)", "meg_spin_ns", "measured")]
 A_UPDATE = [("Write start", "meg_wstart_ns", "measured"), ("Write-end flush", "meg_wflush_ns", "measured")]
@@ -81,29 +87,34 @@ def fig_a(a):
         bars = [("search", None if sv[0] is None else sv + [0.0] * len(A_UPDATE)),
                 ("update", None if uv[0] is None else [0.0] * n + uv)]
         groups.append((f"{share:g}%", bars))
-        rows.append([share, s["ops"] if s else 0, u["ops"] if u else 0] + [v6.r(v, 3) for v in sv + uv]
+        rows.append([share, s["ops"] if s else 0, u["ops"] if u else 0] + [v6.r(v, 4) for v in sv + uv]
                     + [v6.r(v6.div(s.get("meg_stale_cnt", 0), s["ops"]) if s else None, 5),
                        v6.r(v6.div(s.get("meg_concur_cnt", 0), s["ops"]) if s else None, 5),
                        v6.r(v6.div(s.get("meg_meta_cnt", 0), s["ops"]) if s else None, 5),
                        v6.r(v6.div(s.get("meg_spin_cnt", 0), s["ops"]) if s else None, 5),
                        v6.r(v6.div(u.get("meg_switch_rw_ns", 0), u["ops"]) / 1e3 if u and u["ops"] else None, 3),
                        v6.r(v6.div(u.get("meg_reclaim_ns", 0), u["ops"]) / 1e3 if u and u["ops"] else None, 3),
-                       s["check_est_missing_nodes"] if s else "", ",".join(map(str, steps)), run.path])
+                       v6.r(v6.div(s.get("meg_lookup_est_ns", 0), s["ops"]) / 1e3 if s and s["ops"] else None, 4),
+                       s["check_est_missing_nodes"] if s else "", s["vcopy_est_missing_nodes"] if s else "",
+                       s["lookup_not_excluded_nodes"] if s else "", ",".join(map(str, steps)), run.path])
     png, csvp = (os.path.join(a.out, f"{a.tag}-fig3a.{e}") for e in ("png", "csv"))
     v6.stacked(png, groups, comps, "Coherence time\nper operation (us)", hatch_from=len(A_SEARCH),
                xlabel="Update share")
     v6.write_csv(csvp, [
         ("figure", f"MOT1 v6 Fig 3a Megalon coherence time per operation by mechanism ({a.tag}); PNG {os.path.basename(png)}"),
         ("formula", "search components = sum over steps and nodes of the search operation's CohSnap delta / N_search; "
-                    "update components = update operation's delta / N_update; section checks = meg_check_ns_sampled x "
-                    "read_sections / check_sampled (per node, read sections only); us = ns / 1000; *_per_search counts = events / N_search"),
+                    "update components = update operation's delta / N_update; section checks = (meg_check_ns_sampled - "
+                    "meg_lookup_ns_sampled) x read_sections / check_sampled (per node, read sections only); validation "
+                    "copy = meg_vcopy_ns_sampled x vcopy_cnt / vcopy_sampled (per node); lookup_us = meg_lookup_ns_sampled "
+                    "x read_sections / check_sampled / N_search (reported only, not in C, not drawn); us = ns / 1000; *_per_search counts = events / N_search"),
         ("sources", "; ".join(f"{c}={'|'.join(sorted(k))}" for c, k in sorted(used_all.items()))),
         ("tags", "; ".join(f"{n}: {t}" for n, _, t in A_SEARCH + A_UPDATE) + "; counts measured; all ratios derived"),
         ("inputs", "Megalon runs per update share, see the run column"),
     ], ["update_share_pct", "N_search", "N_update"] + [f"{c}_us" for c in
-        ("check", "stale_A", "concur_B", "meta_C", "waits_D")] + ["wstart_us", "wflush_us", "stale_A_per_search",
+        ("check", "vcopy", "stale_A", "concur_B", "meta_C", "waits_D")] + ["wstart_us", "wflush_us", "stale_A_per_search",
         "concur_B_per_search", "meta_C_per_search", "waits_D_per_search", "switch_rw_us_per_update",
-        "reclaim_us_per_update", "check_est_missing_nodes", "steps", "run"], rows)
+        "reclaim_us_per_update", "lookup_us_not_in_C", "check_est_missing_nodes", "vcopy_est_missing_nodes",
+        "lookup_not_excluded_nodes", "steps", "run"], rows)
     print(f"-> {png}\n-> {csvp}")
 
 
