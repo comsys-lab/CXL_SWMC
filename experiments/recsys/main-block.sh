@@ -8,7 +8,9 @@
 # env (required): C8 (= builds/popcorn_new/8/deploy-v3), K8, GT8, RECV_MODE, D (inputs dir with MANIFEST.txt),
 #   VM_PLAIN (guest dir: build-3 server, all-HWcc + page MSI), VM_MEG (guest dir: Megalon build + recsys-2vm.yaml),
 #   MEG_BUILD (recsys-megalon build on builds/megalon/70), LOADGEN; optional SEED (20261016), UPD_RATE (2100),
-#   ROUNDS (3), FIXED (1; 0 = no fixed-load window), XT (server lifetime bound, s, default 28800).
+#   ROUNDS (3), FIXED (1; 0 = no fixed-load window), XT (server lifetime bound, s, default 28800),
+#   SYSTEMS (subset of "hw pop mg", seeded order kept), SLO_MS_FROM (slo.txt of an earlier block; required when hw is
+#   not in SYSTEMS: its slo_ms is the block SLO), L_FROM (fixed-load-L.txt; needed then only with FIXED=1).
 # Load once per system (recorded exception to "every run starts from the initial image"): per system one server
 # lifetime (session.sh) with, in this order,
 #   warmup 1 query/s + the updater, 10 s + 70 s, unmeasured (results kept, never used): after the server's own read of
@@ -36,12 +38,24 @@ P=/home/comsys/sungsu/destijl-control X=$P/CXL_SWMC/experiments/recsys G=$P/CXL_
 MB=$MEG_BUILD SEED=${SEED:-20261016} UPD_RATE=${UPD_RATE:-2100} ROUNDS=${ROUNDS:-3} FIXED=${FIXED:-1} XT=${XT:-28800}
 T_MS=60000 SLO_FACTOR=${SLO_FACTOR:-5} SLO_MS=""
 export SLO_MS SLO_RULE="pending: ${SLO_FACTOR} x all-HWcc query p99 at 1 query/s (gate window)"
+if [[ " ${SYSTEMS:-hw pop mg} " != *" hw "* ]]; then  # imported block SLO (rerun without all-HWcc)
+  SLO_MS=$(sed -n 's/^slo_ms=\([0-9.]*\) .*/\1/p' "$SLO_MS_FROM" | head -1)
+  awk -v x="$SLO_MS" 'BEGIN{exit !(x > 0)}' || { echo "SEQUENCE STOP: no slo_ms in $SLO_MS_FROM"; exit 2; }
+  SLO_RULE="imported from $SLO_MS_FROM ($(sed -n 's/^slo_ms=[0-9.]* rule=//p' "$SLO_MS_FROM" | head -1))"
+fi
 HOST_PLAIN=$P/builds/recsys/3/bin/recsys-server
 SSH="ssh -o BatchMode=yes -o ConnectTimeout=8"
 IPS=(192.168.122.100 192.168.122.101)
 OWNER="RECSYS-main-$(basename "$E")"
 [[ $RECV_MODE =~ ^(poll|idle|sleep)$ ]] || { echo "SEQUENCE STOP: bad RECV_MODE"; exit 2; }
 [[ $ROUNDS =~ ^[1-9]$ ]] || { echo "SEQUENCE STOP: bad ROUNDS"; exit 2; }
+# SYSTEMS (subset of "hw pop mg", default all) and SLO_MS_FROM (a previous block's slo.txt; required without hw):
+# a rerun of some systems against the block SLO set by an earlier all-HWcc gate (user 2026-10-16, Megalon rerun)
+for s in ${SYSTEMS:-hw pop mg}; do case $s in hw|pop|mg) ;; *) echo "SEQUENCE STOP: bad SYSTEMS entry $s"; exit 2;; esac; done
+if [[ " ${SYSTEMS:-hw pop mg} " != *" hw "* ]]; then
+  [ -f "${SLO_MS_FROM:-}" ] || { echo "SEQUENCE STOP: SYSTEMS without hw needs SLO_MS_FROM=<slo.txt>"; exit 2; }
+  [ "${FIXED:-1}" = 0 ] || [ -f "${L_FROM:-}" ] || { echo "SEQUENCE STOP: SYSTEMS without hw and FIXED=1 needs L_FROM=<fixed-load-L.txt>"; exit 2; }
+fi
 case $FIXED in 0|1) ;; *) echo "SEQUENCE STOP: bad FIXED"; exit 2;; esac
 grep -q "^megalon_build=$P/builds/megalon/70$" $MB/manifest.txt || { echo "SEQUENCE STOP: $MB is not on builds/megalon/70"; exit 2; }
 [ "$C8" = $P/builds/popcorn_new/8/deploy-v3 ] && [ ! -e $C8/SUPERSEDED.txt ] \
@@ -259,7 +273,15 @@ system() {  # one server lifetime: hw | pop | mg
 }
 echo "$(date -Is) block $OWNER start (git $(git -C $P/CXL_SWMC rev-parse --short HEAD)) K8=$K8 RECV_MODE=$RECV_MODE MEG_BUILD=$MB VM_PLAIN=$VM_PLAIN VM_MEG=$VM_MEG D=$D SEED=$SEED ROUNDS=$ROUNDS FIXED=$FIXED XT=$XT"
 precheck
+if [[ " ${SYSTEMS:-hw pop mg} " != *" hw "* ]]; then
+  { echo "slo_ms=$SLO_MS rule=$SLO_RULE"; echo "imported_file_sha256=$(sha256sum < "$SLO_MS_FROM" | cut -d' ' -f1)"; sed 's/^/imported: /' "$SLO_MS_FROM"; } | tee "$E/slo.txt"
+  [ -z "${L_FROM:-}" ] || { cp "$L_FROM" "$E/fixed-load-L.txt" && echo "L imported from $L_FROM: $(cat "$E/fixed-load-L.txt")"; }
+fi
 ORDER="hw $(shuffle pop mg)"
 echo "system order: $ORDER (all-HWcc first; page MSI / Megalon shuffled with seed $OWNER)" | tee "$E/order.txt"
+if [ -n "${SYSTEMS:-}" ]; then  # subset rerun: keep the seeded order, drop the others
+  O2=""; for s in $ORDER; do [[ " $SYSTEMS " == *" $s "* ]] && O2="$O2 $s"; done; ORDER=${O2# }
+  echo "SYSTEMS=\"$SYSTEMS\" -> run: $ORDER" | tee -a "$E/order.txt"
+fi
 for s in $ORDER; do system $s; done
 echo "$(date -Is) SEQUENCE DONE $OWNER"
