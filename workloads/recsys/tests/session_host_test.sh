@@ -63,7 +63,7 @@ m warmup -- "${LGC[@]}" --mode fixed --rates 1 --warmup-s 2 --step-warmup-s 0 --
 m gate -- "${LGC[@]}" --raw --mode fixed --rates 1 --warmup-s 2 --step-measure-s 10; rc=$?
 [ $rc = 0 ] || bad "gate rc $rc"
 echo "gate: $(python3 "$X/main_util.py" gate "$S/gate/loadgen/steps.jsonl")"
-python3 "$X/main_util.py" gate "$S/gate/loadgen/steps.jsonl" | grep -q '^VALID p99_ms=' || bad "gate not VALID"
+python3 "$X/main_util.py" gate "$S/gate/loadgen/steps.jsonl" | grep -q '^VALID queries_done=' || bad "gate not VALID"
 SLO_MS=$(python3 "$X/main_util.py" slo "$S/gate/loadgen/steps.jsonl" 5) || { bad "no SLO"; SLO_MS=60; }
 export SLO_MS SLO_RULE="5 x gate p99 (Host test)"
 echo "SLO_MS=$SLO_MS"

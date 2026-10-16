@@ -19,7 +19,8 @@
 #   is the caller's --slo argument).
 # SESSION_LOCAL=1 is for Host tests only (tests/session_host_test.sh): guest commands run in a local shell, node k
 # listens on PORT+k, no virsh. Exit codes: 0 ok; 1 loadgen rc != 0 (caller reads summary.json note); 3 precondition
-# (servers gone, not idle, Host build, existing dir); 4 invariant violated; 2 usage.
+# (servers gone, not idle, Host build, existing dir); 4 invariant violated; 5 STATS MISSING (a stats key or file the
+# idle check / invariants need is absent); 2 usage.
 set -uo pipefail
 CMD=${1:-} S=${2:-}
 [ -n "$CMD" ] && [ -n "$S" ] || { sed -n 2,20p "$0" >&2; exit 2; }
@@ -37,7 +38,12 @@ host_check() {  # <log> <tag>: any compiler/linker/build tool on the Host invali
   echo "$(date -Is) $2 builds=[${p//$'\n'/; }] loadavg=$(cut -d' ' -f1-3 /proc/loadavg)" >> "$1"
   [ -z "$p" ] || [ "${RUN_KIND:-measurement}" = functional ] || { echo "Host build running ($2): $p"; return 1; }
 }
-kvget() { sed -n "s/^$2=//p" "$1" | tail -1; }  # kvget <file> <key>
+kvget() { sed -n "s/^$2=//p" "$1" 2>/dev/null | tail -1; }  # kvget <file> <key>
+kvnum() {  # kvnum <var> <file> <key>: integer value or "STATS MISSING <key> in <file>" and exit 5 (never a silent abort)
+  local _kvn; _kvn=$(kvget "$2" "$3")
+  [[ $_kvn =~ ^-?[0-9]+$ ]] || { echo "STATS MISSING $3 in $2"; exit 5; }
+  printf -v "$1" "%s" "$_kvn"
+}
 
 case "$CMD" in
 start)
@@ -134,11 +140,15 @@ measure)
     sleep 5
     for k in "${!NODE[@]}"; do
       python3 "$HERE/stats_snap.py" "${NODE[$k]}:${PORTS[$k]}" "$M/idle$n-b-t$k.txt" > /dev/null || ok=0
-      for key in queries samples rows_written; do [ "$(kvget "$M/idle$n-a-t$k.txt" $key)" = "$(kvget "$M/idle$n-b-t$k.txt" $key)" ] || ok=0; done
-      # updater threads < 0.2 s CPU in the 5 s (rows_written moves only when a round ends; run_ns shows a running one)
-      ub=$(( $(kvget "$M/idle$n-b-t$k.txt" thr.rs-update.run_ns) - $(kvget "$M/idle$n-a-t$k.txt" thr.rs-update.run_ns) ))
-      [ "$ub" -lt 200000000 ] || ok=0
-      [ "$(kvget "$M/idle$n-b-t$k.txt" serve_queue)" = 0 ] || ok=0
+      [ $ok = 1 ] || continue  # a failed snapshot is retried by the next probe (deadline below)
+      for key in queries samples rows_written thr.rs-update.run_ns serve_queue; do
+        kvnum va "$M/idle$n-a-t$k.txt" $key; kvnum vb "$M/idle$n-b-t$k.txt" $key
+        case $key in
+          thr.rs-update.run_ns) ub=$((vb - va)); [ "$ub" -lt 200000000 ] || ok=0;;  # updater < 0.2 s CPU in 5 s
+          serve_queue) [ "$vb" = 0 ] || ok=0;;
+          *) [ "$va" = "$vb" ] || ok=0;;
+        esac
+      done
     done
     echo "$(date -Is) idle probe $n ok=$ok updater_run_ns_5s=${ub:-}" >> "$M/idle.txt"
     [ $ok = 1 ] && break
@@ -178,7 +188,8 @@ measure)
   INV=0
   for k in "${!NODE[@]}"; do
     for key in torn_rows misses update_misses bad_requests; do
-      d=$(( $(kvget "$M/post-t$k.txt" $key) - $(kvget "$M/pre-t$k.txt" $key) ))
+      kvnum va "$M/pre-t$k.txt" $key; kvnum vb "$M/post-t$k.txt" $key
+      d=$((vb - va))
       echo "node$k ${key}_delta=$d" >> "$M/invariants.txt"
       [ "$d" = 0 ] || INV=1
     done

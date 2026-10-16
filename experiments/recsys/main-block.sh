@@ -25,9 +25,10 @@
 #   then page MSI and Megalon in an order shuffled with seed = the block owner (recorded in order.txt).
 # /dev/dax0.0: comsys for all-HWcc / Megalon, root:root 600 before page MSI (p-popcorn-shm.sh precheck; its teardown
 # restores it). Holds workspaces/MEASUREMENT.lock; Host gate before every measurement; stops at the first MAIN STOP.
-# On every exit (finish): stop this block's servers (session dirs and a running --preload-only via its pid file),
+# On every exit (finish, not interruptible): stop this block's servers (session dirs and a running --preload-only via its pid file),
 # tear down page MSI if loaded without "teardown PASS" (instr-on retry), /dev/dax0.0 back to root:root 600
-# UNCONDITIONALLY on both VMs ("ROLLBACK FAIL" if a stat line is not root:root 600), unlock.
+# UNCONDITIONALLY on both VMs ("ROLLBACK FAIL" if a stat line is not root:root 600 or a recsys-server survived), unlock.
+# A measurement whose stats key/file is missing stops the block with "STATS MISSING <key>" (session.sh rc 5).
 set -uo pipefail
 E=${1:?evidence dir}
 P=/home/comsys/sungsu/destijl-control X=$P/CXL_SWMC/experiments/recsys G=$P/CXL_SWMC/experiments/vectordb/host-gate.sh
@@ -90,7 +91,11 @@ dax_root_all() {  # both VMs, always; fresh per-check file per VM; DAXOK=1 only 
   done
 }
 finish() {
+  trap '' INT TERM HUP  # the rollback itself is not interruptible
   stop_servers; shm_cleanup
+  local procs_ok=1
+  servers_gone || procs_ok=0
+  [ $procs_ok = 1 ] || echo "$(date -Is) ROLLBACK FAIL: a recsys-server process survived on a VM (procs != 0; see $E/rollback.out)" | tee -a "$E/rollback.out"
   dax_root_all
   [ $DAXOK = 1 ] && echo "$(date -Is) rollback: dax0.0 root:root 600 on both VMs" | tee -a "$E/rollback.out" \
     || echo "$(date -Is) ROLLBACK FAIL: dax0.0 not root:root 600 on every VM (see $E/rollback.out)" | tee -a "$E/rollback.out"
@@ -142,6 +147,7 @@ measure() {  # session dir, name, loadgen args... -> rc of session.sh measure
   bash $X/session.sh measure "$S" "$n" -- "$@" > "$S.$n.out" 2>&1
   local rc=$?
   tail -2 "$S.$n.out" | sed "s|^|  $(basename "$S")/$n: |"
+  [ $rc = 5 ] && stop "$(basename "$S")/$n: $(grep -m1 '^STATS MISSING' "$S.$n.out") (session.sh rc 5)"
   return $rc
 }
 pop_setup() {  # P-popcorn-deploy §6a cycle with build 8 (init_state=shared), as pilot-run.sh, once per lifetime
@@ -202,7 +208,8 @@ system() {  # one server lifetime: hw | pop | mg
     SLO_MS=$(python3 $X/main_util.py slo "$S/gate/loadgen/steps.jsonl" "$SLO_FACTOR") || stop "no SLO from the all-HWcc gate"
     awk -v x="$SLO_MS" 'BEGIN{exit !(x > 0)}' || stop "bad SLO $SLO_MS"
     SLO_RULE="${SLO_FACTOR} x all-HWcc query p99 at 1 query/s ($S/gate, $(echo "$g" | grep -o 'p99_ms=[^ ]*'))"
-    echo "slo_ms=$SLO_MS rule=$SLO_RULE (user 2026-10-16; deviation from MOT1's 60 ms)" | tee "$E/slo.txt"
+    { echo "slo_ms=$SLO_MS rule=$SLO_RULE (user 2026-10-16; deviation from MOT1's 60 ms)"
+      echo "source_window: $g"; } | tee "$E/slo.txt"  # p99 of ~60 queries = the window max; round overlap recorded
   else
     case "$g" in VALID*) ;; *) echo "MAIN NOTE $s lowest-load window invalid (recorded; the block continues): $g";; esac
   fi
