@@ -5,17 +5,21 @@
 #   1 lmdb-image (N records, MDB_APPEND)
 #   2 lmdb-stress plain: cross-node snapshot isolation under page reuse (both nodes write and read)
 #   3 negative control: node 0's writer ignores node 1's reader slots -> the test must FAIL
-#   4 lmdb-server x2 plain via --preload-only/--preloaded (Popcorn path) + loadgen (update ratio 50%) with log=1,
-#     check_log.py (exact MVCC check), verify op on both nodes, stats op
+#   4 lmdb-server x2 plain via --preload-only/--preloaded (Popcorn path) + loadgen (mixed stream, update_ratio
+#     UPDATE_RATIO, default 0.5) with log=1, check_log.py (exact MVCC check), verify op on both nodes, stats op,
+#     per-operation split (workloads/kv/tools/opsplit.py: get and update rows with T > 0, C within [0, T]; at the
+#     clean stop opt.get.ops = gets + not-found + errors, opt.update.ops = updates + not-found + errors,
+#     opt.update.mod_bytes = 1000 x updates). C = 0 on the Host (no swmc_acct; Megalon v1 shim until build 71;
+#     EXPECT_COH=1 requires c_supported = 1 on the megalon backend)
 #   5 (MEGALON_BUILD set) 2 and 4 with --backend megalon
 # usage: host_test.sh <work dir (new)> <lmdb build dir> <loadgen build dir with the lmdb plugin> [records (100000)]
 #        env: MEGALON_BUILD=<lmdb build with lib/> to add step 5; NEG_BUILD=<dir with bin/lmdb-stress-negative>
-#        CPUS0 / CPUS1 / CPUSL (node0 / node1 / loadgen CPU lists, default Host node1: 16-21 / 22-27 / 28-31)
+#        CPUS0 / CPUS1 / CPUSL (node0 / node1 / loadgen CPU lists, default Host node1: 18-23,50-55 / 24-29,56-61 / 30-31,62-63)
 set -uo pipefail
 WD=$1; B=$(cd "$2" && pwd); LG=$(cd "$3" && pwd); N=${4:-100000}
 HERE=$(cd "$(dirname "$0")" && pwd); W=$(cd "$HERE/.." && pwd)
 NEG=${NEG_BUILD:+$(cd "$NEG_BUILD" && pwd)}; MB=${MEGALON_BUILD:+$(cd "$MEGALON_BUILD" && pwd)}
-C0=${CPUS0:-16-21}; C1=${CPUS1:-22-27}; CL=${CPUSL:-28-31}
+C0=${CPUS0:-18-23,50-55}; C1=${CPUS1:-24-29,56-61}; CL=${CPUSL:-30-31,62-63}  # Megalon: >= 6 CPUs per node (4 readers + writer + its own threads; fewer: readers descheduled, MAP_FULL)
 mkdir "$WD" || exit 2; WD=$(cd "$WD" && pwd); cd "$WD"
 MAXP=$(( N * 6 / 10 + 4096 ))   # ~1.8 x the image's pages: forces freelist page reuse
 RESULT=0
@@ -92,7 +96,7 @@ serve() {  # <tag> <bin dir> <backend> [node0 env...]: servers, loadgen (log=1),
   if ! grep -q READY "$tag.srv0.log" || ! grep -q READY "$tag.srv1.log"; then
     fail "$tag servers not READY"; tail -5 "$tag.srv0.log" "$tag.srv1.log"; pkill -x lmdb-server; return; fi
   taskset -c "$CL" "$LG/loadgen" --workload lmdb --target 127.0.0.1:17100,127.0.0.1:17101 --out "$tag.lg" \
-    --opt records=$N --opt log=1 --mode fixed --rates ${RATES:-500,2000} --mix get=1,update=1 --warmup-s 2 \
+    --opt records=$N --opt log=1 --opt update_ratio=${UPDATE_RATIO:-0.5} --mode fixed --rates ${RATES:-500,2000} --mix mixed=1 --warmup-s 2 \
     --step-warmup-s 1 --step-measure-s 5 --drain-s 5 --stats-op 10 > "$tag.lg.log" 2>&1 || fail "$tag loadgen"
   tail -3 "$tag.lg.log"; cat "$tag.lg/lmdb.txt" | head -8
   python3 -I "$W/tools/check_log.py" "$tag.lg" || fail "$tag check_log"
@@ -103,14 +107,38 @@ serve() {  # <tag> <bin dir> <backend> [node0 env...]: servers, loadgen (log=1),
   done
   "$W/tools/lmdb_ctl.py" 127.0.0.1:17100 stats > "$tag.stats0.txt" || fail "$tag stats"
   grep -E '^(gets|updates|update_lock_ns|update_commit_ns|lmdb\.page_writes|lmdb\.oldest_lag_max|megalon\.(write_sections|flushes|switch_rw))=' "$tag.stats0.txt" | tr '\n' ' '; echo
-  pkill -x lmdb-server; sleep 1
+  local osys=all-HWcc; [ "$be" = megalon ] && osys=Megalon
+  python3 -I "$W/../kv/tools/opsplit.py" "$tag.lg" --system $osys --out "$tag.opsplit.csv" || fail "$tag opsplit"
+  python3 -I - "$tag.opsplit.csv" "${EXPECT_COH:-0}" <<'PY' || fail "$tag opsplit check"
+import csv, sys
+rows = list(csv.DictReader(open(sys.argv[1]))); bad = []
+for o in ("get", "update"):
+    rs = [r for r in rows if r["op"] == o and int(r["ops[measured]"]) > 0]
+    if not rs or any(float(r["T_us_per_op[measured]"]) <= 0 for r in rs): bad.append(f"{o}: no rows with ops > 0 and T > 0")
+for r in rows:
+    c, t = float(r["C_us_per_op[derived]"]), float(r["T_us_per_op[measured]"])
+    if c < 0 or c > t * 1.0001 + 0.01: bad.append(f"{r['step']} {r['op']}: C {c} outside [0, T]")
+    if sys.argv[2] == "1" and r["c_supported"] != "1": bad.append(f"{r['step']} {r['op']}: c_supported 0")
+print("opsplit:", "OK" if not bad else "BAD " + "; ".join(bad),
+      " ".join(f"{r['step']}:{r['op']}:n={r['ops[measured]']}:T={r['T_us_per_op[measured]']}us:C={r['C_us_per_op[derived]']}us:mod={r['mod_bytes_per_op[measured]']}:sup={r['c_supported']}" for r in rows))
+sys.exit(1 if bad else 0)
+PY
+  pkill -x lmdb-server; sleep 2
+  for k in 0 1; do  # every executed operation counted once in the split (clean-stop stats)
+    local L=$tag.srv$k.log
+    v() { sed -n "s/^$1=//p" "$L" | tail -1; }
+    grep -q "lmdb-server: stopping" "$L" || { fail "$tag node$k: no clean stop"; continue; }
+    [ "$(v opt.get.ops)" = $(( $(v gets) + $(v get_not_found) + $(v get_errors) )) ] &&
+    [ "$(v opt.update.ops)" = $(( $(v updates) + $(v update_not_found) + $(v update_errors) )) ] &&
+    [ "$(v opt.update.mod_bytes)" = $(( 1000 * $(v updates) )) ] || fail "$tag node$k: opt counts (get $(v opt.get.ops)/$(v gets) update $(v opt.update.ops)/$(v updates) mod $(v opt.update.mod_bytes))"
+  done
 }
 
 echo "== 4 servers plain (preload path) + loadgen"
 serve srv-plain "$B" plain
 
 if [ -n "$MB" ]; then
-  sed -e 's/^object_arena_size: .*/object_arena_size: 1GB/' "$W/../../systems/megalon/vectordb-2vm.yaml" > megalon.yaml
+  sed -e 's/^object_arena_size: .*/object_arena_size: 1GB/' "$W/config/megalon-2vm.yaml" > megalon.yaml
   export RACKOBJ_CONFIG=$WD/megalon.yaml
   echo "== 5a stress megalon"
   stress stress-megalon "$MB/bin/lmdb-stress" "MEGALON_REINIT=1" --backend megalon || fail "stress megalon"

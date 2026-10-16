@@ -3,7 +3,8 @@
 # 4M keys, 1 KiB values, Zipfian 0.99, requests of BATCH mixed ops (each op a put with probability PUT_RATIO),
 # SLO per request mixed p99 <= 1 ms.
 # usage: pilot-run.sh <name> <evidence dir>
-# env (required): SYS (all-HWcc | Megalon | Popcorn), PUT_RATIO (0 | 0.05 | 0.5), KIND (functional | pslo | slo | pfix |
+# env (required): SYS (all-HWcc | Megalon | Popcorn), PUT_RATIO (0 | 0.05 | 0.2 | 0.5 | 0.8; MOT1 v6 H1 mixes get/put
+#   95/5 = 0.05, 50/50 = 0.5, 20/80 = 0.8), KIND (functional | pslo | slo | pfix |
 #   ptrace); slo = the full MOT1 v5 §3.3 SLO search (main runs, reports/KV-main-packet.md: 10 s warm-up, steps 3 s +
 #   15 s, adaptive ramp from 500 req/s, bisect to 5 %, confirm 3 x 30 s with up to two -5 % step-downs, fill 0.7/0.8/0.9
 #   x result, overload 1.05/1.1/1.2 x first fail; every measured step has a stats snapshot pair); fix = one fixed-load
@@ -14,7 +15,7 @@
 #   ladder = fixed-rate steps at RATES (comma list, run in that order; 10 s warm-up, 3 s + 15 s per step, no SLO abort);
 #   used for the low-rate latency (CPU idle) check, reports/KV-idle-check.md.
 #   SYS=Popcorn: C8 (build-8 deploy bundle dir), K8 (release), GT8 (guest tools dir), RECV_MODE (poll | idle | sleep)
-# optional: KEYS (4000000), BATCH (16), SEED (20261016), GATE=0 (skip the Host gate: functional runs only),
+# optional: KEYS (4000000), BATCH (16), SEED (20261016), GATE=0 (skip the Host gate; refused unless KIND=functional),
 #   VM_PLAIN (/home/comsys/kv3), VM_MEG (/home/comsys/kvm3), PLAIN_BUILD (builds/kv/3), MEG_BUILD (builds/kv-megalon/3),
 #   LOADGEN_BUILD (builds/kv-loadgen/3).
 # Page MSI (user decision A, 2026-10-16): cxl_shm is loaded and coherence ENABLED before kv-server starts, so node 0's
@@ -34,7 +35,7 @@ LOADGEN_BUILD=${LOADGEN_BUILD:-$P/builds/kv-loadgen/3}
 stop() { echo "PILOTRUN $NAME STOP $*"; exit 1; }
 [ -d "$E" ] || stop "missing evidence dir $E"
 [ -e "$E/$NAME" ] && stop "$E/$NAME exists"
-[[ $PUT_RATIO =~ ^(0|0\.05|0\.2|0\.5)$ ]] || stop "bad PUT_RATIO"
+[[ $PUT_RATIO =~ ^(0|0\.05|0\.2|0\.5|0\.8)$ ]] || stop "bad PUT_RATIO"
 [[ $BATCH =~ ^(16|32|64)$ ]] || stop "bad BATCH"
 [[ $KEYS =~ ^[1-9][0-9]*$ ]] || stop "bad KEYS"
 SA="--nodes 2 --keys $KEYS --threads 14 --start-timeout-ms 5400000"
@@ -69,6 +70,9 @@ IPS=(192.168.122.100 192.168.122.101)
 servers_gone() { for ip in "${IPS[@]}"; do [ "$($SSH comsys@$ip 'pgrep -c -x kv-server' < /dev/null)" = 0 ] || return 1; done; }
 echo "$(date -Is) $NAME: SYS=$SYS PUT_RATIO=$PUT_RATIO KIND=$KIND RATE=${RATE:-} BATCH=$BATCH KEYS=$KEYS TRACE=$TRACE RECV_MODE=${RECV_MODE:-} SEED=$SEED"
 servers_gone || stop "a kv-server is running before the run"
+[[ ${GATE:-1} =~ ^[01]$ ]] || stop "bad GATE"
+# GATE=0 skips the whole Host gate (incl. the measure-env check): functional runs only
+[ "${GATE:-1}" = 1 ] || [ "$KIND" = functional ] || stop "GATE=0 is allowed only with KIND=functional (KIND=$KIND)"
 if [ "${GATE:-1}" = 1 ]; then bash $P/CXL_SWMC/experiments/vectordb/host-gate.sh check "$E/gate-$NAME.txt" || stop "host gate"; fi
 T0=$(date +%s)
 if [ "$SYS" = Popcorn ]; then  # P-popcorn-deploy §6a cycle with build 8; enable BEFORE the server (load under coherence)
@@ -119,6 +123,8 @@ fi
 [ "$KIND" = functional ] && ! grep -q '"pass":true' $R/loadgen/steps.jsonl && stop "functional step not PASS"
 # every run: a non-empty per-step stats table (stats snapshots of every measured step; verifier LOW-1)
 [ -s $R/stats-steps.csv ] && [ "$(wc -l < $R/stats-steps.csv)" -ge 2 ] || stop "no stats-steps.csv rows"
+# MOT1 v6 Fig 2: per-operation split per step (run.sh writes opsplit.csv; servers without opt.* keys fail here)
+[ -s $R/opsplit.csv ] && [ "$(wc -l < $R/opsplit.csv)" -ge 2 ] || stop "no opsplit.csv rows"
 if [ "$KIND" = fix ]; then
   python3 - $R/loadgen/steps.jsonl > $R/fix-result.txt <<'PY' || stop "fixed window result"
 import json, sys

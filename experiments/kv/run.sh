@@ -13,6 +13,8 @@
 #   passed: both backends run Megalon's KV library), SERVER_CPUS (guest CPU list; every kv-server thread pinned after
 #   READY and verified), TRACE (0; 1 adds --trace-dir <guest run dir>: per-put and per-get logs node<k>.kv-*.bin for
 #   MOT1 H2 Figure 2c, fixed-load runs only, never SLO searches), STATS_OP (10 = kv kOpStats; 0 = off).
+# Outputs with stats snapshots: stats-steps.csv (counter deltas) and opsplit.csv (MOT1 v6 Fig 2 per-operation split,
+#   workloads/kv/tools/opsplit.py; C source chosen by SYSTEM: Popcorn*/page-MSI = swmc_acct, Megalon = thread_coh).
 # Checks before starting: --opt keys=N equals --keys N; the guests' cfg/megalon.yaml has key_space/slots/
 #   logical_scr_size equal to `kv-server --print-sizes --keys N` (read-only).
 # Stops (and stops the servers) on the first error. Measurement hygiene: no Host build before/after (pgrep).
@@ -126,6 +128,8 @@ host_check after
 echo "end=$(date -Is) loadgen_rc=$LG" >> "$RUN/manifest.txt"
 if [ -s "$RUN/loadgen/steps.jsonl" ] && [ -s "$RUN/loadgen/summary.json" ]; then
   [ ! -d "$RUN/loadgen/stats" ] || python3 "$ROOT/experiments/loadgen/stats_delta.py" "$RUN/loadgen" --out "$RUN/stats-steps.csv" || true
+  # MOT1 v6 Fig 2: per-operation time split (T, C, rest per get / put per step; tagged columns)
+  [ ! -d "$RUN/loadgen/stats" ] || python3 -I "$ROOT/workloads/kv/tools/opsplit.py" "$RUN/loadgen" --system "$SYSTEM" --out "$RUN/opsplit.csv" || true
   python3 "$ROOT/experiments/loadgen/export_csv.py" --out "$RUN/steps.csv" "$RUN/loadgen=$SYSTEM" > /dev/null || true
   python3 "$ROOT/experiments/loadgen/plot_slo.py" --out "$RUN/slo.png" "$RUN/loadgen=$SYSTEM" > "$RUN/slo-points.txt" 2>&1 || true
 fi

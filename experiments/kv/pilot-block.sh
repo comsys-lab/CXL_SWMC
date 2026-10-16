@@ -17,7 +17,8 @@
 #        recorded from sysfs before the run).
 #   hmtrace: only the traced 0.5 windows of all-HWcc and Megalon (shuffled) at L from an earlier hm block (LREF), e.g.
 #        after an hm block that stopped at its ptrace runs.
-# env: PIN (harness commit), BUILD_PIN (commit the builds were made from; default PIN; every build manifest must name
+# env: MEGALON_BUILD_N (70; 71 once the CohSnap build exists: the Megalon build the kv-megalon build must name),
+#   PIN (harness commit), BUILD_PIN (commit the builds were made from; default PIN; every build manifest must name
 #   it with dirty=0, and the server/loadgen sources must not differ between BUILD_PIN and PIN), KV_CFG, K8.
 # Holds the measurement lock for the whole block; stops at the first PILOTRUN STOP. On every exit: this block's servers
 # stopped, page MSI teardown of every attempted load, /dev/dax0.0 back to root:root 600 on both VMs UNCONDITIONALLY
@@ -31,7 +32,7 @@ BP=${PLAIN_BUILD:-$P/builds/kv/3} BM=${MEG_BUILD:-$P/builds/kv-megalon/3} BL=${L
 : "${PIN:?PIN = harness commit}"
 BPIN=${BUILD_PIN:-$PIN}
 [ "$BPIN" = "$PIN" ] || git -C $P/CXL_SWMC diff --quiet "$BPIN" "$PIN" -- workloads/kv/server workloads/kv/loadgen workloads/kv/proto.h \
-  systems/common experiments/loadgen/loadgen.cc experiments/loadgen/workload.h experiments/loadgen/frame.h \
+  systems/common systems/megalon/shim/megalon_objapi.h systems/popcorn_new/include/swmc_acct.h experiments/loadgen/loadgen.cc experiments/loadgen/workload.h experiments/loadgen/frame.h \
   || { echo "SEQUENCE STOP: server/loadgen sources differ between BUILD_PIN $BPIN and PIN $PIN"; exit 2; }
 export VM_PLAIN=$VP VM_MEG=$VM PLAIN_BUILD=$BP MEG_BUILD=$BM LOADGEN_BUILD=$BL
 CFG=${KV_CFG:?KV_CFG = the megalon.yaml install.sh wrote (<install log>.megalon.yaml)}
@@ -39,8 +40,8 @@ SSH="ssh -o BatchMode=yes -o ConnectTimeout=8"
 IPS=(192.168.122.100 192.168.122.101)
 OWNER="KV-pilot-$B"; [ "$B" = main ] && OWNER="KV-main-h1"
 [ -d "$E" ] && [ -z "$(ls -A "$E" | grep -v '^sequence')" ] || { echo "SEQUENCE STOP: $E missing or not empty"; exit 2; }
-grep -q "^megalon_build=$P/builds/megalon/70$" "$BM/manifest.txt" && grep -q "^source_commit=$BPIN dirty=0$" "$BM/manifest.txt" \
-  || { echo "SEQUENCE STOP: $BM is not a clean build of $BPIN on builds/megalon/70"; exit 2; }
+grep -q "^megalon_build=$P/builds/megalon/${MEGALON_BUILD_N:-70}$" "$BM/manifest.txt" && grep -q "^source_commit=$BPIN dirty=0$" "$BM/manifest.txt" \
+  || { echo "SEQUENCE STOP: $BM is not a clean build of $BPIN on builds/megalon/${MEGALON_BUILD_N:-70}"; exit 2; }
 grep -q "^source_commit=$BPIN dirty=0$" "$BP/manifest.txt" && grep -q "^megalon.flavor=hwcc$" "$BP/manifest.txt" \
   || { echo "SEQUENCE STOP: $BP is not a clean hwcc-flavor build of $BPIN"; exit 2; }
 grep -q "^cxl_swmc_commit=$BPIN kv_dirty=0$" "$BL/kv-manifest.txt" \
@@ -99,7 +100,7 @@ confirm_l() {  # 0.5 x the confirm mean of an SLO run without a note (a noted ru
 if s.get("note"): sys.exit("note: " + s["note"])
 x=c.get("x_mean",0); assert x > 0, "no confirm result"; print(round(0.5 * x, 3))' "$1"
 }
-tag() { case $1 in 0) echo u0;; 0.05) echo u5;; 0.2) echo u20;; 0.5) echo u50;; esac; }
+tag() { case $1 in 0) echo u0;; 0.05) echo u5;; 0.2) echo u20;; 0.5) echo u50;; 0.8) echo u80;; esac; }
 precheck() {
   local i f files="${VP#/home/comsys/}/bin/kv-server ${VP#/home/comsys/}/bin/kv-node.sh ${VP#/home/comsys/}/lib/libkv-megalon.so ${VP#/home/comsys/}/lib/libmegalon.so ${VP#/home/comsys/}/cfg/cxl_region.yaml ${VP#/home/comsys/}/cfg/megalon.yaml ${VM#/home/comsys/}/bin/kv-server ${VM#/home/comsys/}/lib/libkv-megalon.so ${VM#/home/comsys/}/lib/libmegalon.so ${VM#/home/comsys/}/cfg/cxl_region.yaml ${VM#/home/comsys/}/cfg/megalon.yaml"
   for i in 0 1; do

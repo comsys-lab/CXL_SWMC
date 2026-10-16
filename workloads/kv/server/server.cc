@@ -41,6 +41,8 @@
 #include "frame.h"
 #include "hwcc_app.h"
 #include "kv_api.h"
+#include "megalon_objapi.h"
+#include "opsplit.h"
 #include "proc_stats.h"
 #include "proto.h"
 
@@ -171,10 +173,8 @@ class Queue {
 struct alignas(64) WorkerStats {
   std::atomic<uint64_t> get_reqs{0}, get_keys{0}, misses{0}, short_reads{0}, put_reqs{0}, put_keys{0}, get_svc_ns{0},
       put_svc_ns{0}, busy_ns{0}, bad_requests{0}, mixed_reqs{0}, mixed_svc_ns{0};
-  std::atomic<uint64_t> t_get_n{0}, t_get_ns{0}, t_get_max{0}, t_put_n{0}, t_put_ns{0}, t_put_max{0};
-  uint64_t get_tick = 0;  // worker-local
 };
-constexpr uint64_t kGetSample = 64;
+enum OpType : uint32_t { kGet = 0, kPut = 1 };  // opsplit operation types
 
 struct TraceBuf {
   std::mutex mu;
@@ -205,15 +205,32 @@ class Server {
       die("megalon config key_space " + std::to_string(api_->key_space()) + " != --keys " + std::to_string(o_.keys));
     if (!mapped_by(r_.map_va, r_.device_size, r_.device, &err)) die(err);
     map_ = reinterpret_cast<uint8_t *>(r_.map_va);
+    // Megalon per-thread coherence time (Fig 2 C): the object-API shim's thread_coh (v2), loaded next to the KV shim
+    // (same libmegalon instance). Not for --backend plain (all-HWcc / Popcorn: C from swmc_acct).
+    const mshim::Api *coh = nullptr;
+    if (o_.backend == "megalon") {
+      const std::string lib = o_.megalon_lib.substr(0, o_.megalon_lib.rfind('/')) + "/libmegalon-objapi.so";
+      void *h = dlopen(lib.c_str(), RTLD_NOW | RTLD_LOCAL);
+      if (!h) die(std::string("dlopen ") + lib + ": " + dlerror());
+      auto fn = reinterpret_cast<megalon_object_api_fn>(dlsym(h, "megalon_object_api"));
+      if (!fn || !(coh = fn())) die(lib + ": no megalon_object_api");
+      coh_info_ = coh->info;
+    }
+    opt_.reset(new opsplit::Table({"get", "put"}, o_.threads,
+                                  o_.backend == "megalon" ? opsplit::Source::kMegalon : opsplit::Source::kPopcorn, coh));
+    oth_.reset(new opsplit::Thread[o_.threads]);
     if (!cxl::hwcc::app_init(r_, map_, lay_.L, o_.run_id, o_.nodes, o_.node, o_.start_timeout_ms, &err)) die(err);
     app_ = cxl::hwcc::app_base(r_, map_);
     std::fprintf(stderr,
                  "kv-server: node %u/%u run %#lx backend %s (%s) keys %lu value %u B threads %u loader %s trace %s\n"
-                 "kv-server: region %s\nkv-server: app layout %lu B (used %lu, hash %016lx)\n",
+                 "kv-server: region %s\nkv-server: app layout %lu B (used %lu, hash %016lx)\n"
+                 "kv-server: opsplit tsc_hz %.0f source %s megalon thread_coh %s (%s)\n",
                  o_.node, o_.nodes, (unsigned long)o_.run_id, o_.backend.c_str(), api_->info, (unsigned long)o_.keys,
                  kValueBytes, o_.threads, o_.loader.c_str(), o_.trace_dir.empty() ? "off" : o_.trace_dir.c_str(),
                  cxl::region_describe(r_).c_str(), (unsigned long)lay_.L.bytes(), (unsigned long)lay_.L.used(),
-                 (unsigned long)lay_.L.hash());
+                 (unsigned long)lay_.L.hash(), opt_->tsc_hz(),
+                 opt_->source() == opsplit::Source::kMegalon ? "megalon" : "popcorn", opt_->meg() ? "yes" : "no (v1 shim: C = 0)",
+                 coh_info_.c_str());
     ws_.reset(new WorkerStats[o_.threads]);
     if (!o_.trace_dir.empty()) tb_.reset(new TraceBuf[o_.threads]);
     for (uint32_t i = 0; i < o_.threads; i++) std::thread([this, i] { worker(i); }).detach();
@@ -265,24 +282,20 @@ class Server {
   }
 
   std::string stats_text() {
-    uint64_t s[18] = {};
+    uint64_t s[12] = {};
     for (uint32_t i = 0; i < o_.threads; i++) {
       const WorkerStats &w = ws_[i];
       s[0] += w.get_reqs, s[1] += w.get_keys, s[2] += w.misses, s[3] += w.short_reads, s[4] += w.put_reqs,
           s[5] += w.put_keys, s[6] += w.get_svc_ns, s[7] += w.put_svc_ns, s[8] += w.busy_ns, s[9] += w.bad_requests;
-      s[10] += w.mixed_reqs, s[11] += w.mixed_svc_ns, s[12] += w.t_get_n, s[13] += w.t_get_ns, s[15] += w.t_put_n,
-          s[16] += w.t_put_ns;
-      s[14] = std::max<uint64_t>(s[14], w.t_get_max), s[17] = std::max<uint64_t>(s[17], w.t_put_max);
+      s[10] += w.mixed_reqs, s[11] += w.mixed_svc_ns;
     }
     std::ostringstream o;
     o << "node=" << o_.node << "\nbackend=" << o_.backend << "\nmegalon.info=" << api_->info << "\nkeys=" << o_.keys
       << "\nthreads=" << o_.threads << "\nget_reqs=" << s[0] << "\ngets=" << s[1] << "\nmisses=" << s[2]
       << "\nshort_reads=" << s[3] << "\nput_reqs=" << s[4] << "\nputs=" << s[5] << "\nget_svc_ns=" << s[6]
       << "\nput_svc_ns=" << s[7] << "\nworker_busy_ns=" << s[8] << "\nbad_requests=" << s[9]
-      << "\nmixed_reqs=" << s[10] << "\nmixed_svc_ns=" << s[11]
-      << "\nkvt.sample=" << kGetSample << "\nkvt.get_timed=" << s[12] << "\nkvt.get_ns=" << s[13]
-      << "\nkvt.get_max_ns=" << s[14] << "\nkvt.put_timed=" << s[15] << "\nkvt.put_ns=" << s[16]
-      << "\nkvt.put_max_ns=" << s[17] << "\nqueue=" << q_.size() << "\nconns=" << conns_.load();
+      << "\nmixed_reqs=" << s[10] << "\nmixed_svc_ns=" << s[11] << "\nqueue=" << q_.size() << "\nconns=" << conns_.load()
+      << "\n" << opt_->text() << "megalon.coh_shim=" << coh_info_;
     if (tb_) {
       uint64_t np = 0, ng = 0, dp = 0, dg = 0;
       for (uint32_t i = 0; i < o_.threads; i++) {
@@ -345,6 +358,7 @@ class Server {
   void worker(uint32_t i) {
     cxl::proc::name_thread("kv-worker");
     api_->reg(int(i));
+    oth_[i].init(opt_.get(), i);
     tid_self_ = uint32_t(syscall(SYS_gettid));
     std::unique_ptr<uint8_t[]> buf(new uint8_t[kValueBytes]);
     while (phase_.load() < 1) std::this_thread::sleep_for(std::chrono::milliseconds(1));
@@ -374,6 +388,7 @@ class Server {
     done_warm_++;
     while (phase_.load() < 3) std::this_thread::sleep_for(std::chrono::milliseconds(1));
     WorkerStats &ws = ws_[i];
+    opsplit::Thread &ot = oth_[i];
     TraceBuf *tb = tb_ ? &tb_[i] : nullptr;
     std::vector<uint8_t> out;
     for (;;) {
@@ -391,7 +406,7 @@ class Server {
         out.resize(sizeof(GetResp) + size_t(rq.n) * kValueBytes);
         GetResp rs{rq.n, 0, 0};
         for (uint32_t x = 0; x < rq.n; x++)
-          rs.misses += do_get(rd64(p + sizeof(GetReq) + 8ull * x), out.data() + sizeof(GetResp) + size_t(x) * kValueBytes, ws, tb);
+          rs.misses += do_get(rd64(p + sizeof(GetReq) + 8ull * x), out.data() + sizeof(GetResp) + size_t(x) * kValueBytes, ws, ot, tb);
         const uint64_t e = now_ns();
         rs.svc_ns = uint32_t(std::min<uint64_t>(e - b0, 0xffffffffu));
         std::memcpy(out.data(), &rs, sizeof(rs));
@@ -410,7 +425,7 @@ class Server {
         }
         for (uint32_t x = 0; x < rq.n; x++) {
           const uint8_t *r = p + sizeof(PutReq) + rec * x;
-          do_put(rd64(r), r + 8, ws, tb);
+          do_put(rd64(r), r + 8, ws, ot, tb);
         }
         const uint64_t e = now_ns();
         PutResp rs{rq.n, 0, uint32_t(std::min<uint64_t>(e - b0, 0xffffffffu))};
@@ -440,10 +455,10 @@ class Server {
         for (uint32_t x = 0; x < rq.n; x++) {
           const uint64_t d = rd64(p + sizeof(MixedReq) + 8ull * x);
           if (d & kPutBit) {
-            do_put(d & ~kPutBit, val, ws, tb);
+            do_put(d & ~kPutBit, val, ws, ot, tb);
             val += kValueBytes;
           } else {
-            rs.misses += do_get(d, dst, ws, tb);
+            rs.misses += do_get(d, dst, ws, ot, tb);
             dst += kValueBytes;
           }
         }
@@ -470,19 +485,13 @@ class Server {
     return v;
   }
 
-  // One library Get / Put with the wrapper timers (kvt.*: every put timed, gets sampled 1 of kGetSample; the same
-  // timers on every backend, so Megalon's KV cost is the difference to the plain backend at equal load).
-  // Returns 1 on a miss (value zeroed).
-  uint32_t do_get(uint64_t key, uint8_t *v, WorkerStats &ws, TraceBuf *tb) {
-    const bool timed = (++ws.get_tick % kGetSample) == 0;
-    const uint64_t t0 = (timed || tb) ? now_ns() : 0;
+  // One library Get / Put = one operation of the per-operation split (opsplit.h: T = rdtsc around the library call,
+  // C = this thread's coherence time inside it; every operation, every backend). Returns 1 on a miss (value zeroed).
+  uint32_t do_get(uint64_t key, uint8_t *v, WorkerStats &ws, opsplit::Thread &ot, TraceBuf *tb) {
+    const uint64_t t0 = tb ? now_ns() : 0;
+    ot.begin();
     const ssize_t rc = api_->get(v, kValueBytes, key);
-    if (timed) {
-      const uint64_t d = now_ns() - t0;
-      ws.t_get_n.fetch_add(1, std::memory_order_relaxed);
-      ws.t_get_ns.fetch_add(d, std::memory_order_relaxed);
-      if (d > ws.t_get_max.load(std::memory_order_relaxed)) ws.t_get_max.store(d, std::memory_order_relaxed);
-    }
+    ot.end(kGet);
     if (rc != ssize_t(kValueBytes)) {
       if (rc != 0) ws.short_reads.fetch_add(1, std::memory_order_relaxed);
       std::memset(v, 0, kValueBytes);
@@ -492,13 +501,12 @@ class Server {
     return 0;
   }
 
-  void do_put(uint64_t key, const uint8_t *val, WorkerStats &ws, TraceBuf *tb) {
-    const uint64_t t0 = now_ns();
+  void do_put(uint64_t key, const uint8_t *val, WorkerStats &ws, opsplit::Thread &ot, TraceBuf *tb) {
+    (void)ws;
+    const uint64_t t0 = tb ? now_ns() : 0;
+    ot.begin();
     api_->put(val, kValueBytes, key);  // artifact Put returns 0; the value is checked by later gets
-    const uint64_t d = now_ns() - t0;
-    ws.t_put_n.fetch_add(1, std::memory_order_relaxed);
-    ws.t_put_ns.fetch_add(d, std::memory_order_relaxed);
-    if (d > ws.t_put_max.load(std::memory_order_relaxed)) ws.t_put_max.store(d, std::memory_order_relaxed);
+    ot.end(kPut, kValueBytes);
     if (tb) log(tb, true, key, rd64(val + 8), t0);
   }
 
@@ -629,6 +637,9 @@ class Server {
   std::atomic<uint32_t> done_load_{0}, done_warm_{0}, conns_{0};
   std::atomic<uint64_t> load_count_{0}, warm_bad_{0}, warm_miss_{0};
   std::unique_ptr<WorkerStats[]> ws_;
+  std::unique_ptr<opsplit::Table> opt_;
+  std::unique_ptr<opsplit::Thread[]> oth_;
+  std::string coh_info_ = "none";
   std::unique_ptr<TraceBuf[]> tb_;
   std::unique_ptr<uint32_t[]> slot_;
   std::atomic<bool> tracing_{false};

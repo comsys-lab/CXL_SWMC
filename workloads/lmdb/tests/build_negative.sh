@@ -8,6 +8,6 @@ OUT=$1; HERE=$(cd "$(dirname "$0")" && pwd); W=$(cd "$HERE/.." && pwd); ROOT=$(c
 mkdir -p "$OUT/bin" "$OUT/obj"
 for f in mdb midl; do cc -O2 -g -pthread -DMDB_CXL_TEST_SCAN -c "$W/server/liblmdb/$f.c" -o "$OUT/obj/$f.o"; done
 c++ -std=c++17 -O2 -g -pthread -I"$W" -I"$W/server" -I"$W/server/liblmdb" -I"$ROOT/experiments/loadgen" \
-    -I"$ROOT/systems/common" -I"$ROOT/workloads/vectordb/server" "$W/tools/lmdb_stress.cc" "$OUT/obj/mdb.o" \
+    -I"$ROOT/systems/common" -I"$ROOT/systems/megalon/shim" -I"$ROOT/systems/popcorn_new/include" -I"$ROOT/workloads/kv/server" "$W/tools/lmdb_stress.cc" "$OUT/obj/mdb.o" \
     "$OUT/obj/midl.o" -ldl -o "$OUT/bin/lmdb-stress-negative"
 rm -rf "$OUT/obj"; echo "built $OUT/bin/lmdb-stress-negative"

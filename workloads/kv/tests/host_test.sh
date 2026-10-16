@@ -3,6 +3,10 @@
 # the region config; two kv-server processes = node 0 and node 1 on Host NUMA node 1; loadgen drives gets and puts to
 # both nodes over loopback with value checks, stats snapshots (--stats-op 10) and, with TRACE=1, the put/get logs.
 # A file region is physically coherent: this checks the API use, layout, value checks and tooling, not a protocol.
+# Per-operation split (opsplit.h, MOT1 v6 Fig 2): tools/opsplit.py over the stats snapshots must give get and put rows
+# with T > 0, and at the clean stop opt.get.ops / opt.put.ops must equal the gets / puts counters on every node.
+# C on the Host: swmc_acct unsupported (no Popcorn build 9) and, until Megalon build 71, the v1 object shim -> C = 0,
+# c_supported = 0 (EXPECT_COH=1 requires c_supported = 1 on the megalon backend: a v2 shim with thread_coh).
 # usage: host_test.sh <kv build dir> <loadgen build dir> <work dir (new)> [plain|megalon]
 # env: KEYS (1000000), MIX (mixed=1; or get=..,put=..), PUT_RATIO (0.5, mixed stream), RATES (2000,5000 requests/s), BATCH (32), STEP_S (5), THREADS (6), LOADER (node0),
 #      TRACE (0), LG_ARGS (loadgen mode args, default --mode fixed --rates $RATES), NEG (0: 1 = second generator run that must fail the value check), PORT (27300), CPUS0/CPUS1/CPUSL, KEEP_IMG (0),
@@ -15,7 +19,7 @@ HERE=$(cd "$(dirname "$0")" && pwd); W=$(cd "$HERE/.." && pwd); ROOT=$(cd "$W/..
 mkdir -p "$WD"; WD=$(cd "$WD" && pwd)
 KEYS=${KEYS:-1000000} MIX=${MIX:-mixed=1} PUT_RATIO=${PUT_RATIO:-0.5} RATES=${RATES:-2000,5000} BATCH=${BATCH:-32} THREADS=${THREADS:-6}
 LOADER=${LOADER:-node0} TRACE=${TRACE:-0} PORT=${PORT:-27300}
-CPUS0=${CPUS0:-16-21,48-53} CPUS1=${CPUS1:-22-27,54-59} CPUSL=${CPUSL:-28-31,60-63}
+CPUS0=${CPUS0:-18-23,50-55} CPUS1=${CPUS1:-24-29,56-61} CPUSL=${CPUSL:-30-31,62-63}  # inside the Host affinity after measure-env apply (18-31,50-63)
 IMG=${IMG:-/dev/shm/kv-test-$$.img}  # IMG + KEEP_IMG=1: reuse a region image across tests (stale-data test)
 HW=$((256 << 20)) AL=$((2 << 20))
 DEV=$(( (HW + KEYS * 1280 + (192 << 20) + AL - 1) / AL * AL ))  # slots + CacheNodes + NR log entries + margin
@@ -54,7 +58,8 @@ T0=$(date +%s)
 start 0 "$CPUS0" MEGALON_REINIT=1
 start 1 "$CPUS1"
 for k in 0 1; do
-  for _ in $(seq 1800); do grep -q "kv-server: READY" "$WD/node$k.log" && break; grep -q FATAL "$WD/node$k.log" && { tail -20 "$WD/node$k.log"; exit 1; }; sleep 1; done
+  for _ in $(seq 1800); do grep -q "kv-server: READY" "$WD/node$k.log" && break; grep -q FATAL "$WD/node$k.log" && { tail -20 "$WD/node$k.log"; exit 1; }
+    kill -0 "${PIDS[$k]}" 2>/dev/null || { echo "node$k exited"; tail -n 20 "$WD/node$k.log"; exit 1; }; sleep 1; done
   grep -q "kv-server: READY" "$WD/node$k.log" || { echo "node$k not ready"; tail "$WD/node$k.log"; exit 1; }
 done
 echo "both nodes READY after $(( $(date +%s) - T0 )) s"
@@ -80,6 +85,28 @@ cat "$WD/lg/kv.txt"
 s() { sed -n "s/^$2=//p" "$WD/node$1.log" | tail -1; }
 for k in 0 1; do echo "node$k: gets=$(s $k gets) puts=$(s $k puts) misses=$(s $k misses) short_reads=$(s $k short_reads) bad_requests=$(s $k bad_requests) trace.puts=$(s $k trace.puts) trace.gets=$(s $k trace.gets)"; done
 python3 "$ROOT/experiments/loadgen/stats_delta.py" "$WD/lg" --out "$WD/stats-steps.csv" > /dev/null
+OSYS=all-HWcc; [ "$BACKEND" = megalon ] && OSYS=Megalon
+python3 -I "$W/tools/opsplit.py" "$WD/lg" --system "$OSYS" --out "$WD/opsplit.csv"
+OPSPLIT=$(python3 -I - "$WD/opsplit.csv" "$MIX" "$PUT_RATIO" "${EXPECT_COH:-0}" <<'PY'
+import csv, sys
+rows = list(csv.DictReader(open(sys.argv[1])))
+mix, pr, want_coh = sys.argv[2], float(sys.argv[3]), sys.argv[4] == "1"
+ops = {r["op"] for r in rows}
+need = {"get", "put"} if (mix != "mixed=1" or 0 < pr < 1) else ({"put"} if pr == 1 else {"get"})
+bad = []
+for o in need:
+    rs = [r for r in rows if r["op"] == o and int(r["ops[measured]"]) > 0]
+    if not rs: bad.append(f"no {o} rows with ops > 0")
+    elif any(float(r["T_us_per_op[measured]"]) <= 0 for r in rs): bad.append(f"{o}: T <= 0")
+for r in rows:
+    c, t = float(r["C_us_per_op[derived]"]), float(r["T_us_per_op[measured]"])
+    if c < 0 or (int(r["ops[measured]"]) and c > t * 1.0001 + 0.01): bad.append(f"step {r['step']} {r['op']}: C {c} outside [0, T {t}]")
+    if want_coh and r["c_supported"] != "1": bad.append(f"step {r['step']} {r['op']}: c_supported 0")
+summ = " ".join(f"{r['step']}:{r['op']}:n={r['ops[measured]']}:T={r['T_us_per_op[measured]']}us:C={r['C_us_per_op[derived]']}us:sup={r['c_supported']}" for r in rows)
+print(("OK " if not bad else "BAD " + "; ".join(bad) + " | ") + summ)
+PY
+)
+echo "opsplit: $OPSPLIT"
 echo "stats snapshots: $(ls "$WD/lg/stats" | wc -l) files; stats-steps.csv rows: $(( $(wc -l < "$WD/stats-steps.csv") - 1 ))"
 g() { sed -n "s/^$1=//p" "$WD/lg/kv.txt"; }
 FAIL=0
@@ -87,6 +114,11 @@ FAIL=0
 for k in 0 1; do [ "$(s $k misses)" = 0 ] && [ "$(s $k short_reads)" = 0 ] && [ "$(s $k bad_requests)" = 0 ] || FAIL=1; done
 [ "$(g checked)" -gt 0 ] && [ "$(g remote_values)" -gt 0 ] && [ "$(g puts)" -gt 0 ] || { echo "no checked/remote values or no puts"; FAIL=1; }
 [ "$(ls "$WD/lg/stats" | wc -l)" -gt 0 ] || { echo "no stats snapshots"; FAIL=1; }
+[[ $OPSPLIT == OK* ]] || { echo "opsplit check failed"; FAIL=1; }
+for k in 0 1; do  # every executed op counted once in the split (clean-stop stats)
+  [ "$(s $k opt.get.ops)" = "$(s $k gets)" ] && [ "$(s $k opt.put.ops)" = "$(s $k puts)" ] \
+    || { echo "node$k: opt.get.ops=$(s $k opt.get.ops) gets=$(s $k gets) opt.put.ops=$(s $k opt.put.ops) puts=$(s $k puts)"; FAIL=1; }
+done
 if [ "$NEGRC" != skip ]; then
   echo "negative check: loadgen rc=$NEGRC future=$(sed -n 's/^future=//p' "$WD/lg-neg/kv.txt")"
   [ "$NEGRC" != 0 ] && [ "$(sed -n 's/^future=//p' "$WD/lg-neg/kv.txt")" -gt 0 ] || { echo "negative check did not fail"; FAIL=1; }

@@ -25,7 +25,9 @@ can be masked by hardware. Tests prove the protocol logic and API use, not a SW 
 | `tools/megalon_bench.cc` | Megalon op cost bench (create / write / read sections, threads, background readers) |
 | `tools/check_log.py`, `tools/lmdb_ctl.py` | exact MVCC check of a logged run; stats/verify requests |
 | `tests/host_test.sh`, `tests/build_negative.sh` | Host functional test; negative-control build |
-| `server/build.sh` | builds everything; with a Megalon build dir also the dlopen shim (vectordb's, reused unchanged) |
+| `server/build.sh` | builds everything; with a Megalon build dir also the dlopen shim `lib/libmegalon-objapi.so` (systems/megalon/shim via workloads/kv/server/objapi-shim.sh: API v2 with thread_coh on Megalon >= 71, v1 fallback on <= 70) |
+| `../kv/server/opsplit.h`, `../kv/tools/opsplit.py` | per-operation time split (MOT1 v6 Fig 2), shared with kv |
+| `../../experiments/lmdb/` | VM harness: `run.sh` (one run), `pilot-run.sh` (MOT1 v6 mixes, SLO, post checks), `install.sh`, `lmdb-node.sh` (guest node script) |
 
 ## 2. Shared state (docs/hwcc-contract.md)
 LMDB's lock file and meta pages move to the HWcc `app` range; B+tree pages (including the freeDB) stay in SWcc.
@@ -103,8 +105,16 @@ Same layout on every system (the backend only enters the hash).
 - `get` = one read-only txn (`mdb_txn_renew`, `mdb_get`, reply with the value, `mdb_txn_reset`) on a get worker
   (reader slot i of this node); `update` = one write txn overwriting an existing key (`mdb_put`; refused with
   not-found if the key did not exist) on the node's single writer thread, in arrival order. One request = one op.
-- Loadgen streams `get` and `update`; update ratio via `--mix get=w1,update=w2` (20% = 4:1, 50% = 1:1, 0% = get
-  only); YCSB-style throughput = total and per stream (steps.jsonl). MOT1 SLO: get p99 <= 1 ms (`--slo get:99:1`).
+- Loadgen streams `get`, `update` and `mixed` (MOT1 v6 main runs): each `mixed` request is an update with probability
+  `--opt update_ratio=R`, else a get; mixes get/update 95/5 (R 0.05, YCSB B), 50/50 (0.5, YCSB A), 20/80 (0.8, Twitter
+  OSDI'20). SLO (user decision 2026-10-16): request p99 < 1 ms over both kinds (`--mix mixed=1 --slo mixed:99:1`), as
+  the kv store. Throughput = completed requests/s (one request = one op).
+- Per-operation split (MOT1 v6 Fig 2; `opsplit.h`): every get/update is one operation; T = rdtsc (no fences) from the
+  start of its transaction to the end of its thread's work on it (get: renew .. mdb_get .. reply .. reset; update:
+  txn_begin incl. the cross-node writer-lock wait .. put .. commit .. reply); C = the thread's coherence time inside it
+  (plain: Popcorn swmc_acct; megalon: CohSnap via thread_coh). Stats keys `opt.get.*`, `opt.update.*` ({ops, t_ns,
+  t_max_ns, c_ns, mod_bytes, pop.*, meg.*}; mod_bytes = 1,000 B per committed update), gauges `opt.tsc_hz`,
+  `opt.pop_threads`, `opt.meg_coh`, `opt.meg_check_sample`; per-step CSV by `workloads/kv/tools/opsplit.py`.
 - Stats op 10 (key=value, cumulative; loadgen `--stats-op 10`): gets/updates/not-found/errors and their ns, writer
   lock wait, commit time, page writes, oldest-reader lag, reader retries, Megalon object counters, and
   `cxl::proc::text` (threads lmdb-get / lmdb-writer / lmdb-conn / megalon-lib..., kernel cxl_recv threads, IRQs,

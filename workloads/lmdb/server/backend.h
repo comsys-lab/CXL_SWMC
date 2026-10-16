@@ -22,7 +22,7 @@
 
 #include "cxl_region.h"
 #include "layout.h"
-#include "megalon_api.h"  // workloads/vectordb/server (generic dlopen shim, reused unchanged)
+#include "megalon_objapi.h"  // systems/megalon/shim (shared object-API shim, lib/libmegalon-objapi.so)
 
 namespace lmdbw {
 
@@ -62,6 +62,7 @@ class PlainBackend {
     return "plain page_base_off=swcc+0 bytes=" + std::to_string(p_.max_pages * MDB_CXL_PSIZE);
   }
   std::string stats() const { return ""; }
+  const mshim::Api *api() const { return nullptr; }
 
  private:
   Params p_;
@@ -75,13 +76,14 @@ class PlainBackend {
   std::_Exit(2);
 }
 
-inline const vdb::MegalonApi *megalon_load(const std::string &path, std::string *err) {
+// API v1 (no thread_coh member) and v2 accepted; thread_coh is read only from v2 tables (opsplit.h)
+inline const mshim::Api *megalon_load(const std::string &path, std::string *err) {
   void *h = dlopen(path.c_str(), RTLD_NOW | RTLD_LOCAL);
   if (!h) return *err = std::string("dlopen ") + path + ": " + dlerror(), nullptr;
-  auto fn = reinterpret_cast<vdb_megalon_api_fn>(dlsym(h, "vdb_megalon_api"));
-  if (!fn) return *err = path + ": no vdb_megalon_api", nullptr;
-  const vdb::MegalonApi *api = fn();
-  if (!api || api->version != vdb::kMegalonApiVersion) return *err = path + ": API version mismatch", nullptr;
+  auto fn = reinterpret_cast<megalon_object_api_fn>(dlsym(h, "megalon_object_api"));
+  if (!fn) return *err = path + ": no megalon_object_api", nullptr;
+  const mshim::Api *api = fn();
+  if (!api || api->version < 1 || api->version > mshim::kApiVersion) return *err = path + ": API version mismatch", nullptr;
   return api;
 }
 
@@ -111,7 +113,7 @@ class MegalonBackend {
   static constexpr const char *kLayoutTag = " backend=megalon";
   static constexpr uint64_t kBase = 0x4c4dull << 48;  // "LM"; id = kBase | pgno (< 2^63)
 
-  MegalonBackend(const cxl::region &, uint8_t *, const Params &p, const vdb::MegalonApi *api) : p_(p), api_(api) {}
+  MegalonBackend(const cxl::region &, uint8_t *, const Params &p, const mshim::Api *api) : p_(p), api_(api) {}
   bool fits(std::string *err) const {
     if (p_.max_pages >= (1ull << 48)) return *err = "megalon: max_pages overflows the object id", false;
     return true;
@@ -160,7 +162,7 @@ class MegalonBackend {
   bool check_placement(uint64_t last_pg, std::string *err) const {
     uint8_t *base = nullptr;
     for (uint64_t p = 2; p <= last_pg; p++) {
-      vdb::MegObj h;
+      mshim::Obj h;
       if (api_->read_start(id(p), &h) != 0) return *err = "ObjectReadStart(page " + std::to_string(p) + ")", false;
       api_->read_end(&h);
       if (p == 2) base = h.ptr;
@@ -172,7 +174,7 @@ class MegalonBackend {
   // one read section: copy the whole page; re-run until ObjectReadEnd accepts
   int read(uint64_t pgno, void *dst) const {
     for (uint32_t a = 0;; a++) {
-      vdb::MegObj h;
+      mshim::Obj h;
       const int rc = api_->read_start(id(pgno), &h);
       if (rc != 0) megalon_fatal("ObjectReadStart(page " + std::to_string(pgno) + ") = " + std::to_string(rc));
       std::memcpy(dst, h.ptr, MDB_CXL_PSIZE);
@@ -184,7 +186,7 @@ class MegalonBackend {
   }
   // one write section: the whole page (whole lines, never reads prior contents: D3); write end flushes the object
   void write_page(uint64_t pgno, const void *src) const {
-    vdb::MegObj h;
+    mshim::Obj h;
     const int rc = api_->write_start(id(pgno), &h);
     if (rc != 0 || h.size != MDB_CXL_PSIZE) megalon_fatal("ObjectWriteStart(page " + std::to_string(pgno) + ") = " + std::to_string(rc));
     std::memcpy(h.ptr, src, MDB_CXL_PSIZE);
@@ -199,8 +201,9 @@ class MegalonBackend {
     return "megalon page_objects=" + std::to_string(p_.max_pages > 2 ? p_.max_pages - 2 : 0) + " object_bytes=" +
            std::to_string((p_.max_pages > 2 ? p_.max_pages - 2 : 0) * MDB_CXL_PSIZE) + " shim=" + api_->info;
   }
+  const mshim::Api *api() const { return api_; }
   std::string stats() const {
-    vdb::MegStats s{};
+    mshim::Stats s{};
     api_->stats(&s);
     std::ostringstream o;
     o << "megalon.arena_bytes=" << s.arena_bytes << "\nmegalon.used_bytes=" << s.used_bytes
@@ -216,7 +219,7 @@ class MegalonBackend {
 
  private:
   Params p_;
-  const vdb::MegalonApi *api_;
+  const mshim::Api *api_;
   mutable std::atomic<uint64_t> retries_{0};
 };
 

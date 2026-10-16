@@ -49,7 +49,7 @@ struct NodeOpts {
   bool preload_only = false, preloaded = false;  // Popcorn init_state=shared (as vectordb)
   bool warm = true;
   uint32_t prepare_threads = 1;  // node 0 prepare: object creation and image copy threads (1 = deterministic order)
-  std::string megalon_lib;  // default <exe dir>/../lib/libvdb-megalon.so
+  std::string megalon_lib;  // default <exe dir>/../lib/libmegalon-objapi.so
 };
 
 // Image dir: pages.bin ((last_pg + 1) * 4096 B; pages 0/1 unused) + meta.txt (key=value).
@@ -314,7 +314,7 @@ class Node {
   Params p_;
   cxl::region r_;
   uint8_t *map_ = nullptr;
-  const vdb::MegalonApi *api_ = nullptr;
+  const mshim::Api *api_ = nullptr;
   std::unique_ptr<Hwcc> h_;
   std::unique_ptr<Be> be_;
   MDB_cxl_conf conf_{};
@@ -342,7 +342,7 @@ inline void megalon_env(NodeOpts &o, const char *argv0) {
     if (n <= 0) die(std::string("readlink /proc/self/exe for ") + argv0);
     exe[n] = 0;
     std::string d(exe);
-    o.megalon_lib = d.substr(0, d.rfind('/')) + "/../lib/libvdb-megalon.so";
+    o.megalon_lib = d.substr(0, d.rfind('/')) + "/../lib/libmegalon-objapi.so";
   }
 }
 

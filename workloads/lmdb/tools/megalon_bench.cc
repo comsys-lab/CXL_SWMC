@@ -1,5 +1,5 @@
 // megalon-bench: cost of Megalon object operations as the lmdb prepare uses them (reports/LMDB-port.md §10), Host only.
-// One process per node through the vectordb dlopen shim (lib/libvdb-megalon.so; Megalon unchanged). Node 0 runs the
+// One process per node through the shared object-API shim (systems/megalon/shim, lib/libmegalon-objapi.so; Megalon unchanged). Node 0 runs the
 // phases, node 1 only joins the run (start barrier, log-sync thread) and idles for --idle-s.
 //   create  N objects of 4 KiB (ids kBase | (2 + i)), --threads T, thread t creates i = t, t+T, ... (or --blocked)
 //   write   one write section per object (memcpy 4 KiB), T threads
@@ -21,7 +21,7 @@
 #include <thread>
 #include <vector>
 
-#include "megalon_api.h"
+#include "megalon_objapi.h"
 
 namespace {
 uint64_t now_ns() {
@@ -65,12 +65,12 @@ int main(int argc, char **argv) {
     ssize_t n = readlink("/proc/self/exe", exe, sizeof(exe) - 1);
     exe[n > 0 ? n : 0] = 0;
     std::string d(exe);
-    lib = d.substr(0, d.rfind('/')) + "/../lib/libvdb-megalon.so";
+    lib = d.substr(0, d.rfind('/')) + "/../lib/libmegalon-objapi.so";
   }
   const uint64_t t_load = now_ns();
   void *h = dlopen(lib.c_str(), RTLD_NOW | RTLD_LOCAL);
   if (!h) die(dlerror());
-  auto *api = reinterpret_cast<vdb_megalon_api_fn>(dlsym(h, "vdb_megalon_api"))();
+  auto *api = reinterpret_cast<megalon_object_api_fn>(dlsym(h, "megalon_object_api"))();
   std::printf("node=%u init_s=%.2f (library load incl. start barrier)\n", node, (now_ns() - t_load) / 1e9);
   std::fflush(stdout);
   if (node != 0) {
@@ -89,7 +89,7 @@ int main(int argc, char **argv) {
         uint64_t x = 88172645463325252ull + r, n = 0;
         while (!stop.load(std::memory_order_relaxed)) {
           x ^= x << 13, x ^= x >> 7, x ^= x << 17;
-          vdb::MegObj o;
+          mshim::Obj o;
           if (api->read_start(kBase | (2 + x % objects), &o) != 0) continue;  // not created yet
           std::memcpy(buf, o.ptr, 4096);
           api->read_end(&o);
@@ -119,7 +119,7 @@ int main(int argc, char **argv) {
     stop = true;
     for (auto &x : bg) x.join();
     if (bg_readers) std::printf("phase=%s bg_readers=%u bg_reads=%lu\n", name, bg_readers, (unsigned long)bg_reads.load());
-    vdb::MegStats st{};
+    mshim::Stats st{};
     api->stats(&st);
     std::vector<uint32_t> all;
     for (auto &v : lat) all.insert(all.end(), v.begin(), v.end());
@@ -151,7 +151,7 @@ int main(int argc, char **argv) {
       run("write", [&](uint64_t i) {
         alignas(64) static thread_local uint8_t buf[4096];
         std::memset(buf, int(i), sizeof(buf));
-        vdb::MegObj o;
+        mshim::Obj o;
         if (api->write_start(kBase | (2 + i), &o) != 0) return false;
         std::memcpy(o.ptr, buf, 4096);
         api->write_end(&o);
@@ -161,7 +161,7 @@ int main(int argc, char **argv) {
       run("read", [&](uint64_t i) {
         alignas(64) static thread_local uint8_t buf[4096];
         for (;;) {
-          vdb::MegObj o;
+          mshim::Obj o;
           if (api->read_start(kBase | (2 + i), &o) != 0) return false;
           std::memcpy(buf, o.ptr, 4096);
           if (api->read_end(&o)) return buf[0] == uint8_t(i) || true;
@@ -169,12 +169,12 @@ int main(int argc, char **argv) {
       });
     else if (p == "ptrs") {
       api->reg(0);
-      vdb::MegObj o0;
+      mshim::Obj o0;
       if (api->read_start(kBase | 2, &o0) != 0) die("read_start 0");
       api->read_end(&o0);
       uint64_t mism = 0;
       for (uint64_t i = 0; i < objects; i++) {
-        vdb::MegObj o;
+        mshim::Obj o;
         if (api->read_start(kBase | (2 + i), &o) != 0) die("read_start");
         api->read_end(&o);
         if (o.ptr != o0.ptr + i * 4096) mism++;

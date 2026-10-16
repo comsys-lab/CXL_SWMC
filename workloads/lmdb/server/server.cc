@@ -6,6 +6,10 @@
 //            node's single writer thread in arrival order
 // Threads: listen, one reader per connection, --get-threads get workers (reader slots 0..n-1 of this node), one
 // writer. Backend (--backend plain|megalon): Server<Backend> is compiled once per backend.
+// Per-operation split (MOT1 v6 Fig 2; workloads/kv/server/opsplit.h): every get / update is one operation, T = rdtsc
+// from the start of its transaction (after request validation) to the end of its thread's work on it (get: renew ..
+// reply .. reset; update: txn_begin incl. the cross-node writer-lock wait .. commit .. reply), C = the thread's
+// coherence time inside it (Popcorn swmc_acct for --backend plain, Megalon thread_coh for --backend megalon).
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <signal.h>
@@ -24,6 +28,7 @@
 #include <vector>
 
 #include "frame.h"
+#include "opsplit.h"
 #include "node.h"
 #include "proto.h"
 
@@ -86,6 +91,7 @@ class Queue {
 struct alignas(64) WorkerStats {  // one per get worker (written by its thread only)
   std::atomic<uint64_t> gets{0}, not_found{0}, errors{0}, ns{0};
 };
+enum OpType : uint32_t { kGetOp = 0, kUpdateOp = 1 };  // opsplit operation types
 struct alignas(64) WriterStats {
   std::atomic<uint64_t> updates{0}, not_found{0}, errors{0}, ns{0}, lock_ns{0}, commit_ns{0};
 };
@@ -102,6 +108,13 @@ class Server {
     if (o_.get_threads == 0 || o_.get_threads > o_.n.p.readers) die("--get-threads must be 1..--readers");
     node_.start("lmdb-server");
     ws_.reset(new WorkerStats[o_.get_threads]);
+    opt_.reset(new opsplit::Table({"get", "update"}, o_.get_threads + 1,
+                                  std::is_same_v<Be, MegalonBackend> ? opsplit::Source::kMegalon : opsplit::Source::kPopcorn,
+                                  node_.backend().api()));
+    oth_.reset(new opsplit::Thread[o_.get_threads + 1]);
+    std::fprintf(stderr, "lmdb-server: opsplit tsc_hz %.0f source %s megalon thread_coh %s\n", opt_->tsc_hz(),
+                 opt_->source() == opsplit::Source::kMegalon ? "megalon" : "popcorn",
+                 opt_->meg() ? "yes" : (std::is_same_v<Be, MegalonBackend> ? "no (v1 shim: C = 0)" : "n/a"));
     std::thread([this] { writer(); }).detach();
     for (uint32_t i = 0; i < o_.get_threads; i++) std::thread([this, i] { getter(i); }).detach();
     std::thread([this] { listen_loop(); }).detach();
@@ -128,7 +141,7 @@ class Server {
       << "\nlmdb.wlock_acquires=" << cs.wlock_acquires << "\nlmdb.reader_retries=" << cs.reader_retries
       << "\nlmdb.oldest_scans=" << cs.oldest_scans << "\nlmdb.oldest_lag_max=" << cs.oldest_lag_max
       << "\nget_queue=" << gq_.size() << "\nupdate_queue=" << wq_.size() << "\n"
-      << node_.backend().stats() << cxl::proc::text(pst_);
+      << node_.backend().stats() << opt_->text() << cxl::proc::text(pst_);
     return o.str();
   }
 
@@ -143,6 +156,8 @@ class Server {
     if (rc) die(std::string("get txn_begin: ") + mdb_strerror(rc));
     mdb_txn_reset(txn);
     WorkerStats &st = ws_[i];
+    opsplit::Thread &ot = oth_[i];
+    ot.init(opt_.get(), i);
     for (;;) {
       Job j = gq_.pop();
       const uint64_t t0 = now_ns();
@@ -150,6 +165,7 @@ class Server {
       if (frame::payload_len(j.h) < sizeof(rq)) { bad(j); continue; }
       std::memcpy(&rq, j.p.data(), sizeof(rq));
       if (frame::payload_len(j.h) != sizeof(rq) + rq.klen || rq.klen == 0 || rq.klen > 511) { bad(j); continue; }
+      ot.begin();
       if ((rc = mdb_txn_renew(txn)) != 0) die(std::string("txn_renew: ") + mdb_strerror(rc));
       MDB_val k{rq.klen, j.p.data() + sizeof(rq)}, v{0, nullptr};
       rc = mdb_get(txn, node_.dbi(), &k, &v);
@@ -160,6 +176,7 @@ class Server {
         // the value is this txn's view (in place for plain, the txn's page copy for Megalon); valid until reset
         j.c->reply(frame::kStatusOk, j.h.req_id, &rs, sizeof(rs), v.mv_data, rs.vlen);
         mdb_txn_reset(txn);
+        ot.end(kGetOp);
         st.gets.fetch_add(1, std::memory_order_relaxed);
       } else {
         mdb_txn_reset(txn);
@@ -172,6 +189,7 @@ class Server {
           std::fprintf(stderr, "lmdb-server: get: %s\n", mdb_strerror(rc));
           j.c->reply(frame::kStatusServerError, j.h.req_id, nullptr, 0);
         }
+        ot.end(kGetOp);
       }
       st.ns.fetch_add(now_ns() - t0, std::memory_order_relaxed);
     }
@@ -181,6 +199,8 @@ class Server {
   void writer() {
     cxl::proc::name_thread("lmdb-writer");
     node_.backend().thread_init(1);
+    opsplit::Thread &ot = oth_[o_.get_threads];
+    ot.init(opt_.get(), o_.get_threads);
     MDB_cxl_stats cs{};
     for (;;) {
       Job j = wq_.pop();
@@ -196,6 +216,7 @@ class Server {
       if (frame::payload_len(j.h) != sizeof(rq) + rq.klen + rq.vlen || rq.klen == 0 || rq.klen > 511) { bad(j); continue; }
       mdb_cxl_get_stats(node_.env(), &cs);
       const uint64_t lock0 = cs.wlock_wait_ns;
+      ot.begin();
       MDB_txn *txn;
       int rc = mdb_txn_begin(node_.env(), nullptr, 0, &txn);  // takes the cross-node writer lock
       if (rc) die(std::string("write txn_begin: ") + mdb_strerror(rc));
@@ -212,6 +233,7 @@ class Server {
         wst_.not_found.fetch_add(1, std::memory_order_relaxed);
         rs.service_us = uint32_t((now_ns() - t0) / 1000);
         j.c->reply(kStatusNotFound, j.h.req_id, &rs, sizeof(rs));
+        ot.end(kUpdateOp);
         continue;
       }
       const uint64_t c0 = now_ns();
@@ -230,6 +252,7 @@ class Server {
         node_.hwcc().nodes[o_.n.node].updates++;
         j.c->reply(frame::kStatusOk, j.h.req_id, &rs, sizeof(rs));
       }
+      ot.end(kUpdateOp, rc == 0 ? rq.vlen : 0);
       wst_.ns.fetch_add(now_ns() - t0, std::memory_order_relaxed);
     }
   }
@@ -326,6 +349,8 @@ class Server {
   Node<Be> node_;
   std::unique_ptr<WorkerStats[]> ws_;
   WriterStats wst_;
+  std::unique_ptr<opsplit::Table> opt_;
+  std::unique_ptr<opsplit::Thread[]> oth_;
   Queue gq_, wq_;
   cxl::proc::Opts pst_{{"cxl_recv"},
                        {"TLB", "CAL", "RES", "LOC"},

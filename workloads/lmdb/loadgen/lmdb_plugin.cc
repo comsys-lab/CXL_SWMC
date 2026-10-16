@@ -1,13 +1,15 @@
 // loadgen plugin "lmdb" (workloads/lmdb/DESIGN.md §7, experiments/loadgen/README.md).
-// Streams "get" and "update" (YCSB core workload: the mix is set with loadgen --mix get=w,update=w, e.g. update ratio
-// 20% = --mix get=4,update=1; one request = one op; YCSB-style throughput = total and per stream). Key: YCSB
+// Streams "get", "update" (one op kind each; --mix get=w,update=w) and "mixed" (main runs, MOT1 v6: each request is an
+// update with probability update_ratio, else a get; --mix mixed=1 --slo mixed:99:1 = request p99 over both kinds, as
+// the kv plugin's mixed stream). One request = one op; YCSB-style throughput = total and per stream. Key: YCSB
 // ScrambledZipfian(0.99) over records; target node uniform; update value = 1,000 B (key, version = global update
 // sequence, writer = target node) overwriting the existing key.
 // Checks (always on): every returned value is complete and belongs to its key (proto.h check_value); a get's snapshot
 // txnid >= the highest update txnid acknowledged before the get was made (cross-node read-after-ack visibility);
 // not-found and errors are counted. With log=1 every response is logged for tools/check_log.py (exact MVCC check:
 // the value read = the last update of that key with txnid <= the get's snapshot).
-// Options: records=N (required, = server --records), seed=N, log=0|1, max_requests=N (log slots, default 200M).
+// Options: records=N (required, = server --records), seed=N, log=0|1, max_requests=N (log slots, default 200M),
+//          update_ratio=R (mixed stream, 0..1, default 0.05).
 // Output: <out>/lmdb.txt (counts); with log=1 <out>/gets.bin and <out>/updates.bin (LogRec below).
 #include <algorithm>
 #include <atomic>
@@ -49,6 +51,13 @@ class Lmdb : public loadgen::Workload {
     if (!records_) return *err = "need --opt records=N (the server's --records)", false;
     seed_ = std::stoull(get("seed", "20261016"));
     log_ = get("log", "0") == "1";
+    for (auto &kv : o)
+      if (kv.first != "records" && kv.first != "seed" && kv.first != "log" && kv.first != "max_requests" &&
+          kv.first != "update_ratio")
+        return *err = "lmdb: unknown option " + kv.first, false;
+    update_ratio_ = std::stod(get("update_ratio", "0.05"));
+    if (!(update_ratio_ >= 0.0 && update_ratio_ <= 1.0)) return *err = "lmdb: update_ratio 0..1", false;
+    kind_rng_.seed(seed_ ^ 0x6a09e667f3bcc909ull);
     max_requests_ = std::stoull(get("max_requests", "200000000"));
     rng_.seed(seed_);
     zipf_ = std::make_unique<ScrambledZipfian>(records_);
@@ -57,7 +66,8 @@ class Lmdb : public loadgen::Workload {
     return true;
   }
 
-  std::vector<loadgen::StreamSpec> streams() const override { return {{"get", false}, {"update", false}}; }
+  // 0 "get", 1 "update", 2 "mixed" (update with probability update_ratio)
+  std::vector<loadgen::StreamSpec> streams() const override { return {{"get", false}, {"update", false}, {"mixed", false}}; }
 
   bool make(uint32_t stream, loadgen::Request *r, std::vector<uint8_t> *p) override {
     if (next_ >= max_requests_) return false;
@@ -68,7 +78,8 @@ class Lmdb : public loadgen::Workload {
     s->key = key;
     char k[kKeyBytes];
     make_key(key, k);
-    if (stream == 0) {
+    const bool update = stream == 1 || (stream == 2 && kind_uni_(kind_rng_) < update_ratio_);
+    if (!update) {
       r->op = kOpGet;
       s->min_txnid = acked_.load(std::memory_order_acquire);
       s->version = 0;
@@ -158,7 +169,7 @@ class Lmdb : public loadgen::Workload {
   std::string describe() const override {
     return "lmdb records=" + std::to_string(records_) + " key=" + std::to_string(kKeyBytes) + "B value=" +
            std::to_string(kValueBytes) + "B dist=scrambled_zipfian(0.99) seed=" + std::to_string(seed_) +
-           " log=" + std::to_string(int(log_));
+           " log=" + std::to_string(int(log_)) + " update_ratio=" + std::to_string(update_ratio_);
   }
 
  private:
@@ -180,7 +191,9 @@ class Lmdb : public loadgen::Workload {
   uint32_t targets_ = 1;
   uint64_t records_ = 0, seed_ = 0, max_requests_ = 0, next_ = 0, version_ = 0;
   bool log_ = false;
-  std::mt19937_64 rng_;
+  double update_ratio_ = 0.05;
+  std::mt19937_64 rng_, kind_rng_;
+  std::uniform_real_distribution<double> kind_uni_{0.0, 1.0};
   std::unique_ptr<ScrambledZipfian> zipf_;
   std::unique_ptr<std::atomic<Slot *>[]> chunks_;
   std::atomic<uint64_t> acked_{0}, gets_ok_{0}, updates_ok_{0}, not_found_{0}, errors_{0}, bad_values_{0}, stale_{0};
