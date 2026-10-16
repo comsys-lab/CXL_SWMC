@@ -19,10 +19,12 @@ needs a decision and a grant). Status as of 2026-10-16.
 Each vCPU is pinned 1:1 to one Host CPU (XML `<cputune><vcpupin>`), all on node0, no CPU shared by the two VMs:
 | VM | vCPU 0-7 | vCPU 8-15 |
 |---|---|---|
-| cxl_vm0 | CPUs 0,2,…,14 | CPUs 32,34,…,46 (SMT siblings of 0,2,…,14) |
-| cxl_vm1 | CPUs 1,3,…,15 | CPUs 33,35,…,47 (SMT siblings of 1,3,…,15) |
-So each VM owns 8 physical cores (both hyperthreads), and vCPU i and vCPU i+8 share a physical core. The guest
-is not told this (no `<topology>` in `<cpu>`), so its scheduler treats the 16 vCPUs as independent CPUs.
+| cxl_vm0 | Host CPUs 0,2,…,14 and their siblings 32,34,…,46 |  |
+| cxl_vm1 | Host CPUs 1,3,…,15 and their siblings 33,35,…,47 |  |
+So each VM owns 8 physical cores (both hyperthreads). Since 2026-10-16 (reports/VM-topology-packet.md v1) the XML
+declares `<topology sockets='1' dies='1' cores='8' threads='2'/>` and pins vCPU 2k → c_k, vCPU 2k+1 → c_k+32 (its
+Host SMT sibling), so the guest sees the real sibling pairs (lscpu: 2 threads per core). Before that, vCPU i and
+i+8 were siblings and the guest was not told.
 libvirt: "The optional vcpupin element specifies which of host's physical CPUs the domain vCPU will be pinned to."
 (https://libvirt.org/formatdomain.html#cpu-tuning)
 

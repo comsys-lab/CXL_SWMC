@@ -10,7 +10,7 @@
 
 namespace mshim {
 
-constexpr uint32_t kApiVersion = 1;
+constexpr uint32_t kApiVersion = 2;  // 2: thread_coh (MOT1 v6 Fig 2/3a; contract fixed 2026-10-16)
 
 struct Obj {  // mirrors rackobj::ObjectHandle
   uint8_t *ptr;
@@ -23,6 +23,23 @@ struct Stats {  // subset of rackobj::ObjectStats (this node unless noted)
   uint64_t arena_bytes, used_bytes, created;  // shared
   uint64_t creates, read_sections, read_retry_notify, read_retry_incoherent;
   uint64_t write_sections, write_retry, switch_rw, flushes, flush_bytes, replay_flushes, replay_flush_bytes;
+};
+
+// Per-thread coherence time of the CALLING thread since reg() (MOT1 v6 reports/MOT1-v6-redesign-draft.md §3.1, §4.1).
+// Durations in ns (plain rdtsc, no fences, converted with the TSC rate), counts in events. Every event is timed
+// except the section checks, which are timed 1 in check_sample (check_ns_sampled = sum over sampled sections only;
+// estimate = check_ns_sampled * check_sample). (A) stale copy at read_start, (B) version changed during the read
+// (read_end false), (C) NR metadata notification (read_end false), (D) spin while a writer holds the version.
+struct CohSnap {
+  uint64_t read_sections, write_sections;
+  uint64_t check_sample, check_ns_sampled, check_sampled;  // read/write start+end work when no retry happens
+  uint64_t stale_cnt, stale_ns;                            // (A) incl. the whole-object flush and the restart
+  uint64_t concur_cnt, concur_ns;                          // (B) flush + the discarded section body
+  uint64_t meta_cnt, meta_ns;                              // (C) discarded section
+  uint64_t spin_cnt, spin_ns;                              // (D) contended only
+  uint64_t wstart_ns, switch_rw_cnt, switch_rw_ns, reclaim_cnt, reclaim_ns;
+  uint64_t wflush_cnt, wflush_ns, wflush_bytes;            // whole-object flush at write_end
+  uint64_t reserved[8];
 };
 
 struct Api {
@@ -38,6 +55,7 @@ struct Api {
   int (*write_start)(uint64_t id, Obj *h);
   void (*write_end)(Obj *h);
   void (*stats)(Stats *s);
+  void (*thread_coh)(CohSnap *s);  // v2; nullptr in a v1 shim
 };
 
 }  // namespace mshim
