@@ -6,7 +6,7 @@
 #     wmeta:  HWcc record layout; artifact64 (default, upstream 64 B/record) | packed4 (paper's 4 B record;
 #             with flavor megalon the owner key moves to the NR replica, nr feature wmeta-rev) | rev64
 #             (packed4's owner-key path, 64 B per record; measurement control for false sharing)
-#     n:      build number -> builds/megalon/<n>/ (n=0 is the upstream baseline; refused)
+#     n:      build number -> builds/megalon/<n>/, optionally with a suffix (75-hwcc) (n=0 is the upstream baseline; refused)
 #
 # Output in builds/megalon/<n>/:
 #   nr_target/          per-flavor cargo target dir (libnr_hashmap.a + .features tag)
@@ -47,7 +47,7 @@ case $WMETA in
     packed4|rev64) if [ "$FLAVOR" = megalon ]; then NR_FEATURES="$NR_FEATURES wmeta-rev"; fi ;;  # must match CMakeLists.txt
     *) usage ;;
 esac
-[[ $N =~ ^[0-9]+$ ]] || usage
+[[ $N =~ ^[0-9]+(-[a-z0-9]+)?$ ]] || usage  # e.g. 75 or 75-hwcc
 [ "$N" != 0 ] || { echo "refusing builds/megalon/0 (upstream baseline)" >&2; exit 1; }
 
 OUT=$ROOT/builds/megalon/$N

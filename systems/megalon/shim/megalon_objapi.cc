@@ -81,12 +81,31 @@ void thread_coh(mshim::CohSnap *s) {
   for (size_t i = 0; i < 8; i++) s->reserved[i] = t.reserved[i];
 }
 
+// v3 (build 75): the calling thread's work that a Megalon-hwcc all-HWcc also executes
+void thread_anchor(mshim::AnchorSnap *s) {
+  static_assert(sizeof(mshim::AnchorSnap) == sizeof(rackobj::ThreadAnchor), "AnchorSnap != ThreadAnchor");
+  rackobj::ThreadAnchor t{};
+  rackobj::GetThreadAnchor(&t);
+  *s = mshim::AnchorSnap{};
+  s->read_sections = t.read_sections;
+  s->write_sections = t.write_sections;
+  s->check_sampled = t.check_sampled;
+  s->read_lookup_ns_sampled = t.read_lookup_ns_sampled;
+  s->read_nr_ns_sampled = t.read_nr_ns_sampled;
+  s->rseq_ns_sampled = t.rseq_ns_sampled;
+  s->write_lookup_ns = t.write_lookup_ns;
+  s->write_nr_ns = t.write_nr_ns;
+  s->wseq_ns = t.wseq_ns;
+  s->wseq_end_ns = t.wseq_end_ns;
+}
+
 #ifndef MSHIM_INFO
 #define MSHIM_INFO "unknown"
 #endif
 
 const mshim::Api kApi{mshim::kApiVersion, MSHIM_INFO, node_id, reg, unreg, create, lookup,
-                      read_start, read_end, write_start, write_end, stats, thread_coh};
+                      read_start, read_end, write_start, write_end, stats, thread_coh,
+                      thread_anchor};
 
 }  // namespace
 
