@@ -9,9 +9,10 @@ Checks (each printed; exit 1 if any fails):
   stop      every node log has "kv-server: stopping" and opt.get.ops = gets, opt.put.ops = puts (every executed op
             counted once in the split)
   rows      opsplit.csv has get and put rows with ops > 0 and T > 0; every C within [0, T]
-  source    all-HWcc: C = 0 on every row
+  gauge     every node's clean-stop stats carry opt.c_formula = the workload (kv / lmdb)
+  source    all-HWcc: C = 0 and every raw pop_*/meg_* column 0 on every row
             Megalon timers on: c_formula kv, c_supported 1, C > 0 on every row with ops > 0, tsc_backwards 0
-            Megalon timers off (MEGALON_COH_TIMERS=0): C = 0 on every row (durations off, counts kept)
+            Megalon timers off (MEGALON_COH_TIMERS=0): c_supported 1 and C = 0 on every row (durations off, counts kept)
             Popcorn: c_supported 1 (swmc_acct registered on every node) and the run's total C > 0
 Writes RUN_DIR/v1-check.txt (results + per step/op T and C).
 """
@@ -56,6 +57,7 @@ for f in logs:
         x = kv.get(f"opt.{op}.ops")
         y = sum(int(kv[c]) for c in ctrs) if all(c in kv for c in ctrs) else None
         check(x is not None and y is not None and int(x) == y, f"{f}: opt.{op}.ops {x} = {'+'.join(ctrs)} {y}")
+    check(kv.get("opt.c_formula") == a.workload, f"{f}: opt.c_formula gauge present and = {a.workload} (got {kv.get('opt.c_formula')})")
 path = os.path.join(a.run, "opsplit.csv")
 rows = list(csv.DictReader(open(path))) if os.path.exists(path) else []
 check(bool(rows), "opsplit.csv has rows")
@@ -70,12 +72,18 @@ check(all(0 <= C(r) <= T(r) * 1.0001 + 0.01 for r in rows if n(r)), "every C wit
 live = [r for r in rows if n(r) > 0]
 if a.system == "all-HWcc":
     check(all(C(r) == 0 for r in live), "all-HWcc: C = 0")
+    # the raw parts, not only the derived C: no Popcorn fault/IPI time and no Megalon interval in any operation
+    raw = [k for k in (rows[0].keys() if rows else []) if (k.startswith("pop_") or k.startswith("meg_"))
+           and k != "meg_check_sample[measured]"]
+    nz = sorted({k for r in live for k in raw if r[k] not in ("", "0", "0.0") and float(r[k]) != 0})
+    check(not nz, f"all-HWcc: every raw pop_*/meg_* column 0 (non-zero: {nz})")
 elif a.system == "Megalon" and a.timers == "on":
     check(all(r["c_formula"] == a.workload for r in live), f"Megalon: c_formula {a.workload}")
     check(all(r["c_supported"] == "1" for r in live), "Megalon: c_supported 1")
     check(all(C(r) > 0 for r in live), "Megalon: C > 0 on every row")
     check(all(float(r["meg_tsc_backwards_per_op[measured]"]) == 0 for r in live), "Megalon: tsc_backwards 0")
 elif a.system == "Megalon":
+    check(all(r["c_supported"] == "1" for r in live), "Megalon timers off: c_supported 1 (thread_coh present)")
     check(all(C(r) == 0 for r in live), "Megalon timers off: C = 0")
 else:
     check(all(r["c_supported"] == "1" for r in live), "Popcorn: c_supported 1 (swmc_acct registered)")

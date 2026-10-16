@@ -39,7 +39,7 @@ stop() { echo "PILOTRUN $NAME STOP $*"; exit 1; }
 [[ $BATCH =~ ^(16|32|64)$ ]] || stop "bad BATCH"
 [[ $KEYS =~ ^[1-9][0-9]*$ ]] || stop "bad KEYS"
 SA="--nodes 2 --keys $KEYS --threads 14 --start-timeout-ms 5400000"
-export LOADGEN=$LOADGEN_BUILD/loadgen READY_TIMEOUT=5400 RUN_KIND=measurement STATS_OP=10 TRACE
+export LOADGEN=$LOADGEN_BUILD/loadgen READY_TIMEOUT=${READY_TIMEOUT:-5400} RUN_KIND=measurement STATS_OP=10 TRACE
 [ "$KIND" = functional ] && RUN_KIND=functional
 export RUN_KIND
 case "$SYS" in

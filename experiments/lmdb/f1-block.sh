@@ -3,42 +3,72 @@
 # Megalon, after H0 (Host image + gate). Holds the measurement/VM lock (host-gate.sh lock LMDB-F1-v1) for the whole
 # block, from G1 (install.sh) to the rollback; on EVERY exit: this block's lmdb processes stopped on both VMs, /dev/dax0.0 back to root:root 600
 # on both VMs (fresh stat check per VM; "ROLLBACK FAIL" otherwise), lock released. Stops at the first unexpected result.
-# usage: f1-block.sh <evidence dir (exists; empty except gate-H0.txt / tasks-check.txt / image.log)>
+# usage: f1-block.sh <evidence dir (exists; empty except tasks-check.txt / block.out)>
+# Steps: lock, G0 image (Host, IMG must not exist), H0 Host gate, G1 install, G2 pre-check, dmesg baseline, G3 chown,
+# A1..B3 [, P0..P2]; after every stress pair and pilot-run a dmesg check (new lines matching DMESG_BAD stop the block).
 # env: POPCORN (0; 1 adds Part P: Popcorn build >= 10 runs, needs C8 K8 GT8 RECV_MODE as experiments/kv/pilot-block),
-#   IMG (Host image dir from H0; required), EXPECT_K (guest kernel release, as recorded in state/HANDOFF.md; required), PLAIN_BUILD / MEG_BUILD /
+#   IMG (Host image dir to create in G0; must not exist; required), EXPECT_K (guest kernel release, as recorded in state/HANDOFF.md; required), PLAIN_BUILD / MEG_BUILD /
 #   LOADGEN_BUILD (pilot-run.sh defaults; PLAIN_BUILD also gives the Host lmdb-server for --print-app-bytes)
 set -uo pipefail
 E=$1
 P=/home/comsys/sungsu/destijl-control X=$P/CXL_SWMC/experiments/lmdb G=$P/CXL_SWMC/experiments/vectordb/host-gate.sh
-: "${EXPECT_K:?EXPECT_K = guest kernel release}" "${IMG:?IMG = Host image dir (H0)}"
+: "${EXPECT_K:?EXPECT_K = guest kernel release}" "${IMG:?IMG = Host image dir to create (G0)}"
 [ "${POPCORN:-0}" = 0 ] || : "${C8:?}" "${K8:?}" "${GT8:?}" "${RECV_MODE:?}"
+[ "${POPCORN:-0}" = 0 ] || [ "$EXPECT_K" = "$K8" ] || { echo "BLOCK STOP: POPCORN=1 needs EXPECT_K = K8 (the Popcorn release)"; exit 2; }
 OWNER=LMDB-F1-v1 L=/home/comsys/lmdb R=1000000 MAXP=600000
 SSH="ssh -o BatchMode=yes -o ConnectTimeout=8"
 IPS=(192.168.122.100 192.168.122.101)
-[ -d "$E" ] && [ -z "$(ls -A "$E" | grep -vE '^(gate-H0\.txt|tasks-check\.txt|image\.log)$')" ] || { echo "BLOCK STOP: $E missing or not empty"; exit 2; }
+[ -d "$E" ] && [ -z "$(ls -A "$E" | grep -vE '^(tasks-check\.txt|block\.out)$')" ] || { echo "BLOCK STOP: $E missing or not empty"; exit 2; }
 [ -s "$E/tasks-check.txt" ] || { echo "BLOCK STOP: $E/tasks-check.txt missing (state/TASKS.md: no other active VM user)"; exit 2; }
 bash $G lock $OWNER || { echo "BLOCK STOP: lock"; exit 2; }
-finish() {
+finish() {  # order as experiments/kv/pilot-block.sh: servers first, then Popcorn teardown, then dax0.0, then unlock
+  for ip in "${IPS[@]}"; do
+    $SSH comsys@$ip 'pkill -x lmdb-server; pkill -x lmdb-stress; sleep 2; echo procs=$(pgrep -c -x lmdb-server)/$(pgrep -c -x lmdb-stress)' < /dev/null 2>&1 | sed "s/^/$(date -Is) $ip /" >> "$E/rollback.out"
+  done
   if [ "${POPCORN:-0}" = 1 ]; then  # Popcorn: tear down every attempted cxl_shm load without "teardown PASS"
     for r in "$E"/shm-*/; do
       r=${r%/}; [ -f "$r/load-vm0.txt" ] || continue
       grep -q "teardown PASS" "$r/steps.log" 2>/dev/null && continue
-      env K=$K8 GT=$GT8 C=$C8 R=$r bash $C8/p-popcorn-shm.sh teardown >> "$E/cleanup.out" 2>&1
-      grep -q "teardown PASS" "$r/steps.log" 2>/dev/null || echo "CLEANUP FAILED: $r" | tee -a "$E/cleanup.out"
+      env K=$K8 GT=$GT8 C=$C8 R=$r bash $C8/p-popcorn-shm.sh teardown >> "$E/cleanup.out" 2>&1 \
+        || { grep -q "instr_enabled=1 missing" "$r/steps.log" 2>/dev/null && env K=$K8 GT=$GT8 C=$C8 R=$r bash $C8/p-popcorn-shm.sh instr-on >> "$E/cleanup.out" 2>&1 \
+             && env K=$K8 GT=$GT8 C=$C8 R=$r bash $C8/p-popcorn-shm.sh teardown >> "$E/cleanup.out" 2>&1; }
+      grep -q "teardown PASS" "$r/steps.log" 2>/dev/null || echo "CLEANUP FAILED: $r (manual: reports/M5-pilot-kv.md §6)" | tee -a "$E/cleanup.out"
     done
   fi
   for ip in "${IPS[@]}"; do
-    $SSH comsys@$ip 'pkill -x lmdb-server; pkill -x lmdb-stress; sleep 2; echo procs=$(pgrep -c -x lmdb-server)/$(pgrep -c -x lmdb-stress)' < /dev/null 2>&1 | sed "s/^/$(date -Is) $ip /" >> "$E/rollback.out"
     out=$($SSH comsys@$ip 'sudo -n chown root:root /dev/dax0.0 && sudo -n chmod 600 /dev/dax0.0; echo stat=$(stat -c "%U:%G %a" /dev/dax0.0); dmesg | tail -n 5' < /dev/null 2>&1)
     echo "$out" | sed "s/^/$(date -Is) $ip /" >> "$E/rollback.out"
     echo "$out" | grep -qx "stat=root:root 600" || echo "ROLLBACK FAIL: $ip dax0.0 not root:root 600" | tee -a "$E/rollback.out"
   done
+  [ -n "${DMESG_BASE_DONE:-}" ] && dmesg_check final  # recorded only (the block has already ended)
   bash $G unlock $OWNER
+}
+# dmesg stop rule: line counts at the block start; after every step, new lines matching DMESG_BAD on either VM stop
+DMESG_BAD='BUG:|Oops|WARNING:|Call Trace|general protection|segfault|[Ee]rror|ERROR|soft lockup|hung_task'
+dmesg_base() {
+  for i in 0 1; do $SSH comsys@${IPS[$i]} 'dmesg | wc -l' < /dev/null > "$E/dmesg-base-vm$i.txt" 2>&1 || stop "dmesg vm$i"; done
+  DMESG_BASE_DONE=1
+}
+dmesg_check() {  # tag; returns 1 (and writes dmesg-new-<tag>-vm<k>.txt) on a new bad line
+  local i n bad=0
+  for i in 0 1; do
+    n=$(cat "$E/dmesg-base-vm$i.txt")
+    $SSH comsys@${IPS[$i]} "dmesg | tail -n +$((n + 1))" < /dev/null > "$E/dmesg-new-$1-vm$i.txt" 2>&1
+    grep -E "$DMESG_BAD" "$E/dmesg-new-$1-vm$i.txt" > /dev/null && { echo "dmesg vm$i ($1): $(grep -E "$DMESG_BAD" "$E/dmesg-new-$1-vm$i.txt" | head -3)" | tee -a "$E/block.log"; bad=1; }
+  done
+  return $bad
 }
 trap finish EXIT
 stop() { echo "$(date -Is) BLOCK STOP $*" | tee -a "$E/block.log"; exit 1; }
 step() { echo "$(date -Is) == $*" | tee -a "$E/block.log"; }
 
+step "G0 image (Host, under the lock, after the owner check)"
+[ -e "$IMG" ] && stop "image dir $IMG exists"
+nice -n 19 numactl --cpunodebind=1 --membind=1 ${PLAIN_BUILD:-$P/builds/lmdb/7}/bin/lmdb-image --out "$IMG" --records $R 2> "$E/image.log" || stop "image"
+grep -q "^records=$R$" "$IMG/meta.txt" && grep -q "^entries=$R$" "$IMG/meta.txt" || stop "image meta"
+tail -n 2 "$E/image.log" >> "$E/block.log"
+step "H0 Host gate (after the image build)"
+bash $G check "$E/gate-H0.txt" || stop "host gate"
 step "G1 install"
 IMG=$IMG bash $X/install.sh "$E/install.log" > "$E/install.out" 2>&1 || stop "install"
 grep -q "^ldd_not_found=0$" "$E/install.log" && [ "$(grep -c '^ldd_not_found=0$' "$E/install.log")" = 2 ] || stop "install: ldd"
@@ -59,6 +89,7 @@ for i in 0 1; do
   $SSH comsys@$ip 'echo lmdb_procs=$(pgrep -c -x lmdb-server)/$(pgrep -c -x lmdb-stress); dmesg | tail -n 5' < /dev/null >> "$E/precheck-vm$i.txt" 2>&1
   grep -q "^lmdb_procs=0/0$" "$E/precheck-vm$i.txt" || stop "lmdb process on vm$i"
 done
+dmesg_base
 step "G3 chown"
 for i in 0 1; do
   $SSH comsys@${IPS[$i]} 'sudo -n chown comsys /dev/dax0.0 && stat -c "%U:%G %a" /dev/dax0.0' < /dev/null > "$E/chown-vm$i.out" 2>&1
@@ -89,6 +120,7 @@ stress() {
   grep -h "RESULT\|final scan\|write_txn_us" "$E/$tag.0.out" "$E/$tag.1.out" | tee -a "$E/block.log"
   [ $r0 = 0 ] && [ $r1 = 0 ] && [ "$(grep -c 'RESULT PASS' "$E/$tag.0.out" "$E/$tag.1.out" | awk -F: '{s+=$2} END {print s}')" = 2 ] \
     && grep -q "final scan .* entries=$R .*bad=0 end=ok" "$E/$tag.0.out" || stop "$tag"
+  dmesg_check "$tag" || stop "$tag: new dmesg error/warning"
 }
 run() {  # name, env...
   local name=$1; shift
@@ -100,6 +132,7 @@ run() {  # name, env...
   # closure checks (opsplit vs server counters; all-HWcc C = 0, Megalon C > 0, Popcorn C > 0 via swmc_acct)
   python3 -I $P/CXL_SWMC/experiments/kv/v1-check.py "$E/$name" --system $sys --workload lmdb | tee -a "$E/v1-check.log" \
     | grep -q "V1 CHECK PASS" || stop "$name: v1-check"
+  dmesg_check "$name" || stop "$name: new dmesg error/warning"
 }
 PL=(VM_PLAIN=$L/plain IMAGE=$L/img-$R RECORDS=$R MAX_PAGES=$MAXP KIND=functional GATE=0 RATES=200,1000)
 ML=(VM_MEG=$L/megalon IMAGE=$L/img-$R RECORDS=$R MAX_PAGES=$MAXP KIND=functional GATE=0 RATES=200,1000 PREPARE_THREADS=8)

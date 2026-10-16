@@ -208,9 +208,20 @@ case "$B" in
       local v="V1_HI_$1_$2"; [ -n "${!v:-}" ] && { echo "${!v}"; return; }
       case $1-$2 in hw-u5) echo 64300;; mg-u5) echo 63900;; pop-u5) echo 16400;;
                     hw-u80) echo 44000;; mg-u80) echo 44000;; pop-u80) echo 9700;; esac; }
+    # dmesg stop rule: line counts after the precheck; after every run, new lines matching BAD on either VM stop
+    BAD='BUG:|Oops|WARNING:|Call Trace|general protection|segfault|[Ee]rror|ERROR|soft lockup|hung_task'
+    for i in 0 1; do $SSH comsys@${IPS[$i]} 'dmesg | wc -l' < /dev/null > "$E/dmesg-base-vm$i.txt" 2>&1 || { echo "SEQUENCE STOP: dmesg vm$i"; exit 1; }; done
     v1chk() {  # run name, system, [timers]
       python3 -I $X/v1-check.py "$E/$1" --system $2 ${3:+--timers $3} | tee -a "$E/v1-check.log" | grep -q "V1 CHECK PASS" \
         || { echo "$(date -Is) SEQUENCE STOP: v1-check $1"; exit 1; }
+      local i n
+      for i in 0 1; do
+        n=$(cat "$E/dmesg-base-vm$i.txt")
+        $SSH comsys@${IPS[$i]} "dmesg | tail -n +$((n + 1))" < /dev/null > "$E/dmesg-new-$1-vm$i.txt" 2>&1
+        grep -E "$BAD" "$E/dmesg-new-$1-vm$i.txt" > /dev/null \
+          && { echo "$(date -Is) SEQUENCE STOP: new dmesg error/warning on vm$i after $1: $(grep -E "$BAD" "$E/dmesg-new-$1-vm$i.txt" | head -3)"; exit 1; }
+      done
+      true
     }
     ORD=$(shuffle hw:u5 hw:u80 mg:u5 mg:u80 mgoff:u5 mgoff:u80)
     echo "# KV-V1 order (shuffle seed $OWNER): $ORD then pop:u5 pop:u80; keys $KEYS batch 16; low $LOW req/s" | tee "$E/order.txt"
@@ -218,15 +229,15 @@ case "$B" in
     for sm in $ORD; do
       s=${sm%%:*} m=${sm#*:}; u=0.05; [ $m = u80 ] && u=0.8
       case $s in
-        hw)    run hw-$m-val SYS=all-HWcc PUT_RATIO=$u KIND=ladder RATES=$LOW,$(hi hw $m) KEYS=$KEYS; v1chk hw-$m-val all-HWcc;;
-        mg)    run mg-$m-val SYS=Megalon PUT_RATIO=$u KIND=ladder RATES=$LOW,$(hi mg $m) KEYS=$KEYS COH_TIMERS=1; v1chk mg-$m-val Megalon on;;
-        mgoff) run mg-$m-val-toff SYS=Megalon PUT_RATIO=$u KIND=ladder RATES=$LOW,$(hi mg $m) KEYS=$KEYS COH_TIMERS=0; v1chk mg-$m-val-toff Megalon off;;
+        hw)    run hw-$m-val SYS=all-HWcc PUT_RATIO=$u KIND=ladder RATES=$LOW,$(hi hw $m) KEYS=$KEYS READY_TIMEOUT=1800; v1chk hw-$m-val all-HWcc;;
+        mg)    run mg-$m-val SYS=Megalon PUT_RATIO=$u KIND=ladder RATES=$LOW,$(hi mg $m) KEYS=$KEYS COH_TIMERS=1 READY_TIMEOUT=1800; v1chk mg-$m-val Megalon on;;
+        mgoff) run mg-$m-val-toff SYS=Megalon PUT_RATIO=$u KIND=ladder RATES=$LOW,$(hi mg $m) KEYS=$KEYS COH_TIMERS=0 READY_TIMEOUT=1800; v1chk mg-$m-val-toff Megalon off;;
       esac
     done
     dax_root_all || { echo "SEQUENCE STOP: dax0.0 not back to root:root 600 before Popcorn"; exit 1; }; CHOWNED=0
     for m in u5 u80; do
       u=0.05; [ $m = u80 ] && u=0.8
-      run pop-$m-val SYS=Popcorn C8=$C8 K8=$K8 GT8=$GT8 RECV_MODE=$RECV_MODE PUT_RATIO=$u KIND=ladder RATES=$LOW,$(hi pop $m) KEYS=$KEYS
+      run pop-$m-val SYS=Popcorn C8=$C8 K8=$K8 GT8=$GT8 RECV_MODE=$RECV_MODE PUT_RATIO=$u KIND=ladder RATES=$LOW,$(hi pop $m) KEYS=$KEYS READY_TIMEOUT=1800
       v1chk pop-$m-val Popcorn
     done;;
   *) echo "SEQUENCE STOP: bad block"; exit 2;;
