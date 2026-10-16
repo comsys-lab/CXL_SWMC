@@ -27,18 +27,23 @@ struct swmc_acct {
   uint64_t ipi_ns;       /* coherence TLB-shootdown IPI handling (vector body) on this thread's CPU, outside faults */
   uint64_t ipi_cnt;
   uint64_t reserved[7];  /* [0] nontrans_ns, [1] nontrans_cnt (build 10; full fault duration of coherence faults
-                            without a transition; 0 on build 9); [2..6] reserved, 0 */
+                            without a transition; 0 on build 9); [2] update sequence (build 12; 0 before);
+                            [3..6] reserved, 0 */
 } __attribute__((aligned(64)));
 
 /* Register the calling thread's area (one per thread; it must stay valid until the thread exits or calls
  * swmc_acct_unregister()). 0 = ok, -1 = unsupported.
  * Kernel interface (Popcorn build 9+): the thread writes the area's address to /proc/thread-self/swmc_acct (only
  * the thread itself may; "0" unregisters). The kernel zeroes the area, sets version, and from then on keeps the
- * values (counted from 0 at registration) current: build 9/10 copy them on return to user mode, build 11 pins the
- * area's page(s) and stores into them directly at the end of each counted fault/IPI (same values). The area must
- * stay mapped and writable until the thread exits or unregisters; registration ends at execve and is not
- * inherited by new threads/processes. Anonymous memory (heap, stack, static) is required for build 11 (the page
- * is pinned; device mappings are refused). Any failure (older kernel: no such file; misaligned area) -> -1. */
+ * values (counted from 0 at registration) current: build 9/10 copy them on return to user mode; build 11+ pins the
+ * area's page(s) (FOLL_LONGTERM) and stores into them directly at the end of each counted fault and of each
+ * coherence IPI outside a counted fault (same values). The area must stay mapped and writable until the thread
+ * exits or unregisters; registration ends at execve and is not inherited by new threads/processes. Build 11+:
+ * the area must be in memory that can be pinned long-term: anonymous memory (heap, stack, .data/.bss), shmem/tmpfs
+ * or hugetlb; DAX/device and regular-file mappings are refused (registration returns -1).
+ * Build 12+: reserved[2] is an update sequence (odd while the kernel updates the area); a reader that may be
+ * interrupted by a coherence IPI between two field loads (the only writer that can run while the thread is in
+ * user mode) should use swmc_acct_snapshot(). Each field is one aligned 64-bit store (never torn). Any failure (older kernel: no such file; misaligned area) -> -1. */
 static inline int swmc_acct_register(struct swmc_acct *a) {
   char buf[32];
   int fd, n, ok;
@@ -53,6 +58,19 @@ static inline int swmc_acct_register(struct swmc_acct *a) {
 
 #define SWMC_ACCT_NONTRANS_NS 0   /* index into reserved[] */
 #define SWMC_ACCT_NONTRANS_CNT 1
+#define SWMC_ACCT_SEQ 2           /* build 12: update sequence, odd while updating */
+
+/* Consistent copy of the area (build 12 sequence; on build 9-11 the sequence stays 0, so this is a plain copy). */
+static inline void swmc_acct_snapshot(const volatile struct swmc_acct *a, struct swmc_acct *out) {
+  uint64_t s0, s1;
+  do {
+    s0 = a->reserved[SWMC_ACCT_SEQ];
+    __asm__ __volatile__("" ::: "memory");
+    *out = *(const struct swmc_acct *)a;
+    __asm__ __volatile__("" ::: "memory");
+    s1 = a->reserved[SWMC_ACCT_SEQ];
+  } while ((s0 & 1) || s0 != s1);
+}
 
 static inline uint64_t swmc_acct_nontrans_ns(const volatile struct swmc_acct *a) {
   return a->reserved[SWMC_ACCT_NONTRANS_NS];
@@ -73,5 +91,7 @@ static inline int swmc_acct_unregister(void) {
 /* Total coherence management time of the thread so far (ns): Fig 2 C_o = delta of this across an operation.
  * Transition faults + coherence IPIs outside them; the no-transition faults (reserved[0]) are reported separately. */
 static inline uint64_t swmc_acct_coh_ns(const volatile struct swmc_acct *a) {
-  return a->fault_ns[0] + a->fault_ns[1] + a->fault_ns[2] + a->ipi_ns;
+  struct swmc_acct c;
+  swmc_acct_snapshot(a, &c);
+  return c.fault_ns[0] + c.fault_ns[1] + c.fault_ns[2] + c.ipi_ns;
 }
