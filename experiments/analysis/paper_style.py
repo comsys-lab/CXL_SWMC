@@ -44,7 +44,7 @@ def curve(path, series, slo, xlabel, ylabel, ylim, xticks, yticks):
     plt.close(fig)
 
 
-def breakdown(path, bars, components, ylabel="Normalized\nserving latency"):
+def breakdown(path, bars, components, ylabel="Normalized\nserving latency", hatched=()):
     """bars: [(name, [values per component])] normalized to all-HWcc = 1; components: legend names, top -> bottom
     (the last one is drawn at the bottom). y axis up to the next 0.5 above the tallest bar."""
     import math
@@ -63,7 +63,8 @@ def breakdown(path, bars, components, ylabel="Normalized\nserving latency"):
         for j in range(n - 1, -1, -1):  # bottom component first
             v = vals[j]
             if v > 1e-9:
-                ax.bar(i, v, 0.55, bottom=b, color=cols[j], edgecolor="black", linewidth=2.5)
+                ax.bar(i, v, 0.55, bottom=b, color=cols[j], edgecolor="black", linewidth=2.5,
+                       hatch="//" if (name, j) in hatched else None)
             b += v
     ax.set_xticks(range(len(bars)))
     ax.set_xticklabels([b[0] for b in bars], fontsize=19)
@@ -80,23 +81,22 @@ def breakdown(path, bars, components, ylabel="Normalized\nserving latency"):
     plt.close(fig)
 
 
-# Serving-latency components (user 2026-10-16: two parts per bar, Popcorn one level finer; same legend in every
-# figure; legend top -> bottom). Every value is measured: total = the system's serving time per request at the same
-# offered rate; Application = all-HWcc's serving time (same binary, kernel and rate; no coherence actions);
-# Coherence overhead = system total - all-HWcc total; for Popcorn the measured message wait (FETCH + INVALIDATE
-# requester wait, kernel per-thread counters) is drawn as its own part of the coherence overhead. Normalized to
-# all-HWcc = 1.
-COMPONENTS = ["Coherence message wait (Popcorn)", "Coherence overhead", "Application (HWcc time)"]
+# Serving-latency breakdown (user 2026-10-16): each bar partitions that system's own serving time per request at
+# the same offered rate; same legend in every figure (top -> bottom); normalized to all-HWcc = 1.
+#   Version check (Megalon): read/write section start/end checks + re-execution (sampled section timers)
+#   Remote reply wait (Popcorn): coherence-fault time spent waiting for the peer's FETCH/INVALIDATE reply
+#   Fault handling (Popcorn): the rest of the coherence-fault handler (dev_dax_swmc_insert)
+#   Request processing: everything else in the request (serving time minus the parts above)
+COMPONENTS = ["Version check (Megalon)", "Remote reply wait (Popcorn)", "Fault handling (Popcorn)", "Request processing"]
 
 
-def compose(raw, hw="HWcc"):
-    """raw: {system: {"total": t, "msg": m (Popcorn only)}} -> {system: [msg, overhead - msg, 1]} normalized."""
+def partition(raw, hw="HWcc"):
+    """raw: {system: {"total", "check", "msg", "local"}} -> {system: [check, msg, local, rest]} / all-HWcc total."""
     base = raw[hw]["total"]
     out = {}
     for k, r in raw.items():
-        over = (r["total"] - base) / base
-        msg = r.get("msg", 0.0) / base
-        out[k] = [msg, max(over - msg, 0.0), 1.0] if k != hw else [0.0, 0.0, 1.0]
+        c, m, l = r.get("check", 0.0), r.get("msg", 0.0), r.get("local", 0.0)
+        out[k] = [c / base, m / base, l / base, (r["total"] - c - m - l) / base]
     return out
 
 

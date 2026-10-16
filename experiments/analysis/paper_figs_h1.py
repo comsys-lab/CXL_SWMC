@@ -58,13 +58,13 @@ def figure(out, tag, S, xscale, xlabel, slo_ms, xticks, ylim, yticks, comps_of, 
     o, m = common_step(S)
     order = [s for s in ("hw", "mg", "pop") if s in S]
     raw = {NAMES[s]: comps_of(s, m[s]) for s in order}
-    norm = ps.compose(raw)
+    norm = ps.partition(raw)
     ps.breakdown(os.path.join(out, f"{tag}-breakdown.png"), [(NAMES[s], norm[NAMES[s]]) for s in order], ps.COMPONENTS)
     note = f"identical offered rate {o} (steps: " + ", ".join(f"{NAMES[s]} pass={m[s]['pass']}" for s in order) + \
         f"); raw values in {unit.strip('_')} per request; normalized to all-HWcc total = 1"
-    write(os.path.join(out, f"{tag}-breakdown.csv"), ["system", "step", "offered", "achieved", "total", "msg"]
+    write(os.path.join(out, f"{tag}-breakdown.csv"), ["system", "step", "offered", "achieved", "total", "check", "msg", "local"]
           + ["norm_" + c for c in ps.COMPONENTS] + ["norm_total"],
-          [[NAMES[s], m[s]["step"], o, m[s]["achieved"]] + [round(raw[NAMES[s]].get(k, 0.0), 4) for k in ("total", "msg")]
+          [[NAMES[s], m[s]["step"], o, m[s]["achieved"]] + [round(raw[NAMES[s]].get(k, 0.0), 4) for k in ("total", "check", "msg", "local")]
            + [round(x, 4) for x in norm[NAMES[s]]] + [round(sum(norm[NAMES[s]]), 4)] for s in order], note)
     return o
 
@@ -87,7 +87,9 @@ def main():
         q = Q[s][st["step"]]
         f = lambda k: float(q[k] or 0)
         scale = f("server_ms_mean") / f("busy_mean_ms") if f("busy_mean_ms") else 0
-        return {"total": f("server_ms_mean"), "msg": f("pf_msg_wait_mean_ms") * scale}
+        return {"total": f("server_ms_mean"), "msg": f("pf_msg_wait_mean_ms") * scale,
+                "local": (f("pf_fault_mean_ms") - f("pf_msg_wait_mean_ms")) * scale,
+                "check": (f("mg_check_mean_ms") + f("mg_reexec_mean_ms")) * scale}
     o = figure(a.out, "vdb", S, 1.0, "Searches per second", 100.0, list(range(0, 211, 30)), (0, 12),
                list(range(0, 13, 2)), vdb_comps, "_ms", fixed_y=True)  # user: y max 12, step 2
     print("vdb common offered", o)
