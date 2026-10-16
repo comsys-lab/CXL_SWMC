@@ -140,8 +140,14 @@ trap finish EXIT
 trap 'echo "$(date -Is) SEQUENCE STOP: interrupted"; exit 130' INT TERM HUP
 stop() { echo "$(date -Is) MAIN STOP $*"; exit 1; }
 dax_comsys() {  # before an all-HWcc / Megalon session
-  [ $CHOWNED = 1 ] && return 0
   local ip
+  if [ $CHOWNED = 1 ]; then  # already chowned by this block: fresh stat on both VMs before the next lifetime
+    for ip in "${IPS[@]}"; do
+      $SSH comsys@$ip 'stat -c "%U:%G %a" /dev/dax0.0' < /dev/null > "$E/dax-stat-$ip-$(date +%s%N).out" 2>&1
+      grep -qx "comsys:root 600" "$(ls -t "$E"/dax-stat-$ip-*.out | head -1)" || stop "dax0.0 on $ip is not comsys:root 600"
+    done
+    return 0
+  fi
   for ip in "${IPS[@]}"; do
     $SSH comsys@$ip 'sudo -n chown comsys /dev/dax0.0 && stat -c "%U:%G %a" /dev/dax0.0' < /dev/null > "$E/chown-$ip-$(date +%s).out" 2>&1
     CHOWNED=1
@@ -310,6 +316,10 @@ nice -n 19 numactl --cpunodebind=1 --membind=1 "$PLAIN_BUILD/bin/recsys-rate" --
   --t-ms $T_MS --windows 20 > "$RATEF" || stop "recsys-rate"
 UPD_RATE=$(sed -n 's/^rate_samples_per_s=//p' "$RATEF")
 awk -v x="$UPD_RATE" 'BEGIN{exit !(x > 0)}' || stop "bad update rate $UPD_RATE"
+if [ -n "${V1_EXPECT_RATE:-}" ]; then  # the packet's expected rate (Host calibration, builds/recsys-inputs/1/rate-frac*.txt)
+  awk -v x="$UPD_RATE" -v y="$V1_EXPECT_RATE" 'BEGIN{exit !(x >= 0.98 * y && x <= 1.02 * y)}' \
+    || stop "update rate $UPD_RATE differs from the expected $V1_EXPECT_RATE by more than 2%"
+fi
 echo "EKKO=$EKKO publish_frac=$PUBLISH_FRAC update_rate=$UPD_RATE samples/s ($EKKO_RULE; $RATEF)"
 LGC=(--opt samples=$D/$UPD_FILE --opt queries=$D/$QRY_FILE --opt wrap=1
      --opt quantiles=$D/dist_quantile.txt --fixed update=$UPD_RATE --mix query=1 --x-stream query)
