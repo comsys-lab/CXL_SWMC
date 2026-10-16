@@ -41,6 +41,9 @@ BPIN=${BUILD_PIN:-$PIN}
   || { echo "SEQUENCE STOP: server/loadgen sources differ between BUILD_PIN $BPIN and PIN $PIN"; exit 2; }
 export VM_PLAIN=$VP VM_MEG=$VM PLAIN_BUILD=$BP MEG_BUILD=$BM LOADGEN_BUILD=$BL
 CFG=${KV_CFG:?KV_CFG = the megalon.yaml install.sh wrote (<install log>.megalon.yaml)}
+# KV_INSTALL=1: install the builds into the (new) guest dirs VM_PLAIN / VM_MEG under the block's lock, before the
+#   precheck (install.sh, grant A; refuses existing dirs); KV_CFG must then be <evidence dir>/install.log.megalon.yaml
+[ "${KV_INSTALL:-0}" = 0 ] || [ "$CFG" = "$E/install.log.megalon.yaml" ] || { echo "SEQUENCE STOP: KV_INSTALL=1 needs KV_CFG=$E/install.log.megalon.yaml"; exit 2; }
 SSH="ssh -o BatchMode=yes -o ConnectTimeout=8"
 IPS=(192.168.122.100 192.168.122.101)
 OWNER="KV-pilot-$B"; [ "$B" = main ] && OWNER="KV-main-h1"; [ "$B" = v1val ] && OWNER="KV-V1-v1"
@@ -127,6 +130,12 @@ precheck() {
   done
 }
 echo "$(date -Is) block $OWNER start (git $(git -C $P/CXL_SWMC rev-parse --short HEAD))"
+if [ "${KV_INSTALL:-0}" = 1 ]; then
+  : "${KEYS:?KEYS (install.sh sizes cfg/megalon.yaml for it)}"
+  echo "$(date -Is) install $BP -> $VP, $BM -> $VM (keys $KEYS)"
+  KEYS=$KEYS bash $X/install.sh "$E/install.log" > "$E/install.out" 2>&1 || { echo "SEQUENCE STOP: install (see install.out)"; exit 1; }
+  [ "$(grep -c '^ldd_not_found=0$' "$E/install.log")" = 2 ] || { echo "SEQUENCE STOP: install ldd"; exit 1; }
+fi
 precheck
 case "$B" in
   hm|hmtrace)
