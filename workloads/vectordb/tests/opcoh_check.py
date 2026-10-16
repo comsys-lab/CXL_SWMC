@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Checks of the per-operation time split (DESIGN.md §15) on a host_smoke.sh scratch dir (Host only).
 
-usage: opcoh_check.py <scratch dir> fake|megalon|none
+usage: opcoh_check.py <run or scratch dir> fake|megalon|none|hwcc|popcorn|megalon-vm|megalon-t0
+  (host_smoke.sh scratch dirs and run.sh run dirs have the same layout: loadgen/, node<k>.log)
   every mode: one v2 record per OK search response (op-coh.bin vs searches.bin, joined by seq) and per OK update
               (vectordb.txt updates_ok_without_coh=0, records = server updates); search sections = segments + 1,
               update sections = 1; t_ns > 0; c_ns = Popcorn parts + Megalon parts; the server's opt.<op>.* totals at
@@ -13,6 +14,14 @@ usage: opcoh_check.py <scratch dir> fake|megalon|none
   megalon:    Megalon build without CohSnap (fallback shim): src bit 2 = 0 and every mg_* field 0 (opt.meg_coh=0);
               Popcorn source none; with CohSnap: mg_read_sections > 0 on searches, mg_wflush_bytes > 0 on updates.
   none:       plain backend, no counter source: c_ns = 0.
+  VM modes (reports/VDB-V1-packet.md):
+  hwcc:       all-HWcc (plain backend, cxl_shm unloaded): any Popcorn source, every Popcorn and Megalon part 0, c_ns 0.
+  popcorn:    Popcorn (plain backend, cxl_shm loaded): source swmc_acct; sum of c_ns > 0 over the searches and over the
+              updates; no Megalon part.
+  megalon-vm: Megalon with CohSnap + AnchorSnap (shim v3): both present on every record, sum of c_ns > 0 per op type,
+              validation copies counted; every Popcorn part 0 (cxl_shm unloaded).
+  megalon-t0: as megalon-vm with MEGALON_COH_TIMERS=0: CohSnap/AnchorSnap present, Megalon durations may be 0 (counts
+              kept), no C > 0 requirement.
 """
 import csv, glob, os, subprocess, sys
 
@@ -99,6 +108,24 @@ if mode == "fake":
           "update fake no-transition 500 ns")
     check((cu["c_ns"] == 1000).all(), "no-transition faults are not part of C")
     check(sum(s["opt.update.pop.nontrans_ns"] for s in st) == 500 * len(cu), "opt.update.pop.nontrans_ns")
+pop_zero = ((c["pf_ns"] == 0).all() and (c["pf_cnt"] == 0).all() and (c["ipi_ns"] == 0).all()
+            and (c["nontrans_ns"] == 0).all())
+mg_fields = [f for f in opsplit.OPCOH.names if f.startswith("mg_") or f.startswith("an_") or f.startswith("vcopy")]
+if mode == "hwcc":
+    check(pop_zero and all((c[f] == 0).all() for f in mg_fields) and (c["c_ns"] == 0).all(), "all-HWcc: C = 0")
+elif mode == "popcorn":
+    check(all(s["opcoh.pop_source"] == "swmc_acct" for s in st) and ((c["src"] & 3) == 1).all(), "source swmc_acct")
+    check(int(cs["c_ns"].sum()) > 0 and int(cu["c_ns"].sum()) > 0, "Popcorn C > 0 for searches and updates")
+    check(all((c[f] == 0).all() for f in mg_fields), "no Megalon part")
+elif mode in ("megalon-vm", "megalon-t0"):
+    check(all(s["opt.meg_coh"] == 1 and s.get("opt.meg_anchor") == 1 for s in st), "CohSnap and AnchorSnap on both nodes")
+    check(((c["src"] & 12) == 12).all(), "src bits 2 and 3 on every record")
+    check(pop_zero, "every Popcorn part 0 (cxl_shm unloaded)")
+    check((cs["vcopy_cnt"] > 0).all() and (cs["mg_read_sections"] > 0).all(), "validation copies and read sections counted")
+    if mode == "megalon-vm":
+        check(int(cs["c_ns"].sum()) > 0 and int(cu["c_ns"].sum()) > 0, "Megalon C > 0 for searches and updates")
+        check(int(c["vcopy_sampled"].sum()) > 0 and int(cu["mg_wflush_bytes"].sum()) > 0, "sampled copies, flush bytes")
+    check(all(s["megt.writer.wr_sections"] > 0 for s in st), "writer write sections")
 elif mode == "megalon":
     snap = all(s["opt.meg_coh"] == 1 for s in st)
     print(f"megalon cohsnap {snap}")
@@ -116,9 +143,9 @@ elif mode == "megalon":
         mgf = [f for f in opsplit.OPCOH.names if f.startswith("mg_")]
         check(all((c[f] == 0).all() for f in mgf) and ((c["src"] & 4) == 0).all(), "no CohSnap: mg fields 0")
     check((cs["vcopy_cnt"] > 0).all() and c["vcopy_sampled"].sum() > 0, "validation copies counted and sampled")
-    check(all(s["opcoh.pop_source"] == "none" for s in st), "popcorn source none on the Host")
+    check(pop_zero, "every Popcorn part 0")
     check(all(s["megt.writer.wr_sections"] > 0 for s in st), "writer write sections")
-if mode != "megalon":
+if not mode.startswith("megalon"):
     check((c["vcopy_cnt"] == 0).all(), "plain backend: no validation copies")
 if mode == "none":
     check(all(s["opcoh.pop_source"] == "none" for s in st), "source none")

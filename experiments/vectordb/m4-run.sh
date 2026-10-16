@@ -23,6 +23,11 @@
 #   all-HWcc = none (no source required). Servers must end with opcoh.read_errors=0 and opcoh.register_errors=0 and
 #   every OK search/update must carry the v2 block; then opsplit.py writes <run>/opsplit-steps.csv + .columns.csv and
 #   must succeed (it refuses runs with mixed coherence sources).
+#   OPCOH_CHECK_MODE (hwcc | popcorn | megalon | megalon-t0; optional): after opsplit, workloads/vectordb/tests/
+#   opcoh_check.py <run> <mode> must print OPCOH_CHECK PASS (closure: server opt.* totals = response blocks; mode
+#   checks per system; output in <run>/opcoh-check.txt).
+#   XENV (optional): extra "ENV:K=V" tokens for every node (e.g. ENV:MEGALON_COH_TIMERS=0); XARGS (optional): extra
+#   vdb-server arguments of the measured server (e.g. --trace-max-mb 2048); both recorded in the run manifest.
 # Prints "M4RUN <name> OK|NOTE|STOP <reason>"; exit 0 for OK/NOTE (NOTE = a loadgen SLO-search outcome that is a
 # result, not an error: "confirm failed at three rates"), 1 for STOP (the sequence stops).
 set -uo pipefail
@@ -30,7 +35,9 @@ NAME=$1 E=$2
 P=/home/comsys/sungsu/destijl-control
 X=$P/CXL_SWMC/experiments/vectordb
 : "${SYS:?}" "${U:?}" "${KIND:?}"
-TRACE=${TRACE:-0} SEED=${SEED:-20261015}
+TRACE=${TRACE:-0} SEED=${SEED:-20261015} XENV=${XENV:-} XARGS=${XARGS:-}
+for t in $XENV; do [[ $t =~ ^ENV:[A-Z_][A-Z0-9_]*=[A-Za-z0-9_./-]*$ ]] || { echo "M4RUN $NAME STOP bad XENV token $t"; exit 1; }; done
+[[ "$XARGS" =~ ^[A-Za-z0-9\ ./=-]*$ ]] || { echo "M4RUN $NAME STOP bad XARGS"; exit 1; }
 stop() { echo "M4RUN $NAME STOP $*"; exit 1; }
 [ -d "$E" ] || stop "missing evidence dir $E"
 [ -e "$E/$NAME" ] && stop "$E/$NAME exists"
@@ -50,14 +57,14 @@ export LOADGEN=${LOADGEN_BIN:-$P/builds/loadgen/4/loadgen} READY_TIMEOUT=5400 RU
 [ "$KIND" = functional ] && RUN_KIND=functional
 export RUN_KIND
 case "$SYS" in
-  all-HWcc) export SYSTEM=all-HWcc V=$VPLAIN HOST_SERVER=$PLAIN_BUILD/bin/vdb-server SERVER_ARGS="$SA";;
+  all-HWcc) export SYSTEM=all-HWcc V=$VPLAIN HOST_SERVER=$PLAIN_BUILD/bin/vdb-server SERVER_ARGS="$SA $XARGS" NODE_ENV="$XENV";;
   Megalon) export SYSTEM=Megalon V=$VMEG HOST_SERVER=$MEG_BUILD/bin/vdb-server \
-             SERVER_ARGS="--backend megalon $SA" NODE_ENV="ENV:RACKOBJ_CONFIG=$VMEG/cfg/megalon.yaml" \
+             SERVER_ARGS="--backend megalon $SA $XARGS" NODE_ENV="ENV:RACKOBJ_CONFIG=$VMEG/cfg/megalon.yaml $XENV" \
              NODE0_ENV="ENV:MEGALON_REINIT=1";;
   Popcorn) : "${C8:?}" "${K8:?}" "${GT8:?}" "${RECV_MODE:?}"
            [[ $RECV_MODE =~ ^(poll|idle|sleep)$ ]] || stop "bad RECV_MODE"
            export SYSTEM=Popcorn-$RECV_MODE V=$VPLAIN HOST_SERVER=$PLAIN_BUILD/bin/vdb-server \
-             SERVER_ARGS="$SA --preloaded";;
+             SERVER_ARGS="$SA --preloaded $XARGS" NODE_ENV="$XENV";;
   *) stop "bad SYS";;
 esac
 [ "$SYS" = Megalon ] || [ "$TRACE" = 0 ] || stop "TRACE=1 is for Megalon only"
@@ -88,7 +95,7 @@ esac
 SSH="ssh -o BatchMode=yes -o ConnectTimeout=8"
 IPS=(192.168.122.100 192.168.122.101)
 servers_gone() { for ip in "${IPS[@]}"; do [ "$($SSH comsys@$ip 'pgrep -c -x vdb-server' < /dev/null)" = 0 ] || return 1; done; }
-echo "$(date -Is) $NAME: SYS=$SYS U=$U KIND=$KIND DATASET=${DATASET:-28m} REP=${REP:-} TRACE=$TRACE RATE=${RATE:-} RECV_MODE=${RECV_MODE:-} SEED=$SEED V=$V HOST_SERVER=$HOST_SERVER"
+echo "$(date -Is) $NAME: SYS=$SYS U=$U KIND=$KIND DATASET=${DATASET:-28m} REP=${REP:-} TRACE=$TRACE RATE=${RATE:-} RECV_MODE=${RECV_MODE:-} SEED=$SEED V=$V HOST_SERVER=$HOST_SERVER XENV=[$XENV] XARGS=[$XARGS] OPCOH_EXPECT=${OPCOH_EXPECT:-} OPCOH_CHECK_MODE=${OPCOH_CHECK_MODE:-}"
 servers_gone || stop "a vdb-server is running before the run"
 [ "${GATE:-1}" = 1 ] || [ "$KIND" = functional ] || stop "GATE=0 is allowed for KIND=functional only"
 if [ "${GATE:-1}" = 1 ]; then bash $X/host-gate.sh check "$E/gate-$NAME.txt" || stop "host gate"; fi
@@ -165,6 +172,10 @@ if [ -n "${OPCOH_EXPECT:-}" ]; then  # per-operation time split (vdb build >= 10
   { grep -qx "ok_without_coh=0" $R/loadgen/vectordb.txt && grep -qx "updates_ok_without_coh=0" $R/loadgen/vectordb.txt &&
     grep -qx "bad_coh_version=0" $R/loadgen/vectordb.txt; } || stop "responses without an op coherence block"
   python3 $X/opsplit.py $R > $R/opsplit.log 2>&1 || stop "opsplit.py failed (see $R/opsplit.log)"
+  if [ -n "${OPCOH_CHECK_MODE:-}" ]; then
+    python3 $P/CXL_SWMC/workloads/vectordb/tests/opcoh_check.py $R $OPCOH_CHECK_MODE > $R/opcoh-check.txt 2>&1
+    grep -q "^OPCOH_CHECK PASS" $R/opcoh-check.txt || stop "opcoh_check $OPCOH_CHECK_MODE (see $R/opcoh-check.txt)"
+  fi
 fi
 python3 $X/e1_check.py --writes $W --na $NA --nb $NB --searches $R/loadgen/searches.bin --out $R/e1 --sample 500 > /dev/null \
   || stop "E1 violation (see $R/e1.e1.txt)"
