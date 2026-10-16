@@ -46,7 +46,11 @@ confirm ≈ 4-6 min per (system, configuration). `--mode fixed --rates r1,r2,...
 `manifest.txt` (all parameters, workload description), `steps.jsonl` (one JSON per step: offered/achieved,
 p50/p90/p95/p99/p99.9/SLO percentile (`pslo_ms`)/max, errors, timeouts, send lag, pass/abort reason, per stream;
 `p95_ms` since 2026-10-16), `summary.json` (`slo` = stream/pct/ms in every run with `--slo`, since 2026-10-16 also
-fixed mode and SLO runs without a passing step), optional `raw-step<N>.bin` (`--raw`: sched/send/done ns, stream/status per request), optional
+fixed mode and SLO runs without a passing step), optional `raw-step<N>.bin` (`--raw`: one 32 B row per request of the
+step, 4 x u64: sched ns, send ns, done ns (0 = never completed), stream << 32 | status | measured << 40) with, since
+2026-10-16, `rawid-step<N>.bin` beside it (one u64 per raw row, same order: the request id = the frame `req_id` the
+server echoes, so per-request server records can be matched by id instead of by time; a sidecar file keeps the raw
+rows unchanged for existing readers; runs before 2026-10-16 have no rawid file), optional
 `stats/` (`--stats-op`, below), plus the
 workload's own files (e.g. vectordb search results for offline recall).
 Plot: `plot_slo.py --out fig.pdf runA=all-HWcc runB=Megalon ...` (x = throughput, y = tail latency).

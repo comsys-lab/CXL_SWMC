@@ -671,13 +671,18 @@ class Engine {
   void dump_raw(uint64_t a, uint64_t b) {
     std::string p = c_.out + "/raw-step" + std::to_string(step_no_) + ".bin";
     FILE *f = std::fopen(p.c_str(), "wb");
+    // request ids (the frame req_id the server echoes), one u64 per raw row in the same order, in a sidecar file so
+    // the 32-byte raw rows stay unchanged for existing readers (glob raw-step*.bin does not match rawid-step*.bin)
+    FILE *g = std::fopen((c_.out + "/rawid-step" + std::to_string(step_no_) + ".bin").c_str(), "wb");
     for (uint64_t id = a; id < b; id++) {
       Rec *r = store_.get(id);
       uint64_t row[4] = {r->sched, r->send, r->done.load(), (uint64_t(r->stream) << 32) | r->status.load() |
                                                                  (uint64_t(r->measured) << 40)};
       std::fwrite(row, sizeof(row), 1, f);
+      std::fwrite(&id, sizeof(id), 1, g);
     }
     std::fclose(f);
+    std::fclose(g);
   }
 
   void write_manifest() {
