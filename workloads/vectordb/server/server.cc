@@ -34,6 +34,7 @@
 #include "frame.h"
 #include "layout.h"
 #include "megalon_backend.h"
+#include "opcoh.h"
 #include "proc_stats.h"
 #include "proto.h"
 #include "qcoh.h"
@@ -73,8 +74,9 @@ struct Opts {
   std::string region;    // region config (default $CXL_REGION_CONFIG)
   std::string backend = "plain";
   std::string megalon_lib;  // default: <dir of the executable>/../lib/libvdb-megalon.so
-  std::string trace_dir;    // measurement traces written at stop (empty: none)
-  bool query_coh = true;    // per-query coherence attribution (qcoh.h; --query-coh off disables it)
+  std::string trace_dir;    // sharing trace written at stop (empty: none; Megalon only; DESIGN.md §16)
+  uint64_t trace_max_mb = 4096;  // per node trace buffer cap (records beyond it are dropped and counted)
+  bool op_coh = true;       // per-operation time split (opcoh.h; --op-coh off disables the counter reads and blocks)
 };
 
 struct Conn {
@@ -126,33 +128,37 @@ struct Stats {
   std::atomic<uint64_t> inserts{0}, deletes{0}, updates{0}, searches{0}, timeouts{0}, bad_records{0}, dists{0},
       wait_ns{0}, replay_ns{0}, search_ns{0}, lock_ns{0}, insert_ns{0}, insert_lock_ns{0}, update_ns{0},
       search_busy_ns{0}, writer_busy_ns{0};
-  // per-query coherence (qcoh.h): totals over answered searches, sections, deltas of timed-out searches (no response
-  // carries them), counter read failures
-  std::atomic<uint64_t> qc_searches{0}, qc_sections{0}, qc_coh_ns{0}, qc_pf_fault_ns{0}, qc_mg_check_ns{0},
-      qc_mg_reexec_ns{0}, qc_unattributed_fault_ns{0}, qc_unattributed_mg_sampled{0}, qc_read_errors{0},
-      qc_open_errors{0};
+  std::atomic<uint64_t> opc_read_errors{0}, opc_register_errors{0}, opc_unattributed_ns{0}, opc_unattributed_t_ns{0};
 };
 
-// Per-query attribution state of one search thread (qcoh.h): the counter values at its previous section end.
-struct QcThread {
-  SwmcReader sw;
-  bool sw_ok = false;
-  SwmcVals last, fake;  // fake: Host-test counter source (VDB_QCOH_FAKE=1)
-  uint64_t mg_last[MegTimers::kN] = {};
-};
-thread_local QcThread g_qct;
-
-// One query's sums over its sections (QueryCtx::qa; segment tasks add under QueryCtx::mu).
-struct QAcc {
-  uint64_t pf_fault_ns = 0, pf_msg_wait_ns = 0, pf_local_wait_ns = 0, pf_faults = 0, pf_transactions = 0;
-  uint64_t mg[MegTimers::kN] = {};
-  uint64_t busy_ns = 0;
-  uint32_t sections = 0;
-  void add(const QAcc &d) {
-    busy_ns += d.busy_ns;
-    pf_fault_ns += d.pf_fault_ns, pf_msg_wait_ns += d.pf_msg_wait_ns, pf_local_wait_ns += d.pf_local_wait_ns;
-    pf_faults += d.pf_faults, pf_transactions += d.pf_transactions, sections += d.sections;
-    for (int k = 0; k < MegTimers::kN; k++) mg[k] += d.mg[k];
+// Window counters of one operation type (opcoh.h), keys in the KV convention (workloads/kv/server/opsplit.h,
+// experiments/analysis/v6_common.py): opt.<op>.{ops,t_ns,c_ns,mod_bytes}, opt.<op>.pop.<f>, opt.<op>.meg.<f>; sums over
+// the operations answered (the same values as the response blocks; the server's completion time decides the window).
+struct OpWin {
+  static constexpr int kPop = 8, kMeg = 20;
+  std::atomic<uint64_t> ops{0}, sections{0}, t_ns{0}, c_ns{0}, mod_bytes{0}, pop[kPop]{}, meg[kMeg]{};
+  void add(const OpCoh &b) {
+    ops++, sections += b.sections, t_ns += b.t_ns, c_ns += b.c_ns, mod_bytes += b.mod_bytes;
+    const uint64_t p[kPop] = {b.pf_ns[0], b.pf_ns[1], b.pf_ns[2], b.pf_cnt[0], b.pf_cnt[1], b.pf_cnt[2], b.ipi_ns, b.ipi_cnt};
+    const uint64_t m[kMeg] = {b.mg_read_sections, b.mg_write_sections, b.mg_check_ns_sampled, b.mg_check_sampled,
+                              b.mg_stale_cnt, b.mg_stale_ns, b.mg_concur_cnt, b.mg_concur_ns, b.mg_meta_cnt,
+                              b.mg_meta_ns, b.mg_spin_cnt, b.mg_spin_ns, b.mg_wstart_ns, b.mg_switch_rw_cnt,
+                              b.mg_switch_rw_ns, b.mg_reclaim_cnt, b.mg_reclaim_ns, b.mg_wflush_cnt, b.mg_wflush_ns,
+                              b.mg_wflush_bytes};
+    for (int i = 0; i < kPop; i++) pop[i] += p[i];
+    for (int i = 0; i < kMeg; i++) meg[i] += m[i];
+  }
+  void print(std::ostream &o, const char *name) const {
+    static const char *const pn[kPop] = {"is_ns", "sm_ns", "wp_ns", "is_cnt", "sm_cnt", "wp_cnt", "ipi_ns", "ipi_cnt"};
+    static const char *const mn[kMeg] = {"read_sections", "write_sections", "check_ns_sampled", "check_sampled",
+                                         "stale_cnt", "stale_ns", "concur_cnt", "concur_ns", "meta_cnt", "meta_ns",
+                                         "spin_cnt", "spin_ns", "wstart_ns", "switch_rw_cnt", "switch_rw_ns",
+                                         "reclaim_cnt", "reclaim_ns", "wflush_cnt", "wflush_ns", "wflush_bytes"};
+    const std::string p = std::string("\nopt.") + name + ".";
+    o << p << "ops=" << ops << p << "sections=" << sections << p << "t_ns=" << t_ns << p << "c_ns=" << c_ns << p
+      << "mod_bytes=" << mod_bytes;
+    for (int i = 0; i < kPop; i++) o << p << "pop." << pn[i] << "=" << pop[i];
+    for (int i = 0; i < kMeg; i++) o << p << "meg." << mn[i] << "=" << meg[i];
   }
 };
 
@@ -194,10 +200,12 @@ class Server {
     if constexpr (std::is_same_v<Be, MegalonBackend>) be_ = std::make_unique<Be>(r_, map_, p_, api_);
     else be_ = std::make_unique<Be>(r_, map_, p_);
     if (!be_->fits(&err)) die(err);
+    tsc_khz_ = calibrate_tsc_khz();
     if constexpr (std::is_same_v<Be, MegalonBackend>)
-      be_->set_trace(o_.trace_dir.empty() ? nullptr : h_->wsec, o_.trace_dir.empty() ? nullptr : h_->objseq,
-                     !o_.trace_dir.empty(), o_.node);
-    {  // trace lines' device offsets (Host tests check that they stay 0 without --trace-dir)
+      be_->set_trace(o_.trace_dir.empty() ? nullptr : h_->wsec, o_.node, (o_.trace_max_mb << 20) / sizeof(TraceRec),
+                     tsc_khz_);
+    {  // trace lines' device offsets (Host tests check that they stay 0 without --trace-dir; objseq is unused since
+       // vdb build 10 and must stay 0)
       const uint64_t app = uint64_t(cxl::hwcc::app_base(r_, map_) - map_);
       std::fprintf(stderr, "vdb-server: trace %s (%s), wsec at device offset %lu, objseq at %lu (%lu objects)\n",
                    o_.trace_dir.empty() ? "off" : "on", Be::kLayoutTag[0] ? "megalon" : "plain: unused",
@@ -229,7 +237,7 @@ class Server {
             o_.start_timeout_ms))
       die("not every node became ready in time");
     warm_up();
-    qc_setup();
+    opc_setup();
     std::thread([this] { writer(); }).detach();
     for (uint32_t i = 0; i < o_.search_threads; i++) std::thread([this, i] { searcher(int(2 + i)); }).detach();
     std::thread([this] { listen_loop(); }).detach();
@@ -240,7 +248,8 @@ class Server {
     if (o_.trace_dir.empty()) return;
     std::string err;
     if constexpr (std::is_same_v<Be, MegalonBackend>)
-      if (!be_->dump_trace(o_.trace_dir + "/node" + std::to_string(o_.node), &err)) std::fprintf(stderr, "vdb-server: %s\n", err.c_str());
+      if (!be_->dump_trace(o_.trace_dir + "/node" + std::to_string(o_.node) + ".vdbtrace.bin", &err))
+        std::fprintf(stderr, "vdb-server: %s\n", err.c_str());
   }
 
   std::string stats_text() {
@@ -258,13 +267,15 @@ class Server {
       << "\nreplay_ns_total=" << st_.replay_ns << "\nsearch_lock_ns_total=" << st_.lock_ns
       << "\ninsert_ns_total=" << st_.insert_ns << "\ninsert_lock_ns_total=" << st_.insert_lock_ns
       << "\nsearch_queue=" << search_queue_len();
-    o << "\nqcoh.enabled=" << int(qc_on_) << "\nqcoh.source=" << kQcSource[qc_source_] << "\nqcoh.clock_ns=" << clock_ns_
-      << "\nqcoh.swmc_read_ns=" << swmc_read_ns_ << "\nqcoh.searches=" << st_.qc_searches << "\nqcoh.sections=" << st_.qc_sections
-      << "\nqcoh.coh_ns_total=" << st_.qc_coh_ns << "\nqcoh.pf_fault_ns_total=" << st_.qc_pf_fault_ns
-      << "\nqcoh.mg_check_est_ns_total=" << st_.qc_mg_check_ns << "\nqcoh.mg_reexec_est_ns_total=" << st_.qc_mg_reexec_ns
-      << "\nqcoh.unattributed_fault_ns=" << st_.qc_unattributed_fault_ns
-      << "\nqcoh.unattributed_mg_sampled=" << st_.qc_unattributed_mg_sampled << "\nqcoh.read_errors=" << st_.qc_read_errors
-      << "\nqcoh.open_errors=" << st_.qc_open_errors;
+    o << "\nopcoh.enabled=" << int(oc_.on()) << "\nopcoh.pop_source=" << pop_src_name(oc_.src())
+      << "\nopcoh.mg_cohsnap=" << int(oc_.mg_snap()) << "\nopcoh.tsc_khz=" << tsc_khz_ << "\nopcoh.clock_ns=" << clock_ns_
+      << "\nopcoh.read_errors=" << st_.opc_read_errors << "\nopcoh.register_errors=" << st_.opc_register_errors
+      << "\nopcoh.unattributed_c_ns=" << st_.opc_unattributed_ns << "\nopcoh.unattributed_t_ns=" << st_.opc_unattributed_t_ns;
+    o << "\nopt.version=1\nopt.c_source=" << (std::is_same_v<Be, MegalonBackend> ? "megalon" : "popcorn")
+      << "\nopt.tsc_hz=" << uint64_t(tsc_khz_) * 1000 << "\nopt.meg_coh=" << int(oc_.mg_snap())
+      << "\nopt.meg_check_sample=" << oc_.mg_check_sample();
+    win_search_.print(o, "search");
+    win_update_.print(o, "update");
     for (uint32_t v = 0; v < p_.nr_nodes; v++) o << "\ndlog_count." << v << "=" << load_acquire(&h_->nodes[v].dlog_count);
     o << "\nbackend=" << be_->usage() << "\n" << be_->stats();
     o << "\n" << cxl::proc::text(pst_);
@@ -389,101 +400,27 @@ class Server {
                  (now_ns() - t0) / 1e9, (unsigned long)(sum & 1));
   }
 
-  // ---------------------------------------------------------------- per-query coherence (qcoh.h)
-  static constexpr const char *kQcSource[3] = {"none", "swmc", "fake"};
-  // Main thread, after warm-up, before the search threads start: timer calibration; page MSI counter source (the
-  // kernel's per-thread file, or the Host-test fake) and the cost of one read (median of 2000; added to every section
-  // end of every system on a kernel that has the file).
-  void qc_setup() {
+  // ---------------------------------------------------------------- per-operation time split (opcoh.h)
+  // Main thread, after warm-up, before the worker threads start: timer calibration (Megalon wrapper), the Popcorn
+  // counter source (swmc_acct, the build-8 file, or the Host-test fake VDB_OPCOH_FAKE=1) and Megalon's CohSnap.
+  void opc_setup() {
     clock_ns_ = calibrate_clock_ns();
     if constexpr (std::is_same_v<Be, MegalonBackend>) be_->set_clock_ns(clock_ns_);
-    qc_on_ = o_.query_coh;
-    const char *fake = getenv("VDB_QCOH_FAKE");
-    std::string err;
-    if (!qc_on_) {
-      qc_source_ = 0;
-    } else if (fake && std::string(fake) == "1") {
-      qc_source_ = 2;
-    } else {
-      SwmcReader r;
-      if (r.open("/proc/thread-self/swmc", &err)) {
-        qc_source_ = 1;
-        std::vector<uint64_t> d;
-        SwmcVals v;
-        for (int i = 0; i < 2000; i++) {
-          const uint64_t a = now_ns();
-          if (!r.read(&v)) die("query coherence: /proc/thread-self/swmc read failed");
-          d.push_back(now_ns() - a);
-        }
-        std::nth_element(d.begin(), d.begin() + d.size() / 2, d.end());
-        swmc_read_ns_ = d[d.size() / 2];
-      } else {
-        qc_source_ = 0;
-      }
-    }
-    std::fprintf(stderr, "vdb-server: query coherence %s, page MSI source %s%s%s (read median %lu ns), clock_ns %u\n",
-                 qc_on_ ? "on" : "off", kQcSource[qc_source_], qc_source_ == 0 && qc_on_ ? ": " : "",
-                 qc_source_ == 0 && qc_on_ ? err.c_str() : "", (unsigned long)swmc_read_ns_, clock_ns_);
+    const char *fake = getenv("VDB_OPCOH_FAKE");
+    CohSnapFn mg = nullptr;
+    if constexpr (std::is_same_v<Be, MegalonBackend>) mg = be_->thread_coh();
+    std::string why;
+    oc_.setup(o_.op_coh, fake && std::string(fake) == "1", mg, tsc_khz_, &why);
+    std::fprintf(stderr, "vdb-server: op coherence %s, popcorn source %s%s%s, megalon cohsnap %s, tsc %u kHz, clock_ns %u\n",
+                 oc_.on() ? "on" : "off", pop_src_name(oc_.src()), why.empty() ? "" : " (", why.empty() ? "" : (why + ")").c_str(),
+                 std::is_same_v<Be, MegalonBackend> ? (oc_.mg_snap() ? "on" : "absent") : "n/a", tsc_khz_, clock_ns_);
   }
-  // Search thread start (after thread_init): open this thread's counter file, take the first values.
-  void qc_thread_start() {
-    if (!qc_on_) return;
-    QcThread &t = g_qct;
-    if (qc_source_ == 1) {
-      std::string err;
-      t.sw_ok = t.sw.open("/proc/thread-self/swmc", &err) && t.sw.read(&t.last);
-      if (!t.sw_ok) st_.qc_open_errors++;
-    }
-    if constexpr (std::is_same_v<Be, MegalonBackend>) be_->thread_snap(t.mg_last);
+  // Worker thread start (after thread_init).
+  void opc_thread_start() {
+    if (!oc_.thread_start()) st_.opc_register_errors++;
   }
-  // End of a section on this search thread: d = counter change since this thread's previous section end.
-  void qc_end_section(QAcc *d) {
-    if (!qc_on_) return;
-    QcThread &t = g_qct;
-    SwmcVals v;
-    bool have = false;
-    if (qc_source_ == 1 && t.sw_ok) {
-      have = t.sw.read(&v);
-      if (!have) st_.qc_read_errors++;
-    } else if (qc_source_ == 2) {
-      v = t.fake, have = true;
-    }
-    if (have) {
-      d->pf_fault_ns = v.fault_ns - t.last.fault_ns, d->pf_msg_wait_ns = v.msg_wait_ns - t.last.msg_wait_ns;
-      d->pf_local_wait_ns = v.local_wait_ns - t.last.local_wait_ns, d->pf_faults = v.faults - t.last.faults;
-      d->pf_transactions = v.transactions - t.last.transactions;
-      t.last = v;
-    }
-    if constexpr (std::is_same_v<Be, MegalonBackend>) {
-      uint64_t now[MegTimers::kN];
-      be_->thread_snap(now);
-      for (int k = 0; k < MegTimers::kN; k++) d->mg[k] = now[k] - t.mg_last[k], t.mg_last[k] = now[k];
-    }
-    d->sections = 1;
-  }
-  // The response block of one query (proto.h SearchCoh: raw sums + the derived, calibrated estimate).
-  SearchCoh qc_block(const QAcc &a) const {
-    SearchCoh q{};
-    q.version = kSearchCohVersion;
-    q.source = uint16_t(qc_source_);
-    q.sections = a.sections;
-    q.pf_fault_ns = a.pf_fault_ns, q.pf_msg_wait_ns = a.pf_msg_wait_ns, q.pf_local_wait_ns = a.pf_local_wait_ns;
-    q.pf_faults = uint32_t(a.pf_faults), q.pf_transactions = uint32_t(a.pf_transactions);
-    q.clock_ns = clock_ns_;
-    if constexpr (std::is_same_v<Be, MegalonBackend>) {
-      using T = MegTimers;
-      q.mg_sample = MegalonBackend::kSample;
-      q.mg_rd_sampled = a.mg[T::kRdSampled], q.mg_rd_start_ns = a.mg[T::kRdStartNs], q.mg_rd_body_ns = a.mg[T::kRdBodyNs];
-      q.mg_rd_end_ns = a.mg[T::kRdEndNs], q.mg_rd_retries = a.mg[T::kRdRetries];
-      q.mg_rd_failed_timed = a.mg[T::kRdFailedTimed], q.mg_rd_failed_ns = a.mg[T::kRdFailedNs];
-      uint64_t chk = 0, re = 0;  // (no pointers into the packed struct)
-      mg_estimate(q.mg_rd_start_ns, q.mg_rd_body_ns, q.mg_rd_end_ns, q.mg_rd_sampled, q.mg_rd_retries,
-                  q.mg_rd_failed_timed, q.mg_rd_failed_ns, clock_ns_, MegalonBackend::kSample, &chk, &re);
-      q.mg_check_est_ns = chk, q.mg_reexec_est_ns = re;
-    }
-    q.busy_ns = a.busy_ns;
-    q.coh_ns = q.pf_fault_ns + q.mg_check_est_ns + q.mg_reexec_est_ns;
-    return q;
+  void opc_end(const OpCohSrc::Start &s, OpAcc *a) {
+    if (!oc_.end(s, a)) st_.opc_read_errors++;
   }
 
   static void read_file(const std::string &path, uint8_t *dst, uint64_t n) {
@@ -498,6 +435,7 @@ class Server {
   void writer() {
     cxl::proc::name_thread("vdb-writer");
     be_->thread_init(1);
+    opc_thread_start();
     const uint32_t dim = p_.g.dim;
     for (;;) {
       Job j = wq_.pop();
@@ -524,11 +462,16 @@ class Server {
         std::memcpy(&rq, j.p.data(), sizeof(rq));
         if (!valid(rq.del_id, rq.w_del) || !valid(rq.ins_id, rq.w_ins) || rq.w_ins != rq.w_del + 1) { bad(j); continue; }
         const uint64_t t0 = now_ns();
+        OpCohSrc::Start os;
+        OpAcc oa;
+        oc_.begin(&os);  // one section on this thread: delete + publish + insert + publish
         do_delete(rq.w_del, rq.del_id);
         publish(rq.w_del);
         do_insert(rq.w_ins, rq.ins_id, reinterpret_cast<const float *>(j.p.data() + sizeof(rq)));
         publish(rq.w_ins);
-        reply_write(j, rq.w_ins);
+        oc_.fake_add(1, 1000, 0);  // Host-test fake: 1000 ns S->M per update
+        opc_end(os, &oa);
+        reply_update(j, rq.w_ins, oa);
         st_.update_ns += now_ns() - t0;
         st_.updates++;
         st_.deletes++;
@@ -588,6 +531,17 @@ class Server {
     WriteResp r{w, uint32_t(load_acquire(h_->P))};
     j.c->reply(frame::kStatusOk, j.h.req_id, &r, sizeof(r));
   }
+  // Update response: WriteResp + OpCoh (op coherence on)
+  void reply_update(Job &j, uint32_t w, const OpAcc &a) {
+    if (!oc_.on()) return reply_write(j, w);
+    uint8_t out[sizeof(WriteResp) + sizeof(OpCoh)];
+    WriteResp r{w, uint32_t(load_acquire(h_->P))};
+    const OpCoh b = op_block(a, kOpUpdate, oc_.src(), oc_.mg_snap(), tsc_khz_);
+    std::memcpy(out, &r, sizeof(r));
+    std::memcpy(out + sizeof(r), &b, sizeof(b));
+    win_update_.add(b);
+    j.c->reply(frame::kStatusOk, j.h.req_id, out, sizeof(out));
+  }
 
   // ---------------------------------------------------------------- reader side
   // Replay node u's delete log up to `upto` entries into del_seq_ (one cursor per log, under dmu_[u]).
@@ -617,7 +571,7 @@ class Server {
     std::atomic<uint64_t> lock_ns{0}, dists{0};
     std::mutex mu;
     std::vector<std::pair<float, uint64_t>> all;
-    QAcc qa;  // per-query coherence (under mu once the segment tasks are published)
+    OpAcc oa;  // per-operation time split (under mu once the segment tasks are published)
   };
 
   void push_search(Job j) {
@@ -631,7 +585,7 @@ class Server {
   void searcher(int tid) {
     cxl::proc::name_thread("vdb-search");
     be_->thread_init(tid);
-    qc_thread_start();
+    opc_thread_start();
     for (;;) {
       QueryCtx *task = nullptr;
       Job job;
@@ -681,14 +635,16 @@ class Server {
     auto *c = new QueryCtx;
     c->k = std::min<uint32_t>(std::max<uint32_t>(rq.k, 1), 1024);
     c->s = rq.ref_w;
+    OpCohSrc::Start os;
+    oc_.begin(&os);
     c->t0 = now_ns();
     // E1 readiness: P >= s (every write <= s applied by its writer)
     if (!cxl::hwcc::poll_until([&] { return load_acquire(h_->P) >= c->s; }, o_.wait_timeout_ms)) {
       st_.timeouts++;
-      QAcc d;  // no response carries this section: keep its deltas out of the next query
-      qc_end_section(&d);
-      st_.qc_unattributed_fault_ns += d.pf_fault_ns;
-      st_.qc_unattributed_mg_sampled += d.mg[MegTimers::kRdSampled];
+      OpAcc d;  // no response carries this section
+      opc_end(os, &d);
+      st_.opc_unattributed_ns += pop_coh_ns(d) + mg_coh_ns(d.mg);
+      st_.opc_unattributed_t_ns += ticks_to_ns(d.ticks, tsc_khz_);
       j.c->reply(frame::kStatusTimeout, j.h.req_id, nullptr, 0);
       delete c;
       return nullptr;
@@ -699,8 +655,7 @@ class Server {
       if (__atomic_load_n(&dcursor_[u], __ATOMIC_ACQUIRE) < n) replay(u, n);
     }
     c->t2 = now_ns();
-    qc_end_section(&c->qa);  // start section (E1 wait + delete-log replay); c is not shared yet
-    c->qa.busy_ns += c->t2 - c->t0;
+    opc_end(os, &c->oa);  // start section (E1 wait + delete-log replay); c is not shared yet
     c->job = std::move(j);
     c->q = reinterpret_cast<const float *>(c->job.p.data() + sizeof(SearchReq));
     return c;
@@ -715,6 +670,8 @@ class Server {
     thread_local std::vector<std::pair<float, uint32_t>> part;
     if (visited.size() < p_.g.capacity) visited.assign(p_.g.capacity, 0);
     SegLines &sl = h_->segs[sg];
+    OpCohSrc::Start os;
+    oc_.begin(&os);
     const uint64_t l0 = now_ns();
     cxl::hwcc::read_lock(&sl.lock);
     c->lock_ns += now_ns() - l0;
@@ -734,18 +691,13 @@ class Server {
     }
     cxl::hwcc::read_unlock(&sl.lock);
     c->dists += nd;
-    if (qc_source_ == 2) {  // Host-test counter source: fault time = distance computations of this section
-      QcThread &t = g_qct;
-      t.fake.fault_ns += nd, t.fake.msg_wait_ns += nd / 4, t.fake.local_wait_ns += nd / 8;
-      t.fake.faults += 1, t.fake.transactions += 1;
-    }
-    QAcc d;
-    qc_end_section(&d);  // before done.fetch_add: the finishing thread sees every section's delta
-    d.busy_ns = now_ns() - l0;
+    oc_.fake_add(0, nd, nd / 8);  // Host-test fake: I->S fault time = distance computations, IPI = 1/8 of it
+    OpAcc d;
+    opc_end(os, &d);  // before done.fetch_add: the finishing thread sees every section's delta
     {
       std::lock_guard<std::mutex> lg(c->mu);
       c->all.insert(c->all.end(), mine.begin(), mine.end());
-      c->qa.add(d);
+      c->oa.add(d);
     }
     if (c->done.fetch_add(1) + 1 == p_.segments) finish_query(c);
     return true;
@@ -765,24 +717,22 @@ class Server {
     resp.lock_us = uint32_t(c->lock_ns.load() / 1000);
     resp.dists = uint32_t(c->dists.load());
     resp.segs = uint16_t(p_.segments);
-    SearchCoh qb{};
+    OpCoh qb{};
     {
       std::lock_guard<std::mutex> lg(c->mu);
-      qb = qc_block(c->qa);
+      qb = op_block(c->oa, kOpSearch, oc_.src(), oc_.mg_snap(), tsc_khz_);
     }
-    if (qc_on_) resp.flags |= kRespCoh;
-    std::vector<uint8_t> out(sizeof(resp) + all.size() * 12 + (qc_on_ ? sizeof(qb) : 0));
+    if (oc_.on()) resp.flags |= kRespCoh;
+    std::vector<uint8_t> out(sizeof(resp) + all.size() * 12 + (oc_.on() ? sizeof(qb) : 0));
     std::memcpy(out.data(), &resp, sizeof(resp));
     for (size_t x = 0; x < all.size(); x++) {
       const float score = -all[x].first;  // inner product
       std::memcpy(out.data() + sizeof(resp) + x * 8, &all[x].second, 8);
       std::memcpy(out.data() + sizeof(resp) + all.size() * 8 + x * 4, &score, 4);
     }
-    if (qc_on_) {
+    if (oc_.on()) {
       std::memcpy(out.data() + sizeof(resp) + all.size() * 12, &qb, sizeof(qb));
-      st_.qc_searches++, st_.qc_sections += qb.sections, st_.qc_coh_ns += qb.coh_ns;
-      st_.qc_pf_fault_ns += qb.pf_fault_ns, st_.qc_mg_check_ns += qb.mg_check_est_ns;
-      st_.qc_mg_reexec_ns += qb.mg_reexec_est_ns;
+      win_search_.add(qb);
     }
     c->job.c->reply(frame::kStatusOk, c->job.h.req_id, out.data(), uint32_t(out.size()));
     st_.searches++;
@@ -874,10 +824,9 @@ class Server {
   std::unique_ptr<uint32_t[]> del_seq_;
   std::vector<uint64_t> dcursor_;
   std::unique_ptr<std::mutex[]> dmu_;
-  bool qc_on_ = false;
-  int qc_source_ = 0;
-  uint32_t clock_ns_ = 0;
-  uint64_t swmc_read_ns_ = 0;
+  OpCohSrc oc_;
+  OpWin win_search_, win_update_;
+  uint32_t clock_ns_ = 0, tsc_khz_ = 0;
 };
 
 volatile sig_atomic_t g_stop = 0;
@@ -907,8 +856,9 @@ void usage() {
                "  [--dim D] [--M M] [--efc E] [--chunk-bytes B (32 MiB)] [--max-writes W] [--max-ids N] [--dlog-chunk E] [--max-deletes D]\n"
                "  [--wait-timeout-ms T] [--start-timeout-ms T] [--backend plain|megalon] [--megalon-lib PATH]\n"
                "  [--preload-only | --preloaded]   Popcorn init_state=shared: node 0 writes the initial chunks before enable\n"
-               "  [--trace-dir DIR]   Megalon false-sharing trace (HWcc wsec/objseq lines; node<K>.megalon-{wsec,retry,refetch}.bin at stop)\n"
-               "  [--query-coh on|off] per-query coherence block in every search response (default on; DESIGN.md §14)\n"
+               "  [--trace-dir DIR] [--trace-max-mb M (4096)]   Megalon sharing trace (HWcc wsec line; node<K>.vdbtrace.bin at\n"
+               "     stop; dedicated runs only; DESIGN.md §16)\n"
+               "  [--op-coh on|off] per-operation time split block in every search/update response (default on; DESIGN.md §15)\n"
                "--backend megalon: Megalon (RACKOBJ_CONFIG, object_arena_size > 0) maps the device; MEGALON_NODE_ID and\n"
                "  MEGALON_RUN_ID default to --node and --run-id, CXL_REGION_CONFIG to --region (DESIGN.md §12).\n"
                "All nodes need identical parameters (checked through the HWcc app layout hash).\n"
@@ -953,10 +903,11 @@ int main(int argc, char **argv) {
     else if (a == "--preload-only") o.preload_only = true;
     else if (a == "--preloaded") o.preloaded = true;
     else if (a == "--trace-dir") o.trace_dir = v();
-    else if (a == "--query-coh") {
+    else if (a == "--trace-max-mb") o.trace_max_mb = std::stoull(v());
+    else if (a == "--op-coh" || a == "--query-coh") {
       const std::string x = v();
       if (x != "on" && x != "off") usage();
-      o.query_coh = x == "on";
+      o.op_coh = x == "on";
     }
     else usage();
   }
@@ -994,7 +945,7 @@ int main(int argc, char **argv) {
     if (n <= 0) usage();
     exe[n] = 0;
     std::string d(exe);
-    o.megalon_lib = d.substr(0, d.rfind('/')) + "/../lib/libvdb-megalon.so";
+    o.megalon_lib = d.substr(0, d.rfind('/')) + "/../lib/libmegalon-objapi.so";
   }
   return run<MegalonBackend>(o);
 }

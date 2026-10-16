@@ -29,7 +29,7 @@ Outputs in DIR:
   qcoh-steps-all.csv  qcoh.py step rows of every run (label = <block>/<run>; SLO-search curves of coherence per query)
   fig1b-query.csv     U=5 fixed load, one row per run: mean latency, all-HWcc latency at the same L, per-query
                coherence (search threads: mean / p50 / p99, page MSI message wait / local wait / other handler time,
-               Megalon checks / re-executed work, thread time of the query, coh/busy, wall-equivalent), the window
+               Megalon checks / re-executed work, thread time of the query, coh/busy), the window
                time-share of the search threads, writer coherence per update (separate)
 """
 import argparse, csv, glob, json, os, re, statistics as st, subprocess, sys
@@ -270,7 +270,7 @@ def main():
     write(os.path.join(a.out, "fig1b-query.csv"), ["block", "run", "system", "u", "achieved", "latency_mean_ms",
           "hw_latency_same_L_ms", "queries", "coh_mean_ms", "coh_p50_ms", "coh_p99_ms", "pf_msg_wait_mean_ms",
           "pf_local_wait_mean_ms", "pf_other_mean_ms", "mg_check_mean_ms", "mg_reexec_mean_ms", "busy_mean_ms",
-          "coh_frac_of_busy", "coh_wall_equiv_mean_ms", "server_ms_mean", "ts_search_coh_ms", "ts_vs_query",
+          "coh_frac_of_busy", "server_ms_mean", "ts_search_coh_ms", "ts_vs_query",
           "writer_coh_ms_per_update", "writer_wr_flush_ms_per_update", "ambiguous", "unmatched_measured", "coh_pct_note"], fq)
     print(f"{len(R)} runs -> {a.out}")
 

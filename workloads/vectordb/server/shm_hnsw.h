@@ -41,6 +41,11 @@
 
 namespace vdb {
 
+// Bytes of the whole lines the application stores in SWcc data, by the calling thread (MOT1 v6 Fig 3b "modified
+// bytes"; read around an update by server/opcoh.h): vector record + zeroed link blocks (write_elem), each committed
+// link block (commit_links), each delete-log entry (backend dlog_write). The initial image copy is not counted.
+inline thread_local uint64_t t_mod_bytes = 0;
+
 struct alignas(64) GraphMeta {  // HWcc, one line; written under the segment write lock
   uint64_t ep_level;   // entry point (low 32) | max level (high 32); kNoEntry = empty graph
   uint64_t count;      // elements [0, count) are complete
@@ -108,8 +113,11 @@ class PlainAcc {
   const float *vec(uint32_t i, float *) const { return vecp(i); }
   const uint32_t *links(uint32_t i, int level, uint64_t uo, uint32_t *) const { return linkp(i, level, uo); }
   uint32_t *links_mut(uint32_t i, int level, uint64_t uo, uint32_t *) const { return linkp(i, level, uo); }
-  void commit_links(uint32_t, int, uint64_t, const uint32_t *) const {}
+  void commit_links(uint32_t, int level, uint64_t, const uint32_t *) const {
+    t_mod_bytes += level ? p_.links_bytes() : l0_;  // in place already; the block is what an update stores
+  }
   void write_elem(uint32_t i, const ElemHeader &h, const float *v, uint64_t upper_bytes) const {
+    t_mod_bytes += vrec_ + l0_ + upper_bytes;
     uint8_t *lc = m_.link[i / N_];
     if (upper_bytes) std::memset(lc + upper_base_ + h.upper_off, 0, upper_bytes);
     uint8_t *vr = vrec(i);  // vector chunk: header + vector, whole lines, written once

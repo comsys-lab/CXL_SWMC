@@ -66,6 +66,7 @@ inline void mg_estimate(uint64_t start, uint64_t body, uint64_t end, uint64_t sa
 
 struct SwmcVals {  // sums of the read_* and write_* counters (wp faults are a subset of write faults)
   uint64_t fault_ns = 0, msg_wait_ns = 0, local_wait_ns = 0, faults = 0, transactions = 0;
+  uint64_t rd_fault_ns = 0, wr_fault_ns = 0, rd_faults = 0, wr_faults = 0;  // the read/write parts (opcoh.h)
 };
 
 class SwmcReader {
@@ -123,6 +124,8 @@ class SwmcReader {
     v->local_wait_ns = x[kReadLocalWait] + x[kWriteLocalWait];
     v->faults = x[kReadFaults] + x[kWriteFaults];
     v->transactions = x[kReadTx] + x[kWriteTx];
+    v->rd_fault_ns = x[kReadFaultNs], v->wr_fault_ns = x[kWriteFaultNs];
+    v->rd_faults = x[kReadFaults], v->wr_faults = x[kWriteFaults];
     return true;
   }
   bool ok() const { return fd_ >= 0; }

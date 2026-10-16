@@ -2,7 +2,8 @@
 # One VectorDB run of the M4 / M5 packets (reports/M4-vdb-packet.md, reports/M5-pilot-packet.md; MOT1 v5 §3.3, §4.3):
 # Host gate, system setup, run.sh, post checks, E1 check, load times.
 # usage: m4-run.sh <name> <evidence dir>
-# env (required): SYS (all-HWcc | Megalon | Popcorn), U (update %: 0 | 5 | 20 | 50),
+# env (required): SYS (all-HWcc | Megalon | Popcorn), U (update %: 0 | 5 | 10 | 20 | 50 | 90; MOT1 v6 H1 mixes
+#   search/update 95/5, 50/50, 10/90 = U 5, 50, 90; H2 shares 0/5/10/20/50),
 #   KIND: functional | slo (MOT1 step 1) | fixed (step 2, 60 s) | pslo (pilot SLO search: steps 2 s + 8 s, confirm
 #   1 x 15 s, no fill/overload) | pfix (pilot fixed load, 30 s)
 #   KIND=fixed|pfix: RATE (total req/s of the scaled streams = L / (1 - U/100)); TRACE (0 | 1, default 0; Megalon only)
@@ -12,10 +13,13 @@
 #   MEG_BUILD (builds/vdb-megalon/6), VMEG (/home/comsys/vdbm6-28m)
 #   SYS=Popcorn: C8 (build-8 deploy bundle dir), K8 (release), GT8 (guest tools dir), RECV_MODE (poll | idle | sleep)
 # optional: REP (repeat label, recorded), SEED (loadgen --seed, default 20261015), GATE=0 (skip the Host gate:
-#   functional runs only), QCOH_EXPECT (none | swmc: per-query coherence, vdb build >= 9, DESIGN.md §14; both
+#   refused unless KIND=functional), QCOH_EXPECT (none | swmc: per-query coherence, vdb build >= 9, DESIGN.md §14; both
 #   servers must log "query coherence on, page MSI source <QCOH_EXPECT>", end with qcoh.read_errors=0 and
 #   qcoh.open_errors=0, and every OK search response must carry the block (vectordb.txt ok_without_coh=0,
-#   bad_coh_version=0); then qcoh.py writes <run>/qcoh-steps.csv).
+#   bad_coh_version=0); then qcoh.py writes <run>/qcoh-steps.csv). vdb builds >= 10: OPCOH_EXPECT (none | swmc_acct |
+#   swmc_file: per-operation time split, DESIGN.md §15; servers log "op coherence on, popcorn source <it>", end with
+#   opcoh.read_errors=0 and opcoh.register_errors=0, every OK search/update carries the v2 block; then opsplit.py
+#   writes <run>/opsplit-steps.csv + .columns.csv). Use QCOH_EXPECT only with builds <= 9.
 # Prints "M4RUN <name> OK|NOTE|STOP <reason>"; exit 0 for OK/NOTE (NOTE = a loadgen SLO-search outcome that is a
 # result, not an error: "confirm failed at three rates"), 1 for STOP (the sequence stops).
 set -uo pipefail
@@ -55,7 +59,8 @@ case "$SYS" in
 esac
 [ "$SYS" = Megalon ] || [ "$TRACE" = 0 ] || stop "TRACE=1 is for Megalon only"
 case "$U" in
-  0) MIX=search=1;; 5) MIX=update=5,search=95;; 20) MIX=update=20,search=80;; 50) MIX=update=50,search=50;;
+  0) MIX=search=1;; 5) MIX=update=5,search=95;; 10) MIX=update=10,search=90;; 20) MIX=update=20,search=80;;
+  50) MIX=update=50,search=50;; 90) MIX=update=90,search=10;;
   *) stop "bad U";;
 esac
 LG=(--opt data=$D --opt writes=$W --opt k=10 --opt seed=$SEED --seed "$SEED" --mix "$MIX" --slo search:99:100
@@ -77,6 +82,7 @@ IPS=(192.168.122.100 192.168.122.101)
 servers_gone() { for ip in "${IPS[@]}"; do [ "$($SSH comsys@$ip 'pgrep -c -x vdb-server' < /dev/null)" = 0 ] || return 1; done; }
 echo "$(date -Is) $NAME: SYS=$SYS U=$U KIND=$KIND DATASET=${DATASET:-28m} REP=${REP:-} TRACE=$TRACE RATE=${RATE:-} RECV_MODE=${RECV_MODE:-} SEED=$SEED V=$V HOST_SERVER=$HOST_SERVER"
 servers_gone || stop "a vdb-server is running before the run"
+[ "${GATE:-1}" = 1 ] || [ "$KIND" = functional ] || stop "GATE=0 is allowed for KIND=functional only"
 if [ "${GATE:-1}" = 1 ]; then bash $X/host-gate.sh check "$E/gate-$NAME.txt" || stop "host gate"; fi
 T0=$(date +%s)
 if [ "$SYS" = Popcorn ]; then  # P-popcorn-deploy §6a cycle with build 8 (init_state=shared)
@@ -138,6 +144,15 @@ if [ -n "${QCOH_EXPECT:-}" ]; then  # per-query coherence (DESIGN.md §14)
   { grep -qx "ok_without_coh=0" $R/loadgen/vectordb.txt && grep -qx "bad_coh_version=0" $R/loadgen/vectordb.txt; } \
     || stop "search responses without a coherence block"
   python3 $X/qcoh.py $R > $R/qcoh.log 2>&1 || echo "M4RUN $NAME: qcoh.py failed (analysis only; see $R/qcoh.log)"
+fi
+if [ -n "${OPCOH_EXPECT:-}" ]; then  # per-operation time split (vdb build >= 10, DESIGN.md §15)
+  for k in 0 1; do
+    grep -qE "^vdb-server: op coherence on, popcorn source $OPCOH_EXPECT[ ,]" $R/node$k.log || stop "node$k: op coherence source != $OPCOH_EXPECT"
+    { grep -qx "opcoh.read_errors=0" $R/node$k.log && grep -qx "opcoh.register_errors=0" $R/node$k.log; } || stop "node$k: opcoh read/register errors"
+  done
+  { grep -qx "ok_without_coh=0" $R/loadgen/vectordb.txt && grep -qx "updates_ok_without_coh=0" $R/loadgen/vectordb.txt &&
+    grep -qx "bad_coh_version=0" $R/loadgen/vectordb.txt; } || stop "responses without an op coherence block"
+  python3 $X/opsplit.py $R > $R/opsplit.log 2>&1 || echo "M4RUN $NAME: opsplit.py failed (analysis only; see $R/opsplit.log)"
 fi
 python3 $X/e1_check.py --writes $W --na $NA --nb $NB --searches $R/loadgen/searches.bin --out $R/e1 --sample 500 > /dev/null \
   || stop "E1 violation (see $R/e1.e1.txt)"

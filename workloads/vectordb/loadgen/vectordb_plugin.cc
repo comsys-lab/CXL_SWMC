@@ -6,9 +6,10 @@
 // Options: data=DIR (pool_b.fbin, queries.fbin), writes=FILE (tools/gen_writes.py), k=10, seed=N,
 //          max_searches=N (default 100M; result slots are allocated in chunks as used).
 // Output: <out>/searches.bin, one record per search response (header struct below + ids[k] u64 + scores[k] f32),
-//         for offline recall (tools/compute_gt.py), <out>/search-coh.bin, one CohLog per OK search response that
-//         carries the server's per-query coherence block (proto.h SearchCoh; DESIGN.md §14; parsed by
-//         experiments/vectordb/qcoh.py), and <out>/vectordb.txt (counts).
+//         for offline recall (tools/compute_gt.py), <out>/op-coh.bin, one OpLog per OK search or update response
+//         that carries the server's per-operation block (proto.h OpCoh v2; DESIGN.md §15; parsed by
+//         experiments/vectordb/opsplit.py), and <out>/vectordb.txt (counts). Servers before vdb build 10 sent the
+//         v1 SearchCoh block on searches only (search-coh.bin, qcoh.py); this plugin counts those as bad_coh_version.
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
@@ -50,17 +51,18 @@ struct __attribute__((packed)) SearchLog {  // one per search response, followed
   uint16_t segs, pad2;
 };
 
-// One per OK search response with a SearchCoh block. seq joins searches.bin; recv_ns = CLOCK_MONOTONIC when the
-// plugin got the response (the engine's done time of the same request is taken just before on_response on the same
-// thread: joins the loadgen raw-step records, qcoh.py).
-struct __attribute__((packed)) CohLog {
+// One per OK search/update response with an OpCoh block. seq joins searches.bin (searches) or is the update index
+// (updates); recv_ns = CLOCK_MONOTONIC when the plugin got the response (the engine's done time of the same request is
+// taken just before on_response on the same thread: joins the loadgen raw-step records, opsplit.py).
+struct __attribute__((packed)) OpLog {
   uint64_t seq, recv_ns;
   uint8_t measured, target;
   uint16_t status;
-  uint32_t pad;
-  vdb::SearchCoh c;
+  uint16_t op;  // vdb::kOpSearch | kOpUpdate
+  uint16_t pad;
+  vdb::OpCoh c;
 };
-static_assert(sizeof(CohLog) == 24 + sizeof(vdb::SearchCoh), "CohLog layout (qcoh.py)");
+static_assert(sizeof(OpLog) == 24 + sizeof(vdb::OpCoh), "OpLog layout (opsplit.py)");
 
 uint64_t mono_ns() {
   timespec ts;
@@ -174,10 +176,27 @@ class VectorDb : public loadgen::Workload {
                    uint32_t len) override {
     if (r.op != vdb::kOpSearch) {
       vdb::WriteResp wr{};
-      if (status == frame::kStatusOk && len == sizeof(wr)) std::memcpy(&wr, p, sizeof(wr));
+      const bool ok_len = len == sizeof(wr) || len == sizeof(wr) + sizeof(vdb::OpCoh);
+      if (status == frame::kStatusOk && ok_len) std::memcpy(&wr, p, sizeof(wr));
       // OK response for an update carries the insert's w_seq (= 2 * (update index + 1))
-      if (status != frame::kStatusOk || len != sizeof(wr) || wr.w_seq != uint32_t(2 * (r.seq + 1)))
+      if (status != frame::kStatusOk || !ok_len || wr.w_seq != uint32_t(2 * (r.seq + 1))) {
         write_errors_.fetch_add(1);
+        return;
+      }
+      if (len == sizeof(wr)) {
+        no_coh_update_.fetch_add(1);
+        return;
+      }
+      OpLog cl{};
+      cl.seq = r.seq, cl.recv_ns = mono_ns(), cl.measured = measured, cl.target = uint8_t(r.target);
+      cl.status = status, cl.op = vdb::kOpUpdate;
+      std::memcpy(&cl.c, p + sizeof(wr), sizeof(cl.c));
+      if (cl.c.version != vdb::kOpCohVersion || cl.c.op != vdb::kOpUpdate) {
+        bad_coh_.fetch_add(1);
+        return;
+      }
+      std::lock_guard<std::mutex> g(out_mu_);
+      coh_.push_back(cl);
       return;
     }
     Slot *s = slot(r.seq, false);
@@ -189,7 +208,7 @@ class VectorDb : public loadgen::Workload {
     lg.measured = measured;
     lg.status = status;
     lg.k = k_;
-    CohLog cl{};
+    OpLog cl{};
     bool have_coh = false;
     if (status == frame::kStatusOk && len >= sizeof(vdb::SearchResp)) {
       vdb::SearchResp sr;
@@ -203,12 +222,14 @@ class VectorDb : public loadgen::Workload {
         bad_responses_.fetch_add(1);
       }
       const size_t co = sizeof(sr) + size_t(sr.n) * 12;
-      if ((sr.flags & vdb::kRespCoh) && len >= co + sizeof(vdb::SearchCoh)) {
+      if ((sr.flags & vdb::kRespCoh) && len >= co + sizeof(vdb::OpCoh)) {
         cl.seq = r.seq, cl.recv_ns = mono_ns(), cl.measured = measured, cl.target = uint8_t(r.target);
-        cl.status = status;
+        cl.status = status, cl.op = vdb::kOpSearch;
         std::memcpy(&cl.c, p + co, sizeof(cl.c));
-        have_coh = cl.c.version == vdb::kSearchCohVersion;
+        have_coh = cl.c.version == vdb::kOpCohVersion && cl.c.op == vdb::kOpSearch;
         if (!have_coh) bad_coh_.fetch_add(1);
+      } else if (sr.flags & vdb::kRespCoh) {
+        bad_coh_.fetch_add(1);  // a block of another version / size (e.g. v1 SearchCoh)
       } else {
         no_coh_.fetch_add(1);
       }
@@ -229,21 +250,22 @@ class VectorDb : public loadgen::Workload {
       std::fwrite(out_.data(), 1, out_.size(), f);
     }
     std::fclose(f);
-    FILE *cf = std::fopen((dir + "/search-coh.bin").c_str(), "wb");
-    if (!cf) return *err = "cannot write search-coh.bin", false;
+    FILE *cf = std::fopen((dir + "/op-coh.bin").c_str(), "wb");
+    if (!cf) return *err = "cannot write op-coh.bin", false;
     {
       std::lock_guard<std::mutex> g(out_mu_);
-      std::fwrite(coh_.data(), sizeof(CohLog), coh_.size(), cf);
+      std::fwrite(coh_.data(), sizeof(OpLog), coh_.size(), cf);
     }
     std::fclose(cf);
     FILE *t = std::fopen((dir + "/vectordb.txt").c_str(), "w");
     std::fprintf(t, "updates_made=%lu\nwrites_made=%lu\nlast_w=%u\nsearches_made=%lu\nwrite_errors=%lu\n"
                  "bad_search_responses=%lu\nsearch_record_bytes=%zu\nk=%u\ncoh_records=%zu\ncoh_record_bytes=%zu\n"
-                 "ok_without_coh=%lu\nbad_coh_version=%lu\n",
+                 "ok_without_coh=%lu\nupdates_ok_without_coh=%lu\nbad_coh_version=%lu\n",
                  (unsigned long)(next_w_ / 2), (unsigned long)next_w_, last_w_, (unsigned long)next_s_,
                  (unsigned long)write_errors_.load(),
                  (unsigned long)bad_responses_.load(), sizeof(SearchLog) + size_t(k_) * 12, k_, coh_.size(),
-                 sizeof(CohLog), (unsigned long)no_coh_.load(), (unsigned long)bad_coh_.load());
+                 sizeof(OpLog), (unsigned long)no_coh_.load(), (unsigned long)no_coh_update_.load(),
+                 (unsigned long)bad_coh_.load());
     std::fclose(t);
     if (write_errors_.load()) *err = "write errors " + std::to_string(write_errors_.load());
     return write_errors_.load() == 0;
@@ -280,8 +302,8 @@ class VectorDb : public loadgen::Workload {
   std::unique_ptr<std::atomic<Slot *>[]> chunks_;
   std::mutex out_mu_;
   std::vector<uint8_t> out_;
-  std::vector<CohLog> coh_;  // under out_mu_
-  std::atomic<uint64_t> write_errors_{0}, bad_responses_{0}, no_coh_{0}, bad_coh_{0};
+  std::vector<OpLog> coh_;  // under out_mu_ (searches and updates)
+  std::atomic<uint64_t> write_errors_{0}, bad_responses_{0}, no_coh_{0}, no_coh_update_{0}, bad_coh_{0};
 };
 LOADGEN_REGISTER("vectordb", VectorDb);
 

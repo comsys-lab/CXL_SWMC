@@ -25,8 +25,8 @@ Per step (qcoh-steps.csv; one row per measured step, nodes summed):
   pf_msg_wait_mean_ms, pf_local_wait_mean_ms, pf_other_mean_ms (= fault - msg wait - local wait), pf_faults_mean,
   pf_transactions_mean, mg_check_mean_ms, mg_reexec_mean_ms, mg_retries_mean, server_ms_mean (wait + replay +
   search of searches.bin), busy_mean_ms (thread time of the query's sections), coh_frac_of_busy (sum coh / sum
-  busy), coh_wall_equiv_mean_ms (per query coh/busy x server time: the coherence part of the server's wall time;
-  coh and busy are sums over parallel segment tasks and can exceed the latency),
+  busy; coh and busy are sums over parallel segment tasks and can exceed the latency; the proportional
+  "wall-equivalent" column was removed for MOT1 v6),
   window time-share (search threads only, stats deltas / searches in the window): ts_search_coh_ms (page MSI:
   thr.vdb-search.swmc read+write fault ns; Megalon: megt.search.* calibrated like the per-query estimate),
   ts_search_msg_wait_ms, ts_vs_query (ts_search_coh_ms / coh_mean_ms),
@@ -129,7 +129,7 @@ COLS = ["step", "phase", "achieved", "searches_window", "queries", "ambiguous", 
         "latency_p99_ms", "coh_mean_ms", "coh_p50_ms", "coh_p99_ms", "coh_share_mean", "pf_fault_mean_ms",
         "pf_msg_wait_mean_ms", "pf_local_wait_mean_ms", "pf_other_mean_ms", "pf_faults_mean", "pf_transactions_mean",
         "mg_check_mean_ms", "mg_reexec_mean_ms", "mg_retries_mean", "server_ms_mean", "busy_mean_ms", "coh_frac_of_busy",
-        "coh_wall_equiv_mean_ms", "ts_search_coh_ms", "ts_search_msg_wait_ms", "ts_vs_query", "writer_coh_ms_per_update",
+        "ts_search_coh_ms", "ts_search_msg_wait_ms", "ts_vs_query", "writer_coh_ms_per_update",
         "writer_wr_flush_ms_per_update", "updates_window", "clock_ns", "qc_unattributed_fault_ns"]
 QCOLS = ["step", "seq", "target", "latency_ms", "coh_ms", "pf_fault_ms", "pf_msg_wait_ms", "pf_faults", "mg_check_ms",
          "mg_reexec_ms", "mg_retries", "sections", "server_ms", "busy_ms"]
@@ -217,9 +217,6 @@ def analyze(run, tol_us=20.0, want_queries=False):
         wr = w.get("wr_mg") if w.get("wr_mg") is not None else (w.get("wr_pf") if w.get("pf") else None)
         srvm = [srv_ms[q] for q in logs["seq"][sel].tolist() if q in srv_ms]
         busy = c["busy_ns"][sel].astype(np.float64)
-        frac = np.divide(cohv[sel], busy, out=np.zeros(len(busy)), where=busy > 0)
-        srv_sel = np.array([srv_ms.get(q, np.nan) for q in logs["seq"][sel].tolist()])
-        wall = frac * srv_sel
         rows.append(dict(step=s["step"], phase=s["phase"], achieved=s["streams"]["search"]["achieved"],
                          searches_window=nsr, queries=int(sel.sum()), ambiguous=ambiguous, unmatched_measured=unmatched,
                          latency_mean_ms=float(lat.mean()) if sel.any() else None, latency_p99_ms=pct(lat, 99),
@@ -236,7 +233,6 @@ def analyze(run, tol_us=20.0, want_queries=False):
                          server_ms_mean=float(np.mean(srvm)) if srvm else None,
                          busy_mean_ms=float(busy.mean() / 1e6) if sel.any() else None,
                          coh_frac_of_busy=float(cohv[sel].sum() / busy.sum()) if sel.any() and busy.sum() else None,
-                         coh_wall_equiv_mean_ms=float(np.nanmean(wall)) if sel.any() and np.isfinite(wall).any() else None,
                          ts_search_coh_ms=ts,
                          ts_search_msg_wait_ms=w["ts_pf_msg"] / nsr / 1e6 if w.get("pf") and nsr else None,
                          ts_vs_query=ts / coh_mean if ts is not None and coh_mean else None,

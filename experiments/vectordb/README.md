@@ -65,6 +65,12 @@ False-sharing classification of a Megalon run (offline), optionally limited to o
 `python3 workloads/vectordb/tools/classify_retries.py --trace r<k> --out r<k>-fs [--stats r<k>/loadgen --step N]`
 Recall / E1 check of a run (offline, never during a measurement):
 `python3 workloads/vectordb/tools/compute_gt.py --data <dataset dir> --writes <writes.bin> --searches r<k>/loadgen/searches.bin --out r<k>-gt`
-Coherence time per search query (vdb build >= 9; search threads only, writer per update separately; offline):
+Per-operation time split (vdb build >= 10; MOT1 v6 Fig 2/3b; workloads/vectordb/DESIGN.md §15; run.sh runs it when
+loadgen/op-coh.bin exists): `python3 experiments/vectordb/opsplit.py r<k>` -> `r<k>/opsplit-steps.csv` and
+`r<k>/opsplit-steps.columns.csv` (tag per column: measured / sampled×N / derived). Mixes: m4-run.sh U = 5 / 50 / 90
+(search/update 95/5, 50/50, 10/90; H2 shares U = 0/5/10/20/50); SLO search p99 <= 100 ms. m4-run.sh OPCOH_EXPECT checks
+the blocks (builds >= 10; QCOH_EXPECT only for builds <= 9). Sharing trace (Fig 3c, TRACE=1, dedicated runs only):
+node<k>.vdbtrace.bin, classified by `workloads/vectordb/tools/classify_sharing.py r<k>` -> sharing.csv (run.sh does it).
+Coherence time per search query (vdb build 9 only; search threads only, writer per update separately; offline):
 `python3 experiments/vectordb/qcoh.py r<k> [--queries r<k>/qcoh-queries.csv]` -> `r<k>/qcoh-steps.csv`.
 H1 main block (reports/M4-vdb-packet.md v2.0): `experiments/vectordb/h1-block.sh <evidence dir>`.

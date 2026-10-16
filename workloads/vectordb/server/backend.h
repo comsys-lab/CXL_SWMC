@@ -69,7 +69,10 @@ class PlainBackend {
   template <class F> auto read_chunk(Chunk k, uint32_t s, uint64_t g, uint64_t off, uint64_t, F f) const {
     return f(static_cast<const uint8_t *>(chunk(k, s, g) + off));
   }
-  void dlog_write(uint32_t node, uint64_t e, const DlogEntry &d) const { std::memcpy(dlog(node) + e, &d, sizeof(d)); }
+  void dlog_write(uint32_t node, uint64_t e, const DlogEntry &d) const {
+    std::memcpy(dlog(node) + e, &d, sizeof(d));
+    t_mod_bytes += sizeof(d);
+  }
   template <class F> void dlog_scan(uint32_t node, uint64_t from, uint64_t to, F f) const {
     const DlogEntry *log = dlog(node);
     for (uint64_t e = from; e < to; e++) {

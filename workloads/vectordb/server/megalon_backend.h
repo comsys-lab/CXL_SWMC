@@ -8,10 +8,13 @@
 // lines) in a write section. Sections never nest; no create inside a section. Node 0 creates every object at prepare;
 // every node checks every object's size by lookup. The device is mapped by Megalon (whole device at region.map_va);
 // the server uses that mapping for the HWcc app range and never maps the device itself.
+// Object API: the shared shim systems/megalon/shim (libmegalon-objapi.so, megalon_objapi.h; since vdb build 10;
+// earlier builds used this directory's megalon_api.h / libvdb-megalon.so, still used by workloads/lmdb).
 #pragma once
 
 #include <dlfcn.h>
 #include <time.h>
+#include <x86intrin.h>
 
 #include <atomic>
 #include <cstdio>
@@ -28,10 +31,14 @@
 #include "cxl_region.h"
 #include "hwcc_app.h"
 #include "layout.h"
-#include "megalon_api.h"
+#include "megalon_objapi.h"
 #include "shm_hnsw.h"
 
 namespace vdb {
+
+using MegObj = mshim::Obj;
+using MegStats = mshim::Stats;
+using MegalonApi = mshim::Api;
 
 [[noreturn]] inline void megalon_fatal(const std::string &m) {
   std::fprintf(stderr, "vdb-server: FATAL megalon backend: %s\n", m.c_str());
@@ -39,24 +46,29 @@ namespace vdb {
   std::_Exit(2);
 }
 
-// dlopen the shim (loading it initialises Megalon: maps the device, joins the run, start barrier).
+// dlopen the shim (loading it initialises Megalon: maps the device, joins the run, start barrier). Accepts API
+// version 1 (no thread_coh) and 2 (thread_coh, may be nullptr when the Megalon build has no per-thread accounting).
 inline const MegalonApi *megalon_load(const std::string &path, std::string *err) {
   void *h = dlopen(path.c_str(), RTLD_NOW | RTLD_LOCAL);
   if (!h) {
     *err = std::string("dlopen ") + path + ": " + dlerror();
     return nullptr;
   }
-  auto fn = reinterpret_cast<vdb_megalon_api_fn>(dlsym(h, "vdb_megalon_api"));
+  auto fn = reinterpret_cast<megalon_object_api_fn>(dlsym(h, "megalon_object_api"));
   if (!fn) {
-    *err = path + ": no vdb_megalon_api";
+    *err = path + ": no megalon_object_api (vdb builds >= 10 need the shared shim systems/megalon/shim)";
     return nullptr;
   }
   const MegalonApi *api = fn();
-  if (!api || api->version != kMegalonApiVersion) {
+  if (!api || api->version < 1 || api->version > mshim::kApiVersion) {
     *err = path + ": API version mismatch";
     return nullptr;
   }
   return api;
+}
+// thread_coh of a loaded API (nullptr for a v1 table, whose struct has no such field).
+inline void (*megalon_thread_coh(const MegalonApi *api))(mshim::CohSnap *) {
+  return api && api->version >= 2 ? api->thread_coh : nullptr;
 }
 
 // [va, va + len) must be covered by mappings of `path` (Megalon's mapping of the device at map_va).
@@ -86,51 +98,84 @@ inline bool mapped_by(uint64_t va, uint64_t len, const std::string &path, std::s
 class MegalonBackend;
 class MegalonAcc;
 
-// Measurement (DESIGN.md §13; MOT1 v4 H1 "Instrumentation" and §4.3 false-sharing classification); Megalon
-// itself is unchanged. Read sections: 1 in kSample sections (random per section) is timed (read_start / body / read_end);
-// a failed attempt of a timed section is timed in full. Write sections are always timed. With a trace dir, every
-// write section is logged (id, written ranges, wsec sequence number taken from an HWcc counter after write_end) and
-// every failed read attempt (id, read range, wsec counter before read_start and after the failed read_end):
-// tools/classify_retries.py marks a retry false sharing when a peer write with seq in (s0, s1] hit the same object
-// on disjoint ranges, true sharing when ranges overlap. Also with a trace dir, an HWcc slot per object holds the seq
-// of its last write section; a read that finds it past this node's cache logs a refetch (Megalon flushes and
-// re-reads the object in ObjectReadStart), classified the same way (node<K>.megalon-refetch.bin).
-// Without a trace dir none of the HWcc trace lines is touched.
-// Overhead without a trace dir (per read section): one xorshift and a branch; 1 in 64 sections 4 clock_gettime
-// (vDSO) + 4 thread-local counter updates; a failed read_end one thread-local update. Per write section: 4
-// clock_gettime + 4 thread-local updates. With a trace dir, in addition: per read section one HWcc load of objseq,
-// one HWcc load of wsec per attempt, a node-local cache load (a CAS on a change); per write section one HWcc
-// fetch-add (wsec) and CAS (objseq), and a log append under a mutex (writer thread only); retries and refetches
-// append under the same mutex.
-// Note: ObjectReadStart retries internally when the object's counter moved since this node last read it (flush the
-// whole object, retry; megalon.read_retry_incoherent): that time is inside rd_start_ns but is not a wrapper retry
-// (rd_retries / the retry log see only failed ObjectReadEnd calls).
+// Measurement (DESIGN.md §13, §16); Megalon itself is unchanged.
+// Wrapper timers (window counters megt.*): 1 in kSample read sections (random per section) timed (read_start / body /
+// read_end); a failed attempt of a timed section is timed in full. Write sections are always timed. Cost per read
+// section: one xorshift and a branch; 1 in 64 sections 4 clock_gettime (vDSO); per write section 4 clock_gettime.
+// Sharing trace (--trace-dir, MOT1 v6 Fig 3c; dedicated runs only, off by default; DESIGN.md §16): per section one
+// TraceRec in the thread's own memory buffer (chunks of kTraceChunk records; no shared writes), dumped at stop:
+//   write section: (object, element, units, seq) with seq = global write-section sequence number from the HWcc
+//                  counter wsec (fetch-add after ObjectWriteEnd);
+//   read section:  (object, element, units, seq = wsec loaded after the accepted attempt's ObjectReadStart) and the
+//                  event flags of the section: (A) = CohSnap.stale_cnt advanced (stale copy at read_start), (B) = failed
+//                  ObjectReadEnd (CohSnap.concur_cnt when thread_coh exists, else the wrapper's own count, which then
+//                  also includes (C) metadata failures); ev_ns = CohSnap (stale_ns + concur_ns) of the section.
+//   Identical consecutive read records of one thread without flags (same object, element, units, seq) are kept once.
+// Trace cost per read section: two thread_coh calls (if any), one HWcc load per attempt, one rdtsc and a 32 B store.
 inline uint64_t mono_ns() {
   timespec ts;
   clock_gettime(CLOCK_MONOTONIC, &ts);
   return uint64_t(ts.tv_sec) * 1000000000ull + uint64_t(ts.tv_nsec);
 }
-struct __attribute__((packed)) WsecRec {  // 48 B
-  uint64_t seq, id;
-  uint32_t off0, len0, off1, len1;
-  uint64_t t_ns, node;
+
+// Element of an object section (trace): vector chunk = slot, delete-log chunk = entry, link chunk = slot | level << 24
+// (one link block); n = consecutive units from elem (vector/delete log: slots/entries; link: levels of the slot);
+// n = 0: the whole object (initial image copy, warm-up).
+struct Elem {
+  uint32_t elem = 0;
+  uint16_t n = 0;
 };
-struct __attribute__((packed)) RetryRec {  // 48 B
-  uint64_t id;
-  uint32_t off, len;
-  uint64_t s0, s1, t_ns, node;
+inline Elem link_elem(uint64_t slot, int level, uint32_t levels = 1) {
+  return Elem{uint32_t(slot) | uint32_t(level) << 24, uint16_t(levels)};
+}
+
+struct __attribute__((packed)) TraceRec {  // 32 B (workloads/vectordb/tools/classify_sharing.py)
+  uint64_t tsc;    // rdtsc at the end of the section (node-local order)
+  uint32_t seq;    // write: global write-section seq; read: wsec loaded after the accepted attempt's read_start
+  uint32_t obj;    // dense object index (MegalonBackend::obj_index)
+  uint32_t elem;   // Elem.elem
+  uint16_t n;      // Elem.n
+  uint8_t type;    // 1 read, 2 write
+  uint8_t flags;   // read: (A) count (bits 0-3, saturating) | (B) count << 4 (saturating)
+  uint32_t ev_ns;  // read: CohSnap stale_ns + concur_ns of the section (saturating)
+  uint32_t pad;
 };
+static_assert(sizeof(TraceRec) == 32, "trace record");
+struct __attribute__((packed)) TraceFileHdr {  // node<K>.vdbtrace.bin: header, then per thread TraceThreadHdr + records
+  char magic[8];   // "VDBTRC1"
+  uint32_t node, nr_nodes, segments, threads;
+  uint64_t groups, dlog_chunks, per_chunk, dlog_chunk;
+  uint64_t wsec_at_dump, tsc_khz, dropped, records;
+  uint32_t has_coh, pad;
+};
+struct __attribute__((packed)) TraceThreadHdr {
+  uint32_t index, role;  // role: MegTimers::kRole*
+  uint64_t count, dropped;
+};
+constexpr uint8_t kTraceRead = 1, kTraceWrite = 2;
+constexpr size_t kTraceChunk = size_t(1) << 16;  // records per buffer chunk (2 MiB)
+
+struct TraceBuf {
+  std::vector<std::unique_ptr<TraceRec[]>> chunks;
+  size_t used = 0;  // records in the last chunk
+  uint64_t dropped = 0;
+  TraceRec last{};
+  bool have_last = false;
+  uint64_t count() const { return chunks.empty() ? 0 : (chunks.size() - 1) * kTraceChunk + used; }
+};
+
 // Wrapper counters, one block per thread (owner-only relaxed load + store: no shared cache-line writes on the read
 // path), summed at stats time.
 // Each block has the role of its thread (server thread ids: 0 main, 1 writer, >= 2 search; set by thread_init), so
 // stats report the search-serving threads and the writer separately (megt.search.*, megt.writer.*, megt.main.*);
-// megt.* without a role is the sum over all blocks (as before).
+// megt.* without a role is the sum over all blocks.
 struct alignas(64) MegTimers {
   enum : int { kRdSampled, kRdStartNs, kRdBodyNs, kRdEndNs, kRdRetries, kRdFailedTimed, kRdFailedNs, kWrSections,
-               kWrStartNs, kWrBodyNs, kWrEndNs, kRefetch, kFirstSight, kN };
+               kWrStartNs, kWrBodyNs, kWrEndNs, kN };
   enum : int { kRoleMain, kRoleWriter, kRoleSearch, kRoleOther, kRoles };
   std::atomic<uint64_t> v[kN] = {};
   std::atomic<int> role{kRoleOther};
+  TraceBuf tb;  // trace only (owner thread appends; dumped after the run)
   void add(int k, uint64_t d) { v[k].store(v[k].load(std::memory_order_relaxed) + d, std::memory_order_relaxed); }
 };
 
@@ -145,7 +190,8 @@ class MegalonBackend {
   using Acc = MegalonAcc;
   static constexpr const char *kLayoutTag = " backend=megalon";
 
-  MegalonBackend(const cxl::region &, uint8_t *, const Params &p, const MegalonApi *api) : p_(p), api_(api) {
+  MegalonBackend(const cxl::region &, uint8_t *, const Params &p, const MegalonApi *api)
+      : p_(p), api_(api), coh_(megalon_thread_coh(api)) {
     dlog_chunks_ = p.dlog_chunks();
   }
   bool fits(std::string *err) const {
@@ -158,9 +204,15 @@ class MegalonBackend {
       *err = "megalon: object id fields overflow";
       return false;
     }
+    if (p_.g.per_chunk() >= (1u << 24) || p_.dlog_chunk > 0xffff || p_.trace_objects() >= (1ull << 32)) {
+      *err = "megalon: trace element fields overflow";
+      return false;
+    }
     return true;
   }
   std::string name() const { return "megalon"; }
+  // Megalon's per-thread coherence snapshot (shim v2 thread_coh), nullptr if the shim/Megalon build has none.
+  void (*thread_coh() const)(mshim::CohSnap *) { return coh_; }
 
   // ---- object ids (deterministic; < 2^63 as ObjectCreate requires)
   static constexpr uint64_t kBase = 0x5644ull << 48;  // "VD"
@@ -211,34 +263,28 @@ class MegalonBackend {
     api_->reg(tid);
     tm().role.store(tid == 0 ? MegTimers::kRoleMain : tid == 1 ? MegTimers::kRoleWriter : MegTimers::kRoleSearch);
   }
-  // This thread's counters (owner-only writes: exact deltas around a section; server.cc per-query attribution).
-  void thread_snap(uint64_t *out) const {
-    MegTimers &t = tm();
-    for (int k = 0; k < MegTimers::kN; k++) out[k] = t.v[k].load(std::memory_order_relaxed);
-  }
   // Timer-read overhead per timed interval (qcoh.h calibrate_clock_ns, measured once at server start); reported as
   // megt.clock_ns. The counters stay raw; analysis subtracts clock_ns per timed interval.
   void set_clock_ns(uint32_t c) { clock_ns_ = c; }
-  // Read section over [off, off + len): f(const uint8_t *) may run more than once and must only produce its result
-  // (per-attempt local state); returns the result of the accepted attempt.
-  template <class F> auto read(uint64_t id, uint64_t off, uint64_t len, F f) const {
+  // Read section over [off, off + len) of element e: f(const uint8_t *) may run more than once and must only produce
+  // its result (per-attempt local state); returns the result of the accepted attempt.
+  template <class F> auto read(uint64_t id, uint64_t off, uint64_t len, F f, Elem e = {}) const {
     using R = decltype(f(static_cast<const uint8_t *>(nullptr)));
     // random 1/kSample sampling per section (a fixed every-k-th rule could alias with HNSW's regular access pattern)
     thread_local uint64_t rs = 0x9e3779b97f4a7c15ull ^ uint64_t(reinterpret_cast<uintptr_t>(&rs));
     rs ^= rs << 13, rs ^= rs >> 7, rs ^= rs << 17;  // xorshift64
     const bool timed = (rs >> 32 & (kSample - 1)) == 0;
-    const uint64_t oi = oseq_ ? obj_index(id) : 0;
-    if (oseq_) note_read(oi, id, off, len);
-    bool failed = false;  // trace: Megalon resets its local seq on a failed read_end; the accepted re-read sets it
-    uint64_t va = 0;
+    mshim::CohSnap c0;
+    if (wsec_ && coh_) coh_(&c0);
+    uint32_t fails = 0;
+    uint64_t seq = 0;
     for (;;) {
       MegObj h;
-      const uint64_t s0 = wsec_ ? cxl::hwcc::load_acquire(wsec_) : 0;
-      if (oseq_ && failed) va = cxl::hwcc::load_acquire(&oseq_[oi]);
       const uint64_t t0 = timed ? mono_ns() : 0;
       const int rc = api_->read_start(id, &h);
       if (rc != 0) megalon_fatal("ObjectReadStart(" + hex(id) + ") = " + std::to_string(rc));
       if (off + len > h.size) megalon_fatal("read beyond object " + hex(id));
+      if (wsec_) seq = cxl::hwcc::load_acquire(wsec_);
       const uint64_t t1 = timed ? mono_ns() : 0;
       if constexpr (std::is_void_v<R>) {
         f(static_cast<const uint8_t *>(h.ptr + off));
@@ -246,7 +292,7 @@ class MegalonBackend {
         const bool ok = api_->read_end(&h);
         if (timed) account_read(t0, t1, t2, ok);
         if (ok) {
-          if (failed && oseq_) raise_cache(oi, va);
+          if (wsec_) trace_read(id, e, seq, fails, c0);
           return;
         }
       } else {
@@ -255,19 +301,16 @@ class MegalonBackend {
         const bool ok = api_->read_end(&h);
         if (timed) account_read(t0, t1, t2, ok);
         if (ok) {
-          if (failed && oseq_) raise_cache(oi, va);
+          if (wsec_) trace_read(id, e, seq, fails, c0);
           return r;
         }
       }
-      failed = true;
+      fails++;
       tm().add(MegTimers::kRdRetries, 1);
-      if (trace_) log_retry(id, off, len, s0);
     }
   }
-  // Write section; f(base, size) writes whole lines only and reads nothing of the object (D3). Ranges are for the
-  // trace only (what the section wrote; [0, size) when not given).
-  template <class F>
-  void write_obj(uint64_t id, F f, uint64_t off0 = 0, uint64_t len0 = ~0ull, uint64_t off1 = 0, uint64_t len1 = 0) const {
+  // Write section of element e; f(base, size) writes whole lines only and reads nothing of the object (D3).
+  template <class F> void write_obj(uint64_t id, F f, Elem e = {}) const {
     MegObj h;
     const uint64_t t0 = mono_ns();
     const int rc = api_->write_start(id, &h);
@@ -282,23 +325,21 @@ class MegalonBackend {
     t.add(MegTimers::kWrEndNs, t3 - t2);
     if (wsec_) {
       const uint64_t seq = cxl::hwcc::fetch_add(wsec_, uint64_t(1)) + 1;
-      note_write(id, seq);
-      if (trace_) {
-        if (len0 == ~0ull) len0 = h.size;
-        std::lock_guard<std::mutex> g(tmu_);
-        wlog_.push_back(WsecRec{seq, id, uint32_t(off0), uint32_t(len0), uint32_t(off1), uint32_t(len1), t3, node_});
-      }
+      TraceRec r{};
+      r.tsc = __rdtsc(), r.seq = uint32_t(seq), r.obj = uint32_t(obj_index(id)), r.elem = e.elem, r.n = e.n;
+      r.type = kTraceWrite;
+      append(t, r);
     }
   }
   // Write section over [off, off + len), whole lines (len may end at the object end).
-  template <class F> void write(uint64_t id, uint64_t off, uint64_t len, F fill) const {
+  template <class F> void write(uint64_t id, uint64_t off, uint64_t len, F fill, Elem e = {}) const {
     write_obj(
         id,
         [&](uint8_t *base, size_t size) {
           check_lines(id, off, len, size);
           fill(base + off);
         },
-        off, len);
+        e);
   }
   static void check_lines(uint64_t id, uint64_t off, uint64_t len, size_t size) {
     if (off % 64 || off + len > size || (len % 64 && off + len != size))
@@ -308,6 +349,7 @@ class MegalonBackend {
 
   // ---- backend interface (server.cc)
   MegalonMem mem(uint32_t s, GraphMeta *meta) const { return MegalonMem{meta, this, s}; }
+  // whole-chunk accesses (initial image copy, warm-up): element = whole object
   template <class F> void write_chunk(Chunk k, uint32_t s, uint64_t g, uint64_t off, uint64_t len, F fill) const {
     write(chunk_id(k, s, g), off, len, fill);
   }
@@ -316,7 +358,8 @@ class MegalonBackend {
   }
   void dlog_write(uint32_t node, uint64_t e, const DlogEntry &d) const {
     write(dlog_id(node, e / p_.dlog_chunk), (e % p_.dlog_chunk) * sizeof(DlogEntry), sizeof(DlogEntry),
-          [&](uint8_t *dst) { std::memcpy(dst, &d, sizeof(d)); });
+          [&](uint8_t *dst) { std::memcpy(dst, &d, sizeof(d)); }, Elem{uint32_t(e % p_.dlog_chunk), 1});
+    t_mod_bytes += sizeof(d);
   }
   // Entries [from, to) of node's log: one read section per chunk copies them out; f runs after the section ended.
   template <class F> void dlog_scan(uint32_t node, uint64_t from, uint64_t to, F f) const {
@@ -325,7 +368,8 @@ class MegalonBackend {
       const uint64_t a = e % p_.dlog_chunk, n = std::min<uint64_t>(p_.dlog_chunk - a, to - e);
       buf.resize(n);
       read(dlog_id(node, e / p_.dlog_chunk), a * sizeof(DlogEntry), n * sizeof(DlogEntry),
-           [&](const uint8_t *src) { std::memcpy(buf.data(), src, n * sizeof(DlogEntry)); });
+           [&](const uint8_t *src) { std::memcpy(buf.data(), src, n * sizeof(DlogEntry)); },
+           Elem{uint32_t(a), uint16_t(n)});
       for (const DlogEntry &d : buf) f(d);
       e += n;
     }
@@ -337,7 +381,8 @@ class MegalonBackend {
            std::to_string(p_.segments) + " groups=" + std::to_string(p_.g.groups()) + " per_chunk=" +
            std::to_string(p_.g.per_chunk()) + " vchunk=" + std::to_string(p_.g.vchunk_bytes()) + " lchunk=" +
            std::to_string(p_.g.lchunk_bytes()) + " dlog_chunks_per_node=" + std::to_string(dlog_chunks_) +
-           " dlog_chunk_bytes=" + std::to_string(uint64_t(p_.dlog_chunk) * sizeof(DlogEntry)) + " shim=" + api_->info;
+           " dlog_chunk_bytes=" + std::to_string(uint64_t(p_.dlog_chunk) * sizeof(DlogEntry)) + " shim_api=" +
+           std::to_string(api_->version) + " thread_coh=" + (coh_ ? "yes" : "no") + " shim=" + api_->info;
   }
   std::string stats() const {
     MegStats s{};
@@ -350,11 +395,10 @@ class MegalonBackend {
       << "\nmegalon.write_retry=" << s.write_retry << "\nmegalon.switch_rw=" << s.switch_rw
       << "\nmegalon.flushes=" << s.flushes << "\nmegalon.flush_bytes=" << s.flush_bytes
       << "\nmegalon.replay_flushes=" << s.replay_flushes << "\nmegalon.replay_flush_bytes=" << s.replay_flush_bytes
-      << "\nmegt.sample=" << kSample << "\nmegt.clock_ns=" << clock_ns_;
+      << "\nmegt.sample=" << kSample << "\nmegt.clock_ns=" << clock_ns_ << "\nmegt.thread_coh=" << (coh_ ? 1 : 0);
     static const char *const names[MegTimers::kN] = {"rd_sampled", "rd_start_ns", "rd_body_ns", "rd_end_ns",
                                                       "rd_retries", "rd_failed_timed", "rd_failed_ns", "wr_sections",
-                                                      "wr_start_ns", "wr_body_ns", "wr_end_ns", "trace_refetch",
-                                                      "trace_first_sight"};
+                                                      "wr_start_ns", "wr_body_ns", "wr_end_ns"};
     static const char *const roles[MegTimers::kRoles] = {"main.", "writer.", "search.", "other."};
     const std::vector<uint64_t> sum = timers(-1);
     for (int k = 0; k < MegTimers::kN; k++) o << "\nmegt." << names[k] << "=" << sum[k];
@@ -362,34 +406,74 @@ class MegalonBackend {
       const std::vector<uint64_t> rs = timers(r);
       for (int k = 0; k < MegTimers::kN; k++) o << "\nmegt." << roles[r] << names[k] << "=" << rs[k];
     }
+    if (wsec_) {
+      uint64_t recs = 0, dropped = 0;
+      {
+        std::lock_guard<std::mutex> g(tmu_);
+        for (const MegTimers *t : tblocks_) recs += t->tb.count(), dropped += t->tb.dropped;
+      }
+      o << "\ntrace.records=" << recs << "\ntrace.bytes=" << recs * sizeof(TraceRec) << "\ntrace.dropped=" << dropped
+        << "\ntrace.cost_ns_per_read_section=" << trace_cost_ns_ << "\ntrace.wsec=" << cxl::hwcc::load_acquire(wsec_);
+    }
     o << "\n";
     return o.str();
   }
 
   // ---- measurement hooks (server.cc)
   static constexpr uint32_t kSample = 64;  // power of two
-  // Trace on: wsec_counter / objseq = the HWcc lines (layout.h), log = keep the logs. Off: nullptrs, no HWcc access.
-  void set_trace(uint64_t *wsec_counter, uint64_t *objseq, bool log, uint32_t node) {
-    wsec_ = wsec_counter, oseq_ = objseq, trace_ = log, node_ = node;
-    if (oseq_) {
-      ocache_.reset(new std::atomic<uint64_t>[p_.trace_objects()]);
-      for (uint64_t i = 0; i < p_.trace_objects(); i++) ocache_[i].store(0);
+  // Trace on: wsec_counter = the HWcc line (layout.h), max_records = per-node cap (beyond it records are dropped and
+  // counted). Off: nullptr, no HWcc access. Measures the per-read-section trace cost once (trace.cost_ns_per_read_section:
+  // two thread_coh calls + an HWcc load of wsec + rdtsc + a record store, on a private line and buffer).
+  void set_trace(uint64_t *wsec_counter, uint32_t node, uint64_t max_records, uint32_t tsc_khz) {
+    wsec_ = wsec_counter, node_ = node, max_chunks_ = (max_records + kTraceChunk - 1) / kTraceChunk, tsc_khz_ = tsc_khz;
+    if (!wsec_) return;
+    alignas(64) uint64_t line = 0;
+    std::vector<TraceRec> tmp(4096);
+    const int n = 200000;
+    const uint64_t a = mono_ns();
+    for (int i = 0; i < n; i++) {
+      mshim::CohSnap s0, s1;
+      if (coh_) coh_(&s0);
+      const uint64_t q = cxl::hwcc::load_acquire(&line);
+      if (coh_) coh_(&s1);
+      TraceRec &r = tmp[size_t(i) & 4095];
+      r.tsc = __rdtsc(), r.seq = uint32_t(q), r.obj = uint32_t(i), r.flags = uint8_t(s1.stale_cnt - s0.stale_cnt);
     }
+    trace_cost_ns_ = (mono_ns() - a) / n;
   }
-  bool dump_trace(const std::string &prefix, std::string *err) const {
-    if (!trace_) return true;
+  bool tracing() const { return wsec_ != nullptr; }
+  // node<K>.vdbtrace.bin (format: TraceFileHdr, then per thread TraceThreadHdr + records)
+  bool dump_trace(const std::string &path, std::string *err) const {
+    if (!wsec_) return true;
     std::lock_guard<std::mutex> g(tmu_);
-    for (int k = 0; k < 3; k++) {
-      static const char *const names[] = {".megalon-wsec.bin", ".megalon-retry.bin", ".megalon-refetch.bin"};
-      const std::string path = prefix + names[k];
-      FILE *f = std::fopen(path.c_str(), "wb");
-      if (!f) return *err = "cannot write " + path, false;
-      if (k == 0) std::fwrite(wlog_.data(), sizeof(WsecRec), wlog_.size(), f);
-      else if (k == 1) std::fwrite(rlog_.data(), sizeof(RetryRec), rlog_.size(), f);
-      else std::fwrite(flog_.data(), sizeof(RetryRec), flog_.size(), f);
-      std::fclose(f);
+    FILE *f = std::fopen(path.c_str(), "wb");
+    if (!f) return *err = "cannot write " + path, false;
+    TraceFileHdr h{};
+    std::memcpy(h.magic, "VDBTRC1", 8);
+    h.node = node_, h.nr_nodes = p_.nr_nodes, h.segments = p_.segments, h.threads = uint32_t(tblocks_.size());
+    h.groups = p_.g.groups(), h.dlog_chunks = dlog_chunks_, h.per_chunk = p_.g.per_chunk(), h.dlog_chunk = p_.dlog_chunk;
+    h.wsec_at_dump = cxl::hwcc::load_acquire(wsec_), h.tsc_khz = tsc_khz_, h.has_coh = coh_ ? 1 : 0;
+    for (const MegTimers *t : tblocks_) h.dropped += t->tb.dropped, h.records += t->tb.count();
+    bool ok = std::fwrite(&h, sizeof(h), 1, f) == 1;
+    uint32_t i = 0;
+    for (const MegTimers *t : tblocks_) {
+      const TraceBuf &b = t->tb;
+      TraceThreadHdr th{i++, uint32_t(t->role.load()), b.count(), b.dropped};
+      ok = ok && std::fwrite(&th, sizeof(th), 1, f) == 1;
+      for (size_t c = 0; c < b.chunks.size(); c++) {
+        const size_t n = c + 1 == b.chunks.size() ? b.used : kTraceChunk;
+        ok = ok && std::fwrite(b.chunks[c].get(), sizeof(TraceRec), n, f) == n;
+      }
     }
-    return true;
+    ok = std::fclose(f) == 0 && ok;
+    if (!ok) *err = "short write " + path;
+    return ok;
+  }
+  // dense index of an object id (for_each_object order: vec/link per segment group, then delete-log chunks per node)
+  uint64_t obj_index(uint64_t id) const {
+    const uint64_t kind = id >> 44 & 0xf, a = id >> 24 & 0xfffff, b = id & 0xffffff;
+    if (kind == 1 || kind == 2) return (a * p_.g.groups() + b) * 2 + (kind - 1);
+    return uint64_t(p_.segments) * p_.g.groups() * 2 + a * dlog_chunks_ + b;
   }
 
  private:
@@ -408,48 +492,38 @@ class MegalonBackend {
       t.add(MegTimers::kRdFailedTimed, 1), t.add(MegTimers::kRdFailedNs, t3 - t0);
     }
   }
-  // dense index of an object id (for_each_object order: vec/link per segment group, then delete-log chunks per node)
-  uint64_t obj_index(uint64_t id) const {
-    const uint64_t kind = id >> 44 & 0xf, a = id >> 24 & 0xfffff, b = id & 0xffffff;
-    if (kind == 1 || kind == 2) return (a * p_.g.groups() + b) * 2 + (kind - 1);
-    return uint64_t(p_.segments) * p_.g.groups() * 2 + a * dlog_chunks_ + b;
+  static uint8_t sat4(uint64_t x) { return uint8_t(x > 15 ? 15 : x); }
+  void trace_read(uint64_t id, Elem e, uint64_t seq, uint32_t fails, const mshim::CohSnap &c0) const {
+    TraceRec r{};
+    uint64_t a = 0, b = fails, ns = 0;
+    if (coh_) {
+      mshim::CohSnap c1;
+      coh_(&c1);
+      a = c1.stale_cnt - c0.stale_cnt, b = c1.concur_cnt - c0.concur_cnt;
+      ns = (c1.stale_ns - c0.stale_ns) + (c1.concur_ns - c0.concur_ns);
+    }
+    r.tsc = __rdtsc(), r.seq = uint32_t(seq), r.obj = uint32_t(obj_index(id)), r.elem = e.elem, r.n = e.n;
+    r.type = kTraceRead, r.flags = uint8_t(sat4(a) | sat4(b) << 4), r.ev_ns = uint32_t(ns > 0xffffffffu ? 0xffffffffu : ns);
+    MegTimers &t = tm();
+    TraceBuf &tb = t.tb;
+    if (!r.flags && tb.have_last && tb.last.obj == r.obj && tb.last.elem == r.elem && tb.last.n == r.n &&
+        tb.last.seq == r.seq)
+      return;  // identical consecutive read (e.g. header + vector of one element)
+    tb.last = r, tb.have_last = true;
+    append(t, r);
   }
-  // Trace only; the node cache mirrors Megalon's per-node local seq of the object (c3.cc): 0 = none (never read or
-  // written here: Megalon's local seq is nullopt and its first read does not flush), set by an accepted read and,
-  // unconditionally, by this node's own write_end. A read section whose object's HWcc objseq is past a non-zero
-  // cache: a write section completed on the object since this node last saw it, so ObjectReadStart flushes and
-  // re-reads the object. One thread per node logs the transition (cache CAS): refetch record (object, this read's
-  // range, old seq, new seq); classify_retries.py classifies it like a retry.
-  void note_read(uint64_t i, uint64_t id, uint64_t off, uint64_t len) const {
-    const uint64_t v = cxl::hwcc::load_acquire(&oseq_[i]);
-    uint64_t c = ocache_[i].load(std::memory_order_relaxed);
-    if (v <= c || !ocache_[i].compare_exchange_strong(c, v)) return;
-    if (c == 0) {  // first sight on this node: no flush in Megalon
-      tm().add(MegTimers::kFirstSight, 1);
-      return;
+  void append(MegTimers &t, const TraceRec &r) const {
+    TraceBuf &b = t.tb;
+    if (b.chunks.empty() || b.used == kTraceChunk) {
+      if (chunks_.fetch_add(1, std::memory_order_relaxed) >= max_chunks_) {
+        chunks_.fetch_sub(1, std::memory_order_relaxed);
+        b.dropped++;
+        return;
+      }
+      b.chunks.emplace_back(new TraceRec[kTraceChunk]);
+      b.used = 0;
     }
-    tm().add(MegTimers::kRefetch, 1);
-    if (trace_) {
-      std::lock_guard<std::mutex> g(tmu_);
-      flog_.push_back(RetryRec{id, uint32_t(off), uint32_t(len), c, v, mono_ns(), node_});
-    }
-  }
-  // Trace only, after write_end (inside the segment's HWcc write lock or the node's own delete log: one writer per
-  // object at a time): objseq = seq; cache = seq unconditionally (Megalon's write_seq_end sets the node's local seq).
-  void note_write(uint64_t id, uint64_t seq) const {
-    if (!oseq_) return;
-    const uint64_t i = obj_index(id);
-    uint64_t prev = cxl::hwcc::load_acquire(&oseq_[i]);
-    while (prev < seq && !cxl::hwcc::cas(&oseq_[i], &prev, seq)) {
-    }
-    ocache_[i].store(seq);
-  }
-  // Trace only: after a failed read_end Megalon's local seq is reset and the accepted re-read sets it to the counter
-  // it read (va = objseq loaded before that attempt's read_start).
-  void raise_cache(uint64_t i, uint64_t va) const {
-    uint64_t c = ocache_[i].load(std::memory_order_relaxed);
-    while (c < va && !ocache_[i].compare_exchange_weak(c, va)) {
-    }
+    b.chunks.back()[b.used++] = r;
   }
   MegTimers &tm() const {  // this thread's block for this backend (a process has one backend; tests may have two)
     thread_local const MegalonBackend *owner = nullptr;
@@ -477,24 +551,16 @@ class MegalonBackend {
         for (int k = 0; k < MegTimers::kN; k++) sum[k] += t->v[k].load(std::memory_order_relaxed);
     return sum;
   }
-  void log_retry(uint64_t id, uint64_t off, uint64_t len, uint64_t s0) const {
-    const uint64_t s1 = wsec_ ? cxl::hwcc::load_acquire(wsec_) : 0;
-    std::lock_guard<std::mutex> g(tmu_);
-    rlog_.push_back(RetryRec{id, uint32_t(off), uint32_t(len), s0, s1, mono_ns(), node_});
-  }
   Params p_;
   const MegalonApi *api_;
+  void (*coh_)(mshim::CohSnap *) = nullptr;
   uint64_t dlog_chunks_;
   uint64_t *wsec_ = nullptr;  // HWcc: write sections completed by all nodes (trace only)
-  uint64_t *oseq_ = nullptr;  // HWcc: per object, seq of its last write section (trace only)
-  mutable std::unique_ptr<std::atomic<uint64_t>[]> ocache_;  // this node: last objseq value seen per object
-  bool trace_ = false;
-  uint32_t node_ = 0, clock_ns_ = 0;
+  uint32_t node_ = 0, clock_ns_ = 0, tsc_khz_ = 0;
+  uint64_t max_chunks_ = 0, trace_cost_ns_ = 0;
+  mutable std::atomic<uint64_t> chunks_{0};    // trace chunks allocated by all threads (cap)
   mutable std::vector<MegTimers *> tblocks_;  // every thread's counter block (under tmu_)
   mutable std::mutex tmu_;
-  mutable std::vector<WsecRec> wlog_;
-  mutable std::vector<RetryRec> rlog_;
-  mutable std::vector<RetryRec> flog_;  // refetches (same record layout: s0 = old seq, s1 = new seq)
 };
 
 // HNSW accessor (shm_hnsw.h): every chunk access is one Megalon section; reads copy into the caller's scratch.
@@ -510,32 +576,36 @@ class MegalonAcc {
   GraphMeta *meta() const { return m_.meta; }
   float dot(const float *q, uint32_t i) const {
     return m_.be->read(vid(i), voff(i) + sizeof(ElemHeader), uint64_t(p_.dim) * 4,
-                       [&](const uint8_t *v) { return vdb::dot(q, reinterpret_cast<const float *>(v), p_.dim); });
+                       [&](const uint8_t *v) { return vdb::dot(q, reinterpret_cast<const float *>(v), p_.dim); },
+                       velem(i));
   }
   const ElemHeader &header(uint32_t i, ElemHeader &tmp) const {
-    m_.be->read(vid(i), voff(i), sizeof(ElemHeader), [&](const uint8_t *src) { std::memcpy(&tmp, src, sizeof(tmp)); });
+    m_.be->read(vid(i), voff(i), sizeof(ElemHeader), [&](const uint8_t *src) { std::memcpy(&tmp, src, sizeof(tmp)); },
+                velem(i));
     return tmp;
   }
   const float *vec(uint32_t i, float *tmp) const {
     m_.be->read(vid(i), voff(i) + sizeof(ElemHeader), uint64_t(p_.dim) * 4,
-                [&](const uint8_t *src) { std::memcpy(tmp, src, size_t(p_.dim) * 4); });
+                [&](const uint8_t *src) { std::memcpy(tmp, src, size_t(p_.dim) * 4); }, velem(i));
     return tmp;
   }
   const uint32_t *links(uint32_t i, int level, uint64_t uo, uint32_t *tmp) const { return links_mut(i, level, uo, tmp); }
   uint32_t *links_mut(uint32_t i, int level, uint64_t uo, uint32_t *tmp) const {
     const uint64_t n = lbytes(level);
-    m_.be->read(lid(i), loff(i, level, uo), n, [&](const uint8_t *src) { std::memcpy(tmp, src, n); });
+    m_.be->read(lid(i), loff(i, level, uo), n, [&](const uint8_t *src) { std::memcpy(tmp, src, n); },
+                link_elem(i % N_, level));
     return tmp;
   }
   void commit_links(uint32_t i, int level, uint64_t uo, const uint32_t *p) const {
     const uint64_t n = lbytes(level);
-    m_.be->write(lid(i), loff(i, level, uo), n, [&](uint8_t *dst) { std::memcpy(dst, p, n); });
+    m_.be->write(lid(i), loff(i, level, uo), n, [&](uint8_t *dst) { std::memcpy(dst, p, n); }, link_elem(i % N_, level));
+    t_mod_bytes += n;
   }
   void write_elem(uint32_t i, const ElemHeader &h, const float *v, uint64_t upper_bytes) const {
     m_.be->write(vid(i), voff(i), vrec_, [&](uint8_t *dst) {
       std::memcpy(dst, &h, sizeof(h));
       std::memcpy(dst + sizeof(ElemHeader), v, size_t(p_.dim) * 4);
-    });
+    }, velem(i));
     const uint64_t l0off = (i % N_) * l0_, uoff = upper_base_ + h.upper_off;
     m_.be->write_obj(
         lid(i),
@@ -547,7 +617,8 @@ class MegalonAcc {
             std::memset(base + uoff, 0, upper_bytes);
           }
         },
-        l0off, l0_, uoff, upper_bytes);
+        link_elem(i % N_, 0, uint32_t(1 + upper_bytes / p_.links_bytes())));
+    t_mod_bytes += vrec_ + l0_ + upper_bytes;
   }
   void prefetch(uint32_t) const {}
 
@@ -555,6 +626,7 @@ class MegalonAcc {
   uint64_t vid(uint32_t i) const { return MegalonBackend::vec_id(m_.seg, i / N_); }
   uint64_t lid(uint32_t i) const { return MegalonBackend::link_id(m_.seg, i / N_); }
   uint64_t voff(uint32_t i) const { return (i % N_) * vrec_; }
+  Elem velem(uint32_t i) const { return Elem{uint32_t(i % N_), 1}; }
   uint64_t lbytes(int level) const { return level ? p_.links_bytes() : l0_; }
   uint64_t loff(uint32_t i, int level, uint64_t uo) const {
     return level == 0 ? (i % N_) * l0_ : upper_base_ + uo + uint64_t(level - 1) * p_.links_bytes();

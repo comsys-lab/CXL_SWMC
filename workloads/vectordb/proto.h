@@ -57,33 +57,47 @@ struct __attribute__((packed)) SearchResp {
   uint16_t pad;
 };
 
-// SearchResp.flags bit: a SearchCoh block follows ids[n] and scores[n] (servers since vdb build 9). Clients that do not
-// know the block ignore the trailing bytes.
+// SearchResp.flags bit: an OpCoh block follows ids[n] and scores[n]. Update responses carry it after WriteResp (the
+// response length says whether it is there). vdb builds 9 sent the v1 SearchCoh block (layout kept in
+// experiments/vectordb/qcoh.py); since vdb build 10 the v2 OpCoh block below, on search and update responses.
 constexpr uint16_t kRespCoh = 1;
 
-// Per-query coherence time (server/qcoh.h, DESIGN.md §14): sums over the query's sections on the search threads.
-// Thread time, summed over the query's sections (segment tasks run in parallel on several threads).
-// coh_ns = pf_fault_ns + mg_check_est_ns + mg_reexec_est_ns (only one system's part is non-zero in practice):
-//   page MSI: managed-fault handler time of the query's sections (/proc/thread-self/swmc deltas)
-//   Megalon:  mg_check_est_ns = max(0, rd_start + rd_end - 2 clock_ns x rd_sampled) x kSample (sampled read
-//             sections, timer overhead subtracted); mg_reexec_est_ns = rd_retries x mean failed attempt (this
-//             query's timed failed attempts minus clock_ns each; none timed: its mean sampled section minus 3 clock_ns)
-struct __attribute__((packed)) SearchCoh {
-  uint16_t version;  // kSearchCohVersion
-  uint16_t source;   // page MSI counter source: 0 none (no swmc file), 1 swmc, 2 fake (Host tests only)
-  uint32_t sections; // sections attributed (start + one per segment task)
-  uint64_t coh_ns;
-  uint64_t pf_fault_ns, pf_msg_wait_ns, pf_local_wait_ns;
-  uint32_t pf_faults, pf_transactions;
-  uint64_t mg_rd_sampled, mg_rd_start_ns, mg_rd_body_ns, mg_rd_end_ns, mg_rd_retries, mg_rd_failed_timed,
-      mg_rd_failed_ns;          // raw (uncalibrated) sampled sums of the query's read sections
-  uint32_t clock_ns;            // timer-read overhead per timed interval (server start calibration)
-  uint32_t mg_sample;           // Megalon read-section sampling factor (0: not Megalon)
-  uint64_t mg_check_est_ns, mg_reexec_est_ns;
-  uint64_t busy_ns;             // thread time of the query's sections (start + segment tasks, incl. lock waits);
-                                // segment tasks run in parallel, so busy_ns (and coh_ns) can exceed the latency
+// Per-operation time split (MOT1 v6 Fig 2/3b; reports/MOT1-v6-redesign-draft.md §3, §4.2; DESIGN.md §15). One block
+// per operation (search or update), sums over the operation's sections, each section run by one thread (search:
+// the start section = E1 wait + delete-log replay, then one section per segment task, on any search thread; update:
+// one section on the writer = delete + publish + insert + publish). Per section: plain rdtsc at start and end (no
+// fences), and the thread's coherence counters read at start and end:
+//   Popcorn  struct swmc_acct (systems/popcorn_new/include/swmc_acct.h; registered per thread; build 9), or the
+//            Host-test fake; earlier kernels: /proc/thread-self/swmc (build 8; read at section end, delta since the
+//            thread's previous section end, read/write fault time only, no IPI time).
+//   Megalon  mshim::CohSnap of the calling thread (systems/megalon/shim/megalon_objapi.h v2 thread_coh; zeros when
+//            the shim has none, e.g. Megalon build 70).
+// t_ns = sum over sections of (end - start) [measured]; c_ns = pf_ns[0..2] + ipi_ns + mg_check_ns_sampled x
+// mg_read_sections / mg_check_sampled (ratio estimator, 0 if nothing sampled) + mg_stale_ns + mg_concur_ns + mg_meta_ns + mg_spin_ns + mg_wstart_ns + mg_wflush_ns [derived;
+// only one system's part is non-zero in practice]. mod_bytes (updates): bytes of the whole lines the application
+// stores in SWcc (vector record, zeroed link blocks, committed link blocks, delete-log entry) [measured].
+struct __attribute__((packed)) OpCoh {
+  uint16_t version;   // kOpCohVersion
+  uint16_t src;       // bits 0-1 Popcorn source: 0 none, 1 swmc_acct, 2 /proc/thread-self/swmc, 3 fake; bit 2 Megalon
+                      // CohSnap present (shim v2 with thread_coh)
+  uint16_t op;        // kOpSearch | kOpUpdate
+  uint16_t sections;  // sections summed
+  uint32_t tsc_khz;   // rdtsc rate used for t_ns (server start calibration)
+  uint32_t mg_check_sample;  // CohSnap.check_sample (0: no CohSnap)
+  uint64_t t_ns, c_ns;
+  uint64_t pf_ns[3];  // Popcorn coherence-fault time: [0] I->S, [1] S->M, [2] write-protect upgrade (file source:
+                      // read faults in [0], write faults in [1])
+  uint32_t pf_cnt[3];
+  uint32_t ipi_cnt;
+  uint64_t ipi_ns;    // TLB-shootdown IPI handling on the thread's CPU
+  uint64_t mg_check_ns_sampled;  // section checks, sampled sections only (estimate = x mg_check_sample)
+  uint32_t mg_check_sampled, mg_read_sections, mg_write_sections, mg_stale_cnt, mg_concur_cnt, mg_meta_cnt,
+      mg_spin_cnt, mg_switch_rw_cnt, mg_reclaim_cnt, mg_wflush_cnt;
+  uint64_t mg_stale_ns, mg_concur_ns, mg_meta_ns, mg_spin_ns, mg_wstart_ns, mg_switch_rw_ns, mg_reclaim_ns,
+      mg_wflush_ns, mg_wflush_bytes;
+  uint64_t mod_bytes;
 };
-constexpr uint16_t kSearchCohVersion = 1;
-static_assert(sizeof(SearchCoh) == 136, "SearchCoh wire size");
+constexpr uint16_t kOpCohVersion = 2;
+static_assert(sizeof(OpCoh) == 208, "OpCoh wire size (experiments/vectordb/opsplit.py)");
 
 }  // namespace vdb

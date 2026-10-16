@@ -11,9 +11,10 @@
 #   NODE_ENV="ENV:RACKOBJ_CONFIG=$V/cfg/megalon.yaml" NODE0_ENV="ENV:MEGALON_REINIT=1".
 #   SERVER_CPUS (unset = no change): guest CPU list (e.g. 0-14); after READY every vdb-server thread on every
 #   node is pinned with taskset -a and verified; recorded in the manifest and node<k>.server-cpus.txt.
-#   TRACE (default 0): TRACE=1 adds vdb-server --trace-dir <guest run dir> (Megalon: HWcc write-section counter and
-#   per-object seq + write-section/retry/refetch logs, collected as node<k>.megalon-{wsec,retry,refetch}.bin; plain:
-#   nothing). MOT1 v4 H2 step 2: set TRACE=1 only for the fixed-load runs, never for SLO searches.
+#   TRACE (default 0): TRACE=1 adds vdb-server --trace-dir <guest run dir> (vdb build >= 10, Megalon: sharing trace
+#   node<k>.vdbtrace.bin, DESIGN.md §16, classified after the run by tools/classify_sharing.py -> sharing.csv; builds
+#   <= 9: node<k>.megalon-{wsec,retry,refetch}.bin; plain: nothing). Dedicated short fixed-load runs only (MOT1 v6
+#   Fig 3c), never SLO searches or Fig 1/2 measurements.
 #   STATS_OP (default 10 = vdb kOpStats): loadgen --stats-op, a server stats snapshot per node at the start and end of
 #   every measured step (loadgen/stats/); STATS_OP=0 omits it. After the run: stats-steps.csv (stats_delta.py) and
 #   steps.csv with the derived per-node columns (export_csv.py).
@@ -60,7 +61,7 @@ APP=$("$HOST_SERVER" $SERVER_ARGS --print-app-bytes)
   echo "lg_cpus=$LG_CPUS"; echo "trace=$TRACE stats_op=$STATS_OP"
   [ -z "${SERVER_CPUS:-}" ] || echo "server_cpus=$SERVER_CPUS"
   for k in "${!NODE[@]}"; do
-    info=$($SSH comsys@"${NODE[$k]}" "uname -r; sha256sum $V/bin/vdb-server $V/cfg/cxl_region.yaml \$(ls $V/lib/libvdb-megalon.so $V/lib/libmegalon.so $V/cfg/megalon.yaml 2>/dev/null) | cut -c1-64; nproc" < /dev/null | tr '\n' ' ')
+    info=$($SSH comsys@"${NODE[$k]}" "uname -r; sha256sum $V/bin/vdb-server $V/cfg/cxl_region.yaml \$(ls $V/lib/libmegalon-objapi.so $V/lib/libvdb-megalon.so $V/lib/libmegalon.so $V/cfg/megalon.yaml 2>/dev/null) | cut -c1-64; nproc" < /dev/null | tr '\n' ' ')
     [ -n "$info" ] || { echo "node$k info empty" >&2; exit 4; }
     echo "node$k=${NODE[$k]} $info"
   done
@@ -124,6 +125,8 @@ echo "end=$(date -Is) loadgen_rc=$LG" >> "$RUN/manifest.txt"
 if [ -s "$RUN/loadgen/steps.jsonl" ] && [ -s "$RUN/loadgen/summary.json" ]; then
   [ ! -d "$RUN/loadgen/stats" ] || python3 "$ROOT/experiments/loadgen/stats_delta.py" "$RUN/loadgen" --out "$RUN/stats-steps.csv" || true
   python3 "$ROOT/experiments/loadgen/export_csv.py" --out "$RUN/steps.csv" "$RUN/loadgen=$SYSTEM" > /dev/null || true
+  [ ! -s "$RUN/loadgen/op-coh.bin" ] || python3 "$HERE/opsplit.py" "$RUN" > "$RUN/opsplit.log" 2>&1 || true
+  ls "$RUN"/node*.vdbtrace.bin > /dev/null 2>&1 && { python3 "$ROOT/workloads/vectordb/tools/classify_sharing.py" "$RUN" > "$RUN/sharing.log" 2>&1 || true; }
   python3 "$ROOT/experiments/loadgen/plot_slo.py" --out "$RUN/slo.png" "$RUN/loadgen=$SYSTEM" > "$RUN/slo-points.txt" 2>&1 || true
 fi
 grep -h "vdb-server: stopping" -A30 "$RUN"/node*.log | grep -E "^(node|P|elements|updates|inserts|deletes|searches|timeouts|bad_records)=" | tr '\n' ' '; echo

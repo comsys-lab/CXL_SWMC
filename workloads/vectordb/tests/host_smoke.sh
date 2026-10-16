@@ -9,8 +9,10 @@
 #      INDEX_BUILDER (default <build>/bin/vdb-build-index), DEVICE_SIZE (bytes, default 2 GiB),
 #      BACKEND (plain | megalon: <build> from build-megalon.sh; Megalon config from systems/megalon/vectordb-2vm.yaml
 #      with object_arena_size ARENA (default 512MB); node 0 MEGALON_REINIT=1), TRACE (1 = --trace-dir <scratch>,
-#      default 1; 0 = none). At the end the HWcc trace lines (wsec, objseq) are read from the device file: they must
-#      stay 0 with TRACE=0 or with the plain backend.
+#      default 1; 0 = none), OPCOH (fake | megalon | none: run tests/opcoh_check.py in that mode; VDB_OPCOH_FAKE=1 in
+#      the environment selects the fake Popcorn source). At the end the HWcc trace lines are read from the device file:
+#      wsec must stay 0 with TRACE=0 or with the plain backend, objseq (unused since vdb build 10) always 0. With
+#      BACKEND=megalon TRACE=1 the trace is classified (tools/classify_sharing.py -> <scratch>/sharing.csv).
 set -euo pipefail
 B=$(cd "$1" && pwd) LG=$2 D=$(cd "$3" && pwd) S=$4
 HERE=$(cd "$(dirname "$0")" && pwd); ROOT=$(cd "$HERE/../../.." && pwd)
@@ -66,7 +68,13 @@ dev = np.memmap(S + "/device.img", dtype=np.uint64, mode="r")
 wsec, objseq = int(dev[w // 8]), dev[o // 8:o // 8 + n]
 print(f"hwcc trace lines: wsec={wsec} objseq nonzero={int((objseq != 0).sum())}/{n} max={int(objseq.max())}")
 expect_on = be == "megalon" and tr == "1"
-if (wsec != 0 or objseq.any()) != expect_on:
-    sys.exit("hwcc trace lines: unexpected (" + ("should be written" if expect_on else "must stay 0") + ")")
+if (wsec != 0) != expect_on or objseq.any():
+    sys.exit("hwcc trace lines: unexpected (wsec " + ("should be written" if expect_on else "must stay 0") + ", objseq must stay 0)")
 PY
-exit $LGRC
+RC=$LGRC
+if [ "$BACKEND" = megalon ] && [ "$TRACE" = 1 ]; then
+  python3 "$HERE/../tools/classify_sharing.py" "$S" || RC=1
+  grep -h "^trace\." "$S"/node*.log | sort | uniq -c | sed -n '1,12p'
+fi
+if [ -n "${OPCOH:-}" ]; then python3 "$HERE/opcoh_check.py" "$S" "$OPCOH" || RC=1; fi
+exit $RC

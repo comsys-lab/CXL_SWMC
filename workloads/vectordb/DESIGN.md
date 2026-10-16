@@ -307,7 +307,7 @@ indexing unit; Megalon flushes the whole object at write end (no dirty-line trac
   read_start / body / read_end; failed attempts of timed sections timed in full; every write section timed
   (write_start, body, write_end incl. flush). `rd_retries` counts every failed ObjectReadEnd. ObjectReadStart's
   internal "incoherent" flush-and-retry (`megalon.read_retry_incoherent`) is inside read_start time, not a retry.
-- False-sharing log (`--trace-dir`, Megalon only; run.sh TRACE=1, fixed-load runs only, MOT1 v4 H2 step 2). HWcc
+- (vdb builds <= 9; replaced by §16 in builds >= 10.) False-sharing log (`--trace-dir`, Megalon only; run.sh TRACE=1, fixed-load runs only, MOT1 v4 H2 step 2). HWcc
   lines in the app layout of every backend (plain never touches them; Megalon only with --trace-dir): `wsec`
   (write sections completed by all nodes) and `objseq[o]`, one u64 per Megalon object (vector and link chunk per
   segment group, delete-log chunks per node; `Params::trace_objects()`), = wsec seq of the object's last write
@@ -339,7 +339,7 @@ indexing unit; Megalon flushes the whole object at write end (no dirty-line trac
 - Host smoke test: tests/host_smoke.sh (2 processes on a scratch file, plain or Megalon); unit tests
   tests/plugin_pairs_test.cc, tests/classify_retries_test.py, experiments/loadgen/test/stats_delta_test.py.
 
-## 14. Per-query coherence time (implemented 2026-10-16, vdb build 9; user decision before the H1 main runs)
+## 14. Per-query coherence time (vdb build 9; superseded by §15 in vdb builds >= 10, kept for earlier runs)
 
 - Every search response carries its own coherence time: `SearchResp.flags & kRespCoh` and a `SearchCoh` block
   (proto.h) after ids/scores (old clients ignore the trailing bytes). Search-serving threads only; the writer is
@@ -378,6 +378,61 @@ indexing unit; Megalon flushes the whole object at write end (no dirty-line trac
   tests/host_smoke.sh + tests/qcoh_check.py: `VDB_QCOH_FAKE=1` (plain; fake source = a segment's distance count:
   per query fault_ns = dists exactly), BACKEND=megalon (sum of per-query sampled sums = megt.search totals; role
   blocks sum to megt.*), plain without the swmc file (source none, coh 0).
+
+## 15. Per-operation time split (vdb build >= 10; MOT1 v6 Fig 2 and 3b, reports/MOT1-v6-redesign-draft.md §3, §4.2)
+
+- Operation = search or update (delete + insert pair). Sections: search = start section (E1 wait + delete-log replay)
+  + one per segment task, on any search thread; update = one section on the writer (delete, publish, insert, publish).
+  Per section, on the thread that runs it: plain rdtsc at start and end (no fences; T) and the thread's coherence
+  counters at start and end (C). Sums over the operation's sections (server/opcoh.h OpAcc).
+- C sources: Popcorn `struct swmc_acct` registered per worker thread (systems/popcorn_new/include/swmc_acct.h, build
+  9; register stub returns -1 until then), else /proc/thread-self/swmc (build 8; read at the section end only, delta
+  since the thread's previous section end; read/write fault time, no IPI), else none; Host tests `VDB_OPCOH_FAKE=1`
+  (the server adds dists of a segment task as I->S ns, dists/8 as IPI ns, 1000 ns S->M per update). Megalon:
+  `mshim::CohSnap` via the shared shim (systems/megalon/shim, libmegalon-objapi.so; API v2 `thread_coh`). Megalon <= 70
+  has no per-thread accounting: build-megalon.sh then builds server/megalon_objapi_fallback.cc (thread_coh = nullptr,
+  compiled against the build's own rackobj.h) and Megalon C is 0 (`opt.meg_coh=0`). C = Popcorn fault_ns[0..2] +
+  ipi_ns + Megalon checks (ratio estimator check_ns_sampled x read_sections / check_sampled, read sections only;
+  CXL_SWMC 2015a31f3; per operation with its own counts, step means with the step's sums) + stale + concur + meta +
+  spin (incl. NR combiner / replica read-lock waits) + wstart + wflush (switch_rw and reclaim are inside wstart;
+  reports/M2-megalon-port-changes.md §13). Megalon background threads (nr-log-sync replay,
+  WriteMetadataManager reclaim) are not in CohSnap: their CPU stays in the window counters (thr.megalon-lib.*,
+  thr.nr-log-sync.*; Popcorn kthr.cxl_recv*), exported next to the split.
+- Modified bytes (Fig 3b reference line): thread-local `t_mod_bytes` (shm_hnsw.h) counts the whole lines the
+  application stores: vector record + zeroed level-0/upper link blocks (write_elem), each committed link block,
+  each 64 B delete-log entry. Written back (Fig 3b): Megalon CohSnap wflush_bytes; Popcorn (S->M + wp faults) x 4 KiB.
+- Transport: proto.h `OpCoh` v2 (208 B) after the search results (SearchResp.flags kRespCoh) and after WriteResp on
+  update responses; the loadgen plugin writes `op-coh.bin` (OpLog 232 B). Window counters in the stats text in the
+  KV convention (workloads/kv/server/opsplit.h): `opt.version`, `opt.tsc_hz`, `opt.meg_coh`, `opt.meg_check_sample`,
+  `opt.<search|update>.{ops,sections,t_ns,c_ns,mod_bytes}`, `opt.<op>.pop.{is,sm,wp}_{ns,cnt}`, `.pop.ipi_{ns,cnt}`,
+  `opt.<op>.meg.<CohSnap field>`; `opcoh.*` = source, errors, timed-out search sections (unattributed).
+- Offline: `experiments/vectordb/opsplit.py RUN` -> `opsplit-steps.csv` (one row per measured step and operation
+  type) + `opsplit-steps.columns.csv` (tag per column: measured / sampled×N / derived, unit, formula). No proportional
+  wall-equivalent columns. `--op-coh off` disables reads and blocks.
+- Cost per section: two rdtsc, two reads of the thread's area (Popcorn: plain loads; Megalon: two thread_coh calls).
+
+## 16. Sharing trace (vdb build >= 10; MOT1 v6 Fig 3c, draft §4.3; dedicated runs only, off by default)
+
+- `--trace-dir DIR` (Megalon backend; run.sh TRACE=1): per section one 32 B `TraceRec` (megalon_backend.h) in the
+  thread's own buffer (2 MiB chunks, cap `--trace-max-mb`, default 4096 per node; overflow counted as dropped),
+  dumped at stop as `node<K>.vdbtrace.bin` (TraceFileHdr, then per thread TraceThreadHdr + records).
+  - write section: object (dense index), element, units, seq = global write-section number (HWcc `wsec` fetch-add
+    after ObjectWriteEnd);
+  - read section: object, element, units, seq = wsec loaded after the accepted attempt's ObjectReadStart, flags =
+    (A) CohSnap.stale_cnt delta | (B) CohSnap.concur_cnt delta << 4 (without CohSnap: failed read_ends), ev_ns =
+    stale_ns + concur_ns delta, tsc. Identical consecutive flagless reads of a thread are kept once.
+  - elements: vector chunk slot, delete-log entry, link block (slot | level << 24); units = consecutive elements
+    (link: levels); 0 = whole object (initial copy, warm-up).
+- `tools/classify_sharing.py DIR` -> sharing.csv/.txt: an event of node n on object O is true sharing if n reads an
+  element modified by the causing writes (peer writes on O with seq in (seq_prev, seq_seen], seq_prev = n's latest
+  refresh point on O: previous event, own write, or first read) before n's next event on O; counts per role and
+  (A)/(B), time shares (ev_ns), events per search. `--a6-dir` writes the CSV input of
+  experiments/analysis/v6_fig3_megalon.py c. HWcc `objseq` lines are no longer used (stay 0).
+- Overhead (Host, tiny dataset, 10/90 mix, load average ~38, single runs): Megalon 70 (no CohSnap): search T p50
+  +9-14 %, update +4-14 %; Megalon 71 (two thread_coh calls per read section): search T p50 +31-86 %, update +27 %;
+  server-measured per-read-section cost 12-22 ns (70) / 211-474 ns (71). Trace runs therefore never feed Fig 1/2.
+- Tests: tests/megalon_trace_test.cc (fake API v2 with thread_coh) + tests/classify_sharing_test.py (constructed
+  true/false/no-prior-copy events); host_smoke.sh BACKEND=megalon TRACE=1.
 
 ## 10. Future reference: E2 (not implemented)
 
