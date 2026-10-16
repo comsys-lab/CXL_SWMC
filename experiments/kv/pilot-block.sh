@@ -10,7 +10,9 @@
 #   main: H1 MAIN run (reports/KV-main-packet.md): one full SLO search (KIND=slo) per system at put ratio 0.05, KEYS
 #        (54000000), order = [hw mg pop] shuffled with seed "KV-main-h1" (order.txt before the first run); dax0.0
 #        comsys for all-HWcc/Megalon, back to root:root 600 (fresh stat check) before page MSI. A confirm failure at
-#        three rates is a NOTE (recorded, the block continues); every other stop ends the block.
+#        three rates is a NOTE (recorded, the block continues); every other stop ends the block. FIX_RATE set: after
+#        each system's SLO search, a separate run <sys>-u5-fix = one 30 s fixed-load window at FIX_RATE req/s (KIND=fix:
+#        no SLO abort; an aborted (saturated) window is a NOTE and is reported).
 #   hmtrace: only the traced 0.5 windows of all-HWcc and Megalon (shuffled) at L from an earlier hm block (LREF), e.g.
 #        after an hm block that stopped at its ptrace runs.
 # env: PIN (harness commit), BUILD_PIN (commit the builds were made from; default PIN; every build manifest must name
@@ -150,14 +152,17 @@ case "$B" in
     : "${C8:?}" "${GT8:?}" "${RECV_MODE:?}" "${KEYS:?}"
     ORD=$(shuffle hw mg pop)
     [ $(echo $ORD | wc -w) = 3 ] || { echo "SEQUENCE STOP: run order"; exit 1; }
-    echo "# KV H1 main order (shuffle seed $OWNER): $ORD; keys $KEYS batch 16 put 0.05 Zipf 0.99 request seed ${SEED:-20261016}" | tee "$E/order.txt"
+    [ -z "${FIX_RATE:-}" ] || [[ $FIX_RATE =~ ^[1-9][0-9]*$ ]] || { echo "SEQUENCE STOP: bad FIX_RATE"; exit 2; }
+    echo "# KV H1 main order (shuffle seed $OWNER): $ORD; keys $KEYS batch 16 put 0.05 Zipf 0.99 request seed ${SEED:-20261016}; per system: slo${FIX_RATE:+, then fix at $FIX_RATE req/s}" | tee "$E/order.txt"
     for s in $ORD; do
       case $s in
-        hw)  [ $CHOWNED = 1 ] || dax_comsys_all; run hw-u5-slo SYS=all-HWcc PUT_RATIO=0.05 KIND=slo KEYS=$KEYS;;
-        mg)  [ $CHOWNED = 1 ] || dax_comsys_all; run mg-u5-slo SYS=Megalon PUT_RATIO=0.05 KIND=slo KEYS=$KEYS;;
+        hw)  [ $CHOWNED = 1 ] || dax_comsys_all; SE=(SYS=all-HWcc);;
+        mg)  [ $CHOWNED = 1 ] || dax_comsys_all; SE=(SYS=Megalon);;
         pop) if [ $CHOWNED = 1 ]; then dax_root_all || { echo "SEQUENCE STOP: dax0.0 not back to root:root 600 before page MSI"; exit 1; }; CHOWNED=0; fi
-             run pop-u5-slo SYS=Popcorn C8=$C8 K8=$K8 GT8=$GT8 RECV_MODE=$RECV_MODE PUT_RATIO=0.05 KIND=slo KEYS=$KEYS;;
+             SE=(SYS=Popcorn C8=$C8 K8=$K8 GT8=$GT8 RECV_MODE=$RECV_MODE);;
       esac
+      run $s-u5-slo "${SE[@]}" PUT_RATIO=0.05 KIND=slo KEYS=$KEYS
+      [ -z "${FIX_RATE:-}" ] || run $s-u5-fix "${SE[@]}" PUT_RATIO=0.05 KIND=fix RATE=$FIX_RATE KEYS=$KEYS
     done;;
   pop)
     : "${C8:?}" "${GT8:?}" "${RECV_MODE:?}" "${LREF:?}"
