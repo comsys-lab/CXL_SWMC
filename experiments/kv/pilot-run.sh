@@ -11,6 +11,8 @@
 #   --slo mixed:99:600000 so only the saturation (outstanding) abort can end the window early; p99 is recorded and the
 #   1 ms SLO is judged here (fix-result.txt: slo_1ms_pass), an aborted window is a NOTE with its reason; KIND=pfix|ptrace: RATE (requests/s = L). ptrace = a pfix window with TRACE=1 (put/get logs for the
 #   Figure 2c classification only; never used for throughput/latency comparisons). pfix forces TRACE=0.
+#   ladder = fixed-rate steps at RATES (comma list, run in that order; 10 s warm-up, 3 s + 15 s per step, no SLO abort);
+#   used for the low-rate latency (CPU idle) check, reports/KV-idle-check.md.
 #   SYS=Popcorn: C8 (build-8 deploy bundle dir), K8 (release), GT8 (guest tools dir), RECV_MODE (poll | idle | sleep)
 # optional: KEYS (4000000), BATCH (16), SEED (20261016), GATE=0 (skip the Host gate: functional runs only),
 #   VM_PLAIN (/home/comsys/kv3), VM_MEG (/home/comsys/kvm3), PLAIN_BUILD (builds/kv/3), MEG_BUILD (builds/kv-megalon/3),
@@ -48,7 +50,7 @@ case "$SYS" in
   *) stop "bad SYS";;
 esac
 export NODE_ENV="ENV:XTIMEOUT=14400"
-SLO_ARG=mixed:99:1; [ "$KIND" = fix ] && SLO_ARG=mixed:99:600000  # fix: no SLO abort (judged after the run)
+SLO_ARG=mixed:99:1; [[ $KIND =~ ^(fix|ladder)$ ]] && SLO_ARG=mixed:99:600000  # fix, ladder: no SLO abort (judged after the run)
 LG=(--opt keys=$KEYS --opt batch=$BATCH --opt put_ratio=$PUT_RATIO --opt seed=$SEED --seed "$SEED" --mix mixed=1
     --slo $SLO_ARG --x-stream mixed)
 case "$KIND" in
@@ -57,6 +59,8 @@ case "$KIND" in
              --step-measure-s 8 --confirm-s 15 --confirm-reps 1 --fill none --overload none);;
   slo) LG+=(--raw --mode slo --start 500 --factor 1.5 --precision 0.05 --max-steps 25 --warmup-s 10 --step-warmup-s 3
             --step-measure-s 15 --drain-s 5 --confirm-s 30 --confirm-reps 3 --fill 0.7,0.8,0.9 --overload 1.05,1.1,1.2);;
+  ladder) [[ ${RATES:?} =~ ^[0-9]+(,[0-9]+)*$ ]] || stop "bad RATES"  # fixed-rate steps in the given order (idle-latency check)
+          LG+=(--raw --mode fixed --rates "$RATES" --warmup-s 10 --step-warmup-s 3 --step-measure-s 15 --drain-s 5);;
   pfix|ptrace|fix) : "${RATE:?}"; LG+=(--raw --mode fixed --rates "$RATE" --warmup-s 10 --step-warmup-s 5 --step-measure-s 30 --drain-s 10);;
   *) stop "bad KIND";;
 esac

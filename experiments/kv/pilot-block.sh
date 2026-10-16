@@ -13,6 +13,8 @@
 #        three rates is a NOTE (recorded, the block continues); every other stop ends the block. FIX_RATE set: after
 #        each system's SLO search, a separate run <sys>-u5-fix = one 30 s fixed-load window at FIX_RATE req/s (KIND=fix:
 #        no SLO abort; an aborted (saturated) window is a NOTE and is reported).
+#   idle: low-rate latency check: one all-HWcc ladder run (KIND=ladder, RATES, KEYS) tagged CTAG (Host C-state setting,
+#        recorded from sysfs before the run).
 #   hmtrace: only the traced 0.5 windows of all-HWcc and Megalon (shuffled) at L from an earlier hm block (LREF), e.g.
 #        after an hm block that stopped at its ptrace runs.
 # env: PIN (harness commit), BUILD_PIN (commit the builds were made from; default PIN; every build manifest must name
@@ -164,6 +166,13 @@ case "$B" in
       run $s-u5-slo "${SE[@]}" PUT_RATIO=0.05 KIND=slo KEYS=$KEYS
       [ -z "${FIX_RATE:-}" ] || run $s-u5-fix "${SE[@]}" PUT_RATIO=0.05 KIND=fix RATE=$FIX_RATE KEYS=$KEYS
     done;;
+  idle)  # low-rate latency check (reports/KV-idle-check.md): one all-HWcc ladder run; CTAG names the Host C-state setting
+    : "${CTAG:?}" "${RATES:?}" "${KEYS:?}"
+    [[ $CTAG =~ ^[a-z0-9-]+$ ]] || { echo "SEQUENCE STOP: bad CTAG"; exit 2; }
+    for f in /sys/devices/system/cpu/cpu0/cpuidle/state*; do echo "$(cat $f/name) disable=$(cat $f/disable)"; done > "$E/host-cstates-$CTAG.txt"
+    for c in /sys/devices/system/cpu/cpu[0-9]*/cpuidle/state*/disable; do echo "$c $(cat $c)"; done > "$E/host-cstates-all-$CTAG.txt"
+    dax_comsys_all
+    run hw-ladder-$CTAG SYS=all-HWcc PUT_RATIO=0.05 KIND=ladder RATES=$RATES KEYS=$KEYS;;
   pop)
     : "${C8:?}" "${GT8:?}" "${RECV_MODE:?}" "${LREF:?}"
     PE=(SYS=Popcorn C8=$C8 K8=$K8 GT8=$GT8 RECV_MODE=$RECV_MODE)
