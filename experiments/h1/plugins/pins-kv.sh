@@ -2,14 +2,15 @@
 # recovery/KV-V1-v1.5-run). all-HWcc = kv/10 on Megalon 77-hwcc (FULL_COHERENCE flavor; MOT1 v6 §3.1 KV rule), Popcorn =
 # kv/10 + cxl_shm build 12, Megalon = kv-megalon/10 on Megalon 77 (timers on), mgoff = the same with MEGALON_COH_TIMERS=0.
 # Builds from BUILD_PIN 934fa9312; installs = the KV-V1 v1.5 guest dirs kv10 / kvm10 (Q10 reuse; the block's precheck
-# compares every installed file with the builds). Hook = block h1 of pilot-block.sh, H1-HOOK v2 (experiments/kv/h1v2-lib.sh) at f8bf42142 (live tree, every file
+# compares every installed file with the builds). Loadgen kv-loadgen/11 (LOADGEN_PIN 39575ed9d: plugin state_in/state_out
+# across the parts of one lifetime). Hook = block h1 of pilot-block.sh, H1-HOOK v2 (experiments/kv/h1v2-lib.sh) at f8bf42142 (live tree, every file
 # the block runs hash-pinned below). Filled 2026-10-17.
 . "$(dirname "${BASH_SOURCE[0]}")/pins-common.inc"
 HR=$P/CXL_SWMC
 HOOK_FILE=$HR/experiments/kv/pilot-block.sh
 BLOCK_CMD=(bash $HOOK_FILE h1)       # H1 hook = block "h1" (marker H1-HOOK v2)
-BLOCK_ENV=(PIN=6624d87a04f2488600da2f503f40a43cc8f248d8 BUILD_PIN=934fa9312c38eeaf2845605cf22d2ef1cfe15fc4 MEGALON_BUILD_N=77 KEYS=54000000
-  PLAIN_BUILD=$P/builds/kv/10 MEG_BUILD=$P/builds/kv-megalon/10 LOADGEN_BUILD=$P/builds/kv-loadgen/10
+BLOCK_ENV=(PIN=56154f40329aabfc29700bb16c525d40c5151de0 BUILD_PIN=934fa9312c38eeaf2845605cf22d2ef1cfe15fc4 MEGALON_BUILD_N=77 KEYS=54000000
+  PLAIN_BUILD=$P/builds/kv/10 MEG_BUILD=$P/builds/kv-megalon/10 LOADGEN_BUILD=$P/builds/kv-loadgen/11 LOADGEN_PIN=39575ed9d243e5251bca8f4b92ccf73607c8ba16
   VM_PLAIN=/home/comsys/kv10 VM_MEG=/home/comsys/kvm10 KV_CFG=$P/recovery/KV-V1-v1.5-run/install.log.megalon.yaml
   K8=$KPOP C8=$CPOP GT8=$GTPOP RECV_MODE=$RECV_MODE EXPECT_DAX_UUID=$EXPECT_DAX_UUID)
 PIN_SHA256="$COMMON_SHA256
@@ -21,14 +22,14 @@ f22c852f5cc83928b2a4852a3aa428197aa70af7bf385defe0a91c18fa622dc7  $P/builds/kv/1
 dc96d5d784d3bd92d9a4d90ecaba92d036a4a37cefc9b17bf18354be8767be34  $P/builds/kv-megalon/10/lib/libkv-megalon.so
 d97d3844fe6464c03b94c816a5836dae30f16c356920969d36c7fcf62f6f2a15  $P/builds/kv-megalon/10/lib/libmegalon-objapi.so
 f9c1753f3bef2ab0941153058860227145f2d7b7e33a210bdc3338fad14eacda  $P/builds/kv-megalon/10/lib/libmegalon.so
-2e299f162de5701d83e2f776326416cf258f0e55dce11f500fafe26c0985773c  $P/builds/kv-loadgen/10/manifest.txt
-68a642f425d1082f389d57acc9119cca2998f33cc8371fe1834f735c927bdea6  $P/builds/kv-loadgen/10/kv-manifest.txt
-5ebc87703788fddd6e93e8cbd6a85dc0f118610775fdfdbaf50b98018aae954a  $P/builds/kv-loadgen/10/loadgen
+5f1348abe42a88167801dbcc25a22f50a8af561113299f489d4f6e1441942744  $P/builds/kv-loadgen/11/manifest.txt
+62d4f8ff9e24ce3876eebfddd048dc1fbd0985159834c34e895136ffb81c2909  $P/builds/kv-loadgen/11/kv-manifest.txt
+bc4889794fd0a1ded5a29e220af91b78988ba3d33d93aa10709d4ddf68fbed57  $P/builds/kv-loadgen/11/loadgen
 48c5f02c0546af9b22cf0a4ce2172177193ffcc6d502d9fb0fdeb51863bb9f17  $P/recovery/KV-V1-v1.5-run/install.log.megalon.yaml
-eda9b67d11fbea5b0afab63f2c5aa4c6ab304ca191b025c95b5444947bf0e302  $HOOK_FILE
+7167fd5bf9f62f51a83330546a85438a741c80998a3ff79592e6584dc50ec8a1  $HOOK_FILE
 fbfb125195d2c862ab33c56da7e251c940973e03bd19ffaa35361002fdd1d895  $HR/experiments/kv/h1v2-lib.sh
-13a41908fa932590ebcbebcf75ff5d58e886609df3da398d5e3af1cdb67a3ead  $HR/experiments/kv/pilot-run.sh
-05360955f25cbb03c7157db5b3f305e47b8b3e29cb57833f9a1033074e19a019  $HR/experiments/kv/run.sh
+7cb021a0ba2a9078ac27a6cf893785666e11ae2a86c6e651c4d4b2332f4252aa  $HR/experiments/kv/pilot-run.sh
+91ea2e208d3a37d926ca3e112b26a888f470fe6e05a08ceb8ca1e6cd95ee7bfa  $HR/experiments/kv/run.sh
 8435ef222785be5d7a6dd6a97572b1404017822c63f3f766c45562efc8ae35ca  $HR/experiments/kv/precheck.sh
 de9d4a99916fbd60b66f6142d0cbc69cd88068e19c9ca08609380241801e76f7  $HR/experiments/kv/v1-check.py
 cbd6d75e743f149633a461e525bff6c69108407bcc0d7b9dc8f443dc72a6690f  $HR/experiments/kv/pretouch-check.sh
