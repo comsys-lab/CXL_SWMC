@@ -504,8 +504,8 @@ class Server {
   // T > 0 (Monolith §2.2.3 touched-key push, Ekko rates; DESIGN.md §5): every worker sees every sample in time order
   // and records the rows it owns (stripe % U == w) in a private map key -> latest seq (latest wins); no shared memory
   // is read or written per sample, and the sample is acknowledged on acceptance (workers never wait for each other).
-  // Every T the worker publishes its touched rows once: resolve each row's slot (probe in SWcc), write it under its
-  // stripe. A round longer than T is an overrun ("update rate not sustained"); the next round starts at the next
+  // Every T the worker publishes its touched rows once: each row's record follows from its key (no probe), written
+  // under its stripe (plain) or in one write section (Megalon). A round longer than T is an overrun ("update rate not sustained"); the next round starts at the next
   // multiple of T after it (never bursted). T = 0 (diagnostic): every sample's rows are written before the reply.
   struct UpdJob {
     Job job;
@@ -562,7 +562,7 @@ class Server {
     st_.rows_written += rows.size();
     __atomic_fetch_add(&h_->nodes[o_.node].rows_written, uint64_t(rows.size()), __ATOMIC_RELAXED);
   }
-  // key -> resolved row (slot by probing SWcc); false on a miss (counted)
+  // key -> resolved row (direct: table and row from the key); false on a miss (counted)
   bool resolve(uint64_t key, uint64_t seq, Touched *t) {  // key -> its row (direct addressing, no probe)
     const uint32_t k = Params::key_table(key);
     const uint64_t r = Params::key_row(key);
