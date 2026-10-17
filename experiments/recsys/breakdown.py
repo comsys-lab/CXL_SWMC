@@ -24,7 +24,8 @@ Megalon estimates are computed from the window deltas of the raw sampled counter
 threads / Megalon role update) is reported in separate columns, never added to the serving time.
 MOT1 v6 Fig 2 columns (server op.* keys, optime.h; tag in brackets): per operation o in {query (node 1), row_update
 (node 0)}: fig2_<o>_n [count], fig2_<o>_T_ms [measured: rdtsc, summed over threads], fig2_<o>_C_ms [Popcorn:
-measured swmc_acct; Megalon: derived = sampled x N check estimate + measured intervals], fig2_<o>_rest_ms [derived T-C],
+measured swmc_acct; Megalon: derived = sampled x N check estimate + measured intervals (Megalon >= 76: event and
+write-side sums of timed sections scaled by their ratio estimators, mg_scaled_window)], fig2_<o>_rest_ms [derived T-C],
 per operation. Megalon background threads (not in CohSnap): bg_cpu_ms_node<k> = thr.nr-log-sync + thr.mg-bg run_ns.
 usage: breakdown.py <run dir> [--out file.csv]
 """
@@ -64,9 +65,33 @@ def mg_check_window(b, e, o):
     return ns * delta(b, e, p + 'read_sections') / ds if ds else 0.0
 
 
+def mg_scaled_window(b, e, o):
+    """Megalon >= 76 (op.<o>.mg.flags bit 1 = lean sampling, not bit 2 = events_always; optime.h, M2 §18): window
+    estimates of the read-side events d(stale+concur+meta+spin ns) x d(read_sections) / d(check_sampled) and of the
+    write side d(wstart+wflush+anchor.write_lookup+anchor.write_nr ns) x d(write_sections) / d(anchor.write_sampled)
+    (a zero denominator gives 0). Returns None when the run has no mg.flags key (server built before this rule) or
+    the flags say the sums are full (pre-76 or events_always): then c_ns deltas are additive as before."""
+    p = f'op.{o}.mg.'
+    if p + 'flags' not in e:
+        return None
+    f = e[p + 'flags']
+    if not (f & 2) or (f & 4):
+        return None
+    ds, dw = delta(b, e, p + 'check_sampled'), delta(b, e, p + 'anchor.write_sampled')
+    ev = sum(delta(b, e, p + k) for k in ('stale_ns', 'concur_ns', 'meta_ns', 'spin_ns'))
+    wr = sum(delta(b, e, p + k) for k in ('wstart_ns', 'wflush_ns', 'anchor.write_lookup_ns', 'anchor.write_nr_ns'))
+    return (ev * delta(b, e, p + 'read_sections') / ds if ds else 0.0) + \
+        (wr * delta(b, e, p + 'write_sections') / dw if dw else 0.0)
+
+
 def op_c_window(b, e, o):
-    """C over the window: additive parts of c_ns (c_ns - cumulative check estimate) + the window check estimate."""
-    return delta(b, e, f'op.{o}.c_ns') - delta(b, e, f'op.{o}.mg.check_est_ns') + mg_check_window(b, e, o)
+    """C over the window. Pre-76 sums / no mg.flags: additive parts of c_ns (c_ns - cumulative check estimate) + the
+    window check estimate. Megalon >= 76 lean sampling: Popcorn part (pc.c_ns delta, 0 for Megalon) + window check
+    estimate + window event and write estimates (mg_scaled_window), all from window deltas of the raw counters."""
+    sc = mg_scaled_window(b, e, o)
+    if sc is None:
+        return delta(b, e, f'op.{o}.c_ns') - delta(b, e, f'op.{o}.mg.check_est_ns') + mg_check_window(b, e, o)
+    return delta(b, e, f'op.{o}.pc.c_ns') + mg_check_window(b, e, o) + sc
 
 
 def delta(b, e, key):

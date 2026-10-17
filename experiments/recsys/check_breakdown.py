@@ -34,6 +34,7 @@ RAW = {  # keys that must exist in the serving node's (t1) end snapshot
             'thr.rs-serve.swmc.wpu_fault_ns', 'sys.swmc.instr.serve.unmap_ns', 'sys.swmc.instr.serve.mkclean_ns'],
     'megalon': ['lookup_ns', 'mlp_ns', 'queries', 'thr.rs-serve.n', 'megalon_time.serve.read_sections', 'op.query.n',
                 'op.query.t_ns', 'op.query.c_ns', 'op.query.mg.read_sections', 'op.query.mg.check_sampled',
+                'op.query.mg.flags', 'op.query.mg.anchor.write_sampled',  # Megalon >= 76 estimators (optime.h)
                 'thr.nr-log-sync.run_ns'],
 }
 

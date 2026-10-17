@@ -9,8 +9,14 @@
 //            back: (check + read_lookup + read_nr)_sampled x read_sections / check_sampled, wstart + write_lookup +
 //            write_nr; rseq/wseq/wseq_end are inside check/wstart/wflush and are not added again. Nothing subtracted.
 //            mg.lookup_ns_sampled = CohSnap.reserved[7] (= anchor.read_lookup_ns_sampled), raw only.
-//            + stale/concur/meta/spin/wstart/wflush ns [measured]
+//            + stale/concur/meta/spin/wstart/wflush ns [measured before Megalon 76]
 //            (switch_rw_ns and reclaim_ns are kept as raw columns only: they are inside write start, §4.1)
+//            Megalon >= 76 (lean sampling, CohSnap.reserved[1] bit 1; M2 §18, megalon_objapi.h contract): every
+//            duration is a sum over timed sections only, so the shim contract's estimators apply: read-side events
+//            (stale/concur/meta/spin) x read_sections / check_sampled, write side (wstart, wflush, anchor.write_lookup,
+//            anchor.write_nr) x write_sections / write_sampled (AnchorSnap.reserved[0]); with MEGALON_COH_EVENTS=always
+//            (bit 2) events and write side are full sums (not scaled). Flags exported as mg.flags (last value), timed
+//            write sections as mg.anchor.write_sampled. No probe subtraction (M2 §19) is applied.
 // A source that is not available (kernel without build 9, cxl_shm not enabled, v1 shim) contributes zeros; the
 // stats say which sources are live (op.coh_src). Workloads call these at operation boundaries only.
 #pragma once
@@ -54,8 +60,9 @@ inline uint64_t tsc_to_ns(uint64_t cyc) { return uint64_t(double(cyc) * 1e6 / do
 // no-transition faults reserved[0..1] = nontrans_ns/cnt, exported but NOT part of C) then Megalon CohSnap up to
 // wflush_bytes (21).
 constexpr int kAnF = 7;  // AnchorSnap read_lookup_ns_sampled .. wseq_end_ns (v3)
-constexpr int kPcF = 10, kMgF = 21, kCohF = kPcF + kMgF + 1 + kAnF;  // + mg.lookup_ns_sampled + mg.anchor.*
-constexpr int kMgLookup = kPcF + kMgF, kAn = kMgLookup + 1;
+constexpr int kPcF = 10, kMgF = 21, kCohF = kPcF + kMgF + 1 + kAnF + 2;  // + mg.lookup_ns_sampled + mg.anchor.* +
+                                                                         // mg.anchor.write_sampled + mg.flags
+constexpr int kMgLookup = kPcF + kMgF, kAn = kMgLookup + 1, kAnWs = kAn + kAnF, kMgFlags = kAnWs + 1;
 inline const char *coh_field(int i) {
   static const char *n[kCohF] = {
       "pc.fault_ns.is", "pc.fault_ns.sm", "pc.fault_ns.wp", "pc.fault_cnt.is", "pc.fault_cnt.sm", "pc.fault_cnt.wp",
@@ -65,10 +72,14 @@ inline const char *coh_field(int i) {
       "mg.spin_ns", "mg.wstart_ns", "mg.switch_rw_cnt", "mg.switch_rw_ns", "mg.reclaim_cnt", "mg.reclaim_ns",
       "mg.wflush_cnt", "mg.wflush_ns", "mg.wflush_bytes", "mg.lookup_ns_sampled",
       "mg.anchor.read_lookup_ns_sampled", "mg.anchor.read_nr_ns_sampled", "mg.anchor.rseq_ns_sampled",
-      "mg.anchor.write_lookup_ns", "mg.anchor.write_nr_ns", "mg.anchor.wseq_ns", "mg.anchor.wseq_end_ns"};
+      "mg.anchor.write_lookup_ns", "mg.anchor.write_nr_ns", "mg.anchor.wseq_ns", "mg.anchor.wseq_end_ns",
+      "mg.anchor.write_sampled", "mg.flags"};
   return n[i];
 }
 constexpr int kMgCheckSample = kPcF + 2;  // not additive: the sampling factor N (last value kept)
+// kMgFlags (CohSnap.reserved[1]: bit 0 timers on, bit 1 lean sampling (>= 76), bit 2 events_always) is not additive
+// either (last value kept)
+inline bool not_additive(int i) { return i == kMgCheckSample || i == kMgFlags; }
 static_assert(offsetof(mshim::CohSnap, wflush_bytes) == (kMgF - 1) * 8, "CohSnap field order");
 static_assert(offsetof(mshim::AnchorSnap, wseq_end_ns) - offsetof(mshim::AnchorSnap, read_lookup_ns_sampled) ==
                   (kAnF - 1) * 8, "AnchorSnap field order");
@@ -96,15 +107,19 @@ struct ThreadCoh {
       mg(&s);
       std::memcpy(v + kPcF, &s, kMgF * 8);
       v[kMgLookup] = s.reserved[7];  // Megalon >= 74 (0 before)
+      v[kMgFlags] = s.reserved[1];   // timers / lean sampling (>= 76) / events_always flags
     } else {
       std::memset(v + kPcF, 0, (kMgF + 1) * 8);
+      v[kMgFlags] = 0;
     }
     if (an) {
       mshim::AnchorSnap a{};
       an(&a);
       std::memcpy(v + kAn, &a.read_lookup_ns_sampled, kAnF * 8);
+      v[kAnWs] = a.reserved[0];  // write_sampled: timed write sections (Megalon >= 76; 0 before)
     } else {
       std::memset(v + kAn, 0, kAnF * 8);
+      v[kAnWs] = 0;
     }
   }
 };
@@ -113,7 +128,7 @@ struct ThreadCoh {
 // adds (end - start) and the coherence delta to the accumulator.
 struct OpAcc {
   std::atomic<uint64_t> n{0}, t_cyc{0}, f[kCohF];
-  std::atomic<uint64_t> check_sample{0};
+  std::atomic<uint64_t> check_sample{0}, flags{0};
   OpAcc() {
     for (auto &x : f) x = 0;
   }
@@ -123,21 +138,38 @@ struct OpAcc {
     const double ns = double(v[kPcF + 3]) + double(v[kAn + 0]) + double(v[kAn + 1]);
     return v[kPcF + 4] ? uint64_t(ns * double(v[kPcF + 0]) / double(v[kPcF + 4])) : 0;
   }
+  // scale factors of the read-side event sums and of the write-side sums (file comment): 1 before Megalon 76 or
+  // with events_always; ratio estimators with lean sampling (a missing denominator gives 0, like check_est)
+  static double event_factor(const uint64_t *v) {
+    if (!(v[kMgFlags] & 2) || (v[kMgFlags] & 4)) return 1.0;
+    return v[kPcF + 4] ? double(v[kPcF + 0]) / double(v[kPcF + 4]) : 0.0;
+  }
+  static double write_factor(const uint64_t *v) {
+    if (!(v[kMgFlags] & 2) || (v[kMgFlags] & 4)) return 1.0;
+    return v[kAnWs] ? double(v[kPcF + 1]) / double(v[kAnWs]) : 0.0;
+  }
+  static uint64_t event_est(const uint64_t *v) {  // stale + concur + meta + spin
+    return uint64_t(double(v[kPcF + 6] + v[kPcF + 8] + v[kPcF + 10] + v[kPcF + 12]) * event_factor(v));
+  }
+  static uint64_t write_est(const uint64_t *v) {  // wstart + wflush + anchor.write_lookup + anchor.write_nr (v3)
+    return uint64_t(double(v[kPcF + 13] + v[kPcF + 19] + v[kAn + 3] + v[kAn + 4]) * write_factor(v));
+  }
   // c_ns: Popcorn part + Megalon part (see the file comment)
   static uint64_t c_ns(const uint64_t *v) {
     const uint64_t pc = v[0] + v[1] + v[2] + v[6];
-    const uint64_t mg = check_est(v) + v[kPcF + 6] + v[kPcF + 8] + v[kPcF + 10] + v[kPcF + 12] + v[kPcF + 13] +
-                        v[kPcF + 19] + v[kAn + 3] + v[kAn + 4];  // + write_lookup + write_nr (v3)
-    return pc + mg;
+    return pc + check_est(v) + event_est(v) + write_est(v);
   }
   void text(std::ostringstream &o, const std::string &name) const {
     uint64_t v[kCohF];
     for (int i = 0; i < kCohF; i++) v[i] = f[i].load();
     v[kMgCheckSample] = check_sample.load();
+    v[kMgFlags] = flags.load();
     const std::string p = "op." + name + ".";
     o << p << "n=" << n << "\n" << p << "t_ns=" << tsc_to_ns(t_cyc) << "\n" << p << "c_ns=" << c_ns(v) << "\n"
       << p << "pc.c_ns=" << v[0] + v[1] + v[2] + v[6] << "\n"
-      << p << "mg.check_est_ns=" << check_est(v) << "\n";
+      << p << "mg.check_est_ns=" << check_est(v) << "\n"
+      << p << "mg.event_est_ns=" << event_est(v) << "\n"
+      << p << "mg.write_est_ns=" << write_est(v) << "\n";
     for (int i = 0; i < kCohF; i++) o << p << coh_field(i) << "=" << v[i] << "\n";
   }
 };
@@ -157,16 +189,20 @@ struct OpTimer {
     acc->n.fetch_add(ops, std::memory_order_relaxed);
     acc->t_cyc.fetch_add(t1 - t0, std::memory_order_relaxed);
     for (int i = 0; i < kCohF; i++)
-      if (i != kMgCheckSample && v1[i] != v0[i]) acc->f[i].fetch_add(v1[i] - v0[i], std::memory_order_relaxed);
+      if (!not_additive(i) && v1[i] != v0[i]) acc->f[i].fetch_add(v1[i] - v0[i], std::memory_order_relaxed);
     if (v1[kMgCheckSample]) acc->check_sample.store(v1[kMgCheckSample], std::memory_order_relaxed);
+    if (v1[kMgFlags]) acc->flags.store(v1[kMgFlags], std::memory_order_relaxed);
   }
 };
 
 // Column tags of the op.* stats (MOT1 v6 §6.3): measured / sampled x N / derived.
 inline const char *op_tags() {
   return "op.tags=n:count:measured t_ns:duration:measured(rdtsc) pc.*:measured(kernel;pc.nontrans_*_not_in_c) mg.check_ns_sampled:sampled "
-         "mg.check_est_ns:sampledxN((check_ns_sampled+anchor.read_lookup_ns_sampled+anchor.read_nr_ns_sampled)*read_sections/check_sampled) mg.lookup_ns_sampled:sampled(raw) mg.anchor.*_sampled:sampled mg.anchor.write_*:measured mg.*_ns:measured mg.*_cnt:count:measured c_ns:derived(pc.c_ns+mg.check_est_ns+"
-         "mg.{stale,concur,meta,spin,wstart,wflush}_ns+mg.anchor.{write_lookup,write_nr}_ns)\n";
+         "mg.check_est_ns:sampledxN((check_ns_sampled+anchor.read_lookup_ns_sampled+anchor.read_nr_ns_sampled)*read_sections/check_sampled) mg.lookup_ns_sampled:sampled(raw) mg.anchor.*_sampled:sampled mg.anchor.write_*:timed-writes(>=76) mg.*_ns:timed-sections(>=76) mg.*_cnt:count:measured "
+         "mg.event_est_ns:sampledxN((stale+concur+meta+spin)_ns*read_sections/check_sampled) "
+         "mg.write_est_ns:sampledxN((wstart+wflush+anchor.write_lookup+anchor.write_nr)_ns*write_sections/anchor.write_sampled) "
+         "mg.flags:last(bit0 timers,bit1 lean,bit2 events_always;no scaling unless lean and not events_always) "
+         "c_ns:derived(pc.c_ns+mg.check_est_ns+mg.event_est_ns+mg.write_est_ns)\n";
 }
 
 }  // namespace rsys

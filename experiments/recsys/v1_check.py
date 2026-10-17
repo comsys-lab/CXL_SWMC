@@ -10,8 +10,11 @@ node 1; window deltas) and <dir>/breakdown.csv. Checks (FAIL = stop the block):
         published per round within +-15% of rows_per_round_target (when a target is set)
   hw    op.query.c_ns and op.row_update.c_ns deltas = 0 (all-HWcc has no coherence actions)
   pop   op.coh_src pc_threads > 0 on both nodes (swmc_acct live) and row_update C > 0
-  mg    op.coh_src mg_threads > 0 on both nodes, query C > 0, row_update C > 0, anchor read parts > 0
-  mgoff mg_threads > 0, Megalon read sections > 0, every Megalon duration field of both ops = 0 and present
+  mg    op.coh_src mg_threads > 0 on both nodes, query C > 0, row_update C > 0, anchor read parts > 0;
+        op.<o>.mg.flags of both ops: timers on (bit 0), lean sampling (bit 1, Megalon >= 76), not events_always
+        (bit 2); timed write sections (op.row_update.mg.anchor.write_sampled delta) > 0 (write-side estimator defined)
+  mgoff mg_threads > 0, Megalon read sections > 0, op.<o>.mg.flags present with bit 0 (timers) = 0 for both ops,
+        every Megalon duration field of both ops = 0 and present
         (CohSnap *_ns incl. wstart/wflush/switch_rw/reclaim/check_ns_sampled, mg.anchor.*; MEGALON_COH_TIMERS=0)
 NOTEs (recorded, no stop): Popcorn query C = 0.
 Prints "V1CHECK PASS|FAIL <system> ..." with the values and exits 0 / 1.
@@ -133,11 +136,24 @@ def main():
         an = d1('op.query.mg.anchor.read_lookup_ns_sampled') + d1('op.query.mg.anchor.read_nr_ns_sampled')
         if an <= 0:
             fails.append('AnchorSnap read parts = 0 (shim v3 / Megalon 75 not live)')
+        for op, e in (('query', e1), ('row_update', e0)):
+            f = e.get(f'op.{op}.mg.flags', -1)
+            vals[f'mg_flags.{op}'] = f
+            if f < 0 or (f & 3) != 3 or (f & 4):
+                fails.append(f'{op}: mg.flags {f} (need timers on + lean sampling, Megalon >= 76; no events_always)')
+        vals['row_update_write_sampled'] = d0('op.row_update.mg.anchor.write_sampled')
+        if vals['row_update_write_sampled'] <= 0:
+            fails.append('no timed Megalon write section on the updater (write-side estimator undefined)')
     else:  # mgoff
         if mg0 <= 0 or mg1 <= 0:
             fails.append(f'CohSnap not registered (mg_threads {mg0}/{mg1})')
         if d1('op.query.mg.read_sections') <= 0:
             fails.append('no Megalon read sections counted')
+        for op, e in (('query', e1), ('row_update', e0)):
+            f = e.get(f'op.{op}.mg.flags', -1)
+            vals[f'mg_flags.{op}'] = f
+            if f < 0 or (f & 1):
+                fails.append(f'{op}: mg.flags {f} (need present with timers off)')
         durk = ['check_ns_sampled', 'stale_ns', 'concur_ns', 'meta_ns', 'spin_ns', 'wstart_ns', 'switch_rw_ns',
                 'reclaim_ns', 'wflush_ns', 'lookup_ns_sampled', 'anchor.read_lookup_ns_sampled',
                 'anchor.read_nr_ns_sampled', 'anchor.rseq_ns_sampled', 'anchor.write_lookup_ns', 'anchor.write_nr_ns',

@@ -110,12 +110,17 @@ each system's API and measures its coherence actions; it cannot prove a coherenc
   ratio estimator [sampled x N]. DLRM's all-HWcc is the plain backend, so every Megalon call counts as C (M2 §16,
   "all-HWcc without Megalon"): C_read = (check_ns_sampled + anchor.read_lookup_ns_sampled + anchor.read_nr_ns_sampled)
   x read_sections / check_sampled; C_write = wstart + anchor.write_lookup + anchor.write_nr + wflush; plus stale,
-  concur, meta, spin. Nothing is subtracted (rseq/wseq/wseq_end are inside check/wstart/wflush). The AnchorSnap
+  concur, meta, spin. Nothing is subtracted (rseq/wseq/wseq_end are inside check/wstart/wflush; no probe correction,
+  M2 §19). Megalon >= 76 (lean sampling, CohSnap.reserved[1] bit 1, exported as `op.<o>.mg.flags`): every duration is
+  a sum over timed sections only, so stale+concur+meta+spin are scaled by read_sections / check_sampled and C_write by
+  write_sections / write_sampled (AnchorSnap.reserved[0], `op.<o>.mg.anchor.write_sampled`), per the shim contract;
+  with MEGALON_COH_EVENTS=always (bit 2) those sums are full and not scaled (`op.<o>.mg.{event,write}_est_ns`;
+  breakdown.py recomputes them from window deltas). The AnchorSnap
   fields (shim v3, Megalon >= 75; zeros with a v2 shim) are exported as `op.<o>.mg.anchor.<field>`, CohSnap.reserved[7]
   as `op.<o>.mg.lookup_ns_sampled` (raw). The server accepts shim API v2..v3. No separate validation copy: the row copy inside the section is the application's
   own copy, as in all-HWcc + stale, concur, meta, spin, wstart,
   wflush ns [measured] (switch_rw and reclaim are inside wstart, exported raw only).
-- Stats keys: `op.<query|row_update>.{n,t_ns,c_ns,pc.c_ns,mg.check_est_ns}` and every raw field `op.<o>.pc.*`,
+- Stats keys: `op.<query|row_update>.{n,t_ns,c_ns,pc.c_ns,mg.check_est_ns,mg.event_est_ns,mg.write_est_ns}` and every raw field `op.<o>.pc.*`,
   `op.<o>.mg.*`; `op.coh_src` (threads with each source live), `op.tags` (measured / sampled / derived).
 - Megalon background threads are not in CohSnap: their CPU is exported as `thr.nr-log-sync.*` and `thr.mg-bg.*`
   (threads Megalon spawns from the main thread during start-up inherit the name mg-bg).
