@@ -66,8 +66,8 @@ each system's API and measures its coherence actions; it cannot prove a coherenc
 - Megalon: a lookup is one read section, repeated by the backend until `read_end` accepts it (`megalon_time.*.read_fail`,
   `megalon.read_retry_*`); an update is one write section. `seq_retries`, `seq_spins`, `lock_spins` are 0.
 - `--verify-rows 1` recomputes csum per hit (`torn_rows`, must be 0) in every system. Host evidence: 0 torn rows in
-  every run; `--test-no-seqlock` (negative, plain) 177 torn rows with probing (v6), 69 with direct addressing
-  (2026-10-18, T = 0).
+  every run; `--test-no-seqlock` (negative, plain) 177 torn rows with probing (v6), 59 with direct addressing
+  (2026-10-18, T = 0, builds/recsys/11; workspaces/recsys-meg-native/host-test-2/plain-neg-T0).
 
 ## 5. Updater, publication interval T and the Ekko operating points (v6)
 - One `update` request = one sample (seq 1..). U workers (`--update-threads`, 4); every worker receives every sample
