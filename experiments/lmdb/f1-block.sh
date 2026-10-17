@@ -23,6 +23,9 @@ P=/home/comsys/sungsu/destijl-control X=$P/CXL_SWMC/experiments/lmdb G=$P/CXL_SW
 [ "${POPCORN:-0}" = 0 ] || : "${C8:?}" "${K8:?}" "${GT8:?}" "${RECV_MODE:?}"
 [ "${POPCORN:-0}" = 0 ] || [ "$EXPECT_K" = "$K8" ] || { echo "BLOCK STOP: POPCORN=1 needs EXPECT_K = K8 (the Popcorn release)"; exit 2; }
 OWNER=LMDB-F1-v1 L=${LMDB_GUEST_DIR:-/home/comsys/lmdb} R=1000000 MAXP=600000
+# our guest processes by command line (v1.7.1): bin/lmdb-server or bin/lmdb-stress as a word (relative or absolute path,
+# timeout wrapper included); the [x] brackets keep the regex from matching the remote shell's own command line
+PAT='(^|[ /])bin/lmdb-(serve[r]|stres[s])( |$)'
 : "${PRETOUCH_DIR:?PRETOUCH_DIR = ENV-pretouch evidence dir of the current QEMU lifetime (standing pretouch rule)}"
 case "$L" in /home/comsys/?*) ;; *) echo "BLOCK STOP: LMDB_GUEST_DIR must be under /home/comsys/"; exit 2;; esac
 if [ -n "${BUILD_PIN:-}" ]; then
@@ -41,14 +44,17 @@ IPS=(192.168.122.100 192.168.122.101)
 bash $G lock $OWNER || { echo "BLOCK STOP: lock"; exit 2; }
 finish() {  # order as experiments/kv/pilot-block.sh: servers first, then Popcorn teardown, then dax0.0, then unlock
   set +eu  # nothing in the trap may abort it before the unlock
-  # v1.7 (HIGH fix): match this block's processes by command line, not by name: a Megalon process stuck in megalon_load
-  # (e.g. at the 2-node start barrier) has the main-thread name "megalon-lib", so v1.6's `pkill -x lmdb-stress` missed
-  # it and it kept /dev/dax0.0 mapped. TERM, wait <= 15 s, KILL, then verify: no process left and `fuser /dev/dax0.0`
-  # empty (ROLLBACK FAIL otherwise). The [x] brackets keep the pattern from matching the remote shell's own command line.
-  local pat="$L/(plain|megalon)/bin/lmdb-(serve[r]|stres[s])" out ip
+  # v1.7.1 (HIGH fix): match our processes by command line, not by name: a Megalon process stuck in megalon_load (e.g.
+  # at the 2-node start barrier) has the main-thread name "megalon-lib", so v1.6's `pkill -x lmdb-stress` missed it and
+  # it kept /dev/dax0.0 mapped. Pattern = the binary path ending bin/lmdb-server|bin/lmdb-stress as a command-line word,
+  # relative or absolute, incl. a `timeout` wrapper, uid comsys only (one VM user at a time: only this block's processes).
+  # TERM, wait <= 15 s, KILL, then verify: no process left and `sudo -n fuser /dev/dax0.0` output empty (fail-closed:
+  # a sudo error is non-empty). A ROLLBACK FAIL here does not skip the Popcorn teardown and the chown below (each is
+  # judged on its own); any ROLLBACK FAIL / CLEANUP FAILED line = stop and manual check (packet §4).
+  local pat="$PAT" out ip
   for ip in "${IPS[@]}"; do
-    out=$($SSH comsys@$ip "pkill -f '$pat'; for i in \$(seq 15); do pgrep -f '$pat' > /dev/null || break; sleep 1; done
-      pkill -9 -f '$pat'; sleep 1; echo procs=\$(pgrep -c -f '$pat'); echo fuser=[\$(sudo -n fuser /dev/dax0.0 2>&1 | tr -d ' \n')]" < /dev/null 2>&1)
+    out=$($SSH comsys@$ip "pkill -u comsys -f '$pat'; for i in \$(seq 15); do pgrep -u comsys -f '$pat' > /dev/null || break; sleep 1; done
+      pkill -9 -u comsys -f '$pat'; sleep 1; echo procs=\$(pgrep -c -u comsys -f '$pat'); echo fuser=[\$(sudo -n fuser /dev/dax0.0 2>&1 | tr -d ' \n')]" < /dev/null 2>&1)
     echo "$out" | sed "s/^/$(date -Is) $ip /" >> "$E/rollback.out"
     echo "$out" | grep -qx "procs=0" && echo "$out" | grep -qx "fuser=\[\]" \
       || echo "ROLLBACK FAIL: $ip lmdb process left or /dev/dax0.0 still in use (see rollback.out)" | tee -a "$E/rollback.out"
@@ -132,8 +138,8 @@ for i in 0 1; do
   $SSH comsys@$ip "EXPECT_K=$EXPECT_K INSTALL_FILES='${L#/home/comsys/}/plain/bin/lmdb-server ${L#/home/comsys/}/megalon/bin/lmdb-server ${L#/home/comsys/}/megalon/lib/libmegalon-objapi.so' bash -s" \
     < $P/CXL_SWMC/experiments/kv/precheck.sh > "$E/precheck-vm$i.txt" 2>&1
   grep -q "PRECHECK PASS" "$E/precheck-vm$i.txt" || stop "precheck vm$i"
-  $SSH comsys@$ip 'echo lmdb_procs=$(pgrep -c -x lmdb-server)/$(pgrep -c -x lmdb-stress); dmesg | tail -n 5' < /dev/null >> "$E/precheck-vm$i.txt" 2>&1
-  grep -q "^lmdb_procs=0/0$" "$E/precheck-vm$i.txt" || stop "lmdb process on vm$i"
+  $SSH comsys@$ip "echo lmdb_procs=\$(pgrep -c -u comsys -f '$PAT'); dmesg | tail -n 5" < /dev/null >> "$E/precheck-vm$i.txt" 2>&1
+  grep -q "^lmdb_procs=0$" "$E/precheck-vm$i.txt" || stop "lmdb process on vm$i"
 done
 dmesg_base
 step "G3 chown"
@@ -152,7 +158,7 @@ stress() {
   [ "$bd" = megalon ] && ev0="RACKOBJ_CONFIG=$L/megalon/cfg/megalon.yaml MEGALON_REINIT=1" ev1="RACKOBJ_CONFIG=$L/megalon/cfg/megalon.yaml"
   local A="--nodes 2 --run-id $rid --region $L/$bd/cfg/cxl_region.yaml --max-pages $MAXP --records $R --seconds 30 --reader-threads 4 --hold-us 2000 --keys-per-txn 4 --backend $bd $*"
   echo "$tag run_id=$rid app=$app args=$A" >> "$E/block.log"
-  $SSH comsys@${IPS[0]} "cd $L && env CXL_APP_HWCC_BYTES=$app $ev0 timeout $to $bd/bin/lmdb-stress --node 0 --image $L/img-$R $A ${NODE0_STRESS:-}" \
+  $SSH comsys@${IPS[0]} "cd $L && env CXL_APP_HWCC_BYTES=$app $ev0 timeout $to $L/$bd/bin/lmdb-stress --node 0 --image $L/img-$R $A ${NODE0_STRESS:-}" \
     < /dev/null > "$E/$tag.0.out" 2> "$E/$tag.0.err" &
   local p0=$! t0=$SECONDS
   # node 1 starts once node 0 has initialised the shared state: plain = node 0's node line; megalon = Megalon's
@@ -164,7 +170,7 @@ stress() {
     [ $((SECONDS - t0)) -lt 120 ] || stop "$tag: no node 0 ready line ($ready) in 120 s"
     sleep 1
   done
-  $SSH comsys@${IPS[1]} "cd $L && env CXL_APP_HWCC_BYTES=$app $ev1 timeout $to $bd/bin/lmdb-stress --node 1 $A" \
+  $SSH comsys@${IPS[1]} "cd $L && env CXL_APP_HWCC_BYTES=$app $ev1 timeout $to $L/$bd/bin/lmdb-stress --node 1 $A" \
     < /dev/null > "$E/$tag.1.out" 2> "$E/$tag.1.err"
   local r1=$?; wait $p0; local r0=$?
   echo "$tag rc0=$r0 rc1=$r1 wall_s=$((SECONDS - t0))" | tee -a "$E/block.log"
@@ -214,6 +220,7 @@ for m in u50 u5 u80; do
   POPA=(); [ -d "$E/pop-$m-func" ] && POPA=(--pop "$E/pop-$m-func")
   python3 -I -B $P/CXL_SWMC/experiments/kv/cdiff.py --hw "$E/hw-$m-func" --mgoff "$E/mg-$m-func-toff" --mg "$E/mg-$m-func" \
     "${POPA[@]}" --workload lmdb --out "$E/cdiff-$m.txt" >> "$E/block.log" 2>&1 || stop "cdiff $m"
+  grep -q "^CDIFF DONE pairs=4 " "$E/cdiff-$m.txt" || stop "cdiff $m: not 4 (rate, op) pairs (v1.7.1, verifier L1)"
   tail -n 1 "$E/cdiff-$m.txt" | tee -a "$E/block.log"
 done
 step "PT pretouch check (end)"
