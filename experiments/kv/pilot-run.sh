@@ -71,7 +71,17 @@ case "$KIND" in
 esac
 SSH="ssh -o BatchMode=yes -o ConnectTimeout=8"
 IPS=(192.168.122.100 192.168.122.101)
-servers_gone() { for ip in "${IPS[@]}"; do [ "$($SSH comsys@$ip 'pgrep -c -x kv-server' < /dev/null)" = 0 ] || return 1; done; }
+# no kv-server of ours (command-line word bin/kv-server, not the process name: Megalon renames the main thread
+# "megalon-lib" while it initialises) and /dev/dax0.0 unused (sudo -n fuser output empty; fail-closed) on both VMs;
+# before and after each run and before the Popcorn cxl_shm load and teardown. [r] keeps the regex off the remote shell.
+PAT='(^|[ /])bin/kv-serve[r]( |$)'
+servers_gone() {
+  local ip out
+  for ip in "${IPS[@]}"; do
+    out=$($SSH comsys@$ip "echo procs=\$(pgrep -c -u comsys -f '$PAT') fuser=[\$(sudo -n fuser /dev/dax0.0 2>&1 | tr -d ' \n')]" < /dev/null 2>&1)
+    [ "$out" = "procs=0 fuser=[]" ] || { echo "$ip: $out" >&2; return 1; }
+  done
+}
 echo "$(date -Is) $NAME: SYS=$SYS PUT_RATIO=$PUT_RATIO KIND=$KIND RATE=${RATE:-} BATCH=$BATCH KEYS=$KEYS TRACE=$TRACE RECV_MODE=${RECV_MODE:-} SEED=$SEED"
 servers_gone || stop "a kv-server is running before the run"
 [[ ${GATE:-1} =~ ^[01]$ ]] || stop "bad GATE"
@@ -81,6 +91,7 @@ if [ "${GATE:-1}" = 1 ]; then bash $P/CXL_SWMC/experiments/vectordb/host-gate.sh
 T0=$(date +%s)
 if [ "$SYS" = Popcorn ]; then  # P-popcorn-deploy §6a cycle with build 8; enable BEFORE the server (load under coherence)
   PS=(K=$K8 GT=$GT8 C=$C8 R=$E/shm-$NAME INIT_STATE=shared)
+  servers_gone || stop "kv-server or /dev/dax0.0 user before the cxl_shm load"
   for ph in precheck load chown; do env "${PS[@]}" bash $C8/p-popcorn-shm.sh $ph || stop "shm $ph"; done
   for ip in "${IPS[@]}"; do
     [ "$($SSH comsys@$ip "sha256sum $V/cfg/cxl_region.yaml $GT8/cxl_region.yaml | cut -d' ' -f1 | sort -u | wc -l" < /dev/null)" = 1 ] \

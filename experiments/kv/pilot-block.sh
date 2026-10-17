@@ -61,13 +61,21 @@ grep -q "^cxl_swmc_commit=$BPIN kv_dirty=0$" "$BL/kv-manifest.txt" \
   || { echo "SEQUENCE STOP: $BL loadgen is not the recorded build of $BPIN"; exit 2; }
 bash $G lock "$OWNER" || { echo "SEQUENCE STOP: lock"; exit 2; }
 CHOWNED=0
+KPAT='(^|[ /])bin/kv-serve[r]( |$)'  # our kv-server by command-line word ([r]: not the remote shell's own command line)
 finish() {
   set +eu  # nothing in the trap may abort it before the unlock
   for ip in "${IPS[@]}"; do
     for g in $(sed -n 's/^guest_run_dir=//p' "$E"/*/manifest.txt 2>/dev/null); do
       $SSH comsys@$ip "for k in 0 1; do [ -e $g/node\$k.pid ] && \$(dirname $g)/../bin/kv-node.sh stop $g \$k; done; true" < /dev/null 2>&1 | sed "s|^|$ip |" >> "$E/rollback.out"
     done
-    $SSH comsys@$ip 'echo procs=$(pgrep -c -x kv-server)' < /dev/null 2>&1 | sed "s/^/$ip /" >> "$E/rollback.out"
+    # count by command-line word (Megalon renames the main thread "megalon-lib"), uid comsys; leftovers are killed by
+    # command line (TERM, <= 15 s, KILL), then procs=0 and an empty sudo -n fuser /dev/dax0.0 are required before the
+    # Popcorn teardown / chown below ("ROLLBACK FAIL" otherwise; those steps still run)
+    out=$($SSH comsys@$ip "pkill -u comsys -f '$KPAT'; for i in \$(seq 15); do pgrep -u comsys -f '$KPAT' > /dev/null || break; sleep 1; done
+      pkill -9 -u comsys -f '$KPAT'; sleep 1; echo procs=\$(pgrep -c -u comsys -f '$KPAT'); echo fuser=[\$(sudo -n fuser /dev/dax0.0 2>&1 | tr -d ' \n')]" < /dev/null 2>&1)
+    echo "$out" | sed "s/^/$ip /" >> "$E/rollback.out"
+    echo "$out" | grep -qx "procs=0" && echo "$out" | grep -qx "fuser=\[\]" \
+      || echo "ROLLBACK FAIL: $ip kv-server left or /dev/dax0.0 still in use (see rollback.out)" | tee -a "$E/rollback.out"
   done
   if [ -n "${C8:-}" ]; then  # page MSI: tear down every attempted load without "teardown PASS"
     for r in "$E"/shm-*/; do
