@@ -44,22 +44,31 @@
 #   After the last lifetime (hw and mgoff present): v1_cdiff.py -> <E>/cdiff.{txt,csv}, Megalon Fig 2 C by the
 #   difference method C_diff = T(mgoff) - T(hw) per op (user decision 2026-10-17); CDIFF FAIL (offered rates differ)
 #   stops the block; C_diff < 0 and C_sampled > T / > C_diff are WARNs only.
-# BLOCK=h1 — H1-HOOK v1 (experiments/h1/README.md, reports/H1-main-packet.md; called by experiments/h1/hook.sh):
-#   env H1MODE slo|fix, H1_N (round / rep), H1_SEED (loadgen seed of every run of this call), H1_PARENT_LOCK=H1-main
-#   (the measurement lock must name owner=H1-main; this block never locks or unlocks), H1_MIXES "<mix>=EKKO=<avg|peak>
-#   ..." (slo) or H1_LEVELS (levels.tsv, fix), PRETOUCH_DIR (pretouch-gate.sh at block start and end),
-#   MEASURE_ENV_DIR (host-gate measure-env check), EXPECT_DAX_UUID (guest precheck). EKKO is per mix (not global).
-#   One server lifetime per (system, mix) (publish_frac is a server argument): prepare as in v1 (node 0 writes the
-#   tables / Megalon creates the objects / Popcorn preload + cxl_shm cycle), warm-up (unmeasured), then
-#   slo: one full SLO search (PROFILE=main: ramp/bisect, confirm 3 x 30 s, fill 0.7/0.8/0.9, overload 1.05/1.1/1.2;
-#        query p95 <= 100 ms; --start 1 --factor 1.5 --precision 0.05 --max-steps 20) named <sys>-<mix>-slo-r<N>,
-#        systems hw pop mg; system order = shuffle(hw pop mg, seed H1-recsys-r1) rotated left by N-1 (Latin square),
-#        mixes per system shuffled with seed H1-recsys-r<N>; a "confirm failed at three rates" note is a NOTE (the
-#        block continues; levels.py / check.py decide);
-#   fix: per levels.tsv row (mix) and per system of shuffle(hw pop mg mgoff, seed H1-recsys-fix-r<N>-<mix>): one
-#        fixed run with two windows, L2_rate then L1_rate query/s (60 s each, no SLO abort), named <sys>-<mix>-fix-r<N>.
-#   Per run: v1_check.py <run> <sys> --h1 and check_breakdown.py -> <run>/h1-runcheck.txt (last line RUNCHECK PASS;
-#   a failed check stops the block); <E>/h1-runs.tsv one line per run; <E>/order.txt before the first run.
+# BLOCK=h1 — H1-HOOK v2 (experiments/h1/README.md "Hook contract H1-HOOK v2", reports/H1-main-packet.md v0.3 §2-§3;
+#   user decisions 2026-10-18; called once per round by experiments/h1/hook.sh):
+#   env H1MODE r1|cont, H1_N, H1_SEED (loadgen seed of every part), H1_MIXES "<mix>=EKKO=<avg|peak> ...", H1_SETTLE_S
+#   (60 s = one publication period T), H1_PARENT_LOCK=H1-main (the lock must name owner=H1-main; never lock/unlock),
+#   PRETOUCH_DIR (pretouch-gate.sh at block start and end), MEASURE_ENV_DIR (Host gate before every loadgen part),
+#   EXPECT_DAX_UUID (guest precheck); r1: H1_LEVELS_CMD (prints "<L2_rate> <L1_rate>" for a mix); cont: H1_LEVELS.
+#   One server lifetime holds one or two loadgen parts: <lifetime>/slo = warm-up (1 query/s, unmeasured) + the full SLO
+#   search (query p95 <= 100 ms; PROFILE=main ramp/bisect, confirm 3 x 30 s, fill, overload past the knee; --start 1
+#   --factor 1.5 --precision 0.05 --max-steps 20); <lifetime>/fix = settle (loadgen --warmup-s H1_SETTLE_S at the
+#   L2 rate, discarded, no stats snapshot) + L2 window + L1 window (60 s each, no SLO abort). A fix-only lifetime starts
+#   with the settle right after READY (no extra warm-up). The Ekko point (publish_frac, update rate) is per mix.
+#   r1, per mix (mix order: shuffle seed H1-recsys-r1): hw and pop SLO-only lifetimes (order seed H1-recsys-r1-<mix>);
+#     mg lifetime: slo -> "$H1_LEVELS_CMD" <mix> (non-zero = LEVELS STOP: stop, roll back) -> fix at those rates;
+#     mgoff lifetime (MEGALON_COH_TIMERS=0) right after mg: fix only; hw and pop fix-only lifetimes (order seed
+#     H1-recsys-r1-<mix>-fix).
+#   cont (rounds 2, 3; rates = H1_LEVELS L2_rate / L1_rate of the mix), per mix (order: shuffle seed H1-recsys-r<n>):
+#     hw, pop, mg in the order shuffle(seed H1-recsys-latin) rotated left by n, each one lifetime slo -> fix; the mgoff
+#     lifetime (fix only) right after mg.
+#   Checks per part: v1_check.py <part> <sys> --h1 (SLO part: update/operating-point checks on the passing,
+#   non-overload steps only, violations elsewhere NOTE; fix part: every check over the L2+L1 span, FAIL; the settle
+#   has no stats snapshot, so it is outside the window, and the v1.2.7 normalisation removes partly fed rounds) and
+#   check_breakdown.py -> <lifetime>/h1-runcheck.txt (last line RUNCHECK PASS[ (NOTE: ...)]; a failed check stops).
+#   <E>/h1-runs.tsv (8 columns: name system mix phase round run_dir steps lifetime), appended as parts finish;
+#   <E>/order.txt before the first lifetime. Lifetime names: r1 <sys>-<mix>-slo-r1 / <sys>-<mix>-fix-r1 (hw, pop),
+#   mg-<mix>-r1 (entries -slo / -fix), mgoff-<mix>-fix-r<n>; cont <sys>-<mix>-r<n> (entries -slo / -fix).
 set -uo pipefail
 E=${1:?evidence dir}
 P=/home/comsys/sungsu/destijl-control X=$(cd "$(dirname "$0")" && pwd)
@@ -69,11 +78,15 @@ G=$(cd "$X/../vectordb" && pwd)/host-gate.sh PTG=$(cd "$X/../vectordb" && pwd)/p
 MB=$MEG_BUILD SEED=${SEED:-20261016} ROUNDS=${ROUNDS:-3} FIXED=${FIXED:-1} XT=${XT:-28800}
 BLOCK=${BLOCK:-main} V1_RATE=${V1_RATE:-1} V1_WINDOW_S=${V1_WINDOW_S:-130}
 case $BLOCK in main|v1|h1) ;; *) echo "SEQUENCE STOP: BLOCK must be main, v1 or h1"; exit 2;; esac
-if [ $BLOCK = h1 ]; then  # H1-HOOK v1 inputs (see the header)
+if [ $BLOCK = h1 ]; then  # H1-HOOK v2 inputs (see the header)
   [ "${H1_PARENT_LOCK:-}" = H1-main ] || { echo "SEQUENCE STOP: BLOCK=h1 needs H1_PARENT_LOCK=H1-main"; exit 2; }
   [[ "${H1_N:-}" =~ ^[1-9]$ ]] && [[ "${H1_SEED:-}" =~ ^[0-9]+$ ]] || { echo "SEQUENCE STOP: H1_N / H1_SEED"; exit 2; }
-  case "${H1MODE:-}" in slo) : "${H1_MIXES:?}";; fix) [ -f "${H1_LEVELS:-}" ] || { echo "SEQUENCE STOP: no H1_LEVELS"; exit 2; };;
-    *) echo "SEQUENCE STOP: bad H1MODE"; exit 2;; esac
+  [[ "${H1_SETTLE_S:-}" =~ ^[1-9][0-9]*$ ]] || { echo "SEQUENCE STOP: bad H1_SETTLE_S"; exit 2; }
+  : "${H1_MIXES:?}"
+  case "${H1MODE:-}" in
+    r1) [ "$H1_N" = 1 ] && [ -n "${H1_LEVELS_CMD:-}" ] || { echo "SEQUENCE STOP: r1 needs H1_N=1 and H1_LEVELS_CMD"; exit 2; };;
+    cont) [ -f "${H1_LEVELS:-}" ] || { echo "SEQUENCE STOP: no H1_LEVELS"; exit 2; };;
+    *) echo "SEQUENCE STOP: bad H1MODE (r1|cont)"; exit 2;; esac
   [ -d "${PRETOUCH_DIR:-}" ] && [ -n "${MEASURE_ENV_DIR:-}" ] && [ -n "${EXPECT_DAX_UUID:-}" ] \
     || { echo "SEQUENCE STOP: BLOCK=h1 needs PRETOUCH_DIR, MEASURE_ENV_DIR and EXPECT_DAX_UUID"; exit 2; }
   [ -z "${SYSTEMS:-}" ] || { echo "SEQUENCE STOP: SYSTEMS is not used with BLOCK=h1"; exit 2; }
@@ -276,9 +289,10 @@ pop_setup() {  # P-popcorn-deploy §6a cycle with build POP_BUILD (init_state=sh
   done
   env "${PS[@]}" STATUS_TAG=pre bash $C8/p-popcorn-shm.sh status || stop "status pre"
 }
-system() {  # one server lifetime: <hw|pop|mg|mgoff> [<name> (h1: <sys>-<mix>-<phase>-r<N>; default = system)]
-  local s=$1 S=$E/${2:-$1} SE r rc g L t0 RD
-  NAME=${2:-$1}
+life_start() {  # <sys> <name>: prepare + session start of one server lifetime -> LS (session dir), NAME
+  local s=$1 SE t0
+  NAME=$2 LS=$E/$2
+  local S=$LS
   if [ $s = pop ]; then SHMR=$E/shm-$NAME; PS=(K=$K8 GT=$GT8 C=$C8 R=$SHMR INIT_STATE=shared); fi
   t0=$(date +%s)
   echo "$(date -Is) system $s start"
@@ -296,33 +310,30 @@ system() {  # one server lifetime: <hw|pop|mg|mgoff> [<name> (h1: <sys>-<mix>-<p
   tail -1 "$S.start.out"
   echo "$NAME prepare_wall_s=$(( $(date +%s) - t0 )) (incl. page MSI shm load + preload)" >> "$E/load-times.txt"
   sed "s/^/$NAME /" "$S/load-times.txt" >> "$E/load-times.txt"
+}
+life_stop() {  # <sys>: session stop, final checks, page MSI teardown (pop)
+  local s=$1 S=$LS
+  bash $X/session.sh stop "$S" > "$S.stop.out" 2>&1 || { tail -5 "$S.stop.out"; stop "$s session stop / final checks"; }
+  tail -1 "$S.stop.out"
+  if [ $s = pop ]; then
+    env "${PS[@]}" STATUS_TAG=post bash $C8/p-popcorn-shm.sh status
+    servers_gone || stop "servers left (page MSI teardown not attempted)"
+    dax_free pre-teardown || stop "/dev/dax0.0 in use before the cxl_shm teardown"
+    env "${PS[@]}" bash $C8/p-popcorn-shm.sh teardown || stop "shm teardown"
+    grep -q "teardown PASS" "$SHMR/steps.log" || stop "no teardown PASS"
+  fi
+  servers_gone || stop "servers left after $NAME"
+}
+system() {  # one server lifetime (BLOCK main / v1): <hw|pop|mg|mgoff> [<name>]
+  local s=$1 S rc g L t0 r
+  t0=$(date +%s)
+  life_start $s ${2:-$1}; S=$LS
   # 1) warm-up (unmeasured): 1 query/s with the updater for 70 s (>= one T = 60 s publication round)
   measure "$S" warmup "${LGC[@]}" --opt seed=$((SEED + 100)) --seed $((SEED + 100)) --mode fixed --rates 1 \
     --warmup-s 10 --step-warmup-s 0 --step-measure-s 70 --drain-s 10
   rc=$?
   [ $rc = 0 ] || stop "$s warm-up rc $rc"
-  if [ $BLOCK = h1 ]; then  # H1-HOOK v1 run (header): one SLO search or one fixed run (L2 then L1) per lifetime
-    if [ $H1MODE = slo ]; then
-      RD=$S/slo
-      measure "$S" slo "${LGC[@]}" --opt seed=$SEED --seed $SEED --slo query:$SLO_PCT:$SLO_MS --raw \
-        --mode slo --start 1 --factor 1.5 --precision 0.05 --max-steps 20
-      rc=$?
-      grep -q 'workload_finish":"ok' "$RD/loadgen/summary.json" 2>/dev/null || stop "$NAME: loadgen workload finish (rc $rc)"
-      H1NOTE=""
-      if [ $rc = 1 ]; then
-        H1NOTE=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("note",""))' "$RD/loadgen/summary.json" 2>/dev/null)
-        [ -n "$H1NOTE" ] || stop "$NAME: loadgen rc 1 without a note"
-        echo "MAIN NOTE $NAME: $H1NOTE"
-      elif [ $rc != 0 ]; then stop "$NAME slo rc $rc"; fi
-    else
-      RD=$S/fix H1NOTE=""
-      measure "$S" fix "${LGC[@]}" --opt seed=$SEED --seed $SEED --raw --mode fixed --rates "$H1_L2,$H1_L1" \
-        --step-warmup-s 5 --step-measure-s 60 --drain-s 10
-      rc=$?
-      [ $rc = 0 ] || stop "$NAME fix rc $rc"
-    fi
-    h1_runcheck $s "$RD"
-  elif [ $BLOCK = v1 ]; then  # validation window (reports/RECSYS-V1-packet.md §3)
+  if [ $BLOCK = v1 ]; then  # validation window (reports/RECSYS-V1-packet.md §3)
     measure "$S" val "${LGC[@]}" --opt seed=$SEED --seed $SEED --raw --mode fixed --rates "$V1_RATE" \
       --step-warmup-s 5 --step-measure-s "$V1_WINDOW_S" --drain-s 10
     rc=$?
@@ -377,32 +388,62 @@ system() {  # one server lifetime: <hw|pop|mg|mgoff> [<name> (h1: <sys>-<mix>-<p
   [ -s "$S/slo-r1/stats-steps.csv" ] || stop "$s slo-r1: no per-step stats (stats-steps.csv)"
   fi
   fi  # BLOCK
-  bash $X/session.sh stop "$S" > "$S.stop.out" 2>&1 || { tail -5 "$S.stop.out"; stop "$s session stop / final checks"; }
-  tail -1 "$S.stop.out"
-  if [ $s = pop ]; then
-    env "${PS[@]}" STATUS_TAG=post bash $C8/p-popcorn-shm.sh status
-    servers_gone || stop "servers left (page MSI teardown not attempted)"
-    dax_free pre-teardown || stop "/dev/dax0.0 in use before the cxl_shm teardown"
-    env "${PS[@]}" bash $C8/p-popcorn-shm.sh teardown || stop "shm teardown"
-    grep -q "teardown PASS" "$SHMR/steps.log" || stop "no teardown PASS"
-  fi
-  servers_gone || stop "servers left after $s"
-  [ $BLOCK = h1 ] && printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$NAME" "$s" "$H1_MIX" "$H1MODE" "$H1_N" "${RD#$E/}" >> "$E/h1-runs.tsv"
+  life_stop $s
   echo "$(date -Is) MAIN $NAME DONE ($(( $(date +%s) - t0 )) s)"
 }
-h1_runcheck() {  # <sys> <run dir>: the validation packet's per-run checks -> <run>/h1-runcheck.txt (RUNCHECK PASS)
-  local s=$1 r=$2
+# ---- H1-HOOK v2 parts (see the header) ----
+h1_warmup() {  # unmeasured warm-up before an SLO part (as every earlier lifetime): 1 query/s with the updater, 70 s
+  measure "$LS" warmup "${LGC[@]}" --opt seed=$((SEED + 100)) --seed $((SEED + 100)) --mode fixed --rates 1 \
+    --warmup-s 10 --step-warmup-s 0 --step-measure-s 70 --drain-s 10
+  local rc=$?; [ $rc = 0 ] || stop "$NAME warm-up rc $rc"
+}
+h1_slo() {  # <sys>: warm-up + full SLO search -> $LS/slo
+  local s=$1 rc RD=$LS/slo note=""
+  h1_warmup
+  measure "$LS" slo "${LGC[@]}" --opt seed=$SEED --seed $SEED --slo query:$SLO_PCT:$SLO_MS --raw \
+    --mode slo --start 1 --factor 1.5 --precision 0.05 --max-steps 20
+  rc=$?
+  grep -q 'workload_finish":"ok' "$RD/loadgen/summary.json" 2>/dev/null || stop "$NAME slo: loadgen workload finish (rc $rc)"
+  if [ $rc = 1 ]; then
+    note=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("note",""))' "$RD/loadgen/summary.json" 2>/dev/null)
+    [ -n "$note" ] || stop "$NAME slo: loadgen rc 1 without a note"
+    echo "MAIN NOTE $NAME slo: $note"
+  elif [ $rc != 0 ]; then stop "$NAME slo rc $rc"; fi
+  h1_check $s slo "$note"
+}
+h1_fix() {  # <sys> <L2 rate> <L1 rate>: settle (H1_SETTLE_S at L2, discarded) + L2 + L1 windows -> $LS/fix; H1STEPS
+  local s=$1 rc RD=$LS/fix
+  measure "$LS" fix "${LGC[@]}" --opt seed=$SEED --seed $SEED --raw --mode fixed --rates "$2,$3" \
+    --warmup-s "$H1_SETTLE_S" --step-warmup-s 5 --step-measure-s 60 --drain-s 10
+  rc=$?; [ $rc = 0 ] || stop "$NAME fix rc $rc"
+  H1STEPS=$(python3 -I -c 'import json,sys
+st=[json.loads(l) for l in open(sys.argv[1]) if l.strip()]
+m=[d for d in st if d.get("measure_s",0) > 0 and d.get("phase") == "fixed"]
+r=[float(sys.argv[2]), float(sys.argv[3])]
+assert len(m) == 2 and all(abs(d["offered_x"] - x) <= 1e-6 * max(1, x) for d, x in zip(m, r)), "fixed steps %s != L2,L1 %s" % ([(d["step"], d["offered_x"]) for d in m], r)
+print("%d,%d" % (m[0]["step"], m[1]["step"]))' "$RD/loadgen/steps.jsonl" "$2" "$3" 2>&1) || stop "$NAME fix: $H1STEPS"
+  h1_check $s fix ""
+}
+h1_check() {  # <sys> <part> <note>: v1_check --h1 + check_breakdown of <part>; <lifetime>/h1-runcheck.txt ends in RUNCHECK PASS
+  local s=$1 r=$LS/$2 f=$LS/h1-runcheck.txt
   python3 $X/v1_check.py "$r" $s --h1 > "$r/v1-check.txt" 2>&1
   python3 $X/check_breakdown.py "$r" > "$r/breakdown-check.txt" 2>&1
-  { echo "# H1 per-run checks $NAME (system $s, mix $H1_MIX, phase $H1MODE, round $H1_N, seed $SEED; main-block.sh BLOCK=h1, H1-HOOK v1)"
-    echo "v1_check: $(cat "$r/v1-check.txt")"; echo "check_breakdown: $(cat "$r/breakdown-check.txt")"
-    echo "summary: $(python3 -c 'import json,sys; s=json.load(open(sys.argv[1])); print("note=%r workload_finish=%s confirm=%s" % (s.get("note",""), s.get("workload_finish"), s.get("confirm",{}).get("x_mean")))' "$r/loadgen/summary.json" 2>&1)"
-  } > "$r/h1-runcheck.txt"
-  grep -q "^V1CHECK PASS" "$r/v1-check.txt" || stop "$NAME: $(cat "$r/v1-check.txt")"
-  grep -q "^BREAKDOWN PASS" "$r/breakdown-check.txt" || stop "$NAME: $(cat "$r/breakdown-check.txt")"
-  [ -s "$r/breakdown.csv" ] || stop "$NAME: no breakdown.csv"
-  if [ -n "$H1NOTE" ]; then echo "RUNCHECK PASS (NOTE: $H1NOTE)" >> "$r/h1-runcheck.txt"; else echo "RUNCHECK PASS" >> "$r/h1-runcheck.txt"; fi
+  [ -f "$f" ] || echo "# H1 per-run checks of lifetime $NAME (system $s, mix $H1_MIX, round $H1_N, seed $SEED; main-block.sh BLOCK=h1, H1-HOOK v2)" > "$f"
+  sed -i '/^RUNCHECK PASS/d' "$f"
+  { echo "[$2] v1_check: $(cat "$r/v1-check.txt")"; echo "[$2] check_breakdown: $(cat "$r/breakdown-check.txt")"
+    echo "[$2] summary: $(python3 -c 'import json,sys; s=json.load(open(sys.argv[1])); print("mode=%s note=%r workload_finish=%s confirm=%s" % (s.get("mode"), s.get("note",""), s.get("workload_finish"), s.get("confirm",{}).get("x_mean")))' "$r/loadgen/summary.json" 2>&1)"
+    [ -z "$3" ] || echo "[$2] NOTE: $3"
+  } >> "$f"
+  grep -q "^V1CHECK PASS" "$r/v1-check.txt" || stop "$NAME $2: $(cat "$r/v1-check.txt")"
+  grep -q "^BREAKDOWN PASS" "$r/breakdown-check.txt" || stop "$NAME $2: $(cat "$r/breakdown-check.txt")"
+  [ -s "$r/breakdown.csv" ] || stop "$NAME $2: no breakdown.csv"
+  local notes; notes=$(sed -n 's/^\[[a-z]*\] NOTE: //p' "$f" | tr '\n' ';' | sed 's/;$//')
+  if [ -n "$notes" ]; then echo "RUNCHECK PASS (NOTE: $notes)" >> "$f"; else echo "RUNCHECK PASS" >> "$f"; fi
 }
+h1_entry() {  # <name> <sys> <phase> <part> <steps> <lifetime kind>
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$1" "$2" "$H1_MIX" "$3" "$H1_N" "${LS#$E/}/$4" "$5" "$6" >> "$E/h1-runs.tsv"
+}
+
 echo "$(date -Is) block $OWNER start (git $(git -C $P/CXL_SWMC rev-parse --short HEAD)) K8=$K8 RECV_MODE=$RECV_MODE MEG_BUILD=$MB VM_PLAIN=$VM_PLAIN VM_MEG=$VM_MEG D=$D SEED=$SEED ROUNDS=$ROUNDS FIXED=$FIXED XT=$XT"
 [ $BLOCK = h1 ] && { bash $PTG "$PRETOUCH_DIR" "$E/pretouch-gate.txt" || stop "pretouch gate at block start"; }
 precheck
@@ -429,45 +470,65 @@ rate_for() {  # <ekko> <out file>: sets UPD_RATE and LGC for that operating poin
 }
 h1shuffle() { local seed=$1; shift; python3 -c 'import random,sys; v=sys.argv[2:]; random.Random(sys.argv[1]).shuffle(v); print(" ".join(v))' "$seed" "$@"; }
 h1_ekko() { case $1 in EKKO=avg) echo avg;; EKKO=peak) echo peak;; *) return 1;; esac; }
-if [ $BLOCK = h1 ]; then
-  printf '# name\tsystem\tmix\tphase\tround\trun_dir\n' > "$E/h1-runs.tsv"
-  if [ $H1MODE = slo ]; then
-    base=($(h1shuffle H1-recsys-r1 hw pop mg)); rot=$(( (H1_N - 1) % 3 ))
+if [ $BLOCK = h1 ]; then  # H1-HOOK v2 driver (header)
+  printf '# name\tsystem\tmix\tphase\tround\trun_dir\tsteps\tlifetime\n' > "$E/h1-runs.tsv"
+  declare -A EK
+  for spec in $H1_MIXES; do EK[${spec%%=*}]=$(h1_ekko "${spec#*=}") || stop "bad mix parameter $spec"; done
+  mixes=$(h1shuffle H1-recsys-r$H1_N $(printf "%s\n" "${!EK[@]}" | sort))
+  lv_rates() {  # <mix>: "<L2_rate> <L1_rate>" from H1_LEVELS (cont)
+    awk -F'\t' -v m="$1" 'NR == 1 { for (i = 1; i <= NF; i++) c[$i] = i; next }
+      $1 == m { print $(c["L2_rate"]), $(c["L1_rate"]); f = 1 } END { exit f ? 0 : 1 }' "$H1_LEVELS"; }
+  if [ $H1MODE = cont ]; then
+    base=($(h1shuffle H1-recsys-latin hw pop mg)); rot=$(( H1_N % 3 ))
     ord="${base[*]:$rot} ${base[*]:0:$rot}"; ord=$(echo $ord)
-    mixes=""; for spec in $H1_MIXES; do h1_ekko "${spec#*=}" > /dev/null || stop "bad mix parameter $spec"; mixes="$mixes ${spec%%=*}"; done
-    mixes=$(h1shuffle H1-recsys-r$H1_N $mixes)
-    { echo "# H1 DLRM recsys SLO round $H1_N (systems: shuffle seed H1-recsys-r1 rotated left by $rot; mixes: shuffle seed H1-recsys-r$H1_N; loadgen seed $SEED)"
-      echo "systems: $ord"; echo "mixes: $mixes"; echo "H1_MIXES: $H1_MIXES"; } | tee "$E/order.txt"
-    for s in $ord; do
-      for m in $mixes; do
-        for spec in $H1_MIXES; do [ "${spec%%=*}" = $m ] && ek=$(h1_ekko "${spec#*=}"); done
-        H1_MIX=$m; rate_for $ek "$E/update-rate-$s-$m-slo-r$H1_N.txt"
-        system $s $s-$m-slo-r$H1_N
-      done
-    done
-  else
-    python3 -I - "$H1_LEVELS" > "$E/levels-used.txt" <<'EOF' || stop "levels file $H1_LEVELS unreadable"
-import sys
-rows = [l.rstrip("\n").split("\t") for l in open(sys.argv[1]) if l.strip()]
-h = rows[0]
-for r in rows[1:]:
-    d = dict(zip(h, r))
-    assert d["mix"] in ("avg", "peak"), d["mix"]
-    l1, l2 = float(d["L1_rate"]), float(d["L2_rate"])
-    assert l1 > 0 and 0 < l2 < l1, (l1, l2)
-    print(d["mix"], d["L2_rate"], d["L1_rate"])
-EOF
-    { echo "# H1 DLRM recsys fixed phase rep $H1_N (levels $H1_LEVELS; systems per mix: shuffle seed H1-recsys-fix-r$H1_N-<mix>; loadgen seed $SEED; windows L2 then L1)"
-      while read -r m l2 l1; do echo "$m: $(h1shuffle H1-recsys-fix-r$H1_N-$m hw pop mg mgoff) L2=$l2 L1=$l1"; done < "$E/levels-used.txt"; } | tee "$E/order.txt"
-    while read -r m l2 l1; do
-      for s in $(h1shuffle H1-recsys-fix-r$H1_N-$m hw pop mg mgoff); do
-        H1_MIX=$m H1_L2=$l2 H1_L1=$l1; rate_for $m "$E/update-rate-$s-$m-fix-r$H1_N.txt"
-        system $s $s-$m-fix-r$H1_N < /dev/null
-      done
-    done < "$E/levels-used.txt"
   fi
+  { echo "# H1 DLRM recsys $H1MODE round $H1_N (H1-HOOK v2; loadgen seed $SEED; settle $H1_SETTLE_S s at L2; mixes: shuffle seed H1-recsys-r$H1_N)"
+    echo "mixes: $mixes"; echo "H1_MIXES: $H1_MIXES"
+    for m in $mixes; do
+      if [ $H1MODE = r1 ]; then
+        echo "$m: slo-only $(h1shuffle H1-recsys-r1-$m hw pop); mg (slo -> levels -> fix); mgoff (fix); fix-only $(h1shuffle H1-recsys-r1-$m-fix hw pop)"
+      else
+        echo "$m: $ord (each slo -> fix; mgoff fix right after mg; latin seed H1-recsys-latin rotated left by $rot); levels $(lv_rates $m || echo MISSING)"
+      fi
+    done; } | tee "$E/order.txt"
+  for m in $mixes; do
+    H1_MIX=$m
+    if [ $H1MODE = r1 ]; then
+      for s in $(h1shuffle H1-recsys-r1-$m hw pop); do
+        rate_for ${EK[$m]} "$E/update-rate-$s-$m-slo-r1.txt"
+        life_start $s $s-$m-slo-r1; h1_slo $s; h1_entry $NAME $s slo slo - sep; life_stop $s
+      done
+      rate_for ${EK[$m]} "$E/update-rate-mg-$m-r1.txt"
+      life_start mg mg-$m-r1; h1_slo mg; h1_entry $NAME-slo mg slo slo - cont
+      lv=$("$H1_LEVELS_CMD" $m 2> "$E/levels-cb-$m.err") || stop "LEVELS STOP $m: $(cat "$E/levels-cb-$m.err")"
+      read -r l2 l1 <<< "$lv"
+      awk -v a="$l2" -v b="$l1" 'BEGIN { exit !(a > 0 && b > a) }' || stop "LEVELS STOP $m: bad rates '$lv'"
+      echo "levels $m: L2=$l2 L1=$l1" | tee -a "$E/levels-used.txt"
+      h1_fix mg $l2 $l1; h1_entry $NAME-fix mg fix fix $H1STEPS cont; life_stop mg
+      rate_for ${EK[$m]} "$E/update-rate-mgoff-$m-fix-r1.txt"
+      life_start mgoff mgoff-$m-fix-r1; h1_fix mgoff $l2 $l1; h1_entry $NAME mgoff fix fix $H1STEPS sep; life_stop mgoff
+      for s in $(h1shuffle H1-recsys-r1-$m-fix hw pop); do
+        rate_for ${EK[$m]} "$E/update-rate-$s-$m-fix-r1.txt"
+        life_start $s $s-$m-fix-r1; h1_fix $s $l2 $l1; h1_entry $NAME $s fix fix $H1STEPS sep; life_stop $s
+      done
+    else
+      lv=$(lv_rates $m) || stop "no levels for $m in $H1_LEVELS"
+      read -r l2 l1 <<< "$lv"
+      awk -v a="$l2" -v b="$l1" 'BEGIN { exit !(a > 0 && b > a) }' || stop "bad levels for $m: '$lv'"
+      echo "levels $m: L2=$l2 L1=$l1" | tee -a "$E/levels-used.txt"
+      for s in $ord; do
+        rate_for ${EK[$m]} "$E/update-rate-$s-$m-r$H1_N.txt"
+        life_start $s $s-$m-r$H1_N; h1_slo $s; h1_entry $NAME-slo $s slo slo - cont
+        h1_fix $s $l2 $l1; h1_entry $NAME-fix $s fix fix $H1STEPS cont; life_stop $s
+        if [ $s = mg ]; then
+          rate_for ${EK[$m]} "$E/update-rate-mgoff-$m-fix-r$H1_N.txt"
+          life_start mgoff mgoff-$m-fix-r$H1_N; h1_fix mgoff $l2 $l1; h1_entry $NAME mgoff fix fix $H1STEPS sep; life_stop mgoff
+        fi
+      done
+    fi
+  done
   bash $PTG "$PRETOUCH_DIR" "$E/pretouch-gate.txt" || stop "pretouch gate at block end"
-  echo "$(date -Is) SEQUENCE DONE H1-recsys $H1MODE r$H1_N ($(($(wc -l < "$E/h1-runs.tsv") - 1)) runs)"
+  echo "$(date -Is) SEQUENCE DONE H1-recsys $H1MODE r$H1_N ($(($(wc -l < "$E/h1-runs.tsv") - 1)) entries)"
   exit 0
 fi
 RATEF=$E/sequence-update-rate.txt

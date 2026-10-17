@@ -1,13 +1,13 @@
 # H1 plugin: DLRM recsys (26 tables, 167.7M rows x 576 B, MLPerf day-23 trace; reports/RECSYS-V1-packet.md v1.2.7
 # blocks). all-HWcc = recsys/9 plain, Popcorn = recsys/9 + cxl_shm build 12 (init_state=shared + preload, recv_mode
 # poll), Megalon = recsys-megalon/11 on Megalon 77 (one object per 576 B row), mgoff = the same with
-# MEGALON_COH_TIMERS=0. Mixes = EKKO avg / peak (two; draft §1 has no balanced DLRM mix). Filled 2026-10-17 (H1 hook =
+# MEGALON_COH_TIMERS=0. Mixes = EKKO avg / peak (two; draft §1 has no balanced DLRM mix). Filled 2026-10-17, re-pinned 2026-10-18 for H1-HOOK v2 (H1 hook =
 # main-block.sh BLOCK=h1, branch recsys-h1-hook; valid once that branch is merged into the live tree after RECSYS-V1
 # v1.2.7 ran — every file the block runs is hash-pinned below, so an unmerged or changed tree is refused by hook.sh).
 . "$(dirname "${BASH_SOURCE[0]}")/pins-common.inc"
 HR=$P/CXL_SWMC                      # live tree (main-block.sh resolves session.sh / v1_check.py / host-gate.sh next to itself)
 HOOK_FILE=$HR/experiments/recsys/main-block.sh
-BLOCK_CMD=(bash $HOOK_FILE)          # H1 hook = BLOCK=h1 in main-block.sh (marker H1-HOOK v1)
+BLOCK_CMD=(bash $HOOK_FILE)          # H1 hook = BLOCK=h1 in main-block.sh (marker H1-HOOK v2: H1MODE r1|cont)
 BLOCK_ENV=(BLOCK=h1 POP_BUILD=12 POP_BUNDLE_SHA=$POP_BUNDLE_SHA C8=$CPOP K8=$KPOP GT8=$GTPOP RECV_MODE=$RECV_MODE
   D=$P/builds/recsys-inputs/1 PLAIN_BUILD=$P/builds/recsys/9 MEG_BUILD=$P/builds/recsys-megalon/11 MEGALON_BASE=$MEG77
   VM_PLAIN=/home/comsys/rs9 VM_MEG=/home/comsys/rsm11 LOADGEN=$P/builds/recsys-loadgen/7/loadgen XT=7200
@@ -25,7 +25,7 @@ eca0ba184cec64224f9fcf1241737132c49412dfde7ce011716ba7392598f5a5  $P/builds/recs
 f9c1753f3bef2ab0941153058860227145f2d7b7e33a210bdc3338fad14eacda  $P/builds/recsys-megalon/11/lib/libmegalon.so
 73c93ce02d57837f09e1b5f8d0d59142b3c7d30735bd69492dc898bd76019583  $P/builds/recsys-loadgen/7/manifest.txt
 d2633e8df70e7eb0b832e205a16f7749485097d3005ce758a3ff08843caa1447  $P/builds/recsys-loadgen/7/loadgen
-341e3ace830662f80fe3a86567845ec07e97e79d97d43e4a581cee5266b06934  $HOOK_FILE
+01170167065d3a56f56b3e9264884c4a85a5da7b213b25e2b13bdeb3f75dd861  $HOOK_FILE
 2c1dcfc371063781639e04c2bd986406a0aa17ff64191ee5c9147c11772fd1e7  $HR/experiments/recsys/session.sh
 252cb04dafd899b837d7f5bf1e190de9d7a5c2ec4a8fca2b81ff74f63dc6c06f  $HR/experiments/recsys/v1_check.py
 32d171199d6a47d15fcfa6971522e253fe21d857e91c9049c201e55a0cdac230  $HR/experiments/recsys/check_breakdown.py
