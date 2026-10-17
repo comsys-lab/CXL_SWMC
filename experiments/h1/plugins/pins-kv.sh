@@ -2,7 +2,7 @@
 # recovery/KV-V1-v1.5-run). all-HWcc = kv/10 on Megalon 77-hwcc (FULL_COHERENCE flavor; MOT1 v6 §3.1 KV rule), Popcorn =
 # kv/10 + cxl_shm build 12, Megalon = kv-megalon/10 on Megalon 77 (timers on), mgoff = the same with MEGALON_COH_TIMERS=0.
 # Builds from BUILD_PIN 934fa9312; installs = the KV-V1 v1.5 guest dirs kv10 / kvm10 (Q10 reuse; the block's precheck
-# compares every installed file with the builds). Hook = block h1 of pilot-block.sh at f941da2fd (live tree, every file
+# compares every installed file with the builds). Hook = block h1 of pilot-block.sh at f941da2fd; pilot-run.sh re-pinned after the wmeta_reclaim NOTE rule (live tree, every file
 # the block runs hash-pinned below). Filled 2026-10-17.
 . "$(dirname "${BASH_SOURCE[0]}")/pins-common.inc"
 HR=$P/CXL_SWMC
@@ -26,7 +26,7 @@ f9c1753f3bef2ab0941153058860227145f2d7b7e33a210bdc3338fad14eacda  $P/builds/kv-m
 5ebc87703788fddd6e93e8cbd6a85dc0f118610775fdfdbaf50b98018aae954a  $P/builds/kv-loadgen/10/loadgen
 48c5f02c0546af9b22cf0a4ce2172177193ffcc6d502d9fb0fdeb51863bb9f17  $P/recovery/KV-V1-v1.5-run/install.log.megalon.yaml
 7f2c385ad563d26b6aa3da3e798d66f4f0e214e6c10be107bd52865e468cacb9  $HOOK_FILE
-03e1837a867a0894d315df2c8a0ed5a8ddb7a4139f5bda0760da2c4282c4f30d  $HR/experiments/kv/pilot-run.sh
+c7742c6a2fe8163a6ef12ce12f4504edd1f613401808b21e1b79921e370927a4  $HR/experiments/kv/pilot-run.sh
 7c5a94a337171ce8ca3ee867710746d46a81b70c99938c864d2bc63d1ce07ab9  $HR/experiments/kv/run.sh
 8435ef222785be5d7a6dd6a97572b1404017822c63f3f766c45562efc8ae35ca  $HR/experiments/kv/precheck.sh
 f074f4dc5df208f2ddd0b38f01d75c00240d6bf74c1eb6115ef04cb07fba6092  $HR/experiments/kv/v1-check.py
