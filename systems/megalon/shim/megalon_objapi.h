@@ -26,8 +26,13 @@ struct Stats {  // subset of rackobj::ObjectStats (this node unless noted)
 };
 
 // Per-thread coherence time of the CALLING thread since reg() (MOT1 v6 reports/MOT1-v6-redesign-draft.md §3.1, §4.1).
-// Durations in ns (plain rdtsc, no fences, converted with the TSC rate), counts in events. Every event is timed
-// except the READ-section checks, which are timed 1 in check_sample (check_ns_sampled = sum over the check_sampled
+// Durations in ns (plain rdtsc, no fences, converted with the TSC rate), counts in events.
+// SCALING (build >= 76, CohSnap.reserved[1] bit 1 set): every *_ns field below, and every AnchorSnap *_ns field, is
+// a SUM OVER SAMPLED SECTIONS ONLY. Never sum them across threads/ops as totals without scaling: read side x
+// read_sections / check_sampled, write side x write_sections / AnchorSnap.reserved[0] (write_sampled); exception
+// MEGALON_COH_EVENTS=always (bit 2): read-side event ns and write-side ns are full sums (do not scale). Counts
+// (*_cnt, *_sections, wflush_bytes) are exact. Details in the build >= 76 paragraph below.
+// Builds 71-75 (bit 1 clear): every event is timed except the READ-section checks, which are timed 1 in check_sample (check_ns_sampled = sum over the check_sampled
 // sampled read sections; estimate for all read sections = check_ns_sampled * read_sections / check_sampled, the
 // ratio estimator — preferred over * check_sample because each thread's first section is always sampled).
 // (A) stale copy at read_start, (B) version changed during the read (read_end false), (C) NR metadata notification
@@ -88,11 +93,15 @@ struct AnchorSnap {
   uint64_t reserved[6];  // [0] write_sampled: timed write sections (build >= 76; 0 before); build >= 77: [1] probe_ns,
                          // [2] probe_ps, [3] timed (A) events, [4] timed (B)+(C) events, [5] timed (D) episodes
 };
-// Probe correction (build >= 77; reports/M2-megalon-port-changes.md §19): every timed interval also measures
-// the TSC reads inside it. p = AnchorSnap.reserved[2] / 1000 ns (per-thread median of back-to-back TSC pairs at reg()).
-// Subtract p x k from each sum before scaling: per sampled read section (check_sampled): check 7, read_lookup 1,
-// read_nr 2, rseq 2; per timed write section (write_sampled): wstart 4, wflush 3, write_lookup 1, write_nr 2, wseq 1,
-// wseq_end 1; per timed event: stale 1 x reserved[3], concur+meta 4 x reserved[4], spin 1 x reserved[5].
+// Probe values (build >= 77; reports/M2-megalon-port-changes.md §19): every timed interval also measures the TSC
+// reads inside it. p = AnchorSnap.reserved[2] / 1000 ns (per-thread median of back-to-back TSC pairs at reg()).
+// Decision (user, 2026-10-17): NO probe correction is applied; consumers report p and reserved[3..5] raw, and Megalon C
+// includes the timer-read cost (an upper bound). For reference only, the TSC reads per interval in the base case (an
+// N-sampled section on an RW object without retries): per sampled read section check 7, read_lookup 1, read_nr 2,
+// rseq 2; per timed write section wstart 4, wflush 3, write_lookup 1, write_nr 2, wseq 1, wseq_end 1; per timed event
+// stale 1, concur+meta 4, spin 1. These k do NOT hold for read sections of RO objects, (C) notification retries,
+// events timed in unsampled sections under MEGALON_COH_EVENTS=always, KV creates (admit path), and sections with NR
+// replay or retries (extra anchors/version reads) — verifier 2026-10-17; do not use them as a correction.
 static_assert(sizeof(CohSnap) == 29 * 8, "CohSnap layout is fixed (v2)");
 static_assert(sizeof(AnchorSnap) == 16 * 8, "AnchorSnap layout is fixed (v3)");
 
