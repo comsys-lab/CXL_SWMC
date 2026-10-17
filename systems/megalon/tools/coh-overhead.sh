@@ -55,7 +55,9 @@ c++ -std=c++17 -O2 -Wall -I"$MSRC/include" "$HERE/coh_overhead.cc" -o "$OUT/coh-
 } > "$OUT/manifest.txt"
 cat "$OUT/manifest.txt"
 
-busy() { local c; c=$(pgrep -c -f '(cc1plus|cc1 |rustc|clang|/ld |ld\.lld|cargo build|ninja|gmake)' 2>/dev/null); echo "${c:-0}"; }
+# Host build processes, matched on the process name only (-x): a -f match on command lines also counted any shell
+# whose command text merely contained one of the words, e.g. the operator's own launch command (verifier MED-3).
+busy() { local c; c=$(pgrep -c -x '(cc1|cc1plus|cc1obj|rustc|clang|clang\+\+|clang-[0-9]+|ld|ld\.lld|ld\.gold|lld|collect2|as|cargo|make|gmake|ninja|cmake)' 2>/dev/null); echo "${c:-0}"; }
 
 echo "label,round,rep,read_ns,write_ns,kvget_ns,kvput_ns,host_busy_before,host_busy_after,loadavg" > "$OUT/raw.csv"
 run_one() {  # idx round
