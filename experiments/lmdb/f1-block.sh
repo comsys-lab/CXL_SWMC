@@ -133,7 +133,8 @@ for i in 0 1; do
   grep -qx "comsys:root 600" "$E/chown-vm$i.out" || stop "chown vm$i"
 done
 
-# lmdb-stress pair with ONE run id for both nodes; node 1 starts after node 0 printed its node line.
+# lmdb-stress pair with ONE run id for both nodes; node 1 starts after node 0 is ready (plain: its node line; megalon:
+# Megalon READY published, before the 2-node start barrier).
 # $1 tag, $2 backend dir (plain|megalon), $3 timeout s per node (stop rule bound), $4.. extra args (both nodes)
 stress() {
   local tag=$1 bd=$2 to=$3; shift 3
@@ -145,9 +146,13 @@ stress() {
   $SSH comsys@${IPS[0]} "cd $L && env CXL_APP_HWCC_BYTES=$app $ev0 timeout $to $bd/bin/lmdb-stress --node 0 --image $L/img-$R $A ${NODE0_STRESS:-}" \
     < /dev/null > "$E/$tag.0.out" 2> "$E/$tag.0.err" &
   local p0=$! t0=$SECONDS
-  until grep -q "lmdb-stress: node 0/2" "$E/$tag.0.err" 2>/dev/null; do
-    kill -0 $p0 2>/dev/null || stop "$tag: node 0 exited before its node line"
-    [ $((SECONDS - t0)) -lt 120 ] || stop "$tag: no node 0 line in 120 s"
+  # node 1 starts once node 0 has initialised the shared state: plain = node 0's node line; megalon = Megalon's
+  # "READY published" (v1.7: Megalon's 2-node start barrier runs inside megalon_load, BEFORE lmdb-stress prints its node
+  # line, so waiting for the node line deadlocked node 0 at the barrier in v1.6 B1)
+  local ready="lmdb-stress: node 0/2"; [ "$bd" = megalon ] && ready="init complete, READY published"
+  until grep -q "$ready" "$E/$tag.0.err" 2>/dev/null; do
+    kill -0 $p0 2>/dev/null || stop "$tag: node 0 exited before its ready line ($ready)"
+    [ $((SECONDS - t0)) -lt 120 ] || stop "$tag: no node 0 ready line ($ready) in 120 s"
     sleep 1
   done
   $SSH comsys@${IPS[1]} "cd $L && env CXL_APP_HWCC_BYTES=$app $ev1 timeout $to $bd/bin/lmdb-stress --node 1 $A" \
