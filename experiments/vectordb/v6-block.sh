@@ -54,6 +54,8 @@ if [ -n "${H1MODE:-}" ]; then
   [ "${H1_PARENT_LOCK:-}" = H1-main ] || { echo "SEQUENCE STOP: H1MODE needs H1_PARENT_LOCK=H1-main"; exit 2; }
   [[ "${H1_N:-}" =~ ^[1-9]$ ]] && [[ "${H1_SEED:-}" =~ ^[0-9]+$ ]] || { echo "SEQUENCE STOP: H1_N / H1_SEED"; exit 2; }
   : "${H1_MIXES:?}"; [[ "${H1_SETTLE_S:-}" =~ ^[1-9][0-9]*$ ]] || { echo "SEQUENCE STOP: bad H1_SETTLE_S"; exit 2; }
+  # README item 8: H1 measurement runs use experiments/h1/h1-gate.sh and scripts/host/measure-run.sh (m4-run.sh, run.sh)
+  [ "${H1_MEASURE_RUN:-0}" = 1 ] && [ -d "${MEASURE_PART_DIR:-}" ] || { echo "SEQUENCE STOP: H1MODE needs H1_MEASURE_RUN=1 and MEASURE_PART_DIR"; exit 2; }
   case $H1MODE in r1) : "${H1_LEVELS_CMD:?}" "${H1_LEVELS_OUT:?}";;
     cont) [ -f "${H1_LEVELS:-}" ] || { echo "SEQUENCE STOP: no H1_LEVELS"; exit 2; };;
     *) echo "SEQUENCE STOP: bad H1MODE (H1-HOOK v2: r1 | cont)"; exit 2;; esac

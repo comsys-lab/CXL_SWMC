@@ -135,7 +135,12 @@ dax_unused() {
 echo "$(date -Is) $NAME: SYS=$SYS U=$U KIND=$KIND DATASET=${DATASET:-28m} REP=${REP:-} TRACE=$TRACE RATE=${RATE:-} RECV_MODE=${RECV_MODE:-} SEED=$SEED V=$V HOST_SERVER=$HOST_SERVER XENV=[$XENV] XARGS=[$XARGS] OPCOH_EXPECT=${OPCOH_EXPECT:-} OPCOH_CHECK_MODE=${OPCOH_CHECK_MODE:-}"
 servers_gone || stop "a vdb-server is running before the run"
 [ "${GATE:-1}" = 1 ] || [ "$KIND" = functional ] || stop "GATE=0 is allowed for KIND=functional only"
-if [ "${GATE:-1}" = 1 ]; then bash $X/host-gate.sh check "$E/gate-$NAME.txt" || stop "host gate"; fi
+if [ "${GATE:-1}" = 1 ]; then  # H1 measurement runs: experiments/h1/h1-gate.sh (README item 8); validation: host-gate.sh
+  if [ "${H1_MEASURE_RUN:-0}" = 1 ]; then
+    [ -n "${MEASURE_PART_DIR:-}" ] || stop "H1_MEASURE_RUN=1 needs MEASURE_PART_DIR"
+    bash $P/CXL_SWMC/experiments/h1/h1-gate.sh check "$E/gate-$NAME.txt" || stop "H1 gate"
+  else bash $X/host-gate.sh check "$E/gate-$NAME.txt" || stop "host gate"; fi
+fi
 T0=$(date +%s)
 if [ "$SYS" = Popcorn ]; then  # P-popcorn-deploy §6a cycle (bundle C8, build >= 8; init_state=shared)
   PS=(K=$K8 GT=$GT8 C=$C8 R=$E/shm-$NAME INIT_STATE=shared)

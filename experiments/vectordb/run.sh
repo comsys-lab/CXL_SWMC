@@ -128,10 +128,16 @@ post_outputs() {  # <dir holding loadgen/>: spreadsheet/plot outputs, always (on
   python3 "$ROOT/experiments/loadgen/plot_slo.py" --out "$R/slo.png" "$R/loadgen=$SYSTEM" > "$R/slo-points.txt" 2>&1 || true
 }
 CONFIRM_NOTE="confirm failed at three rates; the knee is noisy (longer --confirm-s?)"
+# H1 measurement runs (H1_MEASURE_RUN=1, experiments/h1/README.md item 8): loadgen starts inside measure.slice through
+# scripts/host/measure-run.sh (clean environment; loadgen needs no variable: everything is on its command line; fail
+# closed, exit 125), and every part after the first is preceded by experiments/h1/h1-gate.sh check (MEASURE_PART_DIR).
+# Without H1_MEASURE_RUN (validation packets) loadgen starts directly, as before.
+LGL=(); [ "${H1_MEASURE_RUN:-0}" = 1 ] && LGL=(bash "$ROOT/scripts/host/measure-run.sh" --)
+echo "loadgen_launcher=${LGL[*]:-direct}" >> "$RUN/manifest.txt"
 if [ -z "${PARTS:-}" ]; then
 cpu_snap before
 set +e
-numactl --physcpubind="$LG_CPUS" --membind=1 "$LOADGEN" --workload vectordb --target "$TARGETS" --out "$RUN/loadgen" \
+"${LGL[@]}" numactl --physcpubind="$LG_CPUS" --membind=1 "$LOADGEN" --workload vectordb --target "$TARGETS" --out "$RUN/loadgen" \
   "${LG_STATS[@]}" "$@" 2>&1 | tee "$RUN/loadgen.log"
 LG=${PIPESTATUS[0]}
 set -e
@@ -161,10 +167,13 @@ else  # H1-HOOK v2: several loadgen parts in this server lifetime
     fi
     v=PART_SEED_$p; PS=()  # per-part query seed (m4-run.sh KIND=h1: slo SEED, fix SEED+1)
     [ -z "${!v:-}" ] || { [[ ${!v} =~ ^[0-9]+$ ]] || { echo "bad $v"; false; }; PS=(--opt seed=${!v} --seed ${!v}); }
+    if [ -n "$PREV" ] && [ "${H1_MEASURE_RUN:-0}" = 1 ]; then  # H1 gate before every later part (servers stay up)
+      bash "$ROOT/experiments/h1/h1-gate.sh" check "$OUT/gate-$NAME-$p.txt" || { echo "part $p: H1 gate failed (see $OUT/gate-$NAME-$p.txt)"; false; }
+    fi
     echo "part_$p=start $(date -Is) w_start=$WS seed=${!v:-common} args=${PA[*]}" >> "$RUN/manifest.txt"
     cpu_snap before; mv "$RUN/guest-cpu.txt" "$PR/guest-cpu.txt" 2>/dev/null || true
     set +e
-    numactl --physcpubind="$LG_CPUS" --membind=1 "$LOADGEN" --workload vectordb --target "$TARGETS" --out "$PR/loadgen" \
+    "${LGL[@]}" numactl --physcpubind="$LG_CPUS" --membind=1 "$LOADGEN" --workload vectordb --target "$TARGETS" --out "$PR/loadgen" \
       "${LG_STATS[@]}" "$@" "${PA[@]}" "${PS[@]}" --opt w_start=$WS 2>&1 | tee "$PR/loadgen.log"
     rc=${PIPESTATUS[0]}
     set -e
