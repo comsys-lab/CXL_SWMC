@@ -92,7 +92,7 @@ servers_gone || stop "a kv-server is running before the run"
 # GATE=0 skips the whole Host gate (incl. the measure-env check): functional runs only
 [ "${GATE:-1}" = 1 ] || [ "$KIND" = functional ] || stop "GATE=0 is allowed only with KIND=functional (KIND=$KIND)"
 if [ "${GATE:-1}" = 1 ]; then bash $P/CXL_SWMC/experiments/vectordb/host-gate.sh check "$E/gate-$NAME.txt" || stop "host gate"; fi
-T0=$(date +%s)
+T0=$(date +%s) RECLAIM_NOTE=
 if [ "$SYS" = Popcorn ]; then  # P-popcorn-deploy §6a cycle with build 8; enable BEFORE the server (load under coherence)
   PS=(K=$K8 GT=$GT8 C=$C8 R=$E/shm-$NAME INIT_STATE=shared)
   servers_gone || stop "kv-server or /dev/dax0.0 user before the cxl_shm load"
@@ -123,8 +123,15 @@ for k in 0 1; do  # clean stop and the workload's own invariants
   L=$R/node$k.log
   grep -q "kv-server: stopping" $L || stop "node$k: no clean stop"
   for kv in misses=0 short_reads=0 bad_requests=0; do grep -q "^$kv\$" $L || stop "node$k: $kv violated"; done
-  # Megalon: no record reclaim at all (sizing keeps every loaded key under the watermark; reports/M5-pilot-kv.md §1)
-  [ "$SYS" = Megalon ] && { grep -q "^megalon.wmeta_reclaim=0\$" $L || stop "node$k: Megalon record reclaim (record pressure)"; }
+  # Megalon: no record reclaim at all (sizing keeps every loaded key under the watermark; reports/M5-pilot-kv.md §1).
+  # An input/sizing check (user principle 2026-10-17): STOP in fixed/ladder/functional runs; in SLO runs (slo, pslo) a
+  # NOTE past the knee, with the steps whose stats-steps.csv megalon.wmeta_reclaim delta is > 0 (value / not-found /
+  # error checks stay STOP everywhere)
+  if [ "$SYS" = Megalon ] && ! grep -q "^megalon.wmeta_reclaim=0\$" $L; then
+    [[ $KIND =~ ^p?slo$ ]] || stop "node$k: Megalon record reclaim (record pressure)"
+    RECLAIM_NOTE="${RECLAIM_NOTE:+$RECLAIM_NOTE; }Megalon record reclaim > 0 (node$k; steps $(python3 -I -B -c 'import csv,sys
+print(",".join(sorted({r["step"] for r in csv.DictReader(open(sys.argv[1])) if float(r.get("megalon.wmeta_reclaim") or 0) > 0}, key=int)) or "unattributed")' $R/stats-steps.csv 2>/dev/null || echo unattributed))"
+  fi
 done
 for kv in torn=0 wrong_key=0 bad_writer=0 future=0 stale=0 misses=0 get_errors=0 put_errors=0; do
   grep -q "^$kv\$" $R/loadgen/kv.txt || stop "value check: $kv violated"
@@ -136,7 +143,7 @@ done
 grep -q "workload_finish\":\"ok" $R/loadgen/summary.json || stop "loadgen workload finish"
 if [ $RC != 0 ]; then
   note=$(python3 -B -c 'import json,sys; print(json.load(open(sys.argv[1])).get("note",""))' $R/loadgen/summary.json 2>/dev/null)
-  [[ $KIND =~ ^p?slo$ ]] && [ -n "$note" ] && { echo "PILOTRUN $NAME NOTE $note"; exit 0; }
+  [[ $KIND =~ ^p?slo$ ]] && [ -n "$note" ] && { echo "PILOTRUN $NAME NOTE $note${RECLAIM_NOTE:+; $RECLAIM_NOTE}"; exit 0; }
   stop "run.sh rc $RC ($note)"
 fi
 [ "$KIND" = functional ] && ! grep -q '"pass":true' $R/loadgen/steps.jsonl && stop "functional step not PASS"
@@ -173,4 +180,5 @@ PY
   cat $R/ladder-result.txt
   awk 'NR>1 && $9=="true"' $R/ladder-result.txt | grep -q . && { echo "PILOTRUN $NAME NOTE $KIND step aborted"; exit 0; }
 fi
+[ -n "${RECLAIM_NOTE:-}" ] && { echo "PILOTRUN $NAME NOTE $RECLAIM_NOTE"; exit 0; }
 echo "PILOTRUN $NAME OK"
