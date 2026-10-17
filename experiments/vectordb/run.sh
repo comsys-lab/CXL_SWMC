@@ -18,6 +18,15 @@
 #   STATS_OP (default 10 = vdb kOpStats): loadgen --stats-op, a server stats snapshot per node at the start and end of
 #   every measured step (loadgen/stats/); STATS_OP=0 omits it. After the run: stats-steps.csv (stats_delta.py) and
 #   steps.csv with the derived per-node columns (export_csv.py).
+#   PARTS (H1-HOOK v2, optional): space-separated loadgen invocations ("parts") inside ONE server lifetime, e.g.
+#   "slo fix" or "fix". Per part p: loadgen args = the common args after -- plus PART_ARGS_<p> (word-split; no spaces in
+#   values); output <run>/<p>/loadgen (+ loadgen.log, guest-cpu.txt, stats-steps.csv, steps.csv, opsplit-steps.csv).
+#   The token @RATES@ in PART_ARGS_fix becomes "<L2>,<L1>": PART_RATES if set, else the output "<L2> <L1>" of
+#   PART_RATES_CMD run right before the fix part (non-zero rc or bad output = LEVELS STOP: servers stopped, exit 5).
+#   Parts after the first get --opt w_start=<next_w of the previous part> (the update stream continues; the previous
+#   part must end with write_errors=0). A part whose loadgen rc != 0 stops the lifetime unless its summary note is the
+#   SLO search's "confirm failed at three rates" (then the next part runs; the caller decides). Per part rc in the
+#   manifest (part_<p>_loadgen_rc=); exit 1 if any part rc != 0.
 # Stops (and stops the servers) on the first error. Measurement hygiene: no Host build before/after (pgrep).
 set -euo pipefail
 NAME=$1 OUT=$2; shift 2; [ "${1:-}" = "--" ] && shift
@@ -108,20 +117,71 @@ cpu_snap() {  # guest CPU time counters (/proc/stat "cpu" line) per node, for bu
   for k in "${!NODE[@]}"; do echo "$1 node$k $($SSH comsys@"${NODE[$k]}" 'head -1 /proc/stat' < /dev/null)"; done >> "$RUN/guest-cpu.txt"
 }
 TARGETS=$(printf '%s:'"$PORT"',' "${NODE[@]}"); TARGETS=${TARGETS%,}
-cpu_snap before
 LG_STATS=(); [ "$STATS_OP" = 0 ] || LG_STATS=(--stats-op "$STATS_OP")
+post_outputs() {  # <dir holding loadgen/>: spreadsheet/plot outputs, always (one row per step and stream; counter deltas)
+  local R=$1
+  [ -s "$R/loadgen/steps.jsonl" ] && [ -s "$R/loadgen/summary.json" ] || return 0
+  [ ! -d "$R/loadgen/stats" ] || python3 "$ROOT/experiments/loadgen/stats_delta.py" "$R/loadgen" --out "$R/stats-steps.csv" || true
+  python3 "$ROOT/experiments/loadgen/export_csv.py" --out "$R/steps.csv" "$R/loadgen=$SYSTEM" > /dev/null || true
+  [ ! -s "$R/loadgen/op-coh.bin" ] || python3 "$HERE/opsplit.py" "$R" > "$R/opsplit.log" 2>&1 || true
+  python3 "$ROOT/experiments/loadgen/plot_slo.py" --out "$R/slo.png" "$R/loadgen=$SYSTEM" > "$R/slo-points.txt" 2>&1 || true
+}
+CONFIRM_NOTE="confirm failed at three rates; the knee is noisy (longer --confirm-s?)"
+if [ -z "${PARTS:-}" ]; then
+cpu_snap before
 set +e
 numactl --physcpubind="$LG_CPUS" --membind=1 "$LOADGEN" --workload vectordb --target "$TARGETS" --out "$RUN/loadgen" \
   "${LG_STATS[@]}" "$@" 2>&1 | tee "$RUN/loadgen.log"
 LG=${PIPESTATUS[0]}
 set -e
+else  # H1-HOOK v2: several loadgen parts in this server lifetime
+  LG=0 WS=0 PREV=
+  for p in $PARTS; do
+    [[ $p =~ ^[a-z0-9]+$ ]] || { echo "bad part name $p"; false; }
+    PR=$RUN/$p; mkdir "$PR"
+    v=PART_ARGS_$p; read -r -a PA <<< "${!v:-}"
+    if [ -n "$PREV" ]; then
+      WS=$(sed -n 's/^next_w=//p' "$RUN/$PREV/loadgen/vectordb.txt" 2>/dev/null)
+      [[ $WS =~ ^[0-9]+$ ]] && grep -qx "write_errors=0" "$RUN/$PREV/loadgen/vectordb.txt" \
+        || { echo "part $p: previous part $PREV has no next_w / write errors"; false; }
+    fi
+    if [[ " ${PA[*]} " == *@RATES@* ]]; then
+      RATES=${PART_RATES:-}
+      if [ -z "$RATES" ]; then
+        set +e; out=$(${PART_RATES_CMD:?PART_RATES or PART_RATES_CMD needed for @RATES@}); rc=$?; set -e
+        echo "$(date -Is) part $p rates_cmd rc=$rc out=[$out]" >> "$RUN/manifest.txt"
+        if [ $rc != 0 ] || ! [[ $out =~ ^[0-9]+(\.[0-9]+)?\ [0-9]+(\.[0-9]+)?$ ]]; then
+          echo "LEVELS STOP (part $p: rates command rc=$rc out=[$out])"; stop_nodes; collect; host_check after || true
+          echo "end=$(date -Is) levels_stop=1" >> "$RUN/manifest.txt"; exit 5
+        fi
+        RATES="${out% *},${out#* }"
+      fi
+      PA=("${PA[@]/@RATES@/$RATES}")
+    fi
+    echo "part_$p=start $(date -Is) w_start=$WS args=${PA[*]}" >> "$RUN/manifest.txt"
+    cpu_snap before; mv "$RUN/guest-cpu.txt" "$PR/guest-cpu.txt" 2>/dev/null || true
+    set +e
+    numactl --physcpubind="$LG_CPUS" --membind=1 "$LOADGEN" --workload vectordb --target "$TARGETS" --out "$PR/loadgen" \
+      "${LG_STATS[@]}" "$@" "${PA[@]}" --opt w_start=$WS 2>&1 | tee "$PR/loadgen.log"
+    rc=${PIPESTATUS[0]}
+    set -e
+    cpu_snap after; cat "$RUN/guest-cpu.txt" >> "$PR/guest-cpu.txt" 2>/dev/null; rm -f "$RUN/guest-cpu.txt"
+    echo "part_${p}_loadgen_rc=$rc end=$(date -Is)" >> "$RUN/manifest.txt"
+    if [ $rc != 0 ]; then
+      LG=$rc
+      note=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("note", ""))' "$PR/loadgen/summary.json" 2>/dev/null || true)
+      [ "$note" = "$CONFIRM_NOTE" ] || { echo "part $p: loadgen rc=$rc ($note): lifetime stopped"; break; }
+    fi
+    PREV=$p
+  done
+fi
 [ -z "${SERVER_CPUS:-}" ] || server_cpus check
-cpu_snap after
+[ -n "${PARTS:-}" ] || cpu_snap after
 stop_nodes
 collect
 host_check after
 echo "end=$(date -Is) loadgen_rc=$LG" >> "$RUN/manifest.txt"
-# spreadsheet/plot outputs, always (CSV: one row per step and stream; per-step counter deltas)
+if [ -n "${PARTS:-}" ]; then for p in $PARTS; do [ -d "$RUN/$p" ] && post_outputs "$RUN/$p"; done; fi
 if [ -s "$RUN/loadgen/steps.jsonl" ] && [ -s "$RUN/loadgen/summary.json" ]; then
   [ ! -d "$RUN/loadgen/stats" ] || python3 "$ROOT/experiments/loadgen/stats_delta.py" "$RUN/loadgen" --out "$RUN/stats-steps.csv" || true
   python3 "$ROOT/experiments/loadgen/export_csv.py" --out "$RUN/steps.csv" "$RUN/loadgen=$SYSTEM" > /dev/null || true

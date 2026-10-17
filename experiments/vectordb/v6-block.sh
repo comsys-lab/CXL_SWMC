@@ -14,22 +14,25 @@
 #      stop must fit vdb-node.sh's 15 s TERM grace: <= 512 MiB per node); run.sh
 #      classifies the trace on Host node 1 under a 16 GB address-space cap (sharing.csv); opsplit / opcoh_check
 #      megalon-vm as in step 1. trace.dropped must be 0 on both nodes.
-# H1-HOOK v1 (experiments/h1/README.md, reports/H1-main-packet.md; set H1MODE): the H1 main phases instead of the
-#   VDB-V1 runs, with this block's precheck, Host gate per run, pretouch gate (start, every run, end), checks and
-#   rollback. Env from experiments/h1/hook.sh: H1MODE slo|fix, H1_N (round), H1_SEED (loadgen seed), H1_PARENT_LOCK
-#   (=H1-main: the lock must be held by it; this block never locks or unlocks), H1_MIXES "<mix>=U=<5|50|90> ..." (slo)
-#   or H1_LEVELS (levels.tsv, fix). Mix tags u5/u50/u90 = search/update 95/5, 50/50, 10/90 (MOT1 v6), 28M dataset.
-#   slo: per system in hw, pop, mg (base order = shuffle seed "H1-vdb-r1", rotated left by N-1: Latin square over
-#        rounds) and per mix (shuffle seed "H1-vdb-r<N>", same for every system): one m4-run.sh KIND=slo run
-#        <sys>-<mix>-slo-r<N> (ramp/bisect, confirm 3 x 30 s, fill 0.7/0.8/0.9, overload 1.05/1.1/1.2 past the first
-#        failure; SLO search p99 <= 100 ms). A loadgen "confirm failed at three rates" NOTE is recorded and the block
-#        continues.
-#   fix: per levels.tsv row (mix) and per system in hw, pop, mg, mgoff (shuffle seed "H1-vdb-fix-r<N>-<mix>"):
-#        one lifetime m4-run.sh KIND=fixed RATE=<L2_rate>,<L1_rate> (windows 10 s + 60 s each, L2 then L1, no SLO
-#        abort) <sys>-<mix>-fix-r<N>; mgoff = Megalon with MEGALON_COH_TIMERS=0 on both nodes (Fig 2 C_diff).
-#   Per run: OPCOH_EXPECT + opcoh_check (hw hwcc, pop popcorn, mg megalon-vm, mgoff megalon-t0), clean stop,
-#   bad_records 0, E1 check, loadgen finish (all inside m4-run.sh) -> <run>/h1-runcheck.txt (last line RUNCHECK PASS);
-#   <dir>/h1-runs.tsv one line per run; order.txt before the first run.
+# H1-HOOK v2 (experiments/h1/README.md "Hook contract H1-HOOK v2", reports/H1-main-packet.md v0.3 §2-§3; user decisions
+#   2026-10-18): one block call per round, with this block's precheck, Host gate per lifetime (m4-run.sh), pretouch gate
+#   (start, every lifetime, end), parent-lock check per lifetime, checks and rollback. Env from experiments/h1/hook.sh:
+#   H1MODE r1|cont, H1_N, H1_SEED (loadgen seed of every part), H1_MIXES "<mix>=U=<5|50|90> ..." (u5/u50/u90 =
+#   search/update 95/5, 50/50, 10/90, MOT1 v6, 28M), H1_SETTLE_S (vector DB 60), H1_PARENT_LOCK=H1-main (this block
+#   never locks or unlocks), r1: H1_LEVELS_CMD (+ H1_PLAN H1_W H1_LEVELS_OUT H1_STAGE_DIR for it), cont: H1_LEVELS.
+#   A lifetime = one m4-run.sh KIND=h1 run (one server start incl. initial image / Popcorn preload) with loadgen parts
+#   <lifetime>/slo (full SLO search: ramp, bisect, confirm 3 x 30 s, fill, overload 1.05/1.1/1.2; every step kept) and
+#   <lifetime>/fix (settle = loadgen --warmup-s H1_SETTLE_S at the L2 rate, discarded; then 60 s windows L2, L1).
+#   r1, per mix (mix order shuffle seed "H1-vdb-r1"): hw and pop SLO-only lifetimes (order seed "H1-vdb-r1-<mix>");
+#       mg lifetime: slo part, its h1-runs.tsv line, "$H1_LEVELS_CMD <mix>" -> "<L2> <L1>" (failure = LEVELS STOP: the
+#       block stops, no fixed windows, rollback), fix part at those rates; mgoff lifetime (MEGALON_COH_TIMERS=0, fix
+#       part only, rates from H1_LEVELS_OUT); hw and pop fixed lifetimes (fix part only; order seed "H1-vdb-r1-<mix>-fix").
+#   cont (rounds 2, 3; rates = H1_LEVELS L2_rate / L1_rate), per mix (order seed "H1-vdb-r<N>"): hw, pop, mg in the
+#       Latin order shuffle("H1-vdb-latin") rotated by N, each one lifetime slo + fix; mgoff (fix only) right after mg.
+#   Per lifetime <lifetime>/h1-runcheck.txt (last line RUNCHECK PASS[ (NOTE: ...)]); <dir>/h1-runs.tsv 8 columns
+#   name system mix phase round run_dir(<lifetime>/<part>) steps(- | <L2 step>,<L1 step>) lifetime(sep|cont).
+#   A loadgen "confirm failed at three rates" note in a slo part is a NOTE (block continues). E1 wait timeouts on
+#   overload steps are recorded (timeouts.txt), not failures; every other check failure stops the block.
 # usage: v6-block.sh <evidence dir (exists, holds only sequence* files)>
 # env (required, set by the packet's sequence.sh): KPOP GTPOP CPOP (Popcorn release, guest tools, deploy bundle),
 #   PLAIN_BUILD VPLAIN (vdb build + guest dir for all-HWcc and Popcorn), MEG_BUILD VMEG MEG_CFG (vdb-megalon build +
@@ -50,8 +53,10 @@ SEED_BASE=20261014 OWNER="VDB-V1"
 if [ -n "${H1MODE:-}" ]; then
   [ "${H1_PARENT_LOCK:-}" = H1-main ] || { echo "SEQUENCE STOP: H1MODE needs H1_PARENT_LOCK=H1-main"; exit 2; }
   [[ "${H1_N:-}" =~ ^[1-9]$ ]] && [[ "${H1_SEED:-}" =~ ^[0-9]+$ ]] || { echo "SEQUENCE STOP: H1_N / H1_SEED"; exit 2; }
-  case $H1MODE in slo) : "${H1_MIXES:?}";; fix) [ -f "${H1_LEVELS:-}" ] || { echo "SEQUENCE STOP: no H1_LEVELS"; exit 2; };;
-    *) echo "SEQUENCE STOP: bad H1MODE"; exit 2;; esac
+  : "${H1_MIXES:?}"; [[ "${H1_SETTLE_S:-}" =~ ^[1-9][0-9]*$ ]] || { echo "SEQUENCE STOP: bad H1_SETTLE_S"; exit 2; }
+  case $H1MODE in r1) : "${H1_LEVELS_CMD:?}" "${H1_LEVELS_OUT:?}";;
+    cont) [ -f "${H1_LEVELS:-}" ] || { echo "SEQUENCE STOP: no H1_LEVELS"; exit 2; };;
+    *) echo "SEQUENCE STOP: bad H1MODE (H1-HOOK v2: r1 | cont)"; exit 2;; esac
   PARENT_LOCK=$H1_PARENT_LOCK OWNER="H1-vdb-$H1MODE-r$H1_N"
 fi
 for b in "$PLAIN_BUILD" "$MEG_BUILD" "$LOADGEN_BUILD"; do
@@ -102,62 +107,90 @@ one() {  # <sys> <name> <run-specific env...>
              XENV=ENV:MEGALON_COH_TIMERS=0 "$@";;
   esac
 }
-# H1 hook helpers
-h1_runcheck() {  # <name> <sys> <mix> <phase>: per-run check record (m4-run.sh stops the block on any failed check)
-  local r=$E/$1 st
-  st=$(grep -h "^M4RUN $1 " "$E/runs.log" | tail -n 1)
-  [[ "$st" =~ ^M4RUN\ $1\ (OK|NOTE) ]] || { echo "SEQUENCE STOP: $1 no M4RUN OK/NOTE"; exit 1; }
-  { echo "# H1 per-run checks $1 (system $2, mix $3, phase $4, round $H1_N, seed $H1_SEED; v6-block.sh H1-HOOK v1)"
+# H1 hook helpers (H1-HOOK v2)
+h1_u() { case $1 in U=5|U=50|U=90) echo ${1#U=};; *) echo "SEQUENCE STOP: bad mix parameter $1" >&2; return 1;; esac; }
+h1_mixu() {  # <mix> -> U from H1_MIXES
+  local spec; for spec in $H1_MIXES; do [ "${spec%%=*}" = "$1" ] && { h1_u "${spec#*=}"; return; }; done
+  echo "SEQUENCE STOP: mix $1 not in H1_MIXES" >&2; return 1
+}
+h1_levels() {  # <levels.tsv> <mix> -> "<L2_rate>,<L1_rate>"
+  awk -F'\t' -v m="$2" 'NR > 1 && $1 == m { print $10 "," $9; f = 1 } END { exit f ? 0 : 1 }' "$1" \
+    | grep -xE '[0-9]+(\.[0-9]+)?,[0-9]+(\.[0-9]+)?' || { echo "SEQUENCE STOP: no levels for $2 in $1" >&2; return 1; }
+}
+h1_line() {  # <sys> <mix> <phase> <lifetime> <life sep|cont>
+  local st=- r=$E/$4/$3
+  [ $3 = fix ] && { st=$(cat $r/h1-steps.txt 2>/dev/null); [[ $st =~ ^[0-9]+,[0-9]+$ ]] || { echo "SEQUENCE STOP: $4 fix steps"; exit 1; }; }
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$1-$2-$3-r$H1_N" "$1" "$2" "$3" "$H1_N" "$4/$3" "$st" "$5" >> "$E/h1-runs.tsv"
+}
+h1_runcheck() {  # <lifetime> <sys> <mix> <parts>: per-lifetime record (m4-run.sh stopped the block on any failed check)
+  local L=$1 r=$E/$1 st p
+  st=$(grep -h "^M4RUN $L " "$E/runs.log" | tail -n 1)
+  [[ "$st" =~ ^M4RUN\ $L\ (OK|NOTE) ]] || { echo "SEQUENCE STOP: $L no M4RUN OK/NOTE"; exit 1; }
+  { echo "# H1 per-lifetime checks $L (system $2, mix $3, parts $4, round $H1_N, seed $H1_SEED, settle ${H1_SETTLE_S}s; v6-block.sh H1-HOOK v2)"
     echo "$st"
     for k in 0 1; do echo "node$k: $(grep -c '^bad_records=0$' $r/node$k.log) x bad_records=0, $(grep -c 'vdb-server: stopping' $r/node$k.log) x stopping, $(grep -h '^opcoh.read_errors=\|^opcoh.register_errors=' $r/node$k.log | tr '\n' ' ')"; done
-    echo "opcoh_check: $(tail -n 1 $r/opcoh-check.txt)"
-    echo "opsplit: $(tail -n 1 $r/opsplit.log | cut -c1-300)"
-    echo "e1: $(head -n 3 $r/e1.e1.txt 2>/dev/null | tr '\n' ' ')"
-    echo "loadgen: $(python3 -I -c 'import json,sys; s=json.load(open(sys.argv[1])); print("workload_finish", s.get("workload_finish"), "note", repr(s.get("note", "")))' $r/loadgen/summary.json)"
+    for p in $4; do
+      echo "[$p] opcoh_check: $(tail -n 1 $r/$p/opcoh-check.txt)"
+      echo "[$p] opsplit: $(tail -n 1 $r/$p/opsplit.log | cut -c1-300)"
+      echo "[$p] e1: $(head -n 3 $r/$p/e1.e1.txt 2>/dev/null | tr '\n' ' ')"
+      echo "[$p] loadgen: $(python3 -I -c 'import json,sys; s=json.load(open(sys.argv[1])); print("workload_finish", s.get("workload_finish"), "note", repr(s.get("note", "")))' $r/$p/loadgen/summary.json)"
+      [ $p = fix ] && echo "[$p] steps L2,L1: $(cat $r/$p/h1-steps.txt)"
+    done
     echo "kernel: $(grep -h '^node0=' $r/manifest.txt)"
   } > $r/h1-runcheck.txt
-  grep -q "^opcoh_check: OPCOH_CHECK PASS" $r/h1-runcheck.txt && [ -f $r/opsplit-steps.csv ] \
-    && grep -q "workload_finish ok" $r/h1-runcheck.txt || { echo "SEQUENCE STOP: $1 run checks incomplete"; exit 1; }
+  for p in $4; do
+    grep -q "^\[$p\] opcoh_check: OPCOH_CHECK PASS" $r/h1-runcheck.txt && [ -f $r/$p/opsplit-steps.csv ] \
+      && grep -q "^\[$p\] loadgen: workload_finish ok" $r/h1-runcheck.txt || { echo "SEQUENCE STOP: $L run checks incomplete ($p)"; exit 1; }
+  done
   if [[ "$st" =~ \ NOTE ]]; then echo "RUNCHECK PASS (NOTE: ${st#* NOTE })" >> $r/h1-runcheck.txt
   else echo "RUNCHECK PASS" >> $r/h1-runcheck.txt; fi
-  printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$1" "$2" "$3" "$4" "$H1_N" "$1" >> "$E/h1-runs.tsv"
 }
-h1_u() { case $1 in U=5|U=50|U=90) echo ${1#U=};; *) echo "SEQUENCE STOP: bad mix parameter $1" >&2; return 1;; esac; }
-h1_run() {  # <sys> <mix> <phase> <env...>
-  local s=$1 m=$2 ph=$3 name=$1-$2-$3-r$H1_N; shift 3
+h1_life() {  # <sys> <mix> <lifetime name> <parts "slo"|"slo fix"|"fix"> <life sep|cont> <rates "L2,L1" | cb>
+  local s=$1 m=$2 L=$3 parts=$4 life=$5 rates=$6 u x
+  u=$(h1_mixu $m) || exit 1
   parent_lock_check
-  case $s in mg) set -- "$@" OPCOH_CHECK_MODE=megalon-vm;; esac
-  one $s $name SEED=$H1_SEED REP=h1-$ph-r$H1_N "$@"
-  h1_runcheck $name $s $m $ph
+  x=(U=$u KIND=h1 "H1_PARTS=$parts" SETTLE_S=$H1_SETTLE_S SEED=$H1_SEED REP=h1-r$H1_N)
+  case $rates in
+    cb) x+=(RATE= "RATES_CMD=bash $X/h1-rates.sh $E $s $m $L $life $H1_N");;  # r1 mg: slo line + levels callback
+    -) x+=(RATE= RATES_CMD=);;  # slo-only lifetime: no fix part
+    *) x+=(RATE=$rates);;
+  esac
+  case $s in mg) x+=(OPCOH_CHECK_MODE=megalon-vm);; esac
+  one $s $L "${x[@]}" < /dev/null
+  h1_runcheck $L $s $m "$parts"
+  [[ " $parts " == *" slo "* ]] && [ "$rates" != cb ] && h1_line $s $m slo $L $life
+  [[ " $parts " == *" fix "* ]] && h1_line $s $m fix $L $life
+  return 0
 }
 h1_main() {
-  local s m spec u base rot ord mixes line f mix l1 l2 i
-  printf '# name\tsystem\tmix\tphase\tround\trun_dir\n' > "$E/h1-runs.tsv"
-  if [ $H1MODE = slo ]; then
-    base=($(SHUFFLE_SEED=H1-vdb-r1 shuffle hw pop mg)); rot=$(( (H1_N - 1) % 3 ))
-    ord="${base[@]:$rot} ${base[@]:0:$rot}"; ord=$(echo $ord)
-    mixes=""; for spec in $H1_MIXES; do mixes="$mixes ${spec%%=*}"; h1_u "${spec#*=}" > /dev/null || exit 1; done
-    mixes=$(SHUFFLE_SEED=H1-vdb-r$H1_N shuffle $mixes)
-    { echo "# H1 vector DB SLO round $H1_N (systems: base shuffle seed H1-vdb-r1 rotated left by $rot; mixes: shuffle seed H1-vdb-r$H1_N; loadgen seed $H1_SEED)"
-      echo "systems: $ord"; echo "mixes: $mixes"; echo "H1_MIXES: $H1_MIXES"; } | tee "$E/order.txt"
-    for s in $ord; do
-      for m in $mixes; do
-        for spec in $H1_MIXES; do [ "${spec%%=*}" = $m ] && u=$(h1_u "${spec#*=}"); done
-        h1_run $s $m slo U=$u KIND=slo
-      done
+  local m s mixes base rot ord rates
+  printf '# name\tsystem\tmix\tphase\tround\trun_dir\tsteps\tlifetime\n' > "$E/h1-runs.tsv"
+  mixes=""; for spec in $H1_MIXES; do mixes="$mixes ${spec%%=*}"; h1_u "${spec#*=}" > /dev/null || exit 1; done
+  mixes=$(SHUFFLE_SEED=H1-vdb-r$H1_N shuffle $mixes)
+  if [ $H1MODE = r1 ]; then
+    { echo "# H1 vector DB r1 (H1-HOOK v2; mixes: shuffle seed H1-vdb-r1; loadgen seed $H1_SEED; settle ${H1_SETTLE_S}s)"
+      echo "mixes: $mixes"
+      for m in $mixes; do echo "$m: slo $(SHUFFLE_SEED=H1-vdb-r1-$m shuffle hw pop) mg(slo+levels+fix) mgoff(fix) fix $(SHUFFLE_SEED=H1-vdb-r1-$m-fix shuffle hw pop)"; done
+    } | tee "$E/order.txt"
+    for m in $mixes; do
+      for s in $(SHUFFLE_SEED=H1-vdb-r1-$m shuffle hw pop); do h1_life $s $m $s-$m-slo-r1 slo sep -; done
+      h1_life mg $m mg-$m-r1 "slo fix" cont cb
+      rates=$(h1_levels "$H1_LEVELS_OUT" $m) || exit 1
+      h1_life mgoff $m mgoff-$m-fix-r1 fix sep $rates
+      for s in $(SHUFFLE_SEED=H1-vdb-r1-$m-fix shuffle hw pop); do h1_life $s $m $s-$m-fix-r1 fix sep $rates; done
     done
   else
-    { echo "# H1 vector DB fixed phase rep $H1_N (levels $H1_LEVELS; systems per mix: shuffle seed H1-vdb-fix-r$H1_N-<mix>; loadgen seed $H1_SEED; windows L2 then L1)"
-      tail -n +2 "$H1_LEVELS" | while IFS=$'\t' read -r mix f; do
-        echo "$mix: $(SHUFFLE_SEED=H1-vdb-fix-r$H1_N-$mix shuffle hw pop mg mgoff)"; done; } | tee "$E/order.txt"
-    while IFS=$'\t' read -r -a f; do
-      mix=${f[0]} l1=${f[8]} l2=${f[9]}
-      u=$(h1_u "U=${mix#u}") || exit 1
-      [[ $l1 =~ ^[0-9]+(\.[0-9]+)?$ ]] && [[ $l2 =~ ^[0-9]+(\.[0-9]+)?$ ]] || { echo "SEQUENCE STOP: levels $mix rates"; exit 1; }
-      for s in $(SHUFFLE_SEED=H1-vdb-fix-r$H1_N-$mix shuffle hw pop mg mgoff); do
-        h1_run $s $mix fix U=$u KIND=fixed RATE=$l2,$l1 < /dev/null
+    base=($(SHUFFLE_SEED=H1-vdb-latin shuffle hw pop mg)); rot=$(( H1_N % 3 ))
+    ord="${base[@]:$rot} ${base[@]:0:$rot}"; ord=$(echo $ord)
+    { echo "# H1 vector DB round $H1_N cont (H1-HOOK v2; systems: shuffle seed H1-vdb-latin rotated by $H1_N; mixes: shuffle seed H1-vdb-r$H1_N; mgoff right after mg; loadgen seed $H1_SEED; settle ${H1_SETTLE_S}s; levels $H1_LEVELS)"
+      echo "systems: $ord"; echo "mixes: $mixes"; } | tee "$E/order.txt"
+    for m in $mixes; do
+      rates=$(h1_levels "$H1_LEVELS" $m) || exit 1
+      for s in $ord; do
+        h1_life $s $m $s-$m-r$H1_N "slo fix" cont $rates
+        [ $s = mg ] && h1_life mgoff $m mgoff-$m-fix-r$H1_N fix sep $rates
       done
-    done < <(tail -n +2 "$H1_LEVELS")
+    done
   fi
 }
 block_start

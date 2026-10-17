@@ -6,6 +6,12 @@
 #   search/update 95/5, 50/50, 10/90 = U 5, 50, 90; H2 shares 0/5/10/20/50),
 #   KIND: functional | slo (MOT1 step 1) | fixed (step 2, 60 s) | pslo (pilot SLO search: steps 2 s + 8 s, confirm
 #   1 x 15 s, no fill/overload) | pfix (pilot fixed load, 30 s)
+#   KIND=h1 (H1-HOOK v2, one server lifetime with loadgen parts, run.sh PARTS): H1_PARTS "slo" | "slo fix" | "fix";
+#     part slo = the KIND=slo search; part fix = settle (loadgen --warmup-s SETTLE_S at the first rate, discarded) +
+#     60 s windows at L2 then L1 (KIND=fixed step lengths), rates RATE="<L2>,<L1>" or, if RATE is empty, from RATES_CMD
+#     ("<L2> <L1>" on stdout, run inside the lifetime after the slo part; failure = "M4RUN <name> STOP LEVELS STOP").
+#     Checks per part dir <run>/<part> (opsplit, opcoh_check with OPCOH_PARTS = all parts, E1, loadgen finish; NOTE
+#     only for the slo part); fix parts get <run>/fix/h1-steps.txt "<L2 step>,<L1 step>" (measured fixed steps).
 #   KIND=fixed|pfix: RATE (total req/s of the scaled streams = L / (1 - U/100)); TRACE (0 | 1, default 0; Megalon only)
 #   DATASET: 28m (default: pubmed-a27m-b1m-q10k, image seg32c32m-a27m) | 1m (pubmed-a1m-b1m-q10k, writes
 #   writes-a1m-b1m-u1m.bin, image seg32c32m)
@@ -94,6 +100,15 @@ case "$KIND" in
             --step-measure-s 8 --confirm-s 15 --confirm-reps 1 --fill none --overload none);;
   pfix) : "${RATE:?}"; LG+=(--raw --mode fixed --rates "$RATE" --warmup-s 10 --step-warmup-s 5 --step-measure-s 30
             --drain-s 10);;
+  h1) [[ "${H1_PARTS:-}" =~ ^(slo|slo\ fix|fix)$ ]] || stop "bad H1_PARTS"
+      [[ "${SETTLE_S:-}" =~ ^[1-9][0-9]*$ ]] || stop "bad SETTLE_S"
+      if [ "$H1_PARTS" = slo ]; then [ -z "${RATE:-}" ] && [ -z "${RATES_CMD:-}" ] || stop "slo-only lifetime takes no rates"
+      elif [ -n "${RATE:-}" ]; then [[ $RATE =~ ^[0-9]+(\.[0-9]+)?,[0-9]+(\.[0-9]+)?$ ]] && [ -z "${RATES_CMD:-}" ] || stop "bad RATE"
+      else [ -n "${RATES_CMD:-}" ] && [ "$H1_PARTS" = "slo fix" ] || stop "RATES_CMD needs H1_PARTS='slo fix'"; fi
+      LG+=(--raw)
+      export PARTS=$H1_PARTS PART_RATES=${RATE:-} PART_RATES_CMD=${RATES_CMD:-}
+      export PART_ARGS_slo="--mode slo --start 10 --factor 1.5 --precision 0.05 --max-steps 25 --warmup-s 10 --step-warmup-s 3 --step-measure-s 15 --confirm-s 30 --confirm-reps 3"
+      export PART_ARGS_fix="--mode fixed --rates @RATES@ --warmup-s $SETTLE_S --step-warmup-s 10 --step-measure-s 60 --drain-s 10";;
   *) stop "bad KIND";;
 esac
 SSH="ssh -o BatchMode=yes -o ConnectTimeout=8"
@@ -153,6 +168,7 @@ if [ "$SYS" = Popcorn ]; then  # P-popcorn-deploy §6a cycle (bundle C8, build >
 fi
 bash $X/run.sh "$NAME" "$E" -- "${LG[@]}"
 RC=$?
+LEVELS=0; [ "$KIND" = h1 ] && [ $RC = 5 ] && LEVELS=1
 if [ "$SYS" = Popcorn ]; then
   env "${PS[@]}" STATUS_TAG=post bash $C8/p-popcorn-shm.sh status
   servers_gone || stop "servers left (Popcorn teardown not attempted)"
@@ -179,6 +195,7 @@ if [ -n "${QCOH_EXPECT:-}" ]; then  # per-query coherence (DESIGN.md §14)
     || stop "search responses without a coherence block"
   python3 $X/qcoh.py $R > $R/qcoh.log 2>&1 || echo "M4RUN $NAME: qcoh.py failed (analysis only; see $R/qcoh.log)"
 fi
+[ $LEVELS = 0 ] || stop "LEVELS STOP (rates command failed inside the lifetime; servers stopped, see $R/manifest.txt)"
 if [ -n "${OPCOH_EXPECT:-}" ]; then  # per-operation time split (vdb build >= 10, DESIGN.md §15)
   for k in 0 1; do
     grep -q "^vdb-server: op coherence on," $R/node$k.log || stop "node$k: op coherence not on"
@@ -188,22 +205,39 @@ if [ -n "${OPCOH_EXPECT:-}" ]; then  # per-operation time split (vdb build >= 10
     esac
     { grep -qx "opcoh.read_errors=0" $R/node$k.log && grep -qx "opcoh.register_errors=0" $R/node$k.log; } || stop "node$k: opcoh read/register errors"
   done
-  { grep -qx "ok_without_coh=0" $R/loadgen/vectordb.txt && grep -qx "updates_ok_without_coh=0" $R/loadgen/vectordb.txt &&
-    grep -qx "bad_coh_version=0" $R/loadgen/vectordb.txt; } || stop "responses without an op coherence block"
-  python3 $X/opsplit.py $R > $R/opsplit.log 2>&1 || stop "opsplit.py failed (see $R/opsplit.log)"
-  if [ -n "${OPCOH_CHECK_MODE:-}" ]; then
-    python3 $P/CXL_SWMC/workloads/vectordb/tests/opcoh_check.py $R $OPCOH_CHECK_MODE > $R/opcoh-check.txt 2>&1
-    grep -q "^OPCOH_CHECK PASS" $R/opcoh-check.txt || stop "opcoh_check $OPCOH_CHECK_MODE (see $R/opcoh-check.txt)"
+fi
+# per loadgen output dir checks (KIND=h1: per part dir; closure of opcoh_check over every part of the lifetime)
+PDIRS=$R; [ "$KIND" = h1 ] && PDIRS=$(for p in $H1_PARTS; do echo -n "$R/$p "; done)
+NOTES=""
+for RP in $PDIRS; do
+  [ -s $RP/loadgen/summary.json ] || stop "no loadgen output in $RP (lifetime stopped early?)"
+  if [ -n "${OPCOH_EXPECT:-}" ]; then
+    { grep -qx "ok_without_coh=0" $RP/loadgen/vectordb.txt && grep -qx "updates_ok_without_coh=0" $RP/loadgen/vectordb.txt &&
+      grep -qx "bad_coh_version=0" $RP/loadgen/vectordb.txt; } || stop "responses without an op coherence block ($RP)"
+    python3 $X/opsplit.py $RP > $RP/opsplit.log 2>&1 || stop "opsplit.py failed (see $RP/opsplit.log)"
+    if [ -n "${OPCOH_CHECK_MODE:-}" ]; then
+      OPCOH_PARTS="$PDIRS" python3 $P/CXL_SWMC/workloads/vectordb/tests/opcoh_check.py $RP $OPCOH_CHECK_MODE > $RP/opcoh-check.txt 2>&1
+      grep -q "^OPCOH_CHECK PASS" $RP/opcoh-check.txt || stop "opcoh_check $OPCOH_CHECK_MODE (see $RP/opcoh-check.txt)"
+    fi
   fi
-fi
-python3 $X/e1_check.py --writes $W --na $NA --nb $NB --searches $R/loadgen/searches.bin --out $R/e1 --sample 500 > /dev/null \
-  || stop "E1 violation (see $R/e1.e1.txt)"
-grep -q "workload_finish\":\"ok" $R/loadgen/summary.json || stop "loadgen workload finish"
-if [ $RC != 0 ]; then
-  note=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["note"])' $R/loadgen/summary.json 2>/dev/null)
-  [[ $KIND =~ ^p?slo$ ]] && [ "$note" = "confirm failed at three rates; the knee is noisy (longer --confirm-s?)" ] \
-    && { echo "M4RUN $NAME NOTE $note"; exit 0; }
-  stop "run.sh rc $RC ($note)"
-fi
+  python3 $X/e1_check.py --writes $W --na $NA --nb $NB --searches $RP/loadgen/searches.bin --out $RP/e1 --sample 500 > /dev/null \
+    || stop "E1 violation (see $RP/e1.e1.txt)"
+  grep -q "workload_finish\":\"ok" $RP/loadgen/summary.json || stop "loadgen workload finish ($RP)"
+  note=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["note"])' $RP/loadgen/summary.json 2>/dev/null)
+  if [ -n "$note" ]; then
+    { [[ $KIND =~ ^p?slo$ ]] || { [ "$KIND" = h1 ] && [ "${RP##*/}" = slo ]; }; } \
+      && [ "$note" = "confirm failed at three rates; the knee is noisy (longer --confirm-s?)" ] || stop "loadgen note ($RP): $note"
+    NOTES="$NOTES ${RP##*/}: $note"
+  fi
+  if [ "$KIND" = h1 ] && [ "${RP##*/}" = fix ]; then  # the two measured fixed steps: L2 then L1
+    python3 -I - $RP/loadgen/steps.jsonl > $RP/h1-steps.txt <<'PY' || stop "fix part steps ($RP)"
+import json, sys
+st = [s for s in map(json.loads, open(sys.argv[1])) if s.get("measure_s", 0) > 0 and s.get("phase") == "fixed"]
+assert len(st) == 2, f"{len(st)} measured fixed steps"
+print(f"{st[0]['step']},{st[1]['step']}")
+PY
+  fi
+done
+if [ $RC != 0 ] && [ -z "$NOTES" ]; then stop "run.sh rc $RC"; fi
 [ "$KIND" = functional ] && ! grep -q '"pass":true' $R/loadgen/steps.jsonl && stop "functional step not PASS"
-echo "M4RUN $NAME OK"
+if [ -n "$NOTES" ]; then echo "M4RUN $NAME NOTE${NOTES}"; else echo "M4RUN $NAME OK"; fi

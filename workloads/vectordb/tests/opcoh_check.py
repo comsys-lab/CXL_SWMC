@@ -3,6 +3,11 @@
 
 usage: opcoh_check.py <run or scratch dir> fake|megalon|none|hwcc|popcorn|megalon-vm|megalon-t0
   (host_smoke.sh scratch dirs and run.sh run dirs have the same layout: loadgen/, node<k>.log)
+  H1-HOOK v2 parts (several loadgen invocations in one server lifetime, run.sh PARTS): <dir> = one part dir
+  (<lifetime>/<part>/loadgen); node<k>.log is read from <dir>, else from its parent (the lifetime dir). The server's
+  totals at stop cover the whole lifetime, so the closure checks (opt.<op>.* = records' sums, one update record per
+  update) use the records of every part named in OPCOH_PARTS (space-separated part dirs of the lifetime, default
+  <dir>); every other check uses <dir>'s records only.
   every mode: one v2 record per OK search response (op-coh.bin vs searches.bin, joined by seq) and per OK update
               (vectordb.txt updates_ok_without_coh=0, records = server updates); search sections = segments + 1,
               update sections = 1; t_ns > 0; c_ns = Popcorn parts + Megalon parts (proto.h RD / EV / WR: Megalon >= 76
@@ -71,17 +76,26 @@ lg = os.path.join(S, "loadgen")
 logs = np.fromfile(os.path.join(lg, "op-coh.bin"), dtype=opsplit.OPLOG)
 sr = np.fromfile(os.path.join(lg, "searches.bin"), dtype=qcoh.search_dtype(10))
 ok = sr[sr["status"] == 0]
-st = [final_stats(os.path.join(S, f"node{k}.log")) for k in (0, 1)]
+def node_log(k):
+    p = os.path.join(S, f"node{k}.log")
+    return p if os.path.exists(p) else os.path.join(os.path.dirname(os.path.abspath(S)), f"node{k}.log")
+
+
+st = [final_stats(node_log(k)) for k in (0, 1)]
 vt = dict(x.strip().split("=", 1) for x in open(os.path.join(lg, "vectordb.txt")) if "=" in x)
 c = logs["c"]
 srch, upd = logs[logs["op"] == 3], logs[logs["op"] == 4]
 cs, cu = srch["c"], upd["c"]
+parts = os.environ.get("OPCOH_PARTS", "").split() or [S]
+assert os.path.abspath(S) in [os.path.abspath(x) for x in parts], "OPCOH_PARTS must include the checked part"
+alll = np.concatenate([np.fromfile(os.path.join(x, "loadgen", "op-coh.bin"), dtype=opsplit.OPLOG) for x in parts])
+acs, acu = alll[alll["op"] == 3]["c"], alll[alll["op"] == 4]["c"]  # closure: every part of the lifetime
 print(f"op records {len(logs)} (search {len(srch)}, update {len(upd)}), OK searches {len(ok)}, "
       f"server updates {sum(s['updates'] for s in st)}")
 check(len(logs) and (c["version"] == 2).all(), "version 2")
 check(np.array_equal(np.sort(srch["seq"]), np.sort(ok["seq"])), "one search record per OK search response")
 check(vt.get("updates_ok_without_coh") == "0" and vt.get("bad_coh_version") == "0", "no response without a v2 block")
-check(len(upd) == sum(s["updates"] for s in st) and len(upd) > 0, "one update record per update")
+check(len(acu) == sum(s["updates"] for s in st) and len(upd) > 0, "one update record per update")
 seg = int(ok["segs"][0]) if len(ok) else 0
 check((cs["sections"] == seg + 1).all() and (cu["sections"] == 1).all(), "sections")
 check((c["t_ns"] > 0).all(), "t_ns > 0")
@@ -121,18 +135,18 @@ if lean_r.any():
     rz = lr[(lr["mg_check_sampled"] == 0) & ((lr["src"] & 32) == 0)]
     check(all((rz[f] == 0).all() for f in ("mg_stale_ns", "mg_concur_ns", "mg_meta_ns", "mg_spin_ns")),
           "lean: no read-side event time without timed read sections")
-for op, x in (("search", cs), ("update", cu)):
+for op, x in (("search", acs), ("update", acu)):
     tot = lambda k: sum(s[f"opt.{op}.{k}"] for s in st)  # noqa: E731
     check(tot("ops") == len(x), f"opt.{op}.ops = records")
     for k, v in (("t_ns", x["t_ns"]), ("c_ns", x["c_ns"]), ("mod_bytes", x["mod_bytes"]), ("pop.is_ns", x["pf_ns"][:, 0]),
                  ("pop.sm_ns", x["pf_ns"][:, 1]), ("pop.ipi_ns", x["ipi_ns"]), ("meg.wflush_bytes", x["mg_wflush_bytes"])):
         check(tot(k) == int(v.astype(np.uint64).sum()), f"opt.{op}.{k} = records' sum ({tot(k)} vs {int(v.sum())})")
-for op, x in (("search", cs), ("update", cu)):
+for op, x in (("search", acs), ("update", acu)):
     check(sum(s[f"opt.{op}.meg.vcopy_cnt"] for s in st) == int(x["vcopy_cnt"].astype(np.uint64).sum()), f"opt.{op}.meg.vcopy_cnt")
 check(all(s["opcoh.read_errors"] == 0 and s["opcoh.register_errors"] == 0 for s in st), "no counter read/register errors")
 check((cs["mod_bytes"] == 0).all(), "search mod_bytes 0")
 check((cs["wait_ns"] <= cs["t_ns"]).all() and (cu["wait_ns"] == 0).all(), "E1 wait inside search T, 0 for updates")
-for op, x in (("search", cs), ("update", cu)):
+for op, x in (("search", acs), ("update", acu)):
     check(sum(s[f"opt.{op}.wait_ns"] for s in st) == int(x["wait_ns"].sum()), f"opt.{op}.wait_ns = records' sum")
 check((cu["mod_bytes"] >= 3136 + 192 + 64).all(), "update mod_bytes >= record + level-0 block + delete-log entry")
 by = {int(q): i for i, q in enumerate(ok["seq"])}
@@ -145,7 +159,7 @@ if mode == "fake":
     check((cu["nontrans_ns"] == 500).all() and (cu["nontrans_cnt"] == 1).all() and (cs["nontrans_ns"] == 0).all(),
           "update fake no-transition 500 ns")
     check((cu["c_ns"] == 1000).all(), "no-transition faults are not part of C")
-    check(sum(s["opt.update.pop.nontrans_ns"] for s in st) == 500 * len(cu), "opt.update.pop.nontrans_ns")
+    check(sum(s["opt.update.pop.nontrans_ns"] for s in st) == 500 * len(acu), "opt.update.pop.nontrans_ns")
 pop_zero = ((c["pf_ns"] == 0).all() and (c["pf_cnt"] == 0).all() and (c["ipi_ns"] == 0).all()
             and (c["nontrans_ns"] == 0).all())
 mg_fields = [f for f in opsplit.OPCOH.names if f.startswith("mg_") or f.startswith("an_") or f.startswith("vcopy")]
@@ -181,7 +195,7 @@ elif mode == "megalon":
             timed_w = cu[cu["mg_write_sampled"] > 0] if lean_r.any() else cu
             check(((c["src"] & 8) == 8).all() and len(timed_w) > 0 and (timed_w["an_write_lookup_ns"] > 0).all() and
                   c["an_read_nr_ns_sampled"].sum() > 0, "AnchorSnap values present")
-            for op, x in (("search", cs), ("update", cu)):
+            for op, x in (("search", acs), ("update", acu)):
                 for f in ("read_lookup_ns_sampled", "write_nr_ns", "write_sampled"):
                     rec = "mg_write_sampled" if f == "write_sampled" else "an_" + f
                     if f == "write_sampled" and not all(f"opt.{op}.meg.anchor.{f}" in s for s in st):

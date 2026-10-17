@@ -4,7 +4,11 @@
 // write made before it, i.e. the insert's w_seq of the last update scheduled before it). The writes file must come
 // from tools/gen_writes.py --mode update (checked at init); an update counts as one request/operation.
 // Options: data=DIR (pool_b.fbin, queries.fbin), writes=FILE (tools/gen_writes.py), k=10, seed=N,
-//          max_searches=N (default 100M; result slots are allocated in chunks as used).
+//          max_searches=N (default 100M; result slots are allocated in chunks as used),
+//          w_start=N (default 0): first writes-file record of this invocation (even = an update boundary). A second
+//          loadgen invocation inside the same server lifetime (H1-HOOK v2 parts) continues the update stream where the
+//          previous one stopped (its vectordb.txt next_w), since the server accepts each id's writes only once and in
+//          w_seq order; searches start with E1 snapshot ref_w = w_seq of record N-1.
 // Output: <out>/searches.bin, one record per search response (header struct below + ids[k] u64 + scores[k] f32),
 //         for offline recall (tools/compute_gt.py), <out>/op-coh.bin, one OpLog per OK search or update response
 //         that carries the server's per-operation block (proto.h OpCoh v2; DESIGN.md §15; parsed by
@@ -101,6 +105,7 @@ class VectorDb : public loadgen::Workload {
     k_ = uint16_t(std::stoul(get("k", "10")));
     seed_ = std::stoull(get("seed", "20261015"));
     max_searches_ = std::stoull(get("max_searches", "100000000"));
+    w_start_ = std::stoull(get("w_start", "0"));
     rng_.seed(seed_);
     if (!pool_b_.open(data + "/pool_b.fbin", err) || !queries_.open(data + "/queries.fbin", err)) return false;
     if (pool_b_.dim != queries_.dim) return *err = "pool B / queries dim differ", false;
@@ -123,6 +128,10 @@ class VectorDb : public loadgen::Workload {
                       " targets", false;
     }
     if (!check_pairs(writes_, err)) return false;
+    if (w_start_ % 2 || w_start_ > writes_.size())
+      return *err = "w_start " + std::to_string(w_start_) + " is odd or beyond the writes file", false;
+    next_w_ = w_start_;
+    last_w_ = w_start_ ? writes_[w_start_ - 1].w_seq : 0;
     chunks_.reset(new std::atomic<Slot *>[kMaxChunks]);
     for (uint64_t i = 0; i < kMaxChunks; i++) chunks_[i].store(nullptr);
     writes_path_ = writes, data_ = data;
@@ -258,10 +267,12 @@ class VectorDb : public loadgen::Workload {
     }
     std::fclose(cf);
     FILE *t = std::fopen((dir + "/vectordb.txt").c_str(), "w");
-    std::fprintf(t, "updates_made=%lu\nwrites_made=%lu\nlast_w=%u\nsearches_made=%lu\nwrite_errors=%lu\n"
+    // updates_made / writes_made: this invocation; w_start / next_w: absolute writes-file record indices
+    std::fprintf(t, "updates_made=%lu\nwrites_made=%lu\nw_start=%lu\nnext_w=%lu\nlast_w=%u\nsearches_made=%lu\nwrite_errors=%lu\n"
                  "bad_search_responses=%lu\nsearch_record_bytes=%zu\nk=%u\ncoh_records=%zu\ncoh_record_bytes=%zu\n"
                  "ok_without_coh=%lu\nupdates_ok_without_coh=%lu\nbad_coh_version=%lu\n",
-                 (unsigned long)(next_w_ / 2), (unsigned long)next_w_, last_w_, (unsigned long)next_s_,
+                 (unsigned long)((next_w_ - w_start_) / 2), (unsigned long)(next_w_ - w_start_),
+                 (unsigned long)w_start_, (unsigned long)next_w_, last_w_, (unsigned long)next_s_,
                  (unsigned long)write_errors_.load(),
                  (unsigned long)bad_responses_.load(), sizeof(SearchLog) + size_t(k_) * 12, k_, coh_.size(),
                  sizeof(OpLog), (unsigned long)no_coh_.load(), (unsigned long)no_coh_update_.load(),
@@ -273,7 +284,8 @@ class VectorDb : public loadgen::Workload {
 
   std::string describe() const override {
     return "vectordb data=" + data_ + " writes=" + writes_path_ + " (" + std::to_string(writes_.size()) +
-           " records, update pairs) k=" + std::to_string(k_) + " seed=" + std::to_string(seed_) + " dim=" + std::to_string(dim_);
+           " records, update pairs) k=" + std::to_string(k_) + " seed=" + std::to_string(seed_) + " dim=" + std::to_string(dim_) +
+           " w_start=" + std::to_string(w_start_);
   }
 
  private:
@@ -294,7 +306,7 @@ class VectorDb : public loadgen::Workload {
 
   uint32_t targets_ = 1, dim_ = 0, last_w_ = 0;
   uint16_t k_ = 10;
-  uint64_t seed_ = 0, max_searches_ = 0, next_w_ = 0, next_s_ = 0;
+  uint64_t seed_ = 0, max_searches_ = 0, next_w_ = 0, next_s_ = 0, w_start_ = 0;
   std::mt19937_64 rng_;
   Fbin pool_b_, queries_;
   std::vector<WriteRec> writes_;
