@@ -1,15 +1,15 @@
-// recsys backends (DESIGN.md §7): where the slots live and which coherence actions wrap each slot access.
-//   plain   all-HWcc and Popcorn: open-addressing tables at fixed SWcc offsets (slots), direct loads/stores. The
-//           application indexes rows itself (linear probing) and guards row copies with the HWcc striped version
-//           table (MemC3, S = 2^16) in server.cc: HWcc and Popcorn give coherence, not multi-line row atomicity.
-//   megalon Megalon-native (user decision 2026-10-18, reports/H1-workload-porting.md Q11/Q12): one Megalon object
-//           per row, object id = (table, row) = the key, found by Megalon's own index as in the artifact KV store.
-//           A lookup is one read section on the row's object (no probing, no empty-slot objects) and the section
-//           itself validates the copy, so server.cc skips the striped version table on this backend.
-// kRowObjects selects the addressing: false = index s is a slot of table k, true = index s is a row of table k.
+// recsys backends (DESIGN.md §7): where the row records live and which coherence actions wrap each record access.
+// Addressing is the same in every system (user decision 2026-10-18, reports/H1-workload-porting.md Q11/Q12): the key
+// names its row, row r of table k is record (k, r); no hash table, no probing, no empty records.
+//   plain   all-HWcc and Popcorn: records at SWcc offset (row_base[k] + r) * slot_bytes, direct loads/stores.
+//           Consistency of a 9-line row copy is the application's job (kAppSeqlock): HWcc and Popcorn give coherence,
+//           not multi-line atomicity, so server.cc wraps record accesses in the HWcc striped version table (MemC3).
+//   megalon one Megalon object per row, object id = (table, row), found by Megalon's own index as in the artifact KV
+//           store. Every record access is one read/write section; the section validates/locks the object itself, so
+//           server.cc skips the striped version table (kAppSeqlock = false).
 // Interface used by server.cc (Server<Backend>): fits, name, usage, stats, thread_init(tid), create_objects (node 0),
-// check_objects (every node), read_slot(k, s, f) (f(const uint8_t *slot) may run more than once and must only
-// produce its result), write_slot(k, s, fill) (fill(uint8_t *slot) writes the whole slot, whole lines, reads nothing).
+// check_objects (every node), read_slot(k, r, f) (f(const uint8_t *rec) may run more than once and must only
+// produce its result), write_slot(k, r, fill) (fill(uint8_t *rec) writes the whole record, whole lines, reads nothing).
 #pragma once
 
 #include <dlfcn.h>
@@ -36,7 +36,7 @@ namespace rsys {
 class PlainBackend {
  public:
   static constexpr const char *kLayoutTag = "";
-  static constexpr bool kRowObjects = false;
+  static constexpr bool kAppSeqlock = true;  // MemC3 striped version table in server.cc
   PlainBackend(const cxl::region &r, uint8_t *map, const Params &p) : map_(map), p_(p) {
     base_ = r.swcc.offset;
     end_ = base_ + p.swcc_bytes();
@@ -51,7 +51,7 @@ class PlainBackend {
     return true;
   }
   std::string name() const { return "plain"; }
-  uint8_t *slot(uint32_t k, uint64_t s) const { return map_ + base_ + (p_.slot_base[k] + s) * p_.slot_bytes; }
+  uint8_t *slot(uint32_t k, uint64_t r) const { return map_ + base_ + (p_.row_base[k] + r) * p_.slot_bytes; }
   void thread_init(int, int = 0) const {}
   void set_time_sample(uint32_t) {}
   void (*coh_fn() const)(mshim::CohSnap *) { return nullptr; }  // no user-level coherence (Popcorn: swmc_acct)
@@ -135,8 +135,8 @@ inline uint64_t mono_ns() {
 
 class MegalonBackend {
  public:
-  static constexpr const char *kLayoutTag = " backend=megalon rows";
-  static constexpr bool kRowObjects = true;
+  static constexpr const char *kLayoutTag = " backend=megalon";
+  static constexpr bool kAppSeqlock = false;  // read/write sections
   MegalonBackend(const cxl::region &, uint8_t *, const Params &p, const mshim::Api *api) : p_(p), api_(api) {}
   bool fits(std::string *err) const {
     if (p_.slot_bytes % 64) return *err = "megalon: slot must be whole lines", false;

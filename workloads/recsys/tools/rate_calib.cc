@@ -3,7 +3,7 @@
 // updater does (rows of the first hot[k] multi-hot ids per table, id mod rows; latest-wins dedup per interval) and
 // counts the samples needed until the distinct rows of one interval reach round(F x total rows); repeats for
 // --windows consecutive intervals. rate = mean samples per interval / T. Server parameters must match the run
-// (--row-div, --row-cap, --multi-hot-div, --load-factor do not change rows except row_div/row_cap).
+// (--row-div, --row-cap, --multi-hot-div; only row_div/row_cap change rows).
 // usage: recsys-rate --samples FILE --frac F --t-ms T [--start N (0)] [--windows W (10)] [--row-div N] [--row-cap R]
 //                    [--multi-hot-div N]
 // Prints key=value lines; rate_samples_per_s is the value for loadgen --fixed update=<rate>.

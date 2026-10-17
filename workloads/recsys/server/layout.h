@@ -1,6 +1,8 @@
 // recsys shared layout (DESIGN.md §2-§4, docs/hwcc-contract.md).
-// SWcc: one open-addressing linear-probing hash table per sparse feature; a slot is one cache-line-aligned record
-//   {key, embedding[dim], seq, csum} (576 B for dim 128). Tables are contiguous, table k after table k-1.
+// SWcc: one directly addressed table per sparse feature (user decision 2026-10-18; was open addressing with linear
+//   probing): row r of table k is record row_base[k] + r, one cache-line-aligned record {key, embedding[dim], seq,
+//   csum} (576 B for dim 128; `slot_bytes`). Tables are contiguous, table k after table k-1, no empty records.
+//   Megalon stores the same records as one object per row (backend.h).
 // HWcc (region.app): header, parameter tag, per-node lines, a striped version table (MemC3 NSDI'13 §3.2.1): S = 2^16
 //   u32 counters, row key -> counter hash(table, key) mod S (v6, user 2026-10-16; replaced one word per 64 slots).
 //   Identical in every system.
@@ -43,36 +45,27 @@ struct Params {
   uint32_t dim = 128;
   uint64_t row_cap = 26000000;  // rows per table are min(MLPerf rows, row_cap) (MOT1 §4.2: 5 tables capped at 26M)
   uint64_t row_div = 1;         // test scaling: rows = max(1, min(MLPerf, cap) / row_div)
-  double load_factor = 0.8;     // slots = ceil(rows / load_factor), rounded up to a multiple of slot_round
-  uint32_t slot_round = 64;     // slot count granularity (SWcc layout kept from v5: 167,731,776 slots at full size)
   uint32_t ver_stripes = 1u << 16;  // S: striped version counters (power of two; libcuckoo kMaxNumLocks)
   uint64_t seed = 20261016;     // initial embeddings, multi-hot expansion, model weights
   uint32_t multi_hot_div = 1;   // test scaling of multi-hot sizes (>= 1 each)
   // derived
-  std::vector<uint64_t> rows, slots, slot_base;  // per table; slot_base in slots
-  std::vector<uint64_t> row_base;               // per table: global index of row 0 (row-addressed backends, Megalon)
+  std::vector<uint64_t> rows, row_base;  // per table: rows, global record index of row 0
   std::vector<uint32_t> hot, hot_off;           // ids used per sample per table; offset of table k in Sample::ids
-  uint64_t total_rows = 0, total_slots = 0, slot_bytes = 0;
+  uint64_t total_rows = 0, slot_bytes = 0;  // slot_bytes: size of one row record
   uint32_t lookups_per_sample = 0;
 
   void derive() {
     const auto &R = mlperf_rows();
     const auto &H = mlperf_multi_hot();
-    rows.clear(), slots.clear(), slot_base.clear(), row_base.clear(), hot.clear(), hot_off.clear();
-    total_rows = total_slots = 0;
+    rows.clear(), row_base.clear(), hot.clear(), hot_off.clear();
+    total_rows = 0;
     lookups_per_sample = 0;
     uint32_t off = 0;
     for (uint32_t k = 0; k < kSparse; k++) {
       uint64_t r = std::max<uint64_t>(1, std::min(R[k], row_cap) / row_div);
-      uint64_t s = uint64_t(double(r) / load_factor + 0.999999);
-      if (s <= r) s = r + 1;  // at least one empty slot: a miss terminates
-      s = (s + slot_round - 1) / slot_round * slot_round;
       rows.push_back(r);
-      slots.push_back(s);
-      slot_base.push_back(total_slots);
       row_base.push_back(total_rows);
       total_rows += r;
-      total_slots += s;
       hot.push_back(std::max<uint32_t>(1, H[k] / multi_hot_div));  // the first hot[k] ids of the sample's H[k]
       hot_off.push_back(off);
       off += H[k];
@@ -80,13 +73,13 @@ struct Params {
     }
     slot_bytes = (8 + uint64_t(dim) * 4 + 16 + 63) / 64 * 64;  // key + emb + seq + csum/pad, whole lines
   }
-  uint64_t swcc_bytes() const { return total_slots * slot_bytes; }
+  uint64_t swcc_bytes() const { return total_rows * slot_bytes; }
   std::string describe() const {
     std::ostringstream o;
     o << "nr_nodes=" << nr_nodes << " dim=" << dim << " row_cap=" << row_cap << " row_div=" << row_div
-      << " load_factor=" << load_factor << " slot_round=" << slot_round << " ver_stripes=" << ver_stripes
+      << " addressing=direct ver_stripes=" << ver_stripes
       << " seed=" << seed << " multi_hot_div=" << multi_hot_div
-      << " rows=" << total_rows << " slots=" << total_slots << " slot_bytes=" << slot_bytes
+      << " rows=" << total_rows << " slot_bytes=" << slot_bytes
       << " swcc_bytes=" << swcc_bytes() << " lookups_per_sample=" << lookups_per_sample;
     return o.str();
   }
@@ -96,9 +89,8 @@ struct Params {
   static uint64_t key(uint32_t k, uint64_t row) { return (uint64_t(k) + 1) << 56 | row; }
   static uint32_t key_table(uint64_t key) { return uint32_t(key >> 56) - 1; }
   static uint64_t key_row(uint64_t key) { return key & ((1ull << 56) - 1); }
-  uint64_t home(uint32_t k, uint64_t key) const { return mix64(key ^ seed) % slots[k]; }
-  // Striped version counter of a row (MemC3): hash(table, key) mod S. The key carries the table; a second salt keeps
-  // the stripe independent of the home slot.
+  // Striped version counter of a row (MemC3): hash(table, key) mod S. The key carries the table. Also the update
+  // worker shard (stripe % U) on every backend.
   uint32_t stripe(uint64_t key) const { return uint32_t(mix64(key ^ seed ^ 0x5eed5a17c0ffee11ull) & (ver_stripes - 1)); }
   // Row of the j-th multi-hot id of table k in sample s (MLPerf ids as is; table cap / row_div: id mod rows, D1)
   uint64_t row_of(uint32_t k, const Sample &s, uint32_t j) const { return s.ids[hot_off[k] + j] % rows[k]; }

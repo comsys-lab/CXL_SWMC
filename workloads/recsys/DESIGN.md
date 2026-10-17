@@ -18,21 +18,22 @@ each system's API and measures its coherence actions; it cannot prove a coherenc
   Throughput = serving queries/s; updates/s reported next to it.
 
 ## 2. Tables (SWcc)
-- 26 sparse features, one open-addressing linear-probing hash table each. Rows per table = min(MLPerf rows, 26M)
-  (5 tables capped: raw id mod 26M; recorded deviation D1), 134,184,588 rows in total.
-- Slots per table = ceil(rows / 0.8) rounded up to a multiple of 64: 167,731,776 slots in total.
-- Slot (576 B, 9 whole cache lines): `key u64 | emb fp32[128] | seq u64 | csum u32 | pad`. key = (table + 1) << 56 |
-  row (0 = empty slot); seq = update sequence that wrote the row (0 = initial); csum = FNV over key, seq and emb.
-- 167,731,776 x 576 B = 96,613,502,976 B = 89.98 GiB of the 95.73 GiB SWcc. Tables are contiguous, table k after
-  table k-1 (plain backend); Megalon places them as objects (§7).
-- Slot count rounding (`slot_round` 64) is kept from v5 so the SWcc layout is unchanged (it no longer relates to
-  version words, §4).
-- Hash: home slot = splitmix64(key ^ seed) mod slots; linear probing; lookups stop at the key or an empty slot. Host
-  test: 2.65 probes per lookup at load factor 0.8 (theory 3.0 for hits).
-- Initial image (prepare, node 0, unmeasured): every row 0..rows-1 inserted in row order (placement computed in DRAM,
-  deterministic), every slot (empty ones as zeros) written once with seq 0. Values are synthetic (§5).
-- No deletes and no new ids during a run: every id of the trace maps to a preloaded row (raw id mod rows). The table
-  is a hash table so that new ids could be inserted (MOT1 §1.3); this setup does not exercise inserts.
+- Addressing (user decision 2026-10-18, reports/H1-workload-porting.md Q11/Q12; replaces v5/v6 open addressing with
+  linear probing): every system addresses rows directly. Row r of table k is record (k, r). Plain: SWcc offset
+  (row_base[k] + r) x 576 B. Megalon: one object per row (§7). A lookup reads exactly one record (`probes` =
+  `lookups`). The updater writes rows without resolving a slot. Reason: Megalon finds an object by its id through its
+  own index. With the app hash table kept only on plain, hw would read ~2.7 slots per lookup plus probe in the
+  updater while mg reads one, which biases C_diff = T(mgoff) - T(hw).
+- 26 sparse features, one directly addressed table each. Rows per table = min(MLPerf rows, 26M) (5 tables capped: raw
+  id mod 26M; recorded deviation D1), 134,184,588 rows in total. No empty records.
+- Record (576 B, 9 whole cache lines): `key u64 | emb fp32[128] | seq u64 | csum u32 | pad`. key = (table + 1) << 56 |
+  row (0 = never written); seq = update sequence that wrote the row (0 = initial); csum = FNV over key, seq and emb.
+- 134,184,588 x 576 B = 77,290,322,688 B = 71.98 GiB of the 95.73 GiB SWcc (was 167,731,776 slots, 89.98 GiB). Tables
+  are contiguous, table k after table k-1 (plain backend); Megalon places them as objects (§7).
+- Initial image (prepare, node 0, unmeasured): every row written once with seq 0, deterministic. Values are synthetic
+  (§5). Warm-up reads every record and checks its key and csum.
+- No deletes and no new ids during a run: every id of the trace maps to a preloaded row (raw id mod rows), as in
+  MLPerf's dense tables indexed by id (D3 resolved).
 
 ## 3. Samples and queries (inputs)
 - Sample record v2 (proto.h `Sample`, 908 B; samples.h version 2): 13 dense fp32 as preprocessed by MLPerf/torchrec (log(x + 3):
@@ -48,20 +49,25 @@ each system's API and measures its coherence actions; it cannot prove a coherenc
   MLPerf sizes by a hash (layout.h `synth_multi_hot`, same uniform distribution as MLPerf's table; D2 applies to
   synthetic inputs only).
 
-## 4. Atomicity: striped version table (HWcc app; v6, MemC3 NSDI'13 §3.2.1)
-- `versions`: S = 2^16 u32 counters (`--ver-stripes`, power of two; libcuckoo kMaxNumLocks), 256 KiB; row key ->
-  counter `mix64(key ^ seed ^ salt) & (S - 1)` (the key carries the table). App layout 266,240 B at full size. Replaces
-  v5's one word per 64 slots; SWcc layout unchanged. Same layout in every system; the layout hash includes S.
-- Writer (per row): CAS even -> odd on the row's counter, write the slot through the backend (Megalon: one write
-  section), release-store +2. Update workers own rows by `stripe % U`, so they never share a counter.
-- Reader (MemC3 optimistic): v1 = acquire-load of the looked-up key's counter (spin while odd: `seq_spins`), probe,
-  copy the matching row, acquire fence, v2 == v1 else re-read that slot (`seq_retries`). Slots passed while probing
-  need no check: keys never move and a key field is only rewritten with the same value (no inserts/deletes in a run).
+## 4. Atomicity of a row copy: each system's own mechanism
+- A row is 9 cache lines. HWcc and Popcorn give coherence, not atomicity of a multi-line copy. The plain backend
+  therefore keeps the application's MemC3 striped version table. Megalon's read/write sections already validate and
+  lock the object, so the Megalon backend does not use the table (it is still allocated; layout unchanged).
+- `versions` (HWcc app; v6, MemC3 NSDI'13 §3.2.1): S = 2^16 u32 counters (`--ver-stripes`, power of two; libcuckoo
+  kMaxNumLocks), 256 KiB; row key -> counter `mix64(key ^ seed ^ salt) & (S - 1)` (the key carries the table). App
+  layout 266,240 B at full size; the layout hash includes S. `stripe % U` is also the update-worker shard on every
+  backend, so workers never share a row.
+- Plain writer (per row): CAS even -> odd on the row's counter, write the record, release-store +2.
+- Plain reader (MemC3 optimistic): v1 = acquire-load of the key's counter (spin while odd: `seq_spins`), copy the row,
+  acquire fence, v2 == v1 else re-read the row (`seq_retries`).
 - False retries (`false_retries`, per query and in stats): a retry where the row itself was not rewritten = the
   discarded copy was consistent (csum) and the re-read has the same seq. Approximation: a writer of the same row that
   completed between v1 and the discarded copy is also counted false (window: one 576 B copy).
-- `--verify-rows 1` recomputes csum per hit (`torn_rows`, must be 0). Host evidence (v6): 0 torn rows in every run;
-  `--test-no-seqlock` (negative) 177 torn rows in the hot T = 0 setting.
+- Megalon: a lookup is one read section, repeated by the backend until `read_end` accepts it (`megalon_time.*.read_fail`,
+  `megalon.read_retry_*`); an update is one write section. `seq_retries`, `seq_spins`, `lock_spins` are 0.
+- `--verify-rows 1` recomputes csum per hit (`torn_rows`, must be 0) in every system. Host evidence: 0 torn rows in
+  every run; `--test-no-seqlock` (negative, plain) 177 torn rows with probing (v6), 69 with direct addressing
+  (2026-10-18, T = 0).
 
 ## 5. Updater, publication interval T and the Ekko operating points (v6)
 - One `update` request = one sample (seq 1..). U workers (`--update-threads`, 4); every worker receives every sample
@@ -69,7 +75,7 @@ each system's API and measures its coherence actions; it cannot prove a coherenc
   memory is read or written per sample; with T > 0 the sample is acknowledged on acceptance (workers independent, no
   all-worker completion per sample).
 - Every T (`--publish-ms`, 60 s in the main runs) each worker publishes its touched rows once (Monolith §2.2.3):
-  resolve the slot by probing SWcc, sort by address, write each row under its counter (§4); then `published_seq`
+  sort its rows by address, write each row (plain: under its counter; Megalon: one write section, §4); then `published_seq`
   (HWcc node line, min over workers). A round longer than T is an overrun: `flush_overruns`, `update_rate_sustained=0`
   ("update rate not sustained"), logged per round (`recsys-server: round ... OVERRUN`); the next round starts at the
   next multiple of T (never bursted). T = 0 (diagnostic): every sample's rows are written before the reply.
@@ -108,7 +114,7 @@ each system's API and measures its coherence actions; it cannot prove a coherenc
   summed over threads, plain rdtsc (TSC rate calibrated at start, `tsc_khz`). Query: each thread's chunk task from
   claiming the chunk (bottom MLP, lookups, top MLP) to its result; the last chunk also assembles the response; queue
   wait before the first chunk and the reply send are excluded. Row update: each worker's publication round from its
-  start (slot resolve, writes under the stripes) to published_seq raised (rows visible); no per-row reply exists
+  start (row writes) to published_seq raised (rows visible); no per-row reply exists
   (samples are acknowledged on acceptance, outside T).
 - C_o = delta of the thread's coherence accounting over the same intervals: Popcorn swmc_acct (fault_ns[3] + ipi_ns,
   measured; registered per serving/update thread, zeros before build 9; read with swmc_acct_snapshot(), which uses
@@ -133,11 +139,13 @@ each system's API and measures its coherence actions; it cannot prove a coherenc
   (threads Megalon spawns from the main thread during start-up inherit the name mg-bg).
 
 ## 7. Backends (`--backend plain|megalon`)
-- plain (all-HWcc, Popcorn): slots at fixed SWcc offsets, direct loads/stores. Popcorn init_state=shared:
-  `--preload-only` (node 0, plain mapping, no HWcc, before coherence is enabled) then `--preloaded` in the server run.
-- megalon: one Megalon object per slot (id `"RS"<<48 | table<<40 | slot`, 576 B), created by node 0 at prepare (all
-  167.7M, empty slots included), each slot access one read or write section; write sections write the whole slot
-  (D3); `write_end` flushes the whole object (576 B). Version words stay in the app range (§4) around the sections.
+- plain (all-HWcc, Popcorn): records at fixed SWcc offsets (§2), direct loads/stores, MemC3 stripes (§4). Popcorn
+  init_state=shared: `--preload-only` (node 0, plain mapping, no HWcc, before coherence is enabled) then `--preloaded`
+  in the server run.
+- megalon (Megalon-native, 2026-10-18): one Megalon object per row (id `"RS"<<48 | table<<40 | row` = the key's
+  (table, row), 576 B), created by node 0 at prepare (134.2M, was 167.7M slots including empty ones), found by
+  Megalon's index. Each record access is one read or write section; write sections write the whole record (whole
+  lines); `write_end` flushes the whole object (576 B). No application version table around the sections (§4).
   Every node checks every 4096th object id/size by ObjectLookup (`--check-stride`; vectordb checks all).
 - Shim: the shared object-API shim `systems/megalon/shim` (`megalon_objapi.h`, `megalon_objapi.cc`, `build-shim.sh`
   -> `lib/libmegalon-objapi.so`, symbol `megalon_object_api`), generalised from vectordb's copy (which vectordb keeps);
@@ -170,7 +178,8 @@ each system's API and measures its coherence actions; it cannot prove a coherenc
 ## 9. Deviations (from MOT1 §4.2 / MLPerf DLRMv2)
 - D1 Tables capped at 26M rows (5 tables), raw id mod 26M (MOT1 decision; folds MLPerf rows together).
 - D2 Synthetic inputs only: multi-hot expansion by hash (same distribution as MLPerf's table). Real day-23 data is used as is (v6).
-- D3 Hash tables with linear probing instead of MLPerf's dense tables indexed by id (MOT1 decision).
+- D3 (resolved 2026-10-18) v5/v6 used hash tables with linear probing instead of MLPerf's dense tables indexed by id;
+  every system now addresses rows directly as MLPerf does (§2).
 - D4 Random model weights (trained MLPerf weights not downloaded; compute cost unchanged).
 - D5 Embedding values synthetic per (key, seq) (MOT1: synthetic values in the motivation study).
 - D6 Inputs (v6): MLPerf day 23 multi-hot as is; time order of day 23 not verified.

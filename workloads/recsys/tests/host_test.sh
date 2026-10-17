@@ -8,8 +8,9 @@
 #      UPD_SMP / QRY_SMP (v2 samples files, e.g. real MLPerf day 23 from tools/mlperf_npz_to_samples.py; default: synthetic),
 #      SLO (loadgen --slo, default query:95:100), PUBLISH_FRAC (--publish-frac, reported only)
 # Checks: loadgen ok, torn_rows 0, no misses, queries and rows written > 0, Fig 2 op counters (op.query.n = queries,
-# op.row_update.n = rows_written, t_ns > 0), false_retries <= seq_retries; megalon (row objects): objects = rows,
-# probes = lookups, no stripe-table use (seq_retries, seq_spins, lock_spins 0).
+# op.row_update.n = rows_written, t_ns > 0), false_retries <= seq_retries, probes = lookups (direct addressing: one
+# record read per lookup, every backend); megalon: objects = rows, no stripe-table use (seq_retries, seq_spins,
+# lock_spins 0).
 set -euo pipefail
 B=$(cd "$1" && pwd); LG=$(cd "$2" && pwd); WD=$3; BACKEND=${4:-plain}; T=${5:-0}; shift $(( $# < 5 ? $# : 5 )); EXTRA=("$@")
 HERE=$(cd "$(dirname "$0")" && pwd); W=$(cd "$HERE/.." && pwd); ROOT=$(cd "$W/../.." && pwd)
@@ -96,11 +97,11 @@ FAIL=0
 [ "$(s 1 op.query.n)" = "$(s 1 queries)" ] && [ "$(s 1 op.query.t_ns)" -gt 0 ] || { echo "op.query counters wrong"; FAIL=1; }
 [ "$(s 0 op.row_update.n)" = "$(s 0 rows_written)" ] && [ "$(s 0 op.row_update.t_ns)" -gt 0 ] || { echo "op.row_update counters wrong"; FAIL=1; }
 [ "$(s 1 false_retries)" -le "$(s 1 seq_retries)" ] || { echo "false_retries > seq_retries"; FAIL=1; }
-if [ "$BACKEND" = megalon ]; then  # Megalon-native: one object per row, one section per lookup, no stripe table
-  ROWS=$(sed -n 's/.*initial tables: \([0-9]*\) rows as [0-9]* row objects.*/\1/p' "$WD/node0.log" | tail -1)
+[ "$(s 1 probes)" = "$(s 1 lookups)" ] || { echo "probes != lookups (direct addressing: one record read per lookup)"; FAIL=1; }
+if [ "$BACKEND" = megalon ]; then  # one object per row, one section per lookup, no stripe table
+  ROWS=$(sed -n 's/.*initial tables: \([0-9]*\) rows (megalon).*/\1/p' "$WD/node0.log" | tail -1)
   OBJS=$(sed -n 's/.*created \([0-9]*\) objects.*/\1/p' "$WD/node0.log" | tail -1)
   [ -n "$ROWS" ] && [ "$OBJS" = "$ROWS" ] || { echo "objects ($OBJS) != rows ($ROWS)"; FAIL=1; }
-  [ "$(s 1 probes)" = "$(s 1 lookups)" ] || { echo "probes != lookups (Megalon-native: one section per lookup)"; FAIL=1; }
   [ "$(s 1 seq_retries)" = 0 ] && [ "$(s 1 seq_spins)" = 0 ] && [ "$(s 0 lock_spins)" = 0 ] || { echo "stripe table used on megalon"; FAIL=1; }
 fi
 [ "$FAIL" = 0 ] && echo "HOST TEST PASS ($BACKEND, T=${T} ms) -> $WD" || { echo "HOST TEST FAIL -> $WD"; exit 1; }

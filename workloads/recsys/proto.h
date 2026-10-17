@@ -45,7 +45,7 @@ struct __attribute__((packed)) QueryResp {
   uint32_t mlp_us;       // sum over tasks: bottom MLP + DCNv2 + top MLP
   uint32_t total_us;     // arrival -> reply
   uint32_t lookups;      // rows read (pairs x 214 for MLPerf sizes)
-  uint32_t probes;       // slots inspected by linear probing
+  uint32_t probes;       // row records read (direct addressing: = lookups)
   uint32_t seq_retries;  // version-word (seqlock) re-reads (all; false ones in false_retries)
   uint32_t misses;       // ids not found (0 with a fully loaded table)
   uint64_t max_row_seq;  // newest update seq seen in any row read (staleness diagnostics)
