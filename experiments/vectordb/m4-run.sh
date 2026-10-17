@@ -115,7 +115,7 @@ case "$KIND" in
       LG=("${NL[@]}" --raw)
       export PART_SEED_slo=$SEED PART_SEED_fix=$((SEED + 1))
       export PARTS=$H1_PARTS PART_RATES=${RATE:-} PART_RATES_CMD=${RATES_CMD:-}
-      export PART_ARGS_slo="--mode slo --start 10 --factor 1.5 --precision 0.05 --max-steps 25 --warmup-s 10 --step-warmup-s 3 --step-measure-s 15 --confirm-s 30 --confirm-reps 3"
+      export PART_ARGS_slo="--mode slo --start 10 --factor 1.5 --precision 0.02 --confirm-precision 0.01 --max-confirm-probes 5 --max-steps 25 --warmup-s 10 --step-warmup-s 3 --step-measure-s 15 --confirm-s 30 --confirm-reps 3"
       export PART_ARGS_fix="--mode fixed --rates @RATES@ --warmup-s $SETTLE_S --step-warmup-s 10 --step-measure-s 60 --drain-s 10";;
   *) stop "bad KIND";;
 esac

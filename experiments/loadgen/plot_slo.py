@@ -3,14 +3,19 @@
 
 usage: plot_slo.py --out fig.pdf RUN_DIR[=label] ... [--stream search] [--metric pslo_ms|p99_ms] [--logy]
 Passing steps are filled markers, failing/aborted steps hollow (an aborted step's tail value is a lower bound);
-the SLO is a dashed line, and each run's confirmed max throughput under the SLO a vertical dotted line.
-Warmup steps are skipped. Also prints a table of the points.
+the SLO is a dashed line, and each run's confirmed max throughput under the SLO a vertical dotted line with its knee
+bracket (export_csv.knee_bracket: confirmed max offered rate .. lowest failed offered rate above it; 2026-10-18 "A+C")
+as a shaded band on the offered-rate scale. Warmup steps are skipped. Also prints a table of the points and a
+"# <label>: knee bracket" line per run.
 """
-import argparse, json, math, os
+import argparse, json, math, os, sys
 
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from export_csv import knee_bracket  # noqa: E402
 
 
 def load(run):
@@ -51,6 +56,12 @@ def main():
         if best:
             ax.axvline(best, color=c, ls=":")
         print(f"# {label} ({run}): stream {stream}, {a.metric}; max under SLO (confirm mean) = {best}")
+        kb = knee_bracket(summ, steps)
+        if kb:
+            print(f"# {label}: knee bracket offered [{kb['lo']}, {kb['hi']}] (hi phase {kb['hi_phase'] or '-'}, "
+                  f"confirmed {kb['confirmed']}, source {kb['source']})")
+            if kb["lo"] and kb["hi"]:
+                ax.axvspan(kb["lo"], kb["hi"], color=c, alpha=0.12, lw=0)
         for x, y, p, ph in pts:
             print(f"{label}\t{ph}\t{x:.1f}\t{y:.3f}\t{'pass' if p else 'fail'}")
     if slo_ms:

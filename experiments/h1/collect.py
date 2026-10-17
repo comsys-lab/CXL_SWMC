@@ -6,11 +6,17 @@ run_dir; run_dir holds loadgen/ and the run's manifest.txt), levels.tsv (levels.
 Writes WDIR/<out-name>/ (new files only; refuses an existing dir — result dirs stay immutable):
   runs-index.csv     one row per run: workload mix system phase round name run_dir manifest_sha256 system_line
                      kernel(node0) note confirm x_mean/x_sd/pslo_mean, max_offered_x_pass, min_offered_x_fail,
-                     n_curve_steps, n_overload_steps
+                     n_curve_steps, n_overload_steps, lifetime, then (2026-10-18 "A+C") bracket_lo, bracket_hi (knee
+                     bracket on the offered scale: confirmed max rate under the SLO, lowest failed rate above it;
+                     export_csv.knee_bracket: summary.json bracket, older runs from the steps), bracket_hi_phase,
+                     bracket_source (summary | steps), confirmed, confirm_probes (confirms after the first),
+                     confirm_finish (loadgen confirm_search.finish)
   steps-all.csv      every step x stream of every run (experiments/loadgen/export_csv.py; label
                      <workload>/<mix>/<system>/<phase>-r<round>), the user's Excel input
   slo-summary.csv    per mix x system: max throughput under SLO per round (confirm x_mean +- x_sd, the 3 confirm
-                     repeats), mean / sd over the rounds present (rounds_note), ratio to all-HWcc, overload points present
+                     repeats), mean / sd over the rounds present (rounds_note), ratio to all-HWcc, overload points
+                     present, per_round_bracket (r<n>:lo..hi), bracket_lo / bracket_hi (single round: that round's
+                     bracket; several rounds: the lowest lo and the highest hi over the rounds)
   fix-steps.csv      per fixed-load window: level (L1 | L2, matched by offered rate within 1 %), offered, achieved, SLO
                      percentile, pass, coherence CPU (below)
   fig/               v6_fig1_curves.py per mix (lowest SLO round present; all rounds stay in the CSVs) and
@@ -36,6 +42,8 @@ import argparse, csv, glob, hashlib, json, os, subprocess, sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 EXP = os.path.dirname(HERE)
+sys.path.insert(0, os.path.join(EXP, "loadgen"))
+from export_csv import knee_bracket  # noqa: E402
 SYSTEMS = ("hw", "pop", "mg")             # SLO phase (Fig 1): Megalon timers on (dec Q6)
 FIXSYS = ("hw", "pop", "mg", "mgoff")     # fixed phase (Fig 2): + Megalon timers off for C_diff (dec 2026-10-17 "(a)")
 CURVE_PHASES = ("ramp", "bisect", "fill", "overload")
@@ -200,6 +208,10 @@ def cdiff(fig2_csv, W, mix, out_rows, rnd=""):
                          os.path.basename(fig2_csv), rnd])
 
 
+def blank(v):
+    return "" if v is None else v
+
+
 def write_csv(path, header, rows):
     with open(path, "w", newline="") as f:
         w = csv.writer(f)
@@ -244,33 +256,45 @@ def main():
         if mp is None:
             note(f"{r['name']}: no manifest found")
         node0 = (mf.get("node0") or "").split()
+        kb = knee_bracket(s, st) if r["phase"] == "slo" else {}
+        cs = s.get("confirm_search", {})
         idx.append([W, r["mix"], r["sys"], r["phase"], r["round"], r["name"], r["dir"], sha256(mp) if mp else "",
                     mf.get("system", ""), node0[1] if len(node0) > 1 else "", mf.get("cxl_swmc_commit", ""),
                     s.get("note", ""), c.get("x_mean", ""), c.get("x_sd", ""), c.get("pslo_mean_ms", ""),
-                    s.get("max_offered_x_pass", ""), s.get("min_offered_x_fail", ""), ncur, nov, r["life"]])
+                    s.get("max_offered_x_pass", ""), s.get("min_offered_x_fail", ""), ncur, nov, r["life"],
+                    blank(kb.get("lo")), blank(kb.get("hi")), kb.get("hi_phase", ""), kb.get("source", ""),
+                    kb.get("confirmed", ""), cs.get("probes", ""), cs.get("finish", "")])
         if r["phase"] == "slo":
-            slo.setdefault((r["mix"], r["sys"]), []).append((r["round"], c.get("x_mean"), c.get("x_sd"), nov))
+            slo.setdefault((r["mix"], r["sys"]), []).append((r["round"], c.get("x_mean"), c.get("x_sd"), nov,
+                                                            kb.get("lo"), kb.get("hi")))
     write_csv(os.path.join(out, "runs-index.csv"),
               ["workload", "mix", "system", "phase", "round", "name", "run_dir", "manifest_sha256", "system_line",
                "kernel_node0", "cxl_swmc_commit", "note", "confirm_x_mean", "confirm_x_sd", "confirm_pslo_mean_ms",
-               "max_offered_x_pass", "min_offered_x_fail", "n_curve_steps", "n_overload_steps", "lifetime"], idx)
+               "max_offered_x_pass", "min_offered_x_fail", "n_curve_steps", "n_overload_steps", "lifetime",
+               "bracket_lo", "bracket_hi", "bracket_hi_phase", "bracket_source", "confirmed", "confirm_probes",
+               "confirm_finish"], idx)
     rows = []
     for m in mixes:
         hw = slo.get((m["mix"], "hw"), [])
-        hwx = [x for _, x, _, _ in hw if x]
+        hwx = [x for _, x, *_ in hw if x]
         hwm = sum(hwx) / len(hwx) if hwx else None
         for k in SYSTEMS:
             v = sorted(slo.get((m["mix"], k), []))
-            xs = [x for _, x, _, _ in v if x]
+            xs = [x for _, x, *_ in v if x]
+            los = [lo for *_, lo, _ in v if lo]
+            his = [hi for *_, hi in v if hi]
             mean = sum(xs) / len(xs) if xs else None
             sd = (sum((x - mean) ** 2 for x in xs) / (len(xs) - 1)) ** 0.5 if len(xs) > 1 else ""
-            rows.append([W, m["mix"], m["label"], k, len(v), ";".join(f"r{rd}:{x}+-{s}" for rd, x, s, _ in v),
+            rows.append([W, m["mix"], m["label"], k, len(v), ";".join(f"r{rd}:{x}+-{s}" for rd, x, s, *_ in v),
                          mean if mean is not None else "", sd,
-                         round(mean / hwm, 4) if mean and hwm else "", all(n > 0 for *_, n in v) if v else "",
-                         "single round (no variance)" if len(v) == 1 else f"{len(v)} rounds: mean and sample sd"])
+                         round(mean / hwm, 4) if mean and hwm else "", all(t[3] > 0 for t in v) if v else "",
+                         "single round (no variance)" if len(v) == 1 else f"{len(v)} rounds: mean and sample sd",
+                         ";".join(f"r{t[0]}:{blank(t[4])}..{blank(t[5])}" for t in v),
+                         min(los) if los else "", max(his) if his else ""])
     write_csv(os.path.join(out, "slo-summary.csv"),
               ["workload", "mix", "mix_label", "system", "rounds", "per_round_confirm_x_mean+-sd", "x_mean_over_rounds",
-               "x_sd_over_rounds", "ratio_to_all_hwcc", "overload_points_present", "rounds_note"], rows)
+               "x_sd_over_rounds", "ratio_to_all_hwcc", "overload_points_present", "rounds_note", "per_round_bracket",
+               "bracket_lo", "bracket_hi"], rows)
 
     # fix-steps.csv
     rows, fig2 = [], {}

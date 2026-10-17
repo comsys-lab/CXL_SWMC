@@ -33,7 +33,10 @@ def _nice_top(v):
     return v, v / 4
 
 
-def curve(path, series, slo, xlabel, ylabel, ylim, xticks, yticks, extend_y=True, clip_factor=2.0):
+KNEE_LABEL = "Max under SLO"  # legend of the knee markers (curve(knees=...))
+
+
+def curve(path, series, slo, xlabel, ylabel, ylim, xticks, yticks, extend_y=True, clip_factor=2.0, knees=None):
     """series: [(name, xs, ys[, ok[, tail]]])] in legend order; ys already normalized; slo normalized (dashed line).
     ok (optional, per point): False = a step past the SLO (failed, or an overload-phase step: the caller decides).
     tail (optional, per point): points joined to the passing curve by a dashed line, in x order (e.g. the overload
@@ -42,7 +45,9 @@ def curve(path, series, slo, xlabel, ylabel, ylim, xticks, yticks, extend_y=True
     Passing points: solid line, filled markers, display cleanup (clean_curve). Past-SLO points: EVERY one is drawn
     (no merge / drop / cut-off) with a hollow marker. extend_y: the y axis grows to include the past-SLO points, up to clip_factor x
     the given top; points still above (or infinite) are drawn on the top edge as hollow triangles (legend says off
-    scale; the CSV has the values). Returns {"ylim": (lo, top), "series": {name: counts of drawn points}}."""
+    scale; the CSV has the values). knees (optional, 2026-10-18 "A+C"): [(name, x, y, x_hi)] = each series' max under
+    the SLO (diamond, series color, black edge) with a horizontal error bar from x to x_hi (the knee bracket: the
+    lowest failed rate above the result). Returns {"ylim": (lo, top), "series": {name: counts of drawn points}}."""
     import math
     lines, past_all = [], []
     for item in series:
@@ -90,6 +95,11 @@ def curve(path, series, slo, xlabel, ylabel, ylim, xticks, yticks, extend_y=True
             ax.plot([x], [min(y, top) if math.isfinite(y) else top], linestyle="none", marker="^" if off else "o",
                     markersize=9, markerfacecolor="white", markeredgecolor=col,
                     markeredgewidth=2.2, clip_on=False, zorder=3)
+    for name, kx, ky, khi in knees or []:
+        col = SERIES[name]
+        ax.errorbar([kx], [min(ky, top)], xerr=[[0], [max(0.0, khi - kx)]], fmt="D", markersize=10, color=col,
+                    markerfacecolor=col, markeredgecolor="black", markeredgewidth=1.8, ecolor=col, elinewidth=2.5,
+                    capsize=6, capthick=2.5, clip_on=False, zorder=4)
     ax.axhline(slo, color="black", linestyle=(0, (4, 2)), linewidth=2.5)
     above = slo + (top - ylim[0]) * 0.16 < top  # label above the line if it fits, else below
     ax.text(xticks[0] + (xticks[-1] - xticks[0]) * 0.02, slo + (top - ylim[0]) * (0.04 if above else -0.04),
@@ -113,7 +123,12 @@ def curve(path, series, slo, xlabel, ylabel, ylim, xticks, yticks, extend_y=True
             handles.append(Line2D([0], [0], linestyle="none", marker="^", markersize=9, markerfacecolor="white",
                                   markeredgecolor="black", markeredgewidth=2.2))
             labels.append("Off scale")
-    ax.legend(handles, labels, ncol=len(handles), loc="lower center", bbox_to_anchor=(0.5, 0.98),
+    if knees:
+        from matplotlib.lines import Line2D
+        handles.append(Line2D([0], [0], linestyle="none", marker="D", markersize=10, markerfacecolor="#7f7f7f",
+                              markeredgecolor="black", markeredgewidth=1.8))
+        labels.append(KNEE_LABEL)
+    ax.legend(handles, labels, ncol=len(handles) if len(handles) <= 5 else (len(handles) + 1) // 2, loc="lower center", bbox_to_anchor=(0.5, 0.98),
               fontsize=FS if len(handles) <= 3 else FS - 4, handlelength=1.2, columnspacing=1.5 if len(handles) > 3
               else 2.0, handletextpad=0.3, borderaxespad=0.1)
     fig.tight_layout()

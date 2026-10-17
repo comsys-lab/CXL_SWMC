@@ -416,7 +416,7 @@ h1_slo() {  # <sys>: warm-up + full SLO search -> $LS/slo
   local s=$1 rc RD=$LS/slo note=""
   h1_warmup
   measure "$LS" slo "${LGC[@]}" --opt seed=$SEED --seed $SEED --slo query:$SLO_PCT:$SLO_MS --raw \
-    --mode slo --start 1 --factor 1.5 --precision 0.05 --max-steps 20
+    --mode slo --start 1 --factor 1.5 --precision 0.02 --confirm-precision 0.01 --max-confirm-probes 5 --max-steps 20
   rc=$?
   echo "$NAME slo: loadgen seed $SEED" >> "$E/seeds.txt"
   grep -q 'workload_finish":"ok' "$RD/loadgen/summary.json" 2>/dev/null || stop "$NAME slo: loadgen workload finish (rc $rc)"

@@ -24,6 +24,7 @@ sys.path.insert(0, HERE)
 sys.path.insert(0, os.path.join(os.path.dirname(HERE), "loadgen"))
 import paper_style as ps  # noqa: E402
 import stats_delta  # noqa: E402
+from export_csv import knee_bracket  # noqa: E402,F401  (Fig 1 knee bracket, 2026-10-18 "A+C")
 
 SYSTEMS = {"hw": "All HWcc", "pop": "Popcorn", "mg": "Megalon"}  # display names = paper_style.SERIES keys
 ORDER = ["pop", "mg", "hw"]  # legend order of paper_style (worst = lightest ... All HWcc = black)

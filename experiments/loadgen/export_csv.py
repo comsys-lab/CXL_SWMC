@@ -7,6 +7,8 @@ RUN_DIR is a loadgen --out dir (steps.jsonl, summary.json, optional stats/ from 
 Columns (stable; new columns are only ever appended):
   label, step, phase, measure_s, pass, aborted, reason, stream, offered, achieved, sent, done, errors, timeouts,
   p50/p90/p99/p999/pslo/max (ms), lag_p99_us, max_under_slo (the run's confirm mean, same on every row of the run)
+  ... (appended last, 2026-10-18 "A+C") bracket_lo_offered, bracket_hi_offered: the run's knee bracket (knee_bracket():
+  confirmed max offered rate under the SLO, lowest failed offered rate above it; same on every row of the run)
 Step-level (same value on every stream row of a step):
   search_per_s, update_per_s     achieved rate of stream "search" / "update" (empty if the run has no such stream)
   total_ops_per_s                sum of the achieved rates of all streams (an update counts as one operation)
@@ -78,6 +80,31 @@ BASE = ["label", "step", "phase", "measure_s", "pass", "aborted", "reason", "str
 STEP = ["search_per_s", "update_per_s", "total_ops_per_s", "search_p50_ms", "search_p99_ms", "update_p50_ms",
         "update_p99_ms", "traffic_bytes", "traffic_per_update"]
 RUNSLO = ["slo_stream", "slo_pct", "slo_ms", "p95_ms"]
+BRACKET = ["bracket_lo_offered", "bracket_hi_offered"]
+SEARCH_PHASES = ("ramp", "bisect", "confirm")
+
+
+def knee_bracket(summ, steps):
+    """Knee bracket of an SLO run (decision 2026-10-18 "A+C"): {"lo", "hi", "hi_phase", "source", "confirmed"};
+    lo = the confirmed max offered rate under the SLO (None if no rate was confirmed), hi = the lowest failed offered
+    rate above it (None if none). summary.json "bracket" (loadgen since 2026-10-18, source "summary"); older runs
+    (source "steps"): lo = max_offered_x_pass when the search ended without a note, hi = the lowest offered_x of a
+    failed ramp / bisect / confirm step above max_offered_x_pass (a failed confirm repeat counts: the r1 step-down
+    runs confirmed-failed there). {} for a run without an SLO result."""
+    b = summ.get("bracket")
+    if isinstance(b, dict):
+        return {"lo": b.get("lo_offered"), "hi": b.get("hi_offered"), "hi_phase": b.get("hi_phase") or "",
+                "source": "summary", "confirmed": bool(summ.get("confirmed"))}
+    best = summ.get("max_offered_x_pass")
+    if not best:
+        return {}
+    best = float(best)
+    fails = sorted((float(s["offered_x"]), s["phase"]) for s in steps
+                   if s.get("phase") in SEARCH_PHASES and not s.get("pass") and s.get("measure_s", 0) > 0
+                   and float(s["offered_x"]) > best * (1 + 1e-9))
+    confirmed = not summ.get("note")
+    return {"lo": best if confirmed else None, "hi": fails[0][0] if fails else None,
+            "hi_phase": fails[0][1] if fails else "", "source": "steps", "confirmed": confirmed}
 NODE = ["window_s", "searches", "updates", "p_advance", "search_busy_frac", "writer_busy_frac", "search_cpu_s",
         "search_rq_wait_s", "writer_cpu_s", "cpu_busy_frac", "pop_search_fault_s", "pop_search_msg_wait_s",
         "pop_search_local_wait_s", "pop_writer_fault_s", "pop_node_fault_s", "meg_rd_check_s", "meg_wr_check_s",
@@ -240,7 +267,7 @@ def main():
             if os.path.exists(os.path.join(run, "manifest.txt")) else 0
         runs.append((run, label or os.path.basename(run.rstrip("/")), per_step, ntgt))
     nodes = max([2] + [r[3] for r in runs] + [max(t) + 1 for r in runs for t in r[2].values()])
-    cols = BASE + STEP + [f"n{k}_{c}" for k in range(nodes) for c in NODE] + RUNSLO
+    cols = BASE + STEP + [f"n{k}_{c}" for k in range(nodes) for c in NODE] + RUNSLO + BRACKET
     with open(a.out, "w", newline="") as f:
         w = csv.writer(f)
         w.writerow(cols)
@@ -248,6 +275,8 @@ def main():
             summ = json.load(open(os.path.join(run, "summary.json")))
             best = summ.get("confirm", {}).get("x_mean", "")
             slo = list(run_slo(run))
+            kb = knee_bracket(summ, [json.loads(line) for line in open(os.path.join(run, "steps.jsonl")) if line.strip()])
+            brk = [blank(kb.get("lo")), blank(kb.get("hi"))]
             for line in open(os.path.join(run, "steps.jsonl")):
                 s = json.loads(line)
                 if s["phase"] == "warmup":
@@ -270,7 +299,7 @@ def main():
                     w.writerow([label, s["step"], s["phase"], s["measure_s"], s["pass"], s["aborted"], s["reason"], name,
                                 x["offered"], x["achieved"], x["sent"], x["done"], x["errors"], x["timeouts"],
                                 x["p50_ms"], x["p90_ms"], x["p99_ms"], x["p999_ms"], x["pslo_ms"], x["max_ms"],
-                                x["lag_p99_us"], best] + step_cols + node_cols + slo + [x.get("p95_ms", "")])
+                                x["lag_p99_us"], best] + step_cols + node_cols + slo + [x.get("p95_ms", "")] + brk)
     print(f"-> {a.out}")
 
 

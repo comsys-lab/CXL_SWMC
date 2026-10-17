@@ -102,7 +102,7 @@ case "$KIND" in
       echo 'set -uo pipefail'
       echo 'RD=$2'
       echo 'case $1 in'
-      echo "  slo) printf '%s\\n' --slo mixed:99:1 --raw --mode slo --start 500 --factor 1.5 --precision 0.05 --max-steps 25 --warmup-s 10 --step-warmup-s 3 --step-measure-s 15 --drain-s 5 --confirm-s 30 --confirm-reps 3 --fill 0.7,0.8,0.9 --overload 1.05,1.1,1.2 --opt seed=$SEED --seed $SEED $([[ $H1_PARTS == "slo fix" ]] && echo "--opt state_out=$SCR/kvstate-slo.bin");;"
+      echo "  slo) printf '%s\\n' --slo mixed:99:1 --raw --mode slo --start 500 --factor 1.5 --precision 0.02 --confirm-precision 0.01 --max-confirm-probes 5 --max-steps 25 --warmup-s 10 --step-warmup-s 3 --step-measure-s 15 --drain-s 5 --confirm-s 30 --confirm-reps 3 --fill 0.7,0.8,0.9 --overload 1.05,1.1,1.2 --opt seed=$SEED --seed $SEED $([[ $H1_PARTS == "slo fix" ]] && echo "--opt state_out=$SCR/kvstate-slo.bin");;"
       echo "  fix) R='${RATES:-}'"
       echo "       if [ -z \"\$R\" ]; then o=\$(${FIX_RATES_CMD:-false}) || { echo \"levels callback failed (rc \$?)\" >&2; exit 1; }"
       echo "         set -- \$o; [ \$# = 2 ] || { echo \"levels callback output '\$o'\" >&2; exit 1; }; R=\$1,\$2; fi"

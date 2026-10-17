@@ -14,6 +14,10 @@ with hollow markers, never merged, dropped or cut off; the overload-phase steps 
 SLO; filled if they pass, also never cleaned) are joined by a dashed line after the passing curve; the y axis grows to include them up to 2x its top
 (paper_style.curve; --ylim fixes it), points above are drawn on the top edge as hollow triangles. CSV column past_slo
 marks them.
+Max under SLO (decision 2026-10-18 "A+C"): per system a diamond at the confirm repeats of the result (x = their mean
+achieved rate, y = their median SLO percentile / base: a passing confirm may hold one failed repeat, e.g. inf) with a horizontal error bar to x * hi / lo, the knee bracket
+[lo, hi] on the offered scale (v6_common.knee_bracket: summary.json bracket; older runs: lowest failed ramp / bisect /
+confirm rate above max_offered_x_pass). No confirmed result (search note) -> no diamond. CSV meta line "knee".
 
 usage: v6_fig1_curves.py --out DIR --tag kv-ycsb-b [--xlabel ..] [--xscale 1e-3] [--x x|total]
                          [--xticks 0,20,..] [--ylim 0,4 --yticks 0,1,2,3,4] hw=DIR pop=DIR mg=DIR
@@ -38,6 +42,25 @@ def points(run, xmode):
         out.append({"step": s["step"], "phase": s["phase"], "offered": s["offered_x"], "x": x, "p_ms": y,
                     "pass": s["pass"]})
     return out
+
+
+def knee(run, xmode):
+    """(x, p_ms, x_hi, bracket) of the run's max under the SLO, or (None, None, None, bracket) without a confirmed
+    result or its confirm repeats."""
+    kb = v6.knee_bracket(run.summary, run.steps)
+    lo, hi = kb.get("lo"), kb.get("hi")
+    if not lo:
+        return None, None, None, kb
+    reps = [s for s in run.measured() if s["phase"] == "confirm" and abs(float(s["offered_x"]) / float(lo) - 1) < 1e-6]
+    if not reps:
+        return None, None, None, kb
+    xs = [s["x"] if xmode == "x" else sum(v["achieved"] for v in s["streams"].values()) for s in reps]
+    ps_ = [s["streams"][run.slo_stream]["pslo_ms"] for s in reps]
+    ps_ = [float("inf") if p == "inf" else p for p in ps_]
+    x = sum(xs) / len(xs)
+    ps_ = sorted(ps_)
+    med = ps_[len(ps_) // 2] if len(ps_) % 2 else (ps_[len(ps_) // 2 - 1] + ps_[len(ps_) // 2]) / 2
+    return x, med, x * float(hi) / float(lo) if hi else x, kb
 
 
 def main():
@@ -77,8 +100,19 @@ def main():
                        [p["phase"] == "overload" for p in pts]))  # dashed tail: the overload phase
         rows += [[v6.SYSTEMS[k], p["step"], p["phase"], p["offered"], v6.r(p["x"]), p["p_ms"], v6.r(y), p["pass"],
                   runs[k].path, q] for p, y, q in zip(pts, ys, past)]
+    knees, kmeta = [], []
+    for k in v6.ORDER:
+        if k not in runs:
+            continue
+        kx, kp, khi, kb = knee(runs[k], a.x)
+        if kx is None:
+            kmeta.append(f"{v6.SYSTEMS[k]}: none (bracket {kb or '-'})")
+            continue
+        knees.append((v6.SYSTEMS[k], kx * a.xscale, kp / base, khi * a.xscale))
+        kmeta.append(f"{v6.SYSTEMS[k]}: x {v6.r(kx)} {pname} {v6.r(kp)} ms y_norm {v6.r(kp / base)}; bracket offered "
+                     f"[{kb['lo']}, {kb['hi']}] (hi {kb['hi_phase'] or '-'}, source {kb['source']}) -> x_hi {v6.r(khi)}")
     slo_n = slo_ms / base
-    xmax = max(x for item in series for x in item[1])
+    xmax = max([x for item in series for x in item[1]] + [kn[3] for kn in knees])
     xticks = [float(t) for t in a.xticks.split(",")] if a.xticks else v6.nice_ticks(xmax * 1.05, 6)
     if a.ylim:
         ylim = tuple(float(t) for t in a.ylim.split(","))
@@ -89,7 +123,7 @@ def main():
     os.makedirs(a.out, exist_ok=True)
     png, csvp = (os.path.join(a.out, f"{a.tag}-fig1.{e}") for e in ("png", "csv"))
     drawn = v6.ps.curve(png, series, slo_n, a.xlabel, f"Normalized\n{pname} latency", ylim, xticks, yticks,
-                        extend_y=not a.ylim)
+                        extend_y=not a.ylim, knees=knees)
     print("drawn: " + "; ".join(f"{n} passing {c['passing']} past_slo {c['past']} (off scale {c['off_scale']}, overload "
                                 f"tail {c['tail']} of which passing {c['tail_passing']})" for n, c in drawn["series"].items()) + f"; y top {drawn['ylim'][1]:g}")
     v6.write_csv(csvp, [
@@ -103,6 +137,9 @@ def main():
         ("tags", f"achieved_per_s measured; {pname}_ms measured (the run's SLO percentile, loadgen pslo_ms); y_norm "
                  "derived; past_slo = pass false (SLO check failed; drawn as hollow markers, every one; overload-phase "
                  "steps form the dashed tail, filled when they pass)"),
+        ("knee", "max under SLO = confirm repeats at the confirmed max offered rate lo: mean x, median SLO percentile "
+                 "(diamond); error "
+                 "bar to x * hi / lo, hi = lowest failed offered rate above lo (knee bracket); " + "; ".join(kmeta)),
         ("inputs", v6.inputs_line([(v6.SYSTEMS[k], r) for k, r in runs.items()])),
     ], ["system", "step", "phase", "offered", "achieved_per_s", f"{pname}_ms", "y_norm", "pass", "run", "past_slo"], rows)
     print(f"-> {png}\n-> {csvp}  (base {pname} {base} ms, SLO norm {slo_n:.3f})")

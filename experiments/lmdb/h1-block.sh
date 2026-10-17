@@ -8,7 +8,9 @@
 #   H1_STAGE_DIR, inherited by the callback), cont: H1_LEVELS; H1_PARENT_LOCK=H1-main (the lock file must name
 #   owner=H1-main; this block never locks or unlocks), PRETOUCH_DIR, MEASURE_ENV_DIR.
 # env (from the plugin): EXPECT_K (Popcorn build 12 release), EXPECT_DAX_UUID, PLAIN_BUILD MEG_BUILD LOADGEN_BUILD,
-#   BUILD_PIN MEGALON_BUILD_N (manifest gate), LMDB_GUEST_DIR (the install: <L>/plain, <L>/megalon, <L>/img-1000000 on
+#   BUILD_PIN MEGALON_BUILD_N (manifest gate), LOADGEN_PIN (optional, default BUILD_PIN: commit of a loadgen build
+#   made later than the servers, e.g. the 2026-10-18 SLO-search fix; its manifest must name LOADGEN_PIN and the lmdb
+#   plugin, proto.h and frame.h must be unchanged between BUILD_PIN and LOADGEN_PIN), LMDB_GUEST_DIR (the install: <L>/plain, <L>/megalon, <L>/img-1000000 on
 #   node 0), LMDB_MEG_CFG (the megalon.yaml that install wrote), IMG (Host image dir whose pages.bin was installed),
 #   C8 K8 GT8 RECV_MODE (Popcorn build 12 bundle).
 # Mixes u5/u50/u80 = get/update 95/5, 50/50, 20/80 (MOT1 v6), 1M records, p99 < 1 ms per request (h1-plan.tsv).
@@ -48,11 +50,15 @@ for spec in $H1_MIXES; do [[ $spec =~ ^u(5|50|80)=UPDATE_RATIO=0\.(05|5|8)$ ]] |
 [ "$EXPECT_K" = "$K8" ] || { echo "SEQUENCE STOP: EXPECT_K != K8 (all systems run on the Popcorn build)"; exit 2; }
 case "$L" in /home/comsys/?*) ;; *) echo "SEQUENCE STOP: LMDB_GUEST_DIR must be under /home/comsys/"; exit 2;; esac
 [ -d "$E" ] && [ -z "$(ls -A "$E" | grep -v '^sequence')" ] || { echo "SEQUENCE STOP: $E missing or not empty"; exit 2; }
+LPIN=${LOADGEN_PIN:-$BUILD_PIN}
+[ "$LPIN" = "$BUILD_PIN" ] || git -C $P/CXL_SWMC diff --quiet "$BUILD_PIN" "$LPIN" -- workloads/lmdb/loadgen workloads/lmdb/proto.h \
+  experiments/loadgen/frame.h experiments/loadgen/workload.h \
+  || { echo "SEQUENCE STOP: lmdb loadgen plugin/protocol sources differ between BUILD_PIN $BUILD_PIN and LOADGEN_PIN $LPIN"; exit 2; }
 grep -q "^source_commit=$BUILD_PIN dirty_files=0$" "$PLAIN_BUILD/manifest.txt" && grep -q "^source_commit=$BUILD_PIN dirty_files=0$" "$MEG_BUILD/manifest.txt" \
   && grep -q "^megalon_build=$P/builds/megalon/$MEGALON_BUILD_N$" "$MEG_BUILD/manifest.txt" \
-  && grep -q " cxl_swmc_commit=$BUILD_PIN lmdb_dirty=0$" "$LOADGEN_BUILD/manifest.txt" \
+  && grep -q " cxl_swmc_commit=$LPIN lmdb_dirty=0$" "$LOADGEN_BUILD/manifest.txt" \
   && grep -q "^sha256 $(sha256sum "$LOADGEN_BUILD/loadgen" | cut -d' ' -f1)  " "$LOADGEN_BUILD/manifest.txt" \
-  || { echo "SEQUENCE STOP: builds are not clean builds of $BUILD_PIN on builds/megalon/$MEGALON_BUILD_N"; exit 2; }
+  || { echo "SEQUENCE STOP: builds are not clean builds of $BUILD_PIN (loadgen $LPIN) on builds/megalon/$MEGALON_BUILD_N"; exit 2; }
 OWNER="H1-lmdb-$H1MODE-r$H1_N" CHOWNED=0
 parent_lock_check() { grep -q "^owner=$H1_PARENT_LOCK " "$LOCKF" 2>/dev/null \
   || { echo "$(date -Is) SEQUENCE STOP: parent lock $H1_PARENT_LOCK not held ($(cat "$LOCKF" 2>/dev/null))"; exit 1; }; }

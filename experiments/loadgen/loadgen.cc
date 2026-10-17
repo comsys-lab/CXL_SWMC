@@ -25,6 +25,7 @@
 #include <vector>
 
 #include "frame.h"
+#include "slo_search.h"
 #include "workload.h"
 
 namespace loadgen {
@@ -75,6 +76,8 @@ struct Config {
   double step_warmup_s = 3, step_measure_s = 15, drain_s = 5;
   double confirm_s = 30;
   uint32_t confirm_reps = 3;
+  double confirm_precision = 0.01;  // after a failed confirm: confirm-length bisection to hi/lo <= 1 + this (2026-10-18)
+  uint32_t max_confirm_probes = 5;  // confirms after the first one (>= 2: the legacy "three rates" note stays true)
   std::vector<double> overload = {1.05, 1.1, 1.2};  // SLO mode: extra points at first-fail x f (past the knee)
   std::vector<double> fill = {0.7, 0.8, 0.9};       // SLO mode: extra points at the result x f (bend before the knee)
   double tol = 0.05;            // achieved >= (1 - tol) * offered
@@ -102,6 +105,9 @@ void usage() {
                "  --warmup-s S --warmup-rate R          run-start warmup (default 10 s at the first rate)\n"
                "  --step-warmup-s S --step-measure-s S --drain-s S  (defaults 3, 15, 5)\n"
                "  --confirm-s S --confirm-reps N        SLO mode: repeats at the found rate (30 s x 3)\n"
+               "  --confirm-precision P --max-confirm-probes N   SLO mode: after a failed confirm, bisect with full\n"
+               "                                        confirms between the highest confirmed pass and the lowest\n"
+               "                                        confirm fail to hi/lo <= 1 + P, at most N confirms (0.01, 5)\n"
                "  --overload f1,f2,...|none             SLO mode: points at first-fail rate x f, measured in full\n"
                "                                        (no early SLO abort) for the curve past the knee (1.05,1.1,1.2)\n"
                "  --fill f1,f2,...|none                 SLO mode: points at the result x f for the bend (0.7,0.8,0.9)\n"
@@ -163,6 +169,8 @@ Config parse(int argc, char **argv) {
     else if (a == "--drain-s") c.drain_s = std::atof(need(i).c_str());
     else if (a == "--confirm-s") c.confirm_s = std::atof(need(i).c_str());
     else if (a == "--confirm-reps") c.confirm_reps = std::stoul(need(i));
+    else if (a == "--confirm-precision") c.confirm_precision = std::atof(need(i).c_str());
+    else if (a == "--max-confirm-probes") c.max_confirm_probes = std::stoul(need(i));
     else if (a == "--fill") {
       std::string v = need(i);
       c.fill.clear();
@@ -194,6 +202,8 @@ Config parse(int argc, char **argv) {
     die("--mode slo needs --slo s:pct:ms and --start R");
   if (c.mode == "fixed" && c.rates.empty()) die("--mode fixed needs --rates");
   if (c.factor <= 1 || c.precision <= 0 || c.conns == 0) die("bad --factor/--precision/--conns");
+  if (c.confirm_precision <= 0 || c.max_confirm_probes < 2 || c.confirm_reps == 0)
+    die("bad --confirm-precision (> 0) / --max-confirm-probes (>= 2) / --confirm-reps (>= 1)");
   if (c.arrival != "poisson" && c.arrival != "uniform") die("--arrival poisson|uniform");
   return c;
 }
@@ -299,12 +309,13 @@ class Engine {
       return finish("");
     }
     // SLO search: ramp (x factor, x factor^2 while far below the SLO) until a step fails, bisect geometrically
-    // to the precision, then confirm the best passing rate with longer repeats.
+    // to the precision, then confirm the best passing rate with longer repeats (slo_search.h).
     double good = 0, bad = 0, r = c_.start, prev_pslo = 0;
     uint32_t n = 0;
     for (; n < c_.max_steps; n++) {
       StepResult s = step("ramp", r, c_.step_warmup_s, c_.step_measure_s);
       if (s.exhausted) return finish("streams exhausted during ramp");
+      search_note(s, "ramp", r);
       if (!s.pass) { bad = r; break; }
       good = r;
       r *= next_factor(s.s[idx_[c_.slo_stream]].pslo, prev_pslo);
@@ -316,30 +327,48 @@ class Engine {
       double m = std::sqrt(good * bad);
       StepResult s = step("bisect", m, c_.step_warmup_s, c_.step_measure_s);
       if (s.exhausted) return finish("streams exhausted during bisection");
+      search_note(s, "bisect", m);
       (s.pass ? good : bad) = m;
     }
-    // confirm with longer repeats; if most repeats fail (the point sits on the knee), step down by the precision
-    // and confirm again, at most twice
-    for (int round = 0; round < 3; round++) {
-      confirm_.clear();
-      uint32_t fails = 0;
+    // confirm phase (decision 2026-10-18 "A+C"): confirm `good`; if most repeats fail, bisect between the highest
+    // confirmed pass (lower ramp/bisect passes re-confirmed first) and the lowest confirm fail with full confirms to
+    // --confirm-precision instead of stepping down by --precision (the old step-down left up to one precision step
+    // between the reported max and the knee unmeasured)
+    std::vector<double> passes;
+    for (auto &f : search_) if (f.pass) passes.push_back(f.offered);
+    const ConfirmOutcome o = confirm_search(good, passes, c_.precision, c_.confirm_precision, c_.max_confirm_probes,
+                                            [&](double x, const char *) -> int {
+      Probe p;
+      p.offered = x;
       for (uint32_t k = 0; k < c_.confirm_reps; k++) {
-        StepResult s = step("confirm", good, c_.step_warmup_s, c_.confirm_s);
-        if (s.exhausted) return finish("streams exhausted during confirm");
-        fails += !s.pass;
-        confirm_.push_back(s);
+        StepResult s = step("confirm", x, c_.step_warmup_s, c_.confirm_s);
+        if (s.exhausted) return -1;
+        p.fails += !s.pass;
+        p.reps.push_back(s);
       }
-      best_ = good;
-      best_bad_ = bad;
-      if (2 * fails <= c_.confirm_reps) {
-        overload(bad);
-        return finish("");
-      }
-      bad = good;
-      good /= 1 + c_.precision;
-    }
-    overload(best_bad_);
-    return finish("confirm failed at three rates; the knee is noisy (longer --confirm-s?)");
+      p.pass = 2 * p.fails <= c_.confirm_reps;
+      probes_.push_back(p);
+      return p.pass ? 1 : 0;
+    });
+    for (size_t k = 0; k < probes_.size() && k < o.probes.size(); k++) probes_[k].role = o.probes[k].role;
+    if (o.exhausted) return finish("streams exhausted during confirm");
+    confirm_search_finish_ = o.finish;
+    confirmed_ = o.confirmed;
+    // result: the highest confirmed pass; no confirmed pass -> the lowest probed rate (its repeats failed; legacy
+    // semantics of the noted result)
+    best_ = o.confirmed ? o.best : o.lo_fail;
+    for (auto &p : probes_)
+      if (p.offered == best_) confirm_ = p.reps;
+    // knee bracket above the result: the lowest failed rate above it, ramp/bisect step or failed confirm
+    best_bad_ = 0, bracket_phase_ = "", bracket_hi_x_ = 0;
+    auto lower = [&](double off, const char *ph, double x) {
+      if (off > best_ && (best_bad_ == 0 || off < best_bad_)) best_bad_ = off, bracket_phase_ = ph, bracket_hi_x_ = x;
+    };
+    for (auto &f : search_) if (!f.pass) lower(f.offered, f.phase.c_str(), f.x);
+    for (auto &p : probes_) if (!p.pass) lower(p.offered, "confirm", mean_x(p.reps));
+    overload(best_bad_ > 0 ? best_bad_ : bad);
+    if (!o.confirmed) return finish("confirm failed at three rates; the knee is noisy (longer --confirm-s?)");
+    return finish("");
   }
 
  private:
@@ -416,6 +445,21 @@ class Engine {
       StepResult s = step("overload", first_fail * f, c_.step_warmup_s, c_.step_measure_s, false);
       if (s.exhausted) return;
     }
+  }
+
+  // ramp/bisect step record for the confirm phase (lower-bound candidates) and the knee bracket
+  void search_note(const StepResult &s, const char *phase, double offered) {
+    search_.push_back({offered, phase, s.pass, xval(s)});
+  }
+  double mean_x(const std::vector<StepResult> &v) const {
+    double t = 0;
+    for (auto &r : v) t += xval(r);
+    return v.empty() ? 0 : t / v.size();
+  }
+  double mean_pslo(const std::vector<StepResult> &v) const {
+    double t = 0;
+    for (auto &r : v) t += r.s[slo_idx_].pslo;
+    return v.empty() ? 0 : t / v.size();
   }
 
   StepResult step(const char *phase, double x, double warmup_s, double measure_s, bool slo_abort = true) {
@@ -699,6 +743,7 @@ class Engine {
       << " max_steps=" << c_.max_steps << "\nwarmup_s=" << c_.warmup_s << " warmup_rate=" << c_.warmup_rate
       << " step_warmup_s=" << c_.step_warmup_s << " step_measure_s=" << c_.step_measure_s
       << " drain_s=" << c_.drain_s << " confirm_s=" << c_.confirm_s << " confirm_reps=" << c_.confirm_reps
+      << " confirm_precision=" << c_.confirm_precision << " max_confirm_probes=" << c_.max_confirm_probes
       << " overload=" << [&] { std::string o; for (double f : c_.overload) o += (o.empty() ? "" : ",") + fmt(f); return o.empty() ? std::string("none") : o; }()
       << "\ntol=" << c_.tol << " max_err=" << c_.max_err << " abort_queue_s=" << c_.abort_queue_s
       << " lag_limit_us=" << c_.lag_limit_us << "\nstats_op=" << c_.stats_op << "\n";
@@ -728,6 +773,23 @@ class Engine {
         << ",\"confirm\":{\"reps\":" << n << ",\"fails\":" << fails << ",\"x_mean\":" << fmt(n ? sx / n : 0)
         << ",\"x_sd\":" << fmt(sd(sx, sxx)) << ",\"pslo_mean_ms\":" << fmt(n ? sp / n : 0)
         << ",\"pslo_sd_ms\":" << fmt(sd(sp, spp)) << "}";
+      // knee bracket (decision 2026-10-18 "A+C"): lo = the confirmed result (null if no rate confirmed), hi = the
+      // lowest failed rate above it (ramp/bisect step or failed confirm; hi_x = that step's x or the confirm mean x)
+      s << ",\"confirmed\":" << (confirmed_ ? "true" : "false") << ",\"bracket\":{\"lo_offered\":"
+        << (confirmed_ ? fmt(best_) : std::string("null")) << ",\"hi_offered\":"
+        << (best_bad_ > 0 ? fmt(best_bad_) : std::string("null")) << ",\"hi_phase\":\"" << bracket_phase_
+        << "\",\"hi_x\":" << (best_bad_ > 0 ? fmt(bracket_hi_x_) : std::string("null")) << ",\"rel_width\":"
+        << (confirmed_ && best_bad_ > 0 ? fmt(best_bad_ / best_ - 1) : std::string("null")) << "}"
+        << ",\"confirm_search\":{\"finish\":\"" << confirm_search_finish_ << "\",\"precision\":" << fmt(c_.precision)
+        << ",\"confirm_precision\":" << fmt(c_.confirm_precision) << ",\"max_probes\":" << c_.max_confirm_probes
+        << ",\"probes\":" << (probes_.empty() ? 0 : probes_.size() - 1) << "},\"confirm_probes\":[";
+      for (size_t k = 0; k < probes_.size(); k++) {
+        auto &p = probes_[k];
+        s << (k ? "," : "") << "{\"offered_x\":" << fmt(p.offered) << ",\"role\":\"" << p.role << "\",\"reps\":"
+          << p.reps.size() << ",\"fails\":" << p.fails << ",\"pass\":" << (p.pass ? "true" : "false")
+          << ",\"x_mean\":" << fmt(mean_x(p.reps)) << ",\"pslo_mean_ms\":" << fmt(mean_pslo(p.reps)) << "}";
+      }
+      s << "]";
     }
     uint32_t lag_pass = 0;
     for (auto &st : steps_log_) lag_pass += st.pass && st.lag;
@@ -765,8 +827,26 @@ class Engine {
   uint32_t step_no_ = 0;
   FILE *steps_ = nullptr;
   std::vector<StepLog> steps_log_;
-  std::vector<StepResult> confirm_;
-  double best_ = 0, best_bad_ = 0;
+  std::vector<StepResult> confirm_;  // repeats of the confirm at the result best_
+  double best_ = 0, best_bad_ = 0;   // result and the knee bracket's upper end (lowest failed rate above it)
+  struct SearchStep {
+    double offered;
+    std::string phase;
+    bool pass;
+    double x;
+  };
+  std::vector<SearchStep> search_;  // ramp/bisect steps in order
+  struct Probe {
+    double offered = 0;
+    std::string role;
+    uint32_t fails = 0;
+    bool pass = false;
+    std::vector<StepResult> reps;
+  };
+  std::vector<Probe> probes_;  // every confirm (confirm_reps repeats each), in order
+  bool confirmed_ = false;
+  std::string confirm_search_finish_, bracket_phase_;
+  double bracket_hi_x_ = 0;
 };
 
 }  // namespace
