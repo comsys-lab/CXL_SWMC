@@ -2,12 +2,12 @@
 # 2026-10-17, recovery/LMDB-F1-v1.7.1-run). all-HWcc = lmdb/8 plain, Popcorn = lmdb/8 + cxl_shm build 12, Megalon =
 # lmdb-megalon/8 on Megalon 77 (timers on), mgoff = the same with MEGALON_COH_TIMERS=0. Builds from BUILD_PIN 934fa9312;
 # install = the LMDB-F1 v1.7.1 guest dir /home/comsys/lmdb8b incl. img-1000000 on node 0 (Q10 reuse; the block checks
-# every installed file, the config and the image against the pins). Hook = experiments/lmdb/h1-block.sh at f941da2fd
+# every installed file, the config and the image against the pins). Hook = experiments/lmdb/h1-block.sh, H1-HOOK v2 (experiments/kv/h1v2-lib.sh) at f8bf42142
 # (live tree, every file the block runs hash-pinned below). Filled 2026-10-17.
 . "$(dirname "${BASH_SOURCE[0]}")/pins-common.inc"
 HR=$P/CXL_SWMC
 HOOK_FILE=$HR/experiments/lmdb/h1-block.sh
-BLOCK_CMD=(bash $HOOK_FILE)          # H1 hook (marker H1-HOOK v1)
+BLOCK_CMD=(bash $HOOK_FILE)          # H1 hook (marker H1-HOOK v2)
 BLOCK_ENV=(BUILD_PIN=934fa9312c38eeaf2845605cf22d2ef1cfe15fc4 MEGALON_BUILD_N=77 EXPECT_K=$KPOP EXPECT_DAX_UUID=$EXPECT_DAX_UUID
   PLAIN_BUILD=$P/builds/lmdb/8 MEG_BUILD=$P/builds/lmdb-megalon/8 LOADGEN_BUILD=$P/builds/lmdb-loadgen/7
   LMDB_GUEST_DIR=/home/comsys/lmdb8b LMDB_MEG_CFG=$P/recovery/LMDB-F1-v1.7.1-run/install.log.megalon.yaml
@@ -24,12 +24,13 @@ f9c1753f3bef2ab0941153058860227145f2d7b7e33a210bdc3338fad14eacda  $P/builds/lmdb
 e45baa9b8d2e211b7418f2ddad5612364df92162fe651e015415f3043bd66514  $P/recovery/LMDB-F1-v1.7.1-run/install.log.megalon.yaml
 d127ac3c498ebac7f3e5c1860c9903876c49f42815720d8222ee080d5524a071  $P/workspaces/lmdb-img-1m-b8-v171/pages.bin
 0930ab5e9a8add069305f259ff10aa94a3818b705f364c134cfbda23aada18b7  $P/workspaces/lmdb-img-1m-b8-v171/meta.txt
-9ca6326f7665073a363e40022bd26d45466e9a4c89cc19dd29cedf3750ae1f28  $HOOK_FILE
-bc9ad2b3a6f09b119c7e156af0b818a65042dcb6008aba5403076ffc2120cc92  $HR/experiments/lmdb/pilot-run.sh
-045e93c4cae3cc3c1bfdc55878665888410b2e6e670b4e7e4a65422d509accb3  $HR/experiments/lmdb/run.sh
+383833452efc59f5951f70d449ee1f38a84016e7c5e67b3a451a18085f172a0a  $HOOK_FILE
+fbfb125195d2c862ab33c56da7e251c940973e03bd19ffaa35361002fdd1d895  $HR/experiments/kv/h1v2-lib.sh
+bb0f689901e006791d3e108c05217b72789059f5b2e1968eeef31b984e317b75  $HR/experiments/lmdb/pilot-run.sh
+39b2fcbd342fc3d3302bb8f9287110ab398381ed242bade6df85477d3f723ecb  $HR/experiments/lmdb/run.sh
 3edf6f2d4c5df8b33da9ac249466f8b41042eebe0ca509b7befd3e9fad456a82  $HR/experiments/lmdb/lmdb-node.sh
 8435ef222785be5d7a6dd6a97572b1404017822c63f3f766c45562efc8ae35ca  $HR/experiments/kv/precheck.sh
-f074f4dc5df208f2ddd0b38f01d75c00240d6bf74c1eb6115ef04cb07fba6092  $HR/experiments/kv/v1-check.py
+de9d4a99916fbd60b66f6142d0cbc69cd88068e19c9ca08609380241801e76f7  $HR/experiments/kv/v1-check.py
 cbd6d75e743f149633a461e525bff6c69108407bcc0d7b9dc8f443dc72a6690f  $HR/experiments/kv/pretouch-check.sh
 1edcdda88f30200fd55c1b5a18cb4b9d6db57aa02647f8ad549e4e7f6aabb31f  $HR/experiments/vectordb/host-gate.sh
 68327dd3178d7af5b0ad9c614f0a6c41b4d99b2f6a23cf456f7751273996eecf  $HR/scripts/host/measure-env.sh
