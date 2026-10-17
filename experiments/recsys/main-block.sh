@@ -41,6 +41,9 @@
 #   with the warm-up and one fixed-load window at V1_RATE (1) query/s for V1_WINDOW_S (130 s, >= 2 rounds of T = 60 s),
 #   then v1_check.py (FAIL stops) and check_breakdown.py; systems hw pop mg mgoff (mgoff = Megalon with
 #   MEGALON_COH_TIMERS=0, same load, for the timer on/off comparison); no SLO search, no gate, no fixed-L window.
+#   After the last lifetime (hw and mgoff present): v1_cdiff.py -> <E>/cdiff.{txt,csv}, Megalon Fig 2 C by the
+#   difference method C_diff = T(mgoff) - T(hw) per op (user decision 2026-10-17); CDIFF FAIL (offered rates differ)
+#   stops the block; C_diff < 0 and C_sampled > T / > C_diff are WARNs only.
 set -uo pipefail
 E=${1:?evidence dir}
 P=/home/comsys/sungsu/destijl-control X=$P/CXL_SWMC/experiments/recsys G=$P/CXL_SWMC/experiments/vectordb/host-gate.sh
@@ -334,4 +337,8 @@ if [ -n "${SYSTEMS:-}" ]; then  # subset rerun: keep the seeded order, drop the 
   echo "SYSTEMS=\"$SYSTEMS\" -> run: $ORDER" | tee -a "$E/order.txt"
 fi
 for s in $ORDER; do system $s; done
+if [ $BLOCK = v1 ] && [ -d "$E/hw/val" ] && [ -d "$E/mgoff/val" ]; then  # Megalon C_diff = T(mgoff) - T(hw) (user 2026-10-17)
+  python3 $X/v1_cdiff.py "$E" | tee "$E/cdiff.txt" | tee -a "$E/v1-checks.txt"
+  grep -q "^CDIFF DONE" "$E/cdiff.txt" || stop "C_diff: $(cat "$E/cdiff.txt")"
+fi
 echo "$(date -Is) SEQUENCE DONE $OWNER"

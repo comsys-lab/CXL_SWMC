@@ -16,7 +16,7 @@ node 1; window deltas) and <dir>/breakdown.csv. Checks (FAIL = stop the block):
   mgoff mg_threads > 0, Megalon read sections > 0, op.<o>.mg.flags present with bit 0 (timers) = 0 for both ops,
         every Megalon duration field of both ops = 0 and present
         (CohSnap *_ns incl. wstart/wflush/switch_rw/reclaim/check_ns_sampled, mg.anchor.*; MEGALON_COH_TIMERS=0)
-NOTEs (recorded, no stop): Popcorn query C = 0.
+NOTEs (recorded, no stop): Popcorn query C = 0; WARN mg C_sampled > T per op (Fig 2 Megalon C = C_diff, v1_cdiff.py).
 Prints "V1CHECK PASS|FAIL <system> ..." with the values and exits 0 / 1.
 """
 import glob
@@ -133,6 +133,11 @@ def main():
             fails.append(f'CohSnap not live (mg_threads {mg0}/{mg1})')
         if cq <= 0 or cu <= 0:
             fails.append(f'Megalon C = 0 (query {cq}, row_update {cu})')
+        # C_sampled <= T per op is a sanity relation only (user 2026-10-17: Fig 2 C = C_diff, v1_cdiff.py): WARN
+        for op, c, b, e in (('query', cq, b1, e1), ('row_update', cu, b0, e0)):
+            t = e.get(f'op.{op}.t_ns', 0) - b.get(f'op.{op}.t_ns', 0)
+            if c > t:
+                notes.append(f'WARN {op}: C_sampled {c:.0f} ns > T {t} ns')
         an = d1('op.query.mg.anchor.read_lookup_ns_sampled') + d1('op.query.mg.anchor.read_nr_ns_sampled')
         if an <= 0:
             fails.append('AnchorSnap read parts = 0 (shim v3 / Megalon 75 not live)')
