@@ -41,7 +41,23 @@ MEG_F = ["read_sections", "write_sections", "check_ns_sampled", "check_sampled",
 # *_sampled fields are sampled with the read-section checks (ratio estimator), the others are timed every time
 # (systems/megalon/shim/megalon_objapi.h v3, CXL_SWMC 28749aee6; wseq_end_ns = WSeqEnd, inside wflush)
 ANCHOR_F = ["read_sections", "write_sections", "check_sampled", "read_lookup_ns_sampled", "read_nr_ns_sampled",
-            "rseq_ns_sampled", "write_lookup_ns", "write_nr_ns", "wseq_ns", "wseq_end_ns"]
+            "rseq_ns_sampled", "write_lookup_ns", "write_nr_ns", "wseq_ns", "wseq_end_ns",
+            # Megalon >= 76: timed write sections (AnchorSnap.reserved[0]; vector DB, KV/LMDB, recsys export it as
+            # <op>.meg.anchor.write_sampled / <op>.mg.anchor.write_sampled; absent before = no lean scaling)
+            "write_sampled"]
+# Megalon >= 76 lean sampling (reports/M2-megalon-port-changes.md §18): every Megalon duration is a sum over TIMED
+# sections only (counts stay exact). Flags = CohSnap.reserved[1] (bit 1 lean, bit 2 MEGALON_COH_EVENTS=always). They
+# are gauges (stats_delta would difference them), so they are read from each node's END snapshot text, per workload:
+#   vector DB opt.<op>.meg.flags (server.cc OpWin) | recsys op.<op>.mg.flags (optime.h) | KV/LMDB opt.meg_flags or
+#   opt.meg_lean + opt.meg_events_always (opsplit.h, process-wide)
+# Lean and not events_always: read-side events (stale/concur/meta/spin) x read_sections / check_sampled, write side
+# (wstart, switch_rw, reclaim, wflush, anchor write_lookup / write_nr / wseq / wseq_end) x write_sections /
+# write_sampled. events_always: events and write side are full sums (no scaling, as recsys optime.h). Checks, read
+# anchor and vcopy keep their own estimators (unchanged). No probe correction (M2 §19; open question).
+LEAN_EV = ["stale_ns", "concur_ns", "meta_ns", "spin_ns"]
+LEAN_WR = ["wstart_ns", "switch_rw_ns", "reclaim_ns", "wflush_ns"]
+LEAN_WR_ANCHOR = ["write_lookup_ns", "write_nr_ns", "wseq_ns", "wseq_end_ns"]
+FLAG_KEYS = ["opt.{op}.meg.flags", "op.{op}.mg.flags", "opt.meg_flags"]
 # Workload rule for Megalon C (user principle 2026-10-16: C = work the workload's own all-HWcc implementation does not
 # do), keyed by the loadgen manifest workload= name:
 #   hwcc_flavor  all-HWcc = Megalon hwcc flavor (same anchor + seqlock reads): anchor work NOT in C; the seqlock parts
@@ -237,6 +253,20 @@ def coh_source(kv):
     return src
 
 
+def lean_flags(kv, op):
+    """(lean, events_always, key) of a node's end snapshot text for operation op (FLAG_KEYS, then opt.meg_lean /
+    opt.meg_events_always); (False, False, None) when no key exists (Megalon <= 75, other systems)."""
+    num = lambda v: int(float(v)) if re.match(r"^-?[0-9.]+$", v or "") else 0  # noqa: E731
+    for c in FLAG_KEYS:
+        k = c.format(op=op)
+        if k in kv:
+            f = num(kv[k])
+            return bool(f & 2), bool(f & 4), c
+    if "opt.meg_lean" in kv:
+        return num(kv["opt.meg_lean"]) == 1, num(kv.get("opt.meg_events_always")) == 1, "opt.meg_lean"
+    return False, False, None
+
+
 def check_source(run, steps):
     """Refuse a pop/mg run unless every node of every step reports exactly the run's coherence source (no build-8
     file fallback, no fallback shim with C = 0, no mixed sources)."""
@@ -278,6 +308,12 @@ def op_sums(run, steps, op):
       C_meg  = meg_check_C_ns + meg_vcopy_est_ns + meg_stale_ns + meg_concur_ns + meg_meta_ns + meg_spin_ns
                + meg_wstart_C_ns + meg_wflush_C_ns    (switch_rw/reclaim are inside wstart: not added; draft §3.1, §4.1)
       C      = C_pop (pop) | C_meg (mg) | 0 (hw: no coherence actions; measured values kept in the audit columns)
+      Megalon >= 76 lean sampling (node flags, lean_flags): BEFORE the terms above, per node, meg_{stale,concur,meta,
+      spin}_ns x read_sections / check_sampled (not with events_always) and meg_{wstart,switch_rw,reclaim,wflush}_ns,
+      anchor.{write_lookup,write_nr,wseq,wseq_end}_ns x write_sections / anchor.write_sampled (not with events_always);
+      raw timed sums kept as <canonical>_timed; meg_lean_nodes / meg_events_always_nodes count the nodes;
+      lean_est_missing_nodes counts nodes with timed durations but a zero denominator (estimate 0); a mg run whose
+      nodes with sections disagree on (lean, events_always) is refused. Data without flag keys: unchanged.
     Refuses a pop/mg run whose nodes do not report exactly that coherence source (check_source).
     Returns (sums dict, keys used dict canonical -> stats key, nodes counted)."""
     check_source(run, steps)
@@ -285,11 +321,13 @@ def op_sums(run, steps, op):
     if run.system == "mg" and rule is None:
         sys.exit(f"{run.path}: workload {run.workload!r} has no Megalon C rule (MEG_RULE); refused")
     out, used, nodes = {}, {}, 0
+    modes = set()  # (lean, events_always) of the nodes with Megalon sections (one mode per run, else refused)
     for st in steps:
         rows = run.deltas().get(st, [])
         if not rows:
             sys.exit(f"{run.path}: step {st} has no begin/end stats snapshots (run with --stats-op)")
-        for _, d in rows:
+        ends = dict(snapshot_text(run, st))
+        for t, d in rows:
             nodes += 1
             vals = {}
             for c, cands in OPKEYS.items():
@@ -297,6 +335,42 @@ def op_sums(run, steps, op):
                 if k is not None:
                     vals[c] = d[k]
                     used.setdefault(c, k.replace(f".{op}.", ".<op>."))
+            lean, always, fk = lean_flags(ends.get(t, {}), op)
+            if fk is not None:
+                used.setdefault("meg_flags", fk.replace(".{op}.", ".<op>."))
+            if vals.get("meg_read_sections") or vals.get("meg_write_sections"):
+                modes.add((lean, always))
+            if lean:
+                # Megalon >= 76: durations are timed-section sums; scale per side (LEAN_* comment). Raw sums are kept
+                # as <canonical>_timed (audit).
+                out["meg_lean_nodes"] = out.get("meg_lean_nodes", 0) + 1
+                if always:
+                    out["meg_events_always_nodes"] = out.get("meg_events_always_nodes", 0) + 1
+                    ws = vals.get("meg_anchor_write_sampled")
+                    if ws is not None and ws != vals.get("meg_write_sections", ws):
+                        # events_always times every write section; a difference means the data is not what it claims
+                        print(f"WARNING {run.path} step {st} node {t}: op {op} events_always but write_sampled={ws} != "
+                              f"write_sections={vals.get('meg_write_sections')}; write side taken as full sums",
+                              file=sys.stderr)
+                else:
+                    cs = vals.get("meg_check_sampled", 0)
+                    fr = vals.get("meg_read_sections", 0) / cs if cs else 0
+                    ws = vals.get("meg_anchor_write_sampled", 0)
+                    wsec = vals.get("meg_write_sections", vals.get("meg_anchor_write_sections", 0))
+                    fw = wsec / ws if ws else 0
+                    ev = ["meg_" + k for k in LEAN_EV]
+                    wr = ["meg_" + k for k in LEAN_WR] + ["meg_anchor_" + k for k in LEAN_WR_ANCHOR]
+                    if (not cs and any(vals.get(k) for k in ev)) or (not ws and any(vals.get(k) for k in wr)):
+                        # timed durations without their sample count: the estimate is unknown, not 0
+                        out["lean_est_missing_nodes"] = out.get("lean_est_missing_nodes", 0) + 1
+                        print(f"WARNING {run.path} step {st} node {t}: op {op} lean Megalon durations without "
+                              f"check_sampled={cs} / write_sampled={ws}; those estimates counted as 0 (column "
+                              "lean_est_missing_nodes)", file=sys.stderr)
+                    for ks, fac in ((ev, fr), (wr, fw)):
+                        for k in ks:
+                            if k in vals:
+                                vals[k + "_timed"] = vals[k]
+                                vals[k] = vals[k] * fac
             if vals.get("meg_check_ns_sampled") and not (vals.get("meg_check_sampled") and "meg_read_sections" in vals):
                 # sampled check time without the sample count / section count: the estimate is unknown, not 0
                 out["check_est_missing_nodes"] = out.get("check_est_missing_nodes", 0) + 1
@@ -347,7 +421,11 @@ def op_sums(run, steps, op):
     out["C_meg"] = (g("meg_check_C_ns") + g("meg_vcopy_est_ns") + g("meg_stale_ns") + g("meg_concur_ns")
                     + g("meg_meta_ns") + g("meg_spin_ns") + g("meg_wstart_C_ns") + g("meg_wflush_C_ns"))
     out["meg_rule"] = rule or ""
-    for k in ("check_est_missing_nodes", "vcopy_est_missing_nodes", "anchor_split_unavailable_nodes"):
+    if run.system == "mg" and len(modes) > 1:
+        sys.exit(f"{run.path}: op {op} steps {steps}: nodes disagree on Megalon lean/events_always flags "
+                 f"{sorted(modes)} (mixed builds or settings): refused")
+    for k in ("check_est_missing_nodes", "vcopy_est_missing_nodes", "anchor_split_unavailable_nodes",
+              "meg_lean_nodes", "meg_events_always_nodes", "lean_est_missing_nodes"):
         out.setdefault(k, 0)
     out["C"] = {"pop": out["C_pop"], "mg": out["C_meg"], "hw": 0}[run.system]
     if "ops" not in out or "t_ns" not in out:

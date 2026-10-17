@@ -76,7 +76,7 @@ def opsum(run, steps, op):
 
 
 def fig_a(a):
-    rows, groups, used_all = [], [], {}
+    rows, groups, used_all, lean = [], [], {}, []
     comps = [c[0] for c in A_SEARCH] + [c[0] for c in A_UPDATE]
     for share, run, steps in share_specs(a.runs, "mg"):
         s, us = opsum(run, steps, a.search_op)
@@ -84,6 +84,10 @@ def fig_a(a):
         for d in (us, uu):
             for c, k in d.items():
                 used_all.setdefault(c, set()).add(k)
+        for o, x in (("search", s), ("update", u)):
+            if x and (x["meg_lean_nodes"] or x["lean_est_missing_nodes"]):
+                lean.append(f"{share:g}%:{o} lean_nodes={x['meg_lean_nodes']} events_always_nodes="
+                            f"{x['meg_events_always_nodes']} lean_est_missing_nodes={x['lean_est_missing_nodes']}")
         sv = [s.get(c, 0) / s["ops"] / 1e3 if s and s["ops"] else None for _, c, _ in A_SEARCH]
         uv = [u.get(c, 0) / u["ops"] / 1e3 if u and u["ops"] else None for _, c, _ in A_UPDATE]
         n = len(A_SEARCH)
@@ -104,7 +108,13 @@ def fig_a(a):
     png, csvp = (os.path.join(a.out, f"{a.tag}-fig3a.{e}") for e in ("png", "csv"))
     v6.stacked(png, groups, comps, "Coherence time\nper operation (us)", hatch_from=len(A_SEARCH),
                xlabel="Update share")
-    v6.write_csv(csvp, [
+    # Megalon >= 76 lean sampling: the "measured" components are then ratio estimates (stated only when present, so
+    # outputs of older data stay byte-identical)
+    lean_meta = [("megalon_lean", "Megalon >= 76: stale/concur/meta/spin = timed-section sums x read_sections/"
+                  "check_sampled, write start / write-end flush (and switch_rw, reclaim) = timed sums x write_sections/"
+                  "anchor.write_sampled per node (v6_common LEAN_*; full sums with events_always; no probe correction); "
+                  "the 'measured' tags below are sampled estimates for these runs: " + "; ".join(lean))] if lean else []
+    v6.write_csv(csvp, lean_meta + [
         ("figure", f"MOT1 v6 Fig 3a Megalon coherence time per operation by mechanism ({a.tag}); PNG {os.path.basename(png)}"),
         ("formula", "search components = sum over steps and nodes of the search operation's CohSnap delta / N_search; "
                     "update components = update operation's delta / N_update; section checks = meg_check_C_ns (rule in "

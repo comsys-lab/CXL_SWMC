@@ -62,7 +62,7 @@ def main():
         if hi > lo * RATE_TOL:
             sys.exit(f"load {load}: offered rates differ by more than 1%: {rates[load]} (refused)")
     os.makedirs(a.out, exist_ok=True)
-    rows, used_all = [], {}
+    rows, used_all, lean = [], {}, []
     for load in [l for l in LOADS if l in loads]:
         ent = loads[load]
         ops = a.ops.split(",") if a.ops else sorted(set().union(*[set(r.ops(s)) for r, s in ent.values()]))
@@ -73,6 +73,9 @@ def main():
                 for c, key in used.items():
                     used_all.setdefault(c, set()).add(key)
                 S[(k, op)] = (s, nodes)
+                if s["meg_lean_nodes"] or s["lean_est_missing_nodes"]:
+                    lean.append(f"{load}:{k}:{op} lean_nodes={s['meg_lean_nodes']} events_always_nodes="
+                                f"{s['meg_events_always_nodes']} lean_est_missing_nodes={s['lean_est_missing_nodes']}")
         groups = []
         for op in ops:
             hs, _ = S[("hw", op)]
@@ -99,7 +102,13 @@ def main():
         v6.stacked(png, groups, COMPONENTS, "Normalized time\nper operation")
         print(f"-> {png}")
     csvp = os.path.join(a.out, f"{a.tag}-fig2.csv")
-    v6.write_csv(csvp, [
+    # Megalon >= 76 lean sampling: stated only when present, so outputs of older data stay byte-identical
+    lean_meta = [("megalon_lean", "Megalon >= 76 timed-section sums scaled per node before C (v6_common LEAN_*): "
+                  "stale/concur/meta/spin x read_sections/check_sampled, wstart/wflush/anchor write_lookup/write_nr/"
+                  "wseq/wseq_end x write_sections/anchor.write_sampled (no scaling with events_always; no probe "
+                  "correction); so those Megalon C terms are sampled estimates, not measured sums: " + "; ".join(lean))] \
+        if lean else []
+    v6.write_csv(csvp, lean_meta + [
         ("figure", f"MOT1 v6 Fig 2 coherence management vs rest per operation ({a.tag}); PNGs {a.tag}-fig2-<load>.png"),
         ("formula", "T_o = t_ns / ops; C_o = C / ops with C = pop_is_ns+pop_sm_ns+pop_wp_ns+pop_ipi_ns (Popcorn) | "
                     "meg_check_C_ns+meg_vcopy_ns_sampled*meg_vcopy_cnt/"
