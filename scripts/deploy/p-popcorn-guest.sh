@@ -1,16 +1,22 @@
 #!/bin/bash
 # Popcorn guest control (runs ON a guest, as root via `sudo -n`; grant-gated).
-#   p-popcorn-guest.sh load <node_id> <invalid|shared> | wait-link <sec> | enable <sec> | status | disable | unload
+#   p-popcorn-guest.sh load <node_id> <invalid|shared> [name=value ...] | wait-link <sec> | enable <sec> | status
+#                      | disable | unload
 #                      | instr <0|1> | instr-dump
 # Expected values come from popcorn.env next to this script (frozen in the
 # packet): K (kernel release), KO_SHA (sha256 of the installed, signed
-# cxl_shm.ko), PARAMS (cxl_shm parameters except node_id, = `faultlat params`
+# cxl_shm.ko; optional KO_PATH: load that file instead of
+# /lib/modules/$K/updates/cxl_shm.ko, e.g. a module-only variant shipped in
+# the tools dir), PARAMS (cxl_shm parameters except node_id, = `faultlat params`
 # for the region config, with init_state=invalid; `load` substitutes the
 # requested init_state), MANAGED_BASE_OFF/MANAGED_BYTES. Every step stops
 # (exit != 0) on the first unexpected result and changes nothing more.
 #   load      checks release, module not loaded, nobody has /dev/dax0.0 open
 #             or mapped, params recomputed from the region config == PARAMS,
-#             module hash; then insmod (initializes only this node's ring lines
+#             module hash; then insmod.  Optional name=value arguments add
+#             receive-path parameters (only recv_mode, max_workers,
+#             worker_spin_us, fallback_us, starve_us; checked after the load
+#             in /sys/module/cxl_shm/parameters) (initializes only this node's ring lines
 #             at msg_ring, registers the swcc range; no SWcc write)
 #   wait-link waits until the link to the peer is up (cxl_shm counters)
 #   enable    syscall 470 (enable_page_coherence), retried while EAGAIN;
@@ -28,7 +34,7 @@ H=$(dirname "$(readlink -f "$0")")
 # shellcheck source=/dev/null
 . "$H/popcorn.env"
 : "${K:?}" "${KO_SHA:?}" "${PARAMS:?}" "${MANAGED_BASE_OFF:?}" "${MANAGED_BYTES:?}"
-KO=/lib/modules/$K/updates/cxl_shm.ko
+KO=${KO_PATH:-/lib/modules/$K/updates/cxl_shm.ko}
 SYS=/sys/kernel/swmc/page_coherence
 CS=/sys/kernel/cxl_shm
 test "$(id -u)" -eq 0 || { echo "STOP: must run as root"; exit 1; }
@@ -54,7 +60,13 @@ links_up() { echo $(( $(cat $CS/link_up) - $(cat $CS/link_down) )); }
 
 case "${1:-}" in
 load)
-  id=${2:?node_id}; mode=${3:?init_state}
+  id=${2:?node_id}; mode=${3:?init_state}; shift 3
+  extra=()
+  for a in "$@"; do
+    [[ "$a" =~ ^(recv_mode|max_workers|worker_spin_us|fallback_us|starve_us)=[a-z0-9]+$ ]] ||
+      { echo "STOP: extra parameter '$a' not allowed"; exit 1; }
+    extra+=("$a")
+  done
   [[ "$id" =~ ^[0-9]$ ]] || { echo "STOP: bad node_id"; exit 1; }
   [[ "$mode" =~ ^(invalid|shared)$ ]] || { echo "STOP: bad init_state"; exit 1; }
   [[ "$PARAMS" == *" init_state=invalid" ]] || { echo "STOP: frozen PARAMS lack init_state=invalid"; exit 1; }
@@ -66,11 +78,17 @@ load)
   [ "$(sha256sum "$KO" | cut -d' ' -f1)" = "$KO_SHA" ] || { echo "STOP: $KO hash differs"; exit 1; }
   [ "$(modinfo -F vermagic "$KO" | cut -d' ' -f1)" = "$K" ] || { echo "STOP: vermagic"; exit 1; }
   # shellcheck disable=SC2086
-  insmod "$KO" node_id="$id" $want
+  insmod "$KO" node_id="$id" $want "${extra[@]}"
   loaded || { echo "STOP: cxl_shm not loaded after insmod"; exit 1; }
-  for f in dax_name nr_nodes node_id ring_offset ring_size ring_coherent managed_offset managed_size init_state recv_mode; do
-    echo "$f=$(cat /sys/module/cxl_shm/parameters/$f)"
+  for f in dax_name nr_nodes node_id ring_offset ring_size ring_coherent managed_offset managed_size init_state recv_mode \
+           max_workers worker_spin_us fallback_us starve_us; do
+    [ -r /sys/module/cxl_shm/parameters/$f ] && echo "$f=$(cat /sys/module/cxl_shm/parameters/$f)"
   done
+  for a in "${extra[@]}"; do
+    [ "$(cat "/sys/module/cxl_shm/parameters/${a%%=*}" 2>/dev/null)" = "${a#*=}" ] ||
+      { echo "STOP: parameter ${a%%=*} is not ${a#*=} after the load"; exit 1; }
+  done
+  echo "version=$(cat /sys/module/cxl_shm/version 2>/dev/null)"
   dmesg | grep -E 'shm_cxl|swmc-popcorn|swmc_kmsg' | tail -n 8
   echo "load OK (node $id)" ;;
 wait-link)

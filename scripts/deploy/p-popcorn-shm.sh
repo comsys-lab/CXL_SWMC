@@ -4,7 +4,9 @@
 #   precheck  both guests: Popcorn kernel, tools hashes, cxl_shm not loaded,
 #             nobody uses /dev/dax0.0, root:root 600 (read-only + sudo status)
 #   load      insmod cxl_shm on VM0 (node 0), then VM1 (node 1), with
-#             init_state=$INIT_STATE (invalid|shared, default invalid); wait for the link
+#             init_state=$INIT_STATE (invalid|shared, default invalid) and the
+#             optional receive-path parameters $LOAD_EXTRA ("name=value ...",
+#             guest script allowlist); wait for the link
 #   enable    enable_page_coherence on both at once (init_state=shared: barrier)
 #   chown     /dev/dax0.0 -> comsys (for unprivileged faultlat / vdb-server)
 #   preload   init_state=shared only, before enable: node 0 writes pattern P
@@ -56,6 +58,8 @@ IP=("${IP0:-192.168.122.100}" "${IP1:-192.168.122.101}")
 BASE=${BASE:-25000000}
 INIT_STATE=${INIT_STATE:-invalid}
 [[ "$INIT_STATE" =~ ^(invalid|shared)$ ]] || { echo "INIT_STATE must be invalid or shared"; exit 2; }
+LOAD_EXTRA=${LOAD_EXTRA:-}
+[[ "$LOAD_EXTRA" =~ ^([a-z_]+=[a-z0-9]+( |$))*$ ]] || { echo "LOAD_EXTRA must be 'name=value ...'"; exit 2; }
 PBASE=${PBASE:-25010000} PPAGES=${PPAGES:-1024} PRUN=${PRUN:-preload-v1}
 PA=0x7777000000000000 PB=0x8888000000000000
 IPAGE=${IPAGE:-25019000} OBASE=${OBASE:-25020000} OREPS=${OREPS:-3} ORUN=${ORUN:-overhead-v1} OPAGES=${OPAGES:-1024}
@@ -123,8 +127,10 @@ precheck)
   done
   log "shm precheck PASS" ;;
 load)
-  G 0 load 0 "$INIT_STATE" | tee "$R/load-vm0.txt"; grep -q 'load OK (node 0)' "$R/load-vm0.txt"
-  G 1 load 1 "$INIT_STATE" | tee "$R/load-vm1.txt"; grep -q 'load OK (node 1)' "$R/load-vm1.txt"
+  # shellcheck disable=SC2086
+  G 0 load 0 "$INIT_STATE" $LOAD_EXTRA | tee "$R/load-vm0.txt"; grep -q 'load OK (node 0)' "$R/load-vm0.txt"
+  # shellcheck disable=SC2086
+  G 1 load 1 "$INIT_STATE" $LOAD_EXTRA | tee "$R/load-vm1.txt"; grep -q 'load OK (node 1)' "$R/load-vm1.txt"
   grep -qx "init_state=$INIT_STATE" "$R/load-vm0.txt" && grep -qx "init_state=$INIT_STATE" "$R/load-vm1.txt"
   for k in 0 1; do G $k wait-link 30 | tee "$R/link-vm$k.txt"; grep -q 'link OK' "$R/link-vm$k.txt"; done
   log "load PASS (links up)" ;;
