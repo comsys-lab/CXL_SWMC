@@ -2,14 +2,15 @@
 """H1 main stage check: acceptance checks of one workload x round (reports/H1-main-packet.md §8; user decision
 2026-10-17: the main session reviews each round-1 result before the next workload; rounds 2/3 stop on a FAIL).
 
-Reads only Host-side results of <E>/<W>/r<n>/ (slo/, fix/, collect/) and <E>/<W>/levels.tsv (+ r1 for n > 1).
+Reads only Host-side results of <E>/<W>/r<n>/ (run/ = the block dir with h1-runs.tsv v2, collect/) and
+<E>/<W>/levels.tsv (+ the r1 (and r2) results for n > 1).
 Writes <E>/<W>/r<n>/check.txt (one line per check, last line "H1CHECK PASS ..." or "H1CHECK FAIL ..."); exit 1 on FAIL.
 FAIL = integrity: the round cannot enter Fig 1 / Fig 2. WARN = plausibility: recorded, judged by the main session
 (h1-accept.sh copies the accepted WARN lines).
 
 FAIL checks (every workload):
-  F1 completeness: slo/ h1-runs.tsv one run per mix x (hw, pop, mg), fix/ per mix x (hw, pop, mg, mgoff = Megalon
-     timers off), phase and round n
+  F1 completeness: run/h1-runs.tsv: per mix one slo entry for hw, pop, mg and one fix entry for hw, pop, mg, mgoff
+     (Megalon timers off), round n, lifetime labels as expected (r1 hw/pop sep, mg cont; r2/r3 cont; mgoff sep)
   F2 per SLO run: empty note (Q4: a noted run stops the workload), workload_finish ok, SLO = plan, confirm reps 3 and
      x_mean > 0, >= 1 fill and >= 1 overload step (points past the knee), >= 3 passing ramp/bisect/fill steps
   F3 per run: h1-runcheck.txt ending in "RUNCHECK PASS" (the hook's per-run validation checks), the workload split
@@ -152,7 +153,8 @@ def compare(W, n, E, mixes, skip):
     run-to-run spread s_mg = |T_mg(n) - T_mg(1)| / T_mg(1) (round 3: max over r1->r3 and r2->r3; hw/pop r2->r3 change
     adds to the spread). REPORT when, per mix x load x op,
       hw or pop:  |T(n) - T(1)| / T(1) > max(5 %, 2 x spread)
-      C_diff:     |C_diff(n) - C_diff(1)| > max(10 % x |C_diff(1)|, 2 x |T_mg(n) - T_mg(1)|)
+      C_diff:     |C_diff(n) - C_diff(1)| > max(10 % x |C_diff(1)|, 2 x |dT_mg|), |dT_mg| = |T_mg(n) - T_mg(1)|
+                  (round 3: max with |T_mg(3) - T_mg(2)|)
     (C_diff = T(mgoff) - T(hw): its hw term changes lifetime type between r1 and r2/r3)."""
     for m in mixes:
         if skip:
@@ -184,8 +186,11 @@ def compare(W, n, E, mixes, skip):
                 res("R", f"C1 {m} {load}/{op} {k} T r1-sep vs r{n}-cont", d <= thr,
                     f"|dT|/T {d:.3f} > threshold {thr:.3f} (5 % or 2 x spread {sp:.3f}); T r1 {a1:g} r{n} {an:g} ns")
             c1, cn = g(t1, "cdiff"), g(tn, "cdiff")
+            dmg = abs(mgn - mg1)
+            if t2 and g(t2, "mg"):  # r3: the r2 -> r3 change of mg is run-to-run spread too (verifier LOW-1)
+                dmg = max(dmg, abs(mgn - g(t2, "mg")))
             if c1 is not None and cn is not None:
-                thr = max(0.10 * abs(c1), 2 * abs(mgn - mg1))
+                thr = max(0.10 * abs(c1), 2 * dmg)
                 res("R", f"C2 {m} {load}/{op} C_diff r1 vs r{n}", abs(cn - c1) <= thr,
                     f"|dC_diff| {abs(cn - c1):g} > threshold {thr:g} ns (C_diff r1 {c1:g}, r{n} {cn:g})")
 

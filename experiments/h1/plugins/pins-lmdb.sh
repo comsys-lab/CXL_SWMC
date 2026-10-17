@@ -36,7 +36,7 @@ cbd6d75e743f149633a461e525bff6c69108407bcc0d7b9dc8f443dc72a6690f  $HR/experiment
 68327dd3178d7af5b0ad9c614f0a6c41b4d99b2f6a23cf456f7751273996eecf  $HR/scripts/host/measure-env.sh
 672ad3c64e2992ba70d1fc5534e2e652c23d6166ad3e107b38597b23caaeb759  $HR/experiments/h1/h1-gate.sh
 aed8d7f32871398db375c502152587ee0b25a716dd60d4ff637e189aa3d42420  $HR/scripts/host/measure-run.sh
-96080a94485adfd192bd1da85d7e6589656657a0b76d65d534aa6494294dd6a4  $HR/scripts/host/measure-env-part.sh
+1f3fe160a17138beb6dba1acd19369e703dc90223bb96d9b0f0f3de93ae5db14  $HR/scripts/host/measure-env-part.sh
 7195fe79fa952cc61a5c95d275e924b004fcfd8a98a97baba640b51c6494e621  $HR/workloads/kv/tools/opsplit.py
 83731292c83fcd5359c3ebb628b71bcbfcf3c3dd12e5e189e0b44bba3ad9508b  $HR/workloads/lmdb/tools/check_log.py
 a9b8dece1a553049959ba2c2512f69c03f60047988391a2cdb2fbfca159177ea  $HR/workloads/lmdb/tools/lmdb_ctl.py

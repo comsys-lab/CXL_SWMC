@@ -7,7 +7,8 @@ SAME offered rate, L1 = the weakest system's max throughput under the SLO, L2 = 
 
 "Max throughput under the SLO" of a system = loadgen summary.json confirm.x_mean of its SLO run (the mean achieved
 x-stream rate of the confirm repeats, as every earlier L rule: m4-lib.sh confirm_x, kv pilot-block confirm_l). With
-SLO_ROUNDS > 1 the per-system value is the mean over rounds (packet Q3; printed per round as well).
+several SLO dirs the per-system value is the mean over them; H1 main calls it only with round 1 (dec Q3: levels from
+r1, reused in r2/r3), in r1 per mix through levels-cb.sh --mix.
 Refused (exit 1, "LEVELS STOP <reason>"; the sequence stops, a methodology judgment waits for the user):
   - a run with a non-empty summary note (e.g. "confirm failed at three rates"), no confirm result, or
     workload_finish != ok;

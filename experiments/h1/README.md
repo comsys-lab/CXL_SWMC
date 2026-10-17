@@ -8,6 +8,7 @@ the workload's own block, reached through its H1 hook. One block runs at a time,
 | File | Role |
 | --- | --- |
 | h1-plan.tsv | workload x mix rows: mix parameter, x -> rate factor, rate decimals, SLO, label (MOT1 v6 §1 mixes and SLOs) |
+| freeze-manifest.sh | writes the frozen code manifest that h1-main.sh checks at every stage start (H1_MANIFEST, H1_MANIFEST_SHA) |
 | h1-gate.sh | H1 Host gate: measure-env-part check, build processes, CPU busy of the node1 measurement sets (meas ≤ 10 % avg / 50 % per CPU, emu ≤ 25 %); lock/unlock delegated to host-gate.sh |
 | levels-cb.sh | r1 callback inside the mg lifetime: levels.py --mix for that mix (appended to levels.tsv), prints `<L2_rate> <L1_rate>` |
 | h1-main.sh | one stage per call (`r1-kv`, `r1-lmdb`, `r1-vdb`, `r1-recsys`, `r2`, `r3`; user decision 2026-10-17; `r2`/`r3` take `--workloads w1,w2` for a user-chosen subset, plan change 2026-10-18). Every stage ends with `<W>/collect-all-r<n>` (rounds 1..n). Takes the lock `H1-main`. Per workload: gates, SLO phase, levels.py (r1 only), fixed phase, gates, collect.py, check.py. Refuses a stage until the previous stage is checked PASS and accepted |
@@ -59,6 +60,12 @@ The block file carries the literal marker `H1-HOOK v2` (hook.sh refuses v1). It 
    check_breakdown; mgoff in the timers-off mode), written to `<lifetime>/h1-runcheck.txt` (last line
    `RUNCHECK PASS[ (NOTE: ...)]`; a failed check stops the block). A loadgen "confirm failed at three rates" note in an
    SLO part is a NOTE (the block continues; levels-cb.sh or check.py F2 then stops the workload, dec Q4).
+   NOTE vs FAIL (sources in state/TASKS.md; packet §8.1): correctness checks (values, misses, errors, torn rows,
+   bad_records, E1, opcoh/closure, clean stop, dmesg) always STOP. DLRM operating-point checks (rows per round,
+   updater sustained, flush_overruns): FAIL in the fixed part, NOTE on failed/overload SLO steps (user 2026-10-17,
+   "지금처럼 고정 부하 단계는 FAIL로 둬"). KV Megalon wmeta_reclaim > 0: NOTE only in SLO-part steps, FAIL in any fixed
+   part (main 2026-10-18, analogous application). Failed and overload SLO steps are kept, never dropped (Fig 1 points
+   past the SLO).
 6. `<dir>/h1-runs.tsv`, 8 columns: `name system mix phase round run_dir steps lifetime` — run_dir = the part dir
    (relative to <dir>); steps = `-` for slo, `<L2 step>,<L1 step>` (measured fixed steps of that part) for fix;
    lifetime = `sep` (r1 hw/pop SLO-only and fixed lifetimes, every mgoff lifetime) or `cont` (mg in every round; all

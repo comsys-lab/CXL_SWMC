@@ -29,6 +29,7 @@
 # env: PRETOUCH_DIR, MEASURE_ENV_DIR, MEASURE_PART_DIR (required unless H1_DRY=1; exported with H1_MEASURE_RUN=1 so the
 #   hooks gate with h1-gate.sh and start loadgen through scripts/host/measure-run.sh), H1_PLAN (default h1-plan.tsv next to this script),
 #   settle_s per workload from the plan (column 8),
+#   H1_MANIFEST + H1_MANIFEST_SHA (required unless H1_DRY=1: the frozen code manifest and its packet sha256),
 #   H1_SEED_BASE (20261017: loadgen seed of round n = base + n), H1_NO_FIGS (set: no
 #   figures), H1_DRY=1 (Host self-test: plugin "stub", gates skipped, LOCK must be a test lock under h1-main/).
 set -uo pipefail
@@ -83,6 +84,16 @@ else
   : "${MEASURE_PART_DIR:?MEASURE_PART_DIR = measure-env-part.sh apply dir (option (ga), 2026-10-18)}"
   export PRETOUCH_DIR MEASURE_ENV_DIR MEASURE_PART_DIR H1_MEASURE_RUN=1
 fi
+# code integrity at stage start (verifier MED-3): the frozen manifest (freeze-manifest.sh, sha256 in the packet) must
+# match the files byte for byte and list every file of experiments/h1. Required for real stages; optional in H1_DRY.
+if [ "$DRY" != 1 ] || [ -n "${H1_MANIFEST:-}" ]; then
+  : "${H1_MANIFEST:?H1_MANIFEST = frozen code manifest (recovery/H1-main-v<x>/manifest.sha256)}" "${H1_MANIFEST_SHA:?H1_MANIFEST_SHA = its sha256 from the packet}"
+  [ "$(sha256sum < "$H1_MANIFEST" | cut -c1-64)" = "$H1_MANIFEST_SHA" ] || { echo "SEQUENCE STOP: manifest $H1_MANIFEST sha256 != H1_MANIFEST_SHA"; exit 2; }
+  ( cd "$H/../.." && sha256sum --quiet -c "$H1_MANIFEST" ) > /dev/null 2>&1 \
+    || { echo "SEQUENCE STOP: code differs from the frozen manifest: $(cd "$H/../.." && sha256sum --quiet -c "$H1_MANIFEST" 2>&1 | head -3 | tr '\n' ' ')"; exit 2; }
+  extra=$(cd "$H/../.." && find experiments/h1 -type f -not -path '*/__pycache__/*' -not -name '*.pyc' | sort | while read -r f; do grep -q "  $f\$" "$H1_MANIFEST" || echo "$f"; done)
+  [ -z "$extra" ] || { echo "SEQUENCE STOP: files in experiments/h1 not in the manifest: $extra"; exit 2; }
+fi
 log() { echo "$(date -Is) [$STAGE] $*" | tee -a "$E/h1-state.txt"; }
 stop() { log "SEQUENCE STOP $*"; exit 1; }
 bash $G lock $OWNER || { echo "SEQUENCE STOP: lock"; exit 2; }
@@ -93,6 +104,7 @@ trap 'bash $G unlock $OWNER' EXIT
   for f in v6_fig2_split.py v6_common.py v6_fig1_curves.py; do echo "analysis/$f sha256=$(sha256sum < $H/../analysis/$f | cut -c1-64)"; done
   echo "stage=$STAGE round=$N workloads=$WL seed_base=$H1_SEED_BASE dry=$DRY"
   echo "pretouch_dir=${PRETOUCH_DIR:-} measure_env_dir=${MEASURE_ENV_DIR:-} measure_part_dir=${MEASURE_PART_DIR:-}"
+  echo "manifest=${H1_MANIFEST:-} manifest_sha256=${H1_MANIFEST_SHA:-}"
   for f in measure-env.sh measure-env-part.sh measure-run.sh; do echo "scripts/host/$f sha256=$(sha256sum < $H/../../scripts/host/$f | cut -c1-64)"; done
   for w in $WL; do f=$H/plugins/pins-$w.sh; [ "$DRY" = 1 ] && f=$H/plugins/pins-stub.sh
     echo "pins.$w=$f sha256=$(sha256sum < "$f" 2>/dev/null | cut -c1-64)"; done; } >> "$E/h1-manifest.txt"

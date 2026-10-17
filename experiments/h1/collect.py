@@ -10,7 +10,7 @@ Writes WDIR/<out-name>/ (new files only; refuses an existing dir — result dirs
   steps-all.csv      every step x stream of every run (experiments/loadgen/export_csv.py; label
                      <workload>/<mix>/<system>/<phase>-r<round>), the user's Excel input
   slo-summary.csv    per mix x system: max throughput under SLO per round (confirm x_mean +- x_sd, the 3 confirm
-                     repeats), mean / sd over rounds when SLO_ROUNDS > 1, ratio to all-HWcc, overload points present
+                     repeats), mean / sd over the rounds present (rounds_note), ratio to all-HWcc, overload points present
   fix-steps.csv      per fixed-load window: level (L1 | L2, matched by offered rate within 1 %), offered, achieved, SLO
                      percentile, pass, coherence CPU (below)
   fig/               v6_fig1_curves.py per mix (lowest SLO round present; all rounds stay in the CSVs) and
@@ -28,7 +28,7 @@ Coherence CPU per window (CLAUDE.md: CPU spent on coherence next to throughput a
                recsys breakdown.csv bg_cpu_ms_node<k>[measured] (thr.nr-log-sync + thr.mg-bg) / 1000
   coh_cpu_vcpus = (recv_cpu_s for Popcorn | meg_bg_cpu_s for Megalon | 0 for all-HWcc) / window_s
 usage: collect.py --plan h1-plan.tsv --workload W [--levels levels.tsv] [--out-name collect] [--no-figs] WDIR
-  WDIR = one round of a workload (<E>/<W>/r<n>: slo/ fix/) or the workload root (<E>/<W>, every round; --out-name
+  WDIR = one round of a workload (<E>/<W>/r<n>: run/ with h1-runs.tsv v2) or the workload root (<E>/<W>, every round; --out-name
   collect-all); runs = every h1-runs.tsv below WDIR outside collect* dirs. Figures use the lowest round present.
 Exit 0 with "COLLECT OK" (notes allowed), 1 on unreadable inputs ("COLLECT FAIL").
 """
@@ -351,7 +351,7 @@ def main():
                     # Megalon C = C_diff = T(mgoff) - T(hw) (dec 2026-10-17 "(a)"): v6_fig2_split.py --megalon-c diff
                     # (default since CXL_SWMC 5b650ab4f) needs all four systems per load and refuses otherwise
                     f2 = os.path.join(an, "v6_fig2_split.py")
-                    cmd = [sys.executable, "-B", f2, "--out", os.path.join(out, "fig"),
+                    cmd = [sys.executable, "-B", f2, "--megalon-c", "diff", "--out", os.path.join(out, "fig"),
                            "--tag", tag] + [f"{l}:{k}={d}:{st}" for l, k, _, d, st, _ in sel]
                     p = subprocess.run(cmd, capture_output=True, text=True)
                     if p.returncode != 0:

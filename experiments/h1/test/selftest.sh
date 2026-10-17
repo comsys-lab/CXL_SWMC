@@ -15,6 +15,8 @@
 #   E  levels.py + collect.py on the real KV-main H1 v2 SLO runs (read-only; mix u5 only): weakest pop
 #   F  h1-accept.sh refuses a check.txt with REPORT lines without --user-ack, accepts with it
 #   G  check.compare(): synthetic Fig 2 CSVs r1 / r2: hw +3 % inside the threshold, pop +12 % -> REPORT, C_diff inside
+#   H  stage-start integrity: a matching manifest passes; an altered hash, an unlisted experiments/h1 file or a wrong
+#      H1_MANIFEST_SHA stop the stage before the lock
 # Prints "SELFTEST PASS" or "SELFTEST FAIL <case>".
 set -uo pipefail
 O=${1:?out dir}
@@ -127,4 +129,15 @@ assert any(l.startswith("OK") and " hw " in l for l in check.lines), check.lines
 assert any(l.startswith("OK") and "C_diff" in l for l in check.lines), check.lines
 print("G OK")
 PYEOF
+# H stage-start code integrity (verifier MED-3): matching manifest passes; a changed hash or an unlisted file stops
+R=$(cd "$H/../.." && pwd)
+(cd "$R" && sha256sum $(bash $H/freeze-manifest.sh --list)) > "$O/H-good.sha256" || fail "H list"
+sed '1s/^\(.\)/0\1/; 1s/^\(.\{64\}\)./\1/' "$O/H-good.sha256" > "$O/H-bad.sha256"   # first hash altered
+grep -v "experiments/h1/levels.py$" "$O/H-good.sha256" > "$O/H-short.sha256"
+for c in good bad short; do mkdir "$O/H-$c"; H1_MANIFEST="$O/H-$c.sha256" H1_MANIFEST_SHA=$(sha256sum < "$O/H-$c.sha256" | cut -c1-64) stage H-$c r1-kv; echo "rc=$?" >> "$O/H-$c.out"; done
+grep -q "^rc=0" "$O/H-good.out" || fail "H good manifest refused ($(head -3 "$O/H-good.out"))"
+grep -q "SEQUENCE STOP: code differs from the frozen manifest" "$O/H-bad.out" || fail "H bad hash not refused"
+grep -q "SEQUENCE STOP: files in experiments/h1 not in the manifest: experiments/h1/levels.py" "$O/H-short.out" || fail "H unlisted file not refused"
+mkdir "$O/H-sha"; H1_MANIFEST="$O/H-good.sha256" H1_MANIFEST_SHA=0000 stage H-sha r1-kv && fail "H wrong manifest sha accepted"
+echo "H OK"
 echo "SELFTEST PASS"

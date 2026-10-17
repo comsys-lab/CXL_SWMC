@@ -53,10 +53,14 @@ case $CMD in
     B=${2:?base state dir} A=${3:?apply dir}; rc=0
     [ -s "$A/sets.txt" ] && grep -qx "sys=$SYS" "$A/sets.txt" && grep -qx "meas=$MEAS" "$A/sets.txt" && grep -qx "emu=$EMU" "$A/sets.txt" \
       || { echo "PART CHECK FAIL: sets.txt in $A missing or different from sys=$SYS meas=$MEAS emu=$EMU"; rc=1; }
-    out=$(bash "$ME" check "$B" 2>&1)
+    out=$(bash "$ME" check "$B" 2>&1); brc=$?
     # every base check except the three slice CPU sets (those are intentionally different here)
     other=$(printf '%s\n' "$out" | grep '^CHECK FAIL' | grep -vE '^CHECK FAIL: (system\.slice|user\.slice|init\.scope) AllowedCPUs$')
     [ -z "$other" ] || { printf '%s\n' "$other" | sed 's/^/PART CHECK FAIL (base): /'; rc=1; }
+    # a non-zero base exit status must be explained by slice lines only (verifier LOW-2: an aborted base check is a FAIL)
+    if [ $brc != 0 ] && ! printf '%s\n' "$out" | grep -qE '^CHECK FAIL: (system\.slice|user\.slice|init\.scope) AllowedCPUs$'; then
+      echo "PART CHECK FAIL (base): measure-env.sh check exit $brc without a CHECK FAIL slice line: $(printf '%s' "$out" | tail -n 1)"; rc=1
+    fi
     for s in "${SLICES[@]}"; do [ "$(cpus $s)" = "$SYS" ] || { echo "PART CHECK FAIL: $s AllowedCPUs=$(cpus $s) (want $SYS)"; rc=1; }; done
     [ "$(systemctl show -p ActiveState --value measure.slice)" = active ] || { echo "PART CHECK FAIL: measure.slice not active"; rc=1; }
     [ "$(cpus measure.slice)" = "$MEAS" ] || { echo "PART CHECK FAIL: measure.slice AllowedCPUs=$(cpus measure.slice) (want $MEAS)"; rc=1; }
