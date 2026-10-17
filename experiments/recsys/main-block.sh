@@ -44,27 +44,63 @@
 #   After the last lifetime (hw and mgoff present): v1_cdiff.py -> <E>/cdiff.{txt,csv}, Megalon Fig 2 C by the
 #   difference method C_diff = T(mgoff) - T(hw) per op (user decision 2026-10-17); CDIFF FAIL (offered rates differ)
 #   stops the block; C_diff < 0 and C_sampled > T / > C_diff are WARNs only.
+# BLOCK=h1 — H1-HOOK v1 (experiments/h1/README.md, reports/H1-main-packet.md; called by experiments/h1/hook.sh):
+#   env H1MODE slo|fix, H1_N (round / rep), H1_SEED (loadgen seed of every run of this call), H1_PARENT_LOCK=H1-main
+#   (the measurement lock must name owner=H1-main; this block never locks or unlocks), H1_MIXES "<mix>=EKKO=<avg|peak>
+#   ..." (slo) or H1_LEVELS (levels.tsv, fix), PRETOUCH_DIR (pretouch-gate.sh at block start and end),
+#   MEASURE_ENV_DIR (host-gate measure-env check), EXPECT_DAX_UUID (guest precheck). EKKO is per mix (not global).
+#   One server lifetime per (system, mix) (publish_frac is a server argument): prepare as in v1 (node 0 writes the
+#   tables / Megalon creates the objects / Popcorn preload + cxl_shm cycle), warm-up (unmeasured), then
+#   slo: one full SLO search (PROFILE=main: ramp/bisect, confirm 3 x 30 s, fill 0.7/0.8/0.9, overload 1.05/1.1/1.2;
+#        query p95 <= 100 ms; --start 1 --factor 1.5 --precision 0.05 --max-steps 20) named <sys>-<mix>-slo-r<N>,
+#        systems hw pop mg; system order = shuffle(hw pop mg, seed H1-recsys-r1) rotated left by N-1 (Latin square),
+#        mixes per system shuffled with seed H1-recsys-r<N>; a "confirm failed at three rates" note is a NOTE (the
+#        block continues; levels.py / check.py decide);
+#   fix: per levels.tsv row (mix) and per system of shuffle(hw pop mg mgoff, seed H1-recsys-fix-r<N>-<mix>): one
+#        fixed run with two windows, L2_rate then L1_rate query/s (60 s each, no SLO abort), named <sys>-<mix>-fix-r<N>.
+#   Per run: v1_check.py <run> <sys> --h1 and check_breakdown.py -> <run>/h1-runcheck.txt (last line RUNCHECK PASS;
+#   a failed check stops the block); <E>/h1-runs.tsv one line per run; <E>/order.txt before the first run.
 set -uo pipefail
 E=${1:?evidence dir}
-P=/home/comsys/sungsu/destijl-control X=$P/CXL_SWMC/experiments/recsys G=$P/CXL_SWMC/experiments/vectordb/host-gate.sh
+P=/home/comsys/sungsu/destijl-control X=$(cd "$(dirname "$0")" && pwd)
+G=$(cd "$X/../vectordb" && pwd)/host-gate.sh PTG=$(cd "$X/../vectordb" && pwd)/pretouch-gate.sh
 : "${C8:?}" "${K8:?}" "${GT8:?}" "${RECV_MODE:?}" "${D:?}" "${VM_PLAIN:?}" "${VM_MEG:?}" "${MEG_BUILD:?}" "${LOADGEN:?}"
-: "${PLAIN_BUILD:?}" "${EKKO:?}"
+: "${PLAIN_BUILD:?}"
 MB=$MEG_BUILD SEED=${SEED:-20261016} ROUNDS=${ROUNDS:-3} FIXED=${FIXED:-1} XT=${XT:-28800}
 BLOCK=${BLOCK:-main} V1_RATE=${V1_RATE:-1} V1_WINDOW_S=${V1_WINDOW_S:-130}
-case $BLOCK in main|v1) ;; *) echo "SEQUENCE STOP: BLOCK must be main or v1"; exit 2;; esac
+case $BLOCK in main|v1|h1) ;; *) echo "SEQUENCE STOP: BLOCK must be main, v1 or h1"; exit 2;; esac
+if [ $BLOCK = h1 ]; then  # H1-HOOK v1 inputs (see the header)
+  [ "${H1_PARENT_LOCK:-}" = H1-main ] || { echo "SEQUENCE STOP: BLOCK=h1 needs H1_PARENT_LOCK=H1-main"; exit 2; }
+  [[ "${H1_N:-}" =~ ^[1-9]$ ]] && [[ "${H1_SEED:-}" =~ ^[0-9]+$ ]] || { echo "SEQUENCE STOP: H1_N / H1_SEED"; exit 2; }
+  case "${H1MODE:-}" in slo) : "${H1_MIXES:?}";; fix) [ -f "${H1_LEVELS:-}" ] || { echo "SEQUENCE STOP: no H1_LEVELS"; exit 2; };;
+    *) echo "SEQUENCE STOP: bad H1MODE"; exit 2;; esac
+  [ -d "${PRETOUCH_DIR:-}" ] && [ -n "${MEASURE_ENV_DIR:-}" ] && [ -n "${EXPECT_DAX_UUID:-}" ] \
+    || { echo "SEQUENCE STOP: BLOCK=h1 needs PRETOUCH_DIR, MEASURE_ENV_DIR and EXPECT_DAX_UUID"; exit 2; }
+  [ -z "${SYSTEMS:-}" ] || { echo "SEQUENCE STOP: SYSTEMS is not used with BLOCK=h1"; exit 2; }
+  SEED=$H1_SEED EKKO=${EKKO:-per-mix}
+else
+  : "${EKKO:?}"
+fi
 MEGALON_BASE=${MEGALON_BASE:-$P/builds/megalon/75}
 UPD_FILE=${UPD_FILE:-updates-day23-0-2M.smp} QRY_FILE=${QRY_FILE:-queries-day23-89137318-1M.smp}
 T_MS=60000 SLO_PCT=95 SLO_MS=100
-case $EKKO in
-  avg) PUBLISH_FRAC=0.000513333333; EKKO_RULE="Ekko OSDI'22 average: 3.08% of rows per hour -> 0.0308/60 per T = 60 s";;
-  peak) PUBLISH_FRAC=0.0043; EKKO_RULE="Ekko OSDI'22 peak: 4.3% of rows per 10 min -> 0.043/10 per T = 60 s";;
-  *) echo "SEQUENCE STOP: EKKO must be avg or peak"; exit 2;;
-esac
+ekko_set() {  # <avg|peak>: PUBLISH_FRAC, EKKO_RULE and the server arguments SA of that operating point
+  case $1 in
+    avg) PUBLISH_FRAC=0.000513333333; EKKO_RULE="Ekko OSDI'22 average: 3.08% of rows per hour -> 0.0308/60 per T = 60 s";;
+    peak) PUBLISH_FRAC=0.0043; EKKO_RULE="Ekko OSDI'22 peak: 4.3% of rows per 10 min -> 0.043/10 per T = 60 s";;
+    *) return 1;;
+  esac
+  SA="--nodes 2 --row-div 1 --serve-threads 14 --update-threads 4 --load-threads 8 --start-timeout-ms $((XT * 1000 / 2)) --publish-frac $PUBLISH_FRAC
+ --verify-rows 1 --proc-sysfs /sys/kernel/swmc/instr --proc-sysfs /sys/kernel/cxl_shm/instr
+ --proc-sysfs /sys/kernel/swmc/page_coherence --proc-kthread cxl_recv"
+  SA=$(echo $SA)
+}
+if [ $BLOCK != h1 ]; then ekko_set "$EKKO" || { echo "SEQUENCE STOP: EKKO must be avg or peak"; exit 2; }; fi
 export SLO_MS SLO_RULE="DeepRecSys ISCA'20: query p${SLO_PCT} <= ${SLO_MS} ms (MOT1 v6, user 2026-10-16)"
 HOST_PLAIN=$PLAIN_BUILD/bin/recsys-server
 SSH="ssh -o BatchMode=yes -o ConnectTimeout=8"
 IPS=(192.168.122.100 192.168.122.101)
-OWNER="RECSYS-$BLOCK-$(basename "$E")"
+OWNER="RECSYS-$BLOCK-$(basename "$E")"; [ $BLOCK = h1 ] && OWNER="H1-recsys-$H1MODE-r$H1_N"
 [[ $RECV_MODE =~ ^(poll|idle|sleep)$ ]] || { echo "SEQUENCE STOP: bad RECV_MODE"; exit 2; }
 [[ $ROUNDS =~ ^[1-9]$ ]] || { echo "SEQUENCE STOP: bad ROUNDS"; exit 2; }
 # SYSTEMS (subset of "hw pop mg", default all): a rerun of some systems (the SLO is fixed; L for the fixed window
@@ -87,13 +123,14 @@ POP_BUILD=${POP_BUILD:-10} POP_BUNDLE_SHA=${POP_BUNDLE_SHA:-626f6a0eb265553aaa6e
   && [ "$(sha256sum < $C8/packet.sha256 | cut -d' ' -f1)" = "$POP_BUNDLE_SHA" ] \
   && (cd $C8 && sha256sum -c --quiet packet.sha256) || { echo "SEQUENCE STOP: C8 is not the verified Popcorn build-$POP_BUILD bundle"; exit 2; }
 [ -d "$E" ] && [ -z "$(ls -A "$E" | grep -v '^sequence')" ] || { echo "SEQUENCE STOP: $E missing or not empty"; exit 2; }
-bash $G lock "$OWNER" || { echo "SEQUENCE STOP: lock"; exit 2; }
-SA="--nodes 2 --row-div 1 --serve-threads 14 --update-threads 4 --load-threads 8 --start-timeout-ms $((XT * 1000 / 2)) --publish-frac $PUBLISH_FRAC
- --verify-rows 1 --proc-sysfs /sys/kernel/swmc/instr --proc-sysfs /sys/kernel/cxl_shm/instr
- --proc-sysfs /sys/kernel/swmc/page_coherence --proc-kthread cxl_recv"
-SA=$(echo $SA)
+LOCKF=${LOCK:-$P/workspaces/MEASUREMENT.lock}
+if [ $BLOCK = h1 ]; then  # parent lock rule: H1 main holds the lock; this block never locks or unlocks
+  grep -q "^owner=H1-main " "$LOCKF" 2>/dev/null || { echo "SEQUENCE STOP: lock $LOCKF not held by H1-main ($(cat "$LOCKF" 2>/dev/null))"; exit 2; }
+else
+  bash $G lock "$OWNER" || { echo "SEQUENCE STOP: lock"; exit 2; }
+fi
 export LOADGEN PROFILE=main RUN_KIND=measurement STATS_OP=10 READY_TIMEOUT=$((XT / 2)) IDLE_WAIT_S=2400  # idle: an overrunning T = 60 s round may take > 10 min (Megalon)
-PS=(K=$K8 GT=$GT8 C=$C8 R=$E/shm-pop INIT_STATE=shared)
+SHMR=$E/shm-pop; PS=(K=$K8 GT=$GT8 C=$C8 R=$SHMR INIT_STATE=shared)   # per page MSI lifetime (system(): shm-<name>)
 CHOWNED=0
 stop_servers() {  # this block's servers only: every session dir's guest run dir + the preload pid dir
   local ip g
@@ -121,8 +158,8 @@ dax_free() { local ip f rc ok=0
     [ $rc = 1 ] && [ "$(wc -l < "$f")" = 1 ] || ok=1
   done
   return $ok; }
-shm_cleanup() {  # page MSI loaded (load attempted) and no "teardown PASS"
-  local r=$E/shm-pop
+shm_cleanup() {  # page MSI loaded (load attempted) and no "teardown PASS" (the current page MSI lifetime's dir)
+  local r=$SHMR
   [ -f "$r/load-vm0.txt" ] || return 0
   grep -q "teardown PASS" "$r/steps.log" 2>/dev/null && return 0
   dax_free cleanup || { echo "CLEANUP FAILED: /dev/dax0.0 still in use or fuser not clean on a VM (see $E/fuser-cleanup-*.out); teardown not attempted (manual: P-popcorn packet §6)" | tee -a "$E/cleanup.out"; return 0; }
@@ -154,7 +191,7 @@ finish() {
   dax_root_all
   [ $DAXOK = 1 ] && echo "$(date -Is) rollback: dax0.0 root:root 600 on both VMs" | tee -a "$E/rollback.out" \
     || echo "$(date -Is) ROLLBACK FAIL: dax0.0 not root:root 600 on every VM (see $E/rollback.out)" | tee -a "$E/rollback.out"
-  bash $G unlock "$OWNER"
+  [ $BLOCK = h1 ] || bash $G unlock "$OWNER"
 }
 trap finish EXIT
 trap 'echo "$(date -Is) SEQUENCE STOP: interrupted"; exit 130' INT TERM HUP
@@ -187,7 +224,7 @@ gatechk() { python3 $X/main_util.py gate "$1" "$SLO_MS" "$SLO_PCT"; }  # validit
 precheck() {
   local i f h files="${VM_PLAIN#/home/comsys/}/bin/recsys-server ${VM_PLAIN#/home/comsys/}/bin/recsys-node.sh ${VM_PLAIN#/home/comsys/}/cfg/cxl_region.yaml ${VM_MEG#/home/comsys/}/bin/recsys-server ${VM_MEG#/home/comsys/}/bin/recsys-node.sh ${VM_MEG#/home/comsys/}/lib/libmegalon-objapi.so ${VM_MEG#/home/comsys/}/lib/libmegalon.so ${VM_MEG#/home/comsys/}/cfg/megalon.yaml ${VM_MEG#/home/comsys/}/cfg/cxl_region.yaml"
   for i in 0 1; do
-    $SSH comsys@${IPS[$i]} "EXPECT_K=$K8 MEM_MIN=60 INSTALL_FILES='$files' bash -s" < $X/precheck.sh > "$E/precheck-${IPS[$i]}.out" 2>&1
+    $SSH comsys@${IPS[$i]} "EXPECT_K=$K8 MEM_MIN=60 EXPECT_DAX_UUID='${EXPECT_DAX_UUID:-}' INSTALL_FILES='$files' bash -s" < $X/precheck.sh > "$E/precheck-${IPS[$i]}.out" 2>&1
     grep -q "^PRECHECK PASS" "$E/precheck-${IPS[$i]}.out" || stop "precheck ${IPS[$i]}"
     for f in "${VM_PLAIN#/home/comsys/}/bin/recsys-server $HOST_PLAIN" "${VM_MEG#/home/comsys/}/bin/recsys-server $MB/bin/recsys-server" \
              "${VM_MEG#/home/comsys/}/lib/libmegalon-objapi.so $MB/lib/libmegalon-objapi.so" "${VM_MEG#/home/comsys/}/lib/libmegalon.so $MB/lib/libmegalon.so" \
@@ -224,23 +261,25 @@ pop_setup() {  # P-popcorn-deploy §6a cycle with build POP_BUILD (init_state=sh
   done
   t=$(date +%s)  # node 0 writes the initial tables through a plain mapping before coherence is enabled (no HWcc access)
   local PD=$VM_PLAIN/runs/preload-main-$(date +%s)
-  echo "$PD" > "$E/preload-pop.dir"
+  echo "$PD" > "$E/preload-$NAME.dir"
   $SSH comsys@${IPS[0]} "mkdir -p $PD && CXL_REGION_CONFIG=$VM_PLAIN/cfg/cxl_region.yaml setsid -w sh -c 'echo \$\$ > $PD/node0.pid; exec timeout $XT $VM_PLAIN/bin/recsys-server --node 0 --preload-only $SA --publish-ms $T_MS'" \
-    < /dev/null > "$E/preload-pop.log" 2>&1
-  echo "preload_wall_s=$(( $(date +%s) - t ))" >> "$E/preload-pop.log"
-  { grep -q "PRELOAD DONE" "$E/preload-pop.log" && servers_gone; } || stop "preload"
+    < /dev/null > "$E/preload-$NAME.log" 2>&1
+  echo "preload_wall_s=$(( $(date +%s) - t ))" >> "$E/preload-$NAME.log"
+  { grep -q "PRELOAD DONE" "$E/preload-$NAME.log" && servers_gone; } || stop "preload"
   env "${PS[@]}" bash $C8/p-popcorn-shm.sh enable || stop "enable gate"
   for ip in "${IPS[@]}"; do
     m=$($SSH comsys@$ip "sudo -n sh -c 'echo $RECV_MODE > /sys/module/cxl_shm/parameters/recv_mode' && cat /sys/module/cxl_shm/parameters/recv_mode" < /dev/null)
     i=$($SSH comsys@$ip "cat /sys/kernel/swmc/instr/enabled" < /dev/null)
-    echo "$ip recv_mode=$m instr_enabled=$i" >> "$E/recv-mode-pop.txt"
+    echo "$ip recv_mode=$m instr_enabled=$i" >> "$E/recv-mode-$NAME.txt"
     [ "$m" = "$RECV_MODE" ] || stop "recv_mode on $ip = $m"
     [ "$i" = 1 ] || stop "instr enabled on $ip = $i"
   done
   env "${PS[@]}" STATUS_TAG=pre bash $C8/p-popcorn-shm.sh status || stop "status pre"
 }
-system() {  # one server lifetime: hw | pop | mg
-  local s=$1 S=$E/$1 SE r rc g L t0
+system() {  # one server lifetime: <hw|pop|mg|mgoff> [<name> (h1: <sys>-<mix>-<phase>-r<N>; default = system)]
+  local s=$1 S=$E/${2:-$1} SE r rc g L t0 RD
+  NAME=${2:-$1}
+  if [ $s = pop ]; then SHMR=$E/shm-$NAME; PS=(K=$K8 GT=$GT8 C=$C8 R=$SHMR INIT_STATE=shared); fi
   t0=$(date +%s)
   echo "$(date -Is) system $s start"
   case $s in
@@ -255,14 +294,35 @@ system() {  # one server lifetime: hw | pop | mg
   servers_gone || stop "a recsys-server runs before $s"
   env "${SE[@]}" T_MS=$T_MS bash $X/session.sh start "$S" > "$S.start.out" 2>&1 || { tail -3 "$S.start.out"; stop "$s session start"; }
   tail -1 "$S.start.out"
-  echo "$s prepare_wall_s=$(( $(date +%s) - t0 )) (incl. page MSI shm load + preload)" >> "$E/load-times.txt"
-  sed "s/^/$s /" "$S/load-times.txt" >> "$E/load-times.txt"
+  echo "$NAME prepare_wall_s=$(( $(date +%s) - t0 )) (incl. page MSI shm load + preload)" >> "$E/load-times.txt"
+  sed "s/^/$NAME /" "$S/load-times.txt" >> "$E/load-times.txt"
   # 1) warm-up (unmeasured): 1 query/s with the updater for 70 s (>= one T = 60 s publication round)
   measure "$S" warmup "${LGC[@]}" --opt seed=$((SEED + 100)) --seed $((SEED + 100)) --mode fixed --rates 1 \
     --warmup-s 10 --step-warmup-s 0 --step-measure-s 70 --drain-s 10
   rc=$?
   [ $rc = 0 ] || stop "$s warm-up rc $rc"
-  if [ $BLOCK = v1 ]; then  # validation window (reports/RECSYS-V1-packet.md §3)
+  if [ $BLOCK = h1 ]; then  # H1-HOOK v1 run (header): one SLO search or one fixed run (L2 then L1) per lifetime
+    if [ $H1MODE = slo ]; then
+      RD=$S/slo
+      measure "$S" slo "${LGC[@]}" --opt seed=$SEED --seed $SEED --slo query:$SLO_PCT:$SLO_MS --raw \
+        --mode slo --start 1 --factor 1.5 --precision 0.05 --max-steps 20
+      rc=$?
+      grep -q 'workload_finish":"ok' "$RD/loadgen/summary.json" 2>/dev/null || stop "$NAME: loadgen workload finish (rc $rc)"
+      H1NOTE=""
+      if [ $rc = 1 ]; then
+        H1NOTE=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("note",""))' "$RD/loadgen/summary.json" 2>/dev/null)
+        [ -n "$H1NOTE" ] || stop "$NAME: loadgen rc 1 without a note"
+        echo "MAIN NOTE $NAME: $H1NOTE"
+      elif [ $rc != 0 ]; then stop "$NAME slo rc $rc"; fi
+    else
+      RD=$S/fix H1NOTE=""
+      measure "$S" fix "${LGC[@]}" --opt seed=$SEED --seed $SEED --raw --mode fixed --rates "$H1_L2,$H1_L1" \
+        --step-warmup-s 5 --step-measure-s 60 --drain-s 10
+      rc=$?
+      [ $rc = 0 ] || stop "$NAME fix rc $rc"
+    fi
+    h1_runcheck $s "$RD"
+  elif [ $BLOCK = v1 ]; then  # validation window (reports/RECSYS-V1-packet.md §3)
     measure "$S" val "${LGC[@]}" --opt seed=$SEED --seed $SEED --raw --mode fixed --rates "$V1_RATE" \
       --step-warmup-s 5 --step-measure-s "$V1_WINDOW_S" --drain-s 10
     rc=$?
@@ -324,28 +384,94 @@ system() {  # one server lifetime: hw | pop | mg
     servers_gone || stop "servers left (page MSI teardown not attempted)"
     dax_free pre-teardown || stop "/dev/dax0.0 in use before the cxl_shm teardown"
     env "${PS[@]}" bash $C8/p-popcorn-shm.sh teardown || stop "shm teardown"
-    grep -q "teardown PASS" "$E/shm-pop/steps.log" || stop "no teardown PASS"
+    grep -q "teardown PASS" "$SHMR/steps.log" || stop "no teardown PASS"
   fi
   servers_gone || stop "servers left after $s"
-  echo "$(date -Is) MAIN $s DONE ($(( $(date +%s) - t0 )) s)"
+  [ $BLOCK = h1 ] && printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$NAME" "$s" "$H1_MIX" "$H1MODE" "$H1_N" "${RD#$E/}" >> "$E/h1-runs.tsv"
+  echo "$(date -Is) MAIN $NAME DONE ($(( $(date +%s) - t0 )) s)"
+}
+h1_runcheck() {  # <sys> <run dir>: the validation packet's per-run checks -> <run>/h1-runcheck.txt (RUNCHECK PASS)
+  local s=$1 r=$2
+  python3 $X/v1_check.py "$r" $s --h1 > "$r/v1-check.txt" 2>&1
+  python3 $X/check_breakdown.py "$r" > "$r/breakdown-check.txt" 2>&1
+  { echo "# H1 per-run checks $NAME (system $s, mix $H1_MIX, phase $H1MODE, round $H1_N, seed $SEED; main-block.sh BLOCK=h1, H1-HOOK v1)"
+    echo "v1_check: $(cat "$r/v1-check.txt")"; echo "check_breakdown: $(cat "$r/breakdown-check.txt")"
+    echo "summary: $(python3 -c 'import json,sys; s=json.load(open(sys.argv[1])); print("note=%r workload_finish=%s confirm=%s" % (s.get("note",""), s.get("workload_finish"), s.get("confirm",{}).get("x_mean")))' "$r/loadgen/summary.json" 2>&1)"
+  } > "$r/h1-runcheck.txt"
+  grep -q "^V1CHECK PASS" "$r/v1-check.txt" || stop "$NAME: $(cat "$r/v1-check.txt")"
+  grep -q "^BREAKDOWN PASS" "$r/breakdown-check.txt" || stop "$NAME: $(cat "$r/breakdown-check.txt")"
+  [ -s "$r/breakdown.csv" ] || stop "$NAME: no breakdown.csv"
+  if [ -n "$H1NOTE" ]; then echo "RUNCHECK PASS (NOTE: $H1NOTE)" >> "$r/h1-runcheck.txt"; else echo "RUNCHECK PASS" >> "$r/h1-runcheck.txt"; fi
 }
 echo "$(date -Is) block $OWNER start (git $(git -C $P/CXL_SWMC rev-parse --short HEAD)) K8=$K8 RECV_MODE=$RECV_MODE MEG_BUILD=$MB VM_PLAIN=$VM_PLAIN VM_MEG=$VM_MEG D=$D SEED=$SEED ROUNDS=$ROUNDS FIXED=$FIXED XT=$XT"
+[ $BLOCK = h1 ] && { bash $PTG "$PRETOUCH_DIR" "$E/pretouch-gate.txt" || stop "pretouch gate at block start"; }
 precheck
-# update rate for the Ekko operating point (Host compute, after the host-gate lock and the
-# input sha256 check in precheck): samples per T so that one round publishes PUBLISH_FRAC of all rows
-RATEF=$E/sequence-update-rate.txt
-nice -n 19 numactl --cpunodebind=1 --membind=1 "$PLAIN_BUILD/bin/recsys-rate" --samples "$D/$UPD_FILE" --frac $PUBLISH_FRAC \
-  --t-ms $T_MS --windows 20 > "$RATEF" || stop "recsys-rate"
-UPD_RATE=$(sed -n 's/^rate_samples_per_s=//p' "$RATEF")
-awk -v x="$UPD_RATE" 'BEGIN{exit !(x > 0)}' || stop "bad update rate $UPD_RATE"
-if [ -n "${V1_EXPECT_RATE:-}" ]; then  # the packet's expected rate (Host calibration, builds/recsys-inputs/1/rate-frac*.txt)
-  awk -v x="$UPD_RATE" -v y="$V1_EXPECT_RATE" 'BEGIN{exit !(x >= 0.98 * y && x <= 1.02 * y)}' \
-    || stop "update rate $UPD_RATE differs from the expected $V1_EXPECT_RATE by more than 2%"
+# update rate for the Ekko operating point (Host compute, after the lock check and the input sha256 check in
+# precheck): samples per T so that one round publishes PUBLISH_FRAC of all rows; checked against the calibration
+# file builds/recsys-inputs/1/rate-frac<frac>.txt (+-2 %) when V1_EXPECT_RATE is set or BLOCK=h1
+rate_for() {  # <ekko> <out file>: sets UPD_RATE and LGC for that operating point
+  ekko_set "$1" || stop "bad Ekko point $1"
+  nice -n 19 numactl --cpunodebind=1 --membind=1 "$PLAIN_BUILD/bin/recsys-rate" --samples "$D/$UPD_FILE" --frac $PUBLISH_FRAC \
+    --t-ms $T_MS --windows 20 > "$2" || stop "recsys-rate"
+  UPD_RATE=$(sed -n 's/^rate_samples_per_s=//p' "$2")
+  awk -v x="$UPD_RATE" 'BEGIN{exit !(x > 0)}' || stop "bad update rate $UPD_RATE"
+  local ex=${V1_EXPECT_RATE:-}
+  [ $BLOCK = h1 ] && ex=$(sed -n 's/^rate_samples_per_s=//p' "$D/rate-frac$PUBLISH_FRAC.txt" 2>/dev/null)
+  if [ $BLOCK = h1 ] || [ -n "$ex" ]; then
+    [ -n "$ex" ] || stop "no calibration file $D/rate-frac$PUBLISH_FRAC.txt"
+    awk -v x="$UPD_RATE" -v y="$ex" 'BEGIN{exit !(x >= 0.98 * y && x <= 1.02 * y)}' \
+      || stop "update rate $UPD_RATE differs from the expected $ex by more than 2%"
+  fi
+  echo "EKKO=$1 publish_frac=$PUBLISH_FRAC update_rate=$UPD_RATE samples/s ($EKKO_RULE; $2)"
+  # seq_base and wrap=1 are appended by session.sh measure (it refuses them from the caller)
+  LGC=(--opt samples=$D/$UPD_FILE --opt queries=$D/$QRY_FILE
+       --opt quantiles=$D/dist_quantile.txt --fixed update=$UPD_RATE --mix query=1 --x-stream query)
+}
+h1shuffle() { local seed=$1; shift; python3 -c 'import random,sys; v=sys.argv[2:]; random.Random(sys.argv[1]).shuffle(v); print(" ".join(v))' "$seed" "$@"; }
+h1_ekko() { case $1 in EKKO=avg) echo avg;; EKKO=peak) echo peak;; *) return 1;; esac; }
+if [ $BLOCK = h1 ]; then
+  printf '# name\tsystem\tmix\tphase\tround\trun_dir\n' > "$E/h1-runs.tsv"
+  if [ $H1MODE = slo ]; then
+    base=($(h1shuffle H1-recsys-r1 hw pop mg)); rot=$(( (H1_N - 1) % 3 ))
+    ord="${base[*]:$rot} ${base[*]:0:$rot}"; ord=$(echo $ord)
+    mixes=""; for spec in $H1_MIXES; do h1_ekko "${spec#*=}" > /dev/null || stop "bad mix parameter $spec"; mixes="$mixes ${spec%%=*}"; done
+    mixes=$(h1shuffle H1-recsys-r$H1_N $mixes)
+    { echo "# H1 DLRM recsys SLO round $H1_N (systems: shuffle seed H1-recsys-r1 rotated left by $rot; mixes: shuffle seed H1-recsys-r$H1_N; loadgen seed $SEED)"
+      echo "systems: $ord"; echo "mixes: $mixes"; echo "H1_MIXES: $H1_MIXES"; } | tee "$E/order.txt"
+    for s in $ord; do
+      for m in $mixes; do
+        for spec in $H1_MIXES; do [ "${spec%%=*}" = $m ] && ek=$(h1_ekko "${spec#*=}"); done
+        H1_MIX=$m; rate_for $ek "$E/update-rate-$s-$m-slo-r$H1_N.txt"
+        system $s $s-$m-slo-r$H1_N
+      done
+    done
+  else
+    python3 -I - "$H1_LEVELS" > "$E/levels-used.txt" <<'EOF' || stop "levels file $H1_LEVELS unreadable"
+import sys
+rows = [l.rstrip("\n").split("\t") for l in open(sys.argv[1]) if l.strip()]
+h = rows[0]
+for r in rows[1:]:
+    d = dict(zip(h, r))
+    assert d["mix"] in ("avg", "peak"), d["mix"]
+    l1, l2 = float(d["L1_rate"]), float(d["L2_rate"])
+    assert l1 > 0 and 0 < l2 < l1, (l1, l2)
+    print(d["mix"], d["L2_rate"], d["L1_rate"])
+EOF
+    { echo "# H1 DLRM recsys fixed phase rep $H1_N (levels $H1_LEVELS; systems per mix: shuffle seed H1-recsys-fix-r$H1_N-<mix>; loadgen seed $SEED; windows L2 then L1)"
+      while read -r m l2 l1; do echo "$m: $(h1shuffle H1-recsys-fix-r$H1_N-$m hw pop mg mgoff) L2=$l2 L1=$l1"; done < "$E/levels-used.txt"; } | tee "$E/order.txt"
+    while read -r m l2 l1; do
+      for s in $(h1shuffle H1-recsys-fix-r$H1_N-$m hw pop mg mgoff); do
+        H1_MIX=$m H1_L2=$l2 H1_L1=$l1; rate_for $m "$E/update-rate-$s-$m-fix-r$H1_N.txt"
+        system $s $s-$m-fix-r$H1_N < /dev/null
+      done
+    done < "$E/levels-used.txt"
+  fi
+  bash $PTG "$PRETOUCH_DIR" "$E/pretouch-gate.txt" || stop "pretouch gate at block end"
+  echo "$(date -Is) SEQUENCE DONE H1-recsys $H1MODE r$H1_N ($(($(wc -l < "$E/h1-runs.tsv") - 1)) runs)"
+  exit 0
 fi
-echo "EKKO=$EKKO publish_frac=$PUBLISH_FRAC update_rate=$UPD_RATE samples/s ($EKKO_RULE; $RATEF)"
-# seq_base and wrap=1 are appended by session.sh measure (it refuses them from the caller)
-LGC=(--opt samples=$D/$UPD_FILE --opt queries=$D/$QRY_FILE
-     --opt quantiles=$D/dist_quantile.txt --fixed update=$UPD_RATE --mix query=1 --x-stream query)
+RATEF=$E/sequence-update-rate.txt
+rate_for "$EKKO" "$RATEF"
 if [ $BLOCK = main ] && [[ " ${SYSTEMS:-hw pop mg} " != *" hw "* ]]; then
   echo "slo_ms=$SLO_MS pct=$SLO_PCT rule=$SLO_RULE (fixed; no all-HWcc in this block)" | tee "$E/slo.txt"
   [ -z "${L_FROM:-}" ] || { cp "$L_FROM" "$E/fixed-load-L.txt" && echo "L imported from $L_FROM: $(cat "$E/fixed-load-L.txt")"; }

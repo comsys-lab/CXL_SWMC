@@ -1,7 +1,14 @@
 #!/usr/bin/env python3
 """RECSYS-V1 validation checks of one measurement window (reports/RECSYS-V1-packet.md §3).
 
-usage: v1_check.py <measurement dir> <hw|pop|mg|mgoff>
+usage: v1_check.py <measurement dir> <hw|pop|mg|mgoff> [--h1]
+--h1 (H1 main runs, reports/H1-main-packet.md §8.1 "DLRM: v1_check-style invariants (torn rows 0, updater sustained
+  +-2 %, flush_overruns 0)"): the updater check applies to the measured steps that passed (SLO searches go past the
+  knee on purpose and fixed windows at L1 may fail, packet W3): update achieved >= 0.98 x offered there; failed or
+  aborted steps are recorded (NOTE), not checked. All other checks are the same as without --h1.
+Round accounting guard (verifier LOW 15): flushes = update_threads x publish_rounds at both window snapshots of
+  node 0 (update_threads from the manifest's server_args); else FAIL (a snapshot inside a round edge).
+A missing rows_per_round_target (0) is a FAIL (verifier LOW 18).
 Reads <dir>/loadgen/stats/step<N>-{begin,end}-t{0,1}.txt of the measured step(s) (t0 = updater node 0, t1 = serving
 node 1; window deltas) and <dir>/breakdown.csv. Checks (FAIL = stop the block):
   all   torn_rows delta 0, misses 0, update_misses 0; >= 1 query; >= 2 publication rounds in the window;
@@ -53,7 +60,8 @@ def coh_src(path):
 
 
 def main():
-    if len(sys.argv) != 3 or sys.argv[2] not in ('hw', 'pop', 'mg', 'mgoff'):
+    h1 = len(sys.argv) == 4 and sys.argv[3] == '--h1'
+    if len(sys.argv) not in (3, 4) or sys.argv[2] not in ('hw', 'pop', 'mg', 'mgoff') or (len(sys.argv) == 4 and not h1):
         sys.exit(__doc__)
     m, s = sys.argv[1], sys.argv[2]
     st = os.path.join(m, 'loadgen', 'stats')
@@ -98,14 +106,42 @@ def main():
             u = d.get('streams', {}).get('update', {})
             off, ach = float(u.get('offered', 0)), float(u.get('achieved', 0))
             vals[f'update_achieved_offered.step{d.get("step")}'] = f'{ach:.2f}/{off:.2f}'
+            bad_step = d.get('aborted') or 'saturated' in str(d.get('reason', ''))
+            if h1:  # H1: checked on passing steps only (+-2 %); past-the-knee / failed steps recorded
+                if d.get('pass') and not bad_step:
+                    if off <= 0 or not ach >= 0.98 * off:
+                        fails.append(f'step {d.get("step")}: updater behind on a passing step (achieved {ach} < 0.98 x offered {off})')
+                elif off > 0 and not ach >= 0.98 * off:
+                    notes.append(f'step {d.get("step")} ({d.get("phase")}, not passing): updater {ach:.2f}/{off:.2f}')
+                continue
             if off <= 0 or not ach >= 0.95 * off:
                 fails.append(f'step {d.get("step")}: updater behind (update achieved {ach} < 0.95 x offered {off})')
-            if d.get('aborted') or 'saturated' in str(d.get('reason', '')):
+            if bad_step:
                 fails.append(f'step {d.get("step")}: aborted/saturated ({d.get("reason", "")})')
     if vals['flush_overruns'] != 0 or vals['update_rate_sustained'] != 1:
         fails.append(f'update rate not sustained (overruns {vals["flush_overruns"]}, '
                      f'update_rate_sustained={vals["update_rate_sustained"]})')
+    # round accounting guard (LOW 15): every worker finished the same rounds at both snapshots
+    ut = None
+    try:
+        for line in open(os.path.join(m, 'manifest.txt')):
+            if line.startswith('server_args='):
+                a = line.split()
+                for i, x in enumerate(a[:-1]):
+                    if x == '--update-threads':
+                        ut = int(a[i + 1])
+    except (OSError, ValueError):
+        ut = None
+    if not ut or ut <= 0:
+        fails.append('round guard: --update-threads not found in the manifest server_args')
+    else:
+        for tag, snap in (('begin', b0), ('end', e0)):
+            fl, pr = snap.get('flushes', -1), snap.get('publish_rounds', -1)
+            if fl != ut * pr:
+                fails.append(f'round guard: {tag} snapshot flushes {fl} != {ut} x publish_rounds {pr} (snapshot inside a round edge)')
     tgt = e0.get('rows_per_round_target', 0)
+    if tgt <= 0:
+        fails.append('no rows_per_round_target in the node-0 end snapshot (Ekko operating point not checkable)')
     if vals['publish_rounds'] > 0 and tgt > 0:
         vals['rows_per_round_window_mean'] = round(vals['round_rows'] / vals['publish_rounds'])
         vals['rows_per_round_target'] = tgt
