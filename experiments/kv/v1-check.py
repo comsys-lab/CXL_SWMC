@@ -8,7 +8,9 @@ gets+get_not_found+get_errors / updates+update_not_found+update_errors, C formul
 Checks (each printed; exit 1 if any fails):
   stop      every node log has "kv-server: stopping" and opt.get.ops = gets, opt.put.ops = puts (every executed op
             counted once in the split)
-  rows      opsplit.csv has get and put rows with ops > 0 and T > 0; every C within [0, T]
+  rows      opsplit.csv has get and put rows with ops > 0 and T > 0; every C >= 0; C <= T is a FAIL for all-HWcc and
+            Popcorn (exact kernel counters) and only a WARN for Megalon (sampled-scaled C overestimates; user decision
+            2026-10-17: Megalon Fig 2 C = C_diff = T(Megalon timers off) - T(all-HWcc), experiments/kv/cdiff.py)
   gauge     every node's clean-stop stats carry opt.c_formula = the workload (kv / lmdb)
   source    all-HWcc: C = 0 and every raw pop_*/meg_* column 0 on every row
             Megalon timers on: c_formula kv, c_supported 1, C > 0 on every row with ops > 0, tsc_backwards 0;
@@ -16,7 +18,8 @@ Checks (each printed; exit 1 if any fails):
                       row and timed write sections (write_sampled) > 0 summed over the write op's rows (put / update; a single
                       low-rate step may have none), so C used the lean
                       estimators (reports/M2-megalon-port-changes.md §18); --megalon-lean 0 for builds <= 75
-            Megalon timers off (MEGALON_COH_TIMERS=0): c_supported 1 and C = 0 on every row (durations off, counts kept)
+            Megalon timers off (MEGALON_COH_TIMERS=0): c_supported 1 and C = 0 on every row (durations off, counts kept;
+                      lmdb: C minus the workload's own validation-copy estimate meg_vcopy_us_per_op, which stays timed)
             Popcorn: c_supported 1 (swmc_acct registered on every node) and the run's total C > 0
 Writes RUN_DIR/v1-check.txt (results + per step/op T and C).
 """
@@ -29,7 +32,13 @@ ap.add_argument("--timers", choices=["on", "off"], default="on")
 ap.add_argument("--workload", choices=["kv", "lmdb"], default="kv")
 ap.add_argument("--megalon-lean", choices=["0", "1"], default="1")
 a = ap.parse_args()
-out, fails = [], []
+out, fails, warns = [], [], []
+
+
+def warn(ok, what):
+    if not ok:
+        out.append("WARN " + what)
+        warns.append(what)
 
 
 def check(ok, what):
@@ -73,7 +82,12 @@ OPS = ("get", "put") if a.workload == "kv" else ("get", "update")
 for op in OPS:
     rs = [r for r in rows if r["op"] == op and n(r) > 0]
     check(bool(rs) and all(T(r) > 0 for r in rs), f"{op}: rows with ops > 0 and T > 0")
-check(all(0 <= C(r) <= T(r) * 1.0001 + 0.01 for r in rows if n(r)), "every C within [0, T]")
+check(all(C(r) >= 0 for r in rows if n(r)), "every C >= 0")
+over = [f"step {r['step']} {r['op']} C {C(r)} > T {T(r)}" for r in rows if n(r) and C(r) > T(r) * 1.0001 + 0.01]
+if a.system == "Megalon":
+    warn(not over, "Megalon sampled C <= T (" + "; ".join(over) + ")")
+else:
+    check(not over, "every C <= T (" + "; ".join(over) + ")")
 live = [r for r in rows if n(r) > 0]
 if a.system == "all-HWcc":
     check(all(C(r) == 0 for r in live), "all-HWcc: C = 0")
@@ -95,14 +109,15 @@ elif a.system == "Megalon" and a.timers == "on":
               f"Megalon: write_sampled > 0 over the run's {wop} rows")
 elif a.system == "Megalon":
     check(all(r["c_supported"] == "1" for r in live), "Megalon timers off: c_supported 1 (thread_coh present)")
-    check(all(C(r) == 0 for r in live), "Megalon timers off: C = 0")
+    vc = (lambda r: float(r.get("meg_vcopy_us_per_op[sampled_xN]") or 0)) if a.workload == "lmdb" else (lambda r: 0.0)
+    check(all(abs(C(r) - vc(r)) <= 1e-3 for r in live), "Megalon timers off: C = 0" + (" (minus the validation copy)" if a.workload == "lmdb" else ""))
 else:
     check(all(r["c_supported"] == "1" for r in live), "Popcorn: c_supported 1 (swmc_acct registered)")
     check(sum(C(r) * n(r) for r in live) > 0, "Popcorn: total C > 0")
 for r in rows:
     out.append(f"step {r['step']} {r['op']} offered={r['offered_x']} ops={r['ops[measured]']} T={r['T_us_per_op[measured]']} us "
                f"C={r['C_us_per_op[derived]']} us bg={r['coh_bg_us_per_op[derived]']} us/op sup={r['c_supported']}")
-res = "V1 CHECK " + ("PASS" if not fails else "FAIL: " + "; ".join(fails))
+res = "V1 CHECK " + ("PASS" if not fails else "FAIL: " + "; ".join(fails)) + (f" (warnings: {len(warns)})" if warns else "")
 out.append(res)
 open(os.path.join(a.run, "v1-check.txt"), "w").write("\n".join(out) + "\n")
 print(res)

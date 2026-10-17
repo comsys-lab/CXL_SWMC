@@ -51,6 +51,10 @@ case "$SYS" in
             export SYSTEM=Popcorn-$RECV_MODE V=$VM_PLAIN HOST_SERVER=$PLAIN_BUILD/bin/lmdb-server SERVER_ARGS="$SA --backend plain";;
   *) stop "bad SYS";;
 esac
+# COH_TIMERS=0|1 (optional, Megalon only): MEGALON_COH_TIMERS for both nodes (timers-off lifetime of the C_diff
+#   method, user decision 2026-10-17; recorded in the run manifest via node_env)
+[ -z "${COH_TIMERS:-}" ] || { [[ $COH_TIMERS =~ ^[01]$ ]] && [ "$SYS" = Megalon ]; } || stop "COH_TIMERS=0|1 is for SYS=Megalon only"
+[ -z "${COH_TIMERS:-}" ] || export NODE_ENV="ENV:MEGALON_COH_TIMERS=$COH_TIMERS"
 SLO_ARG=mixed:99:1; [[ $KIND =~ ^(fix|ladder)$ ]] && SLO_ARG=mixed:99:600000  # fix, ladder: no SLO abort (judged after)
 LG=(--opt records=$RECORDS --opt update_ratio=$UPDATE_RATIO --opt seed=$SEED --opt log=$LOG --seed "$SEED" --mix mixed=1
     --slo $SLO_ARG --x-stream mixed)

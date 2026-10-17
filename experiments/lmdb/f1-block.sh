@@ -165,9 +165,9 @@ run() {  # name, env...
   env LOCK_OWNER=$OWNER "$@" bash $X/pilot-run.sh "$name" "$E" 2>&1 | tee -a "$E/runs.log" | grep -E "^PILOTRUN"
   [ ${PIPESTATUS[0]} = 0 ] || stop "$name"
   grep -q "^PILOTRUN $name OK" "$E/runs.log" || stop "$name not OK"
-  local sys; for x in "$@"; do case $x in SYS=*) sys=${x#SYS=};; esac; done
+  local sys tm=on; for x in "$@"; do case $x in SYS=*) sys=${x#SYS=};; COH_TIMERS=0) tm=off;; esac; done
   # closure checks (opsplit vs server counters; all-HWcc C = 0, Megalon C > 0, Popcorn C > 0 via swmc_acct)
-  python3 -I -B $P/CXL_SWMC/experiments/kv/v1-check.py "$E/$name" --system $sys --workload lmdb | tee -a "$E/v1-check.log" \
+  python3 -I -B $P/CXL_SWMC/experiments/kv/v1-check.py "$E/$name" --system $sys --timers $tm --workload lmdb | tee -a "$E/v1-check.log" \
     | grep -q "V1 CHECK PASS" || stop "$name: v1-check"
   dmesg_check "$name" || stop "$name: dmesg check failed (new error/warning line, ssh failure or wrap; see block.log)"
 }
@@ -181,6 +181,10 @@ step "B1 Megalon stress"; NODE0_STRESS="--prepare-threads 8" stress B1-stress-me
 run mg-u50-func SYS=Megalon UPDATE_RATIO=0.5 LOG=1 "${ML[@]}"
 run mg-u5-func SYS=Megalon UPDATE_RATIO=0.05 "${ML[@]}"
 run mg-u80-func SYS=Megalon UPDATE_RATIO=0.8 "${ML[@]}"
+# v1.6: Megalon timers-off lifetimes at the all-HWcc rates (C_diff method, user decision 2026-10-17)
+run mg-u50-func-toff SYS=Megalon UPDATE_RATIO=0.5 COH_TIMERS=0 "${ML[@]}"
+run mg-u5-func-toff SYS=Megalon UPDATE_RATIO=0.05 COH_TIMERS=0 "${ML[@]}"
+run mg-u80-func-toff SYS=Megalon UPDATE_RATIO=0.8 COH_TIMERS=0 "${ML[@]}"
 if [ "${POPCORN:-0}" = 1 ]; then  # Part P: dax0.0 back to root:root 600 (p-popcorn-shm.sh owns chown/teardown)
   step "P0 dax0.0 root before Popcorn"
   for ip in "${IPS[@]}"; do
@@ -191,6 +195,13 @@ if [ "${POPCORN:-0}" = 1 ]; then  # Part P: dax0.0 back to root:root 600 (p-popc
   run pop-u50-func SYS=Popcorn UPDATE_RATIO=0.5 LOG=1 "${PL[@]}" "${PP[@]}"
   run pop-u80-func SYS=Popcorn UPDATE_RATIO=0.8 "${PL[@]}" "${PP[@]}"
 fi
+step "CD Megalon C_diff (T timers off - T all-HWcc per rate and op; Popcorn cross-check)"
+for m in u50 u5 u80; do
+  POPA=(); [ -d "$E/pop-$m-func" ] && POPA=(--pop "$E/pop-$m-func")
+  python3 -I -B $P/CXL_SWMC/experiments/kv/cdiff.py --hw "$E/hw-$m-func" --mgoff "$E/mg-$m-func-toff" --mg "$E/mg-$m-func" \
+    "${POPA[@]}" --workload lmdb --out "$E/cdiff-$m.txt" >> "$E/block.log" 2>&1 || stop "cdiff $m"
+  tail -n 1 "$E/cdiff-$m.txt" | tee -a "$E/block.log"
+done
 step "PT pretouch check (end)"
 bash $P/CXL_SWMC/experiments/kv/pretouch-check.sh "$PRETOUCH_DIR" "$E/pretouch-check-end.txt" >> "$E/block.log" 2>&1 || stop "pretouch check (end), see pretouch-check-end.txt"
 step "BLOCK DONE"

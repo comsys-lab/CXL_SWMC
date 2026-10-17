@@ -228,7 +228,8 @@ case "$B" in
     LOW=${V1_LOW:-2000}
     hi() {  # system mix -> high rate (requests/s); V1_HI_<sys>_<mix> overrides
       local v="V1_HI_$1_$2"; [ -n "${!v:-}" ] && { echo "${!v}"; return; }
-      case $1-$2 in hw-u5) echo 64300;; mg-u5) echo 63900;; pop-u5) echo 16400;;
+      # mg-u5 = hw-u5 (v1.5: the timers-off Megalon run needs the all-HWcc rates for C_diff; v1.3/v1.4 used 63,900)
+      case $1-$2 in hw-u5) echo 64300;; mg-u5) echo 64300;; pop-u5) echo 16400;;
                     hw-u80) echo 44000;; mg-u80) echo 44000;; pop-u80) echo 9700;; esac; }
     # dmesg stop rule: line counts after the precheck; after every run, new lines matching BAD on either VM stop
     BAD='BUG:|Oops|WARNING:|Call Trace|general protection|segfault|[Ee]rror|ERROR|soft lockup|hung_task'
@@ -272,6 +273,13 @@ case "$B" in
       u=0.05; [ $m = u80 ] && u=0.8
       run pop-$m-val SYS=Popcorn C8=$C8 K8=$K8 GT8=$GT8 RECV_MODE=$RECV_MODE PUT_RATIO=$u KIND=ladder RATES=$LOW,$(hi pop $m) KEYS=$KEYS READY_TIMEOUT=1800
       v1chk pop-$m-val Popcorn
+    done
+    # Megalon C by the difference method (user decision 2026-10-17): T(mg timers off) - T(all-HWcc) per rate and op,
+    # split by the timers-on sampled parts; Popcorn T(pop) - T(hw) cross-check where the rates match (low step)
+    for m in u5 u80; do
+      python3 -I -B $X/cdiff.py --hw "$E/hw-$m-val" --mgoff "$E/mg-$m-val-toff" --mg "$E/mg-$m-val" --pop "$E/pop-$m-val" \
+        --workload kv --out "$E/cdiff-$m.txt" >> "$E/v1-check.log" 2>&1 || { echo "$(date -Is) SEQUENCE STOP: cdiff $m"; exit 1; }
+      tail -n 1 "$E/cdiff-$m.txt"
     done;;
   *) echo "SEQUENCE STOP: bad block"; exit 2;;
 esac

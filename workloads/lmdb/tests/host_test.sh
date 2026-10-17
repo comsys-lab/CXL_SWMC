@@ -117,7 +117,10 @@ for o in ("get", "update"):
     if not rs or any(float(r["T_us_per_op[measured]"]) <= 0 for r in rs): bad.append(f"{o}: no rows with ops > 0 and T > 0")
 for r in rows:
     c, t = float(r["C_us_per_op[derived]"]), float(r["T_us_per_op[measured]"])
-    if c < 0 or c > t * 1.0001 + 0.01: bad.append(f"{r['step']} {r['op']}: C {c} outside [0, T]")
+    if c < 0: bad.append(f"{r['step']} {r['op']}: C {c} < 0")
+    if c > t * 1.0001 + 0.01:  # Megalon sampled C: WARN only (user decision 2026-10-17: Fig 2 C = C_diff)
+        (print(f"WARN {r['step']} {r['op']}: sampled C {c} > T {t}") if r["c_source"] == "megalon"
+         else bad.append(f"{r['step']} {r['op']}: C {c} > T {t}"))
     if sys.argv[2] == "1" and r["c_supported"] != "1": bad.append(f"{r['step']} {r['op']}: c_supported 0")
 print("opsplit:", "OK" if not bad else "BAD " + "; ".join(bad),
       " ".join(f"{r['step']}:{r['op']}:n={r['ops[measured]']}:T={r['T_us_per_op[measured]']}us:C={r['C_us_per_op[derived]']}us:mod={r['mod_bytes_per_op[measured]']}:sup={r['c_supported']}" for r in rows))

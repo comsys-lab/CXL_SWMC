@@ -101,7 +101,10 @@ for o in need:
     elif any(float(r["T_us_per_op[measured]"]) <= 0 for r in rs): bad.append(f"{o}: T <= 0")
 for r in rows:
     c, t = float(r["C_us_per_op[derived]"]), float(r["T_us_per_op[measured]"])
-    if c < 0 or (int(r["ops[measured]"]) and c > t * 1.0001 + 0.01): bad.append(f"step {r['step']} {r['op']}: C {c} outside [0, T {t}]")
+    if c < 0: bad.append(f"step {r['step']} {r['op']}: C {c} < 0")
+    if int(r["ops[measured]"]) and c > t * 1.0001 + 0.01:  # Megalon sampled C: WARN only (user decision 2026-10-17, C_diff)
+        (print(f"WARN step {r['step']} {r['op']}: sampled C {c} > T {t}", file=sys.stderr) if r["c_source"] == "megalon"
+         else bad.append(f"step {r['step']} {r['op']}: C {c} > T {t}"))
     if want_coh and r["c_supported"] != "1": bad.append(f"step {r['step']} {r['op']}: c_supported 0")
     if want_c and int(r["ops[measured]"]) and c <= 0: bad.append(f"step {r['step']} {r['op']}: C = 0 (Megalon KV path not timed)")
 gap = want_coh and not want_c and all(float(r["C_us_per_op[derived]"]) == 0 for r in rows)
