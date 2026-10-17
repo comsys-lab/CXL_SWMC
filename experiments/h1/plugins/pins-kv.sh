@@ -8,7 +8,7 @@
 HR=$P/CXL_SWMC
 HOOK_FILE=$HR/experiments/kv/pilot-block.sh
 BLOCK_CMD=(bash $HOOK_FILE h1)       # H1 hook = block "h1" (marker H1-HOOK v2)
-BLOCK_ENV=(PIN=f8bf421429e110c2f5debc9feb7795daa2559da8 BUILD_PIN=934fa9312c38eeaf2845605cf22d2ef1cfe15fc4 MEGALON_BUILD_N=77 KEYS=54000000
+BLOCK_ENV=(PIN=6624d87a04f2488600da2f503f40a43cc8f248d8 BUILD_PIN=934fa9312c38eeaf2845605cf22d2ef1cfe15fc4 MEGALON_BUILD_N=77 KEYS=54000000
   PLAIN_BUILD=$P/builds/kv/10 MEG_BUILD=$P/builds/kv-megalon/10 LOADGEN_BUILD=$P/builds/kv-loadgen/10
   VM_PLAIN=/home/comsys/kv10 VM_MEG=/home/comsys/kvm10 KV_CFG=$P/recovery/KV-V1-v1.5-run/install.log.megalon.yaml
   K8=$KPOP C8=$CPOP GT8=$GTPOP RECV_MODE=$RECV_MODE EXPECT_DAX_UUID=$EXPECT_DAX_UUID)
@@ -27,13 +27,16 @@ f9c1753f3bef2ab0941153058860227145f2d7b7e33a210bdc3338fad14eacda  $P/builds/kv-m
 48c5f02c0546af9b22cf0a4ce2172177193ffcc6d502d9fb0fdeb51863bb9f17  $P/recovery/KV-V1-v1.5-run/install.log.megalon.yaml
 eda9b67d11fbea5b0afab63f2c5aa4c6ab304ca191b025c95b5444947bf0e302  $HOOK_FILE
 fbfb125195d2c862ab33c56da7e251c940973e03bd19ffaa35361002fdd1d895  $HR/experiments/kv/h1v2-lib.sh
-ff686bac62f20b3283682a9ca5a8a7c1c18618840a5b5fd488cc902f19042cd0  $HR/experiments/kv/pilot-run.sh
-c567383e11f88d89e8327676876e07be0636abc01e74a807afe18fecdb5bc43b  $HR/experiments/kv/run.sh
+13a41908fa932590ebcbebcf75ff5d58e886609df3da398d5e3af1cdb67a3ead  $HR/experiments/kv/pilot-run.sh
+05360955f25cbb03c7157db5b3f305e47b8b3e29cb57833f9a1033074e19a019  $HR/experiments/kv/run.sh
 8435ef222785be5d7a6dd6a97572b1404017822c63f3f766c45562efc8ae35ca  $HR/experiments/kv/precheck.sh
 de9d4a99916fbd60b66f6142d0cbc69cd88068e19c9ca08609380241801e76f7  $HR/experiments/kv/v1-check.py
 cbd6d75e743f149633a461e525bff6c69108407bcc0d7b9dc8f443dc72a6690f  $HR/experiments/kv/pretouch-check.sh
 1edcdda88f30200fd55c1b5a18cb4b9d6db57aa02647f8ad549e4e7f6aabb31f  $HR/experiments/vectordb/host-gate.sh
 68327dd3178d7af5b0ad9c614f0a6c41b4d99b2f6a23cf456f7751273996eecf  $HR/scripts/host/measure-env.sh
+672ad3c64e2992ba70d1fc5534e2e652c23d6166ad3e107b38597b23caaeb759  $HR/experiments/h1/h1-gate.sh
+aed8d7f32871398db375c502152587ee0b25a716dd60d4ff637e189aa3d42420  $HR/scripts/host/measure-run.sh
+96080a94485adfd192bd1da85d7e6589656657a0b76d65d534aa6494294dd6a4  $HR/scripts/host/measure-env-part.sh
 ea8417418975f9a363d2c133f43a0a84bac5bd5f86eb0953305cea2864629327  $HR/scripts/guest/kv-node.sh
 7195fe79fa952cc61a5c95d275e924b004fcfd8a98a97baba640b51c6494e621  $HR/workloads/kv/tools/opsplit.py
 6470d54b3727164cc765072e9a87b5573264b6b4b2d016d0b71309fbeb2b50e1  $HR/experiments/loadgen/stats_delta.py
