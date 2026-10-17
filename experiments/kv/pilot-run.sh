@@ -85,19 +85,32 @@ case "$KIND" in
     [[ $H1_PARTS != *fix* ]] || [ -n "${RATES:-}" ] || [ -n "${FIX_RATES_CMD:-}" ] || stop "h1life fix part needs RATES or FIX_RATES_CMD"
     PARTS_SH=$E/$NAME.parts.sh
     [ -e "$PARTS_SH" ] && stop "$PARTS_SH exists"
+    # KV check state between the parts (648 MB at 54M keys): scratch dir OUTSIDE recovery/ (user decision 2026-10-18),
+    # <P>/workspaces/h1-scratch/<evidence dir below P, / -> _>/<lifetime>/kvstate-slo.bin; size + sha256 go to
+    # <lifetime>/kvstate.txt before the fix part reads it; deleted when this pilot-run exits (success or failure)
+    SCR=$P/workspaces/h1-scratch/$(echo "${E#$P/}" | tr '/' '_')/$NAME
+    case "$SCR" in $P/workspaces/h1-scratch/?*/?*) ;; *) stop "bad scratch dir $SCR";; esac
+    scratch_clean() {  # only the state file of this lifetime, only below workspaces/h1-scratch/
+      [ -n "${SCR:-}" ] || return 0
+      case "$SCR" in $P/workspaces/h1-scratch/?*/?*) ;; *) return 0;; esac
+      if [ -e "$SCR/kvstate-slo.bin" ]; then rm -f "$SCR/kvstate-slo.bin" && echo "kvstate_deleted=$(date -Is) $SCR/kvstate-slo.bin" >> "$E/$NAME/kvstate.txt" 2>/dev/null; fi
+      rmdir "$SCR" 2>/dev/null; true
+    }
+    [[ $H1_PARTS == "slo fix" ]] && { mkdir -p "$SCR" || stop "scratch dir $SCR"; trap scratch_clean EXIT; }
     { echo '#!/bin/bash'
       echo "# H1-HOOK v2 part args of $NAME (written by pilot-run.sh KIND=h1life; called by run.sh before each part)"
       echo 'set -uo pipefail'
       echo 'RD=$2'
       echo 'case $1 in'
-      echo "  slo) printf '%s\\n' --slo mixed:99:1 --raw --mode slo --start 500 --factor 1.5 --precision 0.05 --max-steps 25 --warmup-s 10 --step-warmup-s 3 --step-measure-s 15 --drain-s 5 --confirm-s 30 --confirm-reps 3 --fill 0.7,0.8,0.9 --overload 1.05,1.1,1.2 --opt seed=$SEED --seed $SEED $([[ $H1_PARTS == "slo fix" ]] && echo "--opt state_out=\$RD/kvstate-slo.bin");;"
+      echo "  slo) printf '%s\\n' --slo mixed:99:1 --raw --mode slo --start 500 --factor 1.5 --precision 0.05 --max-steps 25 --warmup-s 10 --step-warmup-s 3 --step-measure-s 15 --drain-s 5 --confirm-s 30 --confirm-reps 3 --fill 0.7,0.8,0.9 --overload 1.05,1.1,1.2 --opt seed=$SEED --seed $SEED $([[ $H1_PARTS == "slo fix" ]] && echo "--opt state_out=$SCR/kvstate-slo.bin");;"
       echo "  fix) R='${RATES:-}'"
       echo "       if [ -z \"\$R\" ]; then o=\$(${FIX_RATES_CMD:-false}) || { echo \"levels callback failed (rc \$?)\" >&2; exit 1; }"
       echo "         set -- \$o; [ \$# = 2 ] || { echo \"levels callback output '\$o'\" >&2; exit 1; }; R=\$1,\$2; fi"
       echo "       [[ \$R =~ ^[1-9][0-9]*,[1-9][0-9]*\$ ]] || { echo \"bad fix rates '\$R' (integers <L2>,<L1>)\" >&2; exit 1; }"
       echo "       echo \"\$R\" > \"\$RD/fix/rates.txt\""
-      [[ $H1_PARTS == "slo fix" ]] && echo "       [ \"\$(stat -c %s \$RD/kvstate-slo.bin 2>/dev/null)\" = $((16 + 12 * KEYS)) ] || { echo \"kv state file \$RD/kvstate-slo.bin missing or not $((16 + 12 * KEYS)) B\" >&2; exit 1; }"
-      echo "       printf '%s\\n' --slo mixed:99:600000 --raw --mode fixed --rates \"\$R\" --warmup-s $H1_SETTLE_S --step-warmup-s 5 --step-measure-s 30 --drain-s 10 --opt seed=$((SEED + 1)) --seed $((SEED + 1)) $([[ $H1_PARTS == "slo fix" ]] && echo "--opt state_in=\$RD/kvstate-slo.bin");;"
+      [[ $H1_PARTS == "slo fix" ]] && echo "       [ \"\$(stat -c %s $SCR/kvstate-slo.bin 2>/dev/null)\" = $((16 + 12 * KEYS)) ] || { echo \"kv state file $SCR/kvstate-slo.bin missing or not $((16 + 12 * KEYS)) B\" >&2; exit 1; }
+       { echo \"# KV check state between the parts (scratch, deleted after the lifetime)\"; echo \"path=$SCR/kvstate-slo.bin\"; echo \"size=\$(stat -c %s $SCR/kvstate-slo.bin)\"; echo \"sha256=\$(sha256sum < $SCR/kvstate-slo.bin | cut -c1-64)\"; echo \"recorded=\$(date -Is)\"; } > \$RD/kvstate.txt"
+      echo "       printf '%s\\n' --slo mixed:99:600000 --raw --mode fixed --rates \"\$R\" --warmup-s $H1_SETTLE_S --step-warmup-s 5 --step-measure-s 30 --drain-s 10 --opt seed=$((SEED + 1)) --seed $((SEED + 1)) $([[ $H1_PARTS == "slo fix" ]] && echo "--opt state_in=$SCR/kvstate-slo.bin");;"
       echo '  *) echo "bad part $1" >&2; exit 2;;'
       echo 'esac'; } > "$PARTS_SH"
     export PARTS="$H1_PARTS" PART_ARGS_CMD="$PARTS_SH";;

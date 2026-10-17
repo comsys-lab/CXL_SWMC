@@ -164,6 +164,10 @@ else  # H1-HOOK v2: several loadgen parts in this one server lifetime (see the h
     echo "part=$part end=$(date -Is) loadgen_rc=$prc" >> "$RUN/manifest.txt"
     [ "$LG" != 0 ] || LG=$prc
     part_post "$RUN/$part"
+    if [ "$part" = slo ] && [ "$prc" != 0 ] && ! grep -q 'confirm failed at three rates' "$RUN/$part/loadgen/summary.json" 2>/dev/null; then
+      echo "run $NAME: slo part failed (rc $prc, not a 'confirm failed at three rates' note): later parts skipped"
+      echo "part=slo later_parts_skipped" >> "$RUN/manifest.txt"; break
+    fi
   done
 fi
 [ -z "${SERVER_CPUS:-}" ] || server_cpus check

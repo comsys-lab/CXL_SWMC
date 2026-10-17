@@ -99,6 +99,10 @@ CHOWNED=0
 KPAT='(^|[ /])bin/kv-serve[r]( |$)'  # our kv-server by command-line word ([r]: not the remote shell's own command line)
 finish() {
   set +eu  # nothing in the trap may abort it before the unlock
+  if [ "$B" = h1 ]; then  # KV check-state scratch of this block (pilot-run deletes each lifetime's file; leftovers here)
+    SCRB=$P/workspaces/h1-scratch/$(echo "${E#$P/}" | tr '/' '_')
+    case "$SCRB" in $P/workspaces/h1-scratch/?*) [ -d "$SCRB" ] && { find "$SCRB" -name kvstate-slo.bin -type f -delete; find "$SCRB" -depth -type d -empty -delete; echo "$(date -Is) scratch $SCRB cleaned" >> "$E/rollback.out"; };; esac
+  fi
   for ip in "${IPS[@]}"; do
     for g in $(sed -n 's/^guest_run_dir=//p' "$E"/*/manifest.txt 2>/dev/null); do
       $SSH comsys@$ip "for k in 0 1; do [ -e $g/node\$k.pid ] && \$(dirname $g)/../bin/kv-node.sh stop $g \$k; done; true" < /dev/null 2>&1 | sed "s|^|$ip |" >> "$E/rollback.out"
