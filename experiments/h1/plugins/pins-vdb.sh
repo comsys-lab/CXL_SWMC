@@ -1,16 +1,17 @@
 # H1 plugin: vector DB (HNSW 28M, pubmed-a27m-b1m-q10k; reports/VDB-V1-packet.md v1.3.1 blocks, validation PASS
 # 2026-10-17 §17). all-HWcc = plain server (no Megalon; MOT1 v6 §3.1), Popcorn = plain server + cxl_shm
 # (init_state=shared + preload, recv_mode poll), Megalon = vdb-megalon on Megalon 77 (packed4, 32 MiB vector chunk
-# object), mgoff = the same with MEGALON_COH_TIMERS=0. Filled 2026-10-17 (H1 hook in v6-block.sh; fixed-phase seed with the mix since the re-pin).
+# object), mgoff = the same with MEGALON_COH_TIMERS=0. H1-HOOK v2 (CXL_SWMC 9a802a6f3). FILL_vdb_loadgen6_*: loadgen with the
+# w_start plugin option (vdb-loadgen/6, not built yet: Host build hold); hook.sh refuses this plugin until they are filled.
 . "$(dirname "${BASH_SOURCE[0]}")/pins-common.inc"
 HR=$P/CXL_SWMC                      # live tree; v6-block.sh uses $P/CXL_SWMC/experiments/vectordb itself. Every file it
                                     # runs is hash-pinned below (hook: see the v6-block.sh pin; builds vdb/15, vdb-megalon/14 from 934fa9312)
 HOOK_FILE=$HR/experiments/vectordb/v6-block.sh
-BLOCK_CMD=(bash $HOOK_FILE)          # H1 hook = H1MODE=slo|fix in v6-block.sh (marker H1-HOOK v1)
+BLOCK_CMD=(bash $HOOK_FILE)          # H1 hook = H1MODE=r1|cont in v6-block.sh (marker H1-HOOK v2)
 BLOCK_ENV=(KPOP=$KPOP GTPOP=$GTPOP CPOP=$CPOP MEG_LIB=$MEG77 MEGALON_LEAN=1 EXPECT_DAX_UUID=$EXPECT_DAX_UUID
   PLAIN_BUILD=$P/builds/vdb/15 VPLAIN=/home/comsys/vdb15
   MEG_BUILD=$P/builds/vdb-megalon/14 VMEG=/home/comsys/vdbm14-28m MEG_CFG=$HR/systems/megalon/vectordb-2vm.yaml
-  LOADGEN_BUILD=$P/builds/vdb-loadgen/5)
+  LOADGEN_BUILD=$P/builds/vdb-loadgen/6)
 PIN_SHA256="$COMMON_SHA256
 f17c8995c1b2c88f3849b6aec890c848fafe99bb40298cbf4412999858bc59d1  $P/builds/vdb/15/manifest.txt
 2097a2e49290849a35d62f474da50bb7e3e4fedb9d0703343c797e9fdabfe525  $P/builds/vdb/15/bin/vdb-server
@@ -18,18 +19,19 @@ f17c8995c1b2c88f3849b6aec890c848fafe99bb40298cbf4412999858bc59d1  $P/builds/vdb/
 5f1ff99101da18cd7f05d55c77444ea7a7cf94030e17bcf24050e0ebe12c0dbc  $P/builds/vdb-megalon/14/bin/vdb-server
 8c59d1808ec569f54a05531610e3b9d18ae4563f9ebb5c264a657bd1edf3a3ac  $P/builds/vdb-megalon/14/lib/libmegalon-objapi.so
 f9c1753f3bef2ab0941153058860227145f2d7b7e33a210bdc3338fad14eacda  $P/builds/vdb-megalon/14/lib/libmegalon.so
-654c0cbcb6841a98844c6998efb561cf9bf0cc1810c3764ac2a3659dffa15465  $P/builds/vdb-loadgen/5/manifest.txt
-76dd2b697acdd8a86787e8aef995c07b3d9ecd864a83b0e8b64ca9982935ec66  $P/builds/vdb-loadgen/5/loadgen
+FILL_vdb_loadgen6_manifest_sha256  $P/builds/vdb-loadgen/6/manifest.txt
+FILL_vdb_loadgen6_loadgen_sha256  $P/builds/vdb-loadgen/6/loadgen
 e9d4942ee33b2f65cf7117d87942296e1365d0234873c2c4159545f40708db54  $P/workspaces/vdb-data/seg32-c32m-a27m-m16-efc128-b1/SHA256SUMS
 4e4e7134710f9b131368d7b3f71c07ab56d97e72ad329649bda27f893f6d65be  $HR/systems/megalon/vectordb-2vm.yaml
 eeb6b23f173d85a3c86ade0fb804b363e3c84a36bf9c0f56a7cbcab25e738b53  $HR/config/cxl_region.yaml
-2a916d89b70f363e740b913f8d35654e9bbced106cc55c6bd66d305140ad6932  $HOOK_FILE
+a08fecca94ba9c47d2251ca5e78716e465015ce5c6a865bff76a5523ec0267c6  $HOOK_FILE
 27a11c2c75f748fa7b47111496e30170ab5a35c0b65bd56422c6b3b6fb4d7503  $HR/experiments/vectordb/m4-lib.sh
-c3fcb406bb4be64a72f9065e87edcfe2c8d7bb487d67e50d7bf74fe6987fb797  $HR/experiments/vectordb/m4-run.sh
+87b54b7b8e9e22d9abd5988573282f03ab65fe687d91a9527a65ece094107c93  $HR/experiments/vectordb/m4-run.sh
 4d917368a0946c0a5052dd0d1e31e5ab900914e74c75bd02d37dc164708b66fb  $HR/experiments/vectordb/m4-precheck.sh
-eca4cd1714887023e06783675a6fba20c5d6f940e04a37b56b0d35003566764c  $HR/experiments/vectordb/run.sh
+8273b51548c7a2de8e28ac6ea395d8816c6a9212439d636b995ab9906e241808  $HR/experiments/vectordb/run.sh
 1edcdda88f30200fd55c1b5a18cb4b9d6db57aa02647f8ad549e4e7f6aabb31f  $HR/experiments/vectordb/host-gate.sh
 1baccf944c1ac66fce65b065c1043529cd72bc08b38f4b42fe43bd2640076031  $HR/experiments/vectordb/pretouch-gate.sh
 49ffaf143f484e4548e84105d20f584547fbd06c6cd38c1522ba4dccbd18e8fe  $HR/experiments/vectordb/opsplit.py
-e81a738fdf1829d9a42f4ab213be07b421b8d9d5b45cb09238a0c66ce1630a5c  $HR/workloads/vectordb/tests/opcoh_check.py
-68327dd3178d7af5b0ad9c614f0a6c41b4d99b2f6a23cf456f7751273996eecf  $HR/scripts/host/measure-env.sh"
+070c89107f47abdb9d4534232a0a0c7ee8f664db0fdb4fd850020e3d3e680321  $HR/workloads/vectordb/tests/opcoh_check.py
+68327dd3178d7af5b0ad9c614f0a6c41b4d99b2f6a23cf456f7751273996eecf  $HR/scripts/host/measure-env.sh
+256445b452eb6373b7bef81ef691f3a4e601d21c77c44b498ba268a01edb57e7  $HR/experiments/vectordb/h1-rates.sh"
