@@ -12,7 +12,7 @@
 # Update seqs continue over the lifetime: measurement i gets --opt seq_base=<last update seq of i-1> --opt wrap=1, so
 # the updater replays the trace on from where the previous measurement stopped (recsys plugin; never restarts at 1).
 # env (start): SYSTEM, V (guest install dir), HOST_SERVER (Host recsys-server of the same build, --print-app-bytes),
-#   SERVER_ARGS (every node; no --publish-*), T_MS (--publish-ms), optional NODE0_ARGS, NODE_ENV, NODE0_ENV (ENV:K=V
+#   SERVER_ARGS (every node; no --publish-ms; --publish-frac allowed), T_MS (--publish-ms), optional NODE0_ARGS, NODE_ENV, NODE0_ENV (ENV:K=V
 #   tokens, e.g. ENV:XTIMEOUT=28800), READY_TIMEOUT (s, default 14400), NODES, PORT (7100).
 # env (measure): LOADGEN, optional LG_CPUS (56-63), STATS_OP (10), PROFILE (main | pilot, as run.sh), RUN_KIND
 #   (measurement | functional), IDLE_WAIT_S (900), SLO_MS / SLO_RULE (recorded in the manifest only; the SLO itself
@@ -49,7 +49,8 @@ case "$CMD" in
 start)
   : "${SYSTEM:?}" "${V:?}" "${HOST_SERVER:?}" "${SERVER_ARGS:?}" "${T_MS:?}"
   [[ $T_MS =~ ^[0-9]+$ ]] || { echo "bad T_MS"; exit 2; }
-  case " $SERVER_ARGS " in *" --publish-"*) echo "SERVER_ARGS must not set --publish-*; use T_MS"; exit 2;; esac
+  # only --publish-ms is owned by T_MS; --publish-frac (Ekko operating point, main-block v6) belongs to SERVER_ARGS
+  case " $SERVER_ARGS " in *" --publish-ms "*|*" --publish-ms="*) echo "SERVER_ARGS must not set --publish-ms; use T_MS"; exit 2;; esac
   [ -e "$S" ] && { echo "refusing: $S exists"; exit 3; }
   mkdir -p "$S" || exit 3
   SA="$SERVER_ARGS --publish-ms $T_MS"
