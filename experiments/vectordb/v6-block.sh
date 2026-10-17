@@ -14,6 +14,22 @@
 #      stop must fit vdb-node.sh's 15 s TERM grace: <= 512 MiB per node); run.sh
 #      classifies the trace on Host node 1 under a 16 GB address-space cap (sharing.csv); opsplit / opcoh_check
 #      megalon-vm as in step 1. trace.dropped must be 0 on both nodes.
+# H1-HOOK v1 (experiments/h1/README.md, reports/H1-main-packet.md; set H1MODE): the H1 main phases instead of the
+#   VDB-V1 runs, with this block's precheck, Host gate per run, pretouch gate (start, every run, end), checks and
+#   rollback. Env from experiments/h1/hook.sh: H1MODE slo|fix, H1_N (round), H1_SEED (loadgen seed), H1_PARENT_LOCK
+#   (=H1-main: the lock must be held by it; this block never locks or unlocks), H1_MIXES "<mix>=U=<5|50|90> ..." (slo)
+#   or H1_LEVELS (levels.tsv, fix). Mix tags u5/u50/u90 = search/update 95/5, 50/50, 10/90 (MOT1 v6), 28M dataset.
+#   slo: per system in hw, pop, mg (base order = shuffle seed "H1-vdb-r1", rotated left by N-1: Latin square over
+#        rounds) and per mix (shuffle seed "H1-vdb-r<N>", same for every system): one m4-run.sh KIND=slo run
+#        <sys>-<mix>-slo-r<N> (ramp/bisect, confirm 3 x 30 s, fill 0.7/0.8/0.9, overload 1.05/1.1/1.2 past the first
+#        failure; SLO search p99 <= 100 ms). A loadgen "confirm failed at three rates" NOTE is recorded and the block
+#        continues.
+#   fix: per levels.tsv row (mix) and per system in hw, pop, mg, mgoff (shuffle seed "H1-vdb-fix-r<N>" per mix):
+#        one lifetime m4-run.sh KIND=fixed RATE=<L2_rate>,<L1_rate> (windows 10 s + 60 s each, L2 then L1, no SLO
+#        abort) <sys>-<mix>-fix-r<N>; mgoff = Megalon with MEGALON_COH_TIMERS=0 on both nodes (Fig 2 C_diff).
+#   Per run: OPCOH_EXPECT + opcoh_check (hw hwcc, pop popcorn, mg megalon-vm, mgoff megalon-t0), clean stop,
+#   bad_records 0, E1 check, loadgen finish (all inside m4-run.sh) -> <run>/h1-runcheck.txt (last line RUNCHECK PASS);
+#   <dir>/h1-runs.tsv one line per run; order.txt before the first run.
 # usage: v6-block.sh <evidence dir (exists, holds only sequence* files)>
 # env (required, set by the packet's sequence.sh): KPOP GTPOP CPOP (Popcorn release, guest tools, deploy bundle),
 #   PLAIN_BUILD VPLAIN (vdb build + guest dir for all-HWcc and Popcorn), MEG_BUILD VMEG MEG_CFG (vdb-megalon build +
@@ -31,6 +47,13 @@ P=/home/comsys/sungsu/destijl-control X=$P/CXL_SWMC/experiments/vectordb
 SEED_BASE=20261014 OWNER="VDB-V1"
 : "${KPOP:?}" "${GTPOP:?}" "${CPOP:?}" "${PLAIN_BUILD:?}" "${VPLAIN:?}" "${MEG_BUILD:?}" "${VMEG:?}" "${MEG_CFG:?}" "${LOADGEN_BUILD:?}"
 : "${MEG_LIB:?}" "${PRETOUCH_DIR:?}"
+if [ -n "${H1MODE:-}" ]; then
+  [ "${H1_PARENT_LOCK:-}" = H1-main ] || { echo "SEQUENCE STOP: H1MODE needs H1_PARENT_LOCK=H1-main"; exit 2; }
+  [[ "${H1_N:-}" =~ ^[1-9]$ ]] && [[ "${H1_SEED:-}" =~ ^[0-9]+$ ]] || { echo "SEQUENCE STOP: H1_N / H1_SEED"; exit 2; }
+  case $H1MODE in slo) : "${H1_MIXES:?}";; fix) [ -f "${H1_LEVELS:-}" ] || { echo "SEQUENCE STOP: no H1_LEVELS"; exit 2; };;
+    *) echo "SEQUENCE STOP: bad H1MODE"; exit 2;; esac
+  PARENT_LOCK=$H1_PARENT_LOCK OWNER="H1-vdb-$H1MODE-r$H1_N"
+fi
 for b in "$PLAIN_BUILD" "$MEG_BUILD" "$LOADGEN_BUILD"; do
   grep -q "^source_commit=.* dirty=0$" $b/manifest.txt || { echo "SEQUENCE STOP: $b is not a clean build"; exit 2; }
 done
@@ -75,12 +98,78 @@ one() {  # <sys> <name> <run-specific env...>
     hw)  dax_comsys; run $name SYS=all-HWcc OPCOH_EXPECT=none OPCOH_CHECK_MODE=hwcc "${COMMON[@]}" "$@";;
     mg)  dax_comsys; run $name SYS=Megalon OPCOH_EXPECT=cohsnap "${COMMON[@]}" "$@";;
     pop) dax_root;   run $name SYS=Popcorn OPCOH_EXPECT=swmc_acct OPCOH_CHECK_MODE=popcorn "${COMMON[@]}" "${PE[@]}" "$@";;
+    mgoff) dax_comsys; run $name SYS=Megalon OPCOH_EXPECT=cohsnap OPCOH_CHECK_MODE=megalon-t0 "${COMMON[@]}" \
+             XENV=ENV:MEGALON_COH_TIMERS=0 "$@";;
   esac
+}
+# H1 hook helpers
+h1_runcheck() {  # <name> <sys> <mix> <phase>: per-run check record (m4-run.sh stops the block on any failed check)
+  local r=$E/$1 st
+  st=$(grep -h "^M4RUN $1 " "$E/runs.log" | tail -n 1)
+  [[ "$st" =~ ^M4RUN\ $1\ (OK|NOTE) ]] || { echo "SEQUENCE STOP: $1 no M4RUN OK/NOTE"; exit 1; }
+  { echo "# H1 per-run checks $1 (system $2, mix $3, phase $4, round $H1_N, seed $H1_SEED; v6-block.sh H1-HOOK v1)"
+    echo "$st"
+    for k in 0 1; do echo "node$k: $(grep -c '^bad_records=0$' $r/node$k.log) x bad_records=0, $(grep -c 'vdb-server: stopping' $r/node$k.log) x stopping, $(grep -h '^opcoh.read_errors=\|^opcoh.register_errors=' $r/node$k.log | tr '\n' ' ')"; done
+    echo "opcoh_check: $(tail -n 1 $r/opcoh-check.txt)"
+    echo "opsplit: $(tail -n 1 $r/opsplit.log | cut -c1-300)"
+    echo "e1: $(head -n 3 $r/e1.e1.txt 2>/dev/null | tr '\n' ' ')"
+    echo "loadgen: $(python3 -I -c 'import json,sys; s=json.load(open(sys.argv[1])); print("workload_finish", s.get("workload_finish"), "note", repr(s.get("note", "")))' $r/loadgen/summary.json)"
+    echo "kernel: $(grep -h '^node0=' $r/manifest.txt)"
+  } > $r/h1-runcheck.txt
+  grep -q "^opcoh_check: OPCOH_CHECK PASS" $r/h1-runcheck.txt && [ -f $r/opsplit-steps.csv ] \
+    && grep -q "workload_finish ok" $r/h1-runcheck.txt || { echo "SEQUENCE STOP: $1 run checks incomplete"; exit 1; }
+  if [[ "$st" =~ \ NOTE ]]; then echo "RUNCHECK PASS (NOTE: ${st#* NOTE })" >> $r/h1-runcheck.txt
+  else echo "RUNCHECK PASS" >> $r/h1-runcheck.txt; fi
+  printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$1" "$2" "$3" "$4" "$H1_N" "$1" >> "$E/h1-runs.tsv"
+}
+h1_u() { case $1 in U=5|U=50|U=90) echo ${1#U=};; *) echo "SEQUENCE STOP: bad mix parameter $1" >&2; return 1;; esac; }
+h1_run() {  # <sys> <mix> <phase> <env...>
+  local s=$1 m=$2 ph=$3 name=$1-$2-$3-r$H1_N; shift 3
+  parent_lock_check
+  case $s in mg) set -- "$@" OPCOH_CHECK_MODE=megalon-vm;; esac
+  one $s $name SEED=$H1_SEED REP=h1-$ph-r$H1_N "$@"
+  h1_runcheck $name $s $m $ph
+}
+h1_main() {
+  local s m spec u base rot ord mixes line f mix l1 l2 i
+  printf '# name\tsystem\tmix\tphase\tround\trun_dir\n' > "$E/h1-runs.tsv"
+  if [ $H1MODE = slo ]; then
+    base=($(SHUFFLE_SEED=H1-vdb-r1 shuffle hw pop mg)); rot=$(( (H1_N - 1) % 3 ))
+    ord="${base[@]:$rot} ${base[@]:0:$rot}"; ord=$(echo $ord)
+    mixes=""; for spec in $H1_MIXES; do mixes="$mixes ${spec%%=*}"; h1_u "${spec#*=}" > /dev/null || exit 1; done
+    mixes=$(SHUFFLE_SEED=H1-vdb-r$H1_N shuffle $mixes)
+    { echo "# H1 vector DB SLO round $H1_N (systems: base shuffle seed H1-vdb-r1 rotated left by $rot; mixes: shuffle seed H1-vdb-r$H1_N; loadgen seed $H1_SEED)"
+      echo "systems: $ord"; echo "mixes: $mixes"; echo "H1_MIXES: $H1_MIXES"; } | tee "$E/order.txt"
+    for s in $ord; do
+      for m in $mixes; do
+        for spec in $H1_MIXES; do [ "${spec%%=*}" = $m ] && u=$(h1_u "${spec#*=}"); done
+        h1_run $s $m slo U=$u KIND=slo
+      done
+    done
+  else
+    { echo "# H1 vector DB fixed phase rep $H1_N (levels $H1_LEVELS; systems per mix: shuffle seed H1-vdb-fix-r$H1_N; loadgen seed $H1_SEED; windows L2 then L1)"
+      tail -n +2 "$H1_LEVELS" | while IFS=$'\t' read -r mix f; do
+        echo "$mix: $(SHUFFLE_SEED=H1-vdb-fix-r$H1_N shuffle hw pop mg mgoff)"; done; } | tee "$E/order.txt"
+    while IFS=$'\t' read -r -a f; do
+      mix=${f[0]} l1=${f[8]} l2=${f[9]}
+      u=$(h1_u "U=${mix#u}") || exit 1
+      [[ $l1 =~ ^[0-9]+(\.[0-9]+)?$ ]] && [[ $l2 =~ ^[0-9]+(\.[0-9]+)?$ ]] || { echo "SEQUENCE STOP: levels $mix rates"; exit 1; }
+      for s in $(SHUFFLE_SEED=H1-vdb-fix-r$H1_N shuffle hw pop mg mgoff); do
+        h1_run $s $mix fix U=$u KIND=fixed RATE=$l2,$l1 < /dev/null
+      done
+    done < <(tail -n +2 "$H1_LEVELS")
+  fi
 }
 block_start
 C8=$CPOP K8=$KPOP GT8=$GTPOP  # block_shm_cleanup (m4-lib.sh) reads C8/K8/GT8
 pretouch_gate block-start
 precheck "$KPOP"
+if [ -n "${H1MODE:-}" ]; then
+  h1_main
+  pretouch_gate block-end
+  echo "$(date -Is) SEQUENCE DONE H1-vdb $H1MODE r$H1_N ($(($(wc -l < "$E/h1-runs.tsv") - 1)) runs)"
+  exit 0
+fi
 ORD=$(SHUFFLE_SEED=VDB-V1 shuffle hw pop mg)
 [ $(echo $ORD | wc -w) = 3 ] || { echo "SEQUENCE STOP: run order list"; exit 1; }
 { echo "# VDB-V1 order (shuffle seed VDB-V1; request seed $((SEED_BASE + R)))"; echo "step 1: $ORD"

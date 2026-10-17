@@ -64,11 +64,18 @@ block_finish() {
   block_stop_servers
   block_shm_cleanup
   block_dax_root
-  bash $X/host-gate.sh unlock "$OWNER"
+  [ -n "${PARENT_LOCK:-}" ] || bash $X/host-gate.sh unlock "$OWNER"  # a parent's lock is never released here
+}
+# PARENT_LOCK (optional, e.g. H1-main for the H1 hook): the measurement lock must already be held by that owner; the
+# block then never locks or unlocks (all other rollback steps unchanged).
+parent_lock_check() {
+  grep -q "^owner=$PARENT_LOCK " "${LOCK:-$P/workspaces/MEASUREMENT.lock}" 2>/dev/null \
+    || { echo "SEQUENCE STOP: parent lock $PARENT_LOCK not held (${LOCK:-$P/workspaces/MEASUREMENT.lock})"; exit 2; }
 }
 block_start() {
   [ -d "$E" ] && [ -z "$(ls -A "$E" | grep -v '^sequence')" ] || { echo "SEQUENCE STOP: $E missing or not empty"; exit 2; }
-  bash $X/host-gate.sh lock "$OWNER" || { echo "SEQUENCE STOP: lock"; exit 2; }
+  if [ -n "${PARENT_LOCK:-}" ]; then parent_lock_check
+  else bash $X/host-gate.sh lock "$OWNER" || { echo "SEQUENCE STOP: lock"; exit 2; }; fi
   trap block_finish EXIT
   echo "$(date -Is) block $OWNER start (git $(git -C $P/CXL_SWMC rev-parse --short HEAD))"
 }
