@@ -119,7 +119,16 @@ servers_gone || stop "an lmdb-server is running before the run"
 LOCKF=$P/workspaces/MEASUREMENT.lock
 grep -q "^owner=${LOCK_OWNER:?LOCK_OWNER = owner of the measurement lock held by the calling block} " "$LOCKF" 2>/dev/null \
   || stop "measurement lock not held by $LOCK_OWNER ($(cat "$LOCKF" 2>/dev/null))"
-if [ "${GATE:-1}" = 1 ]; then bash $P/CXL_SWMC/experiments/vectordb/host-gate.sh check "$E/gate-$NAME.txt" || stop "host gate"; fi
+# H1 (H1_MEASURE_RUN=1, README contract item 8): experiments/h1/h1-gate.sh (partition check, no build process, node1
+# measurement CPUs quiet; needs MEASURE_PART_DIR) instead of host-gate.sh; validation runs keep host-gate.sh
+if [ "${GATE:-1}" = 1 ]; then
+  if [ "${H1_MEASURE_RUN:-0}" = 1 ]; then
+    : "${MEASURE_PART_DIR:?H1_MEASURE_RUN=1 needs MEASURE_PART_DIR}"
+    bash $P/CXL_SWMC/experiments/h1/h1-gate.sh check "$E/gate-$NAME.txt" || stop "h1 gate"
+  else
+    bash $P/CXL_SWMC/experiments/vectordb/host-gate.sh check "$E/gate-$NAME.txt" || stop "host gate"
+  fi
+fi
 T0=$(date +%s)
 if [ "$SYS" = Popcorn ]; then  # same cycle as experiments/kv/pilot-run.sh; enable BEFORE the servers
   PS=(K=$K8 GT=$GT8 C=$C8 R=$E/shm-$NAME INIT_STATE=shared)

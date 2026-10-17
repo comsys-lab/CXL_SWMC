@@ -121,9 +121,13 @@ cpu_snap() {  # guest CPU time counters (/proc/stat "cpu" line) per node, for bu
 TARGETS=$(printf '%s:'"$PORT"',' "${NODE[@]}"); TARGETS=${TARGETS%,}  # target order = node order (put writer = target)
 cpu_snap before
 LG_STATS=(); [ "$STATS_OP" = 0 ] || LG_STATS=(--stats-op "$STATS_OP")
+# H1 (H1_MEASURE_RUN=1, README contract item 8): loadgen starts through scripts/host/measure-run.sh in measure.slice
+# (clean environment; loadgen needs no variable, so no --env); validation runs start it directly
+LGPRE=(); [ "${H1_MEASURE_RUN:-0}" = 1 ] && LGPRE=(bash "$ROOT/scripts/host/measure-run.sh" --)
+echo "loadgen_launcher=${LGPRE[*]:-direct}" >> "$RUN/manifest.txt"
 if [ -z "${PARTS:-}" ]; then
 set +e
-numactl --physcpubind="$LG_CPUS" --membind=1 "$LOADGEN" --workload kv --target "$TARGETS" --out "$RUN/loadgen" \
+"${LGPRE[@]}" numactl --physcpubind="$LG_CPUS" --membind=1 "$LOADGEN" --workload kv --target "$TARGETS" --out "$RUN/loadgen" \
   "${LG_STATS[@]}" "$@" 2>&1 | tee "$RUN/loadgen.log"
 LG=${PIPESTATUS[0]}
 set -e
@@ -149,7 +153,7 @@ else  # H1-HOOK v2: several loadgen parts in this one server lifetime (see the h
     mapfile -t PA < "$RUN/$part/args.txt"
     echo "part=$part start=$(date -Is) args=${PA[*]}" >> "$RUN/manifest.txt"
     set +e
-    numactl --physcpubind="$LG_CPUS" --membind=1 "$LOADGEN" --workload kv --target "$TARGETS" --out "$RUN/$part/loadgen" \
+    "${LGPRE[@]}" numactl --physcpubind="$LG_CPUS" --membind=1 "$LOADGEN" --workload kv --target "$TARGETS" --out "$RUN/$part/loadgen" \
       "${LG_STATS[@]}" "$@" "${PA[@]}" 2>&1 | tee "$RUN/$part/loadgen.log"
     prc=${PIPESTATUS[0]}
     set -e
