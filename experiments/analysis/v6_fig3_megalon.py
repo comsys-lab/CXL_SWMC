@@ -172,8 +172,12 @@ def fig_b(a):
     if groups:
         v6.stacked(png, groups, ["Written back"], "KiB written back\nper update", ref=ref, logy=True,
                    xlabel="Update share")
+    else:  # no Megalon run has update-operation data (e.g. runs before the per-op stats): CSV only, no PNG
+        print(f"WARNING fig3b: no run has {a.update_op!r} operation data (N_update = 0); no PNG written",
+              file=sys.stderr)
+    pngnote = f"PNG {os.path.basename(png)}" if groups else f"no PNG (no run has {a.update_op} operation data)"
     v6.write_csv(csvp, [
-        ("figure", f"MOT1 v6 Fig 3b bytes written back per update ({a.tag}); PNG {os.path.basename(png)}"),
+        ("figure", f"MOT1 v6 Fig 3b bytes written back per update ({a.tag}); {pngnote}"),
         ("formula", "Megalon: sum meg_wflush_bytes(update op) / N_update; Popcorn: sum over nodes of the window "
                     "delta of sys.swmc.page_coherence.remote_writeback_count x 4096 / N_update (contrast; pages "
                     "written back for a peer); secondary column M_acquisitions_x4KiB_per_update = (pop_sm_cnt + "
@@ -185,7 +189,7 @@ def fig_b(a):
         ("inputs", "see the run column"),
     ], ["update_share_pct", "system", "N_update", "writeback_bytes_per_update", "modified_bytes_per_update",
         "M_acquisitions_x4KiB_per_update", "writeback_source", "run"], rows)
-    print(f"-> {png}\n-> {csvp}")
+    print(f"-> {png}\n-> {csvp}" if groups else f"-> {csvp}")
 
 
 def classify(trace):

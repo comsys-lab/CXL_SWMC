@@ -8,7 +8,7 @@ step=.. offered_x=.. target=.. addr=.. status=.. wall_ns=.. mono_ns=.. rtt_us=..
 Output: one row per (step, target) that has both snapshots. Fixed columns: step, phase, offered_x, target, addr,
 begin_wall_ns, end_wall_ns, window_s (loadgen clock: end mono_ns - begin mono_ns), srv_window_s (server clock:
 t_mono_ns delta, if the server emits it), then one column per numeric key (sorted): end - begin, except gauges
-(identity values, current sizes and maxima: see GAUGE below), which keep the end value; per-operation counts
+(identity values, flag words, current sizes and maxima: see GAUGE below), which keep the end value; per-operation counts
 op.<op>.n / opt.<op>.n are counters despite the ".n" gauge suffix. Non-numeric keys are ignored.
 A key missing in one snapshot of a pair is left empty for that row.
 """
@@ -19,7 +19,11 @@ FNAME = re.compile(r"^step(\d+)-(begin|end)-t(\d+)\.txt$")
 GAUGE_EXACT = {"node", "write_queue", "search_queue", "megt.sample"}
 GAUGE_SUFFIX = (".n", "max_ns", ".in_flight_transaction_count", ".enabled",
                 # identity values of the MOT1 v6 per-operation stats (sampling factor, TSC rate, thread counts)
-                "check_sample", "tsc_hz", ".threads", "_threads", ".version", ".meg_coh")
+                "check_sample", "tsc_hz", ".threads", "_threads", ".version", ".meg_coh",
+                # Megalon >= 76 flag words (CohSnap.reserved[1]: lean sampling, events_always) and >= 77 probe cost:
+                # vector DB opt.<op>.meg.flags, opt.<op>.meg.anchor.probe_ps_{min,max}; recsys op.<op>.mg.flags;
+                # KV/LMDB opt.meg_flags, opt.meg_lean, opt.meg_events_always, opt.meg_probe_ps_{min,max}
+                ".meg.flags", ".mg.flags", "meg_flags", "meg_lean", "meg_events_always", "probe_ps_min", "probe_ps_max")
 # MOT1 v6 per-operation namespaces op.<op>.* / opt.<op>.*: the operation count "<prefix>.<op>.n" is a counter
 OP_COUNT = re.compile(r"^opt?\.[^.]+\.n$")
 

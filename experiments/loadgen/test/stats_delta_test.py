@@ -63,6 +63,14 @@ def main():
     check(all(stats_delta.is_gauge(k) for k in ("op.query.mg.check_sample", "opt.meg_check_sample", "opt.tsc_hz",
                                                 "opt.threads", "opt.pop_threads", "opt.version", "thr.x.n")),
           "per-op identity values")
+    # Megalon >= 76 flag words and >= 77 probe cost are values (end value), the per-op sums beside them are counters
+    check(all(stats_delta.is_gauge(k) for k in ("opt.search.meg.flags", "op.query.mg.flags", "opt.meg_flags",
+                                                "opt.meg_lean", "opt.meg_events_always", "opt.meg_probe_ps_min",
+                                                "opt.meg_probe_ps_max", "opt.search.meg.anchor.probe_ps_min",
+                                                "opt.search.meg.anchor.probe_ps_max")), "Megalon flag / probe gauges")
+    check(not any(stats_delta.is_gauge(k) for k in ("opt.get.meg.anchor.write_sampled", "op.query.mg.wstart_ns",
+                                                    "opt.search.meg.anchor.timed_a", "opt.get.meg.check_sampled")),
+          "Megalon per-op sums stay counters")
     check("backend" not in d and "only_begin" not in d, "non-numeric / one-sided keys dropped")
     subprocess.run([sys.executable, os.path.join(LG, "stats_delta.py"), run], check=True)
     hdr = next(csv.reader(open(os.path.join(run, "stats-steps.csv"))))
