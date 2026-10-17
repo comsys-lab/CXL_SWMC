@@ -3,9 +3,12 @@
 
 usage: v1_check.py <measurement dir> <hw|pop|mg|mgoff> [--h1]
 --h1 (H1 main runs, reports/H1-main-packet.md §8.1 "DLRM: v1_check-style invariants (torn rows 0, updater sustained
-  +-2 %, flush_overruns 0)"): the updater check applies to the measured steps that passed (SLO searches go past the
-  knee on purpose and fixed windows at L1 may fail, packet W3): update achieved >= 0.98 x offered there; failed or
-  aborted steps are recorded (NOTE), not checked. All other checks are the same as without --h1.
+  +-2 %, flush_overruns 0)"; coordinator 2026-10-17): updater limit 0.98 x offered. SLO searches (summary mode slo)
+  include points past the knee on purpose: the update checks (updater, flush_overruns 0, round guard, rows per full
+  round +-15 %) use only the steps that passed the SLO, outside the overload phase, at offered x <=
+  max_offered_x_pass, each over its own node-0 snapshots; violations on other steps are NOTEs, never a stop. Fixed
+  runs (L2/L1 <= the weakest max) keep every check over the whole span as FAIL. Torn rows / misses and the system
+  checks are whole-span FAILs in every mode.
 Round accounting guard (verifier LOW 15): flushes = update_threads x publish_rounds at both window snapshots of
   node 0 (update_threads from the manifest's server_args); else FAIL (a snapshot inside a round edge).
 A missing rows_per_round_target (0) is a FAIL (verifier LOW 18).
@@ -20,6 +23,8 @@ node 1; window deltas) and <dir>/breakdown.csv. Checks (FAIL = stop the block):
         the t0 end snapshot; d(published_seq) on t0 = samples made visible by the rounds that fired in the window.
         The plain window mean d(round_rows) / d(publish_rounds) is reported (rows_per_round_window_mean), not
         checked: the server's round clock is not aligned to the window, so the first round may be partly fed
+        (known bias, verifier LOW 16: a partly fed round de-duplicates less, so the normalised value leans about
+        +1-3 % high; it can hide a shortfall of that size, never invent one; workloads/recsys/DESIGN.md §5)
   hw    op.query.c_ns and op.row_update.c_ns deltas = 0 (all-HWcc has no coherence actions)
   pop   op.coh_src pc_threads > 0 on both nodes (swmc_acct live) and row_update C > 0
   mg    op.coh_src mg_threads > 0 on both nodes, query C > 0, row_update C > 0, anchor read parts > 0;
@@ -85,86 +90,125 @@ def main():
     vals['queries'] = d1('queries')
     if vals['queries'] <= 0:
         fails.append('no query in the window')
-    vals['publish_rounds'] = d0('publish_rounds')
-    vals['round_rows'] = d0('round_rows')
-    vals['flush_overruns'] = d0('flush_overruns')
-    vals['update_rate_sustained'] = e0.get('update_rate_sustained', -1)
-    if vals['publish_rounds'] < 2:
-        fails.append(f'{vals["publish_rounds"]} publication rounds in the window (need >= 2)')
-    # updater keeps up (loadgen side): achieved/offered of the update stream, no saturated or aborted step
-    try:
-        steps = [json.loads(re.sub(r'(?<![A-Za-z"])-?(inf|nan)(?![A-Za-z"])', 'NaN', l))
-                 for l in open(os.path.join(m, 'loadgen', 'steps.jsonl')) if l.strip()]
-    except (OSError, ValueError) as ex:
-        steps = None
-        fails.append(f'steps.jsonl unreadable: {ex}')
-    if steps is not None:
-        meas = [d for d in steps if d.get('measure_s', 0) > 0]
-        if not meas:
-            fails.append('no measured loadgen step')
-        for d in meas:
-            u = d.get('streams', {}).get('update', {})
-            off, ach = float(u.get('offered', 0)), float(u.get('achieved', 0))
-            vals[f'update_achieved_offered.step{d.get("step")}'] = f'{ach:.2f}/{off:.2f}'
-            bad_step = d.get('aborted') or 'saturated' in str(d.get('reason', ''))
-            if h1:  # H1: checked on passing steps only (+-2 %); past-the-knee / failed steps recorded
-                if d.get('pass') and not bad_step:
-                    if off <= 0 or not ach >= 0.98 * off:
-                        fails.append(f'step {d.get("step")}: updater behind on a passing step (achieved {ach} < 0.98 x offered {off})')
-                elif off > 0 and not ach >= 0.98 * off:
-                    notes.append(f'step {d.get("step")} ({d.get("phase")}, not passing): updater {ach:.2f}/{off:.2f}')
-                continue
-            if off <= 0 or not ach >= 0.95 * off:
-                fails.append(f'step {d.get("step")}: updater behind (update achieved {ach} < 0.95 x offered {off})')
-            if bad_step:
-                fails.append(f'step {d.get("step")}: aborted/saturated ({d.get("reason", "")})')
-    if vals['flush_overruns'] != 0 or vals['update_rate_sustained'] != 1:
-        fails.append(f'update rate not sustained (overruns {vals["flush_overruns"]}, '
-                     f'update_rate_sustained={vals["update_rate_sustained"]})')
-    # round accounting guard (LOW 15): every worker finished the same rounds at both snapshots
-    ut = None
+    # manifest: configured update rate R (loadgen_args "--fixed update=R") and update threads (server_args)
+    rate, ut = None, None
     try:
         for line in open(os.path.join(m, 'manifest.txt')):
+            a = line.split()
+            if line.startswith('loadgen_args='):
+                for i, x in enumerate(a[:-1]):
+                    if x == '--fixed':
+                        for tok in a[i + 1].split(','):
+                            if tok.startswith('update='):
+                                rate = float(tok.split('=', 1)[1])
             if line.startswith('server_args='):
-                a = line.split()
                 for i, x in enumerate(a[:-1]):
                     if x == '--update-threads':
                         ut = int(a[i + 1])
     except (OSError, ValueError):
-        ut = None
+        pass
+    try:
+        steps = [json.loads(re.sub(r'(?<![A-Za-z"])-?(inf|nan)(?![A-Za-z"])', 'NaN', l))
+                 for l in open(os.path.join(m, 'loadgen', 'steps.jsonl')) if l.strip()]
+    except (OSError, ValueError) as ex:
+        steps = []
+        fails.append(f'steps.jsonl unreadable: {ex}')
+    meas = [d for d in steps if d.get('measure_s', 0) > 0]
+    if not meas:
+        fails.append('no measured loadgen step')
+    try:
+        summ = json.load(open(os.path.join(m, 'loadgen', 'summary.json')))
+    except (OSError, ValueError):
+        summ = {}
+    # H1 SLO search (--h1 and summary mode slo; coordinator 2026-10-17): the update checks (updater +-2 %,
+    # flush_overruns 0, round guard, rows per full round +-15 %) apply to the steps that passed the SLO, outside the
+    # overload phase, at offered x <= max_offered_x_pass; violations on the other steps are NOTEs. Otherwise (v1, H1
+    # fixed runs) they apply to the whole measured span (first begin .. last end) and every measured step.
+    h1slo = h1 and summ.get('mode') == 'slo'
+    xmax = float(summ.get('max_offered_x_pass', 0) or 0)
+    def checked(d):
+        if not h1slo:
+            return True
+        return bool(d.get('pass')) and d.get('phase') != 'overload' and not d.get('aborted') \
+            and float(d.get('offered_x', 0)) <= xmax * (1 + 1e-9)
+    bad = fails.append
+    for d in meas:
+        u = d.get('streams', {}).get('update', {})
+        off, ach = float(u.get('offered', 0)), float(u.get('achieved', 0))
+        vals[f'update_achieved_offered.step{d.get("step")}'] = f'{ach:.2f}/{off:.2f}'
+        bad_step = d.get('aborted') or 'saturated' in str(d.get('reason', ''))
+        lim = 0.98 if h1 else 0.95
+        rec = bad if checked(d) else (lambda t: notes.append(t + ' [not a checked step]'))
+        if off <= 0 or not ach >= lim * off:
+            rec(f'step {d.get("step")} ({d.get("phase")}): updater behind (update achieved {ach} < {lim} x offered {off})')
+        if bad_step:
+            rec(f'step {d.get("step")} ({d.get("phase")}): aborted/saturated ({d.get("reason", "")})')
+    # windows for the round accounting: whole span, or the checked steps' own snapshots (H1 SLO)
+    if h1slo:
+        wins, other = [], []
+        for d in meas:
+            n = int(d.get('step', 0))
+            bp, ep = os.path.join(st, f'step{n:03d}-begin-t0.txt'), os.path.join(st, f'step{n:03d}-end-t0.txt')
+            if not (os.path.isfile(bp) and os.path.isfile(ep)):
+                (wins if checked(d) else other).append(None)
+                continue
+            (wins if checked(d) else other).append((n, kv(bp), kv(ep)))
+        if None in wins:
+            fails.append('a checked step has no node-0 stats snapshots')
+        wins = [w for w in wins if w]
+        other = [w for w in other if w]
+        vals['checked_steps'] = ','.join(str(w[0]) for w in wins)
+        if not wins:
+            fails.append('H1 SLO run: no checked (passing, non-overload) step')
+    else:
+        wins, other = [(0, b0, e0)], []
+    dd = lambda b, e, k: e.get(k, 0) - b.get(k, 0)  # noqa: E731
+    vals['publish_rounds'] = d0('publish_rounds')
+    if vals['publish_rounds'] < 2:
+        fails.append(f'{vals["publish_rounds"]} publication rounds in the whole span (need >= 2)')
+    rr = sum(dd(b, e, 'round_rows') for _, b, e in wins)
+    pub = sum(dd(b, e, 'published_seq') for _, b, e in wins)
+    pr = sum(dd(b, e, 'publish_rounds') for _, b, e in wins)
+    vals['round_rows'] = rr
+    vals['flush_overruns'] = sum(dd(b, e, 'flush_overruns') for _, b, e in wins)
+    if vals['flush_overruns'] != 0:
+        fails.append(f'update rate not sustained (flush overruns {vals["flush_overruns"]} in the checked span)')
+    if not h1slo:
+        vals['update_rate_sustained'] = e0.get('update_rate_sustained', -1)
+        if vals['update_rate_sustained'] != 1:
+            fails.append(f'update_rate_sustained={vals["update_rate_sustained"]}')
+    for n, b, e in other:
+        o = dd(b, e, 'flush_overruns')
+        if o:
+            notes.append(f'step {n} (not checked): {o} flush overruns')
+    # round accounting guard (LOW 15): every worker finished the same rounds at each snapshot used
     if not ut or ut <= 0:
         fails.append('round guard: --update-threads not found in the manifest server_args')
     else:
-        for tag, snap in (('begin', b0), ('end', e0)):
-            fl, pr = snap.get('flushes', -1), snap.get('publish_rounds', -1)
-            if fl != ut * pr:
-                fails.append(f'round guard: {tag} snapshot flushes {fl} != {ut} x publish_rounds {pr} (snapshot inside a round edge)')
+        for n, b, e in wins:
+            for tag, snap in (('begin', b), ('end', e)):
+                fl, prr = snap.get('flushes', -1), snap.get('publish_rounds', -1)
+                if fl != ut * prr:
+                    fails.append(f'round guard: step {n} {tag} snapshot flushes {fl} != {ut} x publish_rounds {prr} (snapshot inside a round edge)')
     tgt = e0.get('rows_per_round_target', 0)
     if tgt <= 0:
         fails.append('no rows_per_round_target in the node-0 end snapshot (Ekko operating point not checkable)')
-    if vals['publish_rounds'] > 0 and tgt > 0:
-        vals['rows_per_round_window_mean'] = round(vals['round_rows'] / vals['publish_rounds'])
+    else:
         vals['rows_per_round_target'] = tgt
-        rate = None
-        try:
-            for line in open(os.path.join(m, 'manifest.txt')):
-                if line.startswith('loadgen_args='):
-                    a = line.split()
-                    for i, x in enumerate(a[:-1]):
-                        if x == '--fixed':
-                            for tok in a[i + 1].split(","):
-                                if tok.startswith("update="):
-                                    rate = float(tok.split("=", 1)[1])
-        except (OSError, ValueError):
-            rate = None
+        if pr > 0:
+            vals['rows_per_round_window_mean'] = round(rr / pr)
         t_s = e0.get('publish_us', 0) / 1e6
-        pub = d0('published_seq')
         vals['samples_published'] = pub
-        if not rate or rate <= 0 or t_s <= 0 or pub <= 0:
-            fails.append(f'rows per round: cannot normalise (update rate {rate}, T {t_s} s, samples published {pub})')
+        if not rate or rate <= 0 or t_s <= 0:
+            fails.append(f'rows per round: cannot normalise (update rate {rate}, T {t_s} s)')
+        elif pub <= 0:
+            if h1slo:  # short passing windows can contain no round edge; recorded
+                notes.append('rows per full round not checkable: no round fired inside the checked steps')
+            else:
+                fails.append(f'rows per round: cannot normalise (samples published {pub})')
         else:
             per_t = rate * t_s
-            per = vals['round_rows'] / (pub / per_t)
+            per = rr / (pub / per_t)
             vals['samples_per_T'] = round(per_t, 1)
             vals['full_round_equiv'] = round(pub / per_t, 3)
             vals['rows_per_full_round'] = round(per)
