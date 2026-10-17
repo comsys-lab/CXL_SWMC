@@ -417,8 +417,10 @@ indexing unit; Megalon flushes the whole object at write end (no dirty-line trac
   write side (wstart + wflush, write lookup + write NR) x write_sections / write_sampled (proto.h RD / EV / WR; per
   operation with its own counts, step means with the step's sums; opsplit tags ev / wr columns sampled×N /
   sampled-write×N for such runs). Window keys `opt.<op>.meg.anchor.write_sampled`, `opt.<op>.meg.flags` (bits 1-2).
-  Megalon <= 75 records (bit 4 clear) keep the plain sums. No probe correction (build 77 probe cost, M2 §19) is
-  applied or exported (open question in reports/VDB-V1-packet.md v1.3).
+  Megalon <= 75 records (bit 4 clear) keep the plain sums. No probe correction (build 77 probe cost, M2 §19; user
+  decision 2026-10-17: keep raw). Raw probe data only in the server stats dump, not in OpCoh:
+  `opt.<op>.meg.anchor.{timed_a,timed_bc,timed_d}` (sums of AnchorSnap.reserved[3..5] deltas) and
+  `opt.<op>.meg.anchor.probe_ps_{min,max}` (reserved[2] over the threads seen; values, not counters).
 - Modified bytes (Fig 3b reference line): thread-local `t_mod_bytes` (shm_hnsw.h) counts the whole lines the
   application stores: vector record + zeroed level-0/upper link blocks (write_elem), each committed link block,
   each 64 B delete-log entry. Written back (Fig 3b): Megalon CohSnap wflush_bytes; Popcorn (S->M + wp faults) x 4 KiB.

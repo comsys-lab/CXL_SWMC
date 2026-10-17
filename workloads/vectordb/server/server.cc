@@ -138,6 +138,19 @@ struct OpWin {
   static constexpr int kPop = 10, kMeg = 23, kAn = 11;
   std::atomic<uint64_t> ops{0}, sections{0}, t_ns{0}, c_ns{0}, mod_bytes{0}, wait_ns{0}, pop[kPop]{}, meg[kMeg]{}, an[kAn]{};
   std::atomic<uint64_t> meg_flags{0};  // OR of the blocks' Megalon flag bits as CohSnap.reserved[1] bits 1-2 (not a sum)
+  // Megalon >= 77 raw probe data (not in the wire block; user decision 2026-10-17: kept raw, no correction):
+  // AnchorSnap.reserved[3..5] timed (A) events, timed (B)+(C) events, timed (D) episodes (sums of deltas) and the
+  // probe cost reserved[2] (ps; min / max over the threads seen)
+  std::atomic<uint64_t> timed_a{0}, timed_bc{0}, timed_d{0}, probe_ps_min{0}, probe_ps_max{0};
+  void add_raw(const OpAcc &a) {
+    timed_a += a.an.reserved[3], timed_bc += a.an.reserved[4], timed_d += a.an.reserved[5];
+    if (a.probe_ps_min) {
+      uint64_t v = probe_ps_min.load();
+      while ((!v || a.probe_ps_min < v) && !probe_ps_min.compare_exchange_weak(v, a.probe_ps_min)) {}
+    }
+    uint64_t v = probe_ps_max.load();
+    while (a.probe_ps_max > v && !probe_ps_max.compare_exchange_weak(v, a.probe_ps_max)) {}
+  }
   void add(const OpCoh &b) {
     ops++, sections += b.sections, t_ns += b.t_ns, c_ns += b.c_ns, mod_bytes += b.mod_bytes, wait_ns += b.wait_ns;
     meg_flags.fetch_or((b.src & 16 ? 2u : 0u) | (b.src & 32 ? 4u : 0u));
@@ -174,6 +187,9 @@ struct OpWin {
                                           // v3; write_sampled = reserved[0], Megalon >= 76)
     for (int i = 0; i < kAn; i++) o << p << "meg.anchor." << an_n[i] << "=" << an[i];
     o << p << "meg.flags=" << meg_flags;  // bit 1 lean sampling, bit 2 events_always (Megalon >= 76; else 0)
+    o << p << "meg.anchor.timed_a=" << timed_a << p << "meg.anchor.timed_bc=" << timed_bc << p
+      << "meg.anchor.timed_d=" << timed_d << p << "meg.anchor.probe_ps_min=" << probe_ps_min << p
+      << "meg.anchor.probe_ps_max=" << probe_ps_max;  // Megalon >= 77 (else 0); raw, no correction applied
   }
 };
 
@@ -559,6 +575,7 @@ class Server {
     std::memcpy(out, &r, sizeof(r));
     std::memcpy(out + sizeof(r), &b, sizeof(b));
     win_update_.add(b);
+    win_update_.add_raw(a);
     j.c->reply(frame::kStatusOk, j.h.req_id, out, sizeof(out));
   }
 
@@ -739,11 +756,13 @@ class Server {
     resp.dists = uint32_t(c->dists.load());
     resp.segs = uint16_t(p_.segments);
     OpCoh qb{};
+    OpAcc qa;  // copy for the raw window counters (add_raw)
     {
       std::lock_guard<std::mutex> lg(c->mu);
       c->oa.ticks += rdtsc() - m0;  // up to the response being ready (the reply send is outside T)
       qb = op_block(c->oa, kOpSearch, oc_.src(), oc_.mg_snap(), tsc_khz_, oc_.an_snap());
       qb.req_id = c->job.h.req_id;
+      qa = c->oa;
     }
     if (oc_.on()) resp.flags |= kRespCoh;
     std::vector<uint8_t> out(sizeof(resp) + all.size() * 12 + (oc_.on() ? sizeof(qb) : 0));
@@ -756,6 +775,7 @@ class Server {
     if (oc_.on()) {
       std::memcpy(out.data() + sizeof(resp) + all.size() * 12, &qb, sizeof(qb));
       win_search_.add(qb);
+      win_search_.add_raw(qa);
     }
     c->job.c->reply(frame::kStatusOk, c->job.h.req_id, out.data(), uint32_t(out.size()));
     st_.searches++;

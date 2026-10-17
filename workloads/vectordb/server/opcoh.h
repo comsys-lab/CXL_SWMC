@@ -72,8 +72,17 @@ struct OpAcc {
   mshim::CohSnap mg{};  // summed deltas; check_sample = the snapshot's value (not a delta)
   mshim::AnchorSnap an{};  // summed deltas (shim v3); an.reserved[0] = timed write sections (Megalon >= 76)
   uint64_t mg_flags = 0;  // CohSnap.reserved[1] of the snapshots (not a delta): bit 1 lean, bit 2 events_always
+  // Megalon >= 77 probe cost AnchorSnap.reserved[2] (ps, per-thread constant; values, not deltas): min / max over the
+  // threads of this operation's sections (0 = none). Raw only: no correction is applied (user decision 2026-10-17).
+  uint64_t probe_ps_min = 0, probe_ps_max = 0;
+  void probe(uint64_t ps) {
+    if (!ps) return;
+    if (!probe_ps_min || ps < probe_ps_min) probe_ps_min = ps;
+    if (ps > probe_ps_max) probe_ps_max = ps;
+  }
   void add(const OpAcc &d) {
     mg_flags |= d.mg_flags;
+    probe(d.probe_ps_min), probe(d.probe_ps_max);
     ticks += d.ticks, wait_ticks += d.wait_ticks, sections += d.sections, nt_ns += d.nt_ns, nt_cnt += d.nt_cnt,
     vc_cnt += d.vc_cnt, vc_sampled += d.vc_sampled, vc_ticks += d.vc_ticks, ipi_ns += d.ipi_ns, ipi_cnt += d.ipi_cnt, mod_bytes += d.mod_bytes;
     for (int i = 0; i < 3; i++) pf_ns[i] += d.pf_ns[i], pf_cnt[i] += d.pf_cnt[i];
@@ -255,8 +264,10 @@ class OpCohSrc {
       a->mg.check_sample = cs;
       a->mg_flags |= e.mg.reserved[1];  // flags word (constant per thread): a value, not a delta
     }
-    if (an_)
+    if (an_) {
       for (int k = 0; k < kAnWords; k++) words(a->an)[k] += words(e.an)[k] - words(s.v.an)[k];
+      a->probe(e.an.reserved[2]);  // probe_ps: a value (constant per thread), not a delta
+    }
     if (src_ == kPopFile && ok) thr().last_end = e;
     return ok;
   }
