@@ -31,6 +31,9 @@ WARN checks:
   W4 (n > 1) a system's confirm x_mean differs from round 1 by > 10 %, or this round's weakest system differs from
      levels.tsv
   W5 Megalon C_sampled_ns > T_mg_on_ns on a row
+  C1/C2 (n > 1; REPORT, not FAIL: separate vs continuous, user decision 2026-10-18) hw/pop T r1 (separate lifetime)
+     vs r<n> (continuous) beyond max(5 %, 2 x run-to-run spread), C_diff beyond max(10 %, 2 x |dT_mg|); see compare().
+     REPORT lines go to the user before r3; h1-accept.sh refuses them without --user-ack.
   W6 C_diff_ns < 0 on a row (message carries the Popcorn cross-check pop_T_minus_hw_ns vs its C and the analysis warn)
 usage: check.py --plan h1-plan.tsv --workload W --round n [--skip-fig2] E
 """
@@ -39,13 +42,17 @@ import argparse, csv, json, os, sys
 SYSTEMS = ("hw", "pop", "mg")            # SLO phase (Fig 1, Megalon timers on)
 FIXSYS = ("hw", "pop", "mg", "mgoff")    # fixed phase (Fig 2; mgoff = Megalon timers off for C_diff)
 SPLIT = {"vdb": "opsplit-steps.csv", "kv": "opsplit.csv", "lmdb": "opsplit.csv", "recsys": "breakdown.csv"}
-lines, nfail, nwarn = [], 0, 0
+lines, nfail, nwarn, nrep = [], 0, 0, 0
 
 
 def res(kind, name, ok, msg=""):
-    global nfail, nwarn
+    global nfail, nwarn, nrep
     if ok:
         lines.append(f"OK   {name}")
+        return
+    if kind == "R":  # separate vs continuous beyond the run-to-run spread: not a FAIL; the user sees it before r3
+        nrep += 1
+        lines.append(f"REPORT {name}: {msg}")
         return
     if kind == "F":
         nfail += 1
@@ -73,9 +80,10 @@ def runs(d):
     for line in open(p):
         if line.strip() and not line.startswith("#"):
             f = line.rstrip("\n").split("\t")
-            if len(f) == 6:
+            if len(f) in (6, 8):  # v2 (H1-HOOK v2): + steps, lifetime
                 rd = f[5] if os.path.isabs(f[5]) else os.path.join(d, f[5])
-                out.append({"name": f[0], "sys": f[1], "mix": f[2], "phase": f[3], "round": f[4], "dir": rd})
+                out.append({"name": f[0], "sys": f[1], "mix": f[2], "phase": f[3], "round": f[4], "dir": rd,
+                            "life": f[7] if len(f) == 8 else "sep"})
     return out
 
 
@@ -119,6 +127,69 @@ def fnum(v):
         return None
 
 
+def fig2_t(E, W, n, m):
+    """{(load, op, key): ns} from the round's official Fig 2 CSV: T_ns of hw / pop, T_mg_on_ns of mg (timers on),
+    C_diff_ns; None if missing"""
+    f2 = fig2_rows(os.path.join(E, W, f"r{n}", "collect", "fig", f"{W}-{m}-fig2.csv"))
+    if f2 is None:
+        return None
+    out = {}
+    for x in f2:
+        k = (x["load"], x["op"])
+        if x["system"] == "All HWcc":
+            out[k + ("hw",)] = fnum(x.get("T_ns"))
+        elif x["system"] == "Popcorn":
+            out[k + ("pop",)] = fnum(x.get("T_ns"))
+        elif x["system"] == "Megalon (timers off)":
+            out[k + ("mg",)] = fnum(x.get("T_mg_on_ns"))
+            out[k + ("cdiff",)] = fnum(x.get("C_diff_ns"))
+    return out
+
+
+def compare(W, n, E, mixes, skip):
+    """Separate vs continuous (user decision 2026-10-18; packet §3.4). hw/pop: r1 = separate fixed lifetime, r2/r3 =
+    continuous (SLO -> settle -> L2 -> L1); mg is continuous in every round, so its round-to-round T change is the
+    run-to-run spread s_mg = |T_mg(n) - T_mg(1)| / T_mg(1) (round 3: max over r1->r3 and r2->r3; hw/pop r2->r3 change
+    adds to the spread). REPORT when, per mix x load x op,
+      hw or pop:  |T(n) - T(1)| / T(1) > max(5 %, 2 x spread)
+      C_diff:     |C_diff(n) - C_diff(1)| > max(10 % x |C_diff(1)|, 2 x |T_mg(n) - T_mg(1)|)
+    (C_diff = T(mgoff) - T(hw): its hw term changes lifetime type between r1 and r2/r3)."""
+    for m in mixes:
+        if skip:
+            res("W", f"C1 {m} separate vs continuous", False, "skipped (--skip-fig2, self-test only)")
+            continue
+        t1, tn = fig2_t(E, W, 1, m), fig2_t(E, W, n, m)
+        t2 = fig2_t(E, W, 2, m) if n == 3 else None
+        if t1 is None or tn is None:
+            res("F", f"C1 {m} separate vs continuous", False, f"Fig 2 CSV missing (r1 {t1 is not None}, r{n} {tn is not None})")
+            continue
+        for (load, op) in sorted({(l, o) for l, o, _ in tn}):
+            g = lambda t, k: (t or {}).get((load, op, k))
+            mg1, mgn = g(t1, "mg"), g(tn, "mg")
+            if not (mg1 and mgn):
+                res("F", f"C1 {m} {load}/{op} spread", False, f"T_mg_on r1 {mg1} r{n} {mgn}")
+                continue
+            spread = abs(mgn - mg1) / mg1
+            if t2 and g(t2, "mg"):
+                spread = max(spread, abs(mgn - g(t2, "mg")) / g(t2, "mg"))
+            for k in ("hw", "pop"):
+                a1, an = g(t1, k), g(tn, k)
+                if not (a1 and an):
+                    res("F", f"C1 {m} {load}/{op} {k}", False, f"T r1 {a1} r{n} {an}")
+                    continue
+                sp = spread
+                if t2 and g(t2, k):  # both continuous: r2 -> r3 change of the system itself
+                    sp = max(sp, abs(an - g(t2, k)) / g(t2, k))
+                d, thr = abs(an - a1) / a1, max(0.05, 2 * sp)
+                res("R", f"C1 {m} {load}/{op} {k} T r1-sep vs r{n}-cont", d <= thr,
+                    f"|dT|/T {d:.3f} > threshold {thr:.3f} (5 % or 2 x spread {sp:.3f}); T r1 {a1:g} r{n} {an:g} ns")
+            c1, cn = g(t1, "cdiff"), g(tn, "cdiff")
+            if c1 is not None and cn is not None:
+                thr = max(0.10 * abs(c1), 2 * abs(mgn - mg1))
+                res("R", f"C2 {m} {load}/{op} C_diff r1 vs r{n}", abs(cn - c1) <= thr,
+                    f"|dC_diff| {abs(cn - c1):g} > threshold {thr:g} ns (C_diff r1 {c1:g}, r{n} {cn:g})")
+
+
 def confirm_x(rd):
     s = js(os.path.join(rd, "loadgen", "summary.json")) or {}
     return s.get("confirm", {}).get("x_mean")
@@ -136,13 +207,19 @@ def main():
     S = os.path.join(E, W, f"r{n}")
     mixes = plan_mixes(a.plan, W)
     rs = {}
+    allr = runs(os.path.join(S, "run"))  # H1-HOOK v2: one block dir per workload and round
     for ph in ("slo", "fix"):
-        want = {(m, s) for m in mixes for s in (FIXSYS if ph == "fix" else SYSTEMS)}
-        r = runs(os.path.join(S, ph))
-        ok = r is not None and {(x["mix"], x["sys"]) for x in r} == want and len(r) == len(want) \
-            and all(x["phase"] == ph and x["round"] == str(n) for x in r)
-        res("F", f"F1 {ph} runs complete", ok, f"{sorted((x['mix'], x['sys']) for x in (r or []))} != {len(want)} mix x system")
-        rs[ph] = r or []
+        # expected lifetime labels (user decision 2026-10-18): r1 hw/pop SLO-only and separate fixed lifetimes, mg
+        # continuous; r2/r3 all continuous; mgoff always its own lifetime ("sep")
+        want = {}
+        for m in mixes:
+            for x in (FIXSYS if ph == "fix" else SYSTEMS):
+                want[(m, x)] = "sep" if x == "mgoff" or (n == 1 and x in ("hw", "pop")) else "cont"
+        r = [x for x in (allr or []) if x["phase"] == ph]
+        ok = allr is not None and {(x["mix"], x["sys"]) for x in r} == set(want) and len(r) == len(want) \
+            and all(x["round"] == str(n) and x["life"] == want[(x["mix"], x["sys"])] for x in r)
+        res("F", f"F1 {ph} runs complete", ok, f"{sorted((x['mix'], x['sys'], x['life']) for x in r)} vs {len(want)} expected")
+        rs[ph] = r
     xs = {}
     for r in rs["slo"]:
         s = js(os.path.join(r["dir"], "loadgen", "summary.json")) or {}
@@ -167,6 +244,8 @@ def main():
             errs.append(f"confirm {c}")
         if "fill" not in ph or "overload" not in ph:
             errs.append("no fill/overload steps")
+        if "fixed" in ph:
+            errs.append("fixed steps inside the SLO part (contract: one loadgen part per phase)")
         if npass < 3:
             errs.append(f"{npass} passing curve steps")
         res("F", f"F2 {r['name']}", not errs, "; ".join(errs))
@@ -177,14 +256,16 @@ def main():
                 f"x_sd/x_mean {sd / float(c['x_mean']):.3f}, confirm fails {c.get('fails')}")
     idx = {x["name"]: x for x in (rows(os.path.join(S, "collect", "runs-index.csv")) or [])}
     for r in rs["slo"] + rs["fix"]:
-        rc = os.path.join(r["dir"], "h1-runcheck.txt")
-        try:
-            rc_ok = open(rc).read().rstrip().splitlines()[-1].startswith("RUNCHECK PASS")
-        except (OSError, IndexError):
-            rc_ok = False
+        rc_ok = False
+        for rc in (os.path.join(r["dir"], "h1-runcheck.txt"), os.path.join(os.path.dirname(r["dir"]), "h1-runcheck.txt")):
+            try:  # the part dir, else its lifetime dir
+                rc_ok = open(rc).read().rstrip().splitlines()[-1].startswith("RUNCHECK PASS")
+                break
+            except (OSError, IndexError):
+                continue
         k = idx.get(r["name"], {}).get("kernel_node0", "")
         errs = [] if rc_ok else ["h1-runcheck.txt not RUNCHECK PASS"]
-        if not os.path.isfile(os.path.join(r["dir"], SPLIT[W])):
+        if not any(os.path.isfile(os.path.join(x, SPLIT[W])) for x in (r["dir"], os.path.dirname(r["dir"]))):
             errs.append(f"no {SPLIT[W]}")
         if not k.endswith("-ds-popcorn-new-12"):
             errs.append(f"kernel_node0 '{k}'")
@@ -273,13 +354,14 @@ def main():
             res("W", f"W4 {m} weakest vs r1 levels", lv.get(m, {}).get("weakest") == weakest,
                 f"levels.tsv {lv.get(m, {}).get('weakest')} vs round {n} {weakest}")
             for s in SYSTEMS:
-                p = os.path.join(E, W, "r1", "slo", f"{s}-{m}-slo-r1")
-                r1 = next((x["dir"] for x in (runs(os.path.join(E, W, "r1", "slo")) or [])
-                           if x["mix"] == m and x["sys"] == s), p)
-                x1 = confirm_x(r1)
+                r1 = next((x["dir"] for x in (runs(os.path.join(E, W, "r1", "run")) or [])
+                           if x["mix"] == m and x["sys"] == s and x["phase"] == "slo"), "")
+                x1 = confirm_x(r1) if r1 else None
                 res("W", f"W4 {m} {s} x vs r1", x1 and abs(xs[(m, s)] / float(x1) - 1) <= 0.10,
                     f"r{n} {xs[(m, s)]:g} vs r1 {x1}")
-    verdict = f"H1CHECK {'FAIL' if nfail else 'PASS'} {W} r{n}: {nfail} FAIL, {nwarn} WARN"
+    if n > 1:
+        compare(W, n, E, mixes, a.skip_fig2)
+    verdict = f"H1CHECK {'FAIL' if nfail else 'PASS'} {W} r{n}: {nfail} FAIL, {nwarn} WARN, {nrep} REPORT"
     with open(os.path.join(S, "check.txt"), "w") as f:
         f.write("\n".join(lines + [verdict]) + "\n")
     print("\n".join(l for l in lines if not l.startswith("OK")))

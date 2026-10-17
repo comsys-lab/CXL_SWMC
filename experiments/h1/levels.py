@@ -37,7 +37,7 @@ def read_plan(path, workload):
         if not line.strip() or line.startswith("#"):
             continue
         f = line.rstrip("\n").split("\t")
-        if len(f) != 7:
+        if len(f) not in (7, 8):
             stop(f"bad plan line: {line.rstrip()}")
         if f[0] == workload:
             rows.append({"mix": f[1], "param": f[2], "factor": float(f[3]), "round": int(f[4]), "slo": f[5]})
@@ -56,9 +56,9 @@ def read_runs(d):
         if not line.strip() or line.startswith("#"):
             continue
         f = line.rstrip("\n").split("\t")
-        if len(f) != 6:
+        if len(f) not in (6, 8):  # v1: 6 columns; v2 (H1-HOOK v2): + steps, lifetime
             stop(f"bad h1-runs.tsv line in {p}: {line.rstrip()}")
-        name, sysk, mix, phase, rnd, rd = f
+        name, sysk, mix, phase, rnd, rd = f[:6]
         if not os.path.isabs(rd):
             rd = os.path.join(d, rd)
         out.append({"name": name, "sys": sysk, "mix": mix, "phase": phase, "round": rnd, "dir": rd})
@@ -92,9 +92,15 @@ def main():
     ap.add_argument("--plan", required=True)
     ap.add_argument("--workload", required=True)
     ap.add_argument("--out", required=True)
+    ap.add_argument("--mix", help="one mix only, appended to --out (the r1 in-lifetime callback, levels-cb.sh): the row "
+                    "must not exist yet; the other mixes of the plan are not required")
     ap.add_argument("slo_dirs", nargs="+")
     a = ap.parse_args()
     plan = read_plan(a.plan, a.workload)
+    if a.mix:
+        plan = [r for r in plan if r["mix"] == a.mix]
+        if not plan:
+            stop(f"mix {a.mix} not in the plan for {a.workload}")
     runs = [r for d in a.slo_dirs for r in read_runs(d) if r["phase"] == "slo"]
     nround = len(a.slo_dirs)
     lines = ["\t".join(["mix", "weakest", "x_hw", "x_pop", "x_mg", "L1_x", "L2_x", "factor", "L1_rate", "L2_rate",
@@ -128,6 +134,13 @@ def main():
         lines.append("\t".join([row["mix"], weakest] + [f"{xs[k]:.6g}" for k in SYSTEMS] +
                                [f"{l1:.6g}", f"{l2:.6g}", f"{row['factor']:g}", str(r1), str(r2), str(nround),
                                 ",".join(src)]))
+    if a.mix and os.path.isfile(a.out):  # append one row; refuse an existing row for this mix
+        old = open(a.out).read().rstrip("\n").split("\n")
+        if old[0] != lines[0]:
+            stop(f"{a.out}: header differs")
+        if any(l.split("\t")[0] == a.mix for l in old[1:]):
+            stop(f"{a.out}: mix {a.mix} already has a row")
+        lines = old + lines[1:]
     tmp = a.out + ".tmp"
     with open(tmp, "w") as f:
         f.write("\n".join(lines) + "\n")
