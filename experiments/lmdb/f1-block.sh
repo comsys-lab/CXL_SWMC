@@ -41,8 +41,17 @@ IPS=(192.168.122.100 192.168.122.101)
 bash $G lock $OWNER || { echo "BLOCK STOP: lock"; exit 2; }
 finish() {  # order as experiments/kv/pilot-block.sh: servers first, then Popcorn teardown, then dax0.0, then unlock
   set +eu  # nothing in the trap may abort it before the unlock
+  # v1.7 (HIGH fix): match this block's processes by command line, not by name: a Megalon process stuck in megalon_load
+  # (e.g. at the 2-node start barrier) has the main-thread name "megalon-lib", so v1.6's `pkill -x lmdb-stress` missed
+  # it and it kept /dev/dax0.0 mapped. TERM, wait <= 15 s, KILL, then verify: no process left and `fuser /dev/dax0.0`
+  # empty (ROLLBACK FAIL otherwise). The [x] brackets keep the pattern from matching the remote shell's own command line.
+  local pat="$L/(plain|megalon)/bin/lmdb-(serve[r]|stres[s])" out ip
   for ip in "${IPS[@]}"; do
-    $SSH comsys@$ip 'pkill -x lmdb-server; pkill -x lmdb-stress; sleep 2; echo procs=$(pgrep -c -x lmdb-server)/$(pgrep -c -x lmdb-stress)' < /dev/null 2>&1 | sed "s/^/$(date -Is) $ip /" >> "$E/rollback.out"
+    out=$($SSH comsys@$ip "pkill -f '$pat'; for i in \$(seq 15); do pgrep -f '$pat' > /dev/null || break; sleep 1; done
+      pkill -9 -f '$pat'; sleep 1; echo procs=\$(pgrep -c -f '$pat'); echo fuser=[\$(sudo -n fuser /dev/dax0.0 2>&1 | tr -d ' \n')]" < /dev/null 2>&1)
+    echo "$out" | sed "s/^/$(date -Is) $ip /" >> "$E/rollback.out"
+    echo "$out" | grep -qx "procs=0" && echo "$out" | grep -qx "fuser=\[\]" \
+      || echo "ROLLBACK FAIL: $ip lmdb process left or /dev/dax0.0 still in use (see rollback.out)" | tee -a "$E/rollback.out"
   done
   if [ "${POPCORN:-0}" = 1 ]; then  # Popcorn: tear down every attempted cxl_shm load without "teardown PASS"
     for r in "$E"/shm-*/; do
