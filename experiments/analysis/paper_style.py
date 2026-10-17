@@ -18,40 +18,107 @@ SERIES = {"Popcorn": "#bfbfbf", "Megalon": "#7f7f7f", "All HWcc": "#000000"}
 STACK = ["white", "#d9d9d9", "#a6a6a6", "#595959", "black"]  # top -> bottom in the legend (5 gray levels)
 
 
-def curve(path, series, slo, xlabel, ylabel, ylim, xticks, yticks):
-    """series: [(name, xs, ys)] in legend order; ys already normalized; slo normalized (dashed line)."""
+PAST_LABEL = "Past SLO"  # legend of the hollow markers (failed steps and overload-phase steps)
+
+
+def _nice_top(v):
+    """Smallest 'nice' axis top >= v and its tick step (1, 2, 2.5, 5 x 10^k; 4-5 intervals)."""
+    import math
+    for k in range(-3, 9):
+        for m in (1, 2, 2.5, 5):
+            step = m * 10 ** k
+            if step * 5 >= v:
+                n = max(1, math.ceil(v / step - 1e-9))
+                return n * step, step
+    return v, v / 4
+
+
+def curve(path, series, slo, xlabel, ylabel, ylim, xticks, yticks, extend_y=True, clip_factor=2.0):
+    """series: [(name, xs, ys[, ok[, tail]]])] in legend order; ys already normalized; slo normalized (dashed line).
+    ok (optional, per point): False = a step past the SLO (failed, or an overload-phase step: the caller decides).
+    tail (optional, per point): the past-SLO points joined to the passing curve by a dashed line, in x order (e.g. the
+    overload phase); default: the past-SLO points beyond the highest passing x.
+    Passing points: solid line, filled markers, display cleanup (clean_curve). Past-SLO points: EVERY one is drawn
+    (no merge / drop / cut-off) with a hollow marker. extend_y: the y axis grows to include the past-SLO points, up to clip_factor x
+    the given top; points still above (or infinite) are drawn on the top edge as hollow triangles (legend says off
+    scale; the CSV has the values). Returns {"ylim": (lo, top), "series": {name: counts of drawn points}}."""
+    import math
+    lines, past_all = [], []
+    for item in series:
+        name, xs, ys = item[:3]
+        if len(item) > 3:
+            ok = item[3]
+            pas = [(x, y) for x, y, p in zip(xs, ys, ok) if p]
+            past = [(x, y) for x, y, p in zip(xs, ys, ok) if not p]
+        else:
+            pas, past = list(zip(xs, ys)), []
+        px, py = clean_curve([p[0] for p in pas], [p[1] for p in pas], ylim[1]) if pas else ([], [])
+        if len(item) > 4:
+            tail = sorted((x, y) for x, y, p, t in zip(xs, ys, item[3], item[4]) if t and not p)
+        else:
+            xmax = max(px) if px else -math.inf
+            tail = sorted(p for p in past if p[0] > xmax)
+        lines.append((name, px, py, past, tail))
+        past_all += [y for _, y in past]
+    top, ticks = ylim[1], yticks
+    fin = [y for y in past_all if math.isfinite(y)]
+    if extend_y and fin and max(fin) > top:
+        need = min(max(fin) * 1.05, top * clip_factor)
+        if need > top:
+            top, step = _nice_top(need)
+            ticks = [round(k * step, 6) for k in range(int(round(top / step)) + 1)]
     fig, ax = plt.subplots(figsize=(10.2, 4.4))
     ax.yaxis.grid(True, color="#d9d9d9", linewidth=1.0)
     ax.set_axisbelow(True)
-    for item in series:
-        name, xs, ys = item[:3]
-        if len(item) > 3:  # pass flags: a failed step below the highest passing rate is superseded (display only)
-            ok = item[3]
-            xmax = max([x for x, p in zip(xs, ok) if p], default=0)
-            keep = [i for i in range(len(xs)) if ok[i] or xs[i] > xmax]
-            xs, ys, ok = [xs[i] for i in keep], [ys[i] for i in keep], [ok[i] for i in keep]
-        else:
-            ok = None
-        xs, ys = clean_curve(xs, ys, ylim[1], ok)
-        ax.plot(xs, ys, color=SERIES[name], linewidth=2.5, marker="o", markersize=6, label=name, clip_on=True)
+    clipped, drawn = False, {}
+    for name, px, py, past, tail in lines:
+        drawn[name] = {"passing": len(px), "past": 0, "off_scale": 0, "tail": len(tail)}
+        col = SERIES[name]
+        ax.plot(px, py, color=col, linewidth=2.5, marker="o", markersize=6, label=name, clip_on=True)
+        if not past:
+            continue
+        if tail:
+            tx = ([px[-1]] if px else []) + [p[0] for p in tail]
+            ty = ([py[-1]] if py else []) + [min(p[1], top) for p in tail]
+            ax.plot(tx, ty, color=col, linewidth=2.0, linestyle=(0, (3, 2)), clip_on=False, zorder=2)
+        for x, y in past:
+            off = not math.isfinite(y) or y > top
+            clipped |= off
+            drawn[name]["past"] += 1
+            drawn[name]["off_scale"] += off
+            ax.plot([x], [min(y, top) if math.isfinite(y) else top], linestyle="none", marker="^" if off else "o",
+                    markersize=9, markerfacecolor="white", markeredgecolor=col,
+                    markeredgewidth=2.2, clip_on=False, zorder=3)
     ax.axhline(slo, color="black", linestyle=(0, (4, 2)), linewidth=2.5)
-    above = slo + (ylim[1] - ylim[0]) * 0.16 < ylim[1]  # label above the line if it fits, else below
-    ax.text(xticks[-1] - (xticks[-1] - xticks[0]) * 0.03, slo + (ylim[1] - ylim[0]) * (0.04 if above else -0.04),
+    above = slo + (top - ylim[0]) * 0.16 < top  # label above the line if it fits, else below
+    ax.text(xticks[-1] - (xticks[-1] - xticks[0]) * 0.03, slo + (top - ylim[0]) * (0.04 if above else -0.04),
             "SLO", ha="right", va="bottom" if above else "top", fontsize=FS)
     ax.set_xlim(xticks[0], xticks[-1])
-    ax.set_ylim(*ylim)
+    ax.set_ylim(ylim[0], top)
     ax.set_xticks(xticks)
-    ax.set_yticks(yticks)
+    ax.set_yticks(ticks)
     ax.set_xlabel(xlabel, fontsize=FS)
     ax.set_ylabel(ylabel, fontsize=FS, linespacing=0.95)
     ax.tick_params(labelsize=FS)
-    for s in ax.spines.values():
-        s.set_visible(True)
-    ax.legend(ncol=len(series), loc="lower center", bbox_to_anchor=(0.5, 0.98), fontsize=FS, handlelength=1.2,
-              columnspacing=2.0, handletextpad=0.3, borderaxespad=0.1)
+    for sp in ax.spines.values():
+        sp.set_visible(True)
+    handles, labels = ax.get_legend_handles_labels()
+    if past_all:
+        from matplotlib.lines import Line2D
+        handles.append(Line2D([0], [0], linestyle="none", marker="o", markersize=9, markerfacecolor="white",
+                              markeredgecolor="black", markeredgewidth=2.2))
+        labels.append(PAST_LABEL)
+        if clipped:
+            handles.append(Line2D([0], [0], linestyle="none", marker="^", markersize=9, markerfacecolor="white",
+                                  markeredgecolor="black", markeredgewidth=2.2))
+            labels.append("Off scale")
+    ax.legend(handles, labels, ncol=len(handles), loc="lower center", bbox_to_anchor=(0.5, 0.98),
+              fontsize=FS if len(handles) <= 3 else FS - 4, handlelength=1.2, columnspacing=1.5 if len(handles) > 3
+              else 2.0, handletextpad=0.3, borderaxespad=0.1)
     fig.tight_layout()
     fig.savefig(path, dpi=150)
     plt.close(fig)
+    return {"ylim": (ylim[0], top), "series": drawn}
 
 
 def breakdown(path, bars, components, ylabel="Normalized\nserving latency", hatched=()):
