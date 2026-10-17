@@ -73,6 +73,15 @@ set -uo pipefail
 E=${1:?evidence dir}
 P=/home/comsys/sungsu/destijl-control X=$(cd "$(dirname "$0")" && pwd)
 G=$(cd "$X/../vectordb" && pwd)/host-gate.sh PTG=$(cd "$X/../vectordb" && pwd)/pretouch-gate.sh
+# Host gate before every loadgen part: H1 main (H1_MEASURE_RUN=1, experiments/h1/README.md item 8) uses
+# experiments/h1/h1-gate.sh (partition check with MEASURE_PART_DIR, builds, node1 measurement CPU sets) and session.sh
+# starts loadgen through scripts/host/measure-run.sh; otherwise (validation packets) host-gate.sh as before.
+GATE=$G
+if [ "${H1_MEASURE_RUN:-0}" = 1 ]; then
+  GATE=$(cd "$X/../h1" && pwd)/h1-gate.sh
+  [ -f "$GATE" ] && [ -d "${MEASURE_PART_DIR:-}" ] || { echo "SEQUENCE STOP: H1_MEASURE_RUN=1 needs experiments/h1/h1-gate.sh and MEASURE_PART_DIR"; exit 2; }
+  export H1_MEASURE_RUN MEASURE_PART_DIR
+fi
 : "${C8:?}" "${K8:?}" "${GT8:?}" "${RECV_MODE:?}" "${D:?}" "${VM_PLAIN:?}" "${VM_MEG:?}" "${MEG_BUILD:?}" "${LOADGEN:?}"
 : "${PLAIN_BUILD:?}"
 MB=$MEG_BUILD SEED=${SEED:-20261016} ROUNDS=${ROUNDS:-3} FIXED=${FIXED:-1} XT=${XT:-28800}
@@ -257,7 +266,7 @@ precheck() {
 }
 measure() {  # session dir, name, loadgen args... -> rc of session.sh measure
   local S=$1 n=$2; shift 2
-  bash $G check "$E/gate-$(basename "$S")-$n.txt" || stop "host gate before $(basename "$S")/$n"
+  bash $GATE check "$E/gate-$(basename "$S")-$n.txt" || stop "host gate before $(basename "$S")/$n"
   bash $X/session.sh measure "$S" "$n" -- "$@" > "$S.$n.out" 2>&1
   local rc=$?
   tail -2 "$S.$n.out" | sed "s|^|  $(basename "$S")/$n: |"

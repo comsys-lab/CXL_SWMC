@@ -1,7 +1,7 @@
 # H1 plugin: DLRM recsys (26 tables, 167.7M rows x 576 B, MLPerf day-23 trace; reports/RECSYS-V1-packet.md v1.2.7
 # blocks). all-HWcc = recsys/9 plain, Popcorn = recsys/9 + cxl_shm build 12 (init_state=shared + preload, recv_mode
 # poll), Megalon = recsys-megalon/11 on Megalon 77 (one object per 576 B row), mgoff = the same with
-# MEGALON_COH_TIMERS=0. Mixes = EKKO avg / peak (two; draft §1 has no balanced DLRM mix). Filled 2026-10-17, re-pinned 2026-10-18 for H1-HOOK v2 (H1 hook =
+# MEGALON_COH_TIMERS=0. Mixes = EKKO avg / peak (two; draft §1 has no balanced DLRM mix). Filled 2026-10-17, re-pinned 2026-10-18 for H1-HOOK v2 and the H1 gate/launcher (README item 8) (H1 hook =
 # main-block.sh BLOCK=h1, branch recsys-h1-hook; valid once that branch is merged into the live tree after RECSYS-V1
 # v1.2.7 ran — every file the block runs is hash-pinned below, so an unmerged or changed tree is refused by hook.sh).
 . "$(dirname "${BASH_SOURCE[0]}")/pins-common.inc"
@@ -25,8 +25,8 @@ eca0ba184cec64224f9fcf1241737132c49412dfde7ce011716ba7392598f5a5  $P/builds/recs
 f9c1753f3bef2ab0941153058860227145f2d7b7e33a210bdc3338fad14eacda  $P/builds/recsys-megalon/11/lib/libmegalon.so
 73c93ce02d57837f09e1b5f8d0d59142b3c7d30735bd69492dc898bd76019583  $P/builds/recsys-loadgen/7/manifest.txt
 d2633e8df70e7eb0b832e205a16f7749485097d3005ce758a3ff08843caa1447  $P/builds/recsys-loadgen/7/loadgen
-01170167065d3a56f56b3e9264884c4a85a5da7b213b25e2b13bdeb3f75dd861  $HOOK_FILE
-2c1dcfc371063781639e04c2bd986406a0aa17ff64191ee5c9147c11772fd1e7  $HR/experiments/recsys/session.sh
+25ef8ad69697a10a2b9174d343dc879348f7d760de98dc2ad18179e869af2146  $HOOK_FILE
+68c5b9ceaf986e9e05e941d586a9a5cb5bb162b1963181ce02efa5d34cce5b54  $HR/experiments/recsys/session.sh
 252cb04dafd899b837d7f5bf1e190de9d7a5c2ec4a8fca2b81ff74f63dc6c06f  $HR/experiments/recsys/v1_check.py
 32d171199d6a47d15fcfa6971522e253fe21d857e91c9049c201e55a0cdac230  $HR/experiments/recsys/check_breakdown.py
 e6b2455d64266df3f2a62f9bc5359b91ddd80588c109a6cae3efde66abceb74c  $HR/experiments/recsys/breakdown.py
@@ -35,6 +35,9 @@ b19dbeb73762a0c3f9a7832a14e229ca4855b71364f1a64ee2b7b1a2a944fe7d  $HR/experiment
 1edcdda88f30200fd55c1b5a18cb4b9d6db57aa02647f8ad549e4e7f6aabb31f  $HR/experiments/vectordb/host-gate.sh
 1baccf944c1ac66fce65b065c1043529cd72bc08b38f4b42fe43bd2640076031  $HR/experiments/vectordb/pretouch-gate.sh
 68327dd3178d7af5b0ad9c614f0a6c41b4d99b2f6a23cf456f7751273996eecf  $HR/scripts/host/measure-env.sh
+672ad3c64e2992ba70d1fc5534e2e652c23d6166ad3e107b38597b23caaeb759  $HR/experiments/h1/h1-gate.sh
+aed8d7f32871398db375c502152587ee0b25a716dd60d4ff637e189aa3d42420  $HR/scripts/host/measure-run.sh
+96080a94485adfd192bd1da85d7e6589656657a0b76d65d534aa6494294dd6a4  $HR/scripts/host/measure-env-part.sh
 fb17ee4445d4d5cb105b787d2c6bfeae5956b2ba9f852cb1eadf7caf759a6a8a  $HR/scripts/guest/recsys-node.sh
 f2fe8c045490a26ad5b01631ca896b997b1fdad6f08ee20d1b314f64fe6fcc1e  $HR/systems/megalon/recsys-2vm.yaml
 eeb6b23f173d85a3c86ade0fb804b363e3c84a36bf9c0f56a7cbcab25e738b53  $HR/config/cxl_region.yaml

@@ -175,7 +175,11 @@ measure)
   cpu before
   TARGETS=""; for k in "${!NODE[@]}"; do TARGETS="$TARGETS${TARGETS:+,}${NODE[$k]}:${PORTS[$k]}"; done
   LG_STATS=(); [ "$STATS_OP" = 0 ] || LG_STATS=(--stats-op "$STATS_OP")
-  numactl --physcpubind="$LG_CPUS" --membind=1 "$LOADGEN" --workload recsys --target "$TARGETS" --out "$M/loadgen" \
+  # H1 main (H1_MEASURE_RUN=1, experiments/h1/README.md item 8): loadgen starts inside measure.slice through
+  # scripts/host/measure-run.sh (clean environment; loadgen needs no variable); fail closed (rc 125, no loadgen run).
+  # Validation packets (H1_MEASURE_RUN unset) launch it as before.
+  LGPRE=(); [ "${H1_MEASURE_RUN:-0}" = 1 ] && LGPRE=(bash "$ROOT/scripts/host/measure-run.sh" --)
+  "${LGPRE[@]}" numactl --physcpubind="$LG_CPUS" --membind=1 "$LOADGEN" --workload recsys --target "$TARGETS" --out "$M/loadgen" \
     "${LG_STATS[@]}" "$@" > "$M/loadgen.log" 2>&1
   LG=$?
   tail -3 "$M/loadgen.log"
