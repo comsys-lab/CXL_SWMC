@@ -24,6 +24,9 @@
 #   build must name), MIXES (main block: put ratios, default MOT1 v6 "0.05 0.5 0.8" = get/put 95/5, 50/50, 20/80),
 #   PIN (harness commit), BUILD_PIN (commit the builds were made from; default PIN; every build manifest must name
 #   it with dirty=0, and the server/loadgen sources must not differ between BUILD_PIN and PIN), KV_CFG, K8.
+#   PRETOUCH_DIR (required for v1val, optional otherwise): the ENV-pretouch evidence dir of the VMs' current QEMU
+#   lifetime; pretouch-check.sh must PASS under the lock before the install/precheck and again after the last run
+#   (standing rule 2026-10-17: whole dax0.0 pre-touched on each VM after every QEMU start, before any measurement).
 # Holds the measurement lock for the whole block; stops at the first PILOTRUN STOP. On every exit: this block's servers
 # stopped, page MSI teardown of every attempted load, /dev/dax0.0 back to root:root 600 on both VMs UNCONDITIONALLY
 # (fresh stat check per VM; "ROLLBACK FAIL" otherwise), lock released.
@@ -130,6 +133,13 @@ precheck() {
   done
 }
 echo "$(date -Is) block $OWNER start (git $(git -C $P/CXL_SWMC rev-parse --short HEAD))"
+[ "$B" != v1val ] || [ -n "${PRETOUCH_DIR:-}" ] || { echo "SEQUENCE STOP: v1val needs PRETOUCH_DIR (standing pretouch rule)"; exit 2; }
+ptcheck() {  # tag
+  [ -z "${PRETOUCH_DIR:-}" ] && return 0
+  bash $X/pretouch-check.sh "$PRETOUCH_DIR" "$E/pretouch-check-$1.txt" | tail -n 1
+  [ "${PIPESTATUS[0]}" = 0 ] || { echo "$(date -Is) SEQUENCE STOP: pretouch check ($1), see pretouch-check-$1.txt"; exit 1; }
+}
+ptcheck start
 if [ "${KV_INSTALL:-0}" = 1 ]; then
   : "${KEYS:?KEYS (install.sh sizes cfg/megalon.yaml for it)}"
   echo "$(date -Is) install $BP -> $VP, $BM -> $VM (keys $KEYS)"
@@ -148,6 +158,7 @@ case "$B" in
         echo "$s u=0.5 L = 0.5 x $LREF/hw-u50-pslo = $r requests/s (trace)" >> "$E/fixed-load-L.txt"
         run $s-u50-ptrace SYS=$S PUT_RATIO=0.5 KIND=ptrace RATE=$r
       done
+      ptcheck end
       echo "$(date -Is) SEQUENCE DONE $OWNER"
       exit 0
     fi
@@ -208,7 +219,7 @@ case "$B" in
     done
     r=$(confirm_l $LREF/hw-u50-pslo/loadgen/summary.json) || { echo "SEQUENCE STOP: no all-HWcc result for 0.5 in $LREF"; exit 1; }
     run pop-u50-ptrace "${PE[@]}" PUT_RATIO=0.5 KIND=ptrace RATE=$r;;
-  v1val)  # KV-V1 (reports/KV-V1-packet.md): MOT1 v6 KV validation on Popcorn build 10. Per system and mix (u5, u80)
+  v1val)  # KV-V1 (reports/KV-V1-packet.md): MOT1 v6 KV validation (v1.4: Popcorn build 12, Megalon 77). Per system and mix (u5, u80)
     # one ladder run (one server lifetime): a low step and one at ~0.5 x the v5 pilot max (u80: the u50 pilot max; no
     # u80 pilot exists), no SLO abort; Megalon also with MEGALON_COH_TIMERS=0 at the same rates (instrumentation
     # overhead); closure checks v1-check.py after every run (a FAIL stops the block). Order: all-HWcc / Megalon runs
@@ -264,4 +275,5 @@ case "$B" in
     done;;
   *) echo "SEQUENCE STOP: bad block"; exit 2;;
 esac
+ptcheck end
 echo "$(date -Is) SEQUENCE DONE $OWNER"

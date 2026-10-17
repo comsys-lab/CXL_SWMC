@@ -90,5 +90,44 @@ l = scenario("lmdb", "lmdb")["get"]
 # lmdb: (10000+3000+4000) x10 = 170000 + 5000 + 300000 + 70000 + 80000 + 200000 + vcopy 1000x100/10 = 10000 -> 835000 / 100
 eq(l["C_us_per_op[derived]"], 8.35, "lmdb formula")
 eq(l["meg_anc_read_nr_us_per_op[sampled_xN]"], 0.4, "anchor read_nr est")
+# Megalon >= 76 lean sampling (opt.meg_lean 1): events x read_sections / check_sampled (x10), write side x write_sections /
+# write_sampled (write_sections 100, write_sampled 4 -> x25); events_always: events unscaled
+def lean_scenario(name, formula, always):
+    d2 = os.path.join(d, name)
+    os.makedirs(os.path.join(d2, "stats"))
+    e = {"opt.tsc_hz": 2e9, "opt.meg_coh": 1, "opt.meg_anchor": 1, "opt.meg_check_sample": 64, "opt.c_formula": formula,
+         "opt.meg_lean": 1, "opt.meg_events_always": always, "opt.meg_probe_ps_max": 10400,
+         "opt.get.ops": 100, "opt.get.t_ns": 100 * 20000, "opt.get.meg.read_sections": 100, "opt.get.meg.check_sampled": 10,
+         "opt.get.meg.write_sections": 100, "opt.get.meg.anchor.write_sampled": 4,
+         "opt.get.meg.check_ns_sampled": 10 * 1000, "opt.get.meg.anchor.rseq_ns_sampled": 10 * 200,
+         "opt.get.meg.anchor.read_lookup_ns_sampled": 10 * 300, "opt.get.meg.anchor.read_nr_ns_sampled": 10 * 400,
+         "opt.get.meg.stale_ns": 10 * 50, "opt.get.meg.wstart_ns": 4 * 3000, "opt.get.meg.anchor.wseq_ns": 4 * 1000,
+         "opt.get.meg.wflush_ns": 4 * 2000, "opt.get.meg.anchor.wseq_end_ns": 4 * 500,
+         "opt.get.meg.anchor.write_lookup_ns": 4 * 700, "opt.get.meg.anchor.write_nr_ns": 4 * 800,
+         "opt.get.meg.anchor.timed_a": 3, "opt.get.meg.vcopy_ns_sampled": 1000, "opt.get.meg.vcopy_sampled": 10,
+         "opt.get.meg.vcopy_cnt": 100}
+    b = {k: (v if not k.startswith("opt.get.") else 0) for k, v in e.items()}
+    for when, kv, mono in (("begin", b, 0), ("end", e, 1_000_000_000)):
+        with open(os.path.join(d2, "stats", f"step001-{when}-t0.txt"), "w") as f:
+            f.write(f"# when={when} phase=fixed step=1 offered_x=1 target=0 addr=x status=0 wall_ns=0 mono_ns={mono} rtt_us=1\n")
+            f.writelines(f"{k}={v}\n" for k, v in kv.items())
+    out = os.path.join(d2, "o.csv")
+    subprocess.run([sys.executable, "-I", TOOL, d2, "--system", "Megalon", "--out", out], check=True, stdout=subprocess.DEVNULL)
+    return {r["op"]: r for r in csv.DictReader(open(out))}["get"]
+k = lean_scenario("kv-lean", "kv", 0)
+# kv lean: (10000-2000) x10 = 80000; stale 500 x10 = 5000; write ((12000-4000)+(8000-2000)) x25 = 350000 -> 435000 / 100
+eq(k["C_us_per_op[derived]"], 4.35, "kv lean formula")
+eq(k["meg_events_us_per_op[sampled_xN]"], 0.05, "kv lean events est")
+eq(k["meg_write_us_per_op[sampled_xN]"], 3.5, "kv lean write est")
+eq(k["meg_write_sampled_per_op[measured]"], 0.04, "write_sampled per op")
+eq(k["meg_probe_ps[measured]"], 10400, "probe ps exported")
+eq(k["meg_timed_a_per_op[measured]"], 0.03, "timed (A) per op")
+eq(k["meg_lean[measured]"], 1, "lean flag")
+l = lean_scenario("lmdb-lean", "lmdb", 0)
+# lmdb lean: (10000+3000+4000) x10 = 170000; 5000; (12000+2800+3200+8000) x25 = 650000; vcopy 10000 -> 835000 / 100
+eq(l["C_us_per_op[derived]"], 8.35, "lmdb lean formula")
+a1 = lean_scenario("kv-lean-always", "kv", 1)
+# events_always: stale 500 not scaled -> 435000 - 5000 + 500 = 430500 / 100
+eq(a1["C_us_per_op[derived]"], 4.305, "kv lean events_always")
 print("OPSPLIT TEST " + ("PASS" if not fails else "FAIL: " + "; ".join(fails)))
 sys.exit(1 if fails else 0)

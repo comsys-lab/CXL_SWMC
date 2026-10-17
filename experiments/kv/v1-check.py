@@ -2,7 +2,7 @@
 """KV-V1 closure checks of one run dir (reports/KV-V1-packet.md): per-operation split vs the server counters and the
 expected coherence source of the system.
 
-usage: v1-check.py RUN_DIR --system all-HWcc|Popcorn|Megalon [--timers on|off] [--workload kv|lmdb]
+usage: v1-check.py RUN_DIR --system all-HWcc|Popcorn|Megalon [--timers on|off] [--workload kv|lmdb] [--megalon-lean 1|0]
 RUN_DIR = an experiments/kv/run.sh (or experiments/lmdb/run.sh, --workload lmdb: ops get/update, server counters
 gets+get_not_found+get_errors / updates+update_not_found+update_errors, C formula lmdb) result dir (node<k>.log with the clean-stop stats, opsplit.csv).
 Checks (each printed; exit 1 if any fails):
@@ -11,7 +11,11 @@ Checks (each printed; exit 1 if any fails):
   rows      opsplit.csv has get and put rows with ops > 0 and T > 0; every C within [0, T]
   gauge     every node's clean-stop stats carry opt.c_formula = the workload (kv / lmdb)
   source    all-HWcc: C = 0 and every raw pop_*/meg_* column 0 on every row
-            Megalon timers on: c_formula kv, c_supported 1, C > 0 on every row with ops > 0, tsc_backwards 0
+            Megalon timers on: c_formula kv, c_supported 1, C > 0 on every row with ops > 0, tsc_backwards 0;
+                      --megalon-lean 1 (default; Megalon >= 76, e.g. build 77): meg_lean 1, meg_events_always 0 on every
+                      row and timed write sections (write_sampled) > 0 summed over the write op's rows (put / update; a single
+                      low-rate step may have none), so C used the lean
+                      estimators (reports/M2-megalon-port-changes.md §18); --megalon-lean 0 for builds <= 75
             Megalon timers off (MEGALON_COH_TIMERS=0): c_supported 1 and C = 0 on every row (durations off, counts kept)
             Popcorn: c_supported 1 (swmc_acct registered on every node) and the run's total C > 0
 Writes RUN_DIR/v1-check.txt (results + per step/op T and C).
@@ -23,6 +27,7 @@ ap.add_argument("run")
 ap.add_argument("--system", required=True, choices=["all-HWcc", "Popcorn", "Megalon"])
 ap.add_argument("--timers", choices=["on", "off"], default="on")
 ap.add_argument("--workload", choices=["kv", "lmdb"], default="kv")
+ap.add_argument("--megalon-lean", choices=["0", "1"], default="1")
 a = ap.parse_args()
 out, fails = [], []
 
@@ -82,6 +87,12 @@ elif a.system == "Megalon" and a.timers == "on":
     check(all(r["c_supported"] == "1" for r in live), "Megalon: c_supported 1")
     check(all(C(r) > 0 for r in live), "Megalon: C > 0 on every row")
     check(all(float(r["meg_tsc_backwards_per_op[measured]"]) == 0 for r in live), "Megalon: tsc_backwards 0")
+    if a.megalon_lean == "1":
+        wop = "put" if a.workload == "kv" else "update"
+        check(all(r.get("meg_lean[measured]") == "1" and r.get("meg_events_always[measured]") == "0" for r in live),
+              "Megalon: lean sampling (meg_lean 1, events_always 0) on every row")
+        check(sum(float(r.get("meg_write_sampled_per_op[measured]") or 0) * n(r) for r in live if r["op"] == wop) > 0,
+              f"Megalon: write_sampled > 0 over the run's {wop} rows")
 elif a.system == "Megalon":
     check(all(r["c_supported"] == "1" for r in live), "Megalon timers off: c_supported 1 (thread_coh present)")
     check(all(C(r) == 0 for r in live), "Megalon timers off: C = 0")

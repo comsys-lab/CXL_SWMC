@@ -34,6 +34,14 @@ Background coherence CPU (not inside any operation; same value on every op row o
   recv_cpu_s       kernel threads cxl_recv* (Popcorn message receive)
   coh_bg_cpu_s     by SYSTEM: Megalon lib_bg_cpu_s, Popcorn recv_cpu_s, all-HWcc 0;
   coh_bg_us_per_op coh_bg_cpu_s / all operations of the step
+Megalon >= 76 (lean sampling, server gauge opt.meg_lean = 1; reports/M2-megalon-port-changes.md §18): every duration is a
+  sum over timed sections only. The same formulas, with read-side parts (check, rseq, read anchor, stale/concur/meta/spin)
+  x read_sections / check_sampled and write-side parts (wstart, wseq, wflush, wseq_end, write anchor) x write_sections /
+  write_sampled (meg.anchor.write_sampled); with opt.meg_events_always = 1 the events are full sums (not scaled). The raw
+  meg_*_us_per_op[measured] and meg_anc_write_*[measured] columns stay raw sums per operation (in lean runs: sums over
+  the timed sections only); the scaled C parts are meg_events_us_per_op / meg_write_us_per_op [sampled_xN].
+  Megalon >= 77 probe cost (meg_probe_ps = max over targets of opt.meg_probe_ps_max) and the timed event counts
+  (meg_timed_*_per_op) are exported raw; NOT subtracted from C (§19 probe rule; methodology decision open).
 C is 0 with c_supported=0 when the source is not available (Popcorn kernel without swmc_acct, Megalon v1 shim).
 Every column name carries its tag: [measured] (a recorded quantity, possibly averaged per operation), [sampled_xN]
 (estimate from a 1-in-N sample of read sections, N in meg_check_sample), [derived] (formula of other columns).
@@ -96,6 +104,9 @@ def columns(ops_present):
           "meg_anc_write_nr_us_per_op[measured]", "meg_anc_wseq_us_per_op[measured]", "meg_anc_wseq_end_us_per_op[measured]"]
     c += [f"meg_{k[:-3]}_us_per_op[measured]" for k in MEG_NS]
     c += [f"meg_{k}_per_op[measured]" for k in MEG_CNT]
+    c += ["meg_lean[measured]", "meg_events_always[measured]", "meg_events_us_per_op[sampled_xN]",
+          "meg_write_us_per_op[sampled_xN]", "meg_write_sampled_per_op[measured]", "meg_probe_ps[measured]",
+          "meg_timed_a_per_op[measured]", "meg_timed_bc_per_op[measured]", "meg_timed_d_per_op[measured]"]
     return c
 
 
@@ -128,6 +139,13 @@ def rows(run, system):
         if len(forms) != 1:
             sys.exit(f"opsplit: step {step}: targets disagree on opt.c_formula {forms}")
         formula = forms.pop()
+        # Megalon >= 76 lean sampling / events-always flags (servers without the gauges: 0 = build <= 75 semantics)
+        leans = {int(num(e[1], "opt.meg_lean") or 0) for _, e in pairs}
+        alws = {int(num(e[1], "opt.meg_events_always") or 0) for _, e in pairs}
+        if len(leans) != 1 or len(alws) != 1:
+            sys.exit(f"opsplit: step {step}: targets disagree on opt.meg_lean {leans} / opt.meg_events_always {alws}")
+        lean, always = leans.pop(), alws.pop()
+        probe_ps = max((num(e[1], "opt.meg_probe_ps_max") or 0) for _, e in pairs)
         def gsum(pred):
             s = 0.0
             for (_, b), (_, e) in pairs:
@@ -157,12 +175,29 @@ def rows(run, system):
             meg = {k: dsum(p + "meg." + k) for k in MEG_NS + MEG_CNT + ["check_ns_sampled", "vcopy_ns_sampled", "vcopy_sampled", "vcopy_cnt", "lookup_ns_sampled"]}
             lookup_est = meg["lookup_ns_sampled"] * meg["read_sections"] / meg["check_sampled"] if meg["check_sampled"] else 0.0
             anc = {k: dsum(p + "meg.anchor." + k) for k in ("read_lookup_ns_sampled", "read_nr_ns_sampled", "rseq_ns_sampled",
-                                                           "write_lookup_ns", "write_nr_ns", "wseq_ns", "wseq_end_ns")}
+                                                           "write_lookup_ns", "write_nr_ns", "wseq_ns", "wseq_end_ns",
+                                                           "write_sampled", "timed_a", "timed_bc", "timed_d")}
             est = (lambda x: x * meg["read_sections"] / meg["check_sampled"]) if meg["check_sampled"] else (lambda x: 0.0)
             vcopy_est = meg["vcopy_ns_sampled"] * meg["vcopy_cnt"] / meg["vcopy_sampled"] if meg["vcopy_sampled"] else 0.0
             check_est = meg["check_ns_sampled"] * meg["read_sections"] / meg["check_sampled"] if meg["check_sampled"] else 0.0
+            # write-side scaling (lean) and the C parts that are not the check
+            west = (lambda x: x * meg["write_sections"] / anc["write_sampled"]) if anc["write_sampled"] else (lambda x: 0.0)
+            events = sum(meg[k] for k in ("stale_ns", "concur_ns", "meta_ns", "spin_ns"))
+            events_c = events if (not lean or always) else est(events)
+            if formula == "kv":
+                write_raw = meg["wstart_ns"] - anc["wseq_ns"] + meg["wflush_ns"] - anc["wseq_end_ns"]
+            else:
+                write_raw = meg["wstart_ns"] + anc["write_lookup_ns"] + anc["write_nr_ns"] + meg["wflush_ns"]
+            write_c = west(write_raw) if lean else write_raw
             if src == "popcorn":
                 C = per(pop["is_ns"] + pop["sm_ns"] + pop["wp_ns"] + pop["ipi_ns"])
+            elif src == "megalon" and lean:
+                if formula == "kv":
+                    C = per(est(max(0.0, meg["check_ns_sampled"] - anc["rseq_ns_sampled"])) + events_c + write_c)
+                else:
+                    C = per(est(meg["check_ns_sampled"] + anc["read_lookup_ns_sampled"] + anc["read_nr_ns_sampled"])
+                            + events_c + write_c + vcopy_est)
+                C = max(C, 0.0)
             elif src == "megalon":
                 rest_exact = sum(meg[k] for k in ("stale_ns", "concur_ns", "meta_ns", "spin_ns"))
                 if formula == "kv":
@@ -192,6 +227,8 @@ def rows(run, system):
                   round(per(anc["write_nr_ns"]), 4), round(per(anc["wseq_ns"]), 4), round(per(anc["wseq_end_ns"]), 4)]
             r += [round(per(meg[k]), 4) for k in MEG_NS]
             r += [round(cnt(meg[k]), 6) for k in MEG_CNT]
+            r += [lean, always, round(per(events_c), 4), round(per(write_c), 4), round(cnt(anc["write_sampled"]), 6),
+                  int(probe_ps), round(cnt(anc["timed_a"]), 6), round(cnt(anc["timed_bc"]), 6), round(cnt(anc["timed_d"]), 6)]
             out.append(r)
     return out
 

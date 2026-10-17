@@ -8,7 +8,13 @@
 # A1..B3 [, P0..P2]; after every stress pair and pilot-run a dmesg check (new lines matching DMESG_BAD stop the block).
 # env: POPCORN (0; 1 adds Part P: Popcorn build >= 10 runs, needs C8 K8 GT8 RECV_MODE as experiments/kv/pilot-block),
 #   IMG (Host image dir to create in G0; must not exist; required), EXPECT_K (guest kernel release, as recorded in state/HANDOFF.md; required), PLAIN_BUILD / MEG_BUILD /
-#   LOADGEN_BUILD (pilot-run.sh defaults; PLAIN_BUILD also gives the Host lmdb-server for --print-app-bytes)
+#   LOADGEN_BUILD (pilot-run.sh defaults; PLAIN_BUILD also gives the Host lmdb-server for --print-app-bytes),
+#   PRETOUCH_DIR (required): the ENV-pretouch evidence dir of the VMs' current QEMU lifetime; experiments/kv/pretouch-check.sh
+#     must PASS under the lock before G0 and again before BLOCK DONE (standing rule 2026-10-17: whole dax0.0
+#     pre-touched on each VM after every QEMU start, before any measurement),
+#   LMDB_GUEST_DIR (guest install dir, new; default /home/comsys/lmdb; install.sh refuses an existing one),
+#   BUILD_PIN + MEGALON_BUILD_N (optional, set together): both lmdb build manifests must name source_commit=BUILD_PIN
+#     dirty_files=0, MEG_BUILD must be on builds/megalon/MEGALON_BUILD_N, and the loadgen manifest must name BUILD_PIN
 set -uo pipefail
 export PYTHONDONTWRITEBYTECODE=1  # never write __pycache__ (harness snapshots live in recovery/); every python3 call also has -B
 E=$1
@@ -16,7 +22,18 @@ P=/home/comsys/sungsu/destijl-control X=$P/CXL_SWMC/experiments/lmdb G=$P/CXL_SW
 : "${EXPECT_K:?EXPECT_K = guest kernel release}" "${IMG:?IMG = Host image dir to create (G0)}"
 [ "${POPCORN:-0}" = 0 ] || : "${C8:?}" "${K8:?}" "${GT8:?}" "${RECV_MODE:?}"
 [ "${POPCORN:-0}" = 0 ] || [ "$EXPECT_K" = "$K8" ] || { echo "BLOCK STOP: POPCORN=1 needs EXPECT_K = K8 (the Popcorn release)"; exit 2; }
-OWNER=LMDB-F1-v1 L=/home/comsys/lmdb R=1000000 MAXP=600000
+OWNER=LMDB-F1-v1 L=${LMDB_GUEST_DIR:-/home/comsys/lmdb} R=1000000 MAXP=600000
+: "${PRETOUCH_DIR:?PRETOUCH_DIR = ENV-pretouch evidence dir of the current QEMU lifetime (standing pretouch rule)}"
+case "$L" in /home/comsys/?*) ;; *) echo "BLOCK STOP: LMDB_GUEST_DIR must be under /home/comsys/"; exit 2;; esac
+if [ -n "${BUILD_PIN:-}" ]; then
+  : "${MEGALON_BUILD_N:?MEGALON_BUILD_N with BUILD_PIN}"
+  BP0=${PLAIN_BUILD:-$P/builds/lmdb/7} BM0=${MEG_BUILD:-$P/builds/lmdb-megalon/7} BL0=${LOADGEN_BUILD:-$P/builds/lmdb-loadgen/6}
+  grep -q "^source_commit=$BUILD_PIN dirty_files=0$" "$BP0/manifest.txt" && grep -q "^source_commit=$BUILD_PIN dirty_files=0$" "$BM0/manifest.txt" \
+    && grep -q "^megalon_build=$P/builds/megalon/$MEGALON_BUILD_N$" "$BM0/manifest.txt" \
+    && grep -q " cxl_swmc_commit=$BUILD_PIN lmdb_dirty=0$" "$BL0/manifest.txt" \
+    && grep -q "^sha256 $(sha256sum "$BL0/loadgen" | cut -d' ' -f1)  " "$BL0/manifest.txt" \
+    || { echo "BLOCK STOP: builds $BP0 $BM0 $BL0 are not clean builds of $BUILD_PIN on builds/megalon/$MEGALON_BUILD_N"; exit 2; }
+fi
 SSH="ssh -o BatchMode=yes -o ConnectTimeout=8"
 IPS=(192.168.122.100 192.168.122.101)
 [ -d "$E" ] && [ -z "$(ls -A "$E" | grep -vE '^(tasks-check\.txt|block\.out)$')" ] || { echo "BLOCK STOP: $E missing or not empty"; exit 2; }
@@ -80,6 +97,8 @@ trap finish EXIT
 stop() { echo "$(date -Is) BLOCK STOP $*" | tee -a "$E/block.log"; exit 1; }
 step() { echo "$(date -Is) == $*" | tee -a "$E/block.log"; }
 
+step "PT pretouch check (start)"
+bash $P/CXL_SWMC/experiments/kv/pretouch-check.sh "$PRETOUCH_DIR" "$E/pretouch-check-start.txt" >> "$E/block.log" 2>&1 || stop "pretouch check (start), see pretouch-check-start.txt"
 step "G0 image (Host, under the lock, after the owner check)"
 [ -e "$IMG" ] && stop "image dir $IMG exists"
 nice -n 19 numactl --cpunodebind=1 --membind=1 ${PLAIN_BUILD:-$P/builds/lmdb/7}/bin/lmdb-image --out "$IMG" --records $R 2> "$E/image.log" || stop "image"
@@ -88,7 +107,7 @@ tail -n 2 "$E/image.log" >> "$E/block.log"
 step "H0 Host gate (after the image build)"
 bash $G check "$E/gate-H0.txt" || stop "host gate"
 step "G1 install"
-IMG=$IMG bash $X/install.sh "$E/install.log" > "$E/install.out" 2>&1 || stop "install"
+IMG=$IMG L=$L bash $X/install.sh "$E/install.log" > "$E/install.out" 2>&1 || stop "install"
 grep -q "^ldd_not_found=0$" "$E/install.log" && [ "$(grep -c '^ldd_not_found=0$' "$E/install.log")" = 2 ] || stop "install: ldd"
 BP=${PLAIN_BUILD:-$P/builds/lmdb/7} BM=${MEG_BUILD:-$P/builds/lmdb-megalon/7}
 want="$(sha256sum < $BP/bin/lmdb-server | cut -c1-64) $(sha256sum < $BM/bin/lmdb-server | cut -c1-64) $(sha256sum < $BM/lib/libmegalon-objapi.so | cut -c1-64) $(sha256sum < $BM/lib/libmegalon.so | cut -c1-64) $(sha256sum < $P/CXL_SWMC/config/cxl_region.yaml | cut -c1-64) $(sha256sum < $E/install.log.megalon.yaml | cut -c1-64)"
@@ -101,7 +120,7 @@ want_img="$(sha256sum < $IMG/pages.bin | cut -c1-64)"
 step "G2 pre-check"
 for i in 0 1; do
   ip=${IPS[$i]}
-  $SSH comsys@$ip "EXPECT_K=$EXPECT_K INSTALL_FILES='lmdb/plain/bin/lmdb-server lmdb/megalon/bin/lmdb-server lmdb/megalon/lib/libmegalon-objapi.so' bash -s" \
+  $SSH comsys@$ip "EXPECT_K=$EXPECT_K INSTALL_FILES='${L#/home/comsys/}/plain/bin/lmdb-server ${L#/home/comsys/}/megalon/bin/lmdb-server ${L#/home/comsys/}/megalon/lib/libmegalon-objapi.so' bash -s" \
     < $P/CXL_SWMC/experiments/kv/precheck.sh > "$E/precheck-vm$i.txt" 2>&1
   grep -q "PRECHECK PASS" "$E/precheck-vm$i.txt" || stop "precheck vm$i"
   $SSH comsys@$ip 'echo lmdb_procs=$(pgrep -c -x lmdb-server)/$(pgrep -c -x lmdb-stress); dmesg | tail -n 5' < /dev/null >> "$E/precheck-vm$i.txt" 2>&1
@@ -172,4 +191,6 @@ if [ "${POPCORN:-0}" = 1 ]; then  # Part P: dax0.0 back to root:root 600 (p-popc
   run pop-u50-func SYS=Popcorn UPDATE_RATIO=0.5 LOG=1 "${PL[@]}" "${PP[@]}"
   run pop-u80-func SYS=Popcorn UPDATE_RATIO=0.8 "${PL[@]}" "${PP[@]}"
 fi
+step "PT pretouch check (end)"
+bash $P/CXL_SWMC/experiments/kv/pretouch-check.sh "$PRETOUCH_DIR" "$E/pretouch-check-end.txt" >> "$E/block.log" 2>&1 || stop "pretouch check (end), see pretouch-check-end.txt"
 step "BLOCK DONE"
