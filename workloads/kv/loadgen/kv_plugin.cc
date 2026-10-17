@@ -14,7 +14,12 @@
 //   the floor only advances on such quiet puts.
 // Options: keys=N (required, = kv-server --keys), dist=zipf|uniform (zipf), theta=0.99 (only 0.99: the artifact's
 //          constants), batch=1 (1..64), put_ratio=0.05 (mixed stream), seed=N (20261016), check=1 (0: no value
-//          check), inflight=N (ring slots for outstanding requests per stream, default 4M / batch).
+//          check), inflight=N (ring slots for outstanding requests per stream, default 4M / batch),
+//          state_in=FILE / state_out=FILE: carry the per-key check state (made / acked / floor) across loadgen invocations
+//          against the SAME server lifetime (H1 multi-part lifetimes: an slo part, then a fix part). state_out is written
+//          at finish (also when the run fails its checks); state_in is read at init and must match keys (else init fails).
+//          Without state_in a second invocation restarts the version counts at 0 and the stored values look "future"
+//          (host_test.sh NEG=1). File: "KVSTATE1", keys (u64), then made[keys], acked[keys], floor[keys] (u32 each).
 // Output: <out>/kv.txt (counts). finish() fails the run on any check error or miss.
 #include <atomic>
 #include <cmath>
@@ -83,7 +88,8 @@ class Kv : public loadgen::Workload {
     };
     for (auto &kvp : o)
       if (kvp.first != "keys" && kvp.first != "dist" && kvp.first != "theta" && kvp.first != "batch" &&
-          kvp.first != "seed" && kvp.first != "check" && kvp.first != "inflight" && kvp.first != "put_ratio")
+          kvp.first != "seed" && kvp.first != "check" && kvp.first != "inflight" && kvp.first != "put_ratio" &&
+          kvp.first != "state_in" && kvp.first != "state_out")
         return *err = "kv: unknown option " + kvp.first, false;
     keys_ = std::stoull(get("keys", "0"));
     dist_ = get("dist", "zipf");
@@ -93,6 +99,8 @@ class Kv : public loadgen::Workload {
     check_ = get("check", "1") != "0";
     inflight_ = std::stoull(get("inflight", std::to_string((4u << 20) / std::max(1u, batch_))));
     put_ratio_ = std::stod(get("put_ratio", "0.05"));
+    state_in_ = get("state_in", "");
+    state_out_ = get("state_out", "");
     if (!(put_ratio_ >= 0.0 && put_ratio_ <= 1.0)) return *err = "kv: put_ratio 0..1", false;
     if (keys_ < 2) return *err = "kv: keys=N (>= 2) required", false;
     if (dist_ != "zipf" && dist_ != "uniform") return *err = "kv: dist=zipf|uniform", false;
@@ -108,6 +116,7 @@ class Kv : public loadgen::Workload {
     made_.reset(new uint32_t[keys_]());
     acked_.reset(new uint32_t[keys_]());
     floor_.reset(new uint32_t[keys_]());
+    if (!state_in_.empty() && !load_state(err)) return false;
     for (int s = 0; s < 3; s++) {
       rkind_[s].reset(new uint8_t[inflight_ * batch_]());  // 1 = put
       ring_[s].reset(new Slot[inflight_]);
@@ -286,7 +295,10 @@ class Kv : public loadgen::Workload {
   }
 
   bool finish(const std::string &out_dir, std::string *err) override {
-    std::string t = counts();
+    std::string serr;
+    const bool sok = state_out_.empty() || save_state(&serr);
+    std::string t = counts() + "state_in=" + (state_in_.empty() ? "-" : state_in_) + "\nstate_out=" +
+                    (state_out_.empty() ? "-" : state_out_) + "\nstate_out_ok=" + (sok ? "1" : "0") + "\n";
     if (FILE *f = std::fopen((out_dir + "/kv.txt").c_str(), "w")) {
       std::fputs(t.c_str(), f);
       std::fclose(f);
@@ -295,6 +307,10 @@ class Kv : public loadgen::Workload {
     const uint64_t errors = torn_ + wrong_key_ + bad_writer_ + future_ + stale_ + misses_ + get_err_ + put_err_ + overflow_;
     if (errors) {
       *err = "kv value check: " + std::to_string(errors) + " errors (see kv.txt)";
+      return false;
+    }
+    if (!sok) {
+      *err = "kv state_out: " + serr;
       return false;
     }
     return true;
@@ -307,6 +323,32 @@ class Kv : public loadgen::Workload {
   }
 
  private:
+  static constexpr char kStateMagic[8] = {'K', 'V', 'S', 'T', 'A', 'T', 'E', '1'};
+  bool load_state(std::string *err) {
+    FILE *f = std::fopen(state_in_.c_str(), "rb");
+    if (!f) return *err = "kv: state_in " + state_in_ + ": cannot open", false;
+    char m[8];
+    uint64_t k = 0;
+    bool ok = std::fread(m, 1, 8, f) == 8 && std::memcmp(m, kStateMagic, 8) == 0 && std::fread(&k, 8, 1, f) == 1 && k == keys_;
+    for (uint32_t *a : {made_.get(), acked_.get(), floor_.get()})
+      ok = ok && std::fread(a, sizeof(uint32_t), keys_, f) == keys_;
+    ok = ok && std::fgetc(f) == EOF;
+    std::fclose(f);
+    if (!ok) return *err = "kv: state_in " + state_in_ + ": bad magic, key count or size (keys " + std::to_string(keys_) + ")", false;
+    return true;
+  }
+  bool save_state(std::string *err) const {
+    const std::string tmp = state_out_ + ".tmp";
+    FILE *f = std::fopen(tmp.c_str(), "wb");
+    if (!f) return *err = "cannot open " + tmp, false;
+    bool ok = std::fwrite(kStateMagic, 1, 8, f) == 8 && std::fwrite(&keys_, 8, 1, f) == 1;
+    for (const uint32_t *a : {made_.get(), acked_.get(), floor_.get()})
+      ok = ok && std::fwrite(a, sizeof(uint32_t), keys_, f) == keys_;
+    ok = (std::fclose(f) == 0) && ok;
+    if (!ok || std::rename(tmp.c_str(), state_out_.c_str()) != 0) return *err = "write " + state_out_ + " failed", false;
+    return true;
+  }
+
   uint64_t next_key(uint32_t stream) {
     if (dist_ == "zipf") return gen_[stream]->next();
     return std::uniform_int_distribution<uint64_t>(0, keys_ - 1)(uni_rng_);
@@ -337,6 +379,7 @@ class Kv : public loadgen::Workload {
   double theta_ = 0.99;
   uint32_t batch_ = 1, targets_ = 1;
   bool check_ = true;
+  std::string state_in_, state_out_;
   std::unique_ptr<ScrambledZipf> gen_[3];
   double put_ratio_ = 0.05;
   std::mt19937_64 kind_rng_;

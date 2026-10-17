@@ -9,7 +9,9 @@
 # c_supported = 0. EXPECT_COH=1 requires c_supported = 1 (a v2 shim with thread_coh) and reports the KNOWN GAP when C = 0
 # for every op (Megalon <= 72 does not time the KV Put/Get path); EXPECT_COH=2 (from Megalon 73) also requires C > 0.
 # usage: host_test.sh <kv build dir> <loadgen build dir> <work dir (new)> [plain|megalon]
-# env: KEYS (1000000), MIX (mixed=1; or get=..,put=..), PUT_RATIO (0.5, mixed stream), RATES (2000,5000 requests/s), BATCH (32), STEP_S (5), THREADS (6), LOADER (node0),
+# env: TWO_PART (0; 1: a second loadgen on the same servers with --opt state_in= the first's state_out; it must pass
+#      with future=0, stale=0 and both workload_finish ok: H1 multi-part lifetimes), PUT_RATIO2 / RATES2 (its mix / rates),
+#      KEYS (1000000), MIX (mixed=1; or get=..,put=..), PUT_RATIO (0.5, mixed stream), RATES (2000,5000 requests/s), BATCH (32), STEP_S (5), THREADS (6), LOADER (node0),
 #      TRACE (0), LG_ARGS (loadgen mode args, default --mode fixed --rates $RATES), NEG (0: 1 = second generator run that must fail the value check), PORT (27300), CPUS0/CPUS1/CPUSL, KEEP_IMG (0),
 #      NR_LOG_SIZE (Megalon nr_log_size, e.g. 1MB: the shared NR log wraps every 8192 entries), STUCK_MS (stuck_timeout_ms)
 set -euo pipefail
@@ -69,8 +71,22 @@ grep -h "kv-server: \(loaded\|warm-up\|slot scan\)\|SCR footprint\|SCR used" "$W
 set +e
 numactl --physcpubind="$CPUSL" --membind=1 "$LG/loadgen" --workload kv --target 127.0.0.1:$PORT,127.0.0.1:$((PORT + 1)) \
   --out "$WD/lg" --opt keys="$KEYS" --opt batch="$BATCH" --opt put_ratio="$PUT_RATIO" --mix "$MIX" ${LG_ARGS:---mode fixed --rates $RATES} \
-  --warmup-s 2 --step-warmup-s 1 --step-measure-s "${STEP_S:-5}" --drain-s 5 --stats-op 10 > "$WD/loadgen.log" 2>&1
+  --warmup-s 2 --step-warmup-s 1 --step-measure-s "${STEP_S:-5}" --drain-s 5 --stats-op 10 $([ "${TWO_PART:-0}" = 1 ] && echo "--opt state_out=$WD/kvstate.bin") > "$WD/loadgen.log" 2>&1
 LGRC=$?
+TWORC=skip
+if [ "${TWO_PART:-0}" = 1 ]; then  # H1 multi-part lifetime: a second loadgen against the SAME servers continues the
+  # per-key check state of the first (state_in); without it every stored value would look "future" (see NEG)
+  TWORC=0
+  [ "$(stat -c %s "$WD/kvstate.bin" 2>/dev/null)" = $((16 + 12 * KEYS)) ] || { echo "two-part: state file size $(stat -c %s "$WD/kvstate.bin" 2>/dev/null) != $((16 + 12 * KEYS))"; TWORC=1; }
+  numactl --physcpubind="$CPUSL" --membind=1 "$LG/loadgen" --workload kv --target 127.0.0.1:$PORT,127.0.0.1:$((PORT + 1)) \
+    --out "$WD/lg2" --opt keys="$KEYS" --opt batch="$BATCH" --opt put_ratio="${PUT_RATIO2:-$PUT_RATIO}" --mix "$MIX" --mode fixed --rates "${RATES2:-1000,2000}" \
+    --warmup-s 2 --step-warmup-s 1 --step-measure-s 3 --drain-s 3 --stats-op 10 --seed 7 --opt seed=7 \
+    --opt state_in="$WD/kvstate.bin" > "$WD/loadgen2.log" 2>&1 || TWORC=1
+  grep -q '"workload_finish":"ok"' "$WD/lg2/summary.json" 2>/dev/null || TWORC=1
+  grep -q '"workload_finish":"ok"' "$WD/lg/summary.json" 2>/dev/null || TWORC=1
+  grep -q "^future=0$" "$WD/lg2/kv.txt" && grep -q "^stale=0$" "$WD/lg2/kv.txt" && grep -q "^checked=[1-9]" "$WD/lg2/kv.txt" || TWORC=1
+  echo "two-part: rc=$TWORC part2 $(grep -E '^(gets|puts|checked|future|stale|state_in)=' "$WD/lg2/kv.txt" 2>/dev/null | tr '\n' ' ')"
+fi
 NEGRC=skip
 if [ "${NEG:-0}" = 1 ]; then  # negative check: a second generator restarts its version counts at 0, so the values the
   # first one stored look "newer than any put made" -> the value check must fail the run
@@ -127,6 +143,7 @@ for k in 0 1; do  # every executed op counted once in the split (clean-stop stat
   [ "$(s $k opt.get.ops)" = "$(s $k gets)" ] && [ "$(s $k opt.put.ops)" = "$(s $k puts)" ] \
     || { echo "node$k: opt.get.ops=$(s $k opt.get.ops) gets=$(s $k gets) opt.put.ops=$(s $k opt.put.ops) puts=$(s $k puts)"; FAIL=1; }
 done
+[ "$TWORC" = skip ] || [ "$TWORC" = 0 ] || { echo "two-part check failed"; FAIL=1; }
 if [ "$NEGRC" != skip ]; then
   echo "negative check: loadgen rc=$NEGRC future=$(sed -n 's/^future=//p' "$WD/lg-neg/kv.txt")"
   [ "$NEGRC" != 0 ] && [ "$(sed -n 's/^future=//p' "$WD/lg-neg/kv.txt")" -gt 0 ] || { echo "negative check did not fail"; FAIL=1; }
