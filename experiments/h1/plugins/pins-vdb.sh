@@ -1,8 +1,8 @@
 # H1 plugin: vector DB (HNSW 28M, pubmed-a27m-b1m-q10k; reports/VDB-V1-packet.md v1.3.1 blocks, validation PASS
 # 2026-10-17 §17). all-HWcc = plain server (no Megalon; MOT1 v6 §3.1), Popcorn = plain server + cxl_shm
 # (init_state=shared + preload, recv_mode poll), Megalon = vdb-megalon on Megalon 77 (packed4, 32 MiB vector chunk
-# object), mgoff = the same with MEGALON_COH_TIMERS=0. H1-HOOK v2 (CXL_SWMC 9a802a6f3). FILL_vdb_loadgen6_*: loadgen with the
-# w_start plugin option (vdb-loadgen/6, not built yet: Host build hold); hook.sh refuses this plugin until they are filled.
+# object), mgoff = the same with MEGALON_COH_TIMERS=0. H1-HOOK v2 (CXL_SWMC 9a802a6f3, 935e487ab). Loadgen = vdb-loadgen/6
+# (w_start plugin option; built 2026-10-18 from 0dcf987bc, plugin provenance in vdb-manifest.txt).
 . "$(dirname "${BASH_SOURCE[0]}")/pins-common.inc"
 HR=$P/CXL_SWMC                      # live tree; v6-block.sh uses $P/CXL_SWMC/experiments/vectordb itself. Every file it
                                     # runs is hash-pinned below (hook: see the v6-block.sh pin; builds vdb/15, vdb-megalon/14 from 934fa9312)
@@ -19,8 +19,9 @@ f17c8995c1b2c88f3849b6aec890c848fafe99bb40298cbf4412999858bc59d1  $P/builds/vdb/
 5f1ff99101da18cd7f05d55c77444ea7a7cf94030e17bcf24050e0ebe12c0dbc  $P/builds/vdb-megalon/14/bin/vdb-server
 8c59d1808ec569f54a05531610e3b9d18ae4563f9ebb5c264a657bd1edf3a3ac  $P/builds/vdb-megalon/14/lib/libmegalon-objapi.so
 f9c1753f3bef2ab0941153058860227145f2d7b7e33a210bdc3338fad14eacda  $P/builds/vdb-megalon/14/lib/libmegalon.so
-FILL_vdb_loadgen6_manifest_sha256  $P/builds/vdb-loadgen/6/manifest.txt
-FILL_vdb_loadgen6_loadgen_sha256  $P/builds/vdb-loadgen/6/loadgen
+35aba4624362528cad6e4177074328ab200f8c23fd526704d8fe4be9727d7404  $P/builds/vdb-loadgen/6/manifest.txt
+d870c74bb5880b7b3d46987baf0437a22572432726b42ab0f3daf36e7a1f1852  $P/builds/vdb-loadgen/6/loadgen
+8bcc4e8667b53c2a084b4d9cc191838dc32e52fe79656bbcc7f75733f4944972  $P/builds/vdb-loadgen/6/vdb-manifest.txt
 e9d4942ee33b2f65cf7117d87942296e1365d0234873c2c4159545f40708db54  $P/workspaces/vdb-data/seg32-c32m-a27m-m16-efc128-b1/SHA256SUMS
 4e4e7134710f9b131368d7b3f71c07ab56d97e72ad329649bda27f893f6d65be  $HR/systems/megalon/vectordb-2vm.yaml
 eeb6b23f173d85a3c86ade0fb804b363e3c84a36bf9c0f56a7cbcab25e738b53  $HR/config/cxl_region.yaml

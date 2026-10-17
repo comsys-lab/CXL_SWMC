@@ -13,6 +13,10 @@
 #      the environment selects the fake Popcorn source). At the end the HWcc trace lines are read from the device file:
 #      wsec must stay 0 with TRACE=0 or with the plain backend, objseq (unused since vdb build 10) always 0. With
 #      BACKEND=megalon TRACE=1 the trace is classified (tools/classify_sharing.py -> <scratch>/sharing.csv).
+#      PARTS2=1 (H1-HOOK v2 check): two loadgen invocations in ONE server lifetime: part "slo" (fixed mode at RATES,
+#      stand-in for the SLO search) then part "fix" (--warmup-s SETTLE_S [3] settle, then RATES2 [default RATES]) with
+#      --opt w_start = the slo part's next_w and seeds SEED / SEED+1; outputs <scratch>/<part>/loadgen; opcoh_check per
+#      part with OPCOH_PARTS (closure over both parts); E1 check per part.
 set -euo pipefail
 B=$(cd "$1" && pwd) LG=$2 D=$(cd "$3" && pwd) S=$4
 HERE=$(cd "$(dirname "$0")" && pwd); ROOT=$(cd "$HERE/../../.." && pwd)
@@ -46,17 +50,39 @@ for k in 0 1; do
   grep -q "vdb-server: READY" "$S/node$k.log" || { echo "node$k not READY"; exit 1; }
 done
 set +e
+if [ "${PARTS2:-0}" = 1 ]; then
+  SEED=${SEED:-20261018} LGRC=0
+  mkdir "$S/slo" "$S/fix"  # loadgen creates only the last --out component
+  taskset -c "$CPUS" "$LG" --workload vectordb --target 127.0.0.1:19300,127.0.0.1:19301 --out "$S/slo/loadgen" --stats-op 10 \
+    --opt data="$D" --opt writes="$D/writes.bin" --mode fixed --rates "$RATES" --mix "$MIX" --warmup-s 2 \
+    --step-warmup-s 1 --step-measure-s 5 --drain-s 2 --raw --opt seed=$SEED --seed $SEED --opt w_start=0 > "$S/slo.loadgen.log" 2>&1 || LGRC=1
+  WS=$(sed -n 's/^next_w=//p' "$S/slo/loadgen/vectordb.txt")
+  grep -qx "write_errors=0" "$S/slo/loadgen/vectordb.txt" && [ -n "$WS" ] || LGRC=1
+  taskset -c "$CPUS" "$LG" --workload vectordb --target 127.0.0.1:19300,127.0.0.1:19301 --out "$S/fix/loadgen" --stats-op 10 \
+    --opt data="$D" --opt writes="$D/writes.bin" --mode fixed --rates "${RATES2:-$RATES}" --mix "$MIX" --warmup-s "${SETTLE_S:-3}" \
+    --step-warmup-s 1 --step-measure-s 5 --drain-s 2 --raw --opt seed=$((SEED + 1)) --seed $((SEED + 1)) --opt w_start=$WS > "$S/fix.loadgen.log" 2>&1 || LGRC=1
+  echo "parts: slo next_w=$WS; fix $(grep -h '^w_start=\|^next_w=\|^updates_made=' "$S/fix/loadgen/vectordb.txt" | tr '\n' ' ')"
+else
 taskset -c "$CPUS" "$LG" --workload vectordb --target 127.0.0.1:19300,127.0.0.1:19301 --out "$S/loadgen" --stats-op 10 \
   --opt data="$D" --opt writes="$D/writes.bin" --mode fixed --rates "$RATES" --mix "$MIX" --warmup-s 2 \
   --step-warmup-s 1 --step-measure-s 5 --drain-s 2 --raw > "$S/loadgen.log" 2>&1
 LGRC=$?
+fi
 set -e
 for p in "${PIDS[@]}"; do kill -TERM "$p"; done
 wait || true
 PIDS=()
+if [ "${PARTS2:-0}" = 1 ]; then
+  for p in slo fix; do
+    python3 "$ROOT/experiments/loadgen/stats_delta.py" "$S/$p/loadgen" --out "$S/$p/stats-steps.csv"
+    python3 "$ROOT/experiments/loadgen/export_csv.py" --out "$S/$p/steps.csv" "$S/$p/loadgen=host-smoke-$p"
+  done
+  echo "loadgen rc=$LGRC"; cat "$S/slo/loadgen/vectordb.txt" "$S/fix/loadgen/vectordb.txt"
+else
 python3 "$ROOT/experiments/loadgen/stats_delta.py" "$S/loadgen" --out "$S/stats-steps.csv"
 python3 "$ROOT/experiments/loadgen/export_csv.py" --out "$S/steps.csv" "$S/loadgen=host-smoke"
 echo "loadgen rc=$LGRC"; cat "$S/loadgen/vectordb.txt"
+fi
 for k in 0 1; do sed -n '/vdb-server: stopping/,$p' "$S/node$k.log" | grep -E "^(node|P|elements|updates|inserts|deletes|searches|timeouts|bad_records)=" | tr '\n' ' '; echo; done
 # HWcc trace lines in the device file (offsets from the server log)
 python3 - "$S" "$BACKEND" "$TRACE" <<'PY'
@@ -76,5 +102,12 @@ if [ "$BACKEND" = megalon ] && [ "$TRACE" = 1 ]; then
   python3 "$HERE/../tools/classify_sharing.py" "$S" || RC=1
   grep -h "^trace\." "$S"/node*.log | sort | uniq -c | sed -n '1,12p'
 fi
-if [ -n "${OPCOH:-}" ]; then python3 "$HERE/opcoh_check.py" "$S" "$OPCOH" || RC=1; fi
+if [ "${PARTS2:-0}" = 1 ]; then
+  NA=$(python3 -c "import numpy as np,sys; print(np.fromfile(sys.argv[1],dtype=np.int32,count=1)[0])" "$D/pool_a.fbin")
+  for p in slo fix; do
+    [ -z "${OPCOH:-}" ] || OPCOH_PARTS="$S/slo $S/fix" python3 "$HERE/opcoh_check.py" "$S/$p" "$OPCOH" | sed "s/^/[$p] /" || RC=1
+    python3 "$ROOT/experiments/vectordb/e1_check.py" --writes "$D/writes.bin" --na $NA --nb $NB --searches "$S/$p/loadgen/searches.bin" \
+      --out "$S/$p/e1" > /dev/null && echo "[$p] E1 PASS ($(head -n 1 $S/$p/e1.e1.txt))" || { echo "[$p] E1 FAIL"; RC=1; }
+  done
+elif [ -n "${OPCOH:-}" ]; then python3 "$HERE/opcoh_check.py" "$S" "$OPCOH" || RC=1; fi
 exit $RC
