@@ -41,6 +41,7 @@ L=$LMDB_GUEST_DIR
 [ "$H1_PARENT_LOCK" = H1-main ] || { echo "SEQUENCE STOP: H1_PARENT_LOCK must be H1-main"; exit 2; }
 [[ $H1_N =~ ^[1-9]$ ]] && [[ $H1_SEED =~ ^[0-9]+$ ]] || { echo "SEQUENCE STOP: H1_N / H1_SEED"; exit 2; }
 [[ $H1_SETTLE_S =~ ^[1-9][0-9]*$ ]] || { echo "SEQUENCE STOP: H1_SETTLE_S"; exit 2; }
+[ "${H1_MEASURE_RUN:-0}" = 1 ] || { echo "SEQUENCE STOP: H1 needs H1_MEASURE_RUN=1 (README item 8: h1 gate + measure.slice launcher)"; exit 2; }
 case $H1MODE in r1) : "${H1_LEVELS_CMD:?r1 needs H1_LEVELS_CMD}";; cont) [ -f "${H1_LEVELS:-}" ] || { echo "SEQUENCE STOP: no H1_LEVELS"; exit 2; };;
   *) echo "SEQUENCE STOP: bad H1MODE (r1|cont)"; exit 2;; esac
 for spec in $H1_MIXES; do [[ $spec =~ ^u(5|50|80)=UPDATE_RATIO=0\.(05|5|8)$ ]] || { echo "SEQUENCE STOP: bad mix spec $spec"; exit 2; }; done

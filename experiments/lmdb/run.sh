@@ -144,6 +144,10 @@ else  # H1-HOOK v2: several loadgen parts in this one server lifetime (see the h
   LG=0
   for part in $PARTS; do
     mkdir -p "$RUN/$part"
+    if [ "${H1_MEASURE_RUN:-0}" = 1 ] && [ "$part" != "${PARTS%% *}" ]; then  # H1: gate before every later part too
+      bash "$ROOT/experiments/h1/h1-gate.sh" check "$RUN/$part/gate.txt" \
+        || { echo "run $NAME: h1 gate before part $part failed"; echo "part=$part gate_failed" >> "$RUN/manifest.txt"; stop_nodes; collect; exit 1; }
+    fi
     if ! bash "$PART_ARGS_CMD" "$part" "$RUN" > "$RUN/$part/args.txt" 2> "$RUN/$part/args.err"; then
       echo "run $NAME: part $part args failed: $(tail -n 2 "$RUN/$part/args.err" | tr '\n' ' ')"
       echo "part=$part args_failed $(date -Is)" >> "$RUN/manifest.txt"

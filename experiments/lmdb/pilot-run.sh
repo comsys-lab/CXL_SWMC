@@ -64,7 +64,8 @@ esac
 [ -z "${COH_TIMERS:-}" ] || export NODE_ENV="ENV:MEGALON_COH_TIMERS=$COH_TIMERS"
 SLO_ARG=mixed:99:1; [[ $KIND =~ ^(fix|fix2|ladder)$ ]] && SLO_ARG=mixed:99:600000
 SLOA=(--slo "$SLO_ARG"); [ "$KIND" = h1life ] && SLOA=()  # h1life: each part sets its own SLO arg  # fix, ladder: no SLO abort (judged after)
-LG=(--opt records=$RECORDS --opt update_ratio=$UPDATE_RATIO --opt seed=$SEED --opt log=$LOG --seed "$SEED" --mix mixed=1
+SEEDA=(--opt seed=$SEED --seed "$SEED"); [ "$KIND" = h1life ] && SEEDA=()  # h1life: per part (slo SEED, fix SEED+1)
+LG=(--opt records=$RECORDS --opt update_ratio=$UPDATE_RATIO "${SEEDA[@]}" --opt log=$LOG --mix mixed=1
     "${SLOA[@]}" --x-stream mixed)
 case "$KIND" in
   functional) LG+=(--mode fixed --rates ${RATES:-200,1000} --warmup-s 10 --step-warmup-s 5 --step-measure-s 30 --drain-s 10);;
@@ -88,13 +89,13 @@ case "$KIND" in
       echo 'set -uo pipefail'
       echo 'RD=$2'
       echo 'case $1 in'
-      echo "  slo) printf '%s\\n' --slo mixed:99:1 --raw --mode slo --start 500 --factor 1.5 --precision 0.05 --max-steps 25 --warmup-s 10 --step-warmup-s 3 --step-measure-s 15 --drain-s 5 --confirm-s 30 --confirm-reps 3 --fill 0.7,0.8,0.9 --overload 1.05,1.1,1.2;;"
+      echo "  slo) printf '%s\\n' --slo mixed:99:1 --raw --mode slo --start 500 --factor 1.5 --precision 0.05 --max-steps 25 --warmup-s 10 --step-warmup-s 3 --step-measure-s 15 --drain-s 5 --confirm-s 30 --confirm-reps 3 --fill 0.7,0.8,0.9 --overload 1.05,1.1,1.2 --opt seed=$SEED --seed $SEED;;"
       echo "  fix) R='${RATES:-}'"
       echo "       if [ -z \"\$R\" ]; then o=\$(${FIX_RATES_CMD:-false}) || { echo \"levels callback failed (rc \$?)\" >&2; exit 1; }"
       echo "         set -- \$o; [ \$# = 2 ] || { echo \"levels callback output '\$o'\" >&2; exit 1; }; R=\$1,\$2; fi"
       echo "       [[ \$R =~ ^[1-9][0-9]*,[1-9][0-9]*\$ ]] || { echo \"bad fix rates '\$R' (integers <L2>,<L1>)\" >&2; exit 1; }"
       echo "       echo \"\$R\" > \"\$RD/fix/rates.txt\""
-      echo "       printf '%s\\n' --slo mixed:99:600000 --raw --mode fixed --rates \"\$R\" --warmup-s $H1_SETTLE_S --step-warmup-s 5 --step-measure-s 30 --drain-s 10;;"
+      echo "       printf '%s\\n' --slo mixed:99:600000 --raw --mode fixed --rates \"\$R\" --warmup-s $H1_SETTLE_S --step-warmup-s 5 --step-measure-s 30 --drain-s 10 --opt seed=$((SEED + 1)) --seed $((SEED + 1));;"
       echo '  *) echo "bad part $1" >&2; exit 2;;'
       echo 'esac'; } > "$PARTS_SH"
     export PARTS="$H1_PARTS" PART_ARGS_CMD="$PARTS_SH";;
@@ -174,7 +175,9 @@ if [ "$KIND" = h1life ]; then  # H1-HOOK v2: checks per part of this one lifetim
     prc=$(sed -n "s/^part=$part end=.* loadgen_rc=//p" $R/manifest.txt | tail -n 1)
     if [ $part = slo ]; then
       note=$(python3 -B -c 'import json,sys; print(json.load(open(sys.argv[1])).get("note",""))' $PD/loadgen/summary.json 2>/dev/null)
-      if [ "$prc" != 0 ]; then [ -n "$note" ] || stop "slo part loadgen rc $prc"; NOTES+=("slo: $note"); fi
+      if [ "$prc" != 0 ]; then  # only the loadgen "confirm failed at three rates" note is a NOTE (dec Q4); any other = STOP
+        [[ "$note" == *"confirm failed at three rates"* ]] || stop "slo part loadgen rc $prc (note '$note')"; NOTES+=("slo: $note")
+      fi
     else
       [ "$prc" = 0 ] || stop "fix part loadgen rc $prc"
       python3 -B - $PD/loadgen/steps.jsonl > $PD/ladder-result.txt <<'EOP' || stop "fix part steps"

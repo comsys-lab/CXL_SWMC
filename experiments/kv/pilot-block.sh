@@ -50,9 +50,17 @@ VP=${VM_PLAIN:-/home/comsys/kv3} VM=${VM_MEG:-/home/comsys/kvm3}
 BP=${PLAIN_BUILD:-$P/builds/kv/3} BM=${MEG_BUILD:-$P/builds/kv-megalon/3} BL=${LOADGEN_BUILD:-$P/builds/kv-loadgen/3}
 : "${PIN:?PIN = harness commit}"
 BPIN=${BUILD_PIN:-$PIN}
-[ "$BPIN" = "$PIN" ] || git -C $P/CXL_SWMC diff --quiet "$BPIN" "$PIN" -- workloads/kv/server workloads/kv/loadgen workloads/kv/proto.h \
-  systems/common systems/megalon/shim/megalon_objapi.h systems/popcorn_new/include/swmc_acct.h experiments/loadgen/loadgen.cc experiments/loadgen/workload.h experiments/loadgen/frame.h \
+# LOADGEN_PIN (optional; default BUILD_PIN): commit of the loadgen build when it was rebuilt later than the servers (H1:
+#   kv-loadgen/11 with the state_in/state_out plugin); the server sources are compared BUILD_PIN..PIN, the loadgen sources
+#   LOADGEN_PIN..PIN, and the loadgen kv-manifest must name LOADGEN_PIN
+LPIN=${LOADGEN_PIN:-$BPIN}
+[ "$BPIN" = "$PIN" ] || git -C $P/CXL_SWMC diff --quiet "$BPIN" "$PIN" -- workloads/kv/server workloads/kv/proto.h \
+  systems/common systems/megalon/shim/megalon_objapi.h systems/popcorn_new/include/swmc_acct.h experiments/loadgen/frame.h \
+  $([ "$LPIN" = "$BPIN" ] && echo workloads/kv/loadgen experiments/loadgen/loadgen.cc experiments/loadgen/workload.h) \
   || { echo "SEQUENCE STOP: server/loadgen sources differ between BUILD_PIN $BPIN and PIN $PIN"; exit 2; }
+[ "$LPIN" = "$BPIN" ] || [ "$LPIN" = "$PIN" ] || git -C $P/CXL_SWMC diff --quiet "$LPIN" "$PIN" -- workloads/kv/loadgen workloads/kv/proto.h \
+  experiments/loadgen/loadgen.cc experiments/loadgen/workload.h experiments/loadgen/frame.h \
+  || { echo "SEQUENCE STOP: loadgen sources differ between LOADGEN_PIN $LPIN and PIN $PIN"; exit 2; }
 export VM_PLAIN=$VP VM_MEG=$VM PLAIN_BUILD=$BP MEG_BUILD=$BM LOADGEN_BUILD=$BL
 CFG=${KV_CFG:?KV_CFG = the megalon.yaml install.sh wrote (<install log>.megalon.yaml)}
 # KV_INSTALL=1: install the builds into the (new) guest dirs VM_PLAIN / VM_MEG under the block's lock, before the
@@ -70,6 +78,7 @@ if [ "$B" = h1 ]; then  # H1-HOOK v2: parent lock, mode, round, seed, settle
     *) echo "SEQUENCE STOP: bad H1MODE (r1|cont)"; exit 2;; esac
   for spec in $H1_MIXES; do [[ $spec =~ ^u(5|50|80)=PUT_RATIO=0\.(05|5|8)$ ]] || { echo "SEQUENCE STOP: bad mix spec $spec"; exit 2; }; done
   [ "${KV_INSTALL:-0}" = 0 ] || { echo "SEQUENCE STOP: h1 reuses the validation install (KV_INSTALL=0)"; exit 2; }
+  [ "${H1_MEASURE_RUN:-0}" = 1 ] || { echo "SEQUENCE STOP: H1 needs H1_MEASURE_RUN=1 (README item 8: h1 gate + measure.slice launcher)"; exit 2; }
   : "${PRETOUCH_DIR:?h1 needs PRETOUCH_DIR}" "${EXPECT_DAX_UUID:?h1 needs EXPECT_DAX_UUID}" "${MEASURE_ENV_DIR:?h1 needs MEASURE_ENV_DIR}"
   export MEASURE_ENV_DIR
   OWNER="H1-kv-$H1MODE-r$H1_N"
@@ -82,9 +91,9 @@ grep -q "^megalon_build=$P/builds/megalon/${MEGALON_BUILD_N:-75}$" "$BM/manifest
 grep -q "^source_commit=$BPIN dirty=0$" "$BP/manifest.txt" && grep -q "^megalon.flavor=hwcc$" "$BP/manifest.txt" \
   && grep -q "^megalon_build=$P/builds/megalon/${MEGALON_BUILD_N:-75}-hwcc$" "$BP/manifest.txt" \
   || { echo "SEQUENCE STOP: $BP is not a clean hwcc-flavor build of $BPIN on builds/megalon/${MEGALON_BUILD_N:-75}-hwcc (all-HWcc and Megalon KV share the library version)"; exit 2; }
-grep -q "^cxl_swmc_commit=$BPIN kv_dirty=0$" "$BL/kv-manifest.txt" \
+grep -q "^cxl_swmc_commit=$LPIN kv_dirty=0$" "$BL/kv-manifest.txt" \
   && grep -q "^sha256 $(sha256sum "$BL/loadgen" | cut -d' ' -f1)  " "$BL/manifest.txt" \
-  || { echo "SEQUENCE STOP: $BL loadgen is not the recorded build of $BPIN"; exit 2; }
+  || { echo "SEQUENCE STOP: $BL loadgen is not the recorded build of $LPIN"; exit 2; }
 if [ "$B" = h1 ]; then parent_lock_check; else bash $G lock "$OWNER" || { echo "SEQUENCE STOP: lock"; exit 2; }; fi
 CHOWNED=0
 KPAT='(^|[ /])bin/kv-serve[r]( |$)'  # our kv-server by command-line word ([r]: not the remote shell's own command line)
