@@ -267,6 +267,17 @@ def lean_flags(kv, op):
     return False, False, None
 
 
+POP_ACTIVITY = re.compile(r"^(opt\.[^.]+\.pop\.(is|sm|wp|ipi)_(ns|cnt)|op\.[^.]+\.pc\.(fault_ns|fault_cnt)\.(is|sm|wp)"
+                          r"|op\.[^.]+\.pc\.ipi_(ns|cnt))$")
+
+
+def pop_idle(kv):
+    """True when a node's end snapshot has per-op Popcorn keys and all of them are 0 (cumulative: no Popcorn
+    coherence activity in this server process)."""
+    ks = [k for k in kv if POP_ACTIVITY.match(k)]
+    return bool(ks) and all(re.match(r"^0+(\.0*)?$", kv[k] or "x") for k in ks)
+
+
 def check_source(run, steps):
     """Refuse a pop/mg run unless every node of every step reports exactly the run's coherence source (no build-8
     file fallback, no fallback shim with C = 0, no mixed sources)."""
@@ -278,6 +289,10 @@ def check_source(run, steps):
             sys.exit(f"{run.path}: step {st} has no end snapshot")
         for t, kv in snaps:
             src = coh_source(kv)
+            if run.system == "mg" and src == {"mg", "pop"} and pop_idle(kv):
+                # Megalon on the common Popcorn kernel (build >= 12): swmc_acct is registered for every process but
+                # no Popcorn coherence ever ran in it (every per-op Popcorn duration/count 0): Megalon only
+                continue
             if src != {run.system}:
                 sys.exit(f"{run.path}: step {st} node {t}: coherence source {sorted(src) or 'none'} "
                          f"(opcoh.pop_source={kv.get('opcoh.pop_source')}, opt.pop_threads={kv.get('opt.pop_threads')}, "
@@ -431,6 +446,74 @@ def op_sums(run, steps, op):
     if "ops" not in out or "t_ns" not in out:
         sys.exit(f"{run.path}: operation {op!r} has no count/time keys in steps {steps} (OPKEYS)")
     return out, used, nodes
+
+
+# ---- Megalon C by the difference method (user decision 2026-10-17, state/TASKS.md "(a) 차분 방식으로 진행해") ----
+# C_diff(W, mix, load, op) = T(Megalon, timers OFF) - T(all-HWcc), per operation type, same offered rate, mix and
+# window. An UPPER BOUND (includes every other backend difference). C_diff < 0 is reported as is with a WARN (no
+# clamp). The sampled-scaled Megalon terms of the timers-ON run only split C_diff (part_i = C_diff x sampled_i /
+# sum sampled) and stay raw as diagnostics. Popcorn C stays from kernel counters; T(pop) - T(hw) is a cross-check.
+# Timed sums that the Megalon timers produce (all 0 with MEGALON_COH_TIMERS=0); the vector DB validation copy is the
+# workload's own timer and stays live, so it is not in this list.
+MEG_TIMED = (["meg_check_ns_sampled", "meg_check_sampled", "meg_lookup_ns_sampled"] + ["meg_" + k for k in LEAN_EV + LEAN_WR]
+             + ["meg_anchor_" + k for k in ("check_sampled", "read_lookup_ns_sampled", "read_nr_ns_sampled",
+                                            "rseq_ns_sampled", "write_lookup_ns", "write_nr_ns", "wseq_ns",
+                                            "wseq_end_ns", "write_sampled")])
+# C_meg terms of op_sums (the split basis), CSV short names
+MEG_PARTS = [("check", "meg_check_C_ns"), ("vcopy", "meg_vcopy_est_ns"), ("stale", "meg_stale_ns"),
+             ("concur", "meg_concur_ns"), ("meta", "meg_meta_ns"), ("spin", "meg_spin_ns"),
+             ("wstart", "meg_wstart_C_ns"), ("wflush", "meg_wflush_C_ns")]
+RAW_FLAG_KEYS = ["op.{op}.mg.flags", "opt.meg_flags"]  # full CohSnap.reserved[1] words (bit 0 = timers on)
+
+
+def check_timers_off(run, steps, ops):
+    """Refuse unless run is a Megalon timers-off lifetime for these steps/ops: Megalon sections counted, every Megalon
+    timed sum (MEG_TIMED) 0 on every node, and no raw flag word with bit 0 (timers on). Returns sections counted."""
+    check_source(run, steps)
+    sections = 0
+    for st in steps:
+        ends = dict(snapshot_text(run, st))
+        for t, d in run.deltas().get(st, []):
+            for op in ops:
+                for c in ["meg_read_sections", "meg_write_sections"] + MEG_TIMED:
+                    k = first_key(d, OPKEYS[c], op)
+                    v = d.get(k, 0) if k else 0
+                    if c in ("meg_read_sections", "meg_write_sections"):
+                        sections += v
+                    elif v:
+                        sys.exit(f"{run.path}: step {st} node {t} op {op}: {k}={v} != 0: Megalon timers were ON; "
+                                 "a timers-off lifetime (MEGALON_COH_TIMERS=0) is required for C_diff: refused")
+                for c in RAW_FLAG_KEYS:
+                    v = ends.get(t, {}).get(c.format(op=op))
+                    if v is not None and re.match(r"^[0-9]+$", v) and int(v) & 1:
+                        sys.exit(f"{run.path}: step {st} node {t}: {c.format(op=op)}={v} (bit 0 timers on): "
+                                 "not a timers-off lifetime: refused")
+    if not sections:
+        sys.exit(f"{run.path}: steps {steps}: no Megalon sections counted: not a Megalon timers-off run: refused")
+    return sections
+
+
+def meg_diff(t_off, t_hw, s_on):
+    """Per-operation C_diff and its split. t_off, t_hw: T per op (ns) of the Megalon timers-off and all-HWcc runs;
+    s_on: op_sums of the Megalon timers-ON run (or None). Returns {C_diff, sampled_<p> (per op, raw diagnostics),
+    sampled_sum, part_<p> = C_diff x sampled_<p> / sampled_sum (None when sampled_sum <= 0 or s_on is None),
+    warn: list of WARN strings}."""
+    out = {"C_diff": t_off - t_hw, "warn": []}
+    if out["C_diff"] < 0:
+        out["warn"].append(f"C_diff<0 ({out['C_diff']:.1f} ns): T(Megalon timers off) < T(all-HWcc); reported, not clamped")
+    samp = {p: (s_on.get(k, 0) / s_on["ops"] if s_on and s_on.get("ops") else None) for p, k in MEG_PARTS}
+    tot = sum(v for v in samp.values() if v is not None) if s_on and s_on.get("ops") else None
+    out["sampled_sum"] = tot
+    for p, _ in MEG_PARTS:
+        out["sampled_" + p] = samp[p]
+        out["part_" + p] = out["C_diff"] * samp[p] / tot if tot and tot > 0 else None
+    if s_on and s_on.get("ops"):
+        t_on = s_on["t_ns"] / s_on["ops"]
+        if not tot or tot <= 0:
+            out["warn"].append("sampled Megalon C <= 0 in the timers-on run (timing sanity check)")
+        elif tot > t_on:
+            out["warn"].append(f"sampled Megalon C {tot:.1f} > T {t_on:.1f} ns in the timers-on run (diagnostic only)")
+    return out
 
 
 def node_sums(run, steps, names, table=None):

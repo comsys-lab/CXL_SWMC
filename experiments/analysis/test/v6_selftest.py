@@ -93,11 +93,11 @@ def main():
     check(any("SLO 1.0 ms -> 10.0000" in m for m in meta) and any(m.startswith("# formula") for m in meta), "fig1 meta")
     check(os.path.exists(os.path.join(out, "kv-fig1.png")), "fig1 png")
     # Fig 2 (one load label, all three systems; two nodes each)
-    run(os.path.join(AN, "v6_fig2_split.py"), "--out", out, "--tag", "kv", *[f"L1:{k}={S}/kv-{k}" for k in ("hw", "pop", "mg")])
-    p = subprocess.run([sys.executable, os.path.join(AN, "v6_fig2_split.py"), "--out", out, "--tag", "kvbad",
+    run(os.path.join(AN, "v6_fig2_split.py"), "--megalon-c", "sampled", "--out", out, "--tag", "kv", *[f"L1:{k}={S}/kv-{k}" for k in ("hw", "pop", "mg")])
+    p = subprocess.run([sys.executable, os.path.join(AN, "v6_fig2_split.py"), "--megalon-c", "sampled", "--out", out, "--tag", "kvbad",
                         f"L1:hw={S}/kv-hw:1", f"L1:pop={S}/kv-pop:3", f"L1:mg={S}/kv-mg:1"], capture_output=True, text=True)
     check(p.returncode != 0 and "differ by more than 1%" in p.stderr, "fig2 refuses different offered rates")
-    p = subprocess.run([sys.executable, os.path.join(AN, "v6_fig2_split.py"), "--out", out, "--tag", "kvbad",
+    p = subprocess.run([sys.executable, os.path.join(AN, "v6_fig2_split.py"), "--megalon-c", "sampled", "--out", out, "--tag", "kvbad",
                         f"L1:hw={S}/kv-hw", f"L1:pop={S}/kv-pop"], capture_output=True, text=True)
     check(p.returncode != 0 and "missing runs" in p.stderr, "fig2 needs hw, pop, mg per load")
     r, meta = rows(os.path.join(out, "kv-fig2.csv"))
@@ -119,7 +119,7 @@ def main():
                        "opt.put.meg.anchor.write_lookup_ns": 777})
     gs = dict(g, **{"opt.meg_coh": 1})
     mkrun(os.path.join(S, "kv-mg75"), ("mixed", 99, 1), curve + ramp, {1: [pair(m75, gs), pair(m75, gs)]})
-    run(os.path.join(AN, "v6_fig2_split.py"), "--out", out, "--tag", "kv75", f"L1:hw={S}/kv-hw", f"L1:pop={S}/kv-pop",
+    run(os.path.join(AN, "v6_fig2_split.py"), "--megalon-c", "sampled", "--out", out, "--tag", "kv75", f"L1:hw={S}/kv-hw", f"L1:pop={S}/kv-pop",
         f"L1:mg={S}/kv-mg75")
     r75 = {(x["op"], x["system"]): x for x in rows(os.path.join(out, "kv75-fig2.csv"))[0]}
     check(float(r75[("get", "Megalon")]["C_ns"]) == (1000 * 64 - 100 * 64 + 100_000) / 1000
@@ -235,7 +235,7 @@ def main():
     p = subprocess.run([sys.executable, os.path.join(AN, "v6_fig3_megalon.py"), "b", "--out", out, "--tag", "x",
                         f"10={S}/vdb-10", "--pop", f"10={S}/vdb-popfile"], capture_output=True, text=True)
     check(p.returncode != 0 and "coherence source" in p.stderr, "op_sums refuses swmc_file (build-8 fallback)")
-    p = subprocess.run([sys.executable, os.path.join(AN, "v6_fig2_split.py"), "--out", out, "--tag", "x",
+    p = subprocess.run([sys.executable, os.path.join(AN, "v6_fig2_split.py"), "--megalon-c", "sampled", "--out", out, "--tag", "x",
                         f"L1:hw={S}/kv-hw", f"L1:pop={S}/kv-mg", f"L1:mg={S}/kv-mg"], capture_output=True, text=True)
     check(p.returncode != 0 and "coherence source" in p.stderr, "op_sums refuses a pop run reporting the Megalon source")
     tr = os.path.join(S, "trace-run")

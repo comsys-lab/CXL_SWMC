@@ -162,7 +162,7 @@ def main():
     pop = mkrun(os.path.join(S, "kv-pop"), "kv", [(pp, {**pp, **opt("get", {"ops": 100, "t_ns": 3000000,
                                                                         "c_ns": 100000, "pop.is_ns": 100000})})])
     out = os.path.join(S, "fig2")
-    p = subprocess.run([sys.executable, os.path.join(os.path.dirname(HERE), "v6_fig2_split.py"), "--out", out,
+    p = subprocess.run([sys.executable, os.path.join(os.path.dirname(HERE), "v6_fig2_split.py"), "--megalon-c", "sampled", "--out", out,
                         "--tag", "t", f"L1:hw={hw}", f"L1:pop={pop}", f"L1:mg={d8}"], capture_output=True, text=True)
     check(p.returncode == 0, "fig2 exit 0" + ("" if p.returncode == 0 else ": " + p.stderr[-300:]))
     if p.returncode == 0:
@@ -175,7 +175,7 @@ def main():
     d9 = mkrun(os.path.join(S, "kv-mg-legacy"), "kv", [({"opt.meg_coh": 1}, {"opt.meg_coh": 1, **opt("get", {
         "ops": 100, "t_ns": 2000000, "meg.read_sections": 100, "meg.check_sampled": 10, "meg.check_ns_sampled": 100, "c_ns": 1000})})])
     out = os.path.join(S, "fig2-legacy")
-    p = subprocess.run([sys.executable, os.path.join(os.path.dirname(HERE), "v6_fig2_split.py"), "--out", out,
+    p = subprocess.run([sys.executable, os.path.join(os.path.dirname(HERE), "v6_fig2_split.py"), "--megalon-c", "sampled", "--out", out,
                         "--tag", "t", f"L1:hw={hw}", f"L1:pop={pop}", f"L1:mg={d9}"], capture_output=True, text=True)
     check(p.returncode == 0 and "megalon_lean" not in open(os.path.join(out, "t-fig2.csv")).read(),
           "fig2 without flag keys: no megalon_lean line")
