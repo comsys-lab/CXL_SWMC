@@ -1,12 +1,17 @@
 #!/usr/bin/env python3
 """P-popcorn recv13 comparison: Host-side summary of one evidence dir (reports/P-popcorn-recv13-packet.md).
 
-Usage: p-popcorn-recv-summary.py <E>
+Usage: p-popcorn-recv-summary.py <E> [<out dir>]   (out dir default <E>; results.csv/summary.txt go there)
 Reads <E>/r<rep>-<cfg>/{config.txt, s1, s2, s3} written by recovery/P-popcorn-recv13-v1/run.sh and writes
   <E>/results.csv   one row per (repeat, config, scenario): latency, owner H / W-H, coherence CPU, counters, hogs
   <E>/summary.txt   mean +- sd per (config, scenario) over the repeats (v1.1: 2 repeats; each repeat listed) and the decision rule of
                     reports/P-popcorn-recv-scaleout.md §5 (adopted by the user 2026-10-18) as computed checks
 Exit 1 if an expected file is missing (no partial summary).
+Decision (v1.2, user 2026-10-18): with 1 repeat each criterion is PASS/FAIL (rule below) and CLEAR or MARGINAL:
+  S1 p50 NEW-OLD <= +2.5 us clear pass, >= +7.5 us clear fail; S2 p99 NEW <= 0.9 OLD / >= 1.1 OLD;
+  S3 ops/s NEW >= 1.025 OLD / <= 0.925 OLD; coh_cpu_total NEW <= 0.9 OLD / >= 1.1 OLD; else MARGINAL.
+  Final line: "DECISION KEEP (clear)" if any criterion is a clear fail, "DECISION ADOPT (clear)" if all are clear
+  passes, else "DECISION MARGINAL: run R2".  With 2 repeats: the mean-based rule (PASS/FAIL per criterion).
 
 Coherence CPU (seconds, per scenario window, delta of the post minus pre snapshots):
   recv_s     receive thread utime+stime (/proc/<pid>/stat, clock ticks): poll/sleep mode = consumer CPU,
@@ -150,6 +155,8 @@ def fl(path, key):
 
 def main():
     E = sys.argv[1]
+    OUT = sys.argv[2] if len(sys.argv) > 2 else E
+    os.makedirs(OUT, exist_ok=True)
     rows = []
     sessions = sorted(d for d in os.listdir(E) if re.fullmatch(r"r[12]-(OLD|NEW|NEWP)", d))
     if not sessions:
@@ -196,7 +203,7 @@ def main():
         for k in r:
             if k not in cols:
                 cols.append(k)
-    with open(os.path.join(E, "results.csv"), "w", newline="") as f:
+    with open(os.path.join(OUT, "results.csv"), "w", newline="") as f:
         w = csv.DictWriter(f, fieldnames=cols)
         w.writeheader()
         for r in rows:
@@ -234,11 +241,25 @@ def main():
     out.append("")
     out.append("decision rule (reports/P-popcorn-recv-scaleout.md §5, user-adopted 2026-10-18; NEW = module 13 defaults):")
     ok = True
+    nrep = len(vals("OLD", "S1", "readM_p50_ns"))
+    single = nrep == 1
+    grades = []
+    out.append("  repeats: %d (%s)" % (nrep, "CLEAR/MARGINAL thresholds" if single else "mean-based rule"))
 
-    def chk(name, cond, detail):
+    def chk(name, cond, detail, clear_pass=None, clear_fail=None):
         nonlocal ok
         ok = ok and bool(cond)
-        out.append("  %s: %s (%s)" % (name, "PASS" if cond else "FAIL", detail))
+        g = ""
+        if single:
+            if cond and clear_pass:
+                g = "CLEAR"
+            elif not cond and clear_fail:
+                g = "CLEAR"
+            else:
+                g = "MARGINAL"
+            grades.append((bool(cond), g))
+            g = " " + g
+        out.append("  %s: %s%s (%s)" % (name, "PASS" if cond else "FAIL", g, detail))
 
     def det(m, scen, unit):
         o, n = vals("OLD", scen, m), vals("NEW", scen, m)
@@ -252,12 +273,16 @@ def main():
 
     for kind in ("readM", "writeI"):
         o, n, t = det(kind + "_p50_ns", "S1", "ns")
-        chk("S1 %s p50 within +5 us of OLD" % kind, o is not None and n is not None and n <= o + 5000, t)
+        v = o is not None and n is not None
+        chk("S1 %s p50 within +5 us of OLD" % kind, v and n <= o + 5000, t,
+            v and n - o <= 2500, v and n - o >= 7500)
     for kind in ("readM", "writeI"):
         o, n, t = det(kind + "_p99_ns", "S2", "ns")
-        chk("S2 %s p99 not worse than OLD" % kind, o is not None and n is not None and n <= o, t)
+        v = o is not None and n is not None
+        chk("S2 %s p99 not worse than OLD" % kind, v and n <= o, t, v and n <= 0.9 * o, v and n >= 1.1 * o)
     o, n, t = det("s3_ops_s_total", "S3", "ops/s")
-    chk("S3 throughput within 5 % of OLD or better", o is not None and n is not None and n >= 0.95 * o, t)
+    v = o is not None and n is not None
+    chk("S3 throughput within 5 % of OLD or better", v and n >= 0.95 * o, t, v and n >= 1.025 * o, v and n <= 0.925 * o)
     oc = sum(ms("OLD", s_, "coh_cpu_total")[0] or 0 for s_ in ("S1", "S2", "S3"))
     nc = sum(ms("NEW", s_, "coh_cpu_total")[0] or 0 for s_ in ("S1", "S2", "S3"))
     ho, hn = ms("OLD", "S2", "hog_iter_s")[0], ms("NEW", "S2", "hog_iter_s")[0]
@@ -266,11 +291,19 @@ def main():
         "OLD %.4g s, NEW %.4g s, NEW-OLD %+.4g s; coh_s OLD %.4g NEW %.4g; fallback_expiries NEW %s" % (
             oc, nc, nc - oc, sum(ms("OLD", s_, "coh_s")[0] or 0 for s_ in ("S1", "S2", "S3")),
             sum(ms("NEW", s_, "coh_s")[0] or 0 for s_ in ("S1", "S2", "S3")),
-            sum(ms("NEW", s_, "fallback_expiries")[0] or 0 for s_ in ("S1", "S2", "S3"))))
+            sum(ms("NEW", s_, "fallback_expiries")[0] or 0 for s_ in ("S1", "S2", "S3"))),
+        nc <= 0.9 * oc, nc >= 1.1 * oc)
     out.append("  like-for-like: S2 hog iterations/s OLD %s, NEW %s" % (ho, hn))
     if ho and hn and ((nc < oc and hn < ho) or (nc >= oc and hn > ho)):
         out.append("  NOTE: coh_cpu_total and S2 hog iterations/s disagree (decide with the user)")
     out.append("  => all checks %s; the adoption itself is decided with the user" % ("PASS" if ok else "not all PASS"))
+    if single:
+        if any(g == "CLEAR" and not p for p, g in grades):
+            out.append("DECISION KEEP (clear)")
+        elif all(g == "CLEAR" and p for p, g in grades):
+            out.append("DECISION ADOPT (clear)")
+        else:
+            out.append("DECISION MARGINAL: run R2")
     out.append("")
     out.append("sanity NEW-poll (module 13, recv_mode=poll max_workers=1 fallback_us=0 worker_spin_us=0) vs OLD, S1 "
                "(expected equal; information):")
@@ -279,7 +312,7 @@ def main():
         if o and n:
             out.append("  %s p50 OLD %.0f NEW-poll %.0f ns (%+.1f %%)%s" % (kind, o, n, 100 * (n - o) / o,
                        "  NOTE: > 5 %" if abs(n - o) > 0.05 * o else ""))
-    open(os.path.join(E, "summary.txt"), "w").write("\n".join(out) + "\n")
+    open(os.path.join(OUT, "summary.txt"), "w").write("\n".join(out) + "\n")
     print("\n".join(out))
 
 
