@@ -99,6 +99,7 @@ if [ $BLOCK = h1 ]; then  # H1-HOOK v2 inputs (see the header)
   [ -d "${PRETOUCH_DIR:-}" ] && [ -n "${MEASURE_ENV_DIR:-}" ] && [ -n "${EXPECT_DAX_UUID:-}" ] \
     || { echo "SEQUENCE STOP: BLOCK=h1 needs PRETOUCH_DIR, MEASURE_ENV_DIR and EXPECT_DAX_UUID"; exit 2; }
   [ -z "${SYSTEMS:-}" ] || { echo "SEQUENCE STOP: SYSTEMS is not used with BLOCK=h1"; exit 2; }
+  [ "${H1_MEASURE_RUN:-0}" = 1 ] || { echo "SEQUENCE STOP: BLOCK=h1 needs H1_MEASURE_RUN=1 (h1-gate.sh + measure-run.sh, README item 8)"; exit 2; }
   SEED=$H1_SEED EKKO=${EKKO:-per-mix}
 else
   : "${EKKO:?}"
@@ -298,8 +299,13 @@ pop_setup() {  # P-popcorn-deploy §6a cycle with build POP_BUILD (init_state=sh
   done
   env "${PS[@]}" STATUS_TAG=pre bash $C8/p-popcorn-shm.sh status || stop "status pre"
 }
+h1_lockchk() {  # BLOCK=h1: the parent lock must still name owner=H1-main (checked at block start and before every lifetime)
+  [ $BLOCK = h1 ] || return 0
+  grep -q "^owner=H1-main " "$LOCKF" 2>/dev/null || stop "lock $LOCKF not held by H1-main ($(cat "$LOCKF" 2>/dev/null))"
+}
 life_start() {  # <sys> <name>: prepare + session start of one server lifetime -> LS (session dir), NAME
   local s=$1 SE t0
+  h1_lockchk
   NAME=$2 LS=$E/$2
   local S=$LS
   if [ $s = pop ]; then SHMR=$E/shm-$NAME; PS=(K=$K8 GT=$GT8 C=$C8 R=$SHMR INIT_STATE=shared); fi
@@ -412,17 +418,20 @@ h1_slo() {  # <sys>: warm-up + full SLO search -> $LS/slo
   measure "$LS" slo "${LGC[@]}" --opt seed=$SEED --seed $SEED --slo query:$SLO_PCT:$SLO_MS --raw \
     --mode slo --start 1 --factor 1.5 --precision 0.05 --max-steps 20
   rc=$?
+  echo "$NAME slo: loadgen seed $SEED" >> "$E/seeds.txt"
   grep -q 'workload_finish":"ok' "$RD/loadgen/summary.json" 2>/dev/null || stop "$NAME slo: loadgen workload finish (rc $rc)"
   if [ $rc = 1 ]; then
     note=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("note",""))' "$RD/loadgen/summary.json" 2>/dev/null)
     [ -n "$note" ] || stop "$NAME slo: loadgen rc 1 without a note"
+    case "$note" in "confirm failed at three rates"*) ;; *) stop "$NAME slo: loadgen note '$note' (only 'confirm failed at three rates' is a NOTE)";; esac
     echo "MAIN NOTE $NAME slo: $note"
   elif [ $rc != 0 ]; then stop "$NAME slo rc $rc"; fi
   h1_check $s slo "$note"
 }
 h1_fix() {  # <sys> <L2 rate> <L1 rate>: settle (H1_SETTLE_S at L2, discarded) + L2 + L1 windows -> $LS/fix; H1STEPS
-  local s=$1 rc RD=$LS/fix
-  measure "$LS" fix "${LGC[@]}" --opt seed=$SEED --seed $SEED --raw --mode fixed --rates "$2,$3" \
+  local s=$1 rc RD=$LS/fix fs=$((SEED + 1))   # fix part seed = SEED + 1 (as the vector DB hook); in loadgen_args
+  echo "$NAME fix: loadgen seed $fs (SLO part seed $SEED), settle $H1_SETTLE_S s at L2=$2, L1=$3" >> "$E/seeds.txt"
+  measure "$LS" fix "${LGC[@]}" --opt seed=$fs --seed $fs --raw --mode fixed --rates "$2,$3" \
     --warmup-s "$H1_SETTLE_S" --step-warmup-s 5 --step-measure-s 60 --drain-s 10
   rc=$?; [ $rc = 0 ] || stop "$NAME fix rc $rc"
   H1STEPS=$(python3 -I -c 'import json,sys
@@ -442,6 +451,7 @@ h1_check() {  # <sys> <part> <note>: v1_check --h1 + check_breakdown of <part>; 
   { echo "[$2] v1_check: $(cat "$r/v1-check.txt")"; echo "[$2] check_breakdown: $(cat "$r/breakdown-check.txt")"
     echo "[$2] summary: $(python3 -c 'import json,sys; s=json.load(open(sys.argv[1])); print("mode=%s note=%r workload_finish=%s confirm=%s" % (s.get("mode"), s.get("note",""), s.get("workload_finish"), s.get("confirm",{}).get("x_mean")))' "$r/loadgen/summary.json" 2>&1)"
     [ -z "$3" ] || echo "[$2] NOTE: $3"
+    grep -q " NOTES: " "$r/v1-check.txt" && echo "[$2] NOTE: v1_check: $(sed -n 's/.* NOTES: //p' "$r/v1-check.txt" | head -1)"
   } >> "$f"
   grep -q "^V1CHECK PASS" "$r/v1-check.txt" || stop "$NAME $2: $(cat "$r/v1-check.txt")"
   grep -q "^BREAKDOWN PASS" "$r/breakdown-check.txt" || stop "$NAME $2: $(cat "$r/breakdown-check.txt")"
