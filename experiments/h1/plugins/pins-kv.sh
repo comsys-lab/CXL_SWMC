@@ -9,7 +9,7 @@
 HR=$P/CXL_SWMC
 HOOK_FILE=$HR/experiments/kv/pilot-block.sh
 BLOCK_CMD=(bash $HOOK_FILE h1)       # H1 hook = block "h1" (marker H1-HOOK v2)
-BLOCK_ENV=(PIN=56154f40329aabfc29700bb16c525d40c5151de0 BUILD_PIN=934fa9312c38eeaf2845605cf22d2ef1cfe15fc4 MEGALON_BUILD_N=77 KEYS=54000000
+BLOCK_ENV=(PIN=6829677c5c15a8756beff0a244a65d02ecb94300 BUILD_PIN=934fa9312c38eeaf2845605cf22d2ef1cfe15fc4 MEGALON_BUILD_N=77 KEYS=54000000
   PLAIN_BUILD=$P/builds/kv/10 MEG_BUILD=$P/builds/kv-megalon/10 LOADGEN_BUILD=$P/builds/kv-loadgen/11 LOADGEN_PIN=39575ed9d243e5251bca8f4b92ccf73607c8ba16
   VM_PLAIN=/home/comsys/kv10 VM_MEG=/home/comsys/kvm10 KV_CFG=$P/recovery/KV-V1-v1.5-run/install.log.megalon.yaml
   K8=$KPOP C8=$CPOP GT8=$GTPOP RECV_MODE=$RECV_MODE EXPECT_DAX_UUID=$EXPECT_DAX_UUID)
@@ -26,10 +26,10 @@ f9c1753f3bef2ab0941153058860227145f2d7b7e33a210bdc3338fad14eacda  $P/builds/kv-m
 62d4f8ff9e24ce3876eebfddd048dc1fbd0985159834c34e895136ffb81c2909  $P/builds/kv-loadgen/11/kv-manifest.txt
 bc4889794fd0a1ded5a29e220af91b78988ba3d33d93aa10709d4ddf68fbed57  $P/builds/kv-loadgen/11/loadgen
 48c5f02c0546af9b22cf0a4ce2172177193ffcc6d502d9fb0fdeb51863bb9f17  $P/recovery/KV-V1-v1.5-run/install.log.megalon.yaml
-7167fd5bf9f62f51a83330546a85438a741c80998a3ff79592e6584dc50ec8a1  $HOOK_FILE
+6df0d4913d86355f0c60ba020d49618b02902995d05532da96f5b5eb186d1b82  $HOOK_FILE
 fbfb125195d2c862ab33c56da7e251c940973e03bd19ffaa35361002fdd1d895  $HR/experiments/kv/h1v2-lib.sh
-7cb021a0ba2a9078ac27a6cf893785666e11ae2a86c6e651c4d4b2332f4252aa  $HR/experiments/kv/pilot-run.sh
-91ea2e208d3a37d926ca3e112b26a888f470fe6e05a08ceb8ca1e6cd95ee7bfa  $HR/experiments/kv/run.sh
+7412bbce17b0532e95a07e6760561f6ed40f7896607486c3e3ac591440a0ec84  $HR/experiments/kv/pilot-run.sh
+3c730903718325d010c0a7c31fa2b53019fae0674308fa1c95cf6256cb1faf91  $HR/experiments/kv/run.sh
 8435ef222785be5d7a6dd6a97572b1404017822c63f3f766c45562efc8ae35ca  $HR/experiments/kv/precheck.sh
 de9d4a99916fbd60b66f6142d0cbc69cd88068e19c9ca08609380241801e76f7  $HR/experiments/kv/v1-check.py
 cbd6d75e743f149633a461e525bff6c69108407bcc0d7b9dc8f443dc72a6690f  $HR/experiments/kv/pretouch-check.sh
