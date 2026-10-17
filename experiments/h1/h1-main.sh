@@ -42,7 +42,10 @@ if [ -n "${3:-}" ]; then
 fi
 H=$(cd "$(dirname "$0")" && pwd)
 G=$H/../vectordb/host-gate.sh PG=$H/../vectordb/pretouch-gate.sh
-PLAN=${H1_PLAN:-$H/h1-plan.tsv} DRY=${H1_DRY:-0}
+DRY=${H1_DRY:-0}
+# D1 (verifier delta on v0.6): the plan is part of the frozen code; an override is for the Host self-test only
+[ -z "${H1_PLAN:-}" ] || [ "$DRY" = 1 ] || { echo "SEQUENCE STOP: H1_PLAN override refused (H1_DRY=1 only)"; exit 2; }
+PLAN=${H1_PLAN:-$H/h1-plan.tsv}
 export H1_SEED_BASE=${H1_SEED_BASE:-20261017}
 ORDER="kv lmdb vdb recsys"   # user decision 2026-10-17
 OWNER=H1-main
@@ -84,16 +87,30 @@ else
   : "${MEASURE_PART_DIR:?MEASURE_PART_DIR = measure-env-part.sh apply dir (option (ga), 2026-10-18)}"
   export PRETOUCH_DIR MEASURE_ENV_DIR MEASURE_PART_DIR H1_MEASURE_RUN=1
 fi
-# code integrity at stage start (verifier MED-3): the frozen manifest (freeze-manifest.sh, sha256 in the packet) must
-# match the files byte for byte and list every file of experiments/h1. Required for real stages; optional in H1_DRY.
+# code integrity (verifier MED-3; D2: at stage start, before each workload's collect/check and at stage end): the
+# frozen manifest (freeze-manifest.sh, sha256 in the packet) must match the files byte for byte and list every file of
+# experiments/h1. Required for real stages; optional in H1_DRY. The path is made absolute first (the check runs from
+# the CXL_SWMC root). Untracked files outside experiments/h1 (e.g. a stray CXL_SWMC/recovery/) are not looked at.
+MAN_ON=0
 if [ "$DRY" != 1 ] || [ -n "${H1_MANIFEST:-}" ]; then
   : "${H1_MANIFEST:?H1_MANIFEST = frozen code manifest (recovery/H1-main-v<x>/manifest.sha256)}" "${H1_MANIFEST_SHA:?H1_MANIFEST_SHA = its sha256 from the packet}"
-  [ "$(sha256sum < "$H1_MANIFEST" | cut -c1-64)" = "$H1_MANIFEST_SHA" ] || { echo "SEQUENCE STOP: manifest $H1_MANIFEST sha256 != H1_MANIFEST_SHA"; exit 2; }
-  ( cd "$H/../.." && sha256sum --quiet -c "$H1_MANIFEST" ) > /dev/null 2>&1 \
-    || { echo "SEQUENCE STOP: code differs from the frozen manifest: $(cd "$H/../.." && sha256sum --quiet -c "$H1_MANIFEST" 2>&1 | head -3 | tr '\n' ' ')"; exit 2; }
-  extra=$(cd "$H/../.." && find experiments/h1 -type f -not -path '*/__pycache__/*' -not -name '*.pyc' | sort | while read -r f; do grep -q "  $f\$" "$H1_MANIFEST" || echo "$f"; done)
-  [ -z "$extra" ] || { echo "SEQUENCE STOP: files in experiments/h1 not in the manifest: $extra"; exit 2; }
+  H1_MANIFEST=$(readlink -f "$H1_MANIFEST") MAN_ON=1
 fi
+manifest_check() {  # <where>; prints the reason and returns 1 on a mismatch
+  [ $MAN_ON = 1 ] || return 0
+  [ -f "$H1_MANIFEST" ] && [ "$(sha256sum < "$H1_MANIFEST" | cut -c1-64)" = "$H1_MANIFEST_SHA" ] \
+    || { echo "SEQUENCE STOP ($1): manifest $H1_MANIFEST missing or sha256 != H1_MANIFEST_SHA"; return 1; }
+  local bad extra
+  bad=$(cd "$H/../.." && sha256sum --quiet -c "$H1_MANIFEST" 2>&1 | head -3 | tr '\n' ' ')
+  [ -z "$bad" ] || { echo "SEQUENCE STOP ($1): code differs from the frozen manifest: $bad"; return 1; }
+  extra=$(cd "$H/../.." && find experiments/h1 -type f -not -path '*/__pycache__/*' -not -name '*.pyc' | sort | while read -r f; do grep -q "  $f\$" "$H1_MANIFEST" || echo "$f"; done)
+  [ -z "$extra" ] || { echo "SEQUENCE STOP ($1): files in experiments/h1 not in the manifest: $extra"; return 1; }
+}
+manifest_check start || exit 2
+# D3: stages are launched with `setsid nohup` (packet §5), so this shell leads its own process group and the §8.3 stop
+# (kill -TERM -- -<pgid>) reaches the whole stage; a real stage refuses otherwise
+PGID=$(ps -o pgid= -p $$ | tr -d ' ')
+[ "$DRY" = 1 ] || [ "$PGID" = "$$" ] || { echo "SEQUENCE STOP: pgid $PGID != pid $$ (launch with setsid nohup, packet §5)"; exit 2; }
 log() { echo "$(date -Is) [$STAGE] $*" | tee -a "$E/h1-state.txt"; }
 stop() { log "SEQUENCE STOP $*"; exit 1; }
 bash $G lock $OWNER || { echo "SEQUENCE STOP: lock"; exit 2; }
@@ -114,7 +131,7 @@ gates() {  # tag
   MEASURE_ENV_DIR=$MEASURE_ENV_DIR MEASURE_PART_DIR=$MEASURE_PART_DIR bash $H/h1-gate.sh check "$E/gate-$1.txt" || stop "h1 gate ($1)"
   log "gate $1: PASS"
 }
-log "stage start: round $N, workloads [$WL]"
+log "stage start: round $N, workloads [$WL], pid $$ pgid $PGID, manifest $([ $MAN_ON = 1 ] && echo "$H1_MANIFEST ok" || echo "off (dry)")"
 for W in $WL; do
   T0=$(date +%s) S=$E/$W/r$N
   MIXES=$(awk -F'\t' -v w="$W" '!/^#/ && $1 == w { printf "%s=%s ", $2, $3 }' "$PLAN")
@@ -136,6 +153,7 @@ for W in $WL; do
     env H1_SETTLE_S=$SETTLE bash $H/hook.sh "$W" cont "$S/run" "$N" "$MIXES" "$E/$W/levels.tsv" || stop "$W r$N"
   fi
   gates "$W-r$N-end"
+  manifest_check "$W r$N before collect" > "$E/manifest-$W-r$N.txt" || stop "$(cat "$E/manifest-$W-r$N.txt")"
   nice -n 19 python3 -B $H/collect.py --plan "$PLAN" --workload "$W" --levels "$E/$W/levels.tsv" ${H1_NO_FIGS:+--no-figs} "$S" \
     > "$S/collect.log" 2>&1 || stop "$W r$N collect: $(tail -n 1 "$S/collect.log")"
   python3 -B $H/check.py --plan "$PLAN" --workload "$W" --round "$N" $([ "$DRY" = 1 ] && echo --skip-fig2) "$E" > "$S/check.log" 2>&1
@@ -151,6 +169,7 @@ for W in $WL; do
     ${H1_NO_FIGS:+--no-figs} "$E/$W" > "$E/$W/collect-all-r$N.log" 2>&1 || stop "$W collect-all-r$N: $(tail -n 1 "$E/$W/collect-all-r$N.log")"
 done
 log "collect-all-r$N done for [$WL] (rounds 1..$N; slo-summary.csv states single round / mean and sd)"
+manifest_check "stage end" > "$E/manifest-end-$STAGE.txt" || stop "$(cat "$E/manifest-end-$STAGE.txt")"
 if [ $N = 1 ]; then
   log "STAGE DONE $STAGE: main session reviews $E/$WL/r1/check.txt, then: bash $H/h1-accept.sh $E 1 $WL"
 else

@@ -17,6 +17,8 @@
 #   G  check.compare(): synthetic Fig 2 CSVs r1 / r2: hw +3 % inside the threshold, pop +12 % -> REPORT, C_diff inside
 #   H  stage-start integrity: a matching manifest passes; an altered hash, an unlisted experiments/h1 file or a wrong
 #      H1_MANIFEST_SHA stop the stage before the lock
+#   I  D1: H1_PLAN and gate threshold overrides refused without H1_DRY=1; D3: a real stage refuses pgid != pid and passes
+#      the pgid check under setsid (it then stops at the real pretouch gate, which has a dummy dir; lock released)
 # Prints "SELFTEST PASS" or "SELFTEST FAIL <case>".
 set -uo pipefail
 O=${1:?out dir}
@@ -136,8 +138,23 @@ sed '1s/^\(.\)/0\1/; 1s/^\(.\{64\}\)./\1/' "$O/H-good.sha256" > "$O/H-bad.sha256
 grep -v "experiments/h1/levels.py$" "$O/H-good.sha256" > "$O/H-short.sha256"
 for c in good bad short; do mkdir "$O/H-$c"; H1_MANIFEST="$O/H-$c.sha256" H1_MANIFEST_SHA=$(sha256sum < "$O/H-$c.sha256" | cut -c1-64) stage H-$c r1-kv; echo "rc=$?" >> "$O/H-$c.out"; done
 grep -q "^rc=0" "$O/H-good.out" || fail "H good manifest refused ($(head -3 "$O/H-good.out"))"
-grep -q "SEQUENCE STOP: code differs from the frozen manifest" "$O/H-bad.out" || fail "H bad hash not refused"
-grep -q "SEQUENCE STOP: files in experiments/h1 not in the manifest: experiments/h1/levels.py" "$O/H-short.out" || fail "H unlisted file not refused"
+grep -q "SEQUENCE STOP (start): code differs from the frozen manifest" "$O/H-bad.out" || fail "H bad hash not refused"
+grep -q "SEQUENCE STOP (start): files in experiments/h1 not in the manifest: experiments/h1/levels.py" "$O/H-short.out" || fail "H unlisted file not refused"
 mkdir "$O/H-sha"; H1_MANIFEST="$O/H-good.sha256" H1_MANIFEST_SHA=0000 stage H-sha r1-kv && fail "H wrong manifest sha accepted"
 echo "H OK"
+# I verifier D1/D3: overrides refused outside H1_DRY; a real stage needs pgid == pid (setsid)
+mkdir "$O/I1" "$O/I2" "$O/I3"
+H1_DRY=0 H1_PLAN=$H/h1-plan.tsv bash $H/h1-main.sh r1-kv "$O/I1" > "$O/I1.out" 2>&1 && fail "I1 rc 0"
+grep -q "H1_PLAN override refused" "$O/I1.out" || fail "I1 reason ($(cat "$O/I1.out"))"
+(unset H1_DRY; MEASURE_PART_DIR=x MEAS_AVG_MAX=50 bash $H/h1-gate.sh judge "$O/I-gate.log") > /dev/null 2>&1 && fail "I gate override accepted"
+grep -q "override of MEAS_AVG_MAX refused" "$O/I-gate.log" || fail "I gate reason"
+REAL=(H1_DRY=0 PRETOUCH_DIR=$O/none MEASURE_ENV_DIR=$O/none MEASURE_PART_DIR=$O/none H1_MANIFEST="$O/H-good.sha256"
+      H1_MANIFEST_SHA=$(sha256sum < "$O/H-good.sha256" | cut -c1-64))
+env "${REAL[@]}" bash $H/h1-main.sh r1-kv "$O/I2" > "$O/I2.out" 2>&1 && fail "I2 rc 0"
+grep -q "SEQUENCE STOP: pgid .* != pid" "$O/I2.out" || fail "I2 reason ($(cat "$O/I2.out"))"
+env "${REAL[@]}" setsid bash $H/h1-main.sh r1-kv "$O/I3" > "$O/I3.out" 2>&1 < /dev/null && fail "I3 rc 0"
+grep -q "SEQUENCE STOP: pgid" "$O/I3.out" && fail "I3 setsid still refused on pgid"
+grep -q "SEQUENCE STOP pretouch gate" "$O/I3/h1-state.txt" || fail "I3 did not reach the gates ($(cat "$O/I3.out"))"
+nolock I3
+echo "I OK"
 echo "SELFTEST PASS"

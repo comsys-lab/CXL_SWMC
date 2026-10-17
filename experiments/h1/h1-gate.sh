@@ -6,7 +6,8 @@
 #        h1-gate.sh check <log file>                wait until the gate passes (re-probe every 60 s, at most GATE_WAIT_S)
 #        h1-gate.sh judge <log file>                one probe of builds + CPU sets only (no partition check; diagnostics/tests)
 # env: MEASURE_ENV_DIR (base measure-env state dir), MEASURE_PART_DIR (measure-env-part.sh apply dir: sets.txt),
-#   GATE_WAIT_S (1800), SAMPLE_S (5), MEAS_AVG_MAX (10), MEAS_CPU_MAX (50), EMU_AVG_MAX (25)
+#   GATE_WAIT_S (1800), SAMPLE_S (5), MEAS_AVG_MAX (10), MEAS_CPU_MAX (50), EMU_AVG_MAX (25) — these five may only be
+#   set with H1_DRY=1 (self-test / diagnostics); otherwise the gate refuses (verifier D1)
 # One probe passes iff:
 #   1. `measure-env-part.sh check MEASURE_ENV_DIR MEASURE_PART_DIR` = PART CHECK PASS (base settings + partition);
 #      a failure fails the gate at once (it does not recover by itself);
@@ -27,6 +28,12 @@ case "${1:-}" in
   check|judge) LOG=${2:?log file};;
   *) echo "usage: h1-gate.sh lock|unlock <owner> | check|judge <log file>"; exit 2;;
 esac
+# D1 (verifier delta on v0.6): the frozen thresholds may only be overridden in the Host self-test / diagnostics
+if [ "${H1_DRY:-0}" != 1 ]; then
+  for v in GATE_WAIT_S SAMPLE_S MEAS_AVG_MAX MEAS_CPU_MAX EMU_AVG_MAX; do
+    [ -z "${!v:-}" ] || { echo "$(date -Is) gate ok=0 override of $v refused (H1_DRY=1 only)" | tee -a "$LOG"; exit 1; }
+  done
+fi
 GATE_WAIT_S=${GATE_WAIT_S:-1800} SAMPLE_S=${SAMPLE_S:-5}
 MEAS_AVG_MAX=${MEAS_AVG_MAX:-10} MEAS_CPU_MAX=${MEAS_CPU_MAX:-50} EMU_AVG_MAX=${EMU_AVG_MAX:-25}
 : "${MEASURE_PART_DIR:?MEASURE_PART_DIR = measure-env-part.sh apply dir (sets.txt)}"

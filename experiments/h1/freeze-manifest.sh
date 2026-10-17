@@ -13,6 +13,8 @@
 # Refuses when a listed path has uncommitted changes (the manifest must describe a commit).
 set -uo pipefail
 OUT=${1:?out file}
+# the path is made absolute BEFORE the cd below (v0.6 bug: a relative path landed inside CXL_SWMC)
+[ "$OUT" = --list ] || OUT=$(readlink -m "$OUT")
 [ "$OUT" = --list ] || [ ! -e "$OUT" ] || { echo "FREEZE REFUSED: $OUT exists"; exit 2; }
 R=$(cd "$(dirname "$0")/../.." && pwd)
 cd "$R" || exit 2
@@ -27,4 +29,5 @@ dirty=$(git status --porcelain -- $LIST)
 [ -z "$dirty" ] || { echo "FREEZE REFUSED: uncommitted changes:"; echo "$dirty"; exit 2; }
 mkdir -p "$(dirname "$OUT")"
 sha256sum $LIST > "$OUT"
+[ -s "$OUT" ] || { echo "FREEZE FAIL: $OUT not written"; exit 1; }
 echo "FROZEN $(wc -l < "$OUT") files at CXL_SWMC $(git rev-parse --short HEAD) -> $OUT sha256 $(sha256sum < "$OUT" | cut -c1-64)"
