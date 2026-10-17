@@ -7,7 +7,12 @@ node 1; window deltas) and <dir>/breakdown.csv. Checks (FAIL = stop the block):
   all   torn_rows delta 0, misses 0, update_misses 0; >= 1 query; >= 2 publication rounds in the window;
         flush_overruns delta 0 and update_rate_sustained=1 (no round longer than T); the updater keeps up: every
         measured loadgen step has update achieved/offered >= 0.95, no saturated/aborted step (steps.jsonl); rows
-        published per round within +-15% of rows_per_round_target (when a target is set)
+        published per round within +-15% of rows_per_round_target (when a target is set), normalised by the samples
+        published in the window (v1.2.7, user 2026-10-17): rows_per_full_round = d(round_rows) / (d(published_seq) /
+        (R x T)), R = the configured update rate (manifest loadgen_args "--fixed update=R"), T = publish_us / 1e6 of
+        the t0 end snapshot; d(published_seq) on t0 = samples made visible by the rounds that fired in the window.
+        The plain window mean d(round_rows) / d(publish_rounds) is reported (rows_per_round_window_mean), not
+        checked: the server's round clock is not aligned to the window, so the first round may be partly fed
   hw    op.query.c_ns and op.row_update.c_ns deltas = 0 (all-HWcc has no coherence actions)
   pop   op.coh_src pc_threads > 0 on both nodes (swmc_acct live) and row_update C > 0
   mg    op.coh_src mg_threads > 0 on both nodes, query C > 0, row_update C > 0, anchor read parts > 0;
@@ -102,11 +107,34 @@ def main():
                      f'update_rate_sustained={vals["update_rate_sustained"]})')
     tgt = e0.get('rows_per_round_target', 0)
     if vals['publish_rounds'] > 0 and tgt > 0:
-        per = vals['round_rows'] / vals['publish_rounds']
-        vals['rows_per_round'] = round(per)
+        vals['rows_per_round_window_mean'] = round(vals['round_rows'] / vals['publish_rounds'])
         vals['rows_per_round_target'] = tgt
-        if abs(per - tgt) > 0.15 * tgt:
-            fails.append(f'rows per round {per:.0f} vs target {tgt} (> 15% off: Ekko operating point not met)')
+        rate = None
+        try:
+            for line in open(os.path.join(m, 'manifest.txt')):
+                if line.startswith('loadgen_args='):
+                    a = line.split()
+                    for i, x in enumerate(a[:-1]):
+                        if x == '--fixed':
+                            for tok in a[i + 1].split(","):
+                                if tok.startswith("update="):
+                                    rate = float(tok.split("=", 1)[1])
+        except (OSError, ValueError):
+            rate = None
+        t_s = e0.get('publish_us', 0) / 1e6
+        pub = d0('published_seq')
+        vals['samples_published'] = pub
+        if not rate or rate <= 0 or t_s <= 0 or pub <= 0:
+            fails.append(f'rows per round: cannot normalise (update rate {rate}, T {t_s} s, samples published {pub})')
+        else:
+            per_t = rate * t_s
+            per = vals['round_rows'] / (pub / per_t)
+            vals['samples_per_T'] = round(per_t, 1)
+            vals['full_round_equiv'] = round(pub / per_t, 3)
+            vals['rows_per_full_round'] = round(per)
+            vals['rows_per_full_round_vs_target_pct'] = round((per / tgt - 1) * 100, 1)
+            if abs(per - tgt) > 0.15 * tgt:
+                fails.append(f'rows per full round {per:.0f} vs target {tgt} (> 15% off: Ekko operating point not met)')
     cq, cu = op_c_window(b1, e1, 'query'), op_c_window(b0, e0, 'row_update')
     vals['query_C_ms_per_q'] = round(cq / vals['queries'] / 1e6, 4) if vals['queries'] > 0 else ''
     vals['row_update_C_ns_total'] = round(cu)
