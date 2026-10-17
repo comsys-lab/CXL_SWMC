@@ -102,14 +102,30 @@ stop_servers() {  # this block's servers only: every session dir's guest run dir
       $SSH comsys@$ip "for k in 0 1; do [ -e $g/node\$k.pid ] && $VM_PLAIN/bin/recsys-node.sh stop $g \$k; done; true" < /dev/null 2>&1 \
         | sed "s|^|$ip $g |" >> "$E/rollback.out"
     done
-    $SSH comsys@$ip 'echo procs=$(pgrep -c -x recsys-server)' < /dev/null 2>&1 | sed "s/^/$ip /" >> "$E/rollback.out"
+    $SSH comsys@$ip "echo procs=\$($PCOUNT)" < /dev/null 2>&1 | sed "s/^/$ip /" >> "$E/rollback.out"
   done
 }
-servers_gone() { local ip; for ip in "${IPS[@]}"; do [ "$($SSH comsys@$ip 'pgrep -c -x recsys-server' < /dev/null)" = 0 ] || return 1; done; }
+# Count our servers by command line, not by comm: Megalon renames threads (e.g. "megalon-lib") and pgrep -x matches
+# the main thread's comm, so a renamed server would count 0. Every server we start runs "<dir>/bin/recsys-server"
+# (session nodes via recsys-node.sh under timeout, and the pop preload); the timeout wrapper matches too. The bracket
+# keeps the remote shell's own command line from matching.
+PCOUNT="pgrep -c -f -- '[/]bin/recsys-server( |\$)'"
+servers_gone() { local ip; for ip in "${IPS[@]}"; do [ "$($SSH comsys@$ip "$PCOUNT" < /dev/null)" = 0 ] || return 1; done; }
+# dax_free <tag>: no process holds /dev/dax0.0 on either VM (sudo -n fuser: rc 1 and no output = free; anything else,
+# incl. sudo denied or ssh failure, counts as not free: fail closed). Output kept in <E>/fuser-<tag>-<ip>.out
+dax_free() { local ip f rc ok=0
+  for ip in "${IPS[@]}"; do
+    f="$E/fuser-$1-$ip.out"
+    $SSH comsys@$ip 'sudo -n fuser /dev/dax0.0' < /dev/null > "$f" 2>&1; rc=$?
+    echo "rc=$rc" >> "$f"
+    [ $rc = 1 ] && [ "$(wc -l < "$f")" = 1 ] || ok=1
+  done
+  return $ok; }
 shm_cleanup() {  # page MSI loaded (load attempted) and no "teardown PASS"
   local r=$E/shm-pop
   [ -f "$r/load-vm0.txt" ] || return 0
   grep -q "teardown PASS" "$r/steps.log" 2>/dev/null && return 0
+  dax_free cleanup || { echo "CLEANUP FAILED: /dev/dax0.0 still in use or fuser not clean on a VM (see $E/fuser-cleanup-*.out); teardown not attempted (manual: P-popcorn packet §6)" | tee -a "$E/cleanup.out"; return 0; }
   echo "$(date -Is) cleanup teardown $r" >> "$E/cleanup.out"
   if ! env "${PS[@]}" bash $C8/p-popcorn-shm.sh teardown >> "$E/cleanup.out" 2>&1; then
     if grep -q "instr_enabled=1 missing" "$r/steps.log" 2>/dev/null; then
@@ -134,6 +150,7 @@ finish() {
   local procs_ok=1
   servers_gone || procs_ok=0
   [ $procs_ok = 1 ] || echo "$(date -Is) ROLLBACK FAIL: a recsys-server process survived on a VM (procs != 0; see $E/rollback.out)" | tee -a "$E/rollback.out"
+  dax_free rollback || echo "$(date -Is) ROLLBACK FAIL: /dev/dax0.0 in use (or fuser not clean) on a VM (see $E/fuser-rollback-*.out)" | tee -a "$E/rollback.out"
   dax_root_all
   [ $DAXOK = 1 ] && echo "$(date -Is) rollback: dax0.0 root:root 600 on both VMs" | tee -a "$E/rollback.out" \
     || echo "$(date -Is) ROLLBACK FAIL: dax0.0 not root:root 600 on every VM (see $E/rollback.out)" | tee -a "$E/rollback.out"
@@ -159,6 +176,7 @@ dax_comsys() {  # before an all-HWcc / Megalon session
 }
 dax_root() {  # before the page MSI lifetime (no server of ours runs then)
   servers_gone || stop "a recsys-server runs before page MSI"
+  dax_free pre-shm-load || stop "/dev/dax0.0 in use before the cxl_shm load"
   [ $CHOWNED = 1 ] || return 0
   dax_root_all; CHOWNED=0
   [ $DAXOK = 1 ] || stop "dax0.0 not back to root:root 600 before page MSI"
@@ -304,6 +322,7 @@ system() {  # one server lifetime: hw | pop | mg
   if [ $s = pop ]; then
     env "${PS[@]}" STATUS_TAG=post bash $C8/p-popcorn-shm.sh status
     servers_gone || stop "servers left (page MSI teardown not attempted)"
+    dax_free pre-teardown || stop "/dev/dax0.0 in use before the cxl_shm teardown"
     env "${PS[@]}" bash $C8/p-popcorn-shm.sh teardown || stop "shm teardown"
     grep -q "teardown PASS" "$E/shm-pop/steps.log" || stop "no teardown PASS"
   fi
@@ -324,7 +343,8 @@ if [ -n "${V1_EXPECT_RATE:-}" ]; then  # the packet's expected rate (Host calibr
     || stop "update rate $UPD_RATE differs from the expected $V1_EXPECT_RATE by more than 2%"
 fi
 echo "EKKO=$EKKO publish_frac=$PUBLISH_FRAC update_rate=$UPD_RATE samples/s ($EKKO_RULE; $RATEF)"
-LGC=(--opt samples=$D/$UPD_FILE --opt queries=$D/$QRY_FILE --opt wrap=1
+# seq_base and wrap=1 are appended by session.sh measure (it refuses them from the caller)
+LGC=(--opt samples=$D/$UPD_FILE --opt queries=$D/$QRY_FILE
      --opt quantiles=$D/dist_quantile.txt --fixed update=$UPD_RATE --mix query=1 --x-stream query)
 if [ $BLOCK = main ] && [[ " ${SYSTEMS:-hw pop mg} " != *" hw "* ]]; then
   echo "slo_ms=$SLO_MS pct=$SLO_PCT rule=$SLO_RULE (fixed; no all-HWcc in this block)" | tee "$E/slo.txt"
