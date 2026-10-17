@@ -11,6 +11,12 @@
 #   (guest tools dir), RECV_MODE (poll | idle | sleep). As the KV pilot: cxl_shm loaded and coherence ENABLED
 #   (init_state=shared) before lmdb-server starts, so node 0's image copy and every warm-up read run under coherence (no
 #   --preload-only); /dev/dax0.0 must be root:root 600 before (p-popcorn-shm.sh chown/teardown own it).
+#   h1life = H1-HOOK v2 lifetime: H1_PARTS ("slo fix" | "slo" | "fix") in ONE server lifetime (run.sh PARTS). slo = the
+#   KIND=slo search (part dir <run>/slo); fix = settle H1_SETTLE_S s at L2 (loadgen --warmup-s, discarded) + the L2 and L1
+#   windows (5 s step warm-up + 30 s each, KIND=fix's window, no SLO abort; part dir <run>/fix). Fix rates: RATES=<L2>,<L1>
+#   or FIX_RATES_CMD (a command run before the fix part that prints "<L2> <L1>", e.g. the H1 levels callback; non-zero =
+#   the run stops). Results: <run>/<part>/..., <run>/fix/fix-steps.txt ("<L2 step>,<L1 step>"). NOTE (exit 0): an slo
+#   part note, an aborted fixed window, a Megalon wmeta_reclaim attributable to slo-part steps only (KV).
 # optional: RECORDS (1000000), MAX_PAGES (600000), GET_THREADS (8), READERS (32), PREPARE_THREADS (Megalon node 0: 8),
 #   SEED (20261016), LOG (0; 1 = loadgen log=1 + check_log.py, functional runs), GATE=0 (skip the Host gate; refused
 #   unless KIND=functional), VM_PLAIN (/home/comsys/lmdb/plain), VM_MEG (/home/comsys/lmdb/megalon), IMAGE
@@ -56,9 +62,10 @@ esac
 #   method, user decision 2026-10-17; recorded in the run manifest via node_env)
 [ -z "${COH_TIMERS:-}" ] || { [[ $COH_TIMERS =~ ^[01]$ ]] && [ "$SYS" = Megalon ]; } || stop "COH_TIMERS=0|1 is for SYS=Megalon only"
 [ -z "${COH_TIMERS:-}" ] || export NODE_ENV="ENV:MEGALON_COH_TIMERS=$COH_TIMERS"
-SLO_ARG=mixed:99:1; [[ $KIND =~ ^(fix|fix2|ladder)$ ]] && SLO_ARG=mixed:99:600000  # fix, ladder: no SLO abort (judged after)
+SLO_ARG=mixed:99:1; [[ $KIND =~ ^(fix|fix2|ladder)$ ]] && SLO_ARG=mixed:99:600000
+SLOA=(--slo "$SLO_ARG"); [ "$KIND" = h1life ] && SLOA=()  # h1life: each part sets its own SLO arg  # fix, ladder: no SLO abort (judged after)
 LG=(--opt records=$RECORDS --opt update_ratio=$UPDATE_RATIO --opt seed=$SEED --opt log=$LOG --seed "$SEED" --mix mixed=1
-    --slo $SLO_ARG --x-stream mixed)
+    "${SLOA[@]}" --x-stream mixed)
 case "$KIND" in
   functional) LG+=(--mode fixed --rates ${RATES:-200,1000} --warmup-s 10 --step-warmup-s 5 --step-measure-s 30 --drain-s 10);;
   pslo) LG+=(--raw --mode slo --start 500 --factor 1.5 --precision 0.05 --max-steps 25 --warmup-s 10 --step-warmup-s 2
@@ -70,6 +77,27 @@ case "$KIND" in
   fix2) [[ ${RATES:?} =~ ^[0-9]+,[0-9]+$ ]] || stop "fix2 needs RATES=<L2>,<L1> (integers)"  # H1 fixed phase: one lifetime, L2 then L1
         LG+=(--raw --mode fixed --rates "$RATES" --warmup-s 10 --step-warmup-s 5 --step-measure-s 30 --drain-s 10);;
   fix) : "${RATE:?}"; LG+=(--raw --mode fixed --rates "$RATE" --warmup-s 10 --step-warmup-s 5 --step-measure-s 30 --drain-s 10);;
+  h1life) [[ ${H1_PARTS:-} =~ ^(slo|fix|slo\ fix)$ ]] || stop "h1life needs H1_PARTS = slo | fix | 'slo fix'"
+    [[ ${H1_SETTLE_S:-} =~ ^[1-9][0-9]*$ ]] || stop "h1life needs H1_SETTLE_S"
+    [ -z "${RATES:-}" ] || [[ $RATES =~ ^[0-9]+,[0-9]+$ ]] || stop "h1life RATES must be <L2>,<L1> (integers)"
+    [[ $H1_PARTS != *fix* ]] || [ -n "${RATES:-}" ] || [ -n "${FIX_RATES_CMD:-}" ] || stop "h1life fix part needs RATES or FIX_RATES_CMD"
+    PARTS_SH=$E/$NAME.parts.sh
+    [ -e "$PARTS_SH" ] && stop "$PARTS_SH exists"
+    { echo '#!/bin/bash'
+      echo "# H1-HOOK v2 part args of $NAME (written by pilot-run.sh KIND=h1life; called by run.sh before each part)"
+      echo 'set -uo pipefail'
+      echo 'RD=$2'
+      echo 'case $1 in'
+      echo "  slo) printf '%s\\n' --slo mixed:99:1 --raw --mode slo --start 500 --factor 1.5 --precision 0.05 --max-steps 25 --warmup-s 10 --step-warmup-s 3 --step-measure-s 15 --drain-s 5 --confirm-s 30 --confirm-reps 3 --fill 0.7,0.8,0.9 --overload 1.05,1.1,1.2;;"
+      echo "  fix) R='${RATES:-}'"
+      echo "       if [ -z \"\$R\" ]; then o=\$(${FIX_RATES_CMD:-false}) || { echo \"levels callback failed (rc \$?)\" >&2; exit 1; }"
+      echo "         set -- \$o; [ \$# = 2 ] || { echo \"levels callback output '\$o'\" >&2; exit 1; }; R=\$1,\$2; fi"
+      echo "       [[ \$R =~ ^[1-9][0-9]*,[1-9][0-9]*\$ ]] || { echo \"bad fix rates '\$R' (integers <L2>,<L1>)\" >&2; exit 1; }"
+      echo "       echo \"\$R\" > \"\$RD/fix/rates.txt\""
+      echo "       printf '%s\\n' --slo mixed:99:600000 --raw --mode fixed --rates \"\$R\" --warmup-s $H1_SETTLE_S --step-warmup-s 5 --step-measure-s 30 --drain-s 10;;"
+      echo '  *) echo "bad part $1" >&2; exit 2;;'
+      echo 'esac'; } > "$PARTS_SH"
+    export PARTS="$H1_PARTS" PART_ARGS_CMD="$PARTS_SH";;
   *) stop "bad KIND";;
 esac
 SSH="ssh -o BatchMode=yes -o ConnectTimeout=8"
@@ -124,6 +152,42 @@ for k in 0 1; do  # clean stop and the workload's own invariants
   grep -q "lmdb-server: stopping" $L || stop "node$k: no clean stop"
   for kv in get_not_found=0 get_errors=0 update_not_found=0 update_errors=0; do grep -q "^$kv\$" $L || stop "node$k: $kv violated"; done
 done
+if [ "$KIND" = h1life ]; then  # H1-HOOK v2: checks per part of this one lifetime (node-level checks above)
+  NOTES=()
+  for part in $H1_PARTS; do
+    PD=$R/$part
+    grep -q "^part=$part end=" $R/manifest.txt || stop "$part: part did not run ($(grep "^part=$part" $R/manifest.txt | tail -n 1); $(tail -n 3 $PD/args.err 2>/dev/null | tr '\n' ' '))"
+    [ -s $PD/loadgen/summary.json ] && [ -s $PD/loadgen/steps.jsonl ] || stop "$part: no loadgen summary/steps"
+    grep -q 'workload_finish":"ok' $PD/loadgen/summary.json || stop "$part: loadgen workload finish"
+    for kv in not_found=0 errors=0 bad_values=0 stale_snapshots=0; do grep -q "^$kv\$" $PD/loadgen/lmdb.txt || stop "$part value check: $kv violated"; done
+    [ -s $PD/stats-steps.csv ] && [ "$(wc -l < $PD/stats-steps.csv)" -ge 2 ] || stop "$part: no stats-steps.csv rows"
+    [ -s $PD/opsplit.csv ] && [ "$(wc -l < $PD/opsplit.csv)" -ge 2 ] || stop "$part: no opsplit.csv rows"
+    prc=$(sed -n "s/^part=$part end=.* loadgen_rc=//p" $R/manifest.txt | tail -n 1)
+    if [ $part = slo ]; then
+      note=$(python3 -B -c 'import json,sys; print(json.load(open(sys.argv[1])).get("note",""))' $PD/loadgen/summary.json 2>/dev/null)
+      if [ "$prc" != 0 ]; then [ -n "$note" ] || stop "slo part loadgen rc $prc"; NOTES+=("slo: $note"); fi
+    else
+      [ "$prc" = 0 ] || stop "fix part loadgen rc $prc"
+      python3 -B - $PD/loadgen/steps.jsonl > $PD/ladder-result.txt <<'EOP' || stop "fix part steps"
+import json, sys
+st = [json.loads(l) for l in open(sys.argv[1]) if l.strip()]
+st = [s for s in st if s["phase"] == "fixed" and s.get("measure_s", 0) > 0]
+assert len(st) == 2, f"expected the L2 and L1 windows, got {len(st)} fixed steps"
+print("step offered_x achieved p50_ms p90_ms p99_ms max_ms done aborted reason")
+for s in st:
+    m = s["streams"]["mixed"]
+    print(s["step"], s["offered_x"], m["achieved"], m["p50_ms"], m.get("p90_ms"), m["p99_ms"], m["max_ms"], m.get("done"),
+          str(s["aborted"]).lower(), (s["reason"] or "-").replace(" ", "_"))
+EOP
+      awk 'NR>1 {printf "%s%s", (n++ ? "," : ""), $1} END {print ""}' $PD/ladder-result.txt > $PD/fix-steps.txt
+      awk -v r="$(tr -d '\n' < $PD/rates.txt)" 'BEGIN {split(r, w, ",")} NR>1 {i++; if ($2 + 0 != w[i] + 0) bad = 1} END {exit (bad || i != 2)}' $PD/ladder-result.txt \
+        || stop "fix part offered rates != rates.txt ($(tr -d '\n' < $PD/rates.txt))"
+      awk 'NR>1 && $9=="true"' $PD/ladder-result.txt | grep -q . && NOTES+=("fix: window aborted ($(awk 'NR>1 && $9=="true" {print $1":"$10}' $PD/ladder-result.txt | tr '\n' ' '))")
+    fi
+  done
+  [ ${#NOTES[@]} = 0 ] && { echo "PILOTRUN $NAME OK"; exit 0; }
+  echo "PILOTRUN $NAME NOTE $(IFS=';'; echo "${NOTES[*]}")"; exit 0
+fi
 for kv in not_found=0 errors=0 bad_values=0 stale_snapshots=0; do grep -q "^$kv\$" $R/loadgen/lmdb.txt || stop "value check: $kv violated"; done
 { echo "# load times $NAME (s)"; echo "run_wall_s=$(( $(date +%s) - T0 ))"
   grep -h "loaded image\|published\|warm-up read\|READY node\|opsplit" $R/node*.log; grep -h "^start=\|^end=" $R/manifest.txt; } > $R/load-times.txt

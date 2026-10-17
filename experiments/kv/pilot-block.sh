@@ -18,22 +18,17 @@
 #        mix (put 0.05, 0.8) one ladder run (low rate, ~0.5 x v5 pilot max), closure checks v1-check.py after each.
 #   idle: low-rate latency check: one all-HWcc ladder run (KIND=ladder, RATES, KEYS) tagged CTAG (Host C-state setting,
 #        recorded from sysfs before the run).
-#   h1: H1-HOOK v1 (experiments/h1/README.md, reports/H1-main-packet.md; env from experiments/h1/hook.sh): H1MODE slo|fix,
-#        H1_N (round), H1_SEED (loadgen seed, same for every system of the round), H1_PARENT_LOCK=H1-main (the lock file
-#        must name owner=H1-main; this block never locks or unlocks), H1_MIXES "<mix>=PUT_RATIO=<0.05|0.5|0.8> ..." (slo)
-#        or H1_LEVELS (levels.tsv; fix), PRETOUCH_DIR, MEASURE_ENV_DIR, EXPECT_DAX_UUID. Mix tags u5/u50/u80 = get/put
-#        95/5, 50/50, 20/80 (MOT1 v6), 54M keys, batch 16, Zipf 0.99, p99 < 1 ms per request.
-#        slo: per system hw, pop, mg (timers on; base order = shuffle seed "H1-kv-r1" rotated left by N-1: Latin square
-#             over rounds) and per mix (shuffle seed "H1-kv-r<N>-<sys>"): one pilot-run.sh KIND=slo run
-#             <sys>-<mix>-slo-r<N> (MOT1 §3.3: ramp from 500 x1.5, bisect 5 %, confirm 3 x 30 s, fill 0.7/0.8/0.9,
-#             overload 1.05/1.1/1.2; every step kept). A loadgen note (e.g. "confirm failed at three rates") = NOTE.
-#        fix: per levels.tsv row (mix) and per system hw, pop, mg, mgoff (shuffle seed "H1-kv-fix-r<N>-<mix>"): one
-#             lifetime pilot-run.sh KIND=fix2 RATES=<L2_rate>,<L1_rate> (two windows 10 s + 5 s + 30 s, no SLO abort; an
-#             aborted window = NOTE) <sys>-<mix>-fix-r<N>; mgoff = Megalon with MEGALON_COH_TIMERS=0 (Fig 2 C_diff).
-#        Per run: pretouch check, Host gate (pilot-run), pilot-run's checks (clean stop, value checks, Megalon
-#        wmeta_reclaim 0, opsplit), v1-check.py (mgoff: --timers off; --loadgen-steps: row checks of failed/overload
-#        steps are NOTEs), dmesg rule -> <run>/h1-runcheck.txt (last line RUNCHECK PASS [NOTE ...]); <dir>/h1-runs.tsv.
-#        Installs: the KV-V1 guest dirs (KV_INSTALL=0; precheck compares every file with the builds).
+#   h1: H1-HOOK v2 (experiments/h1/README.md, reports/H1-main-packet.md v0.3; env from experiments/h1/hook.sh): one call per
+#        round, H1MODE r1|cont, H1_N, H1_SEED, H1_MIXES "<mix>=PUT_RATIO=<0.05|0.5|0.8> ...", H1_SETTLE_S (30 s), r1:
+#        H1_LEVELS_CMD (+ its env), cont: H1_LEVELS; H1_PARENT_LOCK=H1-main (the lock file must name owner=H1-main; this
+#        block never locks or unlocks), PRETOUCH_DIR, MEASURE_ENV_DIR, EXPECT_DAX_UUID. Lifetimes, parts, order and
+#        h1-runs.tsv: experiments/kv/h1v2-lib.sh (each lifetime = one pilot-run.sh KIND=h1life with parts slo and/or fix;
+#        fix = settle at L2 + L2 window + L1 window of 5 s + 30 s; mgoff = MEGALON_COH_TIMERS=0). Mix tags u5/u50/u80 =
+#        get/put 95/5, 50/50, 20/80 (MOT1 v6), 54M keys, batch 16, Zipf 0.99, p99 < 1 ms per request.
+#        Per lifetime: pretouch check, Host gate (pilot-run), pilot-run's checks (clean stop, value checks per part,
+#        Megalon wmeta_reclaim: NOTE if only in slo-part steps, FAIL in the fix part), v1-check.py per part (mgoff
+#        --timers off; row checks of failed/overload steps are NOTEs), dmesg rule -> <lifetime>/h1-runcheck.txt.
+#        Installs: the KV-V1 guest dirs (KV_INSTALL=0; precheck compares every file with the builds). Marker H1-HOOK v2.
 #   hmtrace: only the traced 0.5 windows of all-HWcc and Megalon (shuffled) at L from an earlier hm block (LREF), e.g.
 #        after an hm block that stopped at its ptrace runs.
 # env: MEGALON_BUILD_N (75 = CohSnap incl. the KV path + AnchorSnap; the Megalon build the kv-megalon
@@ -66,11 +61,14 @@ CFG=${KV_CFG:?KV_CFG = the megalon.yaml install.sh wrote (<install log>.megalon.
 SSH="ssh -o BatchMode=yes -o ConnectTimeout=8"
 IPS=(192.168.122.100 192.168.122.101)
 OWNER="KV-pilot-$B"; [ "$B" = main ] && OWNER="KV-main-h1"; [ "$B" = v1val ] && OWNER="KV-V1-v1"
-if [ "$B" = h1 ]; then  # H1-HOOK v1: parent lock, mode, round, seed
+if [ "$B" = h1 ]; then  # H1-HOOK v2: parent lock, mode, round, seed, settle
   [ "${H1_PARENT_LOCK:-}" = H1-main ] || { echo "SEQUENCE STOP: h1 needs H1_PARENT_LOCK=H1-main"; exit 2; }
-  [[ "${H1_N:-}" =~ ^[1-9]$ ]] && [[ "${H1_SEED:-}" =~ ^[0-9]+$ ]] || { echo "SEQUENCE STOP: H1_N / H1_SEED"; exit 2; }
-  case "${H1MODE:-}" in slo) : "${H1_MIXES:?}";; fix) [ -f "${H1_LEVELS:-}" ] || { echo "SEQUENCE STOP: no H1_LEVELS"; exit 2; };;
-    *) echo "SEQUENCE STOP: bad H1MODE"; exit 2;; esac
+  [[ "${H1_N:-}" =~ ^[1-9]$ ]] && [[ "${H1_SEED:-}" =~ ^[0-9]+$ ]] && [[ "${H1_SETTLE_S:-}" =~ ^[1-9][0-9]*$ ]] \
+    || { echo "SEQUENCE STOP: H1_N / H1_SEED / H1_SETTLE_S"; exit 2; }
+  : "${H1_MIXES:?}"
+  case "${H1MODE:-}" in r1) : "${H1_LEVELS_CMD:?r1 needs H1_LEVELS_CMD}";; cont) [ -f "${H1_LEVELS:-}" ] || { echo "SEQUENCE STOP: no H1_LEVELS"; exit 2; };;
+    *) echo "SEQUENCE STOP: bad H1MODE (r1|cont)"; exit 2;; esac
+  for spec in $H1_MIXES; do [[ $spec =~ ^u(5|50|80)=PUT_RATIO=0\.(05|5|8)$ ]] || { echo "SEQUENCE STOP: bad mix spec $spec"; exit 2; }; done
   [ "${KV_INSTALL:-0}" = 0 ] || { echo "SEQUENCE STOP: h1 reuses the validation install (KV_INSTALL=0)"; exit 2; }
   : "${PRETOUCH_DIR:?h1 needs PRETOUCH_DIR}" "${EXPECT_DAX_UUID:?h1 needs EXPECT_DAX_UUID}" "${MEASURE_ENV_DIR:?h1 needs MEASURE_ENV_DIR}"
   export MEASURE_ENV_DIR
@@ -317,15 +315,15 @@ case "$B" in
         --workload kv --out "$E/cdiff-$m.txt" >> "$E/v1-check.log" 2>&1 || { echo "$(date -Is) SEQUENCE STOP: cdiff $m"; exit 1; }
       tail -n 1 "$E/cdiff-$m.txt"
     done;;
-  h1)  # H1-HOOK v1 (see the header): H1 main SLO or fixed phase
+  h1)  # H1-HOOK v2 (see the header; orchestration in experiments/kv/h1v2-lib.sh)
     : "${C8:?}" "${GT8:?}" "${RECV_MODE:?}" "${KEYS:?}"
-    h1shuf() { python3 -B -c 'import random,sys; v=sys.argv[2:]; random.Random(sys.argv[1]).shuffle(v); print(" ".join(v))' "$@"; }
+    H1W=kv V1CHECK=$X/v1-check.py
     H1BAD='BUG:|Oops|WARNING:|Call Trace|general protection|segfault|[Ee]rror|ERROR|soft lockup|hung_task'
     h1dcount() { local c; c=$($SSH comsys@${IPS[$1]} 'dmesg | wc -l' < /dev/null 2>/dev/null) || return 1; [[ $c =~ ^[0-9]+$ ]] || return 1; echo "$c"; }
     for i in 0 1; do
       c=$(h1dcount $i) || { echo "SEQUENCE STOP: dmesg baseline vm$i"; exit 1; }; echo "$c" > "$E/dmesg-base-vm$i.txt"
     done
-    h1dmesg() {  # <run>: new dmesg lines since the block start must not match H1BAD (validation packets' dmesg rule)
+    h1_dmesg() {  # <lifetime>: new dmesg lines since the block start must not match H1BAD (validation packets' dmesg rule)
       local i n c
       for i in 0 1; do
         n=$(cat "$E/dmesg-base-vm$i.txt"); c=$(h1dcount $i) || { echo "$(date -Is) SEQUENCE STOP: dmesg vm$i after $1"; exit 1; }
@@ -336,69 +334,21 @@ case "$B" in
           && { echo "$(date -Is) SEQUENCE STOP: new dmesg error/warning on vm$i after $1: $(grep -E "$H1BAD" "$E/dmesg-new-$1-vm$i.txt" | head -2)"; exit 1; }
       done; true
     }
-    h1u() { case $1 in PUT_RATIO=0.05) echo 0.05;; PUT_RATIO=0.5) echo 0.5;; PUT_RATIO=0.8) echo 0.8;;
-            *) echo "SEQUENCE STOP: bad mix parameter $1" >&2; return 1;; esac; }
-    h1run() {  # <sys> <mix> <phase> <env...>: one run + per-run checks + h1-runcheck.txt + h1-runs.tsv line
-      local s=$1 m=$2 ph=$3 name=$1-$2-$3-r$H1_N st v1 tm=on SE; shift 3
-      parent_lock_check
-      ptcheck "$name"
+    h1_pilot() {  # <lifetime> <sys> <env...>: one pilot-run.sh call of that system (run() stops the block on a STOP)
+      local life=$1 s=$2 SE; shift 2
       case $s in
-        hw)    [ $CHOWNED = 1 ] || dax_comsys_all; SE=(SYS=all-HWcc); sysv=all-HWcc;;
-        mg)    [ $CHOWNED = 1 ] || dax_comsys_all; SE=(SYS=Megalon COH_TIMERS=1); sysv=Megalon;;
-        mgoff) [ $CHOWNED = 1 ] || dax_comsys_all; SE=(SYS=Megalon COH_TIMERS=0); sysv=Megalon; tm=off;;
+        hw)    [ $CHOWNED = 1 ] || dax_comsys_all; SE=(SYS=all-HWcc);;
+        mg)    [ $CHOWNED = 1 ] || dax_comsys_all; SE=(SYS=Megalon COH_TIMERS=1);;
+        mgoff) [ $CHOWNED = 1 ] || dax_comsys_all; SE=(SYS=Megalon COH_TIMERS=0);;
         pop)   if [ $CHOWNED = 1 ]; then dax_root_all || { echo "SEQUENCE STOP: dax0.0 not back to root:root 600 before Popcorn"; exit 1; }; CHOWNED=0; fi
-               SE=(SYS=Popcorn C8=$C8 K8=$K8 GT8=$GT8 RECV_MODE=$RECV_MODE); sysv=Popcorn;;
+               SE=(SYS=Popcorn C8=$C8 K8=$K8 GT8=$GT8 RECV_MODE=$RECV_MODE);;
       esac
-      run $name "${SE[@]}" KEYS=$KEYS SEED=$H1_SEED "$@"
-      st=$(grep -h "^PILOTRUN $name " "$E/runs.log" | tail -n 1)
-      [[ "$st" =~ ^PILOTRUN\ $name\ (OK|NOTE) ]] || { echo "SEQUENCE STOP: $name no PILOTRUN OK/NOTE"; exit 1; }
-      v1=$(python3 -I -B $X/v1-check.py "$E/$name" --system $sysv --timers $tm --workload kv --loadgen-steps "$E/$name/loadgen/steps.jsonl")
-      echo "$name $v1" >> "$E/v1-check.log"
-      [[ "$v1" == "V1 CHECK PASS"* ]] || { echo "$(date -Is) SEQUENCE STOP: v1-check $name: $v1"; exit 1; }
-      h1dmesg "$name"
-      { echo "# H1 per-run checks $name (system $s, mix $m, phase $ph, round $H1_N, seed $H1_SEED; pilot-block.sh h1, H1-HOOK v1)"
-        echo "$st"
-        echo "v1-check: $v1"; grep -h "^NOTE \|^WARN " "$E/$name/v1-check.txt" | sed 's/^/v1-check: /' | cut -c1-400
-        echo "pretouch: $(tail -n 1 "$E/pretouch-check-$name.txt")"
-        echo "dmesg: no new error/warning lines on vm0/vm1 since the block start"
-        echo "loadgen: $(python3 -I -B -c 'import json,sys; s=json.load(open(sys.argv[1])); print("workload_finish", s.get("workload_finish"), "note", repr(s.get("note", "")))' "$E/$name/loadgen/summary.json")"
-        echo "kernel: $(grep -h '^node0=' "$E/$name/manifest.txt")"
-      } > "$E/$name/h1-runcheck.txt"
-      grep -q "^loadgen: workload_finish ok" "$E/$name/h1-runcheck.txt" && [ -s "$E/$name/opsplit.csv" ] \
-        || { echo "SEQUENCE STOP: $name run checks incomplete"; exit 1; }
-      if [[ "$st" =~ \ NOTE\  ]] || [[ "$v1" == *"(notes:"* ]]; then
-        nt=""; [[ "$st" =~ \ NOTE\  ]] && nt="${st#PILOTRUN $name NOTE }"; [[ "$v1" == *"(notes:"* ]] && nt="${nt:+$nt; }v1-check${v1#V1 CHECK PASS}"
-        echo "RUNCHECK PASS (NOTE: $nt)" >> "$E/$name/h1-runcheck.txt"
-      else echo "RUNCHECK PASS" >> "$E/$name/h1-runcheck.txt"; fi
-      printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$name" "$s" "$m" "$ph" "$H1_N" "$name" >> "$E/h1-runs.tsv"
+      run $life "${SE[@]}" KEYS=$KEYS "$@" < /dev/null
     }
-    printf '# name\tsystem\tmix\tphase\tround\trun_dir\n' > "$E/h1-runs.tsv"
-    if [ "$H1MODE" = slo ]; then
-      base=($(h1shuf H1-kv-r1 hw pop mg)); rot=$(( (H1_N - 1) % 3 ))
-      ord=$(echo "${base[@]:$rot} ${base[@]:0:$rot}")
-      mixes=""; for spec in $H1_MIXES; do mixes="$mixes ${spec%%=*}"; h1u "${spec#*=}" > /dev/null || exit 1; done
-      { echo "# H1 KV SLO round $H1_N (systems: base shuffle seed H1-kv-r1 rotated left by $rot; mixes per system: shuffle seed H1-kv-r$H1_N-<sys>; loadgen seed $H1_SEED; keys $KEYS batch 16)"
-        echo "systems: $ord"; for s in $ord; do echo "mixes $s: $(h1shuf H1-kv-r$H1_N-$s $mixes)"; done; echo "H1_MIXES: $H1_MIXES"; } | tee "$E/order.txt"
-      for s in $ord; do
-        for m in $(h1shuf H1-kv-r$H1_N-$s $mixes); do
-          for spec in $H1_MIXES; do [ "${spec%%=*}" = "$m" ] && u=$(h1u "${spec#*=}"); done
-          h1run $s $m slo PUT_RATIO=$u KIND=slo
-        done
-      done
-    else
-      { echo "# H1 KV fixed phase rep $H1_N (levels $H1_LEVELS; systems per mix: shuffle seed H1-kv-fix-r$H1_N-<mix>; loadgen seed $H1_SEED; windows L2 then L1)"
-        tail -n +2 "$H1_LEVELS" | while IFS=$'\t' read -r mix rest; do echo "$mix: $(h1shuf H1-kv-fix-r$H1_N-$mix hw pop mg mgoff)"; done; } | tee "$E/order.txt"
-      while IFS=$'\t' read -r -a f; do
-        mix=${f[0]} l1=${f[8]} l2=${f[9]}
-        case $mix in u5) u=0.05;; u50) u=0.5;; u80) u=0.8;; *) echo "SEQUENCE STOP: levels mix $mix"; exit 1;; esac
-        [[ $l1 =~ ^[1-9][0-9]*$ ]] && [[ $l2 =~ ^[1-9][0-9]*$ ]] || { echo "SEQUENCE STOP: levels $mix rates $l2/$l1 (integers expected)"; exit 1; }
-        for s in $(h1shuf H1-kv-fix-r$H1_N-$mix hw pop mg mgoff); do
-          h1run $s $mix fix PUT_RATIO=$u KIND=fix2 RATES=$l2,$l1 < /dev/null
-        done
-      done < <(tail -n +2 "$H1_LEVELS")
-    fi;;
+    . $X/h1v2-lib.sh
+    h1v2_main PUT_RATIO;;
   *) echo "SEQUENCE STOP: bad block"; exit 2;;
 esac
 ptcheck end
-[ "$B" = h1 ] && echo "$(date -Is) SEQUENCE DONE H1-kv $H1MODE r$H1_N ($(($(wc -l < "$E/h1-runs.tsv") - 1)) runs)"
+[ "$B" = h1 ] && echo "$(date -Is) SEQUENCE DONE H1-kv $H1MODE r$H1_N ($(($(wc -l < "$E/h1-runs.tsv") - 1)) entries)"
 echo "$(date -Is) SEQUENCE DONE $OWNER"

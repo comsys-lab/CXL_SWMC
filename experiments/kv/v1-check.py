@@ -3,7 +3,9 @@
 expected coherence source of the system.
 
 usage: v1-check.py RUN_DIR --system all-HWcc|Popcorn|Megalon [--timers on|off] [--workload kv|lmdb] [--megalon-lean 1|0]
-                   [--loadgen-steps STEPS_JSONL]
+                   [--loadgen-steps STEPS_JSONL] [--opsplit CSV] [--out TXT]
+--opsplit / --out (H1-HOOK v2 multi-part lifetimes): the part's opsplit.csv (default RUN_DIR/opsplit.csv) and the result
+file (default RUN_DIR/v1-check.txt); the node logs (clean-stop closure) are always RUN_DIR's (the lifetime's).
 --loadgen-steps (H1 SLO / fixed runs): row-level checks of steps that failed their SLO check or are overload steps (past
 the knee, steps.jsonl pass=false or phase=overload) are NOTEs, not FAILs (H1 hook rule: every step is kept; a saturated
 step may lose a side property such as C > 0 on a row); the closure, gauge and run-level checks stay FAILs.
@@ -36,6 +38,8 @@ ap.add_argument("--timers", choices=["on", "off"], default="on")
 ap.add_argument("--workload", choices=["kv", "lmdb"], default="kv")
 ap.add_argument("--megalon-lean", choices=["0", "1"], default="1")
 ap.add_argument("--loadgen-steps")
+ap.add_argument("--opsplit")
+ap.add_argument("--out")
 a = ap.parse_args()
 out, fails, warns, notes = [], [], [], []
 
@@ -83,7 +87,7 @@ for f in logs:
         y = sum(int(kv[c]) for c in ctrs) if all(c in kv for c in ctrs) else None
         check(x is not None and y is not None and int(x) == y, f"{f}: opt.{op}.ops {x} = {'+'.join(ctrs)} {y}")
     check(kv.get("opt.c_formula") == a.workload, f"{f}: opt.c_formula gauge present and = {a.workload} (got {kv.get('opt.c_formula')})")
-path = os.path.join(a.run, "opsplit.csv")
+path = a.opsplit or os.path.join(a.run, "opsplit.csv")
 rows = list(csv.DictReader(open(path))) if os.path.exists(path) else []
 check(bool(rows), "opsplit.csv has rows")
 T = lambda r: float(r["T_us_per_op[measured]"])
@@ -154,6 +158,6 @@ for r in rows:
 res = "V1 CHECK " + ("PASS" if not fails else "FAIL: " + "; ".join(fails)) + (f" (warnings: {len(warns)})" if warns else "") \
     + (f" (notes: {len(notes)})" if notes else "")
 out.append(res)
-open(os.path.join(a.run, "v1-check.txt"), "w").write("\n".join(out) + "\n")
+open(a.out or os.path.join(a.run, "v1-check.txt"), "w").write("\n".join(out) + "\n")
 print(res)
 sys.exit(1 if fails else 0)

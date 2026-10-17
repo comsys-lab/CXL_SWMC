@@ -18,6 +18,11 @@
 # Checks before starting: --opt keys=N equals --keys N; the guests' cfg/megalon.yaml has key_space/slots/
 #   logical_scr_size equal to `kv-server --print-sizes --keys N` (read-only).
 # Stops (and stops the servers) on the first error. Measurement hygiene: no Host build before/after (pgrep).
+# Multi-part lifetime (H1-HOOK v2): env PARTS="<part> ..." (e.g. "slo fix") and PART_ARGS_CMD (a script called as
+#   `bash $PART_ARGS_CMD <part> <run dir>` after the servers are READY and before each part; it prints that part's extra
+#   loadgen args, one per line; a non-zero exit stops the run: servers stopped, rc 1). Each part writes
+#   <run>/<part>/{loadgen/,loadgen.log,stats-steps.csv,opsplit.csv,steps.csv,slo.png,slo-points.txt}; the common args
+#   after -- are passed to every part. One server lifetime for all parts; node logs and manifest stay in <run>.
 set -euo pipefail
 export PYTHONDONTWRITEBYTECODE=1  # never write __pycache__ (harness snapshots live in recovery/); every python3 call also has -B
 NAME=$1 OUT=$2; shift 2; [ "${1:-}" = "--" ] && shift
@@ -116,11 +121,43 @@ cpu_snap() {  # guest CPU time counters (/proc/stat "cpu" line) per node, for bu
 TARGETS=$(printf '%s:'"$PORT"',' "${NODE[@]}"); TARGETS=${TARGETS%,}  # target order = node order (put writer = target)
 cpu_snap before
 LG_STATS=(); [ "$STATS_OP" = 0 ] || LG_STATS=(--stats-op "$STATS_OP")
+if [ -z "${PARTS:-}" ]; then
 set +e
 numactl --physcpubind="$LG_CPUS" --membind=1 "$LOADGEN" --workload kv --target "$TARGETS" --out "$RUN/loadgen" \
   "${LG_STATS[@]}" "$@" 2>&1 | tee "$RUN/loadgen.log"
 LG=${PIPESTATUS[0]}
 set -e
+else  # H1-HOOK v2: several loadgen parts in this one server lifetime (see the header)
+  : "${PART_ARGS_CMD:?PARTS needs PART_ARGS_CMD}"
+  part_post() {  # <part dir>: the per-step tables of one part (as the single-part run below)
+    [ -s "$1/loadgen/steps.jsonl" ] && [ -s "$1/loadgen/summary.json" ] || return 0
+    if [ -d "$1/loadgen/stats" ]; then
+      python3 -B "$ROOT/experiments/loadgen/stats_delta.py" "$1/loadgen" --out "$1/stats-steps.csv" || true
+    python3 -I -B "$ROOT/workloads/kv/tools/opsplit.py" "$1/loadgen" --system "$SYSTEM" --out "$1/opsplit.csv" || true
+    fi
+    python3 -B "$ROOT/experiments/loadgen/export_csv.py" --out "$1/steps.csv" "$1/loadgen=$SYSTEM" > /dev/null || true
+    python3 -B "$ROOT/experiments/loadgen/plot_slo.py" --out "$1/slo.png" "$1/loadgen=$SYSTEM" > "$1/slo-points.txt" 2>&1 || true
+  }
+  LG=0
+  for part in $PARTS; do
+    mkdir -p "$RUN/$part"
+    if ! bash "$PART_ARGS_CMD" "$part" "$RUN" > "$RUN/$part/args.txt" 2> "$RUN/$part/args.err"; then
+      echo "run $NAME: part $part args failed: $(tail -n 2 "$RUN/$part/args.err" | tr '\n' ' ')"
+      echo "part=$part args_failed $(date -Is)" >> "$RUN/manifest.txt"
+      stop_nodes; collect; exit 1
+    fi
+    mapfile -t PA < "$RUN/$part/args.txt"
+    echo "part=$part start=$(date -Is) args=${PA[*]}" >> "$RUN/manifest.txt"
+    set +e
+    numactl --physcpubind="$LG_CPUS" --membind=1 "$LOADGEN" --workload kv --target "$TARGETS" --out "$RUN/$part/loadgen" \
+      "${LG_STATS[@]}" "$@" "${PA[@]}" 2>&1 | tee "$RUN/$part/loadgen.log"
+    prc=${PIPESTATUS[0]}
+    set -e
+    echo "part=$part end=$(date -Is) loadgen_rc=$prc" >> "$RUN/manifest.txt"
+    [ "$LG" != 0 ] || LG=$prc
+    part_post "$RUN/$part"
+  done
+fi
 [ -z "${SERVER_CPUS:-}" ] || server_cpus check
 cpu_snap after
 stop_nodes
