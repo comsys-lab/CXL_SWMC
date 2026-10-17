@@ -36,6 +36,9 @@ WARN checks:
      vs r<n> (continuous) beyond max(5 %, 2 x run-to-run spread), C_diff beyond max(10 %, 2 x |dT_mg|); see compare().
      REPORT lines go to the user before r3; h1-accept.sh refuses them without --user-ack.
   W6 C_diff_ns < 0 on a row (message carries the Popcorn cross-check pop_T_minus_hw_ns vs its C and the analysis warn)
+  W7 per SLO run with the loadgen knee bracket (loadgen since 2026-10-18 "A+C"; older runs: no W7): confirm search
+     ended at the probe limit (summary confirm_search.finish "probe limit ...") or bracket rel_width > 5 % (hi/lo - 1);
+     the message names system, mix, rel_width, finish and whether the system is the mix's weakest (it defines L1/L2)
 usage: check.py --plan h1-plan.tsv --workload W --round n [--skip-fig2] E
 """
 import argparse, csv, json, os, sys
@@ -225,9 +228,11 @@ def main():
             and all(x["round"] == str(n) and x["life"] == want[(x["mix"], x["sys"])] for x in r)
         res("F", f"F1 {ph} runs complete", ok, f"{sorted((x['mix'], x['sys'], x['life']) for x in r)} vs {len(want)} expected")
         rs[ph] = r
-    xs = {}
+    xs, w7 = {}, []
     for r in rs["slo"]:
         s = js(os.path.join(r["dir"], "loadgen", "summary.json")) or {}
+        if "confirm_search" in s or "bracket" in s:
+            w7.append((r, s))
         st = jl(os.path.join(r["dir"], "loadgen", "steps.jsonl")) or []
         c = s.get("confirm", {})
         so = s.get("slo", {})
@@ -259,6 +264,16 @@ def main():
             sd = float(c.get("x_sd") or 0)
             res("W", f"W2 {r['name']} confirm spread", sd / float(c["x_mean"]) <= 0.05 and not c.get("fails"),
                 f"x_sd/x_mean {sd / float(c['x_mean']):.3f}, confirm fails {c.get('fails')}")
+    for r, s in w7:  # W7 knee bracket resolution (verifier MED-1 on v0.6.3: a wide bracket feeds levels.py L1/L2)
+        m = r["mix"]
+        fin = (s.get("confirm_search") or {}).get("finish") or ""
+        rw = (s.get("bracket") or {}).get("rel_width")
+        rw = rw if isinstance(rw, (int, float)) else None
+        weakest = min(SYSTEMS, key=lambda x: xs[(m, x)]) if all((m, x) in xs for x in SYSTEMS) else None
+        res("W", f"W7 {r['name']} knee bracket", not fin.startswith("probe limit") and (rw is None or rw <= 0.05),
+            f"{r['sys']} {m}: rel_width {rw}, finish '{fin}', "
+            + ("WEAKEST of the mix (defines L1/L2)" if weakest == r["sys"] else
+               f"not the weakest ({weakest})" if weakest else "weakest unknown"))
     idx = {x["name"]: x for x in (rows(os.path.join(S, "collect", "runs-index.csv")) or [])}
     for r in rs["slo"] + rs["fix"]:
         rc_ok = False

@@ -21,6 +21,7 @@
 #      the pgid check under setsid (it then stops at the real pretouch gate, which has a dummy dir; lock released)
 #   J  r1 skip: r1-vdb refused after a stopped r1-lmdb, starts after h1-accept.sh --skip lmdb (logged); --skip refused
 #      for an accepted stage, for r2 and twice; a skipped stage cannot be accepted; r2 still refuses
+#   K  check.py W7 (knee bracket at the probe limit or rel_width > 5 %, weakest named; legacy runs without the field: no W7)
 # Prints "SELFTEST PASS" or "SELFTEST FAIL <case>".
 set -uo pipefail
 O=${1:?out dir}
@@ -184,4 +185,24 @@ bash $H/h1-accept.sh "$O/J" 1 recsys selftest >> "$O/J.out" 2>&1 || fail "J acce
 stage J r2 --workloads kv && fail "J r2 ran with r1 lmdb skipped"
 grep -q "SEQUENCE STOP: r1 of lmdb not checked PASS + accepted" "$O/J.out" || fail "J r2 refusal reason"
 echo "J OK"
+# K W7 (verifier MED-1 on v0.6.3): copy of A's kv r1 with knee-bracket fields added: pop u50 (weakest) at the probe
+#   limit, mg u80 rel_width 0.06 -> two W7 WARNs (weakest named), hw u5 rel_width 0.01 -> OK; untouched legacy runs: no W7
+mkdir -p "$O/K" && cp -r "$O/A/kv" "$O/K/kv" || fail "K copy"
+python3 -I -B - "$O/K/kv/r1/run" <<'PY' || fail "K edit"
+import json, os, sys
+d = sys.argv[1]
+for name, cs, rw in (("pop-u50-slo-r1", "probe limit (hi/lo 1.0954 > 1 + 0.01)", 0.0954),
+                     ("mg-u80-r1", "bracket within confirm precision", 0.06), ("hw-u5-slo-r1", "first confirm passed", 0.01)):
+    p = os.path.join(d, name, "slo", "loadgen", "summary.json")
+    s = json.load(open(p))
+    s.update(confirmed=True, confirm_search={"finish": cs}, bracket={"lo_offered": 1, "hi_offered": 1 + rw, "rel_width": rw})
+    json.dump(s, open(p, "w"))
+PY
+python3 -B $H/check.py --plan $H/h1-plan.tsv --workload kv --round 1 --skip-fig2 "$O/K" > "$O/K.out" 2>&1
+C=$O/K/kv/r1/check.txt
+grep -q "^WARN W7 pop-u50-slo-r1 knee bracket: pop u50: rel_width 0.0954, finish 'probe limit .*WEAKEST of the mix" "$C" \
+  && grep -q "^WARN W7 mg-u80-r1-slo knee bracket: mg u80: rel_width 0.06, .*not the weakest (pop)" "$C" \
+  && grep -q "^OK   W7 hw-u5-slo-r1 knee bracket" "$C" && [ "$(grep -c "W7 " "$C")" = 3 ] \
+  && tail -n 1 "$C" | grep -q "^H1CHECK PASS" || fail "K W7 ($(grep W7 "$C"; tail -n 1 "$C"))"
+echo "K OK"
 echo "SELFTEST PASS"

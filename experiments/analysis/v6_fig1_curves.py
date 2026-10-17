@@ -137,9 +137,9 @@ def main():
         ("tags", f"achieved_per_s measured; {pname}_ms measured (the run's SLO percentile, loadgen pslo_ms); y_norm "
                  "derived; past_slo = pass false (SLO check failed; drawn as hollow markers, every one; overload-phase "
                  "steps form the dashed tail, filled when they pass)"),
-        ("knee", "max under SLO = confirm repeats at the confirmed max offered rate lo: mean x, median SLO percentile "
-                 "(diamond); error "
-                 "bar to x * hi / lo, hi = lowest failed offered rate above lo (knee bracket); " + "; ".join(kmeta)),
+        ("knee", f"max under SLO (x: mean of confirms, y: median {pname} of confirms; bar: knee bracket) = the confirm "
+                 "repeats at the confirmed max offered rate lo (diamond, legend 'Max under SLO (bar: knee bracket)'); "
+                 "bar to x * hi / lo, hi = lowest failed offered rate above lo; " + "; ".join(kmeta)),
         ("inputs", v6.inputs_line([(v6.SYSTEMS[k], r) for k, r in runs.items()])),
     ], ["system", "step", "phase", "offered", "achieved_per_s", f"{pname}_ms", "y_norm", "pass", "run", "past_slo"], rows)
     print(f"-> {png}\n-> {csvp}  (base {pname} {base} ms, SLO norm {slo_n:.3f})")

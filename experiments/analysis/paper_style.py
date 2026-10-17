@@ -33,7 +33,7 @@ def _nice_top(v):
     return v, v / 4
 
 
-KNEE_LABEL = "Max under SLO"  # legend of the knee markers (curve(knees=...))
+KNEE_LABEL = "Max under SLO (bar: knee bracket)"  # legend of the knee markers (curve(knees=...)); full text in the CSV
 
 
 def curve(path, series, slo, xlabel, ylabel, ylim, xticks, yticks, extend_y=True, clip_factor=2.0, knees=None):
