@@ -4,7 +4,7 @@
 Usage: p-popcorn-recv-summary.py <E>
 Reads <E>/r<rep>-<cfg>/{config.txt, s1, s2, s3} written by recovery/P-popcorn-recv13-v1/run.sh and writes
   <E>/results.csv   one row per (repeat, config, scenario): latency, owner H / W-H, coherence CPU, counters, hogs
-  <E>/summary.txt   mean +- sd per (config, scenario) over the repeats and the decision rule of
+  <E>/summary.txt   mean +- sd per (config, scenario) over the repeats (v1.1: 2 repeats; each repeat listed) and the decision rule of
                     reports/P-popcorn-recv-scaleout.md §5 (adopted by the user 2026-10-18) as computed checks
 Exit 1 if an expected file is missing (no partial summary).
 
@@ -13,7 +13,15 @@ Coherence CPU (seconds, per scenario window, delta of the post minus pre snapsho
              idle mode = the SCHED_IDLE watcher (reported apart as watcher_s, not counted as coherence CPU)
   busy_s     sum of instr consumer<i>_busy_ns (module 13 consumer work items, start -> return incl. spin)
   coh_s      = busy_s + (recv_s if recv_mode != idle else 0)
-S1/S2 count the answering node vm1 (vm0 only requests); S3 counts both nodes.
+S1/S2 count the answering node vm1 only (vm0 only requests); S3 counts both nodes.  coh_s excludes hardirq time
+(module 13: fallback timer and tick hook; both modules: IPIs), so fallback_expiries and the S2 hog iterations/s
+(like-for-like CPU left to the workload) are printed next to it.
+  irq_s, softirq_s, steal_s  /proc/stat aggregate deltas of the window (build 12: CONFIG_IRQ_TIME_ACCOUNTING=y,
+             so hardirq/softirq time is measured, not folded into the interrupted task; USER_HZ resolution, 10 ms
+             per CPU field: short S1 windows are coarse); steal = Host time while the vCPU was preempted (VM exits
+             of timer interrupts land mostly here, reported apart)
+  coh_cpu_total = coh_s + irq_s + softirq_s (user decision 2026-10-18: interrupt cost is part of the coherence
+             cost; includes background interrupts, equal across configs); the decision rule uses coh_cpu_total.
 """
 import csv
 import json
@@ -22,9 +30,10 @@ import re
 import statistics
 import sys
 
-CFGS = ["OLD", "NEW", "NEWP", "NEW16"]
+CFGS = ["OLD", "NEW", "NEWP"]
 COUNTERS = ["consumer_kicks", "scaleout_kicks", "consumer_requeues", "consumer_rekicks", "fallback_arms",
-            "fallback_kicks", "fallback_expiries", "idle_kicks", "tick_kicks", "work_runs", "link_down"]
+            "fallback_kicks", "fallback_expiries", "fallback_parks", "stuck_kicks", "idle_kicks", "tick_kicks",
+            "work_runs", "link_down"]
 KDELTA = ["transaction_error_count", "send_drop_count", "late_response_count", "nack_retry_count",
           "remote_request_count", "transaction_count"]
 
@@ -92,7 +101,40 @@ def cpu_delta(sd, k, mode):
         x, y = num(a, "swmc." + c), num(b, "swmc." + c)
         out[c] = (y - x) if x is not None and y is not None else ""
     out["max_active"] = b.get("cxl_shm.max_active", "")
+    pa, pb = pstat(os.path.join(sd, "procstat-pre-vm%d.txt" % k)), pstat(os.path.join(sd, "procstat-post-vm%d.txt" % k))
+    for i, f in ((5, "irq_s"), (6, "softirq_s"), (7, "steal_s")):
+        out[f] = (pb["cpu"][i] - pa["cpu"][i]) / pb["hz"]
+    out["coh_cpu_total"] = out["coh_s"] + out["irq_s"] + out["softirq_s"]
+    # per-consumer runs/msgs (module 13 /sys/kernel/cxl_shm/consumers; not reset by instr reset): deltas
+    ca, cb = cons(os.path.join(sd, "consumers-pre-vm%d.txt" % k)), cons(os.path.join(sd, "consumers-post-vm%d.txt" % k))
+    out["consumer_runs"] = sum(v for kk, v in cb.items() if kk.endswith("_runs")) - \
+        sum(v for kk, v in ca.items() if kk.endswith("_runs"))
+    out["consumer_msgs"] = sum(v for kk, v in cb.items() if kk.endswith("_msgs")) - \
+        sum(v for kk, v in ca.items() if kk.endswith("_msgs"))
     return out
+
+
+def pstat(path):
+    """clk_tck line + /proc/stat; returns {"hz": N, "cpu": [user nice system idle iowait irq softirq steal ...]}"""
+    d = {"hz": None, "cpu": None}
+    for line in open(need(path)):
+        p = line.split()
+        if p and p[0] == "clk_tck":
+            d["hz"] = int(p[1])
+        elif p and p[0] == "cpu":
+            d["cpu"] = [int(x) for x in p[1:]]
+    if not d["hz"] or not d["cpu"]:
+        die("bad " + path)
+    return d
+
+
+def cons(path):
+    d = {}
+    for line in open(need(path)):
+        p = line.split()
+        if len(p) == 2 and re.fullmatch(r"consumer\d+_(runs|msgs)", p[0]):
+            d[p[0]] = int(p[1])
+    return d
 
 
 def fl(path, key):
@@ -109,7 +151,7 @@ def fl(path, key):
 def main():
     E = sys.argv[1]
     rows = []
-    sessions = sorted(d for d in os.listdir(E) if re.fullmatch(r"r[123]-(OLD|NEW|NEWP|NEW16)", d))
+    sessions = sorted(d for d in os.listdir(E) if re.fullmatch(r"r[12]-(OLD|NEW|NEWP)", d))
     if not sessions:
         die("no session dirs in " + E)
     for s in sessions:
@@ -172,19 +214,20 @@ def main():
 
     out = []
     metrics = {"S1": ["readM_p50_ns", "readM_p99_ns", "writeI_p50_ns", "writeI_p99_ns", "readM_H_ns", "readM_WmH_ns",
-                      "coh_s", "watcher_s", "consumer_kicks", "fallback_kicks"],
+                      "coh_cpu_total", "coh_s", "irq_s", "softirq_s", "steal_s", "watcher_s", "fallback_expiries", "consumer_kicks", "consumer_msgs", "fallback_kicks"],
                "S2": ["readM_p50_ns", "readM_p99_ns", "writeI_p50_ns", "writeI_p99_ns", "readM_H_ns", "readM_WmH_ns",
-                      "coh_s", "watcher_s", "hog_iter_s", "hog_base_iter_s", "fallback_arms", "fallback_kicks",
-                      "tick_kicks"],
-               "S3": ["s3_ops_s_total", "s3_read_p99_ns", "s3_write_p99_ns", "coh_s", "watcher_s", "scaleout_kicks",
-                      "consumer_kicks", "nack_retry_count"]}
-    out.append("config scenario metric n mean sd")
+                      "coh_cpu_total", "coh_s", "irq_s", "softirq_s", "steal_s", "watcher_s", "fallback_expiries", "hog_iter_s", "hog_base_iter_s", "fallback_arms",
+                      "fallback_parks", "fallback_kicks", "stuck_kicks", "tick_kicks"],
+               "S3": ["s3_ops_s_total", "s3_read_p99_ns", "s3_write_p99_ns", "coh_cpu_total", "coh_s", "irq_s", "softirq_s", "steal_s", "watcher_s", "fallback_expiries",
+                      "scaleout_kicks", "stuck_kicks", "consumer_kicks", "consumer_msgs", "nack_retry_count"]}
+    out.append("config scenario metric n mean sd values(r1 r2 ...)")
     for scen in ("S1", "S2", "S3"):
         for cfg in CFGS:
             for m in metrics[scen]:
                 a, sd, n = ms(cfg, scen, m)
                 if n:
-                    out.append("%s %s %s %d %.6g %.3g" % (cfg, scen, m, n, a, sd))
+                    out.append("%s %s %s %d %.6g %.3g %s" % (cfg, scen, m, n, a, sd,
+                               " ".join("%.6g" % x for x in vals(cfg, scen, m))))
             ma = [r["max_active"] for r in rows if r["config"] == cfg and r["scenario"] == scen]
             if ma and scen == "S3":
                 out.append("%s %s max_active(vm0/vm1, cumulative since load) %s" % (cfg, scen, " ".join(ma)))
@@ -197,29 +240,45 @@ def main():
         ok = ok and bool(cond)
         out.append("  %s: %s (%s)" % (name, "PASS" if cond else "FAIL", detail))
 
+    def det(m, scen, unit):
+        o, n = vals("OLD", scen, m), vals("NEW", scen, m)
+        mo = statistics.mean(o) if o else None
+        mn = statistics.mean(n) if n else None
+        txt = "OLD %s (mean %s), NEW %s (mean %s), NEW-OLD %s %s" % (
+            " ".join("%.6g" % x for x in o), "%.6g" % mo if mo is not None else "-",
+            " ".join("%.6g" % x for x in n), "%.6g" % mn if mn is not None else "-",
+            "%+.6g" % (mn - mo) if mo is not None and mn is not None else "-", unit)
+        return mo, mn, txt
+
     for kind in ("readM", "writeI"):
-        o, n = ms("OLD", "S1", kind + "_p50_ns")[0], ms("NEW", "S1", kind + "_p50_ns")[0]
-        chk("S1 %s p50 within +5 us of OLD" % kind, o is not None and n is not None and n <= o + 5000,
-            "OLD %s, NEW %s ns" % (o, n))
+        o, n, t = det(kind + "_p50_ns", "S1", "ns")
+        chk("S1 %s p50 within +5 us of OLD" % kind, o is not None and n is not None and n <= o + 5000, t)
     for kind in ("readM", "writeI"):
-        o, n = ms("OLD", "S2", kind + "_p99_ns")[0], ms("NEW", "S2", kind + "_p99_ns")[0]
-        chk("S2 %s p99 not worse than OLD" % kind, o is not None and n is not None and n <= o, "OLD %s, NEW %s ns" % (o, n))
-    o, n = ms("OLD", "S3", "s3_ops_s_total")[0], ms("NEW", "S3", "s3_ops_s_total")[0]
-    chk("S3 throughput within 5 % of OLD or better", o is not None and n is not None and n >= 0.95 * o,
-        "OLD %s, NEW %s ops/s" % (o, n))
-    oc = sum(ms("OLD", s, "coh_s")[0] or 0 for s in ("S1", "S2", "S3"))
-    nc = sum(ms("NEW", s, "coh_s")[0] or 0 for s in ("S1", "S2", "S3"))
-    chk("coherence CPU lower (S1+S2+S3, mean per repeat)", nc < oc, "OLD %.3f s, NEW %.3f s" % (oc, nc))
+        o, n, t = det(kind + "_p99_ns", "S2", "ns")
+        chk("S2 %s p99 not worse than OLD" % kind, o is not None and n is not None and n <= o, t)
+    o, n, t = det("s3_ops_s_total", "S3", "ops/s")
+    chk("S3 throughput within 5 % of OLD or better", o is not None and n is not None and n >= 0.95 * o, t)
+    oc = sum(ms("OLD", s_, "coh_cpu_total")[0] or 0 for s_ in ("S1", "S2", "S3"))
+    nc = sum(ms("NEW", s_, "coh_cpu_total")[0] or 0 for s_ in ("S1", "S2", "S3"))
+    ho, hn = ms("OLD", "S2", "hog_iter_s")[0], ms("NEW", "S2", "hog_iter_s")[0]
+    chk("coherence CPU lower: coh_cpu_total = consumer/poll-thread CPU + irq + softirq (S1+S2+S3, mean per repeat; "
+        "S1/S2 vm1 only, S3 both nodes)", nc < oc,
+        "OLD %.4g s, NEW %.4g s, NEW-OLD %+.4g s; coh_s OLD %.4g NEW %.4g; fallback_expiries NEW %s" % (
+            oc, nc, nc - oc, sum(ms("OLD", s_, "coh_s")[0] or 0 for s_ in ("S1", "S2", "S3")),
+            sum(ms("NEW", s_, "coh_s")[0] or 0 for s_ in ("S1", "S2", "S3")),
+            sum(ms("NEW", s_, "fallback_expiries")[0] or 0 for s_ in ("S1", "S2", "S3"))))
+    out.append("  like-for-like: S2 hog iterations/s OLD %s, NEW %s" % (ho, hn))
+    if ho and hn and ((nc < oc and hn < ho) or (nc >= oc and hn > ho)):
+        out.append("  NOTE: coh_cpu_total and S2 hog iterations/s disagree (decide with the user)")
     out.append("  => all checks %s; the adoption itself is decided with the user" % ("PASS" if ok else "not all PASS"))
     out.append("")
-    out.append("sanity NEW-poll (module 13, recv_mode=poll max_workers=1) vs OLD, S1 (expected equal; information):")
+    out.append("sanity NEW-poll (module 13, recv_mode=poll max_workers=1 fallback_us=0 worker_spin_us=0) vs OLD, S1 "
+               "(expected equal; information):")
     for kind in ("readM", "writeI"):
         o, n = ms("OLD", "S1", kind + "_p50_ns")[0], ms("NEWP", "S1", kind + "_p50_ns")[0]
         if o and n:
             out.append("  %s p50 OLD %.0f NEW-poll %.0f ns (%+.1f %%)%s" % (kind, o, n, 100 * (n - o) / o,
                        "  NOTE: > 5 %" if abs(n - o) > 0.05 * o else ""))
-    out.append("S3 NEW (max_workers default) vs NEW16 (max_workers 16): ops/s %s vs %s" % (
-        ms("NEW", "S3", "s3_ops_s_total")[0], ms("NEW16", "S3", "s3_ops_s_total")[0]))
     open(os.path.join(E, "summary.txt"), "w").write("\n".join(out) + "\n")
     print("\n".join(out))
 
