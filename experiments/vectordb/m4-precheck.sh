@@ -26,8 +26,10 @@ fi
 f=$(sudo -n fuser -v /dev/dax0.0 2>&1); echo "fuser: [$f]"
 echo "$f" | grep -q "sudo:" && fail "sudo denied"
 echo "$f" | grep -qE '[0-9]+' && fail "dax0.0 in use"
-echo "procs vdb-server=$(pgrep -c -x vdb-server) faultlat=$(pgrep -c -x faultlat)"
-[ "$(pgrep -c -x vdb-server)" = 0 ] && [ "$(pgrep -c -x faultlat)" = 0 ] || fail procs
+# by command line (renamed threads, e.g. Megalon's "megalon-lib", must not hide a server)
+n_vdb=$(pgrep -c -f "[/]bin/vdb-server( |\$)") n_fl=$(pgrep -c -f "[/]faultlat( |\$)")
+echo "procs vdb-server=$n_vdb faultlat=$n_fl"
+[ "$n_vdb" = 0 ] && [ "$n_fl" = 0 ] || fail procs
 for f in $INSTALL_DIRS; do sha256sum /home/comsys/$f || fail "install /home/comsys/$f"; done
 I=$INIT_DIR
 if [ "${INIT_CHECK:-0}" = 1 ]; then

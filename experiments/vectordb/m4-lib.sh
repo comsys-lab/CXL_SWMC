@@ -4,6 +4,22 @@
 SSH="ssh -o BatchMode=yes -o ConnectTimeout=8"
 IPS=(192.168.122.100 192.168.122.101)
 CHOWNED=0
+# vdb-server processes are counted by command line, not by name (a Megalon server's main thread can be renamed, e.g.
+# "megalon-lib"): every process whose cmdline contains .../bin/vdb-server followed by a space or the end, incl. the
+# timeout wrappers vdb-node.sh / m4-run.sh launch them with (counting a wrapper is fail-closed). The [/] keeps the
+# remote shell's own command line from matching. Guest command (single-quoted locally):
+VDB_PROCS='pgrep -c -f "[/]bin/vdb-server( |\$)"'
+# /dev/dax0.0 has no user on a guest: `sudo -n fuser` prints nothing and exits 1 (any output, incl. a sudo denial,
+# counts as in use: fail closed). Prints "<ip> dax_users=[...]" lines to the given log; returns 1 if any VM has a user.
+dax_unused() {  # <log file>
+  local ip out rc=0
+  for ip in "${IPS[@]}"; do
+    out=$($SSH comsys@$ip 'f=$(sudo -n fuser /dev/dax0.0 2>&1); r=$?; echo "dax_users=[$f] rc=$r"' < /dev/null 2>&1)
+    echo "$(date -Is) $ip $out" >> "$1"
+    [ "$out" = "dax_users=[] rc=1" ] || { echo "DAX IN USE (or unreadable): $ip $out" | tee -a "$1"; rc=1; }
+  done
+  return $rc
+}
 # Stop this block's servers only: the guest run dirs recorded in this block's run manifests (run.sh writes
 # guest_run_dir before it starts a server).
 block_stop_servers() {
@@ -16,7 +32,7 @@ block_stop_servers() {
     [ -n "$gip" ] && [ -n "$pf" ] || continue
     $SSH comsys@$gip "p=\$(cat $pf 2>/dev/null) || exit 0; ps -o args= -p \$p 2>/dev/null | grep -q -- '--preload-only' || { echo preload \$p not running; exit 0; }
       kill -TERM \$p; for i in \$(seq 30); do kill -0 \$p 2>/dev/null || break; sleep 1; done
-      pkill -KILL -P \$p 2>/dev/null; kill -KILL \$p 2>/dev/null; sleep 1; echo preload \$p stopped procs=\$(pgrep -c -x vdb-server)" \
+      pkill -KILL -P \$p 2>/dev/null; kill -KILL \$p 2>/dev/null; sleep 1; echo preload \$p stopped procs=\$($VDB_PROCS)" \
       < /dev/null 2>&1 | sed "s|^|$gip $f |" >> "$E/rollback.out"
   done
   for ip in "${IPS[@]}"; do
@@ -24,7 +40,7 @@ block_stop_servers() {
       $SSH comsys@$ip "for k in 0 1; do [ -e $g/node\$k.pid ] && \$(dirname $g)/../bin/vdb-node.sh stop $g \$k; done; true" < /dev/null 2>&1 \
         | sed "s|^|$ip $g |" >> "$E/rollback.out"
     done
-    $SSH comsys@$ip 'echo procs=$(pgrep -c -x vdb-server)' < /dev/null 2>&1 | sed "s/^/$ip /" >> "$E/rollback.out"
+    $SSH comsys@$ip "echo procs=\$($VDB_PROCS)" < /dev/null 2>&1 | sed "s/^/$ip /" >> "$E/rollback.out"
   done
 }
 # page MSI: every shm-<run> dir whose load was attempted (load-vm0.txt) and that has no "teardown PASS" in its
@@ -62,7 +78,9 @@ block_rollback() { block_stop_servers; block_dax_root; }
 # chown dax0.0 through p-popcorn-shm.sh without CHOWNED, and a failed teardown may leave it comsys), then the lock.
 block_finish() {
   block_stop_servers
-  block_shm_cleanup
+  # fail closed: no cxl_shm teardown while any process still holds /dev/dax0.0 (ROLLBACK FAIL, manual packet §8)
+  if dax_unused "$E/rollback.out"; then block_shm_cleanup
+  else echo "ROLLBACK FAIL: /dev/dax0.0 still in use after stopping the servers: cxl_shm cleanup skipped (manual)" | tee -a "$E/rollback.out"; fi
   block_dax_root
   [ -n "${PARENT_LOCK:-}" ] || bash $X/host-gate.sh unlock "$OWNER"  # a parent's lock is never released here
 }

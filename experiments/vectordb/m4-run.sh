@@ -98,7 +98,17 @@ case "$KIND" in
 esac
 SSH="ssh -o BatchMode=yes -o ConnectTimeout=8"
 IPS=(192.168.122.100 192.168.122.101)
-servers_gone() { for ip in "${IPS[@]}"; do [ "$($SSH comsys@$ip 'pgrep -c -x vdb-server' < /dev/null)" = 0 ] || return 1; done; }
+# by command line, not name (renamed Megalon threads; m4-lib.sh VDB_PROCS); any non-"0" answer counts as running
+servers_gone() { for ip in "${IPS[@]}"; do [ "$($SSH comsys@$ip 'pgrep -c -f "[/]bin/vdb-server( |\$)"' < /dev/null)" = 0 ] || return 1; done; }
+# /dev/dax0.0 unused on both guests (sudo -n fuser prints nothing, rc 1; anything else = in use, fail closed)
+dax_unused() {
+  local ip out
+  for ip in "${IPS[@]}"; do
+    out=$($SSH comsys@$ip 'f=$(sudo -n fuser /dev/dax0.0 2>&1); r=$?; echo "dax_users=[$f] rc=$r"' < /dev/null 2>&1)
+    echo "$(date -Is) $NAME $ip $out" >> "$E/dax-users.txt"
+    [ "$out" = "dax_users=[] rc=1" ] || return 1
+  done
+}
 echo "$(date -Is) $NAME: SYS=$SYS U=$U KIND=$KIND DATASET=${DATASET:-28m} REP=${REP:-} TRACE=$TRACE RATE=${RATE:-} RECV_MODE=${RECV_MODE:-} SEED=$SEED V=$V HOST_SERVER=$HOST_SERVER XENV=[$XENV] XARGS=[$XARGS] OPCOH_EXPECT=${OPCOH_EXPECT:-} OPCOH_CHECK_MODE=${OPCOH_CHECK_MODE:-}"
 servers_gone || stop "a vdb-server is running before the run"
 [ "${GATE:-1}" = 1 ] || [ "$KIND" = functional ] || stop "GATE=0 is allowed for KIND=functional only"
@@ -110,10 +120,12 @@ if [ "$SYS" = Popcorn ]; then  # P-popcorn-deploy §6a cycle (bundle C8, build >
   shm_down() {
     [ $SHM = 1 ] || return 0
     servers_gone || { echo "M4RUN $NAME: servers still running, teardown skipped (manual: packet rollback)"; return 1; }
+    dax_unused || { echo "M4RUN $NAME: /dev/dax0.0 still in use, teardown skipped (manual: packet rollback; see dax-users.txt)"; return 1; }
     env "${PS[@]}" bash $C8/p-popcorn-shm.sh teardown && SHM=0
   }
   trap 'shm_down' EXIT
   env "${PS[@]}" bash $C8/p-popcorn-shm.sh precheck || stop "shm precheck"
+  dax_unused || stop "/dev/dax0.0 in use before the cxl_shm load (see $E/dax-users.txt)"
   SHM=1
   for ph in load chown; do env "${PS[@]}" bash $C8/p-popcorn-shm.sh $ph || stop "shm $ph"; done
   for ip in "${IPS[@]}"; do  # the server's region config must equal the module parameters' one (both must exist)
