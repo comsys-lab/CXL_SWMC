@@ -10,7 +10,7 @@ HOOK_FILE=$HR/experiments/recsys/main-block.sh
 BLOCK_CMD=(bash $HOOK_FILE)          # H1 hook = BLOCK=h1 in main-block.sh (marker H1-HOOK v2: H1MODE r1|cont)
 BLOCK_ENV=(BLOCK=h1 POP_BUILD=12 POP_BUNDLE_SHA=$POP_BUNDLE_SHA C8=$CPOP K8=$KPOP GT8=$GTPOP RECV_MODE=$RECV_MODE
   D=$P/builds/recsys-inputs/1 PLAIN_BUILD=$P/builds/recsys/9 MEG_BUILD=$P/builds/recsys-megalon/11 MEGALON_BASE=$MEG77
-  VM_PLAIN=/home/comsys/rs9 VM_MEG=/home/comsys/rsm11 LOADGEN=$P/builds/recsys-loadgen/7/loadgen XT=7200
+  VM_PLAIN=/home/comsys/rs9 VM_MEG=/home/comsys/rsm11 LOADGEN=$P/builds/recsys-loadgen/8/loadgen XT=7200
   EXPECT_DAX_UUID=$EXPECT_DAX_UUID)
 PIN_SHA256="$COMMON_SHA256
 9c330ba688b96019792dee4bb80e91965cfb7e5d5c21265bb3a2e805df3db5a8  $P/builds/recsys-inputs/1/MANIFEST.txt
@@ -23,9 +23,9 @@ baac2252d78571f1cbbb7914cc5f749210cf64061a5e7cff2c11a53f3e2afeb3  $P/builds/recs
 5150764f44b659b707e985502405544f15c56266fc23907ab57343628e902311  $P/builds/recsys-megalon/11/bin/recsys-server
 eca0ba184cec64224f9fcf1241737132c49412dfde7ce011716ba7392598f5a5  $P/builds/recsys-megalon/11/lib/libmegalon-objapi.so
 f9c1753f3bef2ab0941153058860227145f2d7b7e33a210bdc3338fad14eacda  $P/builds/recsys-megalon/11/lib/libmegalon.so
-73c93ce02d57837f09e1b5f8d0d59142b3c7d30735bd69492dc898bd76019583  $P/builds/recsys-loadgen/7/manifest.txt
-d2633e8df70e7eb0b832e205a16f7749485097d3005ce758a3ff08843caa1447  $P/builds/recsys-loadgen/7/loadgen
-b67b0d41b2a1fa4cef6379598864c5cca5365b67eb516d16e0c2af358adb9ed9  $HOOK_FILE
+31fb973011c7d7fb82b78bb2e1f088e1868a398af964dfab282981c040ca23e7  $P/builds/recsys-loadgen/8/manifest.txt
+a37956eff5b88d46e30f77e2fb0c6c5bcf24fc70fe347722618571c05fd81110  $P/builds/recsys-loadgen/8/loadgen
+3231281a405c55c2ff1c5d9e23985806adc83866f958e32ddbca5774d199f1d7  $HOOK_FILE
 68c5b9ceaf986e9e05e941d586a9a5cb5bb162b1963181ce02efa5d34cce5b54  $HR/experiments/recsys/session.sh
 252cb04dafd899b837d7f5bf1e190de9d7a5c2ec4a8fca2b81ff74f63dc6c06f  $HR/experiments/recsys/v1_check.py
 32d171199d6a47d15fcfa6971522e253fe21d857e91c9049c201e55a0cdac230  $HR/experiments/recsys/check_breakdown.py
@@ -42,4 +42,4 @@ fb17ee4445d4d5cb105b787d2c6bfeae5956b2ba9f852cb1eadf7caf759a6a8a  $HR/scripts/gu
 f2fe8c045490a26ad5b01631ca896b997b1fdad6f08ee20d1b314f64fe6fcc1e  $HR/systems/megalon/recsys-2vm.yaml
 eeb6b23f173d85a3c86ade0fb804b363e3c84a36bf9c0f56a7cbcab25e738b53  $HR/config/cxl_region.yaml
 6470d54b3727164cc765072e9a87b5573264b6b4b2d016d0b71309fbeb2b50e1  $HR/experiments/loadgen/stats_delta.py
-c4142bdb0aeb0ea66c337b886086ca0b9540dbd0fcc20739529c520adce0f370  $HR/experiments/loadgen/export_csv.py"
+fe35a89936c8da64a97a468b2429ad61062bd499a0fb775a1a003437366cc701  $HR/experiments/loadgen/export_csv.py"

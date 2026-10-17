@@ -9,7 +9,7 @@ HR=$P/CXL_SWMC
 HOOK_FILE=$HR/experiments/lmdb/h1-block.sh
 BLOCK_CMD=(bash $HOOK_FILE)          # H1 hook (marker H1-HOOK v2)
 BLOCK_ENV=(BUILD_PIN=934fa9312c38eeaf2845605cf22d2ef1cfe15fc4 MEGALON_BUILD_N=77 EXPECT_K=$KPOP EXPECT_DAX_UUID=$EXPECT_DAX_UUID
-  PLAIN_BUILD=$P/builds/lmdb/8 MEG_BUILD=$P/builds/lmdb-megalon/8 LOADGEN_BUILD=$P/builds/lmdb-loadgen/7
+  PLAIN_BUILD=$P/builds/lmdb/8 MEG_BUILD=$P/builds/lmdb-megalon/8 LOADGEN_BUILD=$P/builds/lmdb-loadgen/8 LOADGEN_PIN=9e2dc0974d550683372c4202f9d7571d99c51a3d
   LMDB_GUEST_DIR=/home/comsys/lmdb8b LMDB_MEG_CFG=$P/recovery/LMDB-F1-v1.7.1-run/install.log.megalon.yaml
   IMG=$P/workspaces/lmdb-img-1m-b8-v171 C8=$CPOP K8=$KPOP GT8=$GTPOP RECV_MODE=$RECV_MODE)
 PIN_SHA256="$COMMON_SHA256
@@ -19,14 +19,14 @@ cff4271e2cf29c33f6aa981404ca954e63ad72f3126d42338095effdcd228031  $P/builds/lmdb
 f2796288194dac8848ea14f926583d1e917e4e5325ab2175d4414639e011c254  $P/builds/lmdb-megalon/8/bin/lmdb-server
 55cbfc03fee0a94790bddd7a80f32b7963d58e39607623dfaf95d6173c1aa221  $P/builds/lmdb-megalon/8/lib/libmegalon-objapi.so
 f9c1753f3bef2ab0941153058860227145f2d7b7e33a210bdc3338fad14eacda  $P/builds/lmdb-megalon/8/lib/libmegalon.so
-3cebe72e8fde8164b5eabde3c59740777ee17bcc6ac6da432fa0a00f7f617bb5  $P/builds/lmdb-loadgen/7/manifest.txt
-26ce2b2b4fa55b94c4ca0da79cbe79a31e7608f69d3343de97fd48af61e6b01d  $P/builds/lmdb-loadgen/7/loadgen
+21b190abca83c7b0c52e785d87e2f53b449e6f010bbf8d5a9fb6f0d32eaa6637  $P/builds/lmdb-loadgen/8/manifest.txt
+5a0fa670a6ad1622e76cc9860a7a2e20e76dc8a19e7f2834281e84a5be595abb  $P/builds/lmdb-loadgen/8/loadgen
 e45baa9b8d2e211b7418f2ddad5612364df92162fe651e015415f3043bd66514  $P/recovery/LMDB-F1-v1.7.1-run/install.log.megalon.yaml
 d127ac3c498ebac7f3e5c1860c9903876c49f42815720d8222ee080d5524a071  $P/workspaces/lmdb-img-1m-b8-v171/pages.bin
 0930ab5e9a8add069305f259ff10aa94a3818b705f364c134cfbda23aada18b7  $P/workspaces/lmdb-img-1m-b8-v171/meta.txt
-90cb9e6920e79aa2ff0d00decb054867ecb7adba4edf5fcbd63200d29b55a460  $HOOK_FILE
+eeed3e6afc7032b38b208cfd44a2bbca214c7995714f1fa4d707a33520876678  $HOOK_FILE
 fbfb125195d2c862ab33c56da7e251c940973e03bd19ffaa35361002fdd1d895  $HR/experiments/kv/h1v2-lib.sh
-461f6230308d698a8fc529316e76b4ba152498506b31a2291d7ab85a47b6375d  $HR/experiments/lmdb/pilot-run.sh
+ac421e395679acc73b3cd6ff04a82778f31200edda7c4ab133b1b63a5d94b2cb  $HR/experiments/lmdb/pilot-run.sh
 c70f6c2b579dab38b5cfd9e992e174507567ba10ec4ecc32c1aeb7e8d2614020  $HR/experiments/lmdb/run.sh
 3edf6f2d4c5df8b33da9ac249466f8b41042eebe0ca509b7befd3e9fad456a82  $HR/experiments/lmdb/lmdb-node.sh
 8435ef222785be5d7a6dd6a97572b1404017822c63f3f766c45562efc8ae35ca  $HR/experiments/kv/precheck.sh
@@ -41,5 +41,5 @@ aed8d7f32871398db375c502152587ee0b25a716dd60d4ff637e189aa3d42420  $HR/scripts/ho
 83731292c83fcd5359c3ebb628b71bcbfcf3c3dd12e5e189e0b44bba3ad9508b  $HR/workloads/lmdb/tools/check_log.py
 a9b8dece1a553049959ba2c2512f69c03f60047988391a2cdb2fbfca159177ea  $HR/workloads/lmdb/tools/lmdb_ctl.py
 6470d54b3727164cc765072e9a87b5573264b6b4b2d016d0b71309fbeb2b50e1  $HR/experiments/loadgen/stats_delta.py
-c4142bdb0aeb0ea66c337b886086ca0b9540dbd0fcc20739529c520adce0f370  $HR/experiments/loadgen/export_csv.py
+fe35a89936c8da64a97a468b2429ad61062bd499a0fb775a1a003437366cc701  $HR/experiments/loadgen/export_csv.py
 eeb6b23f173d85a3c86ade0fb804b363e3c84a36bf9c0f56a7cbcab25e738b53  $HR/config/cxl_region.yaml"
