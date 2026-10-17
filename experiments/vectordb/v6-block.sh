@@ -24,7 +24,7 @@
 #        <sys>-<mix>-slo-r<N> (ramp/bisect, confirm 3 x 30 s, fill 0.7/0.8/0.9, overload 1.05/1.1/1.2 past the first
 #        failure; SLO search p99 <= 100 ms). A loadgen "confirm failed at three rates" NOTE is recorded and the block
 #        continues.
-#   fix: per levels.tsv row (mix) and per system in hw, pop, mg, mgoff (shuffle seed "H1-vdb-fix-r<N>" per mix):
+#   fix: per levels.tsv row (mix) and per system in hw, pop, mg, mgoff (shuffle seed "H1-vdb-fix-r<N>-<mix>"):
 #        one lifetime m4-run.sh KIND=fixed RATE=<L2_rate>,<L1_rate> (windows 10 s + 60 s each, L2 then L1, no SLO
 #        abort) <sys>-<mix>-fix-r<N>; mgoff = Megalon with MEGALON_COH_TIMERS=0 on both nodes (Fig 2 C_diff).
 #   Per run: OPCOH_EXPECT + opcoh_check (hw hwcc, pop popcorn, mg megalon-vm, mgoff megalon-t0), clean stop,
@@ -147,14 +147,14 @@ h1_main() {
       done
     done
   else
-    { echo "# H1 vector DB fixed phase rep $H1_N (levels $H1_LEVELS; systems per mix: shuffle seed H1-vdb-fix-r$H1_N; loadgen seed $H1_SEED; windows L2 then L1)"
+    { echo "# H1 vector DB fixed phase rep $H1_N (levels $H1_LEVELS; systems per mix: shuffle seed H1-vdb-fix-r$H1_N-<mix>; loadgen seed $H1_SEED; windows L2 then L1)"
       tail -n +2 "$H1_LEVELS" | while IFS=$'\t' read -r mix f; do
-        echo "$mix: $(SHUFFLE_SEED=H1-vdb-fix-r$H1_N shuffle hw pop mg mgoff)"; done; } | tee "$E/order.txt"
+        echo "$mix: $(SHUFFLE_SEED=H1-vdb-fix-r$H1_N-$mix shuffle hw pop mg mgoff)"; done; } | tee "$E/order.txt"
     while IFS=$'\t' read -r -a f; do
       mix=${f[0]} l1=${f[8]} l2=${f[9]}
       u=$(h1_u "U=${mix#u}") || exit 1
       [[ $l1 =~ ^[0-9]+(\.[0-9]+)?$ ]] && [[ $l2 =~ ^[0-9]+(\.[0-9]+)?$ ]] || { echo "SEQUENCE STOP: levels $mix rates"; exit 1; }
-      for s in $(SHUFFLE_SEED=H1-vdb-fix-r$H1_N shuffle hw pop mg mgoff); do
+      for s in $(SHUFFLE_SEED=H1-vdb-fix-r$H1_N-$mix shuffle hw pop mg mgoff); do
         h1_run $s $mix fix U=$u KIND=fixed RATE=$l2,$l1 < /dev/null
       done
     done < <(tail -n +2 "$H1_LEVELS")

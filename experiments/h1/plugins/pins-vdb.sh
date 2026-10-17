@@ -1,10 +1,10 @@
 # H1 plugin: vector DB (HNSW 28M, pubmed-a27m-b1m-q10k; reports/VDB-V1-packet.md v1.3.1 blocks, validation PASS
 # 2026-10-17 §17). all-HWcc = plain server (no Megalon; MOT1 v6 §3.1), Popcorn = plain server + cxl_shm
 # (init_state=shared + preload, recv_mode poll), Megalon = vdb-megalon on Megalon 77 (packed4, 32 MiB vector chunk
-# object), mgoff = the same with MEGALON_COH_TIMERS=0. Filled 2026-10-17 (CXL_SWMC eecda9519, H1 hook in v6-block.sh).
+# object), mgoff = the same with MEGALON_COH_TIMERS=0. Filled 2026-10-17 (H1 hook in v6-block.sh; fixed-phase seed with the mix since the re-pin).
 . "$(dirname "${BASH_SOURCE[0]}")/pins-common.inc"
 HR=$P/CXL_SWMC                      # live tree; v6-block.sh uses $P/CXL_SWMC/experiments/vectordb itself. Every file it
-                                    # runs is hash-pinned below (hook eecda9519; builds vdb/15, vdb-megalon/14 from 934fa9312)
+                                    # runs is hash-pinned below (hook: see the v6-block.sh pin; builds vdb/15, vdb-megalon/14 from 934fa9312)
 HOOK_FILE=$HR/experiments/vectordb/v6-block.sh
 BLOCK_CMD=(bash $HOOK_FILE)          # H1 hook = H1MODE=slo|fix in v6-block.sh (marker H1-HOOK v1)
 BLOCK_ENV=(KPOP=$KPOP GTPOP=$GTPOP CPOP=$CPOP MEG_LIB=$MEG77 MEGALON_LEAN=1 EXPECT_DAX_UUID=$EXPECT_DAX_UUID
@@ -23,7 +23,7 @@ f9c1753f3bef2ab0941153058860227145f2d7b7e33a210bdc3338fad14eacda  $P/builds/vdb-
 e9d4942ee33b2f65cf7117d87942296e1365d0234873c2c4159545f40708db54  $P/workspaces/vdb-data/seg32-c32m-a27m-m16-efc128-b1/SHA256SUMS
 4e4e7134710f9b131368d7b3f71c07ab56d97e72ad329649bda27f893f6d65be  $HR/systems/megalon/vectordb-2vm.yaml
 eeb6b23f173d85a3c86ade0fb804b363e3c84a36bf9c0f56a7cbcab25e738b53  $HR/config/cxl_region.yaml
-3954e666b979fdab999d1d364e2084301d55c26a81a800e71360e672f30f1e46  $HOOK_FILE
+2a916d89b70f363e740b913f8d35654e9bbced106cc55c6bd66d305140ad6932  $HOOK_FILE
 9d7fead21754368299e243eb2aee515fa394c022e775e8d0c5c214ef36e48a6b  $HR/experiments/vectordb/m4-lib.sh
 6c625aca1acca67badc88891884f67749335a79051c29ea09e48adbbea903bc7  $HR/experiments/vectordb/m4-run.sh
 4f107af05c0a062f72ac3de31ce59dbfd0c6b86a63ad4ad62ec84598c75e8a57  $HR/experiments/vectordb/m4-precheck.sh
