@@ -9,9 +9,9 @@
 Lowest-rate step = the all-HWcc curve step (as below: measured, not warmup, not a confirm repeat) with the smallest
 offered rate. Curve steps: every measured step except confirm repeats (ramp, bisect, fill, overload, fixed); paper_style.curve draws them (display cleanup only;
 the CSV keeps every step). All runs must share SLO stream and percentile.
-Past-SLO points (user: curves include points past the SLO): steps that failed the SLO check (pass false) and every
-overload-phase step (offered beyond the confirmed max under SLO) are drawn with hollow markers, never merged, dropped
-or cut off; the overload-phase steps are joined by a dashed line after the passing curve; the y axis grows to include them up to 2x its top
+Past-SLO points (user: curves include points past the SLO): steps that failed the SLO check (pass false) are drawn
+with hollow markers, never merged, dropped or cut off; the overload-phase steps (offered beyond the confirmed max under
+SLO; filled if they pass, also never cleaned) are joined by a dashed line after the passing curve; the y axis grows to include them up to 2x its top
 (paper_style.curve; --ylim fixes it), points above are drawn on the top edge as hollow triangles. CSV column past_slo
 marks them.
 
@@ -72,7 +72,7 @@ def main():
             continue
         pts = sorted(P[k], key=lambda p: p["x"])
         ys = [p["p_ms"] / base for p in pts]
-        past = [(not p["pass"]) or p["phase"] == "overload" for p in pts]
+        past = [not p["pass"] for p in pts]  # failed the SLO check
         series.append((v6.SYSTEMS[k], [p["x"] * a.xscale for p in pts], ys, [not q for q in past],
                        [p["phase"] == "overload" for p in pts]))  # dashed tail: the overload phase
         rows += [[v6.SYSTEMS[k], p["step"], p["phase"], p["offered"], v6.r(p["x"]), p["p_ms"], v6.r(y), p["pass"],
@@ -91,7 +91,7 @@ def main():
     drawn = v6.ps.curve(png, series, slo_n, a.xlabel, f"Normalized\n{pname} latency", ylim, xticks, yticks,
                         extend_y=not a.ylim)
     print("drawn: " + "; ".join(f"{n} passing {c['passing']} past_slo {c['past']} (off scale {c['off_scale']}, overload "
-                                f"tail {c['tail']})" for n, c in drawn["series"].items()) + f"; y top {drawn['ylim'][1]:g}")
+                                f"tail {c['tail']} of which passing {c['tail_passing']})" for n, c in drawn["series"].items()) + f"; y top {drawn['ylim'][1]:g}")
     v6.write_csv(csvp, [
         ("figure", f"MOT1 v6 Fig 1 latency vs throughput ({a.tag}); PNG {os.path.basename(png)}"),
         ("formula", f"x = completions in the step window / window ({'run x-stream' if a.x == 'x' else 'all streams'}) "
@@ -101,8 +101,8 @@ def main():
         ("sources", f"loadgen steps.jsonl: x {'x' if a.x == 'x' else 'streams.*.achieved'}, "
                     f"streams.{stream}.pslo_ms ({pname}, --slo {stream}:{pct:g}:{slo_ms:g}), pass, phase, offered_x"),
         ("tags", f"achieved_per_s measured; {pname}_ms measured (the run's SLO percentile, loadgen pslo_ms); y_norm "
-                 "derived; past_slo derived = pass false (SLO check failed) or phase overload (drawn as hollow "
-                 "past-SLO markers, every one)"),
+                 "derived; past_slo = pass false (SLO check failed; drawn as hollow markers, every one; overload-phase "
+                 "steps form the dashed tail, filled when they pass)"),
         ("inputs", v6.inputs_line([(v6.SYSTEMS[k], r) for k, r in runs.items()])),
     ], ["system", "step", "phase", "offered", "achieved_per_s", f"{pname}_ms", "y_norm", "pass", "run", "past_slo"], rows)
     print(f"-> {png}\n-> {csvp}  (base {pname} {base} ms, SLO norm {slo_n:.3f})")

@@ -31,12 +31,13 @@ def main():
     #    (one passing below the SLO, one at 6.0), one at 50 and one infinite; given top 4 -> axis 8, 9 / 50 / inf off scale
     xs = [1, 2, 3, 4, 5, 3.5, 5.2, 5.5, 5.8, 6.0]
     ys = [1, 1.1, 1.2, 1.3, 1.5, 9.0, 1.8, 6.0, 50.0, float("inf")]
-    ok = [True] * 5 + [False] * 5
+    ok = [True] * 5 + [False, True, False, False, False]  # 5.2 is a passing overload step
     tail = [False] * 6 + [True] * 4
     d = ps.curve(os.path.join(S, "syn.png"), [("All HWcc", xs, ys, ok, tail)], 2.0, "x", "y", (0, 4), [0, 2, 4, 6],
                  [0, 1, 2, 3, 4])
     c = d["series"]["All HWcc"]
-    check(c["passing"] == 5 and c["past"] == 5 and c["tail"] == 4, f"every past point drawn, overload tail 4 ({c})")
+    check(c["passing"] == 5 and c["past"] == 4 and c["tail"] == 4 and c["tail_passing"] == 1,
+          f"every past point drawn hollow, overload tail 4 incl. 1 passing (filled) ({c})")
     check(d["ylim"][1] == 8 and c["off_scale"] == 3, f"y grows to 2x top (8); 9, 50, inf on the edge ({d})")
     d = ps.curve(os.path.join(S, "syn-fixed.png"), [("All HWcc", xs, ys, ok, tail)], 2.0, "x", "y", (0, 4), [0, 2, 4, 6],
                  [0, 1, 2, 3, 4], extend_y=False)
@@ -67,7 +68,7 @@ def main():
         r = list(csv.DictReader(l for l in lines if not l.startswith("#")))
         check("p95_ms" in r[0] and "past_slo" in r[0], "CSV columns p95_ms and past_slo")
         past = {int(x["step"]) for x in r if x["past_slo"] == "True"}
-        check(past == {3, 6, 7} and len(r) == 6, f"past_slo = failed + overload steps {sorted(past)}; confirm excluded")
+        check(past == {3, 7} and len(r) == 6, f"past_slo = failed steps only {sorted(past)}; confirm excluded")
 
     # 3. stored runs (read-only): every failed / overload curve step is drawn as a past-SLO point
     specs = sys.argv[2:]
@@ -76,18 +77,20 @@ def main():
         for spec in specs:
             k, dpath, _ = v6.parse_spec(spec)
             pts = sorted(f1.points(v6.Run(dpath, k), "x"), key=lambda q: q["x"])
-            past = [(not q["pass"]) or q["phase"] == "overload" for q in pts]
+            past = [not q["pass"] for q in pts]
             name = v6.SYSTEMS[k]
             series.append((name, [q["x"] / 1e3 for q in pts], [q["p_ms"] / pts[0]["p_ms"] for q in pts],
                            [not q for q in past], [q["phase"] == "overload" for q in pts]))
-            want[name] = (sum(past), sum(q["phase"] == "overload" for q in pts))
+            want[name] = (sum(past), sum(q["phase"] == "overload" for q in pts),
+                          sum(q["phase"] == "overload" and q["pass"] for q in pts))
         xmax = max(x for s in series for x in s[1])
         d = ps.curve(os.path.join(S, "stored.png"), series, 2.0, "x", "y", (0, 4), v6.nice_ticks(xmax * 1.05, 6),
                      [0, 1, 2, 3, 4])
-        for name, (npast, nover) in want.items():
+        for name, (npast, nover, nop) in want.items():
             c = d["series"][name]
-            check(c["past"] == npast and c["tail"] == nover,
-                  f"stored {name}: {npast} failed/overload steps drawn ({c['past']}), {nover} overload in the tail")
+            check(c["past"] == npast and c["tail"] == nover and c["tail_passing"] == nop,
+                  f"stored {name}: {npast} failed steps drawn hollow ({c['past']}), {nover} overload steps in the tail "
+                  f"({nop} passing, filled)")
     print("PASS" if not fails else f"{fails} FAIL")
     sys.exit(1 if fails else 0)
 

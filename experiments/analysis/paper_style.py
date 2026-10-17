@@ -36,8 +36,9 @@ def _nice_top(v):
 def curve(path, series, slo, xlabel, ylabel, ylim, xticks, yticks, extend_y=True, clip_factor=2.0):
     """series: [(name, xs, ys[, ok[, tail]]])] in legend order; ys already normalized; slo normalized (dashed line).
     ok (optional, per point): False = a step past the SLO (failed, or an overload-phase step: the caller decides).
-    tail (optional, per point): the past-SLO points joined to the passing curve by a dashed line, in x order (e.g. the
-    overload phase); default: the past-SLO points beyond the highest passing x.
+    tail (optional, per point): points joined to the passing curve by a dashed line, in x order (e.g. the overload
+    phase); tail points that pass are drawn filled but, like past-SLO points, never cleaned; default: the past-SLO
+    points beyond the highest passing x.
     Passing points: solid line, filled markers, display cleanup (clean_curve). Past-SLO points: EVERY one is drawn
     (no merge / drop / cut-off) with a hollow marker. extend_y: the y axis grows to include the past-SLO points, up to clip_factor x
     the given top; points still above (or infinite) are drawn on the top edge as hollow triangles (legend says off
@@ -46,20 +47,19 @@ def curve(path, series, slo, xlabel, ylabel, ylim, xticks, yticks, extend_y=True
     lines, past_all = [], []
     for item in series:
         name, xs, ys = item[:3]
-        if len(item) > 3:
-            ok = item[3]
-            pas = [(x, y) for x, y, p in zip(xs, ys, ok) if p]
-            past = [(x, y) for x, y, p in zip(xs, ys, ok) if not p]
-        else:
-            pas, past = list(zip(xs, ys)), []
+        ok = item[3] if len(item) > 3 else [True] * len(xs)
+        tf = item[4] if len(item) > 4 else [False] * len(xs)
+        pas = [(x, y) for x, y, p, t in zip(xs, ys, ok, tf) if p and not t]  # cleaned passing curve
+        past = [(x, y) for x, y, p in zip(xs, ys, ok) if not p]  # hollow, never cleaned
+        tpass = [(x, y) for x, y, p, t in zip(xs, ys, ok, tf) if p and t]  # passing tail points: filled, never cleaned
         px, py = clean_curve([p[0] for p in pas], [p[1] for p in pas], ylim[1]) if pas else ([], [])
         if len(item) > 4:
-            tail = sorted((x, y) for x, y, p, t in zip(xs, ys, item[3], item[4]) if t and not p)
+            tail = sorted((x, y) for x, y, t in zip(xs, ys, tf) if t)
         else:
             xmax = max(px) if px else -math.inf
             tail = sorted(p for p in past if p[0] > xmax)
-        lines.append((name, px, py, past, tail))
-        past_all += [y for _, y in past]
+        lines.append((name, px, py, past, tail, tpass))
+        past_all += [y for _, y in past + tpass]
     top, ticks = ylim[1], yticks
     fin = [y for y in past_all if math.isfinite(y)]
     if extend_y and fin and max(fin) > top:
@@ -71,12 +71,13 @@ def curve(path, series, slo, xlabel, ylabel, ylim, xticks, yticks, extend_y=True
     ax.yaxis.grid(True, color="#d9d9d9", linewidth=1.0)
     ax.set_axisbelow(True)
     clipped, drawn = False, {}
-    for name, px, py, past, tail in lines:
-        drawn[name] = {"passing": len(px), "past": 0, "off_scale": 0, "tail": len(tail)}
+    for name, px, py, past, tail, tpass in lines:
+        drawn[name] = {"passing": len(px), "past": 0, "off_scale": 0, "tail": len(tail), "tail_passing": len(tpass)}
         col = SERIES[name]
         ax.plot(px, py, color=col, linewidth=2.5, marker="o", markersize=6, label=name, clip_on=True)
-        if not past:
-            continue
+        if tpass:
+            ax.plot([p[0] for p in tpass], [min(p[1], top) for p in tpass], linestyle="none", marker="o",
+                    markersize=6, color=col, clip_on=False, zorder=3)
         if tail:
             tx = ([px[-1]] if px else []) + [p[0] for p in tail]
             ty = ([py[-1]] if py else []) + [min(p[1], top) for p in tail]
@@ -91,8 +92,8 @@ def curve(path, series, slo, xlabel, ylabel, ylim, xticks, yticks, extend_y=True
                     markeredgewidth=2.2, clip_on=False, zorder=3)
     ax.axhline(slo, color="black", linestyle=(0, (4, 2)), linewidth=2.5)
     above = slo + (top - ylim[0]) * 0.16 < top  # label above the line if it fits, else below
-    ax.text(xticks[-1] - (xticks[-1] - xticks[0]) * 0.03, slo + (top - ylim[0]) * (0.04 if above else -0.04),
-            "SLO", ha="right", va="bottom" if above else "top", fontsize=FS)
+    ax.text(xticks[0] + (xticks[-1] - xticks[0]) * 0.02, slo + (top - ylim[0]) * (0.04 if above else -0.04),
+            "SLO", ha="left", va="bottom" if above else "top", fontsize=FS)  # left end: clear of the knee markers
     ax.set_xlim(xticks[0], xticks[-1])
     ax.set_ylim(ylim[0], top)
     ax.set_xticks(xticks)
