@@ -5,7 +5,8 @@ usage: opcoh_check.py <run or scratch dir> fake|megalon|none|hwcc|popcorn|megalo
   (host_smoke.sh scratch dirs and run.sh run dirs have the same layout: loadgen/, node<k>.log)
   every mode: one v2 record per OK search response (op-coh.bin vs searches.bin, joined by seq) and per OK update
               (vectordb.txt updates_ok_without_coh=0, records = server updates); search sections = segments + 1,
-              update sections = 1; t_ns > 0; c_ns = Popcorn parts + Megalon parts; the server's opt.<op>.* totals at
+              update sections = 1; t_ns > 0; c_ns = Popcorn parts + Megalon parts (proto.h RD / EV / WR: Megalon >= 76
+              lean sampling, src bit 4, scales the timed-section sums per side); the server's opt.<op>.* totals at
               stop (nodes summed) equal the records' sums (ops, t_ns, c_ns, mod_bytes, pop.*, meg.wflush_bytes);
               opcoh.read_errors = register_errors = 0; search mod_bytes = 0; update mod_bytes >= vector record +
               level-0 block + delete-log entry; opsplit.py writes rows for both operation types and the column table.
@@ -22,7 +23,12 @@ usage: opcoh_check.py <run or scratch dir> fake|megalon|none|hwcc|popcorn|megalo
               measured step whose searches have C = 0 prints "OPCOH_CHECK NOTE" (few invalidated pages read at a low
               rate), not a failure; no Megalon part.
   megalon-vm: Megalon with CohSnap + AnchorSnap (shim v3): both present on every record, sum of c_ns > 0 per op type,
-              validation copies counted; every Popcorn part 0 (cxl_shm unloaded).
+              validation copies counted; every Popcorn part 0 (cxl_shm unloaded); MEGALON_LEAN=1 in the environment
+              (Megalon >= 76 runs, reports/VDB-V1-packet.md v1.3): lean bit on and events_always off on every record,
+              timed write sections > 0 over the updates.
+  every Megalon mode with lean records: mg_write_sampled <= mg_write_sections; a record without timed read sections
+              has no read-side event time and one without timed write sections has no write-side time (contract
+              megalon_objapi.h: durations only in timed sections).
   megalon-t0: as megalon-vm with MEGALON_COH_TIMERS=0: CohSnap/AnchorSnap present, Megalon durations may be 0 (counts
               kept), no C > 0 requirement.
 """
@@ -83,9 +89,36 @@ vce = np.array([int(x["vcopy_ns_sampled"]) * int(x["vcopy_cnt"]) // int(x["vcopy
                 for x in c], dtype=np.uint64)
 anr = np.array([(int(x["an_read_lookup_ns_sampled"]) + int(x["an_read_nr_ns_sampled"])) * int(x["mg_read_sections"])
                 // int(x["mg_check_sampled"]) if x["mg_check_sampled"] else 0 for x in c], dtype=np.uint64)
-mg = (chk + vce + anr + c["an_write_lookup_ns"] + c["an_write_nr_ns"] + c["mg_stale_ns"] + c["mg_concur_ns"] + c["mg_meta_ns"]
-      + c["mg_spin_ns"] + c["mg_wstart_ns"] + c["mg_wflush_ns"])
+lean_r = (c["src"] & 16) != 0      # Megalon >= 76 lean sampling (proto.h src bit 4)
+always_r = (c["src"] & 32) != 0    # MEGALON_COH_EVENTS=always (bit 5)
+
+
+def ev_est(x):  # proto.h EV: read-side events
+    ev = int(x["mg_stale_ns"]) + int(x["mg_concur_ns"]) + int(x["mg_meta_ns"]) + int(x["mg_spin_ns"])
+    if (x["src"] & 16) and not (x["src"] & 32):
+        return ev * int(x["mg_read_sections"]) // int(x["mg_check_sampled"]) if x["mg_check_sampled"] else 0
+    return ev
+
+
+def wr_est(v, x):  # proto.h WR: write side
+    if x["src"] & 16:
+        return v * int(x["mg_write_sections"]) // int(x["mg_write_sampled"]) if x["mg_write_sampled"] else 0
+    return v
+
+
+mg = np.array([ev_est(x) + wr_est(int(x["mg_wstart_ns"]) + int(x["mg_wflush_ns"]), x)
+               + wr_est(int(x["an_write_lookup_ns"]) + int(x["an_write_nr_ns"]), x) for x in c], dtype=np.uint64)
+mg = mg + chk + vce + anr
 check((c["c_ns"] == c["pf_ns"].sum(axis=1) + c["ipi_ns"] + mg).all(), "c_ns = parts")
+if lean_r.any():
+    lr = c[lean_r]
+    check((lr["mg_write_sampled"] <= lr["mg_write_sections"]).all(), "lean: timed write sections <= write sections")
+    wz = lr[lr["mg_write_sampled"] == 0]
+    check(all((wz[f] == 0).all() for f in ("mg_wstart_ns", "mg_wflush_ns", "an_write_lookup_ns", "an_write_nr_ns",
+                                           "an_wseq_ns", "an_wseq_end_ns")), "lean: no write-side time without timed writes")
+    rz = lr[(lr["mg_check_sampled"] == 0) & ((lr["src"] & 32) == 0)]
+    check(all((rz[f] == 0).all() for f in ("mg_stale_ns", "mg_concur_ns", "mg_meta_ns", "mg_spin_ns")),
+          "lean: no read-side event time without timed read sections")
 for op, x in (("search", cs), ("update", cu)):
     tot = lambda k: sum(s[f"opt.{op}.{k}"] for s in st)  # noqa: E731
     check(tot("ops") == len(x), f"opt.{op}.ops = records")
@@ -130,6 +163,9 @@ elif mode in ("megalon-vm", "megalon-t0"):
     check((cs["vcopy_cnt"] > 0).all() and (cs["mg_read_sections"] > 0).all(), "validation copies and read sections counted")
     if mode == "megalon-vm":
         check(int(cs["c_ns"].sum()) > 0 and int(cu["c_ns"].sum()) > 0, "Megalon C > 0 for searches and updates")
+        if os.environ.get("MEGALON_LEAN") == "1":
+            check(lean_r.all() and not always_r.any(), "Megalon >= 76: lean sampling on, events_always off")
+            check(int(cu["mg_write_sampled"].sum()) > 0, "Megalon >= 76: timed write sections over the updates")
         check(int(c["vcopy_sampled"].sum()) > 0 and int(cu["mg_wflush_bytes"].sum()) > 0, "sampled copies, flush bytes")
     check(all(s["megt.writer.wr_sections"] > 0 for s in st), "writer write sections")
 elif mode == "megalon":
@@ -139,11 +175,16 @@ elif mode == "megalon":
         check((cs["mg_read_sections"] > 0).all() and (cu["mg_wflush_bytes"] > 0).all(), "CohSnap values present")
         check(((c["src"] & 4) == 4).all(), "src bit 2")
         if all(s.get("opt.meg_anchor") == 1 for s in st):
-            check(((c["src"] & 8) == 8).all() and (cu["an_write_lookup_ns"] > 0).all() and
+            # every update's write section is timed only without lean sampling (Megalon <= 75)
+            timed_w = cu[cu["mg_write_sampled"] > 0] if lean_r.any() else cu
+            check(((c["src"] & 8) == 8).all() and len(timed_w) > 0 and (timed_w["an_write_lookup_ns"] > 0).all() and
                   c["an_read_nr_ns_sampled"].sum() > 0, "AnchorSnap values present")
             for op, x in (("search", cs), ("update", cu)):
-                for f in ("read_lookup_ns_sampled", "write_nr_ns"):
-                    check(sum(s[f"opt.{op}.meg.anchor.{f}"] for s in st) == int(x["an_" + f].astype(np.uint64).sum()),
+                for f in ("read_lookup_ns_sampled", "write_nr_ns", "write_sampled"):
+                    rec = "mg_write_sampled" if f == "write_sampled" else "an_" + f
+                    if f == "write_sampled" and not all(f"opt.{op}.meg.anchor.{f}" in s for s in st):
+                        continue  # vdb builds <= 14 have no write_sampled key (their records carry 0)
+                    check(sum(s[f"opt.{op}.meg.anchor.{f}"] for s in st) == int(x[rec].astype(np.uint64).sum()),
                           f"opt.{op}.meg.anchor.{f}")
     else:
         mgf = [f for f in opsplit.OPCOH.names if f.startswith("mg_")]

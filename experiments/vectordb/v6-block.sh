@@ -1,6 +1,6 @@
 #!/bin/bash
-# VDB-V1 block (reports/VDB-V1-packet.md v1): VM validation of the vector DB v6 builds (per-operation time split,
-# MOT1 v6 Fig 2/3), HNSW VectorDB 28M, all three systems on Popcorn build 10 (all-HWcc and Megalon with cxl_shm
+# VDB-V1 block (reports/VDB-V1-packet.md v1.3): VM validation of the vector DB v6 builds (per-operation time split,
+# MOT1 v6 Fig 2/3), HNSW VectorDB 28M, all three systems on one Popcorn build (v1.3: build 12; all-HWcc and Megalon with cxl_shm
 # unloaded; Popcorn with cxl_shm loaded per run, init_state=shared + preload, recv_mode poll). Validation only, not
 # comparison data: checks that the blocks close and the coherence sources are right, and measures the Megalon timer
 # overhead.
@@ -15,9 +15,13 @@
 #      classifies the trace on Host node 1 under a 16 GB address-space cap (sharing.csv); opsplit / opcoh_check
 #      megalon-vm as in step 1. trace.dropped must be 0 on both nodes.
 # usage: v6-block.sh <evidence dir (exists, holds only sequence* files)>
-# env (required, set by the packet's sequence.sh): K10 GT10 C10 (build-10 release, guest tools, deploy bundle),
+# env (required, set by the packet's sequence.sh): KPOP GTPOP CPOP (Popcorn release, guest tools, deploy bundle),
 #   PLAIN_BUILD VPLAIN (vdb build + guest dir for all-HWcc and Popcorn), MEG_BUILD VMEG MEG_CFG (vdb-megalon build +
-#   guest dir + Megalon config), LOADGEN_BUILD (loadgen dir).
+#   guest dir + Megalon config), MEG_LIB (the Megalon build MEG_BUILD must be built on, e.g. builds/megalon/77),
+#   LOADGEN_BUILD (loadgen dir), PRETOUCH_DIR (ENV-pretouch evidence dir: pretouch-gate.sh must pass at the block start
+#   and before every run: dax0.0 of both VMs pre-touched after their last QEMU start; standing rule 2026-10-17).
+#   Optional: EXPECT_DAX_UUID (guest namespace0.0 uuid, checked by the precheck), MEASURE_ENV_DIR (host-gate.sh),
+#   MEGALON_LEAN=1 (opcoh_check megalon-vm: Megalon >= 76 lean-sampling checks).
 # dax0.0: owned by comsys for all-HWcc/Megalon runs, back to root:root 600 before each Popcorn run (its
 # p-popcorn-shm.sh precheck needs it; teardown restores it). Same Host gate (measure-env check) / lock / stop rules as
 # M4 (m4-lib.sh, host-gate.sh).
@@ -25,11 +29,12 @@ set -uo pipefail
 E=$1 R=1
 P=/home/comsys/sungsu/destijl-control X=$P/CXL_SWMC/experiments/vectordb
 SEED_BASE=20261014 OWNER="VDB-V1"
-: "${K10:?}" "${GT10:?}" "${C10:?}" "${PLAIN_BUILD:?}" "${VPLAIN:?}" "${MEG_BUILD:?}" "${VMEG:?}" "${MEG_CFG:?}" "${LOADGEN_BUILD:?}"
+: "${KPOP:?}" "${GTPOP:?}" "${CPOP:?}" "${PLAIN_BUILD:?}" "${VPLAIN:?}" "${MEG_BUILD:?}" "${VMEG:?}" "${MEG_CFG:?}" "${LOADGEN_BUILD:?}"
+: "${MEG_LIB:?}" "${PRETOUCH_DIR:?}"
 for b in "$PLAIN_BUILD" "$MEG_BUILD" "$LOADGEN_BUILD"; do
   grep -q "^source_commit=.* dirty=0$" $b/manifest.txt || { echo "SEQUENCE STOP: $b is not a clean build"; exit 2; }
 done
-grep -q "^megalon_build=$P/builds/megalon/75$" $MEG_BUILD/manifest.txt || { echo "SEQUENCE STOP: $MEG_BUILD is not on builds/megalon/75"; exit 2; }
+grep -qx "megalon_build=$MEG_LIB" $MEG_BUILD/manifest.txt || { echo "SEQUENCE STOP: $MEG_BUILD is not on $MEG_LIB"; exit 2; }
 grep -q "^shim_kind=shared$" $MEG_BUILD/manifest.txt || { echo "SEQUENCE STOP: $MEG_BUILD has no shared (v3) shim"; exit 2; }
 GUEST_INIT=/home/comsys/vdb/init/seg32c32m-a27m HOST_IMAGE=$P/workspaces/vdb-data/seg32-c32m-a27m-m16-efc128-b1
 VP=${VPLAIN#/home/comsys/} VM=${VMEG#/home/comsys/}
@@ -51,7 +56,7 @@ $VM/cfg/cxl_region.yaml $P/CXL_SWMC/config/cxl_region.yaml"
 RATE_LOW=10.526 RATE_L=$(rate 158.479 5) RATE_TRACE=20
 COMMON=(DATASET=28m PLAIN_BUILD=$PLAIN_BUILD VPLAIN=$VPLAIN MEG_BUILD=$MEG_BUILD VMEG=$VMEG
         LOADGEN_BIN=$LOADGEN_BUILD/loadgen KIND=pfix)
-PE=(C8=$C10 K8=$K10 GT8=$GT10 RECV_MODE=poll)  # m4-run.sh's Popcorn variables, given the build-10 bundle
+PE=(C8=$CPOP K8=$KPOP GT8=$GTPOP RECV_MODE=poll)  # m4-run.sh's Popcorn variables (named C8/K8/GT8), given the bundle
 dax_root() {  # before a Popcorn run: back to root:root 600 (no server of ours runs between runs); fresh stat check
   [ $CHOWNED = 1 ] || return 0
   block_stop_servers
@@ -59,8 +64,13 @@ dax_root() {  # before a Popcorn run: back to root:root 600 (no server of ours r
   CHOWNED=0
 }
 dax_comsys() { [ $CHOWNED = 1 ] || chown_dax; }
+pretouch_gate() {  # standing rule: both VMs pre-touched after their last QEMU start (Host-only check)
+  bash $X/pretouch-gate.sh "$PRETOUCH_DIR" "$E/pretouch-gate.txt" > /dev/null \
+    || { echo "SEQUENCE STOP: pretouch gate ($1; see $E/pretouch-gate.txt)"; exit 1; }
+}
 one() {  # <sys> <name> <run-specific env...>
   local s=$1 name=$2; shift 2
+  pretouch_gate "$name"
   case $s in
     hw)  dax_comsys; run $name SYS=all-HWcc OPCOH_EXPECT=none OPCOH_CHECK_MODE=hwcc "${COMMON[@]}" "$@";;
     mg)  dax_comsys; run $name SYS=Megalon OPCOH_EXPECT=cohsnap "${COMMON[@]}" "$@";;
@@ -68,8 +78,9 @@ one() {  # <sys> <name> <run-specific env...>
   esac
 }
 block_start
-C8=$C10 K8=$K10 GT8=$GT10  # block_shm_cleanup (m4-lib.sh) reads C8/K8/GT8
-precheck "$K10"
+C8=$CPOP K8=$KPOP GT8=$GTPOP  # block_shm_cleanup (m4-lib.sh) reads C8/K8/GT8
+pretouch_gate block-start
+precheck "$KPOP"
 ORD=$(SHUFFLE_SEED=VDB-V1 shuffle hw pop mg)
 [ $(echo $ORD | wc -w) = 3 ] || { echo "SEQUENCE STOP: run order list"; exit 1; }
 { echo "# VDB-V1 order (shuffle seed VDB-V1; request seed $((SEED_BASE + R)))"; echo "step 1: $ORD"
@@ -85,4 +96,5 @@ grep -q "^-> .*sharing.csv:" $E/mg-u90-trace/sharing.log || { echo "SEQUENCE STO
 [ "$(grep -h '^trace.dropped=' $E/mg-u90-trace/node*.log | sort -u)" = "trace.dropped=0" ] \
   || { echo "SEQUENCE STOP: trace records dropped (see node logs)"; exit 1; }
 python3 $X/v6_overhead.py $E/mg-u5-v6 $E/mg-u5-t0 > $E/timer-overhead.txt 2>&1 || { echo "SEQUENCE STOP: v6_overhead.py"; exit 1; }
+pretouch_gate block-end  # no QEMU restart during the block
 echo "$(date -Is) SEQUENCE DONE $OWNER"

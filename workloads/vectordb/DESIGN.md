@@ -409,6 +409,16 @@ indexing unit; Megalon flushes the whole object at write end (no dirty-line trac
   reports/M2-megalon-port-changes.md §13). Megalon background threads (nr-log-sync replay,
   WriteMetadataManager reclaim) are not in CohSnap: their CPU stays in the window counters (thr.megalon-lib.*,
   thr.nr-log-sync.*; Popcorn kthr.cxl_recv*), exported next to the split.
+- Megalon >= 76 lean sampling (vdb build >= 15; megalon_objapi.h, reports/M2-megalon-port-changes.md §18): counts
+  stay exact, but every Megalon duration is a sum over timed sections only (a jittered 1 in check_sample of the read
+  sections and, separately, of the write sections). OpCoh src bit 4 = lean (CohSnap.reserved[1] bit 1), bit 5 =
+  MEGALON_COH_EVENTS=always (bit 2); `mg_write_sampled` (former pad2) = AnchorSnap.reserved[0] delta. C then uses
+  read-side events (stale + concur + meta + spin) x read_sections / check_sampled (full sums with events_always) and
+  write side (wstart + wflush, write lookup + write NR) x write_sections / write_sampled (proto.h RD / EV / WR; per
+  operation with its own counts, step means with the step's sums; opsplit tags ev / wr columns sampled×N /
+  sampled-write×N for such runs). Window keys `opt.<op>.meg.anchor.write_sampled`, `opt.<op>.meg.flags` (bits 1-2).
+  Megalon <= 75 records (bit 4 clear) keep the plain sums. No probe correction (build 77 probe cost, M2 §19) is
+  applied or exported (open question in reports/VDB-V1-packet.md v1.3).
 - Modified bytes (Fig 3b reference line): thread-local `t_mod_bytes` (shm_hnsw.h) counts the whole lines the
   application stores: vector record + zeroed level-0/upper link blocks (write_elem), each committed link block,
   each 64 B delete-log entry. Written back (Fig 3b): Megalon CohSnap wflush_bytes; Popcorn (S->M + wp faults) x 4 KiB.

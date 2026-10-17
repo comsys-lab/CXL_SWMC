@@ -135,10 +135,12 @@ struct Stats {
 // experiments/analysis/v6_common.py): opt.<op>.{ops,t_ns,c_ns,mod_bytes}, opt.<op>.pop.<f>, opt.<op>.meg.<f>; sums over
 // the operations answered (the same values as the response blocks; the server's completion time decides the window).
 struct OpWin {
-  static constexpr int kPop = 10, kMeg = 23, kAn = 10;
+  static constexpr int kPop = 10, kMeg = 23, kAn = 11;
   std::atomic<uint64_t> ops{0}, sections{0}, t_ns{0}, c_ns{0}, mod_bytes{0}, wait_ns{0}, pop[kPop]{}, meg[kMeg]{}, an[kAn]{};
+  std::atomic<uint64_t> meg_flags{0};  // OR of the blocks' Megalon flag bits as CohSnap.reserved[1] bits 1-2 (not a sum)
   void add(const OpCoh &b) {
     ops++, sections += b.sections, t_ns += b.t_ns, c_ns += b.c_ns, mod_bytes += b.mod_bytes, wait_ns += b.wait_ns;
+    meg_flags.fetch_or((b.src & 16 ? 2u : 0u) | (b.src & 32 ? 4u : 0u));
     const uint64_t p[kPop] = {b.pf_ns[0], b.pf_ns[1], b.pf_ns[2], b.pf_cnt[0], b.pf_cnt[1], b.pf_cnt[2], b.ipi_ns, b.ipi_cnt,
                               b.nontrans_ns, b.nontrans_cnt};
     const uint64_t m[kMeg] = {b.mg_read_sections, b.mg_write_sections, b.mg_check_ns_sampled, b.mg_check_sampled,
@@ -150,7 +152,7 @@ struct OpWin {
     for (int i = 0; i < kMeg; i++) meg[i] += m[i];
     const uint64_t x[kAn] = {b.mg_read_sections, b.mg_write_sections, b.mg_check_sampled, b.an_read_lookup_ns_sampled,
                              b.an_read_nr_ns_sampled, b.an_rseq_ns_sampled, b.an_write_lookup_ns, b.an_write_nr_ns,
-                             b.an_wseq_ns, b.an_wseq_end_ns};
+                             b.an_wseq_ns, b.an_wseq_end_ns, b.mg_write_sampled};
     for (int i = 0; i < kAn; i++) an[i] += x[i];
   }
   void print(std::ostream &o, const char *name) const {
@@ -168,8 +170,10 @@ struct OpWin {
     for (int i = 0; i < kMeg; i++) o << p << "meg." << mn[i] << "=" << meg[i];
     static const char *const an_n[kAn] = {"read_sections", "write_sections", "check_sampled", "read_lookup_ns_sampled",
                                           "read_nr_ns_sampled", "rseq_ns_sampled", "write_lookup_ns", "write_nr_ns",
-                                          "wseq_ns", "wseq_end_ns"};  // AnchorSnap field names (shim v3)
+                                          "wseq_ns", "wseq_end_ns", "write_sampled"};  // AnchorSnap field names (shim
+                                          // v3; write_sampled = reserved[0], Megalon >= 76)
     for (int i = 0; i < kAn; i++) o << p << "meg.anchor." << an_n[i] << "=" << an[i];
+    o << p << "meg.flags=" << meg_flags;  // bit 1 lean sampling, bit 2 events_always (Megalon >= 76; else 0)
   }
 };
 
@@ -658,7 +662,7 @@ class Server {
       st_.timeouts++;
       OpAcc d;  // no response carries this section
       opc_end(os, &d);
-      st_.opc_unattributed_ns += pop_coh_ns(d) + mg_coh_ns(d.mg);
+      st_.opc_unattributed_ns += pop_coh_ns(d) + mg_coh_ns(d);
       st_.opc_unattributed_t_ns += ticks_to_ns(d.ticks, tsc_khz_);
       j.c->reply(frame::kStatusTimeout, j.h.req_id, nullptr, 0);
       delete c;

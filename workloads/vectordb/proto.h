@@ -75,16 +75,24 @@ constexpr uint16_t kRespCoh = 1;
 // T covers server processing from the worker's dequeue of the request to the response being ready (search: the start
 // section, the segment tasks and the final merge/encode on the finishing thread; update: the writer section); queueing
 // before the dequeue and the socket send of the reply are outside T.
-// t_ns = sum over sections of (end - start) [measured]; c_ns = pf_ns[0..2] + ipi_ns + mg_check_ns_sampled x
-// mg_read_sections / mg_check_sampled (ratio estimator, 0 if nothing sampled) + vcopy_ns_sampled x vcopy_cnt /
-// vcopy_sampled (Megalon validation copies, same estimator; user decision 2026-10-16) + (an_read_lookup_ns_sampled +
-// an_read_nr_ns_sampled) x mg_read_sections / mg_check_sampled + an_write_lookup_ns + an_write_nr_ns + mg_stale_ns + mg_concur_ns + mg_meta_ns + mg_spin_ns + mg_wstart_ns + mg_wflush_ns [derived;
-// only one system's part is non-zero in practice]. mod_bytes (updates): bytes of the whole lines the application
+// t_ns = sum over sections of (end - start) [measured]; c_ns = pf_ns[0..2] + ipi_ns + RD(mg_check_ns_sampled) +
+// vcopy_ns_sampled x vcopy_cnt / vcopy_sampled (Megalon validation copies, same estimator; user decision 2026-10-16) +
+// RD(an_read_lookup_ns_sampled + an_read_nr_ns_sampled) + EV(mg_stale_ns + mg_concur_ns + mg_meta_ns + mg_spin_ns) +
+// WR(mg_wstart_ns + mg_wflush_ns) + WR(an_write_lookup_ns + an_write_nr_ns) [derived; only one system's part is
+// non-zero in practice], each term computed separately in integer arithmetic (floor), where
+//   RD(x) = x * mg_read_sections / mg_check_sampled (ratio estimator; 0 if mg_check_sampled = 0);
+//   EV(x) = RD(x) if src bit 4 (Megalon lean sampling) and not bit 5 (MEGALON_COH_EVENTS=always), else x;
+//   WR(x) = x * mg_write_sections / mg_write_sampled (0 if mg_write_sampled = 0) if src bit 4, else x.
+// Megalon <= 75 (bit 4 clear): EV and WR are the plain sums (every event and write section timed). Megalon >= 76
+// (megalon_objapi.h; reports/M2-megalon-port-changes.md §18): durations are sums over timed sections only, scaled per
+// side. No probe correction (build 77 AnchorSnap.reserved[1..5], M2 §19) is applied or exported. mod_bytes (updates): bytes of the whole lines the application
 // stores in SWcc (vector record, zeroed link blocks, committed link blocks, delete-log entry) [measured].
 struct __attribute__((packed)) OpCoh {
   uint16_t version;   // kOpCohVersion
   uint16_t src;       // bits 0-1 Popcorn source: 0 none, 1 swmc_acct, 2 /proc/thread-self/swmc, 3 fake; bit 2 Megalon
-                      // CohSnap present (shim v2 with thread_coh); bit 3 Megalon AnchorSnap present (shim v3)
+                      // CohSnap present (shim v2 with thread_coh); bit 3 Megalon AnchorSnap present (shim v3); bit 4
+                      // Megalon lean sampling (CohSnap.reserved[1] bit 1, build >= 76); bit 5 MEGALON_COH_EVENTS=always
+                      // (CohSnap.reserved[1] bit 2)
   uint16_t op;        // kOpSearch | kOpUpdate
   uint16_t sections;  // sections summed
   uint32_t tsc_khz;   // rdtsc rate used for t_ns (server start calibration)
@@ -106,7 +114,9 @@ struct __attribute__((packed)) OpCoh {
   uint32_t nontrans_cnt;  // reserved[1]; NOT part of c_ns [measured]
   uint32_t vcopy_cnt;     // Megalon validation copies into per-attempt scratch (every copy) [measured]
   uint64_t vcopy_ns_sampled;  // sum over the sampled copies (1 in kVcopySample, rdtsc) [sampled]
-  uint32_t vcopy_sampled, pad2;
+  uint32_t vcopy_sampled;
+  uint32_t mg_write_sampled;  // Megalon timed write sections (AnchorSnap.reserved[0] delta, build >= 76; 0 before;
+                              // was pad2, always 0, in vdb builds <= 14) [measured]
   // Megalon anchor work (shim v3 AnchorSnap, Megalon >= 75; zeros otherwise; src bit 3 = present). Vector DB's all-HWcc
   // has no Megalon, so all of it is C: read_lookup + read_nr (sampled read sections, ratio estimate x mg_read_sections
   // / mg_check_sampled) and write_lookup + write_nr are excluded from check / wstart and ADDED to c_ns; rseq (inside

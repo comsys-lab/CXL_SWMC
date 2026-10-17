@@ -19,7 +19,12 @@ done - sched.
 Output: one row per (measured step, operation type) in --out and a column table <out without .csv>.columns.csv
 (column, tag, unit, meaning). Tags: measured = sum of timed intervals / counted events / bytes; sampled×N = sum over
 sampled intervals × N (N = the CohSnap check_sample in the records, e.g. sampled×64); derived = computed from other
-columns (formula in the table). Means are per operation of that type: (1/N_o) sum_ops sum_threads. No proportional
+columns (formula in the table). Megalon >= 76 (records with src bit 4, lean sampling; megalon_objapi.h, reports/
+M2-megalon-port-changes.md §18): every Megalon duration is a sum over timed sections only, so the read-side event
+columns (tag ev) are scaled by the step's sum mg_read_sections / sum mg_check_sampled (not with src bit 5,
+MEGALON_COH_EVENTS=always: full sums) and the write-side columns (tag wr) by sum mg_write_sections / sum
+mg_write_sampled; their tag is then sampled×N / sampled-write×N, else (Megalon <= 75, other systems) measured. No
+probe correction (Megalon 77, M2 §19). Means are per operation of that type: (1/N_o) sum_ops sum_threads. No proportional
 "wall-equivalent" columns (thread-time sums are reported as they are). Per-operation C percentiles and the window C
 are not exported (the per-operation Megalon check ratio estimate is biased; C means use the step's sums). A run whose
 records carry more than one coherence source (mixed nodes or builds) is refused.
@@ -42,7 +47,7 @@ OPCOH = np.dtype([("version", "<u2"), ("src", "<u2"), ("op", "<u2"), ("sections"
                   ("mg_wstart_ns", "<u8"), ("mg_switch_rw_ns", "<u8"), ("mg_reclaim_ns", "<u8"),
                   ("mg_wflush_ns", "<u8"), ("mg_wflush_bytes", "<u8"), ("mod_bytes", "<u8"), ("wait_ns", "<u8"),
                   ("nontrans_ns", "<u8"), ("nontrans_cnt", "<u4"), ("vcopy_cnt", "<u4"), ("vcopy_ns_sampled", "<u8"),
-                  ("vcopy_sampled", "<u4"), ("pad2", "<u4")] + [(f, "<u8") for f in (
+                  ("vcopy_sampled", "<u4"), ("mg_write_sampled", "<u4")] + [(f, "<u8") for f in (
                       "an_read_lookup_ns_sampled", "an_read_nr_ns_sampled", "an_rseq_ns_sampled", "an_write_lookup_ns",
                       "an_write_nr_ns", "an_wseq_ns", "an_wseq_end_ns")] + [("req_id", "<u8")])
 OPLOG = np.dtype([("seq", "<u8"), ("recv_ns", "<u8"), ("measured", "u1"), ("target", "u1"), ("status", "<u2"),
@@ -68,7 +73,8 @@ COLUMNS = [
     ("wait_ms", "measured", "ms", "search: E1 wait (polling P >= ref_w) inside the start section, part of T_ms"),
     ("C_ms", "derived", "ms", "C_o = Popcorn (pop_is + pop_sm + pop_wp + pop_ipi) + Megalon (mg_check + mg_vcopy + "
      "mg_an_read_lookup + mg_an_read_nr + mg_an_write_lookup + mg_an_write_nr + mg_stale + mg_concur + mg_meta + "
-     "mg_spin + mg_wstart + mg_wflush), step means (only work the plain all-HWcc does not do: every Megalon call)"),
+     "mg_spin + mg_wstart + mg_wflush), step means of the columns as exported (Megalon >= 76: estimated per side, see "
+     "the tags) (only work the plain all-HWcc does not do: every Megalon call)"),
     ("rest_ms", "derived", "ms", "T_ms - C_ms"),
     ("C_frac", "derived", "", "C_ms / T_ms"),
     ("T_p50_ms", "measured", "ms", "per-operation T p50"),
@@ -96,24 +102,26 @@ COLUMNS = [
      "ratio estimate sum x sum mg_read_sections / sum mg_check_sampled / N_o; excluded from mg_check, part of C"),
     ("mg_an_read_nr_ms", "sampled", "ms", "Megalon anchor: NR sync / replay / combining / read lock of read sections, "
      "same estimator; excluded from mg_check, part of C"),
-    ("mg_an_write_lookup_ms", "measured", "ms", "Megalon anchor: index lookup of write sections; excluded from "
+    ("mg_an_write_lookup_ms", "wr", "ms", "Megalon anchor: index lookup of write sections; excluded from "
      "mg_wstart, part of C"),
-    ("mg_an_write_nr_ms", "measured", "ms", "Megalon anchor: NR part of write sections; excluded from mg_wstart, part of C"),
+    ("mg_an_write_nr_ms", "wr", "ms", "Megalon anchor: NR part of write sections; excluded from mg_wstart, part of C"),
     ("mg_an_rseq_ms", "sampled", "ms", "Megalon seqlock version reads of read sections (same estimator); INSIDE "
      "mg_check (not added again)"),
-    ("mg_an_wseq_ms", "measured", "ms", "Megalon WSeqBegin of write sections; INSIDE mg_wstart (not added again)"),
-    ("mg_an_wseq_end_ms", "measured", "ms", "Megalon WSeqEnd; INSIDE mg_wflush (not added again)"),
-    ("mg_stale_ms", "measured", "ms", "Megalon (A) stale copy: flush + restart"),
-    ("mg_concur_ms", "measured", "ms", "Megalon (B) concurrent write: flush + discarded section body"),
-    ("mg_meta_ms", "measured", "ms", "Megalon (C) metadata change: discarded section"),
-    ("mg_spin_ms", "measured", "ms", "Megalon (D) spin: writer lock, NR combiner / replica read-lock waits (contended only)"),
-    ("mg_wstart_ms", "measured", "ms", "Megalon write start (incl. switch_rw and reclaim)"),
-    ("mg_switch_rw_ms", "measured", "ms", "Megalon switch_rw (part of mg_wstart_ms; not added to C)"),
-    ("mg_reclaim_ms", "measured", "ms", "Megalon reclaim (part of mg_wstart_ms; not added to C)"),
-    ("mg_wflush_ms", "measured", "ms", "Megalon write-end whole-object flush"),
+    ("mg_an_wseq_ms", "wr", "ms", "Megalon WSeqBegin of write sections; INSIDE mg_wstart (not added again)"),
+    ("mg_an_wseq_end_ms", "wr", "ms", "Megalon WSeqEnd; INSIDE mg_wflush (not added again)"),
+    ("mg_stale_ms", "ev", "ms", "Megalon (A) stale copy: flush + restart"),
+    ("mg_concur_ms", "ev", "ms", "Megalon (B) concurrent write: flush + discarded section body"),
+    ("mg_meta_ms", "ev", "ms", "Megalon (C) metadata change: discarded section"),
+    ("mg_spin_ms", "ev", "ms", "Megalon (D) spin: writer lock, NR combiner / replica read-lock waits (contended only)"),
+    ("mg_wstart_ms", "wr", "ms", "Megalon write start (incl. switch_rw and reclaim)"),
+    ("mg_switch_rw_ms", "wr", "ms", "Megalon switch_rw (part of mg_wstart_ms; not added to C)"),
+    ("mg_reclaim_ms", "wr", "ms", "Megalon reclaim (part of mg_wstart_ms; not added to C)"),
+    ("mg_wflush_ms", "wr", "ms", "Megalon write-end whole-object flush"),
     ("mg_read_sections", "measured", "count", "Megalon read sections per operation"),
     ("mg_write_sections", "measured", "count", "Megalon write sections per operation"),
     ("mg_check_sampled", "measured", "count", "Megalon sampled sections per operation (timed checks)"),
+    ("mg_write_sampled", "measured", "count", "Megalon timed write sections per operation (AnchorSnap.reserved[0], "
+     "Megalon >= 76; 0 before)"),
     ("mg_stale_cnt", "measured", "count", "(A) events per operation"),
     ("mg_concur_cnt", "measured", "count", "(B) events per operation"),
     ("mg_meta_cnt", "measured", "count", "(C) events per operation"),
@@ -140,6 +148,9 @@ COLUMNS = [
      "source per run is enforced"),
     ("mg_cohsnap", "", "", "1 = Megalon CohSnap present in the step's records (shim v2 with thread_coh)"),
     ("mg_anchor", "", "", "1 = Megalon AnchorSnap present in the step's records (shim v3 with thread_anchor)"),
+    ("mg_lean", "", "", "1 = Megalon lean sampling (src bit 4, CohSnap.reserved[1] bit 1, Megalon >= 76): ev / wr "
+     "columns are estimates"),
+    ("mg_events_always", "", "", "1 = MEGALON_COH_EVENTS=always (src bit 5): ev columns are full sums, wr scale = 1"),
     ("unmatched", "measured", "count", "run-level: measured op records without a raw record (same on every row)"),
     ("match", "", "", "how op records were joined to loadgen raw rows: req_id (server echoes the frame req_id; loadgen "
      "rawid-step sidecar) or time (old runs without the sidecar: latest done <= recv within --tol-us; flagged)"),
@@ -254,6 +265,7 @@ def analyze(run, tol_us=20.0):
                        if len(raws) else 0, np.nan)
         per_op[op] = (L, step_of, lat)
     src = int(c["src"][0]) if len(logs) else 0
+    lean, always = bool(src & 16), bool(src & 32)  # Megalon >= 76 lean sampling / MEGALON_COH_EVENTS=always (one source)
     for s in steps:
         if s["phase"] == "warmup" or s.get("measure_s", 0) <= 0:
             continue
@@ -273,12 +285,19 @@ def analyze(run, tol_us=20.0):
             vcopy_total = vs * vc / vn if vn else 0.0
             ratio = rs / cs_ if cs_ else 0.0
             sm = lambda k: float(x[k].astype(np.float64).sum())  # noqa: E731
+            # Megalon >= 76 (lean): read-side events x the read ratio (unless events_always), write side x
+            # sum write_sections / sum write_sampled (step sums, as for the checks); else plain sums (scale 1)
+            ws, wsam = sm("mg_write_sections"), sm("mg_write_sampled")
+            ev_k = (ratio if lean and not always else 1.0)
+            wr_k = ((ws / wsam if wsam else 0.0) if lean else 1.0)
             an_rd = (sm("an_read_lookup_ns_sampled") + sm("an_read_nr_ns_sampled")) * ratio
-            an_wr = sm("an_write_lookup_ns") + sm("an_write_nr_ns")
+            an_wr = (sm("an_write_lookup_ns") + sm("an_write_nr_ns")) * wr_k
             chk_total_c = chk_total + vcopy_total + an_rd + an_wr
-            other = (x["pf_ns"].sum(axis=1).astype(np.float64) + x["ipi_ns"] + x["mg_stale_ns"] + x["mg_concur_ns"]
-                     + x["mg_meta_ns"] + x["mg_spin_ns"] + x["mg_wstart_ns"] + x["mg_wflush_ns"])
-            C_step = (float(other.sum()) + chk_total_c) / n if n else None
+            ev_total = (sm("mg_stale_ns") + sm("mg_concur_ns") + sm("mg_meta_ns") + sm("mg_spin_ns")) * ev_k
+            wr_total = (sm("mg_wstart_ns") + sm("mg_wflush_ns")) * wr_k
+            pop_total = float((x["pf_ns"].sum(axis=1).astype(np.float64) + x["ipi_ns"]).sum())
+            C_step = (pop_total + ev_total + wr_total + chk_total_c) / n if n else None
+            kms = lambda k, f: sm(k) * f / n / 1e6 if n else None  # noqa: E731
             w = win.get(s["step"], {})
             wn = w.get(f"opt.{name}.ops", 0)
             row = dict(step=s["step"], phase=s["phase"], op=name,
@@ -298,8 +317,9 @@ def analyze(run, tol_us=20.0):
                        mg_an_read_lookup_ms=sm("an_read_lookup_ns_sampled") * ratio / n / 1e6 if n else None,
                        mg_an_read_nr_ms=sm("an_read_nr_ns_sampled") * ratio / n / 1e6 if n else None,
                        mg_an_rseq_ms=sm("an_rseq_ns_sampled") * ratio / n / 1e6 if n else None,
-                       mg_an_write_lookup_ms=ms(x["an_write_lookup_ns"]), mg_an_write_nr_ms=ms(x["an_write_nr_ns"]),
-                       mg_an_wseq_ms=ms(x["an_wseq_ns"]), mg_an_wseq_end_ms=ms(x["an_wseq_end_ns"]),
+                       mg_an_write_lookup_ms=kms("an_write_lookup_ns", wr_k), mg_an_write_nr_ms=kms("an_write_nr_ns", wr_k),
+                       mg_an_wseq_ms=kms("an_wseq_ns", wr_k), mg_an_wseq_end_ms=kms("an_wseq_end_ns", wr_k),
+                       mg_lean=int(lean) if n else None, mg_events_always=int(always) if n else None,
                        mg_anchor=(int(x["src"][0]) >> 3) & 1 if n else None,
                        wb_bytes_mg=cnt(x["mg_wflush_bytes"]),
                        m_acq_bytes_pop=cnt((x["pf_cnt"][:, 1].astype(np.float64) + x["pf_cnt"][:, 2]) * PAGE),
@@ -313,9 +333,11 @@ def analyze(run, tol_us=20.0):
                        if w.get("window_s") else None,
                        pop_source=POP_SRC.get(int(x["src"][0]) & 3, "?") if n else None,
                        mg_cohsnap=(int(x["src"][0]) >> 2) & 1 if n else None, unmatched=None)
-            for k in ("stale", "concur", "meta", "spin", "wstart", "switch_rw", "reclaim", "wflush"):
-                row[f"mg_{k}_ms"] = ms(x[f"mg_{k}_ns"])
-            for k in ("read_sections", "write_sections", "check_sampled", "stale_cnt", "concur_cnt", "meta_cnt",
+            for k in ("stale", "concur", "meta", "spin"):
+                row[f"mg_{k}_ms"] = kms(f"mg_{k}_ns", ev_k)
+            for k in ("wstart", "switch_rw", "reclaim", "wflush"):
+                row[f"mg_{k}_ms"] = kms(f"mg_{k}_ns", wr_k)
+            for k in ("read_sections", "write_sections", "check_sampled", "write_sampled", "stale_cnt", "concur_cnt", "meta_cnt",
                       "spin_cnt", "switch_rw_cnt", "reclaim_cnt", "wflush_cnt"):
                 row[f"mg_{k}"] = cnt(x[f"mg_{k}"])
             rows.append(row)
@@ -323,7 +345,12 @@ def analyze(run, tol_us=20.0):
     for r in rows:
         r["unmatched"] = unmatched
         r["match"] = method
-    tag = lambda t: f"sampled×{sample or 64}" if t == "sampled" else t  # noqa: E731
+    def tag(t):
+        if t == "ev":
+            t = "sampled" if lean and not always else "measured"
+        elif t == "wr":
+            t = "sampled-write" if lean and not always else "measured"
+        return f"{t}×{sample or 64}" if t in ("sampled", "sampled-write") else t
     table = [(col, tag(t), u, m) for col, t, u, m in COLUMNS]
     summary = (f"{len(rows)} rows, {len(logs)} op records ({int((logs['op'] == OP_SEARCH).sum())} search, "
                f"{int((logs['op'] == OP_UPDATE).sum())} update), matched {matched}, ambiguous {ambiguous}, "

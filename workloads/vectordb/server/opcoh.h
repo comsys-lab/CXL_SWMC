@@ -70,8 +70,10 @@ struct OpAcc {
   uint64_t nt_ns = 0, nt_cnt = 0;  // Popcorn no-transition faults (swmc_acct reserved[0..1]); not part of C
   uint64_t vc_cnt = 0, vc_sampled = 0, vc_ticks = 0;  // Megalon validation copies (part of C, ratio estimate)
   mshim::CohSnap mg{};  // summed deltas; check_sample = the snapshot's value (not a delta)
-  mshim::AnchorSnap an{};  // summed deltas (shim v3)
+  mshim::AnchorSnap an{};  // summed deltas (shim v3); an.reserved[0] = timed write sections (Megalon >= 76)
+  uint64_t mg_flags = 0;  // CohSnap.reserved[1] of the snapshots (not a delta): bit 1 lean, bit 2 events_always
   void add(const OpAcc &d) {
+    mg_flags |= d.mg_flags;
     ticks += d.ticks, wait_ticks += d.wait_ticks, sections += d.sections, nt_ns += d.nt_ns, nt_cnt += d.nt_cnt,
     vc_cnt += d.vc_cnt, vc_sampled += d.vc_sampled, vc_ticks += d.vc_ticks, ipi_ns += d.ipi_ns, ipi_cnt += d.ipi_cnt, mod_bytes += d.mod_bytes;
     for (int i = 0; i < 3; i++) pf_ns[i] += d.pf_ns[i], pf_cnt[i] += d.pf_cnt[i];
@@ -86,13 +88,23 @@ struct OpAcc {
 // (C) metadata change + (D) spin (writer lock, NR combiner / replica read-lock waits) + write start (incl. switch_rw,
 // reclaim) + write-end flush. Contract (megalon_objapi.h, CXL_SWMC 2015a31f3): the intervals are disjoint; checks =
 // ratio estimator check_ns_sampled x read_sections / check_sampled (read sections only; 0 when nothing was sampled).
+// Megalon >= 76 (CohSnap.reserved[1] bit 1 = lean sampling; M2 §18): every duration is a sum over timed sections only:
+// read-side events (stale/concur/meta/spin) x read_sections / check_sampled unless MEGALON_COH_EVENTS=always (bit 2:
+// full sums), write side (wstart, wflush, AnchorSnap write_*) x write_sections / write_sampled (AnchorSnap.reserved[0];
+// identity with events_always, where write_sampled = write_sections). proto.h OpCoh: RD / EV / WR.
 // Per operation the ratio uses the operation's own counts; step means in opsplit.py use the step's sums.
-inline uint64_t mg_check_est_ns(const mshim::CohSnap &d) {
-  return d.check_sampled ? uint64_t((unsigned __int128)d.check_ns_sampled * d.read_sections / d.check_sampled) : 0;
+constexpr uint64_t kMgFlagLean = 2, kMgFlagEventsAlways = 4;  // CohSnap.reserved[1] bits (Megalon >= 76)
+inline uint64_t mg_ratio(uint64_t x, uint64_t num, uint64_t den) {
+  return den ? uint64_t((unsigned __int128)x * num / den) : 0;
 }
-inline uint64_t mg_coh_ns(const mshim::CohSnap &d) {
-  return mg_check_est_ns(d) + d.stale_ns + d.concur_ns + d.meta_ns + d.spin_ns + d.wstart_ns + d.wflush_ns;
+inline uint64_t mg_check_est_ns(const mshim::CohSnap &d) { return mg_ratio(d.check_ns_sampled, d.read_sections, d.check_sampled); }
+inline uint64_t mg_coh_ns(const mshim::CohSnap &d, uint64_t write_sampled, uint64_t flags) {
+  const bool lean = flags & kMgFlagLean, always = flags & kMgFlagEventsAlways;
+  const uint64_t ev = d.stale_ns + d.concur_ns + d.meta_ns + d.spin_ns, wr = d.wstart_ns + d.wflush_ns;
+  return mg_check_est_ns(d) + (lean && !always ? mg_ratio(ev, d.read_sections, d.check_sampled) : ev) +
+         (lean ? mg_ratio(wr, d.write_sections, write_sampled) : wr);
 }
+inline uint64_t mg_coh_ns(const OpAcc &a) { return mg_coh_ns(a.mg, a.an.reserved[0], a.mg_flags); }
 // Validation-copy estimate of a block (ns): ratio estimator over the block's own counts (0 if nothing sampled).
 inline uint64_t vcopy_est_ns(const OpCoh &b) {
   return b.vcopy_sampled ? uint64_t((unsigned __int128)b.vcopy_ns_sampled * b.vcopy_cnt / b.vcopy_sampled) : 0;
@@ -106,17 +118,18 @@ inline const char *pop_src_name(int s) {
 }
 
 // Megalon anchor work that vector DB counts in C (no Megalon in its all-HWcc): read lookup + NR (sampled, ratio
-// estimate over the operation's own read sections) + write lookup + NR. rseq / wseq / wseq_end are already inside
-// check / wstart / wflush.
+// estimate over the operation's own read sections) + write lookup + NR (Megalon >= 76, src bit 4: timed write
+// sections only, x write_sections / write_sampled). rseq / wseq / wseq_end are already inside check / wstart / wflush.
 inline uint64_t an_coh_ns(const OpCoh &b) {
-  const uint64_t rd = b.an_read_lookup_ns_sampled + b.an_read_nr_ns_sampled;
-  return (b.mg_check_sampled ? uint64_t((unsigned __int128)rd * b.mg_read_sections / b.mg_check_sampled) : 0) +
-         b.an_write_lookup_ns + b.an_write_nr_ns;
+  const uint64_t rd = b.an_read_lookup_ns_sampled + b.an_read_nr_ns_sampled, wr = b.an_write_lookup_ns + b.an_write_nr_ns;
+  return mg_ratio(rd, b.mg_read_sections, b.mg_check_sampled) +
+         ((b.src & 16) ? mg_ratio(wr, b.mg_write_sections, b.mg_write_sampled) : wr);
 }
 inline OpCoh op_block(const OpAcc &a, uint16_t op, int pop_src, bool mg_snap, uint32_t tsc_khz, bool an_snap = false) {
   OpCoh b{};
   b.version = kOpCohVersion;
-  b.src = uint16_t((pop_src & 3) | (mg_snap ? 4 : 0) | (an_snap ? 8 : 0));
+  b.src = uint16_t((pop_src & 3) | (mg_snap ? 4 : 0) | (an_snap ? 8 : 0) |
+                   (mg_snap && (a.mg_flags & kMgFlagLean) ? 16 : 0) | (mg_snap && (a.mg_flags & kMgFlagEventsAlways) ? 32 : 0));
   b.op = op;
   b.sections = uint16_t(a.sections > 0xffff ? 0xffff : a.sections);
   b.tsc_khz = tsc_khz;
@@ -142,7 +155,9 @@ inline OpCoh op_block(const OpAcc &a, uint16_t op, int pop_src, bool mg_snap, ui
   b.an_read_lookup_ns_sampled = n.read_lookup_ns_sampled, b.an_read_nr_ns_sampled = n.read_nr_ns_sampled;
   b.an_rseq_ns_sampled = n.rseq_ns_sampled, b.an_write_lookup_ns = n.write_lookup_ns, b.an_write_nr_ns = n.write_nr_ns;
   b.an_wseq_ns = n.wseq_ns, b.an_wseq_end_ns = n.wseq_end_ns;
-  b.c_ns = pop_coh_ns(a) + mg_coh_ns(m) + vcopy_est_ns(b) + an_coh_ns(b);
+  b.mg_write_sampled = uint32_t(n.reserved[0]);
+  b.c_ns = pop_coh_ns(a) + mg_coh_ns(m, n.reserved[0], (b.src & 16 ? kMgFlagLean : 0) | (b.src & 32 ? kMgFlagEventsAlways : 0)) +
+           vcopy_est_ns(b) + an_coh_ns(b);
   return b;
 }
 
@@ -238,6 +253,7 @@ class OpCohSrc {
       const uint64_t cs = e.mg.check_sample;
       for (int k = 0; k < kSnapWords; k++) words(a->mg)[k] += words(e.mg)[k] - words(s.v.mg)[k];
       a->mg.check_sample = cs;
+      a->mg_flags |= e.mg.reserved[1];  // flags word (constant per thread): a value, not a delta
     }
     if (an_)
       for (int k = 0; k < kAnWords; k++) words(a->an)[k] += words(e.an)[k] - words(s.v.an)[k];

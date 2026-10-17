@@ -101,7 +101,7 @@ precheck() {  # expected kernel release
   local kr=$1 i f sums
   sums=$(sha256sum < "$HOST_IMAGE/SHA256SUMS" | cut -d' ' -f1)
   for i in 0 1; do
-    $SSH comsys@${IPS[$i]} "EXPECT_K=$kr INIT_DIR=$GUEST_INIT INIT_SUMS=$sums INIT_CHECK=$([ $i = 0 ] && echo 1 || echo 0) INSTALL_DIRS='$(echo "$INSTALL" | awk '{print $1}' | tr '\n' ' ')' bash -s" \
+    $SSH comsys@${IPS[$i]} "EXPECT_K=$kr EXPECT_DAX_UUID=${EXPECT_DAX_UUID:-} INIT_DIR=$GUEST_INIT INIT_SUMS=$sums INIT_CHECK=$([ $i = 0 ] && echo 1 || echo 0) INSTALL_DIRS='$(echo "$INSTALL" | awk '{print $1}' | tr '\n' ' ')' bash -s" \
       < $X/m4-precheck.sh > "$E/precheck-${IPS[$i]}.out" 2>&1
     grep -q "^PRECHECK PASS" "$E/precheck-${IPS[$i]}.out" || { echo "SEQUENCE STOP: precheck ${IPS[$i]}"; exit 1; }
     while read -r g h; do
