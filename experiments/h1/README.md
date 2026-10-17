@@ -8,6 +8,7 @@ the workload's own block, reached through its H1 hook. One block runs at a time,
 | File | Role |
 | --- | --- |
 | h1-plan.tsv | workload x mix rows: mix parameter, x -> rate factor, rate decimals, SLO, label (MOT1 v6 §1 mixes and SLOs) |
+| h1-gate.sh | H1 Host gate: measure-env-part check, build processes, CPU busy of the node1 measurement sets (meas ≤ 10 % avg / 50 % per CPU, emu ≤ 25 %); lock/unlock delegated to host-gate.sh |
 | levels-cb.sh | r1 callback inside the mg lifetime: levels.py --mix for that mix (appended to levels.tsv), prints `<L2_rate> <L1_rate>` |
 | h1-main.sh | one stage per call (`r1-kv`, `r1-lmdb`, `r1-vdb`, `r1-recsys`, `r2`, `r3`; user decision 2026-10-17; `r2`/`r3` take `--workloads w1,w2` for a user-chosen subset, plan change 2026-10-18). Every stage ends with `<W>/collect-all-r<n>` (rounds 1..n). Takes the lock `H1-main`. Per workload: gates, SLO phase, levels.py (r1 only), fixed phase, gates, collect.py, check.py. Refuses a stage until the previous stage is checked PASS and accepted |
 | check.py | per workload x round acceptance checks F1-F9 (FAIL) and W1-W6 (WARN, judged by the main session) -> `r<n>/check.txt` |
@@ -65,6 +66,13 @@ The block file carries the literal marker `H1-HOOK v2` (hook.sh refuses v1). It 
 7. Systems as v1: all-HWcc = the workload's all-HWcc build (KV: kv on Megalon 77-hwcc; others plain), Popcorn =
    plain + cxl_shm build 12 (init_state=shared, recv_mode poll, instr_enabled=1), Megalon = Megalon 77 timers on,
    mgoff = the same Megalon build with MEGALON_COH_TIMERS=0.
+8. Host gate and loadgen launch under H1 (option (가), user decisions 2026-10-18; set by h1-main.sh/hook.sh as
+   `H1_MEASURE_RUN=1` + `MEASURE_PART_DIR`): before every lifetime/part use `experiments/h1/h1-gate.sh check <log>`
+   (partition check, no build process, node1 measurement CPU sets quiet; VM/node0 load not judged) instead of
+   `experiments/vectordb/host-gate.sh check`, and start loadgen as `bash scripts/host/measure-run.sh [--env K=V].. --
+   numactl --physcpubind=$LG_CPUS --membind=1 $LOADGEN ...` (measure.slice; user.slice can no longer reach 56-63).
+   Without H1_MEASURE_RUN (validation packets) both stay as they are. measure-run.sh clears the environment: pass any
+   variable loadgen needs with --env.
 
 ## Self-test
 `bash experiments/h1/test/selftest.sh /home/comsys/sungsu/destijl-control/workspaces/h1-main/selftest-<n>` must print

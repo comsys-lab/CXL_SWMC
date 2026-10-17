@@ -16,7 +16,8 @@
 #   check.py r2 compares hw/pop r1 separate vs r2 continuous against the run-to-run spread (mg, continuous in both
 #   rounds); REPORT lines block the r2 acceptance (r3) until the user has seen them.
 # Per workload W and round n (stage dir <E>/<W>/r<n>/run/, must not exist):
-#   1. gate: pretouch gate (standing rule 2026-10-17) and Host gate (no build, quiet, measure-env check)
+#   1. gate: pretouch gate (standing rule 2026-10-17) and h1-gate.sh (partition check, no build, node1 measurement CPU
+#      sets quiet; VM/node0 load not judged, user 2026-10-18)
 #   2. hook.sh W r1|cont <E>/<W>/r<n>/run (one block call per workload and round; r1 writes <E>/<W>/levels.tsv
 #      through levels-cb.sh inside each mg lifetime; r2/r3 reuse it, dec Q3)
 #   5. pretouch gate again; 6. collect.py -> r<n>/collect; 7. check.py -> r<n>/check.txt (H1CHECK PASS | FAIL)
@@ -25,7 +26,8 @@
 # first failing step ("SEQUENCE STOP"); every block rolls back in its own EXIT trap; this script releases the lock.
 # usage: h1-main.sh <stage> <evidence root E>
 #   E: for r1-kv it must exist and be empty except sequence* files; later stages use the same E.
-# env: PRETOUCH_DIR, MEASURE_ENV_DIR (required unless H1_DRY=1), H1_PLAN (default h1-plan.tsv next to this script),
+# env: PRETOUCH_DIR, MEASURE_ENV_DIR, MEASURE_PART_DIR (required unless H1_DRY=1; exported with H1_MEASURE_RUN=1 so the
+#   hooks gate with h1-gate.sh and start loadgen through scripts/host/measure-run.sh), H1_PLAN (default h1-plan.tsv next to this script),
 #   settle_s per workload from the plan (column 8),
 #   H1_SEED_BASE (20261017: loadgen seed of round n = base + n), H1_NO_FIGS (set: no
 #   figures), H1_DRY=1 (Host self-test: plugin "stub", gates skipped, LOCK must be a test lock under h1-main/).
@@ -78,7 +80,8 @@ if [ "$DRY" = 1 ]; then
   case "${LOCK:-}" in */h1-main/*) ;; *) echo "SEQUENCE STOP: H1_DRY=1 needs LOCK=<test lock under workspaces/h1-main/>"; exit 2;; esac
 else
   : "${PRETOUCH_DIR:?PRETOUCH_DIR = ENV-pretouch evidence dir of the current QEMU lifetime}" "${MEASURE_ENV_DIR:?}"
-  export PRETOUCH_DIR MEASURE_ENV_DIR
+  : "${MEASURE_PART_DIR:?MEASURE_PART_DIR = measure-env-part.sh apply dir (option (ga), 2026-10-18)}"
+  export PRETOUCH_DIR MEASURE_ENV_DIR MEASURE_PART_DIR H1_MEASURE_RUN=1
 fi
 log() { echo "$(date -Is) [$STAGE] $*" | tee -a "$E/h1-state.txt"; }
 stop() { log "SEQUENCE STOP $*"; exit 1; }
@@ -86,16 +89,17 @@ bash $G lock $OWNER || { echo "SEQUENCE STOP: lock"; exit 2; }
 trap 'bash $G unlock $OWNER' EXIT
 { echo "# H1 main stage $STAGE"; echo "start=$(date -Is)"; echo "cxl_swmc_commit=$(git -C $H rev-parse HEAD 2>/dev/null)"
   echo "cxl_swmc_dirty_h1=$(git -C $H status --porcelain -- . | wc -l)"; echo "plan=$PLAN sha256=$(sha256sum < "$PLAN" | cut -c1-64)"
-  for f in h1-main.sh hook.sh levels.py levels-cb.sh collect.py check.py h1-accept.sh; do echo "$f sha256=$(sha256sum < $H/$f | cut -c1-64)"; done
+  for f in h1-main.sh hook.sh h1-gate.sh levels.py levels-cb.sh collect.py check.py h1-accept.sh; do echo "$f sha256=$(sha256sum < $H/$f | cut -c1-64)"; done
   for f in v6_fig2_split.py v6_common.py v6_fig1_curves.py; do echo "analysis/$f sha256=$(sha256sum < $H/../analysis/$f | cut -c1-64)"; done
   echo "stage=$STAGE round=$N workloads=$WL seed_base=$H1_SEED_BASE dry=$DRY"
-  echo "pretouch_dir=${PRETOUCH_DIR:-} measure_env_dir=${MEASURE_ENV_DIR:-}"
+  echo "pretouch_dir=${PRETOUCH_DIR:-} measure_env_dir=${MEASURE_ENV_DIR:-} measure_part_dir=${MEASURE_PART_DIR:-}"
+  for f in measure-env.sh measure-env-part.sh measure-run.sh; do echo "scripts/host/$f sha256=$(sha256sum < $H/../../scripts/host/$f | cut -c1-64)"; done
   for w in $WL; do f=$H/plugins/pins-$w.sh; [ "$DRY" = 1 ] && f=$H/plugins/pins-stub.sh
     echo "pins.$w=$f sha256=$(sha256sum < "$f" 2>/dev/null | cut -c1-64)"; done; } >> "$E/h1-manifest.txt"
 gates() {  # tag
   if [ "$DRY" = 1 ]; then log "gate $1: DRY (pretouch and Host gates skipped)"; return 0; fi
   bash $PG "$PRETOUCH_DIR" "$E/pretouch-gate.txt" > /dev/null || stop "pretouch gate ($1; see pretouch-gate.txt)"
-  MEASURE_ENV_DIR=$MEASURE_ENV_DIR bash $G check "$E/gate-$1.txt" || stop "host gate ($1)"
+  MEASURE_ENV_DIR=$MEASURE_ENV_DIR MEASURE_PART_DIR=$MEASURE_PART_DIR bash $H/h1-gate.sh check "$E/gate-$1.txt" || stop "h1 gate ($1)"
   log "gate $1: PASS"
 }
 log "stage start: round $N, workloads [$WL]"

@@ -38,7 +38,8 @@ esac
 MIXTAGS=$(for m in $ARG; do echo -n "${m%%=*} "; done)
 echo "$(date -Is) hook $W $MODE $N: ${BLOCK_CMD[*]} $D" > "$D/sequence.cmd"
 env "${BLOCK_ENV[@]}" H1MODE=$MODE H1_N=$N "${XE[@]}" H1_PARENT_LOCK=H1-main \
-  PRETOUCH_DIR="${PRETOUCH_DIR:-}" MEASURE_ENV_DIR="${MEASURE_ENV_DIR:-}" \
+  PRETOUCH_DIR="${PRETOUCH_DIR:-}" MEASURE_ENV_DIR="${MEASURE_ENV_DIR:-}" MEASURE_PART_DIR="${MEASURE_PART_DIR:-}" \
+  H1_MEASURE_RUN="${H1_MEASURE_RUN:-0}" \
   "${BLOCK_CMD[@]}" "$D" > "$D/sequence.log" 2>&1
 RC=$?
 [ $RC = 0 ] || stop "block rc $RC ($(grep -m1 'STOP' "$D/sequence.log" || tail -n 1 "$D/sequence.log"))"
