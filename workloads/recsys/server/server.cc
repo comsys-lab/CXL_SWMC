@@ -360,6 +360,7 @@ class Server {
   }
 
   void write_tables() {
+    if constexpr (Be::kRowObjects) return write_rows_initial();
     const uint64_t t0 = now_ns();
     auto keys = placement();
     const uint64_t t1 = now_ns();
@@ -384,12 +385,37 @@ class Server {
                  p_.swcc_bytes() / 1073741824.0);
   }
 
+  // Row-addressed backend (Megalon objects, one per row): every row written once with seq 0; no placement, no empty
+  // slots. Row contents are the same as in the slot tables (make_slot of the same key).
+  void write_rows_initial() {
+    const uint64_t t0 = now_ns();
+    std::atomic<uint64_t> next{0};
+    pool_.run([&](int) {
+        std::vector<uint8_t> buf(p_.slot_bytes);
+        for (;;) {
+          const uint64_t c = next.fetch_add(4096);
+          if (c >= p_.total_rows) break;
+          const uint64_t e = std::min(p_.total_rows, c + 4096);
+          uint32_t k = 0;
+          for (uint64_t g = c; g < e; g++) {
+            while (k + 1 < kSparse && p_.row_base[k + 1] <= g) k++;
+            const uint64_t r = g - p_.row_base[k];
+            make_slot(p_, Params::key(k, r), 0, buf.data());
+            be_->write_slot(k, r, [&](uint8_t *dst) { std::memcpy(dst, buf.data(), p_.slot_bytes); });
+          }
+        }
+      });
+    std::fprintf(stderr, "recsys-server: initial tables: %lu rows as %lu row objects, write %.1f s (%.1f GiB)\n",
+                 (unsigned long)p_.total_rows, (unsigned long)p_.total_rows, (now_ns() - t0) / 1e9,
+                 double(p_.total_rows * p_.slot_bytes) / 1073741824.0);
+  }
+
   void load_initial() {
     std::string err;
     const uint64_t t0 = now_ns();
     if constexpr (std::is_same_v<Be, MegalonBackend>) {
       if (!be_->create_objects(&err, [this](std::function<void(int)> f) { pool_.run(std::move(f)); })) die(err);
-      std::fprintf(stderr, "recsys-server: created %lu objects in %.1f s\n", (unsigned long)p_.total_slots,
+      std::fprintf(stderr, "recsys-server: created %lu objects in %.1f s\n", (unsigned long)p_.total_rows,
                    (now_ns() - t0) / 1e9);
     }
     if (o_.preloaded) {
@@ -405,20 +431,25 @@ class Server {
     const uint64_t t0 = now_ns();
     std::atomic<uint64_t> next{0}, occupied{0}, bad{0};
     const SlotView v(p_);
+    // index space: slots (plain) or rows (row objects; every row is occupied and must hold its own key)
+    const uint64_t total = Be::kRowObjects ? p_.total_rows : p_.total_slots;
+    const std::vector<uint64_t> &base = Be::kRowObjects ? p_.row_base : p_.slot_base;
     pool_.run([&](int) {
         std::vector<float> e(p_.dim);
         for (;;) {
           const uint64_t c = next.fetch_add(4096);
-          if (c >= p_.total_slots) break;
-          const uint64_t end = std::min(p_.total_slots, c + 4096);
+          if (c >= total) break;
+          const uint64_t end = std::min(total, c + 4096);
           uint32_t k = 0;
           for (uint64_t g = c; g < end; g++) {
-            while (k + 1 < kSparse && p_.slot_base[k + 1] <= g) k++;
-            const int r = be_->read_slot(k, g - p_.slot_base[k], [&](const uint8_t *s) {
+            while (k + 1 < kSparse && base[k + 1] <= g) k++;
+            const uint64_t i = g - base[k];
+            const int r = be_->read_slot(k, i, [&](const uint8_t *s) {
               uint64_t key, seq;
               uint32_t cs;
               std::memcpy(&key, s + v.key_off, 8);
               if (!key) return 0;
+              if (Be::kRowObjects && key != Params::key(k, i)) return 2;
               std::memcpy(&seq, s + v.seq_off, 8);
               std::memcpy(&cs, s + v.csum_off, 4);
               std::memcpy(e.data(), s + v.emb_off, size_t(p_.dim) * 4);
@@ -429,8 +460,8 @@ class Server {
           }
         }
       });
-    std::fprintf(stderr, "recsys-server: warm-up read %lu slots (%lu occupied, %lu bad) in %.1f s\n",
-                 (unsigned long)p_.total_slots, (unsigned long)occupied.load(), (unsigned long)bad.load(),
+    std::fprintf(stderr, "recsys-server: warm-up read %lu %s (%lu occupied, %lu bad) in %.1f s\n",
+                 (unsigned long)total, Be::kRowObjects ? "row objects" : "slots", (unsigned long)occupied.load(), (unsigned long)bad.load(),
                  (now_ns() - t0) / 1e9);
     if (occupied != p_.total_rows || bad) die("warm-up: table content does not match the initial load");
   }
@@ -473,6 +504,7 @@ class Server {
   }
   // Look up `key` in table k; on hit, adds the row's embedding into acc[dim]. Returns false on a miss.
   bool lookup(uint32_t k, uint64_t key, float *acc, float *tmp, LookupCnt *c) {
+    if constexpr (Be::kRowObjects) return lookup_row(k, key, acc, tmp, c);
     const uint32_t *ver = &h_->ver[p_.stripe(key)];
     uint32_t v1 = wait_even(ver, c);
     uint64_t s = p_.home(k, key);
@@ -499,6 +531,20 @@ class Server {
       s = s + 1 == p_.slots[k] ? 0 : s + 1;
     }
     return false;
+  }
+  // Row-addressed backend (Megalon-native): the key names its object, so a lookup is exactly one read section; the
+  // backend repeats the section until read_end accepts it, which is the consistency check the striped version table
+  // provides on plain (no application seqlock here, Q11). csum stays the independent torn-row check (--verify-rows).
+  bool lookup_row(uint32_t k, uint64_t key, float *acc, float *tmp, LookupCnt *c) {
+    const uint64_t row = Params::key_row(key);
+    if (row >= p_.rows[k]) return false;
+    Probe pr = read_probe(k, row, key, tmp);
+    c->probes++;
+    if (pr.key != key) return false;  // cannot happen with a complete initial load (warm-up checks every row's key)
+    if (o_.verify_rows && row_csum(key, pr.seq, tmp, p_.dim) != pr.csum) st_.torn++;
+    for (uint32_t j = 0; j < p_.dim; j++) acc[j] += tmp[j];  // sum pooling into x0
+    if (pr.seq > c->max_seq) c->max_seq = pr.seq;
+    return true;
   }
   // Slot of `key` in table k (keys never move: no deletes), or ~0 on a miss.
   uint64_t find_slot(uint32_t k, uint64_t key) {
@@ -539,7 +585,7 @@ class Server {
     std::atomic<uint32_t> left;
   };
   struct Touched {
-    uint64_t gslot;  // global slot index (slot_base[k] + s): sort key (SWcc address order)
+    uint64_t gslot;  // global index: slot_base[k] + slot (plain) or row_base[k] + row (row objects); sort key
     uint64_t key, seq;
     uint32_t k;
   };
@@ -574,6 +620,10 @@ class Server {
     buf.resize(p_.slot_bytes);
     for (const Touched &t : rows) {
       make_slot(p_, t.key, t.seq, buf.data());
+      if constexpr (Be::kRowObjects) {  // the write section locks and versions the object itself (no stripe, Q11)
+        be_->write_slot(t.k, t.gslot - p_.row_base[t.k], [&](uint8_t *dst) { std::memcpy(dst, buf.data(), p_.slot_bytes); });
+        continue;
+      }
       uint32_t *ver = &h_->ver[p_.stripe(t.key)];
       const uint32_t v = lock_stripe(ver);
       be_->write_slot(t.k, t.gslot - p_.slot_base[t.k], [&](uint8_t *dst) { std::memcpy(dst, buf.data(), p_.slot_bytes); });
@@ -586,6 +636,12 @@ class Server {
   // key -> resolved row (slot by probing SWcc); false on a miss (counted)
   bool resolve(uint64_t key, uint64_t seq, Touched *t) {
     const uint32_t k = Params::key_table(key);
+    if constexpr (Be::kRowObjects) {  // the key names its object: no probe
+      const uint64_t r = Params::key_row(key);
+      if (r >= p_.rows[k]) return st_.update_misses++, false;
+      *t = Touched{p_.row_base[k] + r, key, seq, k};
+      return true;
+    }
     const uint64_t s = find_slot(k, key);
     if (s == ~0ull) return st_.update_misses++, false;
     *t = Touched{p_.slot_base[k] + s, key, seq, k};

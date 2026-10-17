@@ -50,6 +50,7 @@ struct Params {
   uint32_t multi_hot_div = 1;   // test scaling of multi-hot sizes (>= 1 each)
   // derived
   std::vector<uint64_t> rows, slots, slot_base;  // per table; slot_base in slots
+  std::vector<uint64_t> row_base;               // per table: global index of row 0 (row-addressed backends, Megalon)
   std::vector<uint32_t> hot, hot_off;           // ids used per sample per table; offset of table k in Sample::ids
   uint64_t total_rows = 0, total_slots = 0, slot_bytes = 0;
   uint32_t lookups_per_sample = 0;
@@ -57,7 +58,7 @@ struct Params {
   void derive() {
     const auto &R = mlperf_rows();
     const auto &H = mlperf_multi_hot();
-    rows.clear(), slots.clear(), slot_base.clear(), hot.clear(), hot_off.clear();
+    rows.clear(), slots.clear(), slot_base.clear(), row_base.clear(), hot.clear(), hot_off.clear();
     total_rows = total_slots = 0;
     lookups_per_sample = 0;
     uint32_t off = 0;
@@ -69,6 +70,7 @@ struct Params {
       rows.push_back(r);
       slots.push_back(s);
       slot_base.push_back(total_slots);
+      row_base.push_back(total_rows);
       total_rows += r;
       total_slots += s;
       hot.push_back(std::max<uint32_t>(1, H[k] / multi_hot_div));  // the first hot[k] ids of the sample's H[k]
@@ -93,6 +95,7 @@ struct Params {
   // key = table+1 in the top byte, row index below (never 0; 0 marks an empty slot)
   static uint64_t key(uint32_t k, uint64_t row) { return (uint64_t(k) + 1) << 56 | row; }
   static uint32_t key_table(uint64_t key) { return uint32_t(key >> 56) - 1; }
+  static uint64_t key_row(uint64_t key) { return key & ((1ull << 56) - 1); }
   uint64_t home(uint32_t k, uint64_t key) const { return mix64(key ^ seed) % slots[k]; }
   // Striped version counter of a row (MemC3): hash(table, key) mod S. The key carries the table; a second salt keeps
   // the stripe independent of the home slot.
