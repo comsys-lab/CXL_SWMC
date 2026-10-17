@@ -81,6 +81,13 @@ each system's API and measures its coherence actions; it cannot prove a coherenc
   60 s interval are at least that fraction / intervals (re-touches across intervals would raise it). Full size,
   day-23 trace [0, 2M), T = 60 s, 20 windows: average 68,881 rows/T -> 883.4 samples/T = 14.72 samples/s; peak
   576,994 rows/T -> 11,325.6 samples/T = 188.76 samples/s (builds/recsys-inputs/1/rate-frac*.txt).
+- Operating-point check (experiments/recsys/v1_check.py, RECSYS-V1 v1.2.7+): rows per full round = d(round_rows) /
+  (d(published_seq) / (R x T)) over the window (the server's round clock is not aligned to a measurement window, so
+  a plain per-round mean includes partly fed rounds), target F x rows, +-15 %. Known bias (verifier LOW 16): a
+  partly fed round de-duplicates less (v1.2.6 hw: 53.9 rows/sample in the partial round vs 50.0 in the full one),
+  so the normalised estimate leans high, about +1-3 % (v1.2.6: hw +1.3 %, pop +2.7 %). Small against +-15 %, but it
+  is upward: it can hide a shortfall of that size, never invent one. H1 SLO runs check it on the passing,
+  non-overload steps only (v1_check --h1).
 - Row values are synthetic: emb = f(key, seq, seed) in [-0.05, 0.05) (D5).
 
 ## 6. Serving (DLRMv2 dense part, CPU, fp32)
