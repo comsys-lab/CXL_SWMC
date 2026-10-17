@@ -31,23 +31,26 @@ def write(name, sysk, mix, steps, summary):
     json.dump(summary, open(os.path.join(rd, "loadgen", "summary.json"), "w"))
     open(os.path.join(rd, "loadgen", "manifest.txt"), "w").write(f"slo={stream}:{slo[0]}:{slo[1]}\n")
     open(os.path.join(rd, "manifest.txt"), "w").write(
-        f"name={name}\nsystem={sysk}\nnode0=192.168.122.100 6.14.0-stub-12 x\ncxl_swmc_commit=stub\n")
+        f"name={name}\nsystem={sysk}\nnode0=192.168.122.100 6.14.0-famfs-de-stijl+-ds-popcorn-new-12 x\ncxl_swmc_commit=stub\n")
     with open(os.path.join(rd, "steps.csv"), "w") as f:
         f.write("label,step,stream,n0_window_s,n0_recv_cpu_s,n0_lib_bg_cpu_s,n1_window_s,n1_recv_cpu_s,n1_lib_bg_cpu_s\n")
         for s in steps:
             r = 3.0 if sysk == "pop" else 0.0
-            b = 2.0 if sysk == "mg" else 0.0
+            b = 2.0 if sysk in ("mg", "mgoff") else 0.0
             f.write(f"x,{s['step']},{stream},15,{r},{b},15,{r},{b}\n")
+    open(os.path.join(rd, "h1-runcheck.txt"), "w").write("stub per-run checks\nRUNCHECK PASS stub\n")
+    if w == "vdb":
+        open(os.path.join(rd, "opsplit-steps.csv"), "w").write("step,op\n")
     if w in ("kv", "lmdb"):  # workload split: Megalon background CPU over both nodes (opsplit.csv lib_bg_cpu_s)
         with open(os.path.join(rd, "opsplit.csv"), "w") as f:
             f.write("step,op,lib_bg_cpu_s[measured]\n")
             for s in steps:
-                f.write(f"{s['step']},get,{4.0 if sysk == 'mg' else 0.0}\n")
+                f.write(f"{s['step']},get,{4.0 if sysk in ('mg', 'mgoff') else 0.0}\n")
     if w == "recsys":  # breakdown.csv bg_cpu_ms_node<k>
         with open(os.path.join(rd, "breakdown.csv"), "w") as f:
             f.write("step,bg_cpu_ms_node0[measured],bg_cpu_ms_node1[measured]\n")
             for s in steps:
-                f.write(f"{s['step']},{2000.0 if sysk == 'mg' else 0.0},{2000.0 if sysk == 'mg' else 0.0}\n")
+                f.write(f"{s['step']},{2000.0 if sysk in ('mg', 'mgoff') else 0.0},{2000.0 if sysk in ('mg', 'mgoff') else 0.0}\n")
     return name
 runs = []
 if mode == "slo":
@@ -75,8 +78,8 @@ else:
     lines = open(os.environ["H1_LEVELS"]).read().split("\n")[1:]
     for line in filter(None, lines):
         f = line.split("\t")
-        mix, l1, l2 = f[0], float(f[5]), float(f[6])
-        for sysk in ("hw", "pop", "mg"):
+        mix, l1, l2 = f[0], float(f[8]), float(f[9])  # L1_rate, L2_rate: a fixed step's offered_x is the rate argument
+        for sysk in ("hw", "pop", "mg", "mgoff"):
             st = [step(0, "warmup", l2, l2, True, 0.1), step(1, "fixed", l2, l2, True, 0.4), step(2, "fixed", l1, l1, True, 0.8)]
             summ = {"mode": "fixed", "note": "", "steps": 3, "slo": {"stream": stream, "pct": slo[0], "ms": slo[1]},
                     "workload_finish": "ok"}

@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """H1 main: collect one workload's runs into CSVs for Excel and the Fig 1 / Fig 2 inputs (reports/H1-main-packet.md §6).
 
-Reads only what the workload hooks wrote (never the guests): every <W dir>/{slo,fix}-r*/h1-runs.tsv (name system mix
-phase round run_dir; run_dir holds loadgen/ and the run's manifest.txt), <W dir>/levels.tsv (levels.py).
-Writes <W dir>/collect/ (new files only; refuses an existing collect/ dir — result dirs stay immutable):
+Reads only what the workload hooks wrote (never the guests): every h1-runs.tsv below WDIR (name system mix phase round
+run_dir; run_dir holds loadgen/ and the run's manifest.txt), levels.tsv (levels.py, written in round 1).
+Writes WDIR/<out-name>/ (new files only; refuses an existing dir — result dirs stay immutable):
   runs-index.csv     one row per run: workload mix system phase round name run_dir manifest_sha256 system_line
                      kernel(node0) note confirm x_mean/x_sd/pslo_mean, max_offered_x_pass, min_offered_x_fail,
                      n_curve_steps, n_overload_steps
@@ -13,9 +13,11 @@ Writes <W dir>/collect/ (new files only; refuses an existing collect/ dir — re
                      repeats), mean / sd over rounds when SLO_ROUNDS > 1, ratio to all-HWcc, overload points present
   fix-steps.csv      per fixed-load window: level (L1 | L2, matched by offered rate within 1 %), offered, achieved, SLO
                      percentile, pass, coherence CPU (below)
-  fig/               v6_fig1_curves.py per mix (SLO round 1 runs; all rounds stay in the CSVs) and
-                     v6_fig2_split.py per mix (L1 / L2 windows) — experiments/analysis, Megalon C per the shim
-                     contract, no probe correction (CXL_SWMC 611a7ac6b, 7a2cfbf62)
+  fig/               v6_fig1_curves.py per mix (lowest SLO round present; all rounds stay in the CSVs) and
+                     v6_fig2_split.py per mix (L1 / L2 windows of hw, pop, mg, mgoff) — experiments/analysis
+  cdiff.csv          extraction of the Fig 2 CSVs of the round (no arithmetic), per mix x load x op: T of hw / pop /
+                     Megalon timers off / on, C_diff_ns (the Fig 2 Megalon C, upper bound, dec 2026-10-17 "(a)"),
+                     C_sampled_ns, C_method, Popcorn C and pop_T_minus_hw_ns, warn
   notes.txt          COLLECT NOTE lines (missing overload points, missing CPU source, figure script failures)
 Coherence CPU per window (CLAUDE.md: CPU spent on coherence next to throughput and latency), seconds summed over nodes:
   recv_cpu_s   Popcorn message receive kthreads cxl_recv* (steps.csv n<k>_recv_cpu_s; every workload)
@@ -25,14 +27,17 @@ Coherence CPU per window (CLAUDE.md: CPU spent on coherence next to throughput a
                kv, lmdb  opsplit.csv lib_bg_cpu_s[measured] (thread groups not named kv-* / lmdb-*)
                recsys breakdown.csv bg_cpu_ms_node<k>[measured] (thr.nr-log-sync + thr.mg-bg) / 1000
   coh_cpu_vcpus = (recv_cpu_s for Popcorn | meg_bg_cpu_s for Megalon | 0 for all-HWcc) / window_s
-usage: collect.py --plan h1-plan.tsv --workload W [--no-figs] WDIR
+usage: collect.py --plan h1-plan.tsv --workload W [--levels levels.tsv] [--out-name collect] [--no-figs] WDIR
+  WDIR = one round of a workload (<E>/<W>/r<n>: slo/ fix/) or the workload root (<E>/<W>, every round; --out-name
+  collect-all); runs = every h1-runs.tsv below WDIR outside collect* dirs. Figures use the lowest round present.
 Exit 0 with "COLLECT OK" (notes allowed), 1 on unreadable inputs ("COLLECT FAIL").
 """
 import argparse, csv, glob, hashlib, json, os, subprocess, sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 EXP = os.path.dirname(HERE)
-SYSTEMS = ("hw", "pop", "mg")
+SYSTEMS = ("hw", "pop", "mg")             # SLO phase (Fig 1): Megalon timers on (dec Q6)
+FIXSYS = ("hw", "pop", "mg", "mgoff")     # fixed phase (Fig 2): + Megalon timers off for C_diff (dec 2026-10-17 "(a)")
 CURVE_PHASES = ("ramp", "bisect", "fill", "overload")
 notes = []
 
@@ -67,7 +72,9 @@ def plan_rows(path, w):
 
 def runs_of(wdir):
     runs = []
-    for idx in sorted(glob.glob(os.path.join(wdir, "*-r*", "h1-runs.tsv"))):
+    for idx in sorted(glob.glob(os.path.join(wdir, "**", "h1-runs.tsv"), recursive=True)):
+        if any(part.startswith("collect") for part in os.path.relpath(idx, wdir).split(os.sep)[:-1]):
+            continue
         d = os.path.dirname(idx)
         for line in open(idx):
             if not line.strip() or line.startswith("#"):
@@ -159,6 +166,35 @@ def coh_cpu(workload, run, step):
     return recv, bg, win, "+".join(src) or "steps.csv"
 
 
+CD_HEADER = ["workload", "mix", "load", "op", "T_hw_ns", "T_pop_ns", "T_mg_off_ns", "T_mg_on_ns", "C_mg_diff_ns",
+             "C_mg_sampled_ns", "C_method", "C_pop_ns", "pop_T_minus_hw_ns", "warn", "source"]
+
+
+def cdiff(fig2_csv, W, mix, out_rows):
+    """Extraction only (no arithmetic): the analysis Fig 2 CSV (v6_fig2_split.py --megalon-c diff, CXL_SWMC 5b650ab4f)
+    publishes per load x op the row "Megalon (timers off)" with C_ns = C_diff_ns = T(mgoff) - T(hw) (upper bound),
+    T_mg_on_ns and C_sampled_ns, and the Popcorn row with pop_T_minus_hw_ns. One row per load x op here, all mixes of
+    the round in one file for Excel."""
+    try:
+        text = open(fig2_csv).read().splitlines()
+    except OSError:
+        note(f"cdiff {mix}: no {fig2_csv}")
+        return
+    hdr = next((i for i, l in enumerate(text) if l.startswith("load,op,system")), None)
+    if hdr is None:
+        note(f"cdiff {mix}: no header in {fig2_csv}")
+        return
+    t = {}
+    for r in csv.DictReader(text[hdr:]):
+        t[(r["load"], r["op"], r["system"])] = r
+    for load, op in sorted({(l, o) for l, o, _ in t}):
+        hw, pop, mg = (t.get((load, op, k)) or {} for k in ("All HWcc", "Popcorn", "Megalon (timers off)"))
+        out_rows.append([W, mix, load, op, hw.get("T_ns", ""), pop.get("T_ns", ""), mg.get("T_ns", ""),
+                         mg.get("T_mg_on_ns", ""), mg.get("C_diff_ns", ""), mg.get("C_sampled_ns", ""),
+                         mg.get("C_method", ""), pop.get("C_ns", ""), pop.get("pop_T_minus_hw_ns", ""), mg.get("warn", ""),
+                         os.path.basename(fig2_csv)])
+
+
 def write_csv(path, header, rows):
     with open(path, "w", newline="") as f:
         w = csv.writer(f)
@@ -171,17 +207,19 @@ def main():
     ap.add_argument("--plan", required=True)
     ap.add_argument("--workload", required=True)
     ap.add_argument("--no-figs", action="store_true")
+    ap.add_argument("--levels", help="levels.tsv (default <WDIR>/levels.tsv)")
+    ap.add_argument("--out-name", default="collect", help="output dir name below WDIR (default collect)")
     ap.add_argument("wdir")
     a = ap.parse_args()
     W, wdir = a.workload, a.wdir
-    out = os.path.join(wdir, "collect")
+    out = os.path.join(wdir, a.out_name)
     if os.path.exists(out):
         fail(f"{out} exists (result dirs are immutable; collect into a fresh copy)")
     os.makedirs(os.path.join(out, "fig"))
     mixes = plan_rows(a.plan, W)
     runs = runs_of(wdir)
     levels = {}
-    lp = os.path.join(wdir, "levels.tsv")
+    lp = a.levels or os.path.join(wdir, "levels.tsv")
     if os.path.isfile(lp):
         for r in csv.DictReader(open(lp), delimiter="\t"):
             levels[r["mix"]] = r
@@ -234,7 +272,10 @@ def main():
         lv = levels.get(r["mix"])
         if lv is None:
             fail(f"{r['name']}: mix {r['mix']} not in levels.tsv")
-        want = {"L1": float(lv["L1_x"]), "L2": float(lv["L2_x"])}
+        # a fixed-mode step's offered_x is the block's rate argument (vector DB: total of search + update streams =
+        # L_x / (1 - U/100); observed in recovery/VDB-V1-v1.3.1: offered_x 83.41 at 78.48 search/s), so windows are
+        # matched against levels.tsv L*_rate, not L*_x
+        want = {"L1": float(lv["L1_rate"]), "L2": float(lv["L2_rate"])}
         for s in load_steps(r["dir"]):
             if s.get("phase") != "fixed":
                 continue
@@ -244,18 +285,21 @@ def main():
                 note(f"{r['name']} step {s['step']}: offered {off} matches no level {want}")
                 continue
             recv, bg, win, src = coh_cpu(W, r, s["step"])
-            coh = 0.0 if r["sys"] == "hw" else (recv if r["sys"] == "pop" else bg)
+            coh = 0.0 if r["sys"] == "hw" else (recv if r["sys"] == "pop" else bg)  # mg and mgoff: Megalon background
             if coh is None:
                 note(f"{r['name']} step {s['step']}: no coherence CPU source ({src})")
             st = next(iter(v for k, v in s["streams"].items() if k in ("search", "mixed", "query")), None)
             rows.append([W, r["mix"], r["sys"], r["round"], r["name"], lvl[0], s["step"], off, s.get("x"),
                          st.get("pslo_ms") if st else "", s.get("pass"), s.get("aborted"), recv if recv is not None else "",
                          bg if bg is not None else "", win if win is not None else "",
-                         round(coh / win, 4) if coh is not None and win else "", src, r["dir"]])
+                         round(coh / win, 4) if coh is not None and win else "", src, r["dir"],
+                         # fixed mode: offered_x = total rate argument, x = the x-stream only (vector DB: search) ->
+                         # the keep-up ratio uses the sum of all streams' achieved rates
+                         round(sum(v.get("achieved", 0) for v in s["streams"].values()), 4)])
             fig2.setdefault(r["mix"], []).append((lvl[0], r["sys"], r["round"], r["dir"], s["step"]))
     write_csv(os.path.join(out, "fix-steps.csv"),
               ["workload", "mix", "system", "rep", "name", "level", "step", "offered_x", "achieved_x", "pslo_ms", "pass",
-               "aborted", "recv_cpu_s", "meg_bg_cpu_s", "window_s", "coh_cpu_vcpus", "cpu_source", "run_dir"], rows)
+               "aborted", "recv_cpu_s", "meg_bg_cpu_s", "window_s", "coh_cpu_vcpus", "cpu_source", "run_dir", "achieved_total"], rows)
 
     # steps-all.csv (the Excel input; export_csv.py keeps its stable column set)
     specs = [f"{os.path.join(r['dir'], 'loadgen')}={W}/{r['mix']}/{r['sys']}/{r['phase']}-r{r['round']}" for r in runs]
@@ -265,25 +309,34 @@ def main():
         note(f"export_csv.py rc {p.returncode}: {p.stderr.strip()[-300:]}")
 
     # figures (analysis only: a failure is a note, the data stay)
+    cd_rows = []
     if not a.no_figs:
         an = os.path.join(EXP, "analysis")
+        fr = min((r["round"] for r in runs), key=int)  # figures from the lowest round present (all rounds in the CSVs)
         for m in mixes:
-            r1 = {r["sys"]: r["dir"] for r in runs if r["phase"] == "slo" and r["mix"] == m["mix"] and r["round"] == "1"}
+            r1 = {r["sys"]: r["dir"] for r in runs if r["phase"] == "slo" and r["mix"] == m["mix"] and r["round"] == fr}
             if set(r1) == set(SYSTEMS):
                 cmd = [sys.executable, "-B", os.path.join(an, "v6_fig1_curves.py"), "--out", os.path.join(out, "fig"),
                        "--tag", f"{W}-{m['mix']}"] + [f"{k}={r1[k]}" for k in SYSTEMS]
                 p = subprocess.run(cmd, capture_output=True, text=True)
                 if p.returncode != 0:
                     note(f"fig1 {m['mix']}: rc {p.returncode}: {(p.stderr or p.stdout).strip()[-300:]}")
-            sel = [x for x in fig2.get(m["mix"], []) if x[2] == "1"]
-            if {(l, k) for l, k, *_ in sel} == {(l, k) for l in ("L1", "L2") for k in SYSTEMS} and len(sel) == 6:
-                cmd = [sys.executable, "-B", os.path.join(an, "v6_fig2_split.py"), "--out", os.path.join(out, "fig"),
-                       "--tag", f"{W}-{m['mix']}"] + [f"{l}:{k}={d}:{st}" for l, k, _, d, st in sel]
+            sel = [x for x in fig2.get(m["mix"], []) if x[2] == fr]
+            if {(l, k) for l, k, *_ in sel} == {(l, k) for l in ("L1", "L2") for k in FIXSYS} and len(sel) == 8:
+                # Megalon C = C_diff = T(mgoff) - T(hw) (dec 2026-10-17 "(a)"): v6_fig2_split.py --megalon-c diff
+                # (default since CXL_SWMC 5b650ab4f) needs all four systems per load and refuses otherwise
+                f2 = os.path.join(an, "v6_fig2_split.py")
+                use = sel
+                cmd = [sys.executable, "-B", f2, "--out", os.path.join(out, "fig"),
+                       "--tag", f"{W}-{m['mix']}"] + [f"{l}:{k}={d}:{st}" for l, k, _, d, st in use]
                 p = subprocess.run(cmd, capture_output=True, text=True)
                 if p.returncode != 0:
                     note(f"fig2 {m['mix']}: rc {p.returncode}: {(p.stderr or p.stdout).strip()[-300:]}")
+                else:
+                    cdiff(os.path.join(out, "fig", f"{W}-{m['mix']}-fig2.csv"), W, m["mix"], cd_rows)
             elif fig2.get(m["mix"]):
-                note(f"fig2 {m['mix']}: windows {sorted((l, k) for l, k, *_ in sel)} are not L1/L2 x hw/pop/mg")
+                note(f"fig2 {m['mix']}: windows {sorted((l, k) for l, k, *_ in sel)} are not L1/L2 x hw/pop/mg/mgoff")
+        write_csv(os.path.join(out, "cdiff.csv"), CD_HEADER, cd_rows)
     with open(os.path.join(out, "notes.txt"), "w") as f:
         f.write("\n".join(notes) + ("\n" if notes else ""))
     print(f"COLLECT OK {W} -> {out} ({len(runs)} runs, {len(notes)} notes)")

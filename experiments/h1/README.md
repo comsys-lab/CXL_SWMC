@@ -8,20 +8,24 @@ the workload's own block, reached through its H1 hook. One block runs at a time,
 | File | Role |
 | --- | --- |
 | h1-plan.tsv | workload x mix rows: mix parameter, x -> rate factor, rate decimals, SLO, label (MOT1 v6 §1 mixes and SLOs) |
-| h1-main.sh | sequencer: lock `H1-main`; per workload: gates, SLO phase (rounds), levels.py, fixed phase (reps), gates, collect.py |
+| h1-main.sh | one stage per call (`r1-kv`, `r1-lmdb`, `r1-vdb`, `r1-recsys`, `r2`, `r3`; user decision 2026-10-17). Takes the lock `H1-main`. Per workload: gates, SLO phase, levels.py (r1 only), fixed phase, gates, collect.py, check.py. Refuses a stage until the previous stage is checked PASS and accepted |
+| check.py | per workload x round acceptance checks F1-F9 (FAIL) and W1-W6 (WARN, judged by the main session) -> `r<n>/check.txt` |
+| h1-accept.sh | main session records its acceptance of a checked stage (`accept/r<n>-<W>.txt` with the check.txt sha256) |
 | hook.sh | runs one phase of one workload through `plugins/pins-<W>.sh`. It refuses FILL_ tokens, a missing hook marker and pin hash mismatches. Afterwards it checks `SEQUENCE DONE` and `h1-runs.tsv` (one run per mix x system) |
 | levels.py | L1 = the weakest system's confirm x_mean per mix, L2 = 0.5 x L1. It refuses noted or SLO-mismatched runs. Writes levels.tsv |
-| collect.py | writes runs-index.csv, steps-all.csv (export_csv.py), slo-summary.csv, fix-steps.csv (L1/L2 windows + coherence CPU), fig/ (v6_fig1_curves.py, v6_fig2_split.py) and notes.txt |
+| collect.py | writes cdiff.csv (an extraction of the analysis Fig 2 CSV, v6_fig2_split.py --megalon-c diff, CXL_SWMC 5b650ab4f: C_diff_ns of the "Megalon (timers off)" rows, C_sampled_ns, T_mg_on_ns, Popcorn pop_T_minus_hw_ns), runs-index.csv, steps-all.csv (export_csv.py), slo-summary.csv, fix-steps.csv (L1/L2 windows + coherence CPU), fig/ (v6_fig1_curves.py, v6_fig2_split.py) and notes.txt |
 | plugins/pins-*.sh | per-workload pins: block command + environment, hook file, sha256 pins. FILL_ tokens are filled after that workload's validation packet passes |
 | test/stub-block.sh, test/selftest.sh | Host self-test (no VM): a stub block with the hook contract, plus 5 cases |
 
 ## Evidence layout (one immutable root per H1 main attempt, recovery/H1-main-vN/)
 ```
-<E>/h1-manifest.txt h1-state.txt gate-*.txt pretouch-gate.txt sequence.log
-<E>/<W>/slo-r<r>/   block evidence dir of SLO round r: sequence.{cmd,log}, h1-runs.tsv, order.txt, run dirs <sys>-<mix>-slo-r<r>/
-<E>/<W>/levels.tsv levels.log
-<E>/<W>/fix-r<k>/   block evidence dir of fixed rep k: run dirs <sys>-<mix>-fix-r<k>/ (one lifetime, windows L2 then L1)
-<E>/<W>/collect/    runs-index.csv steps-all.csv slo-summary.csv fix-steps.csv fig/ notes.txt
+<E>/h1-manifest.txt (one block per stage) h1-state.txt gate-*.txt pretouch-gate.txt sequence-<stage>.log
+<E>/accept/r<n>-<W>.txt   main-session acceptance records
+<E>/<W>/levels.tsv levels.log   written in round 1, reused by rounds 2 and 3
+<E>/<W>/r<n>/slo/   block evidence dir of SLO round n: sequence.{cmd,log}, h1-runs.tsv, order.txt, run dirs <sys>-<mix>-slo-r<n>/
+<E>/<W>/r<n>/fix/   block evidence dir of the fixed phase of round n: run dirs <sys>-<mix>-fix-r<n>/ (one lifetime: L2 then L1)
+<E>/<W>/r<n>/collect/  runs-index.csv steps-all.csv slo-summary.csv fix-steps.csv fig/ notes.txt; r<n>/check.txt
+<E>/<W>/collect-all/   after r3: every round (slo-summary.csv: mean / sd of the per-round maxima)
 ```
 
 ## Hook contract H1-HOOK v1 (what each workload block must add; owner = that workload's agent)
@@ -44,14 +48,17 @@ The block file carries the literal marker `H1-HOOK v1`. It is called by hook.sh 
      check_breakdown.py, clean stop, bad records 0, dmesg rule), without timer-off or trace runs.
    - A "confirm failed at three rates" outcome is recorded as a NOTE and the block continues; levels.py then stops
      the sequence.
-4. `H1MODE=fix`: for every row of H1_LEVELS and every system, use one server lifetime with the workload's normal
+4. `H1MODE=fix`: for every row of H1_LEVELS and every fixed-phase system — hw, pop, mg (timers on) and **mgoff**
+   (Megalon with MEGALON_COH_TIMERS=0 on both nodes; Fig 2 Megalon C = T(mgoff) − T(hw), user decision 2026-10-17
+   "(a)") — use one server lifetime with the workload's normal
    start (initial image, prepare, Popcorn preload). It holds two fixed-load windows: first at L2_rate, then at
    L1_rate (the rate argument of the block). Each window is the workload's existing fixed-window kind, with no SLO
    abort. Run name `<sys>-<mix>-fix-r<N>`, seed H1_SEED, the same checks as in item 3.
-5. Write `<dir>/h1-runs.tsv`, one line per run: `name<TAB>system(hw|pop|mg)<TAB>mix<TAB>phase(slo|fix)<TAB>N<TAB>run_dir`.
+5. Write `<dir>/h1-runs.tsv`, one line per run: `name<TAB>system(hw|pop|mg|mgoff)<TAB>mix<TAB>phase(slo|fix)<TAB>N<TAB>run_dir`.
    run_dir is relative to <dir> or absolute and holds loadgen/{summary.json,steps.jsonl}, the run manifest and the
-   workload's split output (vector DB opsplit-steps.csv, KV/LMDB opsplit.csv, DLRM breakdown.csv). The last line of
-   stdout is `SEQUENCE DONE ...`.
+   workload's split output (vector DB opsplit-steps.csv, KV/LMDB opsplit.csv, DLRM breakdown.csv) and
+   `h1-runcheck.txt`: the outputs of the per-run validation checks, last line `RUNCHECK PASS` (a failed check stops
+   the block before). The last line of stdout is `SEQUENCE DONE ...`.
 6. Systems: all-HWcc = the workload's all-HWcc build. For KV this is kv on Megalon 77-hwcc; vector DB, LMDB and
    DLRM use the plain backend (MOT1 v6 §3.1). Popcorn = the plain build with cxl_shm of build 12 (init_state=shared,
    recv_mode poll, instr_enabled=1). Megalon = the build on Megalon 77, timers on with the library default sampling.
@@ -59,4 +66,5 @@ The block file carries the literal marker `H1-HOOK v1`. It is called by hook.sh 
 
 ## Self-test
 `bash experiments/h1/test/selftest.sh /home/comsys/sungsu/destijl-control/workspaces/h1-main/selftest-<n>` must print
-`SELFTEST PASS`. Case E reads recovery/KV-main-h1-v2 read-only.
+`SELFTEST PASS` (never while a VM measurement holds workspaces/MEASUREMENT.lock). Case E reads recovery/KV-main-h1-v2
+read-only.

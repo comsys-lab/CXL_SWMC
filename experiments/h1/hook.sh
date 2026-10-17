@@ -7,7 +7,7 @@
 # The dir must exist and be empty. Checks before the block: no FILL_ token left in the pins (unpinned = refuse), the
 # hook marker "H1-HOOK v1" in HOOK_FILE, every PIN_SHA256 entry ("<sha256>  <file>") matches. After the block:
 # rc 0, last "SEQUENCE DONE" line in sequence.log, and <dir>/h1-runs.tsv lists exactly one run per mix x system
-# (hw, pop, mg) with this phase and round, each run dir holding loadgen/summary.json and loadgen/steps.jsonl.
+# (slo: hw, pop, mg; fix: hw, pop, mg, mgoff = Megalon timers off) with this phase and round, each run dir holding loadgen/summary.json and loadgen/steps.jsonl.
 set -uo pipefail
 W=${1:?} MODE=${2:?} D=${3:?} N=${4:?} ARG=${5:?}
 H=$(cd "$(dirname "$0")" && pwd)
@@ -52,7 +52,7 @@ for line in open(os.path.join(d, "h1-runs.tsv")):
     for x in ("summary.json", "steps.jsonl"):
         assert os.path.isfile(os.path.join(rd, "loadgen", x)), f"{name}: no loadgen/{x}"
     seen[(m, s)] = name
-want = {(m, s) for m in mixes for s in ("hw", "pop", "mg")}
+want = {(m, s) for m in mixes for s in (("hw", "pop", "mg", "mgoff") if mode == "fix" else ("hw", "pop", "mg"))}
 assert set(seen) == want, f"runs {sorted(seen)} != {sorted(want)}"
 print(f"h1-runs.tsv: {len(seen)} runs OK")
 EOF
