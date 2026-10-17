@@ -7,12 +7,34 @@
 # Refuses unless <E>/<W>/r<n>/check.txt ends with "H1CHECK PASS" and no accept record exists yet. Writes
 # <E>/accept/r<n>-<W>.txt with the check.txt sha256 (h1-main.sh re-verifies it) and the WARN lines it accepted.
 # Run only by the main session after reading check.txt (WARN lines are judgment items for the main session/user).
+#        h1-accept.sh <E> 1 <W> --skip "<reason>"   (user decision 2026-10-18: overnight runs never sit idle)
+# --skip (round 1 only): the r1 stage of W ended in STOP / check FAIL / REPORT / an unexplained WARN and main moves on
+# to the next r1 stage. Writes <E>/accept/r1-<W>-skip.txt (reason, time, check.txt sha256 or "none", stage log
+# references); never the acceptance record. Refused if r1-<W>.txt (accepted) or a skip record already exists.
+# h1-main.sh lets the NEXT r1 stage start on it; r2/r3 still need all four r1 accepted (a skipped workload's r1 is
+# re-run in a new evidence root).
 set -uo pipefail
 E=${1:?} N=${2:?} W=${3:?} REMARK=${4:-} ACK=
+if [ "$REMARK" = --skip ]; then
+  R=${5:?--skip needs a reason}
+  [ "$N" = 1 ] || { echo "SKIP REFUSED: --skip is for round 1 only (r2/r3 need every r1 accepted)"; exit 1; }
+  A=$E/accept/r1-$W.txt S=$E/accept/r1-$W-skip.txt C=$E/$W/r1/check.txt
+  [ ! -e "$A" ] || { echo "SKIP REFUSED: $A exists (r1 $W is accepted)"; exit 1; }
+  [ ! -e "$S" ] || { echo "SKIP REFUSED: $S exists"; exit 1; }
+  [ -d "$E/$W/r1" ] || { echo "SKIP REFUSED: $E/$W/r1 missing (stage never started)"; exit 1; }
+  mkdir -p "$E/accept"
+  { echo "SKIP r1 $W $(date -Is) by main session (not accepted)"; echo "reason=$R"
+    echo "check_sha256=$([ -f "$C" ] && sha256sum < "$C" | cut -c1-64 || echo none)"
+    echo "check_last=$([ -f "$C" ] && tail -n 1 "$C" || echo none)"
+    echo "stage_log=$E/sequence-r1-$W.log state_log=$E/h1-state.txt"
+    grep "\[r1-$W\]" "$E/h1-state.txt" 2>/dev/null | tail -n 3 | sed 's/^/state_tail: /'; } > "$S"
+  echo "SKIPPED r1 $W -> $S"; exit 0
+fi
 [ "${5:-}" = --user-ack ] && ACK=${6:?--user-ack needs a reference}
 C=$E/$W/r$N/check.txt A=$E/accept/r$N-$W.txt
 [ -f "$C" ] && tail -n 1 "$C" | grep -q "^H1CHECK PASS" || { echo "ACCEPT REFUSED: $C missing or not PASS"; exit 1; }
 [ ! -e "$A" ] || { echo "ACCEPT REFUSED: $A exists"; exit 1; }
+[ ! -e "$E/accept/r$N-$W-skip.txt" ] || { echo "ACCEPT REFUSED: r$N $W was skipped ($E/accept/r$N-$W-skip.txt)"; exit 1; }
 if grep -q "^REPORT" "$C" && [ -z "$ACK" ]; then
   echo "ACCEPT REFUSED: $C has REPORT lines (separate vs continuous); report to the user, then --user-ack \"<TASKS.md ref>\""; exit 1
 fi

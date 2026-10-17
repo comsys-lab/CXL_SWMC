@@ -73,10 +73,19 @@ accepted() {  # W n -> 0 if r<n> of W has check PASS and an acceptance record ma
   [ -f "$c" ] && tail -n 1 "$c" | grep -q "^H1CHECK PASS" && [ -f "$a" ] \
     && grep -q "check_sha256=$(sha256sum < "$c" | cut -c1-64)" "$a"
 }
+# r1 chain (user decision 2026-10-18, overnight runs never sit idle): the previous r1 stage accepted, OR skipped by the
+# main session (h1-accept.sh --skip: <E>/accept/r1-<W>-skip.txt, only without an acceptance record). r2/r3 stay strict.
+SKIPNOTE=
+prev_r1() {  # W
+  accepted $1 1 && return 0
+  local s=$E/accept/r1-$1-skip.txt
+  [ -f "$s" ] && [ ! -e "$E/accept/r1-$1.txt" ] || return 1
+  SKIPNOTE="previous stage $1 SKIPPED (not accepted): $(sed -n 's/^reason=//p' "$s")"
+}
 case $STAGE in
-  r1-lmdb) accepted kv 1 || { echo "SEQUENCE STOP: r1-kv not checked PASS + accepted"; exit 2; };;
-  r1-vdb) accepted lmdb 1 || { echo "SEQUENCE STOP: r1-lmdb not checked PASS + accepted"; exit 2; };;
-  r1-recsys) accepted vdb 1 || { echo "SEQUENCE STOP: r1-vdb not checked PASS + accepted"; exit 2; };;
+  r1-lmdb) prev_r1 kv || { echo "SEQUENCE STOP: r1-kv not checked PASS + accepted (nor skipped)"; exit 2; };;
+  r1-vdb) prev_r1 lmdb || { echo "SEQUENCE STOP: r1-lmdb not checked PASS + accepted (nor skipped)"; exit 2; };;
+  r1-recsys) prev_r1 vdb || { echo "SEQUENCE STOP: r1-vdb not checked PASS + accepted (nor skipped)"; exit 2; };;
   r2|r3) for w in $ORDER; do accepted $w 1 || { echo "SEQUENCE STOP: r1 of $w not checked PASS + accepted (r2/r3 need all four r1)"; exit 2; }; done
          if [ $N = 3 ]; then for w in $WL; do accepted $w 2 || { echo "SEQUENCE STOP: r2 of $w not checked PASS + accepted"; exit 2; }; done; fi;;
 esac
@@ -132,6 +141,7 @@ gates() {  # tag
   log "gate $1: PASS"
 }
 log "stage start: round $N, workloads [$WL], pid $$ pgid $PGID, manifest $([ $MAN_ON = 1 ] && echo "$H1_MANIFEST ok" || echo "off (dry)")"
+[ -z "$SKIPNOTE" ] || log "$SKIPNOTE"
 for W in $WL; do
   T0=$(date +%s) S=$E/$W/r$N
   MIXES=$(awk -F'\t' -v w="$W" '!/^#/ && $1 == w { printf "%s=%s ", $2, $3 }' "$PLAN")

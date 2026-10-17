@@ -19,6 +19,8 @@
 #      H1_MANIFEST_SHA stop the stage before the lock
 #   I  D1: H1_PLAN and gate threshold overrides refused without H1_DRY=1; D3: a real stage refuses pgid != pid and passes
 #      the pgid check under setsid (it then stops at the real pretouch gate, which has a dummy dir; lock released)
+#   J  r1 skip: r1-vdb refused after a stopped r1-lmdb, starts after h1-accept.sh --skip lmdb (logged); --skip refused
+#      for an accepted stage, for r2 and twice; a skipped stage cannot be accepted; r2 still refuses
 # Prints "SELFTEST PASS" or "SELFTEST FAIL <case>".
 set -uo pipefail
 O=${1:?out dir}
@@ -157,4 +159,29 @@ grep -q "SEQUENCE STOP: pgid" "$O/I3.out" && fail "I3 setsid still refused on pg
 grep -q "SEQUENCE STOP pretouch gate" "$O/I3/h1-state.txt" || fail "I3 did not reach the gates ($(cat "$O/I3.out"))"
 nolock I3
 echo "I OK"
+# J r1 skip (user decision 2026-10-18: overnight runs never sit idle): r1-lmdb stops; r1-vdb is refused without a
+#   record; h1-accept.sh --skip lmdb lets r1-vdb start (logged); --skip refused for an accepted stage, for r2 and twice;
+#   a skipped stage cannot be accepted; r2 still refuses (strict: all four r1 accepted)
+mkdir "$O/J"
+stage J r1-kv || fail "J r1-kv"
+bash $H/h1-accept.sh "$O/J" 1 kv selftest >> "$O/J.out" 2>&1 || fail "J accept kv"
+STUB_FAIL=rc stage J r1-lmdb && fail "J r1-lmdb rc 0"
+stage J r1-vdb && fail "J r1-vdb ran without lmdb accepted or skipped"
+grep -q "r1-lmdb not checked PASS + accepted (nor skipped)" "$O/J.out" || fail "J refusal reason"
+bash $H/h1-accept.sh "$O/J" 1 kv --skip "selftest" >> "$O/J.out" 2>&1 && fail "J skip of an accepted stage"
+bash $H/h1-accept.sh "$O/J" 2 lmdb --skip "selftest" >> "$O/J.out" 2>&1 && fail "J skip of r2"
+bash $H/h1-accept.sh "$O/J" 1 lmdb --skip "selftest: injected STOP" >> "$O/J.out" 2>&1 || fail "J skip lmdb"
+S=$O/J/accept/r1-lmdb-skip.txt
+[ -f "$S" ] && [ ! -e "$O/J/accept/r1-lmdb.txt" ] && grep -q "^reason=selftest: injected STOP$" "$S" \
+  && grep -q "^check_sha256=none$" "$S" && grep -q "^stage_log=" "$S" || fail "J skip record ($(cat "$S" 2>/dev/null))"
+bash $H/h1-accept.sh "$O/J" 1 lmdb --skip "again" >> "$O/J.out" 2>&1 && fail "J second skip"
+bash $H/h1-accept.sh "$O/J" 1 lmdb selftest >> "$O/J.out" 2>&1 && fail "J accept after skip"
+stage J r1-vdb || fail "J r1-vdb with lmdb skipped (see $O/J.out)"
+grep -q "previous stage lmdb SKIPPED (not accepted): selftest: injected STOP" "$O/J/h1-state.txt" || fail "J skip not logged"
+bash $H/h1-accept.sh "$O/J" 1 vdb selftest >> "$O/J.out" 2>&1 || fail "J accept vdb"
+stage J r1-recsys || fail "J r1-recsys"
+bash $H/h1-accept.sh "$O/J" 1 recsys selftest >> "$O/J.out" 2>&1 || fail "J accept recsys"
+stage J r2 --workloads kv && fail "J r2 ran with r1 lmdb skipped"
+grep -q "SEQUENCE STOP: r1 of lmdb not checked PASS + accepted" "$O/J.out" || fail "J r2 refusal reason"
+echo "J OK"
 echo "SELFTEST PASS"
