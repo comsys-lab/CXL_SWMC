@@ -105,7 +105,15 @@ case "$KIND" in
       if [ "$H1_PARTS" = slo ]; then [ -z "${RATE:-}" ] && [ -z "${RATES_CMD:-}" ] || stop "slo-only lifetime takes no rates"
       elif [ -n "${RATE:-}" ]; then [[ $RATE =~ ^[0-9]+(\.[0-9]+)?,[0-9]+(\.[0-9]+)?$ ]] && [ -z "${RATES_CMD:-}" ] || stop "bad RATE"
       else [ -n "${RATES_CMD:-}" ] && [ "$H1_PARTS" = "slo fix" ] || stop "RATES_CMD needs H1_PARTS='slo fix'"; fi
-      LG+=(--raw)
+      # per-part query seed (fixed by part name, the same for every system and lifetime type): slo = SEED, fix =
+      # SEED + 1, so a fix part never replays the slo part's query sequence; run.sh appends it and records it
+      NL=(); i=0
+      while [ $i -lt ${#LG[@]} ]; do  # drop the common --opt seed=.. and --seed .. (set per part instead)
+        case "${LG[$i]}" in --opt) [[ "${LG[$((i+1))]}" == seed=* ]] && { i=$((i+2)); continue; };; --seed) i=$((i+2)); continue;; esac
+        NL+=("${LG[$i]}"); i=$((i+1))
+      done
+      LG=("${NL[@]}" --raw)
+      export PART_SEED_slo=$SEED PART_SEED_fix=$((SEED + 1))
       export PARTS=$H1_PARTS PART_RATES=${RATE:-} PART_RATES_CMD=${RATES_CMD:-}
       export PART_ARGS_slo="--mode slo --start 10 --factor 1.5 --precision 0.05 --max-steps 25 --warmup-s 10 --step-warmup-s 3 --step-measure-s 15 --confirm-s 30 --confirm-reps 3"
       export PART_ARGS_fix="--mode fixed --rates @RATES@ --warmup-s $SETTLE_S --step-warmup-s 10 --step-measure-s 60 --drain-s 10";;
@@ -211,6 +219,8 @@ PDIRS=$R; [ "$KIND" = h1 ] && PDIRS=$(for p in $H1_PARTS; do echo -n "$R/$p "; d
 NOTES=""
 for RP in $PDIRS; do
   [ -s $RP/loadgen/summary.json ] || stop "no loadgen output in $RP (lifetime stopped early?)"
+  # writes file exhausted: loadgen ends fill/overload silently (note "") or notes "streams exhausted"; both are a STOP
+  ! grep -q '"reason":"stream [a-z]* exhausted' $RP/loadgen/steps.jsonl || stop "writes file exhausted in $RP (stream exhausted; packet: bigger writes file needs a dataset decision)"
   if [ -n "${OPCOH_EXPECT:-}" ]; then
     { grep -qx "ok_without_coh=0" $RP/loadgen/vectordb.txt && grep -qx "updates_ok_without_coh=0" $RP/loadgen/vectordb.txt &&
       grep -qx "bad_coh_version=0" $RP/loadgen/vectordb.txt; } || stop "responses without an op coherence block ($RP)"

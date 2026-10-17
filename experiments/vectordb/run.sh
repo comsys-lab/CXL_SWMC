@@ -25,7 +25,8 @@
 #   PART_RATES_CMD run right before the fix part (non-zero rc or bad output = LEVELS STOP: servers stopped, exit 5).
 #   Parts after the first get --opt w_start=<next_w of the previous part> (the update stream continues; the previous
 #   part must end with write_errors=0). A part whose loadgen rc != 0 stops the lifetime unless its summary note is the
-#   SLO search's "confirm failed at three rates" (then the next part runs; the caller decides). Per part rc in the
+#   SLO search's "confirm failed at three rates" (then the next part runs; the caller decides). PART_SEED_<p> (optional):
+#   that part's query seed (--opt seed= --seed), recorded in the manifest part line. Per part rc in the
 #   manifest (part_<p>_loadgen_rc=); exit 1 if any part rc != 0.
 # Stops (and stops the servers) on the first error. Measurement hygiene: no Host build before/after (pgrep).
 set -euo pipefail
@@ -158,11 +159,13 @@ else  # H1-HOOK v2: several loadgen parts in this server lifetime
       fi
       PA=("${PA[@]/@RATES@/$RATES}")
     fi
-    echo "part_$p=start $(date -Is) w_start=$WS args=${PA[*]}" >> "$RUN/manifest.txt"
+    v=PART_SEED_$p; PS=()  # per-part query seed (m4-run.sh KIND=h1: slo SEED, fix SEED+1)
+    [ -z "${!v:-}" ] || { [[ ${!v} =~ ^[0-9]+$ ]] || { echo "bad $v"; false; }; PS=(--opt seed=${!v} --seed ${!v}); }
+    echo "part_$p=start $(date -Is) w_start=$WS seed=${!v:-common} args=${PA[*]}" >> "$RUN/manifest.txt"
     cpu_snap before; mv "$RUN/guest-cpu.txt" "$PR/guest-cpu.txt" 2>/dev/null || true
     set +e
     numactl --physcpubind="$LG_CPUS" --membind=1 "$LOADGEN" --workload vectordb --target "$TARGETS" --out "$PR/loadgen" \
-      "${LG_STATS[@]}" "$@" "${PA[@]}" --opt w_start=$WS 2>&1 | tee "$PR/loadgen.log"
+      "${LG_STATS[@]}" "$@" "${PA[@]}" "${PS[@]}" --opt w_start=$WS 2>&1 | tee "$PR/loadgen.log"
     rc=${PIPESTATUS[0]}
     set -e
     cpu_snap after; cat "$RUN/guest-cpu.txt" >> "$PR/guest-cpu.txt" 2>/dev/null; rm -f "$RUN/guest-cpu.txt"
