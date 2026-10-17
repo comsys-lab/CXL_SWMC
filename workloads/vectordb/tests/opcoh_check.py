@@ -26,6 +26,8 @@ usage: opcoh_check.py <run or scratch dir> fake|megalon|none|hwcc|popcorn|megalo
               validation copies counted; every Popcorn part 0 (cxl_shm unloaded); MEGALON_LEAN=1 in the environment
               (Megalon >= 76 runs, reports/VDB-V1-packet.md v1.3): lean bit on and events_always off on every record,
               timed write sections > 0 over the updates.
+  every mode: a step whose C_ms exceeds T_ms prints "OPCOH_CHECK WARN" (never a failure; sampled Megalon C is biased
+              upward, Fig 2 uses C_diff, experiments/vectordb/cdiff.py).
   every Megalon mode with lean records: mg_write_sampled <= mg_write_sections; a record without timed read sections
               has no read-side event time and one without timed write sections has no write-side time (contract
               megalon_objapi.h: durations only in timed sections).
@@ -214,6 +216,10 @@ if r.returncode == 0:
         for x in rows:
             if x["op"] == "search" and x["n_ops"] not in ("", "0") and float(x["C_ms"] or 0) == 0:
                 print(f"OPCOH_CHECK NOTE: step {x['step']} ({x['achieved_per_s']} search/s): search C = 0")
+    for x in rows:  # sampled C above T: reported, never a failure (Megalon sampled C is biased upward by the probe
+        # cost; Fig 2 uses C_diff = T(timers off) - T(all-HWcc), experiments/vectordb/cdiff.py; user decision 2026-10-17)
+        if x["n_ops"] not in ("", "0") and x["C_ms"] and x["T_ms"] and float(x["C_ms"]) > float(x["T_ms"]):
+            print(f"OPCOH_CHECK WARN: step {x['step']} {x['op']}: C_ms {x['C_ms']} > T_ms {x['T_ms']} (sampled C, not a failure)")
     for x in rows:
         if x["op"] == "update" and x["win_n"]:
             check(abs(float(x["win_T_ms"]) - float(x["T_ms"])) <= 0.5 * float(x["T_ms"]) + 1e-6, "window T ~ record T")
