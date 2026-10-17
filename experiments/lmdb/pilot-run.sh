@@ -5,7 +5,8 @@
 # Mixes (MOT1 v6): get/update 95/5 = 0.05 (YCSB B), 50/50 = 0.5 (YCSB A), 20/80 = 0.8 (Twitter OSDI'20); 0 = get only.
 # usage: pilot-run.sh <name> <evidence dir>
 # env (required): SYS (all-HWcc | Megalon), UPDATE_RATIO (0 | 0.05 | 0.5 | 0.8), KIND (functional | pslo | slo | fix |
-#   ladder; same loadgen schedules as experiments/kv/pilot-run.sh; fix: RATE, ladder: RATES).
+#   ladder | fix2; same loadgen schedules as experiments/kv/pilot-run.sh; fix: RATE, ladder: RATES, fix2 (H1 fixed phase):
+#   RATES=<L2>,<L1>, two fixed windows in one lifetime).
 #   SYS=Popcorn (plain backend, Popcorn build >= 10): C8 (deploy bundle dir with p-popcorn-shm.sh), K8 (release), GT8
 #   (guest tools dir), RECV_MODE (poll | idle | sleep). As the KV pilot: cxl_shm loaded and coherence ENABLED
 #   (init_state=shared) before lmdb-server starts, so node 0's image copy and every warm-up read run under coherence (no
@@ -55,7 +56,7 @@ esac
 #   method, user decision 2026-10-17; recorded in the run manifest via node_env)
 [ -z "${COH_TIMERS:-}" ] || { [[ $COH_TIMERS =~ ^[01]$ ]] && [ "$SYS" = Megalon ]; } || stop "COH_TIMERS=0|1 is for SYS=Megalon only"
 [ -z "${COH_TIMERS:-}" ] || export NODE_ENV="ENV:MEGALON_COH_TIMERS=$COH_TIMERS"
-SLO_ARG=mixed:99:1; [[ $KIND =~ ^(fix|ladder)$ ]] && SLO_ARG=mixed:99:600000  # fix, ladder: no SLO abort (judged after)
+SLO_ARG=mixed:99:1; [[ $KIND =~ ^(fix|fix2|ladder)$ ]] && SLO_ARG=mixed:99:600000  # fix, ladder: no SLO abort (judged after)
 LG=(--opt records=$RECORDS --opt update_ratio=$UPDATE_RATIO --opt seed=$SEED --opt log=$LOG --seed "$SEED" --mix mixed=1
     --slo $SLO_ARG --x-stream mixed)
 case "$KIND" in
@@ -66,6 +67,8 @@ case "$KIND" in
             --step-measure-s 15 --drain-s 5 --confirm-s 30 --confirm-reps 3 --fill 0.7,0.8,0.9 --overload 1.05,1.1,1.2);;
   ladder) [[ ${RATES:?} =~ ^[0-9]+(,[0-9]+)*$ ]] || stop "bad RATES"
           LG+=(--raw --mode fixed --rates "$RATES" --warmup-s 10 --step-warmup-s 3 --step-measure-s 15 --drain-s 5);;
+  fix2) [[ ${RATES:?} =~ ^[0-9]+,[0-9]+$ ]] || stop "fix2 needs RATES=<L2>,<L1> (integers)"  # H1 fixed phase: one lifetime, L2 then L1
+        LG+=(--raw --mode fixed --rates "$RATES" --warmup-s 10 --step-warmup-s 5 --step-measure-s 30 --drain-s 10);;
   fix) : "${RATE:?}"; LG+=(--raw --mode fixed --rates "$RATE" --warmup-s 10 --step-warmup-s 5 --step-measure-s 30 --drain-s 10);;
   *) stop "bad KIND";;
 esac
@@ -134,4 +137,18 @@ fi
 [ "$LOG" = 1 ] && { grep -q "^check_log rc=0$" $R/check-log.txt || stop "check_log"; }
 [ -s $R/stats-steps.csv ] && [ "$(wc -l < $R/stats-steps.csv)" -ge 2 ] || stop "no stats-steps.csv rows"
 [ -s $R/opsplit.csv ] && [ "$(wc -l < $R/opsplit.csv)" -ge 2 ] || stop "no opsplit.csv rows"
+if [[ $KIND =~ ^(ladder|fix|fix2)$ ]]; then  # per-step table (as the KV pilot-run); an aborted fixed step is a NOTE
+  python3 -B - $R/loadgen/steps.jsonl > $R/ladder-result.txt <<'EOP' || stop "fixed steps result"
+import json, sys
+st = [json.loads(l) for l in open(sys.argv[1]) if l.strip()]
+st = [s for s in st if s["phase"] == "fixed"]
+print("step offered_x achieved p50_ms p90_ms p99_ms max_ms done aborted reason")
+for s in st:
+    m = s["streams"]["mixed"]
+    print(s["step"], s["offered_x"], m["achieved"], m["p50_ms"], m.get("p90_ms"), m["p99_ms"], m["max_ms"], m.get("done"),
+          str(s["aborted"]).lower(), (s["reason"] or "-").replace(" ", "_"))
+EOP
+  cat $R/ladder-result.txt
+  awk 'NR>1 && $9=="true"' $R/ladder-result.txt | grep -q . && { echo "PILOTRUN $NAME NOTE $KIND step aborted"; exit 0; }
+fi
 echo "PILOTRUN $NAME OK"

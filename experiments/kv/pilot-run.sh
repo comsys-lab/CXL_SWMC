@@ -12,6 +12,8 @@
 #   --slo mixed:99:600000 so only the saturation (outstanding) abort can end the window early; p99 is recorded and the
 #   1 ms SLO is judged here (fix-result.txt: slo_1ms_pass), an aborted window is a NOTE with its reason; KIND=pfix|ptrace: RATE (requests/s = L). ptrace = a pfix window with TRACE=1 (put/get logs for the
 #   Figure 2c classification only; never used for throughput/latency comparisons). pfix forces TRACE=0.
+#   fix2 = H1 fixed phase: one server lifetime with two fixed windows at RATES=<L2>,<L1> (fix's window: 10 s run warm-up,
+#   5 s step warm-up, 30 s measured; no SLO abort; per-step table ladder-result.txt; an aborted window is a NOTE).
 #   ladder = fixed-rate steps at RATES (comma list, run in that order; 10 s warm-up, 3 s + 15 s per step, no SLO abort);
 #   used for the low-rate latency (CPU idle) check, reports/KV-idle-check.md.
 #   SYS=Popcorn: C8 (build-8 deploy bundle dir), K8 (release), GT8 (guest tools dir), RECV_MODE (poll | idle | sleep)
@@ -55,7 +57,7 @@ esac
 #   value is recorded in the run manifest via node_env)
 [ -z "${COH_TIMERS:-}" ] || { [[ $COH_TIMERS =~ ^[01]$ ]] && [ "$SYS" = Megalon ]; } || stop "COH_TIMERS=0|1 is for SYS=Megalon only"
 export NODE_ENV="ENV:XTIMEOUT=14400${COH_TIMERS:+ ENV:MEGALON_COH_TIMERS=$COH_TIMERS}"
-SLO_ARG=mixed:99:1; [[ $KIND =~ ^(fix|ladder)$ ]] && SLO_ARG=mixed:99:600000  # fix, ladder: no SLO abort (judged after the run)
+SLO_ARG=mixed:99:1; [[ $KIND =~ ^(fix|fix2|ladder)$ ]] && SLO_ARG=mixed:99:600000  # fix, ladder: no SLO abort (judged after the run)
 LG=(--opt keys=$KEYS --opt batch=$BATCH --opt put_ratio=$PUT_RATIO --opt seed=$SEED --seed "$SEED" --mix mixed=1
     --slo $SLO_ARG --x-stream mixed)
 case "$KIND" in
@@ -66,6 +68,8 @@ case "$KIND" in
             --step-measure-s 15 --drain-s 5 --confirm-s 30 --confirm-reps 3 --fill 0.7,0.8,0.9 --overload 1.05,1.1,1.2);;
   ladder) [[ ${RATES:?} =~ ^[0-9]+(,[0-9]+)*$ ]] || stop "bad RATES"  # fixed-rate steps in the given order (idle-latency check)
           LG+=(--raw --mode fixed --rates "$RATES" --warmup-s 10 --step-warmup-s 3 --step-measure-s 15 --drain-s 5);;
+  fix2) [[ ${RATES:?} =~ ^[0-9]+,[0-9]+$ ]] || stop "fix2 needs RATES=<L2>,<L1> (integers)"  # H1 fixed phase: one lifetime, L2 then L1
+        LG+=(--raw --mode fixed --rates "$RATES" --warmup-s 10 --step-warmup-s 5 --step-measure-s 30 --drain-s 10);;
   pfix|ptrace|fix) : "${RATE:?}"; LG+=(--raw --mode fixed --rates "$RATE" --warmup-s 10 --step-warmup-s 5 --step-measure-s 30 --drain-s 10);;
   *) stop "bad KIND";;
 esac
@@ -155,7 +159,7 @@ PY
   tr '\n' ' ' < $R/fix-result.txt; echo
   grep -q "^aborted=true" $R/fix-result.txt && { echo "PILOTRUN $NAME NOTE fixed window aborted: $(sed -n 's/^reason=//p' $R/fix-result.txt)"; exit 0; }
 fi
-if [ "$KIND" = ladder ]; then  # per-step table; an aborted step is a NOTE (fixed mode does not fail on it)
+if [[ $KIND =~ ^(ladder|fix2)$ ]]; then  # per-step table; an aborted step is a NOTE (fixed mode does not fail on it)
   python3 -B - $R/loadgen/steps.jsonl > $R/ladder-result.txt <<'PY' || stop "ladder result"
 import json, sys
 st = [json.loads(l) for l in open(sys.argv[1]) if l.strip()]
@@ -167,6 +171,6 @@ for s in st:
           str(s["aborted"]).lower(), (s["reason"] or "-").replace(" ", "_"))
 PY
   cat $R/ladder-result.txt
-  awk 'NR>1 && $9=="true"' $R/ladder-result.txt | grep -q . && { echo "PILOTRUN $NAME NOTE ladder step aborted"; exit 0; }
+  awk 'NR>1 && $9=="true"' $R/ladder-result.txt | grep -q . && { echo "PILOTRUN $NAME NOTE $KIND step aborted"; exit 0; }
 fi
 echo "PILOTRUN $NAME OK"
