@@ -597,6 +597,7 @@ class Server {
   void write_rows(const std::vector<Touched> &rows, std::vector<uint8_t> &buf) {
     const uint64_t t0 = now_ns();
     buf.resize(p_.slot_bytes);
+    uint64_t sections = 0;  // Megalon write sections of this batch, counted after the rows (below)
     if constexpr (!Be::kAppSeqlock) {
       for (size_t i = 0; i < rows.size();) {
         const uint32_t k = rows[i].k;
@@ -609,7 +610,7 @@ class Server {
             std::memcpy(obj + be_->row_offset(k, rows[x].gslot - p_.row_base[k]), buf.data(), p_.slot_bytes);
           }
         });
-        st_.update_sections++;
+        sections++;
         i = j;
       }
     } else {
@@ -623,6 +624,7 @@ class Server {
     }
     st_.write_ns += now_ns() - t0;
     st_.rows_written += rows.size();
+    st_.update_sections += sections;  // after rows_written; stats_text reads rows_written first: sections <= rows
     __atomic_fetch_add(&h_->nodes[o_.node].rows_written, uint64_t(rows.size()), __ATOMIC_RELAXED);
   }
   // key -> resolved row (direct: table and row from the key); false on a miss (counted)
