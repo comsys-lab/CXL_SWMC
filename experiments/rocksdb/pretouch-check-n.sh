@@ -23,13 +23,28 @@ fails=() lines=()
 say() { lines+=("$*"); }
 bad() { fails+=("$*"); say "FAIL $*"; }
 D=$(cd "$D" 2>/dev/null && pwd) || { echo "PRETOUCH CHECK FAIL: no dir $1" | tee "$OUT"; exit 1; }
-case "$D" in $P/recovery/ENV-pretouch-v*) ;; *) bad "dir $D is not $P/recovery/ENV-pretouch-v*";; esac
-say "pretouch_dir=$D checked_at=$(date -Is)"
-for t in "T0 DONE" "T1 DONE"; do grep -q " $t" "$D/steps.log" 2>/dev/null || bad "steps.log has no '$t'"; done
-grep -q "STOP" "$D/steps.log" 2>/dev/null && bad "steps.log has a STOP line: $(grep -m1 STOP "$D/steps.log")"
-say "c_done=$(grep -m1 ' C DONE' "$D/steps.log" 2>/dev/null || echo none)"
+# Two evidence layouts: ENV-pretouch packets (steps.log T0/T1 DONE, no STOP line, pretouch-vm<k>.txt) and the VM8
+# chain (recovery/VM8-v*: steps.log "PRETOUCH PASS vm<j>:" per VM, pretouch-vm<j>-<HHMMSS>.txt; its other STOP lines
+# are chain steps, not pretouch failures). In the VM8 layout <j> = the libvirt domain's index (cxl_vm<j>), so any
+# subset of the 8 VMs is checked by its own files.
+case "$D" in
+  $P/recovery/ENV-pretouch-v*) LAYOUT=env
+    for t in "T0 DONE" "T1 DONE"; do grep -q " $t" "$D/steps.log" 2>/dev/null || bad "steps.log has no '$t'"; done
+    grep -q "STOP" "$D/steps.log" 2>/dev/null && bad "steps.log has a STOP line: $(grep -m1 STOP "$D/steps.log")"
+    say "c_done=$(grep -m1 ' C DONE' "$D/steps.log" 2>/dev/null || echo none)";;
+  $P/recovery/VM8-v*) LAYOUT=vm8;;
+  *) LAYOUT=none; bad "dir $D is neither $P/recovery/ENV-pretouch-v* nor $P/recovery/VM8-v*";;
+esac
+say "pretouch_dir=$D layout=$LAYOUT checked_at=$(date -Is)"
 for k in "${!IPS[@]}"; do
   ip=${IPS[$k]} f=$D/pretouch-vm$k.txt
+  if [ "$LAYOUT" = vm8 ]; then
+    j=${DOMS[$k]#cxl_vm}
+    f=$(ls -t "$D"/pretouch-vm$j-*.txt 2>/dev/null | head -1)
+    [ -n "$f" ] || f=$D/pretouch-vm$j-MISSING.txt
+    grep -q " PRETOUCH PASS vm$j:" "$D/steps.log" 2>/dev/null || bad "vm$k (${DOMS[$k]}): steps.log has no 'PRETOUCH PASS vm$j:'"
+    say "vm$k domain=${DOMS[$k]} file=$f"
+  fi
   sz=$($SSH comsys@$ip 'cat /sys/bus/dax/devices/dax0.0/size' < /dev/null 2>/dev/null)
   if [[ $sz =~ ^[0-9]+$ ]] && [ $((sz % 4096)) = 0 ]; then
     n=$((sz / 4096)); say "vm$k dax0.0_size=$sz pages=$n"
