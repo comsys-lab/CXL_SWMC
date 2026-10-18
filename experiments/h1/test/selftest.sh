@@ -375,7 +375,7 @@ grep -q "\[r1-recsys\] SEQUENCE STOP" "$O/N/h1-state.txt" && grep -q "^avg	" "$O
 L1SHA=$(cd "$O/N/recsys/r1" && find . -type f -printf '%P %s\n' | LC_ALL=C sort | sha256sum | cut -c1-64)
 na 1 recsys && fail "N accepted a stopped stage"
 stage N r1-recsys && fail "N r1-recsys rerun without --retry"
-grep -q "recsys/r1 exists (stage dirs are immutable; a stopped r1 stage is re-run with --retry)" "$O/N/h1-state.txt" || fail "N rerun reason"
+grep -q "recsys/r1 exists (stage dirs are immutable; a stopped r1 stage is re-run with --retry; r2/r3 have no retry path yet)" "$O/N/h1-state.txt" || fail "N rerun reason"
 stage N r1-recsys --retry && fail "N --retry without reason"
 stage N r2 --retry "x" && fail "N --retry for r2"
 grep -q "SEQUENCE STOP: --retry is for r1-<W> stages only" "$O/N.out" || fail "N r2 retry reason"
