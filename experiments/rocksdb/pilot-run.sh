@@ -106,10 +106,34 @@ bash $X/run.sh "$NAME" "$E" -- "${LG[@]}"
 RC=$?
 if [ "$SYS" = Popcorn ]; then
   env "${PS[@]}" STATUS_TAG=post bash $C8/p-popcorn-shm.sh status
+  # Popcorn error counters over the run (verifier HIGH-1): transaction_error / send_drop / late_response deltas = 0
+  python3 -I -B - "$E/shm-$NAME" "$N" > "$E/$NAME.popcorn-errors.txt" 2>&1 <<'EOP'
+import os, sys
+d, n = sys.argv[1], int(sys.argv[2]); bad = []
+def kv(p):
+    out = {}
+    for l in open(p):
+        if '=' in l and not l.startswith('dmesg: '):
+            k, v = l.rstrip('\n').split('=', 1); out[k] = v
+    return out
+for k in range(n):
+    b, a = os.path.join(d, f'status-pre-vm{k}.txt'), os.path.join(d, f'status-post-vm{k}.txt')
+    if not (os.path.exists(b) and os.path.exists(a)): bad.append(f'vm{k}: status files missing'); continue
+    b, a = kv(b), kv(a)
+    for c in ('transaction_error_count', 'send_drop_count', 'late_response_count'):
+        try: dv = int(a['swmc.' + c]) - int(b['swmc.' + c])
+        except (KeyError, ValueError): bad.append(f'vm{k}: {c} unreadable'); continue
+        print(f'vm{k} {c} delta={dv}')
+        if dv: bad.append(f'vm{k}: {c} delta {dv}')
+print('POPCORN ERRORS ' + ('OK' if not bad else 'FAIL ' + '; '.join(bad)))
+sys.exit(1 if bad else 0)
+EOP
+  PERR=$?
   servers_gone || stop "servers left (Popcorn teardown not attempted)"
   env "${PS[@]}" bash $C8/p-popcorn-shm.sh teardown || stop "shm teardown"
 fi
 servers_gone || stop "servers left"
+[ "$SYS" != Popcorn ] || [ "$PERR" = 0 ] || stop "Popcorn error counters ($(tail -n 1 "$E/$NAME.popcorn-errors.txt"))"
 R=$E/$NAME
 [ -d "$R" ] || stop "no run dir"
 { echo "# load times $NAME (s)"; echo "run_wall_s=$(( $(date +%s) - T0 ))"; grep -h "^node[0-9]* .*IMAGE" $R/manifest.txt

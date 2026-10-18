@@ -38,6 +38,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("run")
     ap.add_argument("--nodes", type=int, required=True)
+    ap.add_argument("--keys", type=int, default=0)
     ap.add_argument("--stop-extents-free", type=int, default=2048)
     ap.add_argument("--stop-blocks-free", type=int, default=16)
     a = ap.parse_args()
@@ -80,6 +81,21 @@ def main():
               f"sync_catchups={','.join(s.get(v + '.sync_catchups', '?') for v in views)} "
               f"extents_free_min={ext_min} blocks_free_min={blk_min} snapshots={len(snaps)} "
               f"sst_bytes={s.get('rocksdb.total-sst-files-size')}")
+    if a.keys:  # completeness (verifier LOW): each node's image = its key share; every key in at least one DB
+        man = open(os.path.join(a.run, "manifest.txt"), errors="replace").read()
+        for k in range(a.nodes):
+            want = (a.keys - k + a.nodes - 1) // a.nodes
+            m = re.search(rf"^node{k} rocksdb-server: IMAGE (\d+) keys", man, re.M)
+            if not m or int(m.group(1)) != want:
+                bad.append(f"node{k}: image keys {m.group(1) if m else 'missing'} != {want}")
+        tot = 0
+        for k in range(a.nodes):
+            p = os.path.join(a.run, f"verify-node{k}.txt")
+            if os.path.exists(p):
+                tot += num(kv(open(p).read()), "verify.entries")
+        if tot and tot < a.keys:
+            bad.append(f"verify entries over all nodes {tot} < keys {a.keys}")
+        print(f"completeness: verify_entries_total={tot} keys={a.keys}")
     for b in bad:
         print("FAIL", b)
     print("check:", "FAIL" if bad else "PASS")

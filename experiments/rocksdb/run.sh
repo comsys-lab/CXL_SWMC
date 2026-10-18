@@ -39,7 +39,7 @@ okeys=""; prev=""; for a in "$@"; do [ "$prev" = --opt ] && case "$a" in keys=*)
 [ "$okeys" = "$KEYS" ] || { echo "loadgen --opt keys=$okeys != rocksdb-server --keys $KEYS"; exit 2; }
 RATE_ARGS=()
 if [ -n "${PER_VM_RATES:-}" ]; then  # same request rate on every VM: total = N x per-VM rate
-  tot=$(tr ',' '\n' <<< "$PER_VM_RATES" | awk -v n="$N" '{printf "%s%g", (NR > 1 ? "," : ""), $1 * n}')
+  tot=$(tr ',' '\n' <<< "$PER_VM_RATES" | awk -v n="$N" '{printf "%s%.3f", (NR > 1 ? "," : ""), $1 * n}')
   RATE_ARGS=(--mode fixed --rates "$tot")
 fi
 SSH="ssh -o BatchMode=yes -o ConnectTimeout=5"
@@ -152,7 +152,7 @@ if [ -s "$RUN/loadgen/gets.bin" ]; then  # loadgen --opt log=1: exact check
   echo "check_log rc=$CRC" >> "$RUN/check-log.txt"; tail -n 2 "$RUN/check-log.txt"
 fi
 KRC=0
-python3 -I -B "$HERE/check-run.py" "$RUN" --nodes "$N" --stop-extents-free "$STOP_EXTENTS_FREE" \
+python3 -I -B "$HERE/check-run.py" "$RUN" --nodes "$N" --keys "$KEYS" --stop-extents-free "$STOP_EXTENTS_FREE" \
   --stop-blocks-free "$STOP_BLOCKS_FREE" > "$RUN/check.txt" 2>&1 || KRC=$?
 cat "$RUN/check.txt"
 [ -f "$RUN/loadgen/rocksdb.txt" ] && tr '\n' ' ' < "$RUN/loadgen/rocksdb.txt" && echo
