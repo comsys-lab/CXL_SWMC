@@ -3,7 +3,8 @@
 // (row r of table k = record row_base[k] + r = key + embedding + seq + csum, 576 B), a striped HWcc version table
 // (MemC3: S = 2^16 u32 counters, row -> hash(table, key) mod S; used by the plain backend). Every node accepts both ops; the harness sends updates to the
 // updater node (0) and queries to the serving node (1). Threads: one reader per connection, U update workers (rows
-// sharded by stripe % U; Monolith-style touched-row publication every T, workers independent), S serving workers (a
+// sharded by stripe % U on plain, by Megalon object % U on Megalon; Monolith-style touched-row publication every T,
+// workers independent), S serving workers (a
 // query is split into chunks of pairs; workers claim chunks). Backend (--backend plain|megalon): where the records live
 // and which coherence actions wrap each record access; Server<Backend> is compiled per backend. Per-operation time
 // split (MOT1 v6 Fig 2): optime.h.
@@ -76,6 +77,8 @@ struct Opts {
   uint64_t check_stride = 4096; // Megalon: ObjectLookup every n-th slot on every node
   bool warm_up = true, verify_rows = false, preload_only = false, preloaded = false;
   bool test_no_seqlock = false;  // negative test only: readers ignore the version words (torn rows must show up)
+  int64_t mg_rows_per_object = -1;  // Megalon object granularity (required with --backend megalon): 0 = one object
+                                    // per table (main), 1 = per row (restructured best case), N > 1 = N-row chunks
   uint32_t megalon_time_sample = 0;  // legacy app-level Megalon timers, 1 in N sections (backend.h MegThr); v6: off
                                      // by default (CohSnap replaces them; they perturb timing)
   std::string region, backend = "plain", megalon_lib;
@@ -144,7 +147,7 @@ class Queue {
 
 struct Stats {
   std::atomic<uint64_t> queries{0}, pairs{0}, lookups{0}, probes{0}, seq_retries{0}, false_retries{0}, seq_spins{0},
-      misses{0}, torn{0}, lookup_ns{0}, mlp_ns{0}, query_ns{0}, bad{0};
+      misses{0}, torn{0}, lookup_ns{0}, mlp_ns{0}, query_ns{0}, bad{0}, update_sections{0};
   std::atomic<uint64_t> samples{0}, rows_touched{0}, rows_written{0}, update_misses{0}, flushes{0}, flush_ns{0},
       flush_ns_max{0}, flush_overruns{0}, lock_spins{0}, write_ns{0}, accum_cyc{0}, publish_rounds{0},
       round_rows{0}, round_rows_max{0}, uq_max{0};
@@ -207,7 +210,11 @@ class Server {
     if (!cxl::region_load(o_.region.empty() ? nullptr : o_.region.c_str(), &r_, &err)) die("region: " + err);
     if (p_.nr_nodes == 0 || o_.node >= p_.nr_nodes) die("bad node/nodes");
     if (o_.update_threads == 0 || o_.serve_threads == 0 || o_.min_chunk == 0) die("threads/min chunk must be > 0");
-    HwccLayout lay(p_, Be::kLayoutTag);
+    // Megalon N != 1 adds its granularity to the layout hash (both nodes must agree); N = 1 keeps the 3ef27d8b6 tag
+    std::string tag = Be::kLayoutTag;
+    if (std::is_same_v<Be, MegalonBackend> && o_.mg_rows_per_object != 1)
+      tag += " rows_per_object=" + std::to_string(o_.mg_rows_per_object);
+    HwccLayout lay(p_, tag.c_str());
     if constexpr (std::is_same_v<Be, MegalonBackend>) {
       if (1 + o_.load_threads + o_.update_threads + o_.serve_threads > 32)
         die("megalon: at most 32 thread registrations per node (main + load + update + serve threads)");
@@ -221,7 +228,8 @@ class Server {
     }
     if (!cxl::hwcc::app_init(r_, map_, lay.L, o_.run_id, p_.nr_nodes, o_.node, o_.start_timeout_ms, &err)) die(err);
     h_ = std::make_unique<Hwcc>(cxl::hwcc::app_base(r_, map_), lay);
-    if constexpr (std::is_same_v<Be, MegalonBackend>) be_ = std::make_unique<Be>(r_, map_, p_, api_);
+    if constexpr (std::is_same_v<Be, MegalonBackend>)
+      be_ = std::make_unique<Be>(r_, map_, p_, api_, uint64_t(o_.mg_rows_per_object));
     else be_ = std::make_unique<Be>(r_, map_, p_);
     if (!be_->fits(&err)) die(err);
     be_->set_time_sample(o_.megalon_time_sample);
@@ -274,7 +282,8 @@ class Server {
       << "\nrows_touched=" << st_.rows_touched << "\nrows_written=" << st_.rows_written
       << "\nupdate_misses=" << st_.update_misses << "\nflushes=" << st_.flushes << "\nflush_ns=" << st_.flush_ns
       << "\nflush_ns_max=" << st_.flush_ns_max << "\nflush_overruns=" << st_.flush_overruns
-      << "\nlock_spins=" << st_.lock_spins << "\nwrite_ns=" << st_.write_ns << "\npublished_seq="
+      << "\nlock_spins=" << st_.lock_spins << "\nwrite_ns=" << st_.write_ns
+      << "\nupdate_sections=" << st_.update_sections << "\npublished_seq="
       << load_acquire(&h_->nodes[o_.node].published_seq) << "\nserve_queue=" << sq_size()
       << "\npublish_us=" << o_.publish_us << "\npublish_frac=" << o_.publish_frac
       << "\nrows_per_round_target=" << uint64_t(o_.publish_frac * double(p_.total_rows) + 0.5)
@@ -344,6 +353,42 @@ class Server {
   void write_tables() {
     const uint64_t t0 = now_ns();
     std::atomic<uint64_t> next{0};
+    if constexpr (!Be::kAppSeqlock) {
+      // Megalon: one write section per object writing all of its rows (no chunking needed: the section's pointer
+      // covers the whole object; write_end flushes the whole object). Threads claim batches of global object indices
+      // (4096 rows' worth, at least one object; N = 1: 4096 objects = rows, as before). Per-object time is logged for
+      // objects >= 1 GiB (the whole-object write_end of a multi-GB object, DESIGN.md §7).
+      const uint64_t rpo = be_->rows_per_object_opt();
+      const uint64_t batch = rpo ? std::max<uint64_t>(1, 4096 / rpo) : 1, nobj = be_->objects();
+      const std::vector<uint64_t> &ob = be_->obj_base();
+      pool_.run([&](int) {
+        std::vector<uint8_t> buf(p_.slot_bytes);
+        for (;;) {
+          const uint64_t c = next.fetch_add(batch);
+          if (c >= nobj) break;
+          const uint64_t e = std::min(nobj, c + batch);
+          uint32_t k = 0;
+          for (uint64_t g = c; g < e; g++) {
+            while (k + 1 < kSparse && ob[k + 1] <= g) k++;
+            const uint64_t ch = g - ob[k], r0 = be_->first_row(k, ch), n = be_->object_rows(k, ch);
+            const uint64_t w0 = now_ns();
+            uint64_t w1 = 0;
+            be_->write_object(k, ch, [&](uint8_t *obj) {
+              for (uint64_t i = 0; i < n; i++) {
+                make_slot(p_, Params::key(k, r0 + i), 0, buf.data());
+                std::memcpy(obj + i * p_.slot_bytes, buf.data(), p_.slot_bytes);
+              }
+              w1 = now_ns();
+            });
+            if (n * p_.slot_bytes >= (1ull << 30))
+              std::fprintf(stderr, "recsys-server: initial object table %u chunk %lu: %lu rows %.2f GiB, fill %.2f s, "
+                                   "write_end (whole-object flush + unlock) %.2f s\n",
+                           k, (unsigned long)ch, (unsigned long)n, n * p_.slot_bytes / 1073741824.0, (w1 - w0) / 1e9,
+                           (now_ns() - w1) / 1e9);
+          }
+        }
+      });
+    } else {
     pool_.run([&](int) {
         std::vector<uint8_t> buf(p_.slot_bytes);
         for (;;) {
@@ -359,6 +404,7 @@ class Server {
           }
         }
       });
+    }
     std::fprintf(stderr, "recsys-server: initial tables: %lu rows (%s), write %.1f s (%.1f GiB)\n",
                  (unsigned long)p_.total_rows, be_->name().c_str(), (now_ns() - t0) / 1e9,
                  p_.swcc_bytes() / 1073741824.0);
@@ -369,7 +415,7 @@ class Server {
     const uint64_t t0 = now_ns();
     if constexpr (std::is_same_v<Be, MegalonBackend>) {
       if (!be_->create_objects(&err, [this](std::function<void(int)> f) { pool_.run(std::move(f)); })) die(err);
-      std::fprintf(stderr, "recsys-server: created %lu objects in %.1f s\n", (unsigned long)p_.total_rows,
+      std::fprintf(stderr, "recsys-server: created %lu objects in %.1f s\n", (unsigned long)be_->objects(),
                    (now_ns() - t0) / 1e9);
     }
     if (o_.preloaded) {
@@ -502,10 +548,12 @@ class Server {
 
   // ---------------------------------------------------------------- updater (node 0)
   // T > 0 (Monolith §2.2.3 touched-key push, Ekko rates; DESIGN.md §5): every worker sees every sample in time order
-  // and records the rows it owns (stripe % U == w) in a private map key -> latest seq (latest wins); no shared memory
+  // and records the rows it owns (owner(): plain stripe % U == w, Megalon object % U == w) in a private map key ->
+  // latest seq (latest wins); no shared memory
   // is read or written per sample, and the sample is acknowledged on acceptance (workers never wait for each other).
   // Every T the worker publishes its touched rows once: each row's record follows from its key (no probe), written
-  // under its stripe (plain) or in one write section (Megalon). A round longer than T is an overrun ("update rate not sustained"); the next round starts at the next
+  // under its stripe (plain) or, per owned object, in one write section with all touched rows of that object (Megalon;
+  // the app's own publication batch, Monolith touched-key push). A round longer than T is an overrun ("update rate not sustained"); the next round starts at the next
   // multiple of T after it (never bursted). T = 0 (diagnostic): every sample's rows are written before the reply.
   struct UpdJob {
     Job job;
@@ -543,20 +591,35 @@ class Server {
     }
   }
 
-  // rows: sorted by gslot, resolved. One stripe hold per row.
+  // rows: sorted by gslot, resolved. Plain: one stripe hold per row. Megalon: one write section per object holding
+  // all of this batch's rows of that object in address order (the write section locks and versions the object
+  // itself; write_end flushes the whole object); N = 1: one section per row, as before.
   void write_rows(const std::vector<Touched> &rows, std::vector<uint8_t> &buf) {
     const uint64_t t0 = now_ns();
     buf.resize(p_.slot_bytes);
-    for (const Touched &t : rows) {
-      make_slot(p_, t.key, t.seq, buf.data());
-      if constexpr (!Be::kAppSeqlock) {  // Megalon: the write section locks and versions the object itself
-        be_->write_slot(t.k, t.gslot - p_.row_base[t.k], [&](uint8_t *dst) { std::memcpy(dst, buf.data(), p_.slot_bytes); });
-        continue;
+    if constexpr (!Be::kAppSeqlock) {
+      for (size_t i = 0; i < rows.size();) {
+        const uint32_t k = rows[i].k;
+        const uint64_t c = be_->chunk_of(k, rows[i].gslot - p_.row_base[k]);
+        size_t j = i + 1;
+        while (j < rows.size() && rows[j].k == k && be_->chunk_of(k, rows[j].gslot - p_.row_base[k]) == c) j++;
+        be_->write_object(k, c, [&](uint8_t *obj) {
+          for (size_t x = i; x < j; x++) {
+            make_slot(p_, rows[x].key, rows[x].seq, buf.data());
+            std::memcpy(obj + be_->row_offset(k, rows[x].gslot - p_.row_base[k]), buf.data(), p_.slot_bytes);
+          }
+        });
+        st_.update_sections++;
+        i = j;
       }
-      uint32_t *ver = &h_->ver[p_.stripe(t.key)];
-      const uint32_t v = lock_stripe(ver);
-      be_->write_slot(t.k, t.gslot - p_.row_base[t.k], [&](uint8_t *dst) { std::memcpy(dst, buf.data(), p_.slot_bytes); });
-      store_release(ver, v + 2);
+    } else {
+      for (const Touched &t : rows) {
+        make_slot(p_, t.key, t.seq, buf.data());
+        uint32_t *ver = &h_->ver[p_.stripe(t.key)];
+        const uint32_t v = lock_stripe(ver);
+        be_->write_slot(t.k, t.gslot - p_.row_base[t.k], [&](uint8_t *dst) { std::memcpy(dst, buf.data(), p_.slot_bytes); });
+        store_release(ver, v + 2);
+      }
     }
     st_.write_ns += now_ns() - t0;
     st_.rows_written += rows.size();
@@ -571,6 +634,13 @@ class Server {
     return true;
   }
 
+
+  // Update worker owning a row: plain stripe(key) % U (unchanged); Megalon gobj(object) % U, because Megalon allows
+  // one writer per object (N = 0: table k % U, at most 26 owners).
+  uint32_t owner(uint32_t k, uint64_t key) const {
+    if constexpr (Be::kAppSeqlock) return p_.stripe(key) % o_.update_threads;
+    else return uint32_t(be_->gobj(k, be_->chunk_of(k, Params::key_row(key))) % o_.update_threads);
+  }
 
   void publish() {  // published_seq = min over workers (single node-0 field, raised by CAS)
     uint64_t m = ~0ull;
@@ -639,7 +709,7 @@ class Server {
         for (uint32_t k = 0; k < kSparse; k++)
           for (uint32_t j = 0; j < p_.hot[k]; j++) {
             const uint64_t key = Params::key(k, p_.row_of(k, u->s, j));
-            if (p_.stripe(key) % o_.update_threads != w) continue;
+            if (owner(k, key) != w) continue;
             st_.rows_touched++;
             touched.insert_or_assign(key, u->seq);  // latest wins
           }
@@ -654,7 +724,7 @@ class Server {
       for (uint32_t k = 0; k < kSparse; k++)
         for (uint32_t j = 0; j < p_.hot[k]; j++) {
           const uint64_t key = Params::key(k, p_.row_of(k, u->s, j));
-          if (p_.stripe(key) % o_.update_threads != w) continue;
+          if (owner(k, key) != w) continue;
           st_.rows_touched++;
           if (resolve(key, u->seq, &t)) rows.push_back(t);
         }
@@ -940,6 +1010,7 @@ void usage() {
                "  [--dim D (128)] [--row-cap R (26000000)] [--row-div N (1)] [--ver-stripes S (65536)]\n"
                "  [--multi-hot-div N (1)] [--rank R (512)] [--seed N] [--verify-rows 0|1] [--warm-up 0|1]\n"
                "  [--check-stride N (4096)] [--megalon-time-sample N (0 = off)] [--start-timeout-ms T] [--backend plain|megalon] [--megalon-lib PATH]\n"
+               "  [--mg-rows-per-object N]   required with --backend megalon: 0 = one object per table, 1 = per row, N = N-row chunks\n"
                "  [--proc-kthread PREFIX]... [--proc-sysfs DIR]...\n"
                "  [--preload-only | --preloaded]   Popcorn init_state=shared: node 0 writes the tables before enable\n"
                "CXL_APP_HWCC_BYTES must equal the app layout size: recsys-server --print-app-bytes [params].\n"
@@ -986,6 +1057,7 @@ int main(int argc, char **argv) {
     else if (a == "--start-timeout-ms") o.start_timeout_ms = std::stoull(v());
     else if (a == "--backend") o.backend = v();
     else if (a == "--megalon-lib") o.megalon_lib = v();
+    else if (a == "--mg-rows-per-object") o.mg_rows_per_object = std::stoll(v());
     else if (a == "--proc-kthread") o.proc.kthread_prefixes.push_back(v());
     else if (a == "--proc-sysfs") o.proc.sysfs_dirs.push_back(v());
     else if (a == "--print-app-bytes") print_bytes = true;
@@ -1010,6 +1082,16 @@ int main(int argc, char **argv) {
     for (uint32_t k = 0; k < kSparse; k++)
       std::printf("table %2u rows %9lu row_base %10lu hot %3u\n", k, (unsigned long)o.p.rows[k],
                   (unsigned long)o.p.row_base[k], o.p.hot[k]);
+    if (o.mg_rows_per_object >= 0) {  // Megalon object granularity (same arithmetic as MegalonBackend)
+      uint64_t objs = 0, mx = 0;
+      for (uint32_t k = 0; k < kSparse; k++) {
+        const uint64_t n = o.mg_rows_per_object ? std::min<uint64_t>(o.mg_rows_per_object, o.p.rows[k]) : o.p.rows[k];
+        objs += (o.p.rows[k] + n - 1) / n;
+        mx = std::max(mx, n * o.p.slot_bytes);
+      }
+      std::printf("megalon rows_per_object %ld objects %lu max_object_bytes %lu\n", (long)o.mg_rows_per_object,
+                  (unsigned long)objs, (unsigned long)mx);
+    }
     if (o.publish_frac > 0)
       std::printf("publish_frac %.9g rows_per_round_target %lu (of %lu rows)\n", o.publish_frac,
                   (unsigned long)(o.publish_frac * double(o.p.total_rows) + 0.5), (unsigned long)o.p.total_rows);
@@ -1023,7 +1105,18 @@ int main(int argc, char **argv) {
   signal(SIGPIPE, SIG_IGN);
   signal(SIGTERM, [](int) { g_stop = 1; });
   signal(SIGINT, [](int) { g_stop = 1; });
-  if (o.backend == "plain") return run<PlainBackend>(o);
+  if (o.backend == "plain") {
+    if (o.mg_rows_per_object >= 0) {
+      std::fprintf(stderr, "recsys-server: --mg-rows-per-object is for --backend megalon only\n");
+      return 2;
+    }
+    return run<PlainBackend>(o);
+  }
+  if (o.backend == "megalon" && o.mg_rows_per_object < 0) {
+    std::fprintf(stderr, "recsys-server: --backend megalon needs --mg-rows-per-object N (0 = one object per table, "
+                         "1 = per row, N > 1 = N-row chunks)\n");
+    return 2;
+  }
   if (o.backend != "megalon") usage();
   auto env = [](const char *k, const std::string &v) {
     const char *cur = getenv(k);
