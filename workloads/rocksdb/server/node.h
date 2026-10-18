@@ -261,10 +261,8 @@ class Node {
     o.env->CreateDirIfMissing(o_.local_dir);
     o.env->CreateDirIfMissing(o.db_log_dir);
     o.env->CreateDirIfMissing(o.wal_dir);
-    rdb::DB *db = nullptr;
-    auto s = rdb::DB::Open(o, CxlFs::dir_of(o_.node), &db);
+    auto s = rdb::DB::Open(o, CxlFs::dir_of(o_.node), &db_);
     if (!s.ok()) die("open primary: " + s.ToString());
-    db_.reset(db);
     std::fprintf(stderr, "%s: primary %s open (write_buffer_size %zu, arena_block_size %zu, max_write_buffer_number %d)\n",
                  who, CxlFs::dir_of(o_.node).c_str(), o.write_buffer_size, o.arena_block_size, o.max_write_buffer_number);
     if (o.max_write_buffer_number > int(kMaxMemtables)) die("max_write_buffer_number > descriptor entries");

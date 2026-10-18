@@ -119,7 +119,7 @@ struct SwccPlan {
   uint64_t share = 0, base0 = 0, arena_blocks = 0, file_extents = 0;
   bool make(const cxl::region &r, const Params &p, std::string *err) {
     share = r.swcc.size / p.nr_nodes / kUnit * kUnit;
-    base0 = cxl::align_up(r.swcc.offset, kUnit);
+    base0 = cxl::detail::align_up(r.swcc.offset, kUnit);
     if (base0 + share * p.nr_nodes > r.swcc.offset + r.swcc.size) share -= kUnit;
     arena_blocks = p.arena_blocks;
     const uint64_t units = share / kUnit;

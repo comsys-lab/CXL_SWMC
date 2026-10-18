@@ -65,11 +65,9 @@ class RemoteView {
     o.env->CreateDirIfMissing(o.wal_dir);
     epoch_enter_now();
     const uint64_t g0 = desc_gen(&sh_->hwcc()->desc[v_]);
-    ROCKSDB_NAMESPACE::DB *db = nullptr;
-    auto s = ROCKSDB_NAMESPACE::DB::OpenAsSecondary(o, CxlFs::dir_of(v_), sec_dir, &db);
+    auto s = ROCKSDB_NAMESPACE::DB::OpenAsSecondary(o, CxlFs::dir_of(v_), sec_dir, &db_);
     sh_->epoch_exit(v_);
     if (!s.ok()) return *err = "OpenAsSecondary node " + std::to_string(v_) + ": " + s.ToString(), false;
-    db_.reset(db);
     applied_.store(g0);
     bg_ = std::thread([this] { background(); });
     return true;
