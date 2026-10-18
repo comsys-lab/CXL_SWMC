@@ -514,10 +514,12 @@ h1_warmup() {  # unmeasured warm-up before an SLO part (as every earlier lifetim
 # operating point is judged by v1_check.py --h1 over the L2+L1 span: update completions >= 0.98 x sent).
 H1_SLO_TOL=0.02
 h1_slo() {  # <sys>: warm-up + full SLO search -> $LS/slo
-  local s=$1 rc RD=$LS/slo note=""
+  local s=$1 rc RD=$LS/slo note="" st=1
+  [ $s != pop ] || st=${POPST[$H1_MIX]:-1}   # v0.6.16: ",POPSTART=<n>" mix parameter (Popcorn only)
   h1_warmup
+  echo "$NAME slo: search start rate $st" >> "$E/seeds.txt"
   measure "$LS" slo "${LGC[@]}" --opt seed=$SEED --seed $SEED --slo query:$SLO_PCT:$SLO_MS --raw --tol $H1_SLO_TOL \
-    --mode slo --start 1 --factor 1.5 --precision 0.02 --confirm-precision 0.01 --max-confirm-probes 6 --confirm-step-down 0.05 --max-steps 20
+    --mode slo --start $st --factor 1.5 --precision 0.02 --confirm-precision 0.01 --max-confirm-probes 6 --confirm-step-down 0.05 --max-steps 20
   rc=$?
   echo "$NAME slo: loadgen seed $SEED" >> "$E/seeds.txt"
   grep -q 'workload_finish":"ok' "$RD/loadgen/summary.json" 2>/dev/null || stop "$NAME slo: loadgen workload finish (rc $rc)"
@@ -607,10 +609,22 @@ rate_for() {  # <ekko> <out file>: sets UPD_RATE and LGC for that operating poin
 }
 h1shuffle() { local seed=$1; shift; python3 -c 'import random,sys; v=sys.argv[2:]; random.Random(sys.argv[1]).shuffle(v); print(" ".join(v))' "$seed" "$@"; }
 h1_ekko() { case $1 in EKKO=avg|EKKO=peak|EKKO=f087|EKKO=f149|EKKO=f253|EKKO=f330|EKKO=f350|EKKO=f370|EKKO=f400|EKKO=f385|EKKO=f392) echo ${1#EKKO=};; *) return 1;; esac; }
+# v0.6.16 (user 2026-10-19, choice (A): one confirmation run): a mix parameter may end in ",POPSTART=<n>" = the start
+# rate of the Popcorn SLO search of that mix (loadgen --start n instead of 1); every other system and every other
+# setting unchanged. Without the suffix (every h1-plan.tsv row) the search starts at 1 as before.
+h1_mixparse() {  # <mix parameter> -> "<ekko point> <pop start rate>"; rc 1 on a bad parameter
+  local p=$1 ps=1 ek
+  if [[ $p == *,POPSTART=* ]]; then ps=${p##*,POPSTART=}; p=${p%,POPSTART=*}; [[ $ps =~ ^[1-9][0-9]*$ ]] || return 1; fi
+  ek=$(h1_ekko "$p") || return 1
+  echo "$ek $ps"
+}
 if [ $BLOCK = h1 ]; then  # H1-HOOK v2 driver (header)
   printf '# name\tsystem\tmix\tphase\tround\trun_dir\tsteps\tlifetime\n' > "$E/h1-runs.tsv"
-  declare -A EK
-  for spec in $H1_MIXES; do EK[${spec%%=*}]=$(h1_ekko "${spec#*=}") || stop "bad mix parameter $spec"; done
+  declare -A EK POPST
+  for spec in $H1_MIXES; do
+    mp=$(h1_mixparse "${spec#*=}") || stop "bad mix parameter $spec"
+    EK[${spec%%=*}]=${mp% *} POPST[${spec%%=*}]=${mp#* }
+  done
   mixes=$(h1shuffle H1-recsys-r$H1_N $(printf "%s\n" "${!EK[@]}" | sort))
   lv_rates() {  # <mix>: "<L2_rate> <L1_rate>" from H1_LEVELS (cont)
     awk -F'\t' -v m="$1" 'NR == 1 { for (i = 1; i <= NF; i++) c[$i] = i; next }

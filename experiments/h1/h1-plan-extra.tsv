@@ -9,6 +9,8 @@
 # v0.6.13 (user 2026-10-19, target Popcorn/All-HWcc 0.2-0.3): f385 = 0.00385; calibration builds/recsys-calib/5.
 # v0.6.12 (user 2026-10-19, search for Popcorn/All-HWcc 0.7-0.8): f350 / f370 / f400 = 0.0035 / 0.0037 / 0.004;
 # calibration builds/recsys-calib/4.
+# v0.6.16 (user 2026-10-19, choice (A)): peak10 = Ekko peak with the Popcorn SLO search starting at 10 query/s
+# (main-block.sh ",POPSTART=10"; one confirmation run of the low-start-rate p95 artifact); all else as peak.
 # v0.6.11 (user 2026-10-18): f330 = geometric mean of f253 and peak (0.0032983 -> 0.0033); calibration builds/recsys-calib/3.
 recsys	f087	EKKO=f087	1	3	query:95:100	Ekko avg-peak geometric 1/4 (0.0874% rows/min)	60
 recsys	f149	EKKO=f149	1	3	query:95:100	Ekko avg-peak geometric 2/4 (0.149% rows/min)	60
@@ -19,3 +21,4 @@ recsys	f370	EKKO=f370	1	3	query:95:100	Ekko f330-peak point (0.37% rows/min)	60
 recsys	f400	EKKO=f400	1	3	query:95:100	Ekko f330-peak point (0.40% rows/min)	60
 recsys	f385	EKKO=f385	1	3	query:95:100	Ekko f370-f400 point (0.385% rows/min)	60
 recsys	f392	EKKO=f392	1	3	query:95:100	Ekko f385-f400 point (0.392% rows/min)	60
+recsys	peak10	EKKO=peak,POPSTART=10	1	3	query:95:100	Ekko peak (4.3% rows/10 min), Popcorn SLO search from 10 q/s	60

@@ -66,6 +66,9 @@
 #      unchanged (no supersession record), Q1 check PASS with runs for the 3 mixes only, levels for f087/f149/f253,
 #      accept works; r2 / r1-kv in Q1 refused; a stopped --add-mixes stage is retried in its root and a tampered E1
 #      acceptance record blocks that retry
+#   R  v0.6.16 Popcorn SLO start-rate knob (main-block.sh h1_mixparse, functions extracted): "EKKO=peak" -> peak 1,
+#      "EKKO=peak,POPSTART=10" -> peak 10, bad suffixes refused; h1_slo passes --start from POPST for pop only (static);
+#      h1-plan.tsv has no POPSTART row; --add-mixes P2 peak10 runs (stage plan row EKKO=peak,POPSTART=10)
 #   K  check.py W7 (knee bracket at the probe limit or rel_width > 5 %, weakest named; legacy runs without the field: no W7);
 #      W4 names both rounds' confirm searches when one did not pass its first confirm (v0.6.5), legacy runs: no note
 # Prints "SELFTEST PASS" or "SELFTEST FAIL <case>".
@@ -705,4 +708,19 @@ echo "tampered" >> "$O/P2q/accept/r1-recsys.txt"
 stage Q3 r1-recsys --retry "x" && fail "Q3 retry after a tampered E1 record"
 grep -q "add-mixes.txt or stage-plan.tsv does not verify" "$O/Q3.out" || fail "Q3 reason"
 echo "Q OK"
+# R v0.6.16 POPSTART knob
+MB=$H/../recsys/main-block.sh
+{ sed -n '/^h1_ekko() {/p' "$MB"; sed -n '/^h1_mixparse() {/,/^}/p' "$MB"; } > "$O/R-fn.sh"
+rp() { bash -c ". $O/R-fn.sh; h1_mixparse \"\$1\"" _ "$1"; }
+[ "$(rp EKKO=peak)" = "peak 1" ] && [ "$(rp EKKO=avg)" = "avg 1" ] && [ "$(rp EKKO=peak,POPSTART=10)" = "peak 10" ] \
+  && [ "$(rp EKKO=f385,POPSTART=3)" = "f385 3" ] || fail "R parse"
+for bad in EKKO=peak,POPSTART=0 EKKO=peak,POPSTART=x EKKO=peak,POPSTART= EKKO=nope,POPSTART=10 EKKO=peak,FOO=1; do
+  rp "$bad" > /dev/null && fail "R accepted $bad"; done
+grep -q '\[ \$s != pop \] || st=\${POPST\[\$H1_MIX\]:-1}' "$MB" && grep -q -- '--mode slo --start \$st --factor 1.5' "$MB" \
+  && [ "$(sed -n '/^h1_slo() {/,/^}/p' "$MB" | grep -c -- '--start 1 ')" = 0 ] || fail "R h1_slo start"
+! grep -q POPSTART "$H/h1-plan.tsv" && grep -q "^recsys	peak10	EKKO=peak,POPSTART=10	" "$H/h1-plan-extra.tsv" || fail "R plans"
+mkdir "$O/R1"; stage R1 r1-recsys --add-mixes "$O/P2" peak10 "selftest: POPSTART" || fail "R --add-mixes peak10 (see $O/R1.out)"
+grep -q "^recsys	peak10	EKKO=peak,POPSTART=10	" "$O/R1/stage-plan.tsv" && grep -q "peak10=EKKO=peak,POPSTART=10" "$O/R1/h1-state.txt" \
+  && tail -n 1 "$O/R1/recsys/r1/check.txt" | grep -q "^H1CHECK PASS" || fail "R stage"
+echo "R OK"
 echo "SELFTEST PASS"

@@ -30,6 +30,8 @@
 # (avg/peak/f149/f253/f330 byte-identical to calib/3, + f350 / f370 / f400 = 0.0035 / 0.0037 / 0.004); main-block.sh re-pinned.
 # Re-pinned 2026-10-18 (H1 v0.6.11): RATE_T_DIR = builds/recsys-calib/3 (avg/peak/f149/f253 byte-identical to calib/2,
 # plus f330 = geometric mean of f253 and peak, user decision); main-block.sh (ekko_set f330) re-pinned.
+# Re-pinned 2026-10-19 (H1 v0.6.16, user choice (A)): main-block.sh (",POPSTART=<n>" mix parameter: Popcorn SLO search start
+# rate; default 1 unchanged); calibration and builds unchanged (builds/recsys-calib/6).
 . "$(dirname "${BASH_SOURCE[0]}")/pins-common.inc"
 HR=$P/CXL_SWMC                      # live tree (main-block.sh resolves session.sh / v1_check.py / host-gate.sh next to itself)
 HOOK_FILE=$HR/experiments/recsys/main-block.sh
@@ -72,7 +74,7 @@ c753d2f0f6806cdd42a82fbba108bff75549a4863691798a022e4ff404434d24  $P/builds/recs
 f9c1753f3bef2ab0941153058860227145f2d7b7e33a210bdc3338fad14eacda  $P/builds/recsys-megalon/14/lib/libmegalon.so
 de2e9a4cd7ee41df5d9a938836802b0ee5186ba69b42252e3ab747f0bfeae193  $P/builds/recsys-loadgen/9/manifest.txt
 61bb70687ef15823a33a56c282d53eecdbcc1c1e574589eeba7791b4a65d81c0  $P/builds/recsys-loadgen/9/loadgen
-51fd6dbcda2b23aa5175ff20b825a47b7cd0422d041d8661f92530a23f5c58c9  $HOOK_FILE
+b3999a0e76ce7d40a5a3ae8f8b690687d01af0f42714fd897e8c4c2cbc5bcf1c  $HOOK_FILE
 68c5b9ceaf986e9e05e941d586a9a5cb5bb162b1963181ce02efa5d34cce5b54  $HR/experiments/recsys/session.sh
 0bd4d06ea0b0678b77d1276aec2f13db70a8eceed7e7ab11f61905052e8ac4ac  $HR/experiments/recsys/v1_check.py
 32d171199d6a47d15fcfa6971522e253fe21d857e91c9049c201e55a0cdac230  $HR/experiments/recsys/check_breakdown.py
