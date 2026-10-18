@@ -624,7 +624,7 @@ class Server {
     }
     st_.write_ns += now_ns() - t0;
     st_.rows_written += rows.size();
-    st_.update_sections += sections;  // after rows_written; stats_text reads rows_written first: sections <= rows
+    st_.update_sections += sections;  // not atomic with rows_written: a snapshot during a round may see sections > rows
     __atomic_fetch_add(&h_->nodes[o_.node].rows_written, uint64_t(rows.size()), __ATOMIC_RELAXED);
   }
   // key -> resolved row (direct: table and row from the key); false on a miss (counted)

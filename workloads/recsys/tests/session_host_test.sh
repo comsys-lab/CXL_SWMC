@@ -6,7 +6,7 @@
 # window invariants, gate validity + SLO in the manifests, L from r1, breakdown columns, negative cases (existing name,
 # measure after stop, seq_base given by the caller). No VM, no CXL device. Run pinned to Host node 1.
 # usage: session_host_test.sh <server build dir> <loadgen build dir> <work dir (new)> [plain|megalon]
-# env: ROW_DIV (200), T_MS (1000), PORT (27300), LG_CPUS (30-31); SLO = 5 x the gate p95 at percentile 95 (v6 uses p95;
+# env: ROW_DIV (200), T_MS (1000), PORT (27300), LG_CPUS (30-31), MG_RPO (megalon --mg-rows-per-object, 0 = one object per table); SLO = 5 x the gate p95 at percentile 95 (v6 uses p95;
 # the fixed 100 ms of the main block is not reachable under Host noise, so the Host test keeps a self-derived limit)
 set -uo pipefail
 B=$(cd "$1" && pwd); LGB=$(cd "$2" && pwd); WD=$3; BACKEND=${4:-plain}
@@ -47,7 +47,7 @@ SE=(SESSION_LOCAL=1 PORT=$PORT T_MS=$T_MS V=$V HOST_SERVER=$B/bin/recsys-server 
 if [ "$BACKEND" = megalon ]; then
   sed -e "s/^object_arena_size:.*/object_arena_size: $ARENA/" -e "s/^logical_scr_size:.*/logical_scr_size: 64MB/" \
       "$W/tests/megalon-host.yaml" > "$V/cfg/megalon.yaml"
-  SE+=(SYSTEM=Megalon "SERVER_ARGS=--backend megalon $SA" "NODE_ENV=ENV:RACKOBJ_CONFIG=$V/cfg/megalon.yaml ENV:XTIMEOUT=3600"
+  SE+=(SYSTEM=Megalon "SERVER_ARGS=--backend megalon --mg-rows-per-object ${MG_RPO:-0} $SA" "NODE_ENV=ENV:RACKOBJ_CONFIG=$V/cfg/megalon.yaml ENV:XTIMEOUT=3600"
        "NODE0_ENV=ENV:MEGALON_REINIT=1")
 else
   SE+=(SYSTEM=all-HWcc "SERVER_ARGS=$SA" "NODE_ENV=ENV:XTIMEOUT=3600")
