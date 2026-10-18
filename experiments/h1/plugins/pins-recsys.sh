@@ -8,6 +8,8 @@
 # Plain = builds/recsys/12 (same source 77ba0fa69 as recsys-megalon/14; server.cc is shared, so the older plain build
 # is not used), guest dirs /home/comsys/rs12 and /home/comsys/rsm14 (installed by RECSYS-V1 v1.4). --mg-rows-per-object
 # has no default and is required with --backend megalon (main-block.sh passes MG_RPO_OPT MG_TABLE_N to mg and mgoff).
+# MG_COH_SAMPLE=1: every Megalon section timed (RECSYS-V1 v1.4 user decision 2026-10-18 for the table objects, ~26
+# write sections per round; H1 use to be confirmed, H1 packet v0.6.6 Q-H5).
 . "$(dirname "${BASH_SOURCE[0]}")/pins-common.inc"
 HR=$P/CXL_SWMC                      # live tree (main-block.sh resolves session.sh / v1_check.py / host-gate.sh next to itself)
 HOOK_FILE=$HR/experiments/recsys/main-block.sh
@@ -15,7 +17,7 @@ BLOCK_CMD=(bash $HOOK_FILE)          # H1 hook = BLOCK=h1 in main-block.sh (mark
 BLOCK_ENV=(BLOCK=h1 POP_BUILD=12 POP_BUNDLE_SHA=$POP_BUNDLE_SHA C8=$CPOP K8=$KPOP GT8=$GTPOP RECV_MODE=$RECV_MODE
   D=$P/builds/recsys-inputs/1 PLAIN_BUILD=$P/builds/recsys/12 MEG_BUILD=$P/builds/recsys-megalon/14 MEGALON_BASE=$MEG77
   VM_PLAIN=/home/comsys/rs12 VM_MEG=/home/comsys/rsm14 LOADGEN=$P/builds/recsys-loadgen/9/loadgen XT=7200
-  MG_RPO_OPT=--mg-rows-per-object MG_TABLE_N=0
+  MG_RPO_OPT=--mg-rows-per-object MG_TABLE_N=0 MG_COH_SAMPLE=1
   EXPECT_DAX_UUID=$EXPECT_DAX_UUID)
 PIN_SHA256="$COMMON_SHA256
 9c330ba688b96019792dee4bb80e91965cfb7e5d5c21265bb3a2e805df3db5a8  $P/builds/recsys-inputs/1/MANIFEST.txt
@@ -30,9 +32,9 @@ PIN_SHA256="$COMMON_SHA256
 f9c1753f3bef2ab0941153058860227145f2d7b7e33a210bdc3338fad14eacda  $P/builds/recsys-megalon/14/lib/libmegalon.so
 de2e9a4cd7ee41df5d9a938836802b0ee5186ba69b42252e3ab747f0bfeae193  $P/builds/recsys-loadgen/9/manifest.txt
 61bb70687ef15823a33a56c282d53eecdbcc1c1e574589eeba7791b4a65d81c0  $P/builds/recsys-loadgen/9/loadgen
-2952dd027c833e1f9276621bd0bc4c8a4fe5ff478eb4b0e46b0a83aa102f4fce  $HOOK_FILE
+9236acd603d80f1293155e62f4cb14def128d611a61012cb75f5fe18530202d9  $HOOK_FILE
 68c5b9ceaf986e9e05e941d586a9a5cb5bb162b1963181ce02efa5d34cce5b54  $HR/experiments/recsys/session.sh
-35ad5c33dc61d2b3c1fdaa12f770a2a9c4ba85e7fb93f4804a188dfdc4396f4f  $HR/experiments/recsys/v1_check.py
+22b5d043c733b2c477436154054bef975272426a71d6607e66abeb97bdc8951f  $HR/experiments/recsys/v1_check.py
 32d171199d6a47d15fcfa6971522e253fe21d857e91c9049c201e55a0cdac230  $HR/experiments/recsys/check_breakdown.py
 e6b2455d64266df3f2a62f9bc5359b91ddd80588c109a6cae3efde66abceb74c  $HR/experiments/recsys/breakdown.py
 f6742a6e473ec417f394cf2acf541f4fd1209d7ac523bbfb253e81c7b5f6f439  $HR/experiments/recsys/precheck.sh
