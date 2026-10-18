@@ -1,0 +1,10 @@
+# H1 extra mixes (v0.6.10): rows with the h1-plan.tsv columns that no regular stage runs; only
+# `h1-main.sh r1-<W> <E2> --add-mixes <E1> <m1,m2,...> "<reason>"` uses them, in a NEW evidence root whose stage plan is
+# h1-plan.tsv with the rows of <W> replaced by the chosen rows of this file (E2/stage-plan.tsv).
+# recsys (user decision 2026-10-18 "3점 등비"): three Ekko points between avg (0.0308/60 = 0.000513333333 of all rows per
+# 60 s) and peak (0.043/10 = 0.0043), geometric (ratio 1.701, 3 significant digits); T = 1 s calibration
+# builds/recsys-calib/2; main-block.sh ekko_set f087 / f149 / f253. Ekko OSDI'22 §6.2.1: 3.08 %/h = production
+# average; 4.3 % per 10 min = an update-intensive model over its busiest 480 min (about 10 % per 60 min).
+recsys	f087	EKKO=f087	1	3	query:95:100	Ekko avg-peak geometric 1/4 (0.0874% rows/min)	60
+recsys	f149	EKKO=f149	1	3	query:95:100	Ekko avg-peak geometric 2/4 (0.149% rows/min)	60
+recsys	f253	EKKO=f253	1	3	query:95:100	Ekko avg-peak geometric 3/4 (0.253% rows/min)	60

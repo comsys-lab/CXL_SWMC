@@ -31,7 +31,20 @@
 # usage: h1-main.sh <stage> <evidence root E>
 #        h1-main.sh r1-<W> <E> --retry "<reason>"   (v0.6.8, user decision 2026-10-18 "응 그렇게 진행해")
 #        h1-main.sh r1-<W> <E2> --from-root <E1> "<reason>"   (v0.6.9, user decision 2026-10-18: H1 RecSys at T = 1 s)
-#   E: for r1-kv (and for --from-root) it must exist and be empty except sequence* files; later stages use the same E.
+#        h1-main.sh r1-<W> <E2> --add-mixes <E1> <m1,m2,...> "<reason>"   (v0.6.10, user decision 2026-10-18: RecSys
+#                                                     intermediate Ekko points)
+#   E: for r1-kv (and for --from-root / --add-mixes) it must exist and be empty except sequence* files; later stages use
+#   the same E.
+# --add-mixes (round 1 stages only; v0.6.10): a NEW evidence root E2 that measures EXTRA mixes of W (rows of
+#   h1-plan-extra.tsv) next to the accepted r1 of W in E1, which stays valid and untouched (no supersession record;
+#   nothing in E1 is written). Preconditions (before the lock): E2 empty except sequence*; E1 has h1-manifest.txt and
+#   r1 of W checked PASS + accepted there; every chosen mix is a row of W in h1-plan-extra.tsv, listed once, and not a
+#   mix of W in h1-plan.tsv. No previous-stage acceptance is required (the stage adds mixes; it replaces nothing).
+#   After the lock: E2/stage-plan.tsv = h1-plan.tsv with the rows of W replaced by the chosen rows (plan order of
+#   h1-plan-extra.tsv), used by the hook, levels, collect and check of this root, and E2/add-mixes.txt (from_root,
+#   workload, mixes, reason, sha256 of h1-plan.tsv, h1-plan-extra.tsv, stage-plan.tsv, E1's r1 acceptance record and
+#   check.txt). A later --retry of r1-<W> in E2 re-verifies these records and uses E2/stage-plan.tsv; r2/r3 and other
+#   r1 stages are refused in such a root. h1-accept.sh works as usual (E2 1 W).
 # --from-root (round 1 stages only; v0.6.9): starts a NEW evidence root E2 at r1-<W> on top of the accepted r1 stages
 #   of an earlier root E1, for a re-measurement of an ACCEPTED r1 stage under changed conditions (H1 RecSys T = 60 s ->
 #   1 s). Preconditions (before the lock): E2 empty except sequence*; E1 has h1-manifest.txt; the stage before W in
@@ -59,9 +72,14 @@
 set -uo pipefail
 export PYTHONDONTWRITEBYTECODE=1
 STAGE=${1:?usage: h1-main.sh <stage> <evidence root> [--workloads w1,w2 | --retry <reason>]} E=${2:?usage: h1-main.sh <stage> <evidence root>}
-SUBSET= RETRY= FROMROOT= FROMREASON=
+SUBSET= RETRY= FROMROOT= FROMREASON= ADDROOT= ADDMIX= ADDREASON=
 if [ -n "${3:-}" ]; then
-  if [ "$3" = --from-root ]; then
+  if [ "$3" = --add-mixes ]; then
+    [ -n "${4:-}" ] && [ -n "${5:-}" ] && [ -n "${6:-}" ] && [ -z "${7:-}" ] || { echo "SEQUENCE STOP: usage: h1-main.sh r1-<W> <E2> --add-mixes <E1> <m1,m2,...> \"<reason>\""; exit 2; }
+    case $STAGE in r1-*) ;; *) echo "SEQUENCE STOP: --add-mixes is for r1-<W> stages only"; exit 2;; esac
+    ADDROOT=$(readlink -f "$4") ADDMIX=${5//,/ } ADDREASON=$6
+    [ "$ADDROOT" != "$(readlink -f "$E")" ] || { echo "SEQUENCE STOP: --add-mixes names the new root itself"; exit 2; }
+  elif [ "$3" = --from-root ]; then
     [ -n "${4:-}" ] && [ -n "${5:-}" ] && [ -z "${6:-}" ] || { echo "SEQUENCE STOP: usage: h1-main.sh r1-<W> <E2> --from-root <E1> \"<reason>\""; exit 2; }
     case $STAGE in r1-*) ;; *) echo "SEQUENCE STOP: --from-root is for r1-<W> stages only"; exit 2;; esac
     FROMROOT=$(readlink -f "$4") FROMREASON=$5
@@ -81,6 +99,7 @@ DRY=${H1_DRY:-0}
 # D1 (verifier delta on v0.6): the plan is part of the frozen code; an override is for the Host self-test only
 [ -z "${H1_PLAN:-}" ] || [ "$DRY" = 1 ] || { echo "SEQUENCE STOP: H1_PLAN override refused (H1_DRY=1 only)"; exit 2; }
 PLAN=${H1_PLAN:-$H/h1-plan.tsv}
+XPLAN=$H/h1-plan-extra.tsv   # v0.6.10: extra mixes (--add-mixes only)
 export H1_SEED_BASE=${H1_SEED_BASE:-20261017}
 ORDER="kv lmdb vdb recsys"   # user decision 2026-10-17
 OWNER=H1-main
@@ -96,8 +115,43 @@ case $STAGE in
   *) echo "SEQUENCE STOP: bad stage $STAGE (r1-kv r1-lmdb r1-vdb r1-recsys r2 r3)"; exit 2;;
 esac
 [ -f "$PLAN" ] || { echo "SEQUENCE STOP: no plan $PLAN"; exit 2; }
+# v0.6.10 --add-mixes: the stage plan of the new root (h1-plan.tsv with the rows of W replaced by the chosen extra rows)
+stage_plan() {  # W "<mixes>" -> stage plan on stdout; rc 1 (reason on stderr) if a mix is not an extra row of W
+  local m n=0
+  for m in $2; do
+    awk -F'\t' -v w="$1" -v m="$m" '!/^#/ && $1 == w && $2 == m { f = 1 } END { exit !f }' "$XPLAN" \
+      || { echo "mix $m is not a row of $1 in $XPLAN" >&2; return 1; }
+    ! awk -F'\t' -v w="$1" -v m="$m" '!/^#/ && $1 == w && $2 == m { f = 1 } END { exit !f }' "$PLAN" \
+      || { echo "mix $m is a regular mix of $1 in $PLAN" >&2; return 1; }
+    [ "$(printf '%s\n' $2 | grep -cx "$m")" = 1 ] || { echo "mix $m listed twice" >&2; return 1; }
+    n=$((n + 1))
+  done
+  [ $n -gt 0 ] || { echo "no mixes" >&2; return 1; }
+  awk -F'\t' -v w="$1" -v ms=" $2 " 'FNR == NR { if (!/^#/ && $1 == w && index(ms, " " $2 " ")) x = x $0 "\n"; next }
+    /^#/ || $1 != w { print; next } !done { printf "%s", x; done = 1 }' "$XPLAN" "$PLAN"
+}
+addroot_ok() {  # -> 0 if E/add-mixes.txt and E/stage-plan.tsv verify (E1 records unchanged, r1 of W still accepted in E1)
+  local f=$E/add-mixes.txt R x
+  [ -f "$f" ] && [ -f "$E/stage-plan.tsv" ] || return 1
+  grep -qx "workload=$WL" "$f" || return 1
+  [ "$(sed -n 's/^stage_plan_sha256=//p' "$f")" = "$(sha256sum < "$E/stage-plan.tsv" | cut -c1-64)" ] || return 1
+  R=$(sed -n 's/^from_root=//p' "$f"); [ -d "$R" ] || return 1
+  while read -r x; do
+    set -- $x   # accept_sha256 <rel path> <sha> check_sha256 <rel path> <sha>
+    [ "$(sha256sum < "$R/$2" 2>/dev/null | cut -c1-64)" = "$3" ] && [ "$(sha256sum < "$R/$5" 2>/dev/null | cut -c1-64)" = "$6" ] || return 1
+  done < <(sed -n 's/^record: //p' "$f")
+  accepted "$WL" 1 "$R"
+}
+if [ -n "$ADDROOT" ]; then
+  [ -f "$XPLAN" ] || { echo "SEQUENCE STOP: no extra plan $XPLAN"; exit 2; }
+  SPLAN=$(stage_plan "${STAGE#r1-}" "$ADDMIX" 2>&1) || { echo "SEQUENCE STOP: --add-mixes refused: $SPLAN"; exit 2; }
+elif [ -f "$E/add-mixes.txt" ]; then  # a root started with --add-mixes: only an r1 --retry of its workload runs here
+  [ -n "$RETRY" ] && [ "$STAGE" = "r1-$(sed -n 's/^workload=//p' "$E/add-mixes.txt")" ] \
+    || { echo "SEQUENCE STOP: $E was started with --add-mixes: only h1-main.sh r1-<its workload> --retry runs in it"; exit 2; }
+  PLAN=$E/stage-plan.tsv
+fi
 for w in $ORDER; do grep -q "^$w	" "$PLAN" || { echo "SEQUENCE STOP: workload $w not in the plan"; exit 2; }; done
-if { [ "$STAGE" = r1-kv ] && [ -z "$RETRY" ]; } || [ -n "$FROMROOT" ]; then
+if { [ "$STAGE" = r1-kv ] && [ -z "$RETRY" ]; } || [ -n "$FROMROOT" ] || [ -n "$ADDROOT" ]; then
   [ -d "$E" ] && [ -z "$(ls -A "$E" | grep -v '^sequence')" ] || { echo "SEQUENCE STOP: $E missing or not empty"; exit 2; }
 else
   [ -f "$E/h1-manifest.txt" ] || { echo "SEQUENCE STOP: $E has no h1-manifest.txt (start with r1-kv)"; exit 2; }
@@ -150,7 +204,15 @@ prev_r1() {  # W
   [ -f "$s" ] && [ ! -e "$E/accept/r1-$1.txt" ] || return 1
   SKIPNOTE="previous stage $1 SKIPPED (not accepted): $(sed -n 's/^reason=//p' "$s")"
 }
-if [ -n "$FROMROOT" ]; then  # v0.6.9: new root on top of E1's accepted r1 stages
+if [ -n "$ADDROOT" ]; then  # v0.6.10: extra mixes next to E1's accepted r1 of WL (E1 is only read)
+  afail() { echo "SEQUENCE STOP: --add-mixes refused for $STAGE: $*"; exit 2; }
+  [ -f "$ADDROOT/h1-manifest.txt" ] || afail "$ADDROOT has no h1-manifest.txt"
+  accepted "$WL" 1 "$ADDROOT" || afail "r1-$WL is not checked PASS + accepted in $ADDROOT (or superseded / invalid there)"
+  SKIPNOTE="new evidence root for extra mixes [$ADDMIX] of $WL next to the accepted r1 in $ADDROOT (nothing there is changed)"
+elif [ -f "$E/add-mixes.txt" ]; then  # --retry in an --add-mixes root: its records must still verify
+  addroot_ok || { echo "SEQUENCE STOP: $E/add-mixes.txt or stage-plan.tsv does not verify (or r1-$WL no longer accepted in its from_root)"; exit 2; }
+  SKIPNOTE="--add-mixes root (records verified): $(sed -n 's/^mixes=//p' "$E/add-mixes.txt") next to $(sed -n 's/^from_root=//p' "$E/add-mixes.txt")"
+elif [ -n "$FROMROOT" ]; then  # v0.6.9: new root on top of E1's accepted r1 stages
   ffail() { echo "SEQUENCE STOP: --from-root refused for $STAGE: $*"; exit 2; }
   [ -f "$FROMROOT/h1-manifest.txt" ] || ffail "$FROMROOT has no h1-manifest.txt"
   PW=$(prevw "$WL") || ffail "workload $WL not in ORDER"
@@ -229,6 +291,8 @@ trap 'bash $G unlock $OWNER' EXIT
   echo "stage=$STAGE round=$N workloads=$WL seed_base=$H1_SEED_BASE dry=$DRY"
   [ -z "$RETRY" ] || echo "retry: $RETRYINFO"
   [ -z "$FROMROOT" ] || echo "from_root: $FROMROOT workload=$WL previous_stage=$PW reason=$FROMREASON"
+  [ -z "$ADDROOT" ] || echo "add_mixes: $ADDROOT workload=$WL mixes=$ADDMIX reason=$ADDREASON"
+  echo "plan_extra=$XPLAN sha256=$(sha256sum < "$XPLAN" 2>/dev/null | cut -c1-64)"
   echo "pretouch_dir=${PRETOUCH_DIR:-} measure_env_dir=${MEASURE_ENV_DIR:-} measure_part_dir=${MEASURE_PART_DIR:-}"
   echo "manifest=${H1_MANIFEST:-} manifest_sha256=${H1_MANIFEST_SHA:-}"
   for f in measure-env.sh measure-env-part.sh measure-run.sh; do echo "scripts/host/$f sha256=$(sha256sum < $H/../../scripts/host/$f | cut -c1-64)"; done
@@ -240,6 +304,23 @@ gates() {  # tag
   MEASURE_ENV_DIR=$MEASURE_ENV_DIR MEASURE_PART_DIR=$MEASURE_PART_DIR bash $H/h1-gate.sh check "$E/gate-$1.txt" || stop "h1 gate ($1)"
   log "gate $1: PASS"
 }
+if [ -n "$ADDROOT" ]; then  # v0.6.10: records written under the lock, before anything runs (nothing in E1 is written)
+  [ ! -e "$E/add-mixes.txt" ] && [ ! -e "$E/stage-plan.tsv" ] || stop "$E/add-mixes.txt or stage-plan.tsv exists"
+  printf '%s\n' "$SPLAN" > "$E/stage-plan.tsv" || stop "stage-plan.tsv"
+  { echo "# H1 evidence root for extra mixes (h1-main.sh --add-mixes, packet v0.6.10); $ADDROOT is only read"
+    echo "from_root=$ADDROOT"; echo "workload=$WL"; echo "mixes=$ADDMIX"; echo "reason=$ADDREASON"
+    echo "created=$(date -Is) stage=$STAGE pid=$$"
+    echo "plan=$PLAN plan_sha256=$(sha256sum < "$PLAN" | cut -c1-64)"
+    echo "plan_extra=$XPLAN plan_extra_sha256=$(sha256sum < "$XPLAN" | cut -c1-64)"
+    echo "stage_plan_sha256=$(sha256sum < "$E/stage-plan.tsv" | cut -c1-64)"
+    echo "from_root_h1_manifest_at_start_sha256=$(sha256sum < "$ADDROOT/h1-manifest.txt" | cut -c1-64)"
+    echo "manifest=${H1_MANIFEST:-} manifest_sha256=${H1_MANIFEST_SHA:-}"
+    d=$(python3 -I -B $H/attempts.py dir "$ADDROOT" "$WL" 1 2>/dev/null) || d=$ADDROOT/$WL/r1
+    echo "record: accept_sha256 accept/r1-$WL.txt $(sha256sum < "$ADDROOT/accept/r1-$WL.txt" | cut -c1-64) check_sha256 ${d#$ADDROOT/}/check.txt $(sha256sum < "$d/check.txt" | cut -c1-64)"
+  } > "$E/add-mixes.txt" || stop "add-mixes.txt"
+  PLAN=$E/stage-plan.tsv
+  addroot_ok || stop "add-mixes.txt does not verify right after writing it"
+fi
 if [ -n "$FROMROOT" ]; then  # v0.6.9: records written under the lock, before anything runs
   [ ! -e "$E/prev-root.txt" ] || stop "$E/prev-root.txt exists"
   { echo "# H1 evidence root started from a predecessor root (h1-main.sh --from-root, packet v0.6.9)"

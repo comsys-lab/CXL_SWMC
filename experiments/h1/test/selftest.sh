@@ -49,7 +49,7 @@
 #      --oppoint-report); update_rate_sustained=0 from overruns before the window PASS with NOTE; an overrun in the
 #      window FAIL; rows +20 % FAIL; (2) --h1 SLO copy of the stopped r1-recsys hw-peak part (4th argument) rewritten to
 #      T = 1 s: rows +20 % over < 45 checked rounds NOTE, over >= 45 rounds FAIL, +0 % PASS; (3) main-block.sh ekko_set /
-#      rate_for at RS_T_MS=1000 with builds/recsys-calib/1 (real recsys-rate runs, Host compute): peak / avg server
+#      rate_for at RS_T_MS=1000 with builds/recsys-calib/2 (real recsys-rate runs, Host compute): peak / avg / f149 server
 #      --publish-frac = the T = 1 s calibration, loadgen update rate = the T = 60 s Ekko rate, T check written once per
 #      Ekko point; a calibration whose ref rate differs stops; RS_T_MS=60000 unchanged; static: BLOCK=h1 needs RS_T_MS,
 #      pins-recsys.sh BLOCK_ENV has RS_T_MS=1000 and RATE_T_DIR
@@ -60,6 +60,12 @@
 #      --workloads recsys in E2 runs at E2's levels, r2 (all four) in E2 refused; refused: a second --from-root (already
 #      superseded), --from-root for r2, non-empty E2, E1 with vdb not accepted; a --from-root stage that stops is retried
 #      in E2 (previous stage found in E1 through prev-root.txt) and a tampered E1 acceptance record blocks that retry
+#   Q  v0.6.10 --add-mixes: E1 = P2 (r1 recsys accepted there); refused: non-empty E2, a regular mix (avg), an unknown
+#      mix, a mix listed twice, r2, E1 without an accepted r1 recsys; r1-recsys --add-mixes P2 f087,f149,f253 into Q1:
+#      stage-plan.tsv = plan with the recsys rows replaced by the three extra rows, add-mixes.txt records, E1 listing
+#      unchanged (no supersession record), Q1 check PASS with runs for the 3 mixes only, levels for f087/f149/f253,
+#      accept works; r2 / r1-kv in Q1 refused; a stopped --add-mixes stage is retried in its root and a tampered E1
+#      acceptance record blocks that retry
 #   K  check.py W7 (knee bracket at the probe limit or rel_width > 5 %, weakest named; legacy runs without the field: no W7);
 #      W4 names both rounds' confirm searches when one did not pass its first confirm (v0.6.5), legacy runs: no note
 # Prints "SELFTEST PASS" or "SELFTEST FAIL <case>".
@@ -557,7 +563,7 @@ o3() {  # <case> <ekko> <T_MS> <RATE_T_DIR> [BLOCK]
   env -i PATH="$PATH" E="$O/O3/$1" T_MS=$3 RATE_T_DIR=$4 BLOCK=${5:-h1} XT=7200 PLAIN_BUILD=$PP/builds/recsys/12 D=$PP/builds/recsys-inputs/1 \
     UPD_FILE=updates-day23-0-2M.smp QRY_FILE=queries-day23-89137318-1M.smp bash "$O/O3/fn.sh" "$2" > "$O/O3/$1.out" 2>&1; echo "rc=$?" >> "$O/O3/$1.out"
 }
-CAL=$PP/builds/recsys-calib/1
+CAL=$PP/builds/recsys-calib/2   # v0.6.10 (avg/peak byte-identical to calib/1)
 o3 peak peak 1000 $CAL
 grep -q "^PF=0.00014302685789816636 UR=188.7608 TCHK=ok SA=.*--publish-frac 0.00014302685789816636 .*LGC=.*--fixed update=188.7608" "$O/O3/peak.out" \
   && grep -q "^EKKO=peak publish_frac=0.00014302685789816636 update_rate=188.7608 samples/s T_ms=1000 " "$O/O3/peak.out" \
@@ -567,13 +573,20 @@ grep -q "^PF=0.00014302685789816636 UR=188.7608 TCHK=ok SA=.*--publish-frac 0.00
 o3 avg avg 1000 $CAL
 grep -q "^PF=1.523274789203064e-05 UR=14.7233 TCHK=ok .*--publish-frac 1.523274789203064e-05 .*--fixed update=14.7233" "$O/O3/avg.out" \
   && grep -qx "rows_per_round_target=2044" "$O/O3/avg/update-rate-T1000-avg.txt" || fail "O3 avg ($(cut -c1-400 "$O/O3/avg.out"))"
+# v0.6.10 intermediate point: rate from its T = 60 s reference in RATE_T_DIR (EKKO_REF); without that file it stops
+o3 f149 f149 1000 $CAL
+grep -q "^PF=4.5713148517473555e-05 UR=51.8558 TCHK=ok .*--publish-frac 4.5713148517473555e-05 .*--fixed update=51.8558" "$O/O3/f149.out" \
+  && grep -qx "rows_per_round_target=6134" "$O/O3/f149/update-rate-T1000-f149.txt" || fail "O3 f149 ($(cut -c1-400 "$O/O3/f149.out"))"
+mkdir -p "$O/O3/calnoref" && cp $CAL/rate-T1000-*.txt "$O/O3/calnoref/"
+o3 noref f253 1000 "$O/O3/calnoref"
+grep -q "^STOPPED: no calibration file $O/O3/calnoref/rate-frac0.00253.txt" "$O/O3/noref.out" || fail "O3 noref ($(cut -c1-400 "$O/O3/noref.out"))"
 mkdir -p "$O/O3/calbad" && cp $CAL/rate-T1000-*.txt "$O/O3/calbad/" && sed -i 's/^ref_rate_samples_per_s=.*/ref_rate_samples_per_s=188.7000/' "$O/O3/calbad/rate-T1000-peak.txt"
 o3 bad peak 1000 "$O/O3/calbad"
 grep -q "STOPPED: .*ref_rate_samples_per_s != the Ekko peak rate 188.7608" "$O/O3/bad.out" && grep -qx "rc=1" "$O/O3/bad.out" || fail "O3 bad calibration ($(cat "$O/O3/bad.out"))"
 o3 t60 peak 60000 "" v1
 grep -q "^PF=0.0043 UR=188.7608 TCHK= SA=.*--publish-frac 0.0043 " "$O/O3/t60.out" && [ ! -e "$O/O3/t60/r1.txt.T60000" ] \
   && [ -z "$(ls "$O/O3/t60" | grep -v '^r[12].txt$')" ] || fail "O3 T = 60 s path ($(cut -c1-300 "$O/O3/t60.out"))"
-grep -q 'BLOCK=h1 needs RS_T_MS' "$MB" && grep -q "RS_T_MS=1000 RATE_T_DIR=\$P/builds/recsys-calib/1" $H/plugins/pins-recsys.sh || fail "O3 static RS_T_MS"
+grep -q 'BLOCK=h1 needs RS_T_MS' "$MB" && grep -q "RS_T_MS=1000 RATE_T_DIR=\$P/builds/recsys-calib/2" $H/plugins/pins-recsys.sh || fail "O3 static RS_T_MS"
 echo "O OK"
 # P v0.6.9 --from-root / --invalid
 mkdir "$O/P1"
@@ -631,4 +644,53 @@ echo "tampered" >> "$O/P1c/accept/r1-vdb.txt"
 stage P6 r1-recsys --retry "x" && fail "P6 retry after a tampered E1 record"
 grep -q "SEQUENCE STOP: r1-vdb not checked PASS + accepted (nor skipped)" "$O/P6.out" || fail "P6 reason"
 echo "P OK"
+# Q v0.6.10 --add-mixes (E1 = P2: r1 recsys accepted, r2 recsys run)
+lsq() { (cd "$1" && find . -type f -printf '%P %s\n' | LC_ALL=C sort | sha256sum | cut -c1-64); }
+Q1SHA=$(lsq "$O/P2")
+mkdir "$O/Q0"; echo x > "$O/Q0/data"
+stage Q0 r1-recsys --add-mixes "$O/P2" f087 "x" && fail "Q into a non-empty root"
+rm "$O/Q0/data"
+stage Q0 r1-recsys --add-mixes "$O/P2" avg "x" && fail "Q regular mix"
+grep -q "mix avg is not a row of recsys in .*h1-plan-extra.tsv" "$O/Q0.out" || fail "Q regular-mix reason"
+stage Q0 r1-recsys --add-mixes "$O/P2" f999 "x" && fail "Q unknown mix"
+stage Q0 r1-recsys --add-mixes "$O/P2" f087,f087 "x" && fail "Q mix twice"
+grep -q "mix f087 listed twice" "$O/Q0.out" || fail "Q twice reason"
+stage Q0 r2 --add-mixes "$O/P2" f087 "x" && fail "Q r2"
+grep -q "SEQUENCE STOP: --add-mixes is for r1-<W> stages only" "$O/Q0.out" || fail "Q r2 reason"
+stage Q0 r1-recsys --add-mixes "$O/P1" f087 "x" && fail "Q from a root whose r1 recsys is superseded"
+grep -q "r1-recsys is not checked PASS + accepted in $O/P1" "$O/Q0.out" || fail "Q superseded reason"
+[ -z "$(ls -A "$O/Q0" | grep -v '^sequence')" ] || fail "Q0 refusals wrote files"
+mkdir "$O/Q1"
+stage Q1 r1-recsys --add-mixes "$O/P2" f087,f149,f253 "selftest: intermediate Ekko points" || fail "Q --add-mixes (see $O/Q1.out)"
+[ "$(lsq "$O/P2")" = "$Q1SHA" ] && [ ! -e "$O/P2/accept/r1-recsys-superseded.txt" ] || fail "Q E1 changed"
+F=$O/Q1/add-mixes.txt
+grep -qx "from_root=$O/P2" "$F" && grep -qx "workload=recsys" "$F" && grep -qx "mixes=f087 f149 f253" "$F" \
+  && [ "$(grep -c '^record: accept_sha256 accept/r1-recsys.txt ' "$F")" = 1 ] \
+  && grep -qx "stage_plan_sha256=$(sha256sum < "$O/Q1/stage-plan.tsv" | cut -c1-64)" "$F" || fail "Q add-mixes.txt ($(cat "$F"))"
+[ "$(awk -F'\t' '!/^#/ && $1 == "recsys" { print $2 }' "$O/Q1/stage-plan.tsv" | tr '\n' ' ')" = "f087 f149 f253 " ] \
+  && diff <(grep -v "^recsys	" "$O/Q1/stage-plan.tsv") <(grep -v "^recsys	" "$H/h1-plan.tsv") > /dev/null || fail "Q stage plan"
+grep -q "^add_mixes: $O/P2 workload=recsys mixes=f087 f149 f253" "$O/Q1/h1-manifest.txt" || fail "Q manifest line"
+python3 -I -B - "$O/Q1" <<'PY' || fail "Q content"
+import csv, sys
+o = sys.argv[1]
+ents = [l.split("\t") for l in open(f"{o}/recsys/r1/run/h1-runs.tsv") if not l.startswith("#")]
+assert sorted({e[2] for e in ents}) == ["f087", "f149", "f253"] and len(ents) == 12, ents
+lv = {r["mix"]: r for r in csv.DictReader(open(f"{o}/recsys/levels.tsv"), delimiter="\t")}
+assert sorted(lv) == ["f087", "f149", "f253"], lv
+assert open(f"{o}/recsys/r1/check.txt").read().strip().splitlines()[-1].startswith("H1CHECK PASS")
+PY
+bash $H/h1-accept.sh "$O/Q1" 1 recsys selftest >> "$O/Q.out" 2>&1 || fail "Q accept"
+stage Q1 r2 --workloads recsys && fail "Q r2 in an --add-mixes root"
+stage Q1 r1-kv && fail "Q r1-kv in an --add-mixes root"
+grep -q "was started with --add-mixes" "$O/Q1.out" || fail "Q refusal reason"
+cp -r "$O/P2" "$O/P2q"
+mkdir "$O/Q2"; STUB_FAIL=rc stage Q2 r1-recsys --add-mixes "$O/P2q" f149 "selftest stop" && fail "Q2 rc 0"
+[ -f "$O/Q2/add-mixes.txt" ] || fail "Q2 records"
+stage Q2 r1-recsys --retry "selftest retry" || fail "Q2 retry (see $O/Q2.out)"
+grep -q -- "--add-mixes root (records verified): f149" "$O/Q2/h1-state.txt" || fail "Q2 retry note"
+mkdir "$O/Q3"; STUB_FAIL=rc stage Q3 r1-recsys --add-mixes "$O/P2q" f253 "selftest stop" && fail "Q3 rc 0"
+echo "tampered" >> "$O/P2q/accept/r1-recsys.txt"
+stage Q3 r1-recsys --retry "x" && fail "Q3 retry after a tampered E1 record"
+grep -q "add-mixes.txt or stage-plan.tsv does not verify" "$O/Q3.out" || fail "Q3 reason"
+echo "Q OK"
 echo "SELFTEST PASS"

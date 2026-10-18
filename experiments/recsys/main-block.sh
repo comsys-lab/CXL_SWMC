@@ -12,7 +12,7 @@
 #   RECV_MODE, optional POP_BUILD (10, >= 10), POP_BUNDLE_SHA (build-10 deploy-v1 packet hash), D (inputs dir with MANIFEST.txt),
 #   VM_PLAIN (guest dir: build-3 server, all-HWcc + page MSI), VM_MEG (guest dir: Megalon build + recsys-2vm.yaml),
 #   MEG_BUILD (recsys-megalon build on MEGALON_BASE, default builds/megalon/75), PLAIN_BUILD (v6 recsys build dir), EKKO
-#   (avg | peak), LOADGEN; optional SEED (20261016), UPD_FILE / QRY_FILE (names in D; default the day-23 slices of
+#   (avg | peak | f087 | f149 | f253, v0.6.10), LOADGEN; optional SEED (20261016), UPD_FILE / QRY_FILE (names in D; default the day-23 slices of
 #   builds/recsys-inputs/1),
 #   ROUNDS (3), FIXED (1; 0 = no fixed-load window), XT (server lifetime bound, s, default 28800),
 #   SYSTEMS (subset of "hw pop mg", seeded order kept), L_FROM (fixed-load-L.txt; needed when hw is not in SYSTEMS
@@ -57,13 +57,13 @@
 #   mgrow; BLOCK v1 and h1) and v1_check.py --mg-sample (the value must reach both servers). v1.4: 1 (user decision
 #   2026-10-18: time every section of the table objects, about 26 write sections per round).
 # RS_T_MS / RATE_T_DIR (H1 v0.6.9, RECSYS-V1 v1.5): publication period T in ms (default 60000 = every block before
-#   v0.6.9) and, for T != 60 s, the T-specific calibration dir (rate-T<ms>-<avg|peak>.txt; see ekko_set below).
+#   v0.6.9) and, for T != 60 s, the T-specific calibration dir (rate-T<ms>-<point>.txt; see ekko_set below).
 #   BLOCK=h1 needs RS_T_MS explicitly (H1 RecSys: 1000, user decision 2026-10-18). The update sample rate is the Ekko
 #   rate at T = 60 s in every case; the window lengths (warm-up 70 s, V1 130 s, H1 settle / L2 / L1 60 s, SLO steps
 #   15 s) are unchanged in seconds, i.e. they hold about 70 / 130 / 60 / 15 rounds at T = 1 s.
 # BLOCK=h1 — H1-HOOK v2 (experiments/h1/README.md "Hook contract H1-HOOK v2", reports/H1-main-packet.md v0.3 §2-§3;
 #   user decisions 2026-10-18; called once per round by experiments/h1/hook.sh):
-#   env H1MODE r1|cont, H1_N, H1_SEED (loadgen seed of every part), H1_MIXES "<mix>=EKKO=<avg|peak> ...", H1_SETTLE_S
+#   env H1MODE r1|cont, H1_N, H1_SEED (loadgen seed of every part), H1_MIXES "<mix>=EKKO=<avg|peak|f087|f149|f253> ...", H1_SETTLE_S
 #   (60 s = one publication period T), H1_PARENT_LOCK=H1-main (the lock must name owner=H1-main; never lock/unlock),
 #   PRETOUCH_DIR (pretouch-gate.sh at block start and end), MEASURE_ENV_DIR (Host gate before every loadgen part),
 #   EXPECT_DAX_UUID (guest precheck); r1: H1_LEVELS_CMD (prints "<L2_rate> <L1_rate>" for a mix); cont: H1_LEVELS.
@@ -138,7 +138,7 @@ SLO_PCT=95 SLO_MS=100
 # published per 60 s round -> recsys-rate (--t-ms 60000, 20 windows, checked against D/rate-frac<EKKO_FRAC60>.txt)
 # gives the loadgen update rate (avg 14.7233, peak 188.7608 samples/s). With RS_T_MS != 60000 the SAME sample rate is
 # replayed and only the round length changes; the server's --publish-frac (rows_per_round_target, used by v1_check's
-# +-15 % window check) is the T-specific calibration RATE_T_DIR/rate-T<RS_T_MS>-<avg|peak>.txt (recsys-rate at that T,
+# +-15 % window check) is the T-specific calibration RATE_T_DIR/rate-T<RS_T_MS>-<point>.txt (recsys-rate at that T,
 # integer target whose rate is closest to the T = 60 s rate; builds/recsys-calib/1 for T = 1 s). Shorter T coalesces
 # fewer row updates: at T = 1 s peak publishes 19,192 rows per round (1.15 M rows / 60 s vs 0.58 M at T = 60 s).
 T_MS=${RS_T_MS:-60000}
@@ -149,11 +149,25 @@ if [ "$T_MS" != 60000 ]; then
   [ -d "${RATE_T_DIR:-}" ] || { echo "SEQUENCE STOP: RS_T_MS=$T_MS needs RATE_T_DIR (T-specific calibration dir)"; exit 2; }
 fi
 calv() { sed -n "s/^$2=//p" "$1" 2>/dev/null | head -1; }   # calv <file> <key>
-ekko_set() {  # <avg|peak>: EKKO_FRAC60, PUBLISH_FRAC (server; = EKKO_FRAC60 at T = 60 s), EKKO_RULE, server arguments SA
+# v0.6.10 (user decision 2026-10-18, "3점 등비"): three intermediate points between Ekko avg and peak, geometric in the
+# rows fraction per 60 s (ratio (0.0043 / 0.000513333333)^(1/4) = 1.701, rounded to 3 significant digits):
+# f087 = 0.000874, f149 = 0.00149, f253 = 0.00253. Same definition as avg/peak (update SAMPLE RATE calibrated at
+# T = 60 s by recsys-rate); their T = 60 s reference files are in RATE_T_DIR (builds/recsys-calib/2), not in D.
+# EKKO_REF = the T = 60 s reference file of the point (rate_for checks the computed rate against it, +-2 %).
+ekko_set() {  # <avg|peak|f087|f149|f253>: EKKO_FRAC60, EKKO_REF, PUBLISH_FRAC (server; = EKKO_FRAC60 at T = 60 s), EKKO_RULE, SA
+  local mid="geometric point between Ekko avg (0.0308/60) and peak (0.043/10) per T = 60 s (user 2026-10-18)"
   case $1 in
     avg) EKKO_FRAC60=0.000513333333; EKKO_RULE="Ekko OSDI'22 average: 3.08% of rows per hour -> 0.0308/60 per T = 60 s";;
     peak) EKKO_FRAC60=0.0043; EKKO_RULE="Ekko OSDI'22 peak: 4.3% of rows per 10 min -> 0.043/10 per T = 60 s";;
+    f087) EKKO_FRAC60=0.000874; EKKO_RULE="$mid: 1/4 -> 0.000874";;
+    f149) EKKO_FRAC60=0.00149; EKKO_RULE="$mid: 2/4 -> 0.00149";;
+    f253) EKKO_FRAC60=0.00253; EKKO_RULE="$mid: 3/4 -> 0.00253";;
     *) return 1;;
+  esac
+  case $1 in
+    avg|peak) EKKO_REF=$D/rate-frac$EKKO_FRAC60.txt;;
+    *) [ -d "${RATE_T_DIR:-}" ] || { echo "SEQUENCE STOP: Ekko point $1 needs RATE_T_DIR (its T = 60 s reference file)"; return 1; }
+       EKKO_REF=$RATE_T_DIR/rate-frac$EKKO_FRAC60.txt;;
   esac
   PUBLISH_FRAC=$EKKO_FRAC60 RATE_TF=
   if [ "$T_MS" != 60000 ]; then
@@ -168,7 +182,7 @@ ekko_set() {  # <avg|peak>: EKKO_FRAC60, PUBLISH_FRAC (server; = EKKO_FRAC60 at 
  --proc-sysfs /sys/kernel/swmc/page_coherence --proc-kthread cxl_recv"
   SA=$(echo $SA)
 }
-if [ $BLOCK != h1 ]; then ekko_set "$EKKO" || { echo "SEQUENCE STOP: EKKO must be avg or peak"; exit 2; }; fi
+if [ $BLOCK != h1 ]; then ekko_set "$EKKO" || { echo "SEQUENCE STOP: EKKO must be avg, peak, f087, f149 or f253"; exit 2; }; fi
 export SLO_MS SLO_RULE="DeepRecSys ISCA'20: query p${SLO_PCT} <= ${SLO_MS} ms (MOT1 v6, user 2026-10-16)"
 HOST_PLAIN=$PLAIN_BUILD/bin/recsys-server
 SSH="ssh -o BatchMode=yes -o ConnectTimeout=8"
@@ -548,7 +562,8 @@ echo "$(date -Is) block $OWNER start (git $(git -C $P/CXL_SWMC rev-parse --short
 precheck
 # update rate for the Ekko operating point (Host compute, after the lock check and the input sha256 check in
 # precheck): samples per T so that one round publishes PUBLISH_FRAC of all rows; checked against the calibration
-# file builds/recsys-inputs/1/rate-frac<frac>.txt (+-2 %) when V1_EXPECT_RATE is set or BLOCK=h1
+# file EKKO_REF (avg/peak: builds/recsys-inputs/1/rate-frac<frac>.txt; v0.6.10 points: RATE_T_DIR) (+-2 %) when
+# V1_EXPECT_RATE is set or BLOCK=h1
 declare -A TCHK   # RS_T_MS != 60000: the T-specific recsys-rate check, once per Ekko point per block (about 30 s)
 rate_for() {  # <ekko> <out file>: sets UPD_RATE and LGC for that operating point
   ekko_set "$1" || stop "bad Ekko point $1"
@@ -557,9 +572,9 @@ rate_for() {  # <ekko> <out file>: sets UPD_RATE and LGC for that operating poin
   UPD_RATE=$(sed -n 's/^rate_samples_per_s=//p' "$2")
   awk -v x="$UPD_RATE" 'BEGIN{exit !(x > 0)}' || stop "bad update rate $UPD_RATE"
   local ex=${V1_EXPECT_RATE:-}
-  [ $BLOCK = h1 ] && ex=$(sed -n 's/^rate_samples_per_s=//p' "$D/rate-frac$EKKO_FRAC60.txt" 2>/dev/null)
+  [ $BLOCK = h1 ] && ex=$(sed -n 's/^rate_samples_per_s=//p' "$EKKO_REF" 2>/dev/null)
   if [ $BLOCK = h1 ] || [ -n "$ex" ]; then
-    [ -n "$ex" ] || stop "no calibration file $D/rate-frac$EKKO_FRAC60.txt"
+    [ -n "$ex" ] || stop "no calibration file $EKKO_REF"
     awk -v x="$UPD_RATE" -v y="$ex" 'BEGIN{exit !(x >= 0.98 * y && x <= 1.02 * y)}' \
       || stop "update rate $UPD_RATE differs from the expected $ex by more than 2%"
   fi
@@ -584,7 +599,7 @@ rate_for() {  # <ekko> <out file>: sets UPD_RATE and LGC for that operating poin
        --opt quantiles=$D/dist_quantile.txt --fixed update=$UPD_RATE --mix query=1 --x-stream query)
 }
 h1shuffle() { local seed=$1; shift; python3 -c 'import random,sys; v=sys.argv[2:]; random.Random(sys.argv[1]).shuffle(v); print(" ".join(v))' "$seed" "$@"; }
-h1_ekko() { case $1 in EKKO=avg) echo avg;; EKKO=peak) echo peak;; *) return 1;; esac; }
+h1_ekko() { case $1 in EKKO=avg|EKKO=peak|EKKO=f087|EKKO=f149|EKKO=f253) echo ${1#EKKO=};; *) return 1;; esac; }
 if [ $BLOCK = h1 ]; then  # H1-HOOK v2 driver (header)
   printf '# name\tsystem\tmix\tphase\tround\trun_dir\tsteps\tlifetime\n' > "$E/h1-runs.tsv"
   declare -A EK
