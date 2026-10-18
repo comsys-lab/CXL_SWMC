@@ -12,7 +12,7 @@
 # Host compute only (no server, no CXL), node1-pinned, nice 19; refuses to start and stops (rc 3, "PAUSED") whenever
 # workspaces/MEASUREMENT.lock exists, checked before every recsys-rate call; a rerun with the same work dir continues
 # (finished points are kept).
-# usage: calib-t.sh <work dir> <TMS> <point> [<point> ...]     points: avg peak f087 f149 f253 f330 f350 f370 f400 f385
+# usage: calib-t.sh <work dir> <TMS> <point> [<point> ...]     points: avg peak f087 f149 f253 f330 f350 f370 f400 f385 f392
 #   env RATE (recsys-rate binary, default builds/recsys/12/bin/recsys-rate), D (builds/recsys-inputs/1),
 #   CALIB_DIR (the dir the files will be published in, for ref_file; default builds/recsys-calib/2)
 set -uo pipefail
@@ -25,7 +25,7 @@ WIN=$(( 20 * 60000 / TMS ))
 mkdir -p "$W" || exit 2
 W=$(readlink -f "$W"); cd $P || exit 2   # recsys-rate records --samples as given: relative to $P, as in calib/1
 lockchk() { [ ! -e "$LOCK" ] || { echo "PAUSED: $LOCK exists ($(head -1 "$LOCK" 2>/dev/null))"; exit 3; }; }
-frac60() { case $1 in avg) echo 0.000513333333;; peak) echo 0.0043;; f087) echo 0.000874;; f149) echo 0.00149;; f253) echo 0.00253;; f330) echo 0.0033;; f350) echo 0.0035;; f370) echo 0.0037;; f400) echo 0.004;; f385) echo 0.00385;; *) return 1;; esac; }
+frac60() { case $1 in avg) echo 0.000513333333;; peak) echo 0.0043;; f087) echo 0.000874;; f149) echo 0.00149;; f253) echo 0.00253;; f330) echo 0.0033;; f350) echo 0.0035;; f370) echo 0.0037;; f400) echo 0.004;; f385) echo 0.00385;; f392) echo 0.00392;; *) return 1;; esac; }
 rr() {  # <frac> <t_ms> <windows> <out>
   lockchk
   nice -n 19 numactl --cpunodebind=1 --membind=1 "$RATE" --samples "${S#$P/}" --frac "$1" --t-ms "$2" --windows "$3" > "$4" \
@@ -70,6 +70,7 @@ point() {
   case $p in
     avg) name="Ekko avg";; peak) name="Ekko peak";;
     f330) name="Ekko point f330 (geometric mean of f253 and peak, $F of rows per 60 s; user 2026-10-18)";;
+    f392) name="Ekko point f392 (between f385 and f400, $F of rows per 60 s; user 2026-10-19: Popcorn/All-HWcc 0.2-0.3)";;
     f385) name="Ekko point f385 (between f370 and f400, $F of rows per 60 s; user 2026-10-19: Popcorn/All-HWcc 0.2-0.3)";;
     f350|f370|f400) name="Ekko point $p (between f330 and peak, $F of rows per 60 s; user 2026-10-19)";;
     *) name="Ekko point $p (geometric between avg and peak, $F of rows per 60 s; user 2026-10-18)";;

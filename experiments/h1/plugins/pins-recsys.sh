@@ -22,6 +22,8 @@
 # (avg/peak files byte-identical to calib/1, plus the three intermediate Ekko points f087 / f149 / f253 and their
 # T = 60 s references); main-block.sh (ekko_set points, EKKO_REF) re-pinned. The extra mixes run only through
 # h1-main.sh --add-mixes (experiments/h1/h1-plan-extra.tsv); builds and builds/recsys-inputs/1 unchanged.
+# Re-pinned 2026-10-19 (H1 v0.6.14, user: Popcorn/All-HWcc 0.2-0.3): RATE_T_DIR = builds/recsys-calib/6 (calib/5 points
+# byte-identical + f392 = 0.00392); main-block.sh re-pinned.
 # Re-pinned 2026-10-19 (H1 v0.6.13, user: Popcorn/All-HWcc 0.2-0.3): RATE_T_DIR = builds/recsys-calib/5 (calib/4 points
 # byte-identical + f385 = 0.00385); main-block.sh re-pinned.
 # Re-pinned 2026-10-19 (H1 v0.6.12, user: search for Popcorn/All-HWcc 0.7-0.8): RATE_T_DIR = builds/recsys-calib/4
@@ -36,7 +38,7 @@ BLOCK_ENV=(BLOCK=h1 POP_BUILD=12 POP_BUNDLE_SHA=$POP_BUNDLE_SHA C8=$CPOP K8=$KPO
   D=$P/builds/recsys-inputs/1 PLAIN_BUILD=$P/builds/recsys/12 MEG_BUILD=$P/builds/recsys-megalon/14 MEGALON_BASE=$MEG77
   VM_PLAIN=/home/comsys/rs12 VM_MEG=/home/comsys/rsm14 LOADGEN=$P/builds/recsys-loadgen/9/loadgen XT=7200
   MG_RPO_OPT=--mg-rows-per-object MG_TABLE_N=0 MG_COH_SAMPLE=1
-  RS_T_MS=1000 RATE_T_DIR=$P/builds/recsys-calib/5
+  RS_T_MS=1000 RATE_T_DIR=$P/builds/recsys-calib/6
   EXPECT_DAX_UUID=$EXPECT_DAX_UUID)
 PIN_SHA256="$COMMON_SHA256
 9c330ba688b96019792dee4bb80e91965cfb7e5d5c21265bb3a2e805df3db5a8  $P/builds/recsys-inputs/1/MANIFEST.txt
