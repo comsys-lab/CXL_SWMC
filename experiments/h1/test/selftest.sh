@@ -390,7 +390,8 @@ grep -q "^V1CHECK FAIL hw step 5 (ramp): updater not judgeable" "$O/N1/fewsent.o
 MB=$H/../recsys/main-block.sh
 fn() { sed -n "/^$1() {/,/^}/p" "$MB"; }
 grep -qx "H1_SLO_TOL=0.02" "$MB" && fn h1_slo | grep -qF -- '--tol $H1_SLO_TOL' && ! fn h1_fix | grep -qF -- "--tol" \
-  && ! fn h1_warmup | grep -qF -- "--tol" && [ "$(grep -v '^ *#' "$MB" | grep -cF -- '--tol')" = 1 ] || fail "N2 recsys h1 loadgen --tol"
+  && ! fn h1_warmup | grep -qF -- "--tol" && [ "$(sed '/^stream_slo() {/,/^}/d' "$MB" | grep -v '^ *#' | grep -cF -- '--tol')" = 1 ] \
+  || fail "N2 recsys h1 loadgen --tol"   # v0.6.17: BLOCK=stream's stream_slo (not an H1 path) has its own --tol 0.02
 for f in $H/../kv/*.sh $H/../lmdb/*.sh $H/../vectordb/*.sh; do [ -f "$f" ] || continue; grep -v '^ *#' "$f" | grep -qF -- "--tol" && fail "N2 --tol in $f"; done
 # N3 r1 retry (attempts.py): r1-recsys stops after its avg mix (levels.tsv row avg written, peak hw/pop SLO entries)
 mkdir "$O/N"
