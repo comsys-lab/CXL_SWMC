@@ -1,7 +1,7 @@
 # H1 plugin: vector DB (HNSW 28M, pubmed-a27m-b1m-q10k; reports/VDB-V1-packet.md v1.3.1 blocks, validation PASS
 # 2026-10-17 §17). all-HWcc = plain server (no Megalon; MOT1 v6 §3.1), Popcorn = plain server + cxl_shm
 # (init_state=shared + preload, recv_mode poll), Megalon = vdb-megalon on Megalon 77 (packed4, 32 MiB vector chunk
-# object), mgoff = the same with MEGALON_COH_TIMERS=0. H1-HOOK v2 (CXL_SWMC 9a802a6f3, 935e487ab). Loadgen = vdb-loadgen/7 (SLO-search fix 2026-10-18 "A+C", built from 9e2dc0974; before: vdb-loadgen/6
+# object), mgoff = the same with MEGALON_COH_TIMERS=0. H1-HOOK v2 (CXL_SWMC 9a802a6f3, 935e487ab). Loadgen = vdb-loadgen/8 (H1 v0.6.5 confirm fallback, built from 9f3cdfbc4; before: vdb-loadgen/7 "A+C" 9e2dc0974, vdb-loadgen/6
 # with the w_start plugin option, built from 0dcf987bc; plugin provenance in vdb-manifest.txt).
 . "$(dirname "${BASH_SOURCE[0]}")/pins-common.inc"
 HR=$P/CXL_SWMC                      # live tree; v6-block.sh uses $P/CXL_SWMC/experiments/vectordb itself. Every file it
@@ -11,7 +11,7 @@ BLOCK_CMD=(bash $HOOK_FILE)          # H1 hook = H1MODE=r1|cont in v6-block.sh (
 BLOCK_ENV=(KPOP=$KPOP GTPOP=$GTPOP CPOP=$CPOP MEG_LIB=$MEG77 MEGALON_LEAN=1 EXPECT_DAX_UUID=$EXPECT_DAX_UUID
   PLAIN_BUILD=$P/builds/vdb/15 VPLAIN=/home/comsys/vdb15
   MEG_BUILD=$P/builds/vdb-megalon/14 VMEG=/home/comsys/vdbm14-28m MEG_CFG=$HR/systems/megalon/vectordb-2vm.yaml
-  LOADGEN_BUILD=$P/builds/vdb-loadgen/7)
+  LOADGEN_BUILD=$P/builds/vdb-loadgen/8)
 PIN_SHA256="$COMMON_SHA256
 f17c8995c1b2c88f3849b6aec890c848fafe99bb40298cbf4412999858bc59d1  $P/builds/vdb/15/manifest.txt
 2097a2e49290849a35d62f474da50bb7e3e4fedb9d0703343c797e9fdabfe525  $P/builds/vdb/15/bin/vdb-server
@@ -19,15 +19,15 @@ f17c8995c1b2c88f3849b6aec890c848fafe99bb40298cbf4412999858bc59d1  $P/builds/vdb/
 5f1ff99101da18cd7f05d55c77444ea7a7cf94030e17bcf24050e0ebe12c0dbc  $P/builds/vdb-megalon/14/bin/vdb-server
 8c59d1808ec569f54a05531610e3b9d18ae4563f9ebb5c264a657bd1edf3a3ac  $P/builds/vdb-megalon/14/lib/libmegalon-objapi.so
 f9c1753f3bef2ab0941153058860227145f2d7b7e33a210bdc3338fad14eacda  $P/builds/vdb-megalon/14/lib/libmegalon.so
-94ce1efd5b188edccd17eb7ff095437dee926817a84b8cab9baa97a3f3822e12  $P/builds/vdb-loadgen/7/manifest.txt
-e32a525b9e7d6f31558c92b80bde0fe643e25e49442f7b401f48e1a0c7757754  $P/builds/vdb-loadgen/7/loadgen
-163aa14dabc46b1642829ce2ffd0d9e78b8d395305db3c866d59062fb3c24973  $P/builds/vdb-loadgen/7/vdb-manifest.txt
+ee6ebec223c3562a497dfd2ff182b05e87f27faea41689e2fb56546ac73f31d1  $P/builds/vdb-loadgen/8/manifest.txt
+26596e97435bf1254fdda4a746181b0b2bd96caa4557737ec96e25b60991e4e1  $P/builds/vdb-loadgen/8/loadgen
+b07edd6bcf1ccb0a6a9aea7b7dab1f137908111d916bd89e93af448fdc5c4cf5  $P/builds/vdb-loadgen/8/vdb-manifest.txt
 e9d4942ee33b2f65cf7117d87942296e1365d0234873c2c4159545f40708db54  $P/workspaces/vdb-data/seg32-c32m-a27m-m16-efc128-b1/SHA256SUMS
 4e4e7134710f9b131368d7b3f71c07ab56d97e72ad329649bda27f893f6d65be  $HR/systems/megalon/vectordb-2vm.yaml
 eeb6b23f173d85a3c86ade0fb804b363e3c84a36bf9c0f56a7cbcab25e738b53  $HR/config/cxl_region.yaml
 7e8cc73998280bd606598ab26003b1ba80a81dd736c58e3f8207a9482d36f2e6  $HOOK_FILE
 27a11c2c75f748fa7b47111496e30170ab5a35c0b65bd56422c6b3b6fb4d7503  $HR/experiments/vectordb/m4-lib.sh
-939c2dfc321f0a043b87597f2b7f456a2d4b7e942444cdfb85eb43ee1ff109a4  $HR/experiments/vectordb/m4-run.sh
+c814123c944cb1fe5fd72e796991f9cfeb20abd1e33a7edbd9445fb873e7aba1  $HR/experiments/vectordb/m4-run.sh
 4d917368a0946c0a5052dd0d1e31e5ab900914e74c75bd02d37dc164708b66fb  $HR/experiments/vectordb/m4-precheck.sh
 5a4cd27c57b9aebe82a3d9b1652690b0496ddd1e81da4e9479a02d33085f3ad6  $HR/experiments/vectordb/run.sh
 1edcdda88f30200fd55c1b5a18cb4b9d6db57aa02647f8ad549e4e7f6aabb31f  $HR/experiments/vectordb/host-gate.sh
