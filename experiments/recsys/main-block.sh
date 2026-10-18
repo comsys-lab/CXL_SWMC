@@ -53,6 +53,9 @@
 #   ONLY operating-point checks (v1_check.py --oppoint-report rc 3: updater behind, flush overruns,
 #   update_rate_sustained, rows per full round) is recorded as "V1CHECK OPFAIL" in <E>/v1-checks.txt and
 #   <E>/v1-opfail.txt and the block continues; correctness / system checks still stop. Only with a user decision.
+#   MG_COH_SAMPLE (default empty = Megalon's 1 in 64): MEGALON_COH_CHECK_SAMPLE for every Megalon lifetime (mg, mgoff,
+#   mgrow; BLOCK v1 and h1) and v1_check.py --mg-sample (the value must reach both servers). v1.4: 1 (user decision
+#   2026-10-18: time every section of the table objects, about 26 write sections per round).
 # BLOCK=h1 — H1-HOOK v2 (experiments/h1/README.md "Hook contract H1-HOOK v2", reports/H1-main-packet.md v0.3 §2-§3;
 #   user decisions 2026-10-18; called once per round by experiments/h1/hook.sh):
 #   env H1MODE r1|cont, H1_N, H1_SEED (loadgen seed of every part), H1_MIXES "<mix>=EKKO=<avg|peak> ...", H1_SETTLE_S
@@ -143,6 +146,10 @@ for s in ${SYSTEMS:-hw pop mg}; do case $s in hw|pop|mg) ;; mgoff|mgrow) [ $BLOC
 MG_RPO_OPT=${MG_RPO_OPT:-} MG_TABLE_N=${MG_TABLE_N:-0} MG_ROW_N=${MG_ROW_N:-1} V1_OPFAIL_CONTINUE=${V1_OPFAIL_CONTINUE:-}
 [[ -z "$MG_RPO_OPT" || "$MG_RPO_OPT" =~ ^--[a-z][a-z0-9-]*$ ]] || { echo "SEQUENCE STOP: bad MG_RPO_OPT"; exit 2; }
 [[ "$MG_TABLE_N" =~ ^[0-9]+$ && "$MG_ROW_N" =~ ^[0-9]+$ ]] || { echo "SEQUENCE STOP: bad MG_TABLE_N / MG_ROW_N"; exit 2; }
+MG_COH_SAMPLE=${MG_COH_SAMPLE:-}
+[[ -z "$MG_COH_SAMPLE" || "$MG_COH_SAMPLE" =~ ^[1-9][0-9]*$ ]] || { echo "SEQUENCE STOP: bad MG_COH_SAMPLE"; exit 2; }
+MGSE=${MG_COH_SAMPLE:+ ENV:MEGALON_COH_CHECK_SAMPLE=$MG_COH_SAMPLE}      # Megalon node env addition
+chk_args() { case $1 in mg|mgoff|mgrow) [ -z "$MG_COH_SAMPLE" ] || echo "--mg-sample $MG_COH_SAMPLE";; esac; }   # v1_check.py extra args
 [[ " ${SYSTEMS:-} " != *" mgrow "* ]] || [ -n "$MG_RPO_OPT" ] || { echo "SEQUENCE STOP: mgrow needs MG_RPO_OPT"; exit 2; }
 for s in $V1_OPFAIL_CONTINUE; do case $s in hw|pop|mg|mgoff|mgrow) ;; *) echo "SEQUENCE STOP: bad V1_OPFAIL_CONTINUE entry $s"; exit 2;; esac; done
 [ -z "$V1_OPFAIL_CONTINUE" ] || [ $BLOCK = v1 ] || { echo "SEQUENCE STOP: V1_OPFAIL_CONTINUE only with BLOCK=v1"; exit 2; }
@@ -332,11 +339,11 @@ life_start() {  # <sys> <name>: prepare + session start of one server lifetime -
   case $s in
     hw) dax_comsys; SE=(SYSTEM=all-HWcc V=$VM_PLAIN HOST_SERVER=$HOST_PLAIN "SERVER_ARGS=$SA" "NODE_ENV=ENV:XTIMEOUT=$XT");;
     mg) dax_comsys; SE=(SYSTEM=Megalon V=$VM_MEG HOST_SERVER=$MB/bin/recsys-server "SERVER_ARGS=--backend megalon$(mg_rpo $MG_TABLE_N) $SA"
-                        "NODE_ENV=ENV:RACKOBJ_CONFIG=$VM_MEG/cfg/megalon.yaml ENV:XTIMEOUT=$XT" "NODE0_ENV=ENV:MEGALON_REINIT=1");;
+                        "NODE_ENV=ENV:RACKOBJ_CONFIG=$VM_MEG/cfg/megalon.yaml ENV:XTIMEOUT=$XT$MGSE" "NODE0_ENV=ENV:MEGALON_REINIT=1");;
     mgrow) dax_comsys; SE=(SYSTEM=Megalon-row V=$VM_MEG HOST_SERVER=$MB/bin/recsys-server "SERVER_ARGS=--backend megalon$(mg_rpo $MG_ROW_N) $SA"
-                        "NODE_ENV=ENV:RACKOBJ_CONFIG=$VM_MEG/cfg/megalon.yaml ENV:XTIMEOUT=$XT" "NODE0_ENV=ENV:MEGALON_REINIT=1");;
+                        "NODE_ENV=ENV:RACKOBJ_CONFIG=$VM_MEG/cfg/megalon.yaml ENV:XTIMEOUT=$XT$MGSE" "NODE0_ENV=ENV:MEGALON_REINIT=1");;
     mgoff) dax_comsys; SE=(SYSTEM=Megalon V=$VM_MEG HOST_SERVER=$MB/bin/recsys-server "SERVER_ARGS=--backend megalon$(mg_rpo $MG_TABLE_N) $SA"
-                        "NODE_ENV=ENV:RACKOBJ_CONFIG=$VM_MEG/cfg/megalon.yaml ENV:MEGALON_COH_TIMERS=0 ENV:XTIMEOUT=$XT" "NODE0_ENV=ENV:MEGALON_REINIT=1");;
+                        "NODE_ENV=ENV:RACKOBJ_CONFIG=$VM_MEG/cfg/megalon.yaml ENV:MEGALON_COH_TIMERS=0 ENV:XTIMEOUT=$XT$MGSE" "NODE0_ENV=ENV:MEGALON_REINIT=1");;
     pop) dax_root; pop_setup
          SE=(SYSTEM=Popcorn-$RECV_MODE V=$VM_PLAIN HOST_SERVER=$HOST_PLAIN "SERVER_ARGS=$SA" NODE0_ARGS=--preloaded "NODE_ENV=ENV:XTIMEOUT=$XT");;
   esac
@@ -374,14 +381,14 @@ system() {  # one server lifetime (BLOCK main / v1): <hw|pop|mg|mgoff|mgrow> [<n
     rc=$?
     [ $rc = 0 ] || stop "$s val rc $rc"
     if [[ " $V1_OPFAIL_CONTINUE " == *" $s "* ]]; then  # user decision only: operating-point-only FAIL -> OPFAIL, continue
-      python3 $X/v1_check.py "$S/val" $(chk_sys $s) --oppoint-report | sed "s/^\(V1CHECK [A-Z]*\) mg /\1 $s /" | tee "$S/val/v1-check.txt" | tee -a "$E/v1-checks.txt"
+      python3 $X/v1_check.py "$S/val" $(chk_sys $s) $(chk_args $s) --oppoint-report | sed "s/^\(V1CHECK [A-Z]*\) mg /\1 $s /" | tee "$S/val/v1-check.txt" | tee -a "$E/v1-checks.txt"
       if grep -q "^V1CHECK OPFAIL" "$S/val/v1-check.txt"; then
         echo "$(date -Is) MAIN NOTE $s: operating point not met (V1_OPFAIL_CONTINUE): $(cut -c1-400 "$S/val/v1-check.txt")" | tee -a "$E/v1-opfail.txt"
       else
         grep -q "^V1CHECK PASS" "$S/val/v1-check.txt" || stop "$s: $(cat "$S/val/v1-check.txt")"
       fi
     else
-      python3 $X/v1_check.py "$S/val" $(chk_sys $s) | sed "s/^\(V1CHECK [A-Z]*\) mg /\1 $s /" | tee "$S/val/v1-check.txt" | tee -a "$E/v1-checks.txt"
+      python3 $X/v1_check.py "$S/val" $(chk_sys $s) $(chk_args $s) | sed "s/^\(V1CHECK [A-Z]*\) mg /\1 $s /" | tee "$S/val/v1-check.txt" | tee -a "$E/v1-checks.txt"
       grep -q "^V1CHECK PASS" "$S/val/v1-check.txt" || stop "$s: $(cat "$S/val/v1-check.txt")"
     fi
     python3 $X/check_breakdown.py "$S/val" | tee "$S/val/breakdown-check.txt" | grep -q "^BREAKDOWN PASS" || stop "$s val: $(cat "$S/val/breakdown-check.txt")"
@@ -473,7 +480,7 @@ print("%d,%d" % (m[0]["step"], m[1]["step"]))' "$RD/loadgen/steps.jsonl" "$2" "$
 }
 h1_check() {  # <sys> <part> <note>: v1_check --h1 + check_breakdown of <part>; <lifetime>/h1-runcheck.txt ends in RUNCHECK PASS
   local s=$1 r=$LS/$2 f=$LS/h1-runcheck.txt
-  python3 $X/v1_check.py "$r" $s --h1 > "$r/v1-check.txt" 2>&1
+  python3 $X/v1_check.py "$r" $s $(chk_args $s) --h1 > "$r/v1-check.txt" 2>&1
   python3 $X/check_breakdown.py "$r" > "$r/breakdown-check.txt" 2>&1
   [ -f "$f" ] || echo "# H1 per-run checks of lifetime $NAME (system $s, mix $H1_MIX, round $H1_N, seed $SEED; main-block.sh BLOCK=h1, H1-HOOK v2)" > "$f"
   sed -i '/^RUNCHECK PASS/d' "$f"
@@ -492,7 +499,7 @@ h1_entry() {  # <name> <sys> <phase> <part> <steps> <lifetime kind>
   printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$1" "$2" "$H1_MIX" "$3" "$H1_N" "${LS#$E/}/$4" "$5" "$6" >> "$E/h1-runs.tsv"
 }
 
-echo "$(date -Is) block $OWNER start (git $(git -C $P/CXL_SWMC rev-parse --short HEAD)) K8=$K8 RECV_MODE=$RECV_MODE MEG_BUILD=$MB VM_PLAIN=$VM_PLAIN VM_MEG=$VM_MEG D=$D SEED=$SEED ROUNDS=$ROUNDS FIXED=$FIXED XT=$XT MG_RPO_OPT='$MG_RPO_OPT' MG_TABLE_N=$MG_TABLE_N MG_ROW_N=$MG_ROW_N V1_OPFAIL_CONTINUE='$V1_OPFAIL_CONTINUE'"
+echo "$(date -Is) block $OWNER start (git $(git -C $P/CXL_SWMC rev-parse --short HEAD)) K8=$K8 RECV_MODE=$RECV_MODE MEG_BUILD=$MB VM_PLAIN=$VM_PLAIN VM_MEG=$VM_MEG D=$D SEED=$SEED ROUNDS=$ROUNDS FIXED=$FIXED XT=$XT MG_RPO_OPT='$MG_RPO_OPT' MG_TABLE_N=$MG_TABLE_N MG_ROW_N=$MG_ROW_N V1_OPFAIL_CONTINUE='$V1_OPFAIL_CONTINUE' MG_COH_SAMPLE='$MG_COH_SAMPLE'"
 [ $BLOCK = h1 ] && { bash $PTG "$PRETOUCH_DIR" "$E/pretouch-gate.txt" || stop "pretouch gate at block start"; }
 precheck
 # update rate for the Ekko operating point (Host compute, after the lock check and the input sha256 check in

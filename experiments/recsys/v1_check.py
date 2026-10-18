@@ -1,7 +1,12 @@
 #!/usr/bin/env python3
 """RECSYS-V1 validation checks of one measurement window (reports/RECSYS-V1-packet.md §3).
 
-usage: v1_check.py <measurement dir> <hw|pop|mg|mgoff> [--h1] [--oppoint-report]
+usage: v1_check.py <measurement dir> <hw|pop|mg|mgoff> [--h1] [--oppoint-report] [--mg-sample N]
+--mg-sample N (RECSYS-V1 v1.4, user decision 2026-10-18: time every Megalon section for the table objects, N = 1):
+  mg / mgoff only: FAIL unless op.query.mg.check_sample (node 1) and op.row_update.mg.check_sample (node 0) at the
+  window end equal N (MEGALON_COH_CHECK_SAMPLE reached the server). Every estimator is a ratio x * sections / timed
+  sections (breakdown.py), so N = 1 means scale factor 1; the flags check (lean sampling, not events_always) is
+  unchanged. Without the option nothing about the sample rate is checked (as before).
 --oppoint-report (RECSYS-V1 v1.4, main-block.sh V1_OPFAIL_CONTINUE; only with a user decision): if every failed
   check is an operating-point check (updater behind / aborted-saturated step, < 2 publication rounds, flush overruns,
   update_rate_sustained, round guard, rows per full round incl. "cannot normalise" for 0 samples published), print
@@ -70,10 +75,18 @@ def coh_src(path):
 
 
 def main():
-    flags = sys.argv[3:]
+    flags, msample = [], None
+    a = sys.argv[3:]
+    while a:
+        f = a.pop(0)
+        if f == '--mg-sample' and a and a[0].isdigit() and int(a[0]) >= 1 and msample is None:
+            msample = int(a.pop(0))
+        elif f in ('--h1', '--oppoint-report') and f not in flags:
+            flags.append(f)
+        else:
+            sys.exit(__doc__)
     h1, opr = '--h1' in flags, '--oppoint-report' in flags
-    if len(sys.argv) < 3 or sys.argv[2] not in ('hw', 'pop', 'mg', 'mgoff') \
-            or any(f not in ('--h1', '--oppoint-report') for f in flags) or len(set(flags)) != len(flags):
+    if len(sys.argv) < 3 or sys.argv[2] not in ('hw', 'pop', 'mg', 'mgoff') or (msample and sys.argv[2] not in ('mg', 'mgoff')):
         sys.exit(__doc__)
     m, s = sys.argv[1], sys.argv[2]
     st = os.path.join(m, 'loadgen', 'stats')
@@ -293,6 +306,11 @@ def main():
                 fails.append(f'Megalon timers not off ({op}: {nz})')
         if d0('op.row_update.mg.write_sections') <= 0:
             fails.append('no Megalon write sections counted on the updater')
+    if msample is not None:  # RECSYS-V1 v1.4: the configured Megalon sample rate reached both nodes' servers
+        cs1, cs0 = e1.get('op.query.mg.check_sample', -1), e0.get('op.row_update.mg.check_sample', -1)
+        vals['mg_check_sample'] = f'{cs0}/{cs1}'
+        if cs1 != msample or cs0 != msample:
+            fails.append(f'mg check_sample {cs0}/{cs1} (node0 row_update / node1 query) != --mg-sample {msample}')
     txt = ' '.join(f'{k}={v}' for k, v in vals.items())
     if notes:
         txt += ' NOTES: ' + '; '.join(notes)
