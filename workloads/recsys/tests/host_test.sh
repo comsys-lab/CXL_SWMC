@@ -12,8 +12,9 @@
 # Checks: loadgen ok, torn_rows 0, no misses, queries and rows written > 0, Fig 2 op counters (op.query.n = queries,
 # op.row_update.n = rows_written, t_ns > 0), false_retries <= seq_retries, probes = lookups (direct addressing: one
 # record read per lookup, every backend); megalon: objects = rows, no stripe-table use (seq_retries, seq_spins,
-# lock_spins 0); megalon objects = the count recsys-server --print-layout gives for MG_RPO (N = 1: = rows), update
-# write sections = objects written per round (<= rows written).
+# lock_spins 0); megalon objects = the count recsys-server --print-layout gives for MG_RPO (N = 1: = rows),
+# update_sections > 0, and <= rows_written (N = 1: =) only on an idle stop snapshot (published_seq = samples): the two
+# counters are not updated atomically, so a snapshot during a round may see sections > rows.
 set -euo pipefail
 B=$(cd "$1" && pwd); LG=$(cd "$2" && pwd); WD=$3; BACKEND=${4:-plain}; T=${5:-0}; shift $(( $# < 5 ? $# : 5 )); EXTRA=("$@")
 HERE=$(cd "$(dirname "$0")" && pwd); W=$(cd "$HERE/.." && pwd); ROOT=$(cd "$W/../.." && pwd)
@@ -112,7 +113,13 @@ if [ "$BACKEND" = megalon ]; then  # objects per MG_RPO, one section per lookup,
   OBJS=$(sed -n 's/.*created \([0-9]*\) objects.*/\1/p' "$WD/node0.log" | tail -1)
   [ -n "$ROWS" ] && [ -n "$EXP_OBJS" ] && [ "$OBJS" = "$EXP_OBJS" ] || { echo "objects ($OBJS) != expected ($EXP_OBJS)"; FAIL=1; }
   [ "${MG_RPO:-1}" != 1 ] || [ "$OBJS" = "$ROWS" ] || { echo "N=1: objects ($OBJS) != rows ($ROWS)"; FAIL=1; }
-  [ "$(s 0 update_sections)" -gt 0 ] && [ "$(s 0 update_sections)" -le "$(s 0 rows_written)" ] || { echo "update_sections not in (0, rows_written]"; FAIL=1; }
+  [ "$(s 0 update_sections)" -gt 0 ] || { echo "update_sections = 0"; FAIL=1; }
+  if [ "$(s 0 published_seq)" = "$(s 0 samples)" ]; then  # updater idle at the stop snapshot
+    [ "$(s 0 update_sections)" -le "$(s 0 rows_written)" ] || { echo "update_sections > rows_written (idle snapshot)"; FAIL=1; }
+    [ "${MG_RPO:-1}" != 1 ] || [ "$(s 0 update_sections)" = "$(s 0 rows_written)" ] || { echo "N=1: update_sections != rows_written (idle snapshot)"; FAIL=1; }
+  else
+    echo "note: updater busy at the stop snapshot (published_seq $(s 0 published_seq) < samples $(s 0 samples)): update_sections <= rows_written not checked"
+  fi
   [ "$(s 1 seq_retries)" = 0 ] && [ "$(s 1 seq_spins)" = 0 ] && [ "$(s 0 lock_spins)" = 0 ] || { echo "stripe table used on megalon"; FAIL=1; }
 fi
 [ "$FAIL" = 0 ] && echo "HOST TEST PASS ($BACKEND${MA[*]:+ ${MA[*]}}, T=${T} ms) -> $WD" || { echo "HOST TEST FAIL -> $WD"; exit 1; }

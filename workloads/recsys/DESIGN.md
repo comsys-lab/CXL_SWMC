@@ -182,7 +182,9 @@ each system's API and measures its coherence actions; it cannot prove a coherenc
   % U, not stripe % U. Each round (and each sample with T = 0), per owned object, ONE write section writes all
   touched rows of that object in address order; write_end flushes the whole object (paper semantics, D3 of M2). This
   is the application's own publication batch (Monolith touched-key push, §5), not an added optimisation.
-  `update_sections` (stats) counts these sections (N = 1: = rows written; plain: 0).
+  `update_sections` (stats) counts these sections (N = 1: = rows written; plain: 0). It is added after
+  rows_written, not atomically, so a stats snapshot during a round can show sections > rows (host_test.sh checks
+  the bound only on an idle stop snapshot).
 - N = 0 limits: at most 26 owners (one per table), so U > 26 adds nothing, and with U = 4 the owners are k % 4
   (worker 0: tables 0, 4, 8, ..., 24 incl. the 26M-row tables 0 and 20; worker 1: 9 and 21; worker 3: 19; worker 2:
   none of the 26M-row tables). Every round each owner writes its tables' touched rows and flushes each whole table
@@ -198,8 +200,11 @@ each system's API and measures its coherence actions; it cannot prove a coherenc
   the create log entry has a fixed size (CheckPut); cache_flush (helper.cc) and the replay flush (replica.rs
   flush_mem_region) loop over size_t/usize lines without chunk limits; write sections do not log. No per-object
   limit applies to a 15 GB object. Records: 26 objects need 26 records (pool 64.2M), so no reclaim/switch_rw after
-  the first write of each table (N = 0); the first write of each object (RO -> RW, switch_rw) replays on the peer as
-  one whole-object flush.
+  the first write of each table (N = 0). The first write of each object (RO -> RW, switch_rw) is a log event; in
+  source its replay can flush the object on the peer (replica.rs obj_span), but flush-15GB showed node 1
+  replay_flushes 0 (the counter is only kept with MEGALON_COH_DETAIL=1 in build >= 76, so 0 does not prove none
+  happened; not measured). The recurring costs are the writer's write_end flush and the reader's flush on a
+  changed counter.
 - Layout hash: N != 1 appends ` rows_per_object=N` to the Megalon layout tag (both nodes must agree); N = 1 keeps
   the 3ef27d8b6 tag. The option is required with `--backend megalon` (no silent default) and rejected with plain.
 - Deviations (this change): (a) N = 1 ownership is now global row % U instead of stripe(key) % U (both: one writer
