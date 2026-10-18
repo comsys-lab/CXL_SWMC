@@ -39,7 +39,7 @@ if [ -n "$MB" ]; then
 fi
 c++ "${FLAGS[@]}" "$HERE/server.cc" "$LIB" -ldl -o "$OUT/bin/rocksdb-server" "${RP[@]}"
 COMMIT=$(git -C "$HERE" rev-parse HEAD)
-DEPS=("$W" "$ROOT/workloads/lmdb/proto.h" "$ROOT/systems/common" "$ROOT/experiments/loadgen/frame.h" "$ROOT/workloads/kv/server/opsplit.h" "$ROOT/systems/popcorn_new/include")
+DEPS=("$W" "$ROOT/workloads/lmdb/proto.h" "$ROOT/systems/common" "$ROOT/experiments/loadgen/frame.h" "$ROOT/workloads/kv/server/opsplit.h" "$ROOT/systems/popcorn_new/include" "$ROOT/systems/megalon/shim" "$ROOT/workloads/kv/server/objapi-shim.sh")
 DIRTY=$(git -C "$HERE" status --porcelain --untracked-files=all -- "${DEPS[@]}" | wc -l)
 SRCHASH=$(cd "$ROOT" && find workloads/rocksdb workloads/lmdb/proto.h systems/common systems/popcorn_new/include/swmc_acct.h \
             workloads/kv/server/opsplit.h experiments/loadgen/frame.h systems/megalon/shim/megalon_objapi.h \
