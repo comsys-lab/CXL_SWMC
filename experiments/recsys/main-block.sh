@@ -44,6 +44,15 @@
 #   After the last lifetime (hw and mgoff present): v1_cdiff.py -> <E>/cdiff.{txt,csv}, Megalon Fig 2 C by the
 #   difference method C_diff = T(mgoff) - T(hw) per op (user decision 2026-10-17); CDIFF FAIL (offered rates differ)
 #   stops the block; C_diff < 0 and C_sampled > T / > C_diff are WARNs only.
+#   v1.4 (reports/RECSYS-V1-packet.v1.4.md): Megalon object granularity. MG_RPO_OPT (server option name, e.g.
+#   --mg-rows-per-object; empty = not passed, builds before recsys-megalon/14) is passed with MG_TABLE_N (default 0 =
+#   one object per embedding table, the main configuration) to mg and mgoff, and with MG_ROW_N (default 1 = one object
+#   per row, the "restructured best case" variant) to the extra system mgrow (BLOCK=v1 only; needs MG_RPO_OPT). The
+#   checkers see mgrow as mg (same Megalon checks). v1 order with mgrow: hw pop mgrow mg mgoff. V1_OPFAIL_CONTINUE
+#   ("<sys> ...", default empty = the user rule: every V1CHECK FAIL stops): for a listed system, a window that fails
+#   ONLY operating-point checks (v1_check.py --oppoint-report rc 3: updater behind, flush overruns,
+#   update_rate_sustained, rows per full round) is recorded as "V1CHECK OPFAIL" in <E>/v1-checks.txt and
+#   <E>/v1-opfail.txt and the block continues; correctness / system checks still stop. Only with a user decision.
 # BLOCK=h1 — H1-HOOK v2 (experiments/h1/README.md "Hook contract H1-HOOK v2", reports/H1-main-packet.md v0.3 §2-§3;
 #   user decisions 2026-10-18; called once per round by experiments/h1/hook.sh):
 #   env H1MODE r1|cont, H1_N, H1_SEED (loadgen seed of every part), H1_MIXES "<mix>=EKKO=<avg|peak> ...", H1_SETTLE_S
@@ -129,7 +138,16 @@ OWNER="RECSYS-$BLOCK-$(basename "$E")"; [ $BLOCK = h1 ] && OWNER="H1-recsys-$H1M
 # SYSTEMS (subset of "hw pop mg", default all): a rerun of some systems (the SLO is fixed; L for the fixed window
 # comes from L_FROM). SLO_MS_FROM (v5) is not used: refused if set.
 [ -z "${SLO_MS_FROM:-}" ] || { echo "SEQUENCE STOP: SLO_MS_FROM is a v5 option (v6 SLO is fixed)"; exit 2; }
-for s in ${SYSTEMS:-hw pop mg}; do case $s in hw|pop|mg) ;; mgoff) [ $BLOCK = v1 ] || { echo "SEQUENCE STOP: mgoff only with BLOCK=v1"; exit 2; };; *) echo "SEQUENCE STOP: bad SYSTEMS entry $s"; exit 2;; esac; done
+for s in ${SYSTEMS:-hw pop mg}; do case $s in hw|pop|mg) ;; mgoff|mgrow) [ $BLOCK = v1 ] || { echo "SEQUENCE STOP: $s only with BLOCK=v1"; exit 2; };; *) echo "SEQUENCE STOP: bad SYSTEMS entry $s"; exit 2;; esac; done
+# Megalon object granularity (v1.4): MG_RPO_OPT N per Megalon system; mgrow needs the option
+MG_RPO_OPT=${MG_RPO_OPT:-} MG_TABLE_N=${MG_TABLE_N:-0} MG_ROW_N=${MG_ROW_N:-1} V1_OPFAIL_CONTINUE=${V1_OPFAIL_CONTINUE:-}
+[[ -z "$MG_RPO_OPT" || "$MG_RPO_OPT" =~ ^--[a-z][a-z0-9-]*$ ]] || { echo "SEQUENCE STOP: bad MG_RPO_OPT"; exit 2; }
+[[ "$MG_TABLE_N" =~ ^[0-9]+$ && "$MG_ROW_N" =~ ^[0-9]+$ ]] || { echo "SEQUENCE STOP: bad MG_TABLE_N / MG_ROW_N"; exit 2; }
+[[ " ${SYSTEMS:-} " != *" mgrow "* ]] || [ -n "$MG_RPO_OPT" ] || { echo "SEQUENCE STOP: mgrow needs MG_RPO_OPT"; exit 2; }
+for s in $V1_OPFAIL_CONTINUE; do case $s in hw|pop|mg|mgoff|mgrow) ;; *) echo "SEQUENCE STOP: bad V1_OPFAIL_CONTINUE entry $s"; exit 2;; esac; done
+[ -z "$V1_OPFAIL_CONTINUE" ] || [ $BLOCK = v1 ] || { echo "SEQUENCE STOP: V1_OPFAIL_CONTINUE only with BLOCK=v1"; exit 2; }
+mg_rpo() { [ -z "$MG_RPO_OPT" ] || echo " $MG_RPO_OPT $1"; }   # <N> -> " <opt> N" or nothing
+chk_sys() { case $1 in mgrow) echo mg;; *) echo $1;; esac; }   # system name for v1_check.py
 if [ $BLOCK = main ] && [[ " ${SYSTEMS:-hw pop mg} " != *" hw "* ]]; then
   [ "${FIXED:-1}" = 0 ] || [ -f "${L_FROM:-}" ] || { echo "SEQUENCE STOP: SYSTEMS without hw and FIXED=1 needs L_FROM=<fixed-load-L.txt>"; exit 2; }
 fi
@@ -313,9 +331,11 @@ life_start() {  # <sys> <name>: prepare + session start of one server lifetime -
   echo "$(date -Is) system $s start"
   case $s in
     hw) dax_comsys; SE=(SYSTEM=all-HWcc V=$VM_PLAIN HOST_SERVER=$HOST_PLAIN "SERVER_ARGS=$SA" "NODE_ENV=ENV:XTIMEOUT=$XT");;
-    mg) dax_comsys; SE=(SYSTEM=Megalon V=$VM_MEG HOST_SERVER=$MB/bin/recsys-server "SERVER_ARGS=--backend megalon $SA"
+    mg) dax_comsys; SE=(SYSTEM=Megalon V=$VM_MEG HOST_SERVER=$MB/bin/recsys-server "SERVER_ARGS=--backend megalon$(mg_rpo $MG_TABLE_N) $SA"
                         "NODE_ENV=ENV:RACKOBJ_CONFIG=$VM_MEG/cfg/megalon.yaml ENV:XTIMEOUT=$XT" "NODE0_ENV=ENV:MEGALON_REINIT=1");;
-    mgoff) dax_comsys; SE=(SYSTEM=Megalon V=$VM_MEG HOST_SERVER=$MB/bin/recsys-server "SERVER_ARGS=--backend megalon $SA"
+    mgrow) dax_comsys; SE=(SYSTEM=Megalon-row V=$VM_MEG HOST_SERVER=$MB/bin/recsys-server "SERVER_ARGS=--backend megalon$(mg_rpo $MG_ROW_N) $SA"
+                        "NODE_ENV=ENV:RACKOBJ_CONFIG=$VM_MEG/cfg/megalon.yaml ENV:XTIMEOUT=$XT" "NODE0_ENV=ENV:MEGALON_REINIT=1");;
+    mgoff) dax_comsys; SE=(SYSTEM=Megalon V=$VM_MEG HOST_SERVER=$MB/bin/recsys-server "SERVER_ARGS=--backend megalon$(mg_rpo $MG_TABLE_N) $SA"
                         "NODE_ENV=ENV:RACKOBJ_CONFIG=$VM_MEG/cfg/megalon.yaml ENV:MEGALON_COH_TIMERS=0 ENV:XTIMEOUT=$XT" "NODE0_ENV=ENV:MEGALON_REINIT=1");;
     pop) dax_root; pop_setup
          SE=(SYSTEM=Popcorn-$RECV_MODE V=$VM_PLAIN HOST_SERVER=$HOST_PLAIN "SERVER_ARGS=$SA" NODE0_ARGS=--preloaded "NODE_ENV=ENV:XTIMEOUT=$XT");;
@@ -339,7 +359,7 @@ life_stop() {  # <sys>: session stop, final checks, page MSI teardown (pop)
   fi
   servers_gone || stop "servers left after $NAME"
 }
-system() {  # one server lifetime (BLOCK main / v1): <hw|pop|mg|mgoff> [<name>]
+system() {  # one server lifetime (BLOCK main / v1): <hw|pop|mg|mgoff|mgrow> [<name>]
   local s=$1 S rc g L t0 r
   t0=$(date +%s)
   life_start $s ${2:-$1}; S=$LS
@@ -353,8 +373,17 @@ system() {  # one server lifetime (BLOCK main / v1): <hw|pop|mg|mgoff> [<name>]
       --step-warmup-s 5 --step-measure-s "$V1_WINDOW_S" --drain-s 10
     rc=$?
     [ $rc = 0 ] || stop "$s val rc $rc"
-    python3 $X/v1_check.py "$S/val" $s | tee "$S/val/v1-check.txt" | tee -a "$E/v1-checks.txt"
-    grep -q "^V1CHECK PASS" "$S/val/v1-check.txt" || stop "$s: $(cat "$S/val/v1-check.txt")"
+    if [[ " $V1_OPFAIL_CONTINUE " == *" $s "* ]]; then  # user decision only: operating-point-only FAIL -> OPFAIL, continue
+      python3 $X/v1_check.py "$S/val" $(chk_sys $s) --oppoint-report | sed "s/^\(V1CHECK [A-Z]*\) mg /\1 $s /" | tee "$S/val/v1-check.txt" | tee -a "$E/v1-checks.txt"
+      if grep -q "^V1CHECK OPFAIL" "$S/val/v1-check.txt"; then
+        echo "$(date -Is) MAIN NOTE $s: operating point not met (V1_OPFAIL_CONTINUE): $(cut -c1-400 "$S/val/v1-check.txt")" | tee -a "$E/v1-opfail.txt"
+      else
+        grep -q "^V1CHECK PASS" "$S/val/v1-check.txt" || stop "$s: $(cat "$S/val/v1-check.txt")"
+      fi
+    else
+      python3 $X/v1_check.py "$S/val" $(chk_sys $s) | sed "s/^\(V1CHECK [A-Z]*\) mg /\1 $s /" | tee "$S/val/v1-check.txt" | tee -a "$E/v1-checks.txt"
+      grep -q "^V1CHECK PASS" "$S/val/v1-check.txt" || stop "$s: $(cat "$S/val/v1-check.txt")"
+    fi
     python3 $X/check_breakdown.py "$S/val" | tee "$S/val/breakdown-check.txt" | grep -q "^BREAKDOWN PASS" || stop "$s val: $(cat "$S/val/breakdown-check.txt")"
   else
   # 2) lowest load: 1 query/s, 60 s, no SLO abort
@@ -463,7 +492,7 @@ h1_entry() {  # <name> <sys> <phase> <part> <steps> <lifetime kind>
   printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$1" "$2" "$H1_MIX" "$3" "$H1_N" "${LS#$E/}/$4" "$5" "$6" >> "$E/h1-runs.tsv"
 }
 
-echo "$(date -Is) block $OWNER start (git $(git -C $P/CXL_SWMC rev-parse --short HEAD)) K8=$K8 RECV_MODE=$RECV_MODE MEG_BUILD=$MB VM_PLAIN=$VM_PLAIN VM_MEG=$VM_MEG D=$D SEED=$SEED ROUNDS=$ROUNDS FIXED=$FIXED XT=$XT"
+echo "$(date -Is) block $OWNER start (git $(git -C $P/CXL_SWMC rev-parse --short HEAD)) K8=$K8 RECV_MODE=$RECV_MODE MEG_BUILD=$MB VM_PLAIN=$VM_PLAIN VM_MEG=$VM_MEG D=$D SEED=$SEED ROUNDS=$ROUNDS FIXED=$FIXED XT=$XT MG_RPO_OPT='$MG_RPO_OPT' MG_TABLE_N=$MG_TABLE_N MG_ROW_N=$MG_ROW_N V1_OPFAIL_CONTINUE='$V1_OPFAIL_CONTINUE'"
 [ $BLOCK = h1 ] && { bash $PTG "$PRETOUCH_DIR" "$E/pretouch-gate.txt" || stop "pretouch gate at block start"; }
 precheck
 # update rate for the Ekko operating point (Host compute, after the lock check and the input sha256 check in
@@ -556,7 +585,7 @@ if [ $BLOCK = main ] && [[ " ${SYSTEMS:-hw pop mg} " != *" hw "* ]]; then
   echo "slo_ms=$SLO_MS pct=$SLO_PCT rule=$SLO_RULE (fixed; no all-HWcc in this block)" | tee "$E/slo.txt"
   [ -z "${L_FROM:-}" ] || { cp "$L_FROM" "$E/fixed-load-L.txt" && echo "L imported from $L_FROM: $(cat "$E/fixed-load-L.txt")"; }
 fi
-if [ $BLOCK = v1 ]; then ORDER="hw pop mg mgoff"; else ORDER="hw $(shuffle pop mg)"; fi
+if [ $BLOCK = v1 ]; then ORDER="hw pop mg mgoff"; [[ " ${SYSTEMS:-} " == *" mgrow "* ]] && ORDER="hw pop mgrow mg mgoff"; else ORDER="hw $(shuffle pop mg)"; fi
 echo "system order: $ORDER (all-HWcc first; page MSI / Megalon shuffled with seed $OWNER)" | tee "$E/order.txt"
 if [ -n "${SYSTEMS:-}" ]; then  # subset rerun: keep the seeded order, drop the others
   O2=""; for s in $ORDER; do [[ " $SYSTEMS " == *" $s "* ]] && O2="$O2 $s"; done; ORDER=${O2# }

@@ -1,7 +1,12 @@
 #!/usr/bin/env python3
 """RECSYS-V1 validation checks of one measurement window (reports/RECSYS-V1-packet.md §3).
 
-usage: v1_check.py <measurement dir> <hw|pop|mg|mgoff> [--h1]
+usage: v1_check.py <measurement dir> <hw|pop|mg|mgoff> [--h1] [--oppoint-report]
+--oppoint-report (RECSYS-V1 v1.4, main-block.sh V1_OPFAIL_CONTINUE; only with a user decision): if every failed
+  check is an operating-point check (updater behind / aborted-saturated step, < 2 publication rounds, flush overruns,
+  update_rate_sustained, round guard, rows per full round incl. "cannot normalise" for 0 samples published), print
+  "V1CHECK OPFAIL <system> ..." and exit 3 instead of FAIL / 1. Any other failure (torn rows, misses, queries, system
+  checks) keeps FAIL / 1. Without the flag the behaviour is unchanged.
 --h1 (H1 main runs, reports/H1-main-packet.md §8.1 "DLRM: v1_check-style invariants (torn rows 0, updater sustained
   +-2 %, flush_overruns 0)"; coordinator 2026-10-17): updater limit 0.98 x offered. SLO searches (summary mode slo)
   include points past the knee on purpose: the update checks (updater, flush_overruns 0, round guard, rows per full
@@ -65,8 +70,10 @@ def coh_src(path):
 
 
 def main():
-    h1 = len(sys.argv) == 4 and sys.argv[3] == '--h1'
-    if len(sys.argv) not in (3, 4) or sys.argv[2] not in ('hw', 'pop', 'mg', 'mgoff') or (len(sys.argv) == 4 and not h1):
+    flags = sys.argv[3:]
+    h1, opr = '--h1' in flags, '--oppoint-report' in flags
+    if len(sys.argv) < 3 or sys.argv[2] not in ('hw', 'pop', 'mg', 'mgoff') \
+            or any(f not in ('--h1', '--oppoint-report') for f in flags) or len(set(flags)) != len(flags):
         sys.exit(__doc__)
     m, s = sys.argv[1], sys.argv[2]
     st = os.path.join(m, 'loadgen', 'stats')
@@ -76,6 +83,11 @@ def main():
         print(f'V1CHECK FAIL {s} no stats snapshots in {st}')
         sys.exit(1)
     fails, notes, vals = [], [], {}
+    opf = []  # operating-point failures (also in fails); --oppoint-report
+
+    def opfail(t):
+        fails.append(t)
+        opf.append(t)
     # the whole measured span: first step's begin .. last step's end
     b1p, e1p = begins[0], sorted(glob.glob(os.path.join(st, 'step*-end-t1.txt')), key=stepno)[-1]
     b0p, e0p = b1p.replace('-t1.txt', '-t0.txt'), e1p.replace('-t1.txt', '-t0.txt')
@@ -131,7 +143,7 @@ def main():
             return True
         return bool(d.get('pass')) and d.get('phase') != 'overload' and not d.get('aborted') \
             and float(d.get('offered_x', 0)) <= xmax * (1 + 1e-9)
-    bad = fails.append
+    bad = opfail
     for d in meas:
         u = d.get('streams', {}).get('update', {})
         off, ach = float(u.get('offered', 0)), float(u.get('achieved', 0))
@@ -165,18 +177,18 @@ def main():
     dd = lambda b, e, k: e.get(k, 0) - b.get(k, 0)  # noqa: E731
     vals['publish_rounds'] = d0('publish_rounds')
     if vals['publish_rounds'] < 2:
-        fails.append(f'{vals["publish_rounds"]} publication rounds in the whole span (need >= 2)')
+        opfail(f'{vals["publish_rounds"]} publication rounds in the whole span (need >= 2)')
     rr = sum(dd(b, e, 'round_rows') for _, b, e in wins)
     pub = sum(dd(b, e, 'published_seq') for _, b, e in wins)
     pr = sum(dd(b, e, 'publish_rounds') for _, b, e in wins)
     vals['round_rows'] = rr
     vals['flush_overruns'] = sum(dd(b, e, 'flush_overruns') for _, b, e in wins)
     if vals['flush_overruns'] != 0:
-        fails.append(f'update rate not sustained (flush overruns {vals["flush_overruns"]} in the checked span)')
+        opfail(f'update rate not sustained (flush overruns {vals["flush_overruns"]} in the checked span)')
     if not h1slo:
         vals['update_rate_sustained'] = e0.get('update_rate_sustained', -1)
         if vals['update_rate_sustained'] != 1:
-            fails.append(f'update_rate_sustained={vals["update_rate_sustained"]}')
+            opfail(f'update_rate_sustained={vals["update_rate_sustained"]}')
     for n, b, e in other:
         o = dd(b, e, 'flush_overruns')
         if o:
@@ -189,7 +201,7 @@ def main():
             for tag, snap in (('begin', b), ('end', e)):
                 fl, prr = snap.get('flushes', -1), snap.get('publish_rounds', -1)
                 if fl != ut * prr:
-                    fails.append(f'round guard: step {n} {tag} snapshot flushes {fl} != {ut} x publish_rounds {prr} (snapshot inside a round edge)')
+                    opfail(f'round guard: step {n} {tag} snapshot flushes {fl} != {ut} x publish_rounds {prr} (snapshot inside a round edge)')
     tgt = e0.get('rows_per_round_target', 0)
     if tgt <= 0:
         fails.append('no rows_per_round_target in the node-0 end snapshot (Ekko operating point not checkable)')
@@ -205,7 +217,7 @@ def main():
             if h1slo:  # short passing windows can contain no round edge; recorded
                 notes.append('rows per full round not checkable: no round fired inside the checked steps')
             else:
-                fails.append(f'rows per round: cannot normalise (samples published {pub})')
+                opfail(f'rows per round: cannot normalise (samples published {pub})')
         else:
             per_t = rate * t_s
             per = rr / (pub / per_t)
@@ -214,7 +226,7 @@ def main():
             vals['rows_per_full_round'] = round(per)
             vals['rows_per_full_round_vs_target_pct'] = round((per / tgt - 1) * 100, 1)
             if abs(per - tgt) > 0.15 * tgt:
-                fails.append(f'rows per full round {per:.0f} vs target {tgt} (> 15% off: Ekko operating point not met)')
+                opfail(f'rows per full round {per:.0f} vs target {tgt} (> 15% off: Ekko operating point not met)')
     cq, cu = op_c_window(b1, e1, 'query'), op_c_window(b0, e0, 'row_update')
     vals['query_C_ms_per_q'] = round(cq / vals['queries'] / 1e6, 4) if vals['queries'] > 0 else ''
     vals['row_update_C_ns_total'] = round(cu)
@@ -284,6 +296,9 @@ def main():
     txt = ' '.join(f'{k}={v}' for k, v in vals.items())
     if notes:
         txt += ' NOTES: ' + '; '.join(notes)
+    if fails and opr and len(opf) == len(fails):
+        print(f'V1CHECK OPFAIL {s} ' + '; '.join(fails) + ' | ' + txt)
+        sys.exit(3)
     if fails:
         print(f'V1CHECK FAIL {s} ' + '; '.join(fails) + ' | ' + txt)
         sys.exit(1)
