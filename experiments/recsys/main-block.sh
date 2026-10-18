@@ -101,7 +101,7 @@
 #   (in STREAM_RATES order), per system (order shuffle(seed recsys-stream-<rate>), <E>/order.txt) one lifetime
 #   <sys>-u<rate>: warmup (1 query/s + the update stream, 10 + 50 s, unmeasured) -> slo (query p95 <= 100 ms, start 1,
 #   factor 1.5, precision 0.02, confirm 3 x 30 s as H1, --tol 0.02, --max-steps 40, --min-step-queries 100,
-#   --ramp-knee 2) -> stream_check.py (FAIL stops; NOTE "update rate not sustained" recorded) -> check_breakdown.py.
+#   --ramp-knee 2, rise 1.2 default) -> stream_check.py (FAIL stops; NOTE "update rate not sustained" recorded) -> check_breakdown.py.
 #   loadgen rc 1 with a note is recorded (MAIN NOTE), not a stop. <E>/stream-results.tsv (one row per lifetime),
 #   <E>/rate-basis.txt (formula and rounding).
 set -uo pipefail
@@ -164,7 +164,7 @@ T_MS=${RS_T_MS:-60000}
 [[ $T_MS =~ ^[1-9][0-9]*$ ]] || { echo "SEQUENCE STOP: bad RS_T_MS"; exit 2; }
 [ $BLOCK != stream ] || T_MS=0   # streaming: no publication period (--publish-ms 0 --update-mode stream)
 if [ $BLOCK = h1 ] && [ -z "${RS_T_MS:-}" ]; then echo "SEQUENCE STOP: BLOCK=h1 needs RS_T_MS (pins-recsys.sh)"; exit 2; fi
-if [ "$T_MS" != 60000 ]; then
+if [ "$T_MS" != 60000 ] && [ $BLOCK != stream ]; then
   [ $BLOCK != main ] || { echo "SEQUENCE STOP: RS_T_MS != 60000 only with BLOCK v1 or h1"; exit 2; }
   [ -d "${RATE_T_DIR:-}" ] || { echo "SEQUENCE STOP: RS_T_MS=$T_MS needs RATE_T_DIR (T-specific calibration dir)"; exit 2; }
 fi
@@ -619,7 +619,8 @@ stream_slo() {  # <sys> <rate>
 s=json.load(open(sys.argv[1])); c=s.get("confirm",{})
 f=lambda v: "" if v is None else str(v)
 print("\t".join([sys.argv[2], sys.argv[3], sys.argv[4], f(s.get("max_offered_x_pass")), f(c.get("x_mean")), f(s.get("confirmed")),
-  str(len(s.get("low_rate_violations",[]))), sys.argv[5].split(" ")[1], s.get("note","")]))' \
+  str(len(s.get("low_rate_violations",[]))), sys.argv[5].split(" ")[1], "1" if sys.argv[5].startswith("STREAMCHECK PASS") else "0",
+  s.get("note","")]))' \
     "$RD/loadgen/summary.json" "$NAME" "$s" "$r" "$sc" >> "$E/stream-results.tsv" || stop "$NAME: results row"
   echo "$NAME: $sc"
 }
@@ -758,7 +759,7 @@ if [ $BLOCK = stream ]; then  # RecSys streaming driver (header "BLOCK=stream")
   { echo "# update rate basis (RecSys methodology, user 2026-10-19; workloads/recsys/DESIGN.md §5.1): rates in trace samples/s, multiples of 50"
     echo "ekko_avg: 3.08% distinct rows per 3600 s -> 41.47 samples/s -> 50; ekko_peak: 4.3% distinct rows per 600 s -> 393.27 samples/s -> 400 (recsys-rate, workspaces/recsys-mid/ekko10min)"
     echo "rates: $STREAM_RATES (> 400 = stress)"; } > "$E/rate-basis.txt"
-  printf '# name\tsystem\trate_sps\tresult_q_s\tconfirm_x_mean\tconfirmed\tlow_rate_violations\tstreamcheck\tnote\n' > "$E/stream-results.tsv"
+  printf '# name\tsystem\trate_sps\tresult_q_s\tconfirm_x_mean\tconfirmed\tlow_rate_violations\tstreamcheck\tvalid\tnote\n' > "$E/stream-results.tsv"
   { echo "# RecSys streaming block: per rate (in STREAM_RATES order) one lifetime per system, order shuffle(seed recsys-stream-<rate>)"
     for r in $STREAM_RATES; do echo "u$r: $(h1shuffle recsys-stream-$r ${SYSTEMS:-hw pop})"; done; } | tee "$E/order.txt"
   for r in $STREAM_RATES; do

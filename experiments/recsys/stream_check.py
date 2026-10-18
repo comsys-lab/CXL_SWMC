@@ -3,8 +3,10 @@
 
 RecSys methodology (user decisions 2026-10-19, state/PROJECT.md): a step is VALID only if the updater kept up with
 the offered update stream:
-  rate  updates written by every worker per second (d published_seq / dt, server clock stats_mono_ns) >= RATIO x the
-        offered update rate (loadgen --fixed update=R; default RATIO 0.98)
+  rate  samples fully written (by every worker) in the window >= RATIO x samples accepted in it: d published_seq /
+        d update_accepted_seq (default RATIO 0.98). Arrivals are Poisson, so the count actually sent in a window
+        differs from R x dt by a few % at 50 samples/s; it is not compared with the nominal rate (written/s vs R is
+        reported as nominal_ratio, information only). Accepted = sent: the server acknowledges on acceptance.
   lag   the backlog (update_lag_samples = accepted seq - published_seq) did not grow over the window: end - begin <=
         max(LAG_ABS samples, R x LAG_S) (defaults 50 samples, 1 s of updates)
 Inputs: <run>/loadgen/steps.jsonl and the node-0 stats snapshots <run>/loadgen/stats/step<NNN>-{begin,end}-t0.txt
@@ -94,15 +96,15 @@ def main():
             return 1
         qmax = max((int(v) for k, v in E.items() if k.startswith("update_queue.w")), default=0)
         written = pub / dt if dt > 0 else 0
-        ratio = written / R if R > 0 else 0
+        ratio = pub / acc if acc > 0 else 0
         tol = max(a.lag_abs, R * a.lag_s)
-        ok_rate = R > 0 and ratio >= a.ratio
+        ok_rate = acc > 0 and ratio >= a.ratio
         ok_lag = lag_e - lag_b <= tol
-        why = [] if ok_rate else [f"written {written:.2f}/s < {a.ratio} x offered {R:g}/s"]
+        why = [] if ok_rate else [f"written {pub} < {a.ratio} x accepted {acc} samples"]
         if not ok_lag:
             why.append(f"backlog grew {lag_b} -> {lag_e} samples (> {tol:g})")
         r.update(valid=ok_rate and ok_lag, why="; ".join(why), window_s=round(dt, 3), accepted_per_s=round(acc / dt, 3) if dt > 0 else 0,
-                 written_per_s=round(written, 3), written_ratio=round(ratio, 4), rows_written_per_s=round(rw / dt, 1) if dt > 0 else 0,
+                 written_per_s=round(written, 3), written_ratio=round(ratio, 4), nominal_ratio=round(written / R, 4) if R > 0 else 0, rows_written_per_s=round(rw / dt, 1) if dt > 0 else 0,
                  lag_samples_begin=lag_b, lag_samples_end=lag_e, lag_ms_mean=round(lns / ln / 1e6, 3) if ln else 0,
                  lag_ms_max=round(lmax / 1e6, 3), queue_max_end=qmax)
         rows.append(r)
@@ -110,7 +112,7 @@ def main():
         print(f"STREAMCHECK FAIL {a.run}: no measured steps")
         return 1
     cols = ["step", "phase", "offered_x", "pass", "valid", "why", "update_offered", "window_s", "accepted_per_s",
-            "written_per_s", "written_ratio", "rows_written_per_s", "lag_samples_begin", "lag_samples_end", "lag_ms_mean",
+            "written_per_s", "written_ratio", "nominal_ratio", "rows_written_per_s", "lag_samples_begin", "lag_samples_end", "lag_ms_mean",
             "lag_ms_max", "queue_max_end"]
     with open(os.path.join(a.run, "stream-check.csv"), "w", newline="") as f:
         w = csv.DictWriter(f, fieldnames=cols)

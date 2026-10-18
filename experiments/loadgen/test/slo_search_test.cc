@@ -155,29 +155,37 @@ int main() {
     auto r = confirm_search(92500, {84000}, 0.02, 0.01, 5, [&](double, const char *) { return n++ ? -1 : 0; });
     check(r.exhausted && r.probes.size() == 1, "exhausted during the second confirm -> exhausted, 1 probe recorded");
   }
-  {  // 8. KneeRamp (--ramp-knee): low-rate failures with a falling percentile do not end the ramp
-    struct St { double x; bool pass, sat; double p; };
-    auto feed = [](uint32_t k, std::vector<St> v, double *good, double *knee) {
-      loadgen::KneeRamp kr(k);
+  {  // 8. KneeRamp (--ramp-knee 2, rise 1.2): low-rate failures do not end the ramp; bracket = final failing run
+    struct St { double x; bool pass, hard, behind; double p; };
+    auto feed = [](std::vector<St> v, double *good, double *knee, std::string *why) {
+      loadgen::KneeRamp kr(2, 1.2);
       int at = -1;
       for (size_t i = 0; i < v.size(); i++)
-        if (kr.add(v[i].x, v[i].pass, v[i].sat, v[i].p)) { at = int(i); break; }
-      *good = kr.good(), *knee = kr.knee();
+        if (kr.add(v[i].x, v[i].pass, v[i].hard, v[i].behind, v[i].p)) { at = int(i); break; }
+      *good = kr.good(), *knee = kr.knee(), *why = kr.why();
       return at;
     };
     double g, kn;
-    int at = feed(2, {{1, 0, 0, 130}, {2.25, 0, 0, 120}, {5, 1, 0, 60}, {11, 1, 0, 80}, {12, 0, 0, 120}, {13.2, 0, 0, 150}}, &g, &kn);
-    check(at == 5 && g == 11 && kn == 12, "popcorn-like: low-rate fails, passes, knee run of 2 -> good 11 knee 12");
-    at = feed(2, {{1, 1, 0, 50}, {2, 0, 0, 150}, {3, 0, 0, 120}, {4, 0, 0, 130}}, &g, &kn);
-    check(at == 3 && g == 1 && kn == 3, "falling percentile restarts the run: knee = 3");
-    at = feed(2, {{1, 1, 0, 50}, {2, 0, 1, 500}}, &g, &kn);
-    check(at == 1 && g == 1 && kn == 2, "saturated fail ends the ramp at once");
-    at = feed(2, {{1, 0, 0, 110}, {2, 0, 0, 120}, {3, 0, 0, 130}}, &g, &kn);
-    check(at == -1 && g == 0, "fails before any pass (not saturated) never end the ramp");
-    at = feed(1, {{1, 1, 0, 50}, {2, 1, 0, 70}, {3, 0, 0, 110}}, &g, &kn);
-    check(at == 2 && g == 2 && kn == 3, "K = 1: first fail after a pass ends the ramp (old rule after a pass)");
-    at = feed(2, {{1, 1, 0, 50}, {2, 0, 0, 150}, {3, 1, 0, 80}, {4, 0, 0, 110}, {5, 0, 0, 1.0 / 0.0}}, &g, &kn);
-    check(at == 4 && g == 3 && kn == 4, "a pass resets the run; inf percentile counts as rising");
+    std::string why;
+    // H2 pattern (verifier HIGH-1): pass at 1, flat/noisy low-rate fails, passes, then the real knee
+    int at = feed({{1, 1, 0, 0, 90}, {1.5, 0, 0, 0, 130}, {2.25, 0, 0, 0, 131}, {3.4, 0, 0, 0, 128}, {5.1, 0, 0, 0, 120},
+                   {7.6, 0, 0, 0, 104}, {11.4, 1, 0, 0, 95}, {17, 1, 0, 0, 70}, {25.6, 1, 0, 0, 80}, {38, 1, 0, 0, 92},
+                   {42, 0, 0, 0, 125}, {63, 0, 0, 0, 400}}, &g, &kn, &why);
+    check(at == 11 && g == 38 && kn == 42 && why == "percentile rising",
+          "H2 pattern: flat low-rate fails (130, 131, 128) do not stop; knee 42 after rises 92->125->400 (good 38)");
+    at = feed({{1, 0, 0, 0, 130}, {1.5, 0, 0, 0, 160}, {2.25, 0, 0, 0, 200}, {3.4, 1, 0, 0, 90}, {5, 0, 0, 0, 150}, {7.5, 0, 0, 0, 300}}, &g, &kn, &why);
+    check(at == 5 && g == 3.4 && kn == 5, "rising fails before the first pass never stop; after a pass they do");
+    at = feed({{1, 1, 0, 0, 50}, {2, 0, 1, 0, 500}}, &g, &kn, &why);
+    check(at == 1 && g == 1 && kn == 2 && why == "saturated (queue cap)", "queue-cap abort ends the ramp at once");
+    at = feed({{1, 0, 0, 1, 500}, {1.5, 1, 0, 0, 80}, {2.25, 0, 0, 1, 90}}, &g, &kn, &why);
+    check(at == 2 && g == 1.5 && kn == 2.25, "falling behind ends the ramp only after a pass");
+    at = feed({{1, 0, 1, 0, 500}}, &g, &kn, &why);
+    check(at == 0 && g == 0, "queue-cap abort before any pass: stop, no pass below the knee");
+    at = feed({{1, 1, 0, 0, 50}, {1.5, 0, 0, 0, 101}, {2.25, 0, 0, 0, 100}, {3.4, 1, 0, 0, 80}, {5, 0, 0, 0, 120},
+               {7.5, 0, 0, 0, 1.0 / 0.0}}, &g, &kn, &why);
+    check(at == 5 && g == 3.4 && kn == 5, "a pass resets the run; inf percentile counts as rising");
+    at = feed({{1, 1, 0, 0, 50}, {1.5, 0, 0, 0, 110}, {2.25, 0, 0, 0, 115}, {3.4, 0, 0, 0, 112}}, &g, &kn, &why);
+    check(at == -1 && g == 1 && kn == 1.5, "no stop yet: bracket = last pass 1 / first fail of the final run 1.5");
   }
   std::printf(fails ? "SLO SEARCH TEST FAIL (%d)\n" : "SLO SEARCH TEST PASS\n", fails);
   return fails ? 1 : 0;

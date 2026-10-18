@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Unit test of experiments/recsys/stream_check.py on synthetic loadgen dirs (no server).
-Cases: valid steps -> PASS; written rate < 0.98 x offered at the result -> NOTE; backlog growth -> NOTE; invalid step
+Cases: valid steps -> PASS; written < 0.98 x accepted at the result -> NOTE; Poisson shortfall of sent vs nominal
+(written = accepted = 0.95 x R) -> PASS; backlog growth -> NOTE; invalid step
 above the result only -> PASS; missing snapshots at the result -> FAIL; batch-mode server -> FAIL.
 usage: python3 -I stream_check_test.py   (prints STREAM CHECK TEST PASS or FAIL)"""
 import json, os, subprocess, sys, tempfile
@@ -32,9 +33,16 @@ def mk(root, steps, best, mode="stream"):
     json.dump(s, open(os.path.join(lg, "summary.json"), "w"))
 
 
-def step(n, ph, x, ok, R=400, rate_frac=1.0, lag=(0, 0), nostats=False):
+def step(n, ph, x, ok, R=400, written=1.0, sent=1.0, lag=None, nostats=False):
+    """10 s window. written / sent: fractions of the nominal R x 10 s written / accepted; lag = (begin, end) backlog
+    (then accepted = written + growth). Consistent counters: accepted_seq = published_seq + backlog."""
     T = 10 * 10**9
-    pub = int(R * 10 * rate_frac)
+    pub = int(R * 10 * written)
+    if lag is None:
+        acc = int(R * 10 * sent)
+        lag = (0, acc - pub)
+    else:
+        acc = pub + lag[1] - lag[0]
     return {"n": n, "phase": ph, "x": x, "pass": ok, "R": R, "nostats": nostats,
             "b": (T * n, 1000, 1000 + lag[0], lag[0]), "e": (T * n + T, 1000 + pub, 1000 + pub + lag[1], lag[1])}
 
@@ -54,17 +62,19 @@ def run(name, steps, best, want, mode="stream"):
 base = [step(0, "ramp", 1, False), step(1, "ramp", 2.25, True), step(2, "ramp", 5, True), step(3, "ramp", 6, False),
         step(4, "confirm", 5, True), step(5, "confirm", 5, True), step(6, "confirm", 5, True)]
 run("all valid", base, 5, "PASS")
-b = [dict(s) for s in base]; b[5] = step(5, "confirm", 5, True, rate_frac=0.95)
-run("written 95% at the result", b, 5, "NOTE")
+b = [dict(s) for s in base]; b[5] = step(5, "confirm", 5, True, written=0.95)
+run("written 95% of accepted at the result", b, 5, "NOTE")
+b = [dict(s) for s in base]; b[5] = step(5, "confirm", 5, True, written=0.95, sent=0.95)
+run("Poisson: 95% of nominal sent, all written", b, 5, "PASS")
 b = [dict(s) for s in base]; b[2] = step(2, "ramp", 5, True, lag=(10, 900))
 run("backlog grows 10 -> 900 below the result", b, 5, "NOTE")
-b = [dict(s) for s in base]; b[2] = step(2, "ramp", 5, True, lag=(10, 400))
-run("backlog +390 within R x 1 s", b, 5, "PASS")
-b = [dict(s) for s in base]; b[3] = step(3, "ramp", 6, False, rate_frac=0.5)
+b = [dict(s) for s in base]; b[2] = step(2, "ramp", 5, True, lag=(10, 60))
+run("backlog +50 (written 98.8 % of accepted)", b, 5, "PASS")
+b = [dict(s) for s in base]; b[3] = step(3, "ramp", 6, False, written=0.5)
 run("invalid only above the result", b, 5, "PASS")
 b = [dict(s) for s in base]; b[4] = step(4, "confirm", 5, True, nostats=True)
 run("no snapshots at the result", b, 5, "FAIL")
-run("batch-mode server", base, 5, "FAIL", mode="batch")
+run("batch-mode server (no update_mode=stream)", base, 5, "FAIL", mode="publish")
 run("no SLO result", base, None, "NOTE")
 print("STREAM CHECK TEST " + ("FAIL (%d)" % fails if fails else "PASS"))
 sys.exit(1 if fails else 0)

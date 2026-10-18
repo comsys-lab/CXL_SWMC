@@ -86,6 +86,8 @@ struct Config {
   // RecSys methodology (2026-10-19), opt-in; 0 = the old behaviour (every existing caller)
   uint32_t min_step_queries = 0;  // every measured step lasts at least N / (SLO stream rate) s
   uint32_t ramp_knee = 0;         // KneeRamp K (slo_search.h): low-rate failures do not end the ramp
+  double ramp_knee_rise = 1.2;    // KneeRamp: a failed step counts toward K if its percentile rose >= this x
+  uint32_t knee_bisect_steps = 12;  // --ramp-knee: bisect steps after the ramp (own budget, not --max-steps)
   double tol = 0.05;            // achieved >= (1 - tol) * offered
   double max_err = 0.001;       // errors + timeouts / measured
   double abort_queue_s = 2.0;   // abort a step when outstanding > max(1000, rate * this)
@@ -124,6 +126,8 @@ void usage() {
                "  --ramp-knee K                         SLO mode: a failed ramp step does not end the ramp; it ends at K\n"
                "                                        consecutive fails after a pass with a non-falling SLO percentile,\n"
                "                                        or a saturated fail; no SLO early abort in ramp steps (default 0 = off)\n"
+               "  --ramp-knee-rise X                    a failed step counts toward K if its percentile >= X x the previous\n"
+               "                                        step's (1.2); bisect then has its own budget of 12 steps\n"
                "  --tol T --max-err E --abort-queue-s S --lag-limit-us U\n"
                "  --arrival poisson|uniform --seed N --raw\n"
                "  --stats-op N            server stats snapshot (request op N, text reply) per target at each measured\n"
@@ -198,6 +202,7 @@ Config parse(int argc, char **argv) {
     }
     else if (a == "--min-step-queries") c.min_step_queries = std::stoul(need(i));
     else if (a == "--ramp-knee") c.ramp_knee = std::stoul(need(i));
+    else if (a == "--ramp-knee-rise") c.ramp_knee_rise = std::atof(need(i).c_str());
     else if (a == "--tol") c.tol = std::atof(need(i).c_str());
     else if (a == "--max-err") c.max_err = std::atof(need(i).c_str());
     else if (a == "--abort-queue-s") c.abort_queue_s = std::atof(need(i).c_str());
@@ -218,6 +223,7 @@ Config parse(int argc, char **argv) {
     die("--mode slo needs --slo s:pct:ms and --start R");
   if (c.mode == "fixed" && c.rates.empty()) die("--mode fixed needs --rates");
   if (c.factor <= 1 || c.precision <= 0 || c.conns == 0) die("bad --factor/--precision/--conns");
+  if (c.ramp_knee && !(c.ramp_knee_rise > 1)) die("bad --ramp-knee-rise (> 1)");
   if (c.confirm_precision <= 0 || c.max_confirm_probes < 2 || c.confirm_reps == 0)
     die("bad --confirm-precision (> 0) / --max-confirm-probes (>= 2) / --confirm-reps (>= 1)");
   if (!(c.confirm_step_down >= 0.02 && c.confirm_step_down <= 0.05)) die("bad --confirm-step-down (0.02 .. 0.05)");
@@ -273,7 +279,7 @@ struct StepResult {
   };
   std::vector<S> s;
   bool aborted = false, exhausted = false, pass = false, lag_flag = false;
-  bool saturated = false;  // the SLO stream fell behind or the queue cap aborted the step
+  bool saturated = false, behind = false;  // the queue cap aborted the step / the SLO stream fell behind
   std::string reason;
 };
 
@@ -330,21 +336,26 @@ class Engine {
     // to the precision, then confirm the best passing rate with longer repeats (slo_search.h).
     double good = 0, bad = 0, r = c_.start, prev_pslo = 0;
     uint32_t n = 0;
+    uint32_t bisect_cap = c_.max_steps;
     if (c_.ramp_knee) {  // knee ramp (slo_search.h KneeRamp): low-rate failures are recorded, the ramp goes on
-      KneeRamp kr(c_.ramp_knee);
+      KneeRamp kr(c_.ramp_knee, c_.ramp_knee_rise);
       bool ended = false;
       for (; n < c_.max_steps; n++) {
         StepResult s = step("ramp", r, c_.step_warmup_s, measure_for(r, c_.step_measure_s), false);
         if (s.exhausted) return finish("streams exhausted during ramp");
         search_note(s, "ramp", r);
         const double p = s.s[idx_[c_.slo_stream]].pslo;
-        if (kr.add(r, s.pass, s.saturated, p)) { ended = true; break; }
-        // below the first pass (low-rate regime) the percentile says nothing about the knee: big steps
-        r *= (!s.pass && !kr.any_pass()) ? c_.factor * c_.factor : next_factor(p, prev_pslo);
+        if (kr.add(r, s.pass, s.saturated, s.behind, p)) { ended = true; break; }
+        // a pass: the usual adaptive step; a fail (low-rate regime or past the knee): x factor
+        r *= s.pass ? next_factor(p, prev_pslo) : c_.factor;
         prev_pslo = p;
       }
-      good = kr.good(), bad = ended ? kr.knee() : 0;
+      ramp_end_ = ended ? kr.why() : kr.knee() > 0 ? "max steps (last steps failed)" : "max steps";
+      if (kr.good() == 0) return finish("no passing ramp step below the knee (" + ramp_end_ + ")");
+      if (kr.knee() == 0) return finish("max steps reached without reaching the knee (--ramp-knee); raise --max-steps");
+      good = kr.good(), bad = kr.knee();
       ramp_knee_ = bad;
+      bisect_cap = n + c_.knee_bisect_steps;
     } else
     for (; n < c_.max_steps; n++) {
       StepResult s = step("ramp", r, c_.step_warmup_s, c_.step_measure_s);
@@ -358,13 +369,14 @@ class Engine {
     if (good == 0)
       return finish(c_.ramp_knee ? "no passing ramp step below the knee" : "the start rate already violates the SLO; lower --start");
     if (bad == 0) return finish("max steps reached without an SLO violation; raise --start or --max-steps");
-    for (; n < c_.max_steps && bad / good > 1 + c_.precision; n++) {
+    for (; n < bisect_cap && bad / good > 1 + c_.precision; n++) {
       double m = std::sqrt(good * bad);
       StepResult s = step("bisect", m, c_.step_warmup_s, measure_for(m, c_.step_measure_s));
       if (s.exhausted) return finish("streams exhausted during bisection");
       search_note(s, "bisect", m);
       (s.pass ? good : bad) = m;
     }
+    bisect_cut_ = bad / good > 1 + c_.precision;
     // confirm phase (decision 2026-10-18 "A+C", fallback H1 v0.6.5): confirm `good`; if most repeats fail, step down
     // from the last failed confirm by at most --confirm-step-down (a known ramp/bisect pass closer below is taken
     // instead) until a confirm passes, then bisect between the highest confirmed pass and the lowest confirm fail
@@ -655,7 +667,7 @@ class Engine {
         // keeping up = completions in the window vs requests actually sent in it (not the nominal rate: a Poisson
         // count over a short window is itself noisy); tiny counts are not judged
         if (st.sent >= 100 && st.achieved * win < (1 - c_.tol) * double(st.sent) && pass)
-          pass = false, why = specs_[s].name + " completions < sent (falling behind)", res.saturated |= s == slo_idx_;
+          pass = false, why = specs_[s].name + " completions < sent (falling behind)", res.behind |= s == slo_idx_;
         if (st.sent && double(st.errors + st.timeouts) / st.sent > c_.max_err && pass)
           pass = false, why = specs_[s].name + " errors/timeouts";
       }
@@ -793,7 +805,8 @@ class Engine {
       << "\ntol=" << c_.tol << " max_err=" << c_.max_err << " abort_queue_s=" << c_.abort_queue_s
       << " lag_limit_us=" << c_.lag_limit_us << "\nstats_op=" << c_.stats_op << "\n";
     if (c_.min_step_queries || c_.ramp_knee)  // opt-in keys only (manifests of earlier callers stay unchanged)
-      m << "min_step_queries=" << c_.min_step_queries << " ramp_knee=" << c_.ramp_knee << "\n";
+      m << "min_step_queries=" << c_.min_step_queries << " ramp_knee=" << c_.ramp_knee << " ramp_knee_rise="
+        << c_.ramp_knee_rise << " knee_bisect_steps=" << c_.knee_bisect_steps << "\n";
     for (auto &kv : c_.mix) m << "mix." << kv.first << "=" << kv.second << "\n";
     for (auto &kv : c_.fixed) m << "fixed." << kv.first << "=" << kv.second << "\n";
   }
@@ -838,8 +851,10 @@ class Engine {
       }
       s << "]";
       if (c_.ramp_knee) {  // knee ramp: low-rate violations = failed ramp/bisect steps below the result
-        s << ",\"ramp_policy\":{\"knee_k\":" << c_.ramp_knee << ",\"min_step_queries\":" << c_.min_step_queries
-          << ",\"knee_offered\":" << (ramp_knee_ > 0 ? fmt(ramp_knee_) : std::string("null")) << "},\"low_rate_violations\":[";
+        s << ",\"ramp_policy\":{\"knee_k\":" << c_.ramp_knee << ",\"knee_rise\":" << fmt(c_.ramp_knee_rise)
+          << ",\"min_step_queries\":" << c_.min_step_queries << ",\"knee_offered\":"
+          << (ramp_knee_ > 0 ? fmt(ramp_knee_) : std::string("null")) << ",\"ramp_end\":\"" << ramp_end_
+          << "\",\"bisect_cut\":" << (bisect_cut_ ? "true" : "false") << "},\"low_rate_violations\":[";
         bool first = true;
         for (auto &f : search_)
           if (!f.pass && f.offered < best_) {
@@ -897,8 +912,10 @@ class Engine {
     uint64_t sent = 0;
     std::string reason;
   };
-  std::vector<SearchStep> search_;
-  double ramp_knee_ = 0;  // --ramp-knee: the knee the ramp ended at (0 = none)  // ramp/bisect steps in order
+  std::vector<SearchStep> search_;  // ramp/bisect steps in order
+  double ramp_knee_ = 0;            // --ramp-knee: the knee bracket of the ramp (0 = none)
+  std::string ramp_end_;            // --ramp-knee: why the ramp stopped
+  bool bisect_cut_ = false;         // the bisect budget ended above the precision  // ramp/bisect steps in order
   struct Probe {
     double offered = 0;
     std::string role;

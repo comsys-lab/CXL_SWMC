@@ -293,7 +293,7 @@ class Server {
       << "\npublish_rounds=" << st_.publish_rounds << "\nround_rows=" << st_.round_rows
       << "\nround_rows_max_worker=" << st_.round_rows_max << "\nupdate_rate_sustained=" << (st_.flush_overruns ? 0 : 1)
       << "\nupdate_queue_max=" << st_.uq_max << "\naccum_ns=" << tsc_to_ns(st_.accum_cyc)
-      << "\nupdate_mode=" << (o_.stream ? "stream" : o_.publish_us ? "publish" : "immediate") << stream_text()
+      << stream_text()
       << "\nver_stripes=" << p_.ver_stripes << "\ntsc_khz=" << tsc_khz()
       << "\nop.coh_src=pc_threads:" << st_.coh_pc_threads << ",mg_threads:" << st_.coh_mg_threads << "\n" << op_tags()
       << op_text() << "mem.vm_rss_kb=" << status_kb("VmRSS:")
@@ -328,7 +328,7 @@ class Server {
     if (!o_.stream) return "";
     std::ostringstream o;
     const uint64_t acc = st_.accepted_seq.load(), pub = load_acquire(&h_->nodes[o_.node].published_seq);
-    o << "\nstats_mono_ns=" << now_ns() << "\nupdate_accepted_seq=" << acc
+    o << "\nupdate_mode=stream\nstats_mono_ns=" << now_ns() << "\nupdate_accepted_seq=" << acc
       << "\nupdate_lag_samples=" << (acc > pub ? acc - pub : 0) << "\nupdate_lag_ns_sum=" << st_.lag_ns_sum
       << "\nupdate_lag_n=" << st_.lag_n << "\nupdate_lag_ns_max=" << st_.lag_ns_max.exchange(0);
     if (uq_)

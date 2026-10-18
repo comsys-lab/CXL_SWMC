@@ -100,33 +100,43 @@ inline ConfirmOutcome confirm_search(double good, std::vector<double> passes, do
 // Knee ramp (--ramp-knee K, opt-in; RecSys methodology, user decisions 2026-10-19, state/PROJECT.md): a failed ramp
 // step does not end the ramp by itself. Reason: when updates arrive at an absolute rate, a query at a LOW rate absorbs
 // every invalidation since the previous one, so tail latency can be worst at low load and fall as the load rises.
-// The ramp ends at the real knee = the first step of a run of K consecutive failed steps after the last pass whose
-// SLO percentile does not fall from step to step (a falling percentile = still the low-rate regime: the run restarts
-// at that step), or at the first saturated failure (the SLO stream falls behind / the queue cap aborts the step).
-// Fails before the first pass never end the ramp unless saturated. Result bracket: good = the last pass before the
-// knee (the highest pass below it), bad = knee. Failed steps below `good` are the low-rate violations (reported).
+// Stop rule (when to stop ramping): (a) a hard saturation (the queue cap aborted the step), or (b) after a pass, the SLO
+// stream falls behind, or (c) after a pass, K consecutive failed steps whose SLO percentile rose by >= `rise` x the
+// previous step's (queueing past the knee; low-rate failures have a flat or falling percentile).
+// Bracket (independent of the stop rule): knee = the first step of the final run of failed steps (every ramp step at
+// or above it failed), good = the last pass before it = the highest pass below the knee (definition (가)).
+// Failed steps below `good` are the low-rate violations (reported).
 class KneeRamp {
  public:
-  explicit KneeRamp(uint32_t k) : k_(k) {}
-  // after each ramp step; true = the ramp ends here (good()/knee() final; good() == 0: no pass below the knee)
-  bool add(double x, bool pass, bool saturated, double pslo) {
+  KneeRamp(uint32_t k, double rise) : k_(k), rise_(rise) {}
+  // after each ramp step; true = stop ramping (good()/knee() are the bracket; good() == 0: no pass below the knee)
+  bool add(double x, bool pass, bool hard, bool behind, double pslo) {
+    const bool prev_pass = n_ == 0 || last_pass_;
+    n_++, last_pass_ = pass;
+    const double prev = prev_p_;
+    prev_p_ = pslo;
     if (pass) {
-      good_ = x, run_ = 0;
+      good_ = x, run_ = 0, knee_ = 0;
       return false;
     }
-    if (run_ == 0 || !(pslo >= last_)) run_ = 1, knee_ = x;  // NaN-safe: inf >= inf holds
-    else run_++;
-    last_ = pslo;
-    if (saturated) return true;
-    return good_ > 0 && run_ >= k_;
+    if (prev_pass) knee_ = x;  // first fail after a pass (or the first step): start of the failing run
+    if (hard) return why_ = "saturated (queue cap)", true;
+    if (good_ > 0 && behind) return why_ = "saturated (SLO stream falls behind)", true;
+    if (good_ > 0 && prev > 0 && pslo >= rise_ * prev) run_++;  // inf >= anything: counts as rising
+    else run_ = 0;
+    if (good_ > 0 && run_ >= k_) return why_ = "percentile rising", true;
+    return false;
   }
   double good() const { return good_; }
-  double knee() const { return knee_; }
+  double knee() const { return knee_; }  // 0 while the last step passed
   bool any_pass() const { return good_ > 0; }
+  const char *why() const { return why_; }
 
  private:
-  uint32_t k_, run_ = 0;
-  double good_ = 0, knee_ = 0, last_ = 0;
+  uint32_t k_, run_ = 0, n_ = 0;
+  double rise_, good_ = 0, knee_ = 0, prev_p_ = 0;
+  bool last_pass_ = false;
+  const char *why_ = "";
 };
 
 }  // namespace loadgen

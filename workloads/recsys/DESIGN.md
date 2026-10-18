@@ -114,8 +114,10 @@ Every RecSys experiment from 2026-10-19 on uses this mode; H1 results and the H1
   `update_lag_samples` (accepted - published_seq = backlog), `update_lag_ns_{sum,n}` (acceptance to the owning
   worker's rows written, per sample and worker), `update_lag_ns_max` (max since the previous stats read),
   `update_queue.w<i>` (current queue depth per worker), with `rows_written`, `update_queue_max` as before.
-- Validity (experiments/recsys/stream_check.py, per measured step from the node-0 stats snapshots): written samples/s
-  = d(published_seq) / dt >= 0.98 x offered and backlog growth <= max(50 samples, 1 s of updates). A result whose
+- Validity (experiments/recsys/stream_check.py, per measured step from the node-0 stats snapshots): samples fully
+  written >= 0.98 x samples accepted in the window (d published_seq / d update_accepted_seq; accepted = sent, the
+  arrivals are Poisson, so the nominal rate is not the reference) and backlog growth <= max(50 samples, 1 s of
+  updates). A result whose
   steps at or below it are not all valid is reported "update rate not sustained" (STREAMCHECK NOTE).
 - Rate: trace samples/s (Criteo 1TB day 23, MLPerf DLRMv2 multi-hot, samples [0, 2M) in file order; the loadgen
   replays it at a fixed rate and wraps), multiples of 50. Basis (Ekko OSDI'22 §6.2.1 + Fig. 9, §4.4): R such that
@@ -130,8 +132,11 @@ Every RecSys experiment from 2026-10-19 on uses this mode; H1 results and the H1
 - SLO search (loadgen `--min-step-queries 100 --ramp-knee 2`, RecSys only; defaults keep every other workload's
   search unchanged): ramp from 1 query/s, every measured step >= 100 queries (step length scaled), a failed step at a
   low rate is recorded and the ramp goes on (tail latency can be worst at low load: each query absorbs every
-  invalidation since the previous one); the ramp ends at the knee (2 consecutive failed steps after a pass with a
-  non-falling p95, or a saturated step); max under SLO = the highest pass below the knee, confirmed as before;
+  invalidation since the previous one; after a failed step the rate grows by x1.5). The ramp stops past the knee:
+  after a pass, 2 consecutive failed steps whose p95 rose >= 1.2x each (queueing; low-rate p95 is flat or falling),
+  or the query stream falls behind; or at once when the queue cap aborts a step. Knee = the first step of the final
+  run of failed ramp steps; max under SLO = the highest pass below it (bisect, own budget of 12 steps, then
+  confirm as before);
   summary.json `low_rate_violations` lists the failed steps below the result with their p95.
 
 ## 6. Serving (DLRMv2 dense part, CPU, fp32)
