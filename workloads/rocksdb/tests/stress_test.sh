@@ -33,7 +33,9 @@ EOF
 ARENA=12; EXT=200; FILES=160
 SP=(--keys $N --arena-blocks $ARENA --file-extents $EXT --max-files $FILES --max-ext 8 --epoch-slots 32)
 export CXL_APP_HWCC_BYTES=$("$B/bin/rocksdb-server" --print-app-bytes "${SP[@]}")
-echo "keys=$N arena_blocks=$ARENA file_extents=$EXT max_files=$FILES max_ext=8 app_bytes=$CXL_APP_HWCC_BYTES"
+echo "keys=$N arena_blocks=$ARENA file_extents=$EXT max_files=$FILES max_ext=8 app_bytes=$CXL_APP_HWCC_BYTES build=$B loadgen=$LG"
+grep -E '^(source|rocksdb_version|patch|sha256)' "$B/manifest.txt"
+sha256sum "$B/bin/rocksdb-server" "$LG/loadgen"
 P=(--nodes 2 --run-id "$(rid)" --region "$WD/region.yaml" --threads 4 --write-buffer-mb 2 --target-file-mb 4
    --max-manifest-kb 64 --prepare-threads 2 "${SP[@]}")
 taskset -c "$C0" "$B/bin/rocksdb-server" --node 0 --port 17300 --local-dir "$WD/local0" "${P[@]}" > srv0.log 2>&1 &
@@ -66,11 +68,13 @@ arena, ext, files = map(int, sys.argv[1:4]); bad = []
 for f in sys.argv[4:]:
     s = dict(l.split("=", 1) for l in open(f).read().splitlines() if "=" in l)
     g = lambda k: int(s.get(k, "0"))
-    r = [k.split(".")[0] for k in s if k.startswith("remote") and k.endswith(".gets")][0]
+    views = sorted({k.split(".")[0] for k in s if k.startswith("remote") and k.endswith(".gets")})
     pools = dict(kv.split("=") for kv in s["pools"].split())
-    print(f, " ".join(f"{k}={s.get(k)}" for k in ("remote_errors", "get_retries", "gc.dropped", r + ".catchups",
-          r + ".sync_catchups", "fs.created", "fs.deleted", "fs.manifests")), s["pools"])
-    for k in ("remote_errors", "get_errors", "update_errors", r + ".errors", r + ".catchup_errors"):
+    print(f, " ".join(f"{k}={s.get(k)}" for k in ["remote_errors", "get_retries", "get_retry_limit", "gc.dropped",
+          "fs.created", "fs.deleted", "fs.manifests"] + [r + x for r in views for x in (".catchups", ".sync_catchups")]),
+          s["pools"])
+    for k in ["remote_errors", "get_errors", "update_errors", "get_retry_limit"] + \
+             [r + x for r in views for x in (".errors", ".catchup_errors")]:
         if g(k): bad.append(f"{f}: {k}={g(k)}")
     if int(pools["blocks_used_total"]) <= arena: bad.append(f"{f}: arena blocks not reused")
     if int(pools["extents_used_total"]) <= ext: bad.append(f"{f}: file extents not reused")

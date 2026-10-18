@@ -4,7 +4,8 @@
 Reads <dir>/gets.bin and <dir>/updates.bin (LogRec, workloads/rocksdb/loadgen/rocksdb_plugin.cc) and checks:
   - every acknowledged update has a unique stamp;
   - every successful get returned either the initial image (stamp 0, version 0, writer 0xffff) or exactly the
-    (key, version, writer) of the acknowledged-or-in-flight update with that stamp (a value is never mixed up);
+    (key, version, writer) of the acknowledged update with that stamp (a value is never mixed up); a get that
+    returned the value of an update never acknowledged in this log counts as foreign (conservative: FAIL);
   - per-key freshness: the stamp read >= the highest stamp of that key acknowledged before the get was made
     (min_stamp, recorded by the plugin);
   - a get never returns a stamp that no update of this run produced (unless --allow-foreign, for multi-run tests

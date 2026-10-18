@@ -75,7 +75,7 @@ for f in sys.argv[1:]:
     print(f, " ".join(f"{k}={s.get(k)}" for k in ("gets", "updates", "remote_errors", "desc_installs", "gc.checked",
           "gc.dropped", r + ".gets", r + ".mem_hits", r + ".sst_hits", r + ".catchups", r + ".sync_catchups",
           r + ".catchup_errors", "rocksdb.num-files-at-level0", "rocksdb.total-sst-files-size", "pools")))
-    for k in ("remote_errors", "get_errors", "update_errors", r + ".errors", r + ".catchup_errors"):
+    for k in ("remote_errors", "get_errors", "update_errors", "get_retry_limit", r + ".errors", r + ".catchup_errors"):
         if g(k): bad.append(f"{f}: {k}={g(k)}")
     for k in ("desc_installs", r + ".mem_hits", r + ".sst_hits", r + ".catchups", "gc.checked"):
         if not g(k): bad.append(f"{f}: {k}=0 (path not exercised)")

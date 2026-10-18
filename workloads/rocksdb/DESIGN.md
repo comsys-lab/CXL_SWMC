@@ -141,13 +141,22 @@ Decision: G1 (user, 2026-10-18).
   another DB after the get read it. Every drop becomes visible only through an install (gen++), so Node::get repeats
   while any node's gen changed during its reads (stats get_retries, get_retry_limit after 1,000 attempts).
 - MED-4 (VM pass criteria): a get that finds a value on one node but gets an error from another still answers;
-  every run must require remote_errors = get_errors = update_errors = remoteN.errors = remoteN.catchup_errors = 0
-  (host_test.sh / stress_test.sh do; the VM packet must too).
+  every run must require remote_errors = get_errors = update_errors = get_retry_limit = remoteN.errors =
+  remoteN.catchup_errors = 0 for every N (host_test.sh / stress_test.sh do; the VM packet must too; re-review v2
+  MED-A: get_retry_limit > 0 means a get answered without a stable read).
 - MED-5 (packet): space is not bounded by construction (image ~28.6 GB per node in a ~47.8 GiB share; L0-L5,
   compaction transients and cross-node stale copies until G1 reaches them). Stats export pools.extents_free and
-  pools.blocks_free; exhaustion gives NoSpace (files) or abort (arena). The VM packet needs a stop rule on
-  pools.extents_free, a fresh image per run and a bounded run length per mix.
+  pools.blocks_free; exhaustion gives NoSpace (files) or abort (arena block source, patch arena.cc). The VM packet
+  needs numeric stop thresholds on pools.extents_free and pools.blocks_free, a fresh image per run and a bounded run
+  length per mix, justified against the headroom (~28.6 GB image in a ~47.8 GiB share, ~19 GiB left for upper
+  levels, compaction transients and stale copies); run manifests cite rocksdb-server c8351508... (builds/rocksdb/3)
+  and builds/rocksdb-loadgen/1.
 - LOW: retired-name fallback now takes the newest retired slot (per-slot creation serial); raw VAs documented (§2);
   tools/check_log.py = offline exact check of log=1 runs; early visibility documented (§2); each DB instance
   (primary and every secondary) has its own DRAM block cache (RocksDB default, 32 MiB), to record in the manifest.
 - User confirmations (2026-10-18): bloom filter 10 bits/key and the 1,008 B stored value stay.
+- Re-review v2 (2026-10-18): PASS-with-corrections, HIGH-1 closed. Notes: Node::get's closing gen loads are
+  acquire loads; on x86-TSO a later load is not reordered before earlier loads, so this is sufficient here; a
+  seq_cst fence is to be added with the next server source change (build 3 is kept unchanged for the packet).
+  Residual: a MANIFEST replay during catch-up may touch already-reclaimed files of intermediate versions; it would
+  surface as remoteN.catchup_errors (gated = 0).
