@@ -114,7 +114,8 @@ class Shared {
     std::lock_guard<std::mutex> g(mu_);
     return "blocks_free=" + std::to_string(free_blocks_.size()) + " extents_free=" + std::to_string(free_ext_.size()) +
            " slots_free=" + std::to_string(free_slots_.size()) + " retired=" + std::to_string(retired_.size()) +
-           " blocks_used_total=" + std::to_string(blocks_used_) + " extents_used_total=" + std::to_string(ext_used_);
+           " blocks_used_total=" + std::to_string(blocks_used_) + " extents_used_total=" + std::to_string(ext_used_) +
+           " reclaimed=" + std::to_string(reclaimed_);
   }
   uint64_t free_extents() {
     std::lock_guard<std::mutex> g(mu_);
@@ -139,6 +140,20 @@ class Shared {
     __atomic_thread_fence(__ATOMIC_SEQ_CST);
   }
   void epoch_exit(uint32_t v) { __atomic_store_n(&my_epoch_line()->e[v], uint64_t(0), __ATOMIC_RELEASE); }
+  // A dedicated slot not tied to a thread (a remote view's pin on the state its secondary holds, remote.h).
+  uint32_t alloc_epoch_slot() {
+    const int slot = next_slot_.fetch_add(1);
+    if (slot >= int(p_.epoch_slots)) die_bad("epoch slots exhausted (raise --epoch-slots)");
+    return uint32_t(slot);
+  }
+  void slot_set(uint32_t slot, uint32_t v, uint64_t e) {
+    __atomic_store_n(&h_->epoch(me_, slot)->e[v], e, __ATOMIC_SEQ_CST);
+    __atomic_thread_fence(__ATOMIC_SEQ_CST);
+  }
+  uint64_t blocks_free() {
+    std::lock_guard<std::mutex> g(mu_);
+    return free_blocks_.size();
+  }
 
  private:
   struct Retired {
@@ -185,6 +200,7 @@ class Shared {
           free_slots_.push_back(it->slot);
         }
         it = retired_.erase(it);
+        reclaimed_++;
       } else {
         ++it;
       }
@@ -204,7 +220,7 @@ class Shared {
   std::vector<uint16_t> ext_refs_;
   std::deque<uint32_t> free_slots_;
   std::deque<Retired> retired_;
-  uint64_t blocks_used_ = 0, ext_used_ = 0;
+  uint64_t blocks_used_ = 0, ext_used_ = 0, reclaimed_ = 0;
   std::atomic<int> next_slot_{0};
 };
 

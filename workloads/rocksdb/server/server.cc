@@ -121,7 +121,9 @@ class Server {
       << "\nget_errors=" << ge << "\nget_ns=" << gns << "\nupdates=" << u << "\nupdate_errors=" << ue
       << "\nupdate_ns=" << uns << "\nremote_errors=" << re << "\nqueue=" << q_.size()
       << "\nstamp=" << cxl::hwcc::load_acquire(node_.hwcc().stamp) << "\ndesc_installs=" << node_.desc_installs()
-      << "\npools=" << node_.shared().usage() << "\n";
+      << "\npools=" << node_.shared().usage() << "\npools.blocks_free=" << node_.shared().blocks_free()
+      << "\npools.extents_free=" << node_.shared().free_extents() << "\nget_retries=" << node_.get_retries()
+      << "\nget_retry_limit=" << node_.get_retry_limit() << "\n" << node_.fs().stats_text();
     if (const StaleFilter *f = node_.filter())
       o << "gc.checked=" << f->checked.load() << "\ngc.dropped=" << f->dropped.load() << "\n";
     for (size_t v = 0; v < node_.views().size(); v++) {
@@ -315,7 +317,8 @@ void usage() {
                "usage: rocksdb-server --node K --nodes N --run-id 0x.. --keys N\n"
                "  [--port P (7200)] [--region yaml] [--threads N (8)] [--epoch-slots S (64)] [--max-files F (2048)]\n"
                "  [--max-ext E (192)] [--arena-blocks B (512)] [--file-extents X (0 = rest)] [--local-dir D]\n"
-               "  [--prepare-threads T (8)] [--no-gc-filter] [--write-buffer-mb M (64; Host tests only)]\n"
+               "  [--prepare-threads T (8)] [--no-gc-filter] [--write-buffer-mb M (64)] [--target-file-mb M (64)]\n"
+               "  [--max-manifest-kb K (max_ext/2 MiB)] (the last three: Host tests only)\n"
                "  [--start-timeout-ms T] [--backend plain]\n"
                "All nodes need identical --nodes/--keys/--epoch-slots/--max-files/--max-ext/--arena-blocks/--file-extents\n"
                "(checked through the HWcc layout hash). CXL_APP_HWCC_BYTES must be at least the app layout size:\n"
@@ -350,6 +353,8 @@ int main(int argc, char **argv) {
     else if (a == "--prepare-threads") o.n.prepare_threads = std::stoul(v());
     else if (a == "--no-gc-filter") o.n.gc_filter = false;
     else if (a == "--write-buffer-mb") o.n.write_buffer_mb = std::stoull(v());
+    else if (a == "--target-file-mb") o.n.target_file_mb = std::stoull(v());
+    else if (a == "--max-manifest-kb") o.n.max_manifest_kb = std::stoull(v());
     else if (a == "--start-timeout-ms") o.n.start_timeout_ms = std::stoull(v());
     else if (a == "--backend") o.backend = v();
     else if (a == "--print-app-bytes") print_bytes = true;

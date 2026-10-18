@@ -63,6 +63,7 @@ struct alignas(64) FileHead {
   uint64_t state;  // 0 free, 1 live
   uint64_t size;   // bytes written
   uint64_t name[kNameWords];
+  uint64_t serial;  // owner's creation counter (newest of several retired slots with one name, cxlfs.h find)
 };
 static_assert(sizeof(FileHead) == 128, "file head");
 

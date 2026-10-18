@@ -5,7 +5,8 @@
 #   1 rocksdb-server x2 (plain): image of N keys split by key across the nodes, small memtables (--write-buffer-mb)
 #     so the run flushes and compacts (descriptor gens, sync catch-ups, deferred frees, G1 drops)
 #   2 loadgen mixed stream (update_ratio UPDATE_RATIO, default 0.5) at RATES: plugin checks (complete values of the
-#     right key, per-key read-after-ack freshness across nodes, no not-found, no errors)
+#     right key, per-key read-after-ack freshness across nodes, no not-found, no errors); tools/check_log.py on the
+#     log (every value read = the exact update with its stamp, unique stamps)
 #   3 verify op on both nodes (every entry of each node's DB complete and ordered), stats op, expected activity
 #   4 opsplit rows (get/update with T > 0, C within [0, T]) and clean-stop counts
 # usage: host_test.sh <work dir (new)> <rocksdb build dir> <loadgen build dir with the rocksdb plugin> [keys (200000)]
@@ -55,6 +56,7 @@ taskset -c "$CL" "$LG/loadgen" --workload rocksdb --target 127.0.0.1:17200,127.0
   --opt keys=$N --opt log=1 --opt update_ratio=${UPDATE_RATIO:-0.5} --mode fixed --rates ${RATES:-4000,12000} --mix mixed=1 \
   --warmup-s 2 --step-warmup-s 1 --step-measure-s ${STEP_S:-15} --drain-s 5 --stats-op 10 > lg.log 2>&1 || fail loadgen
 tail -3 lg.log; head -9 lg/rocksdb.txt
+python3 -I "$W/tools/check_log.py" lg || fail check_log
 
 echo "== 3 verify + stats"
 for port in 17200 17201; do

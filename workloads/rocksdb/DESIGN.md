@@ -1,6 +1,7 @@
-# rocksdb workload — design (DRAFT v0.1, not implemented)
+# rocksdb workload — design (v0.2: plain backend implemented, Megalon backend open)
 
-Status 2026-10-18: draft by the fork session (port owner). Nothing built or run. Open items are marked OPEN.
+Status 2026-10-18: plain backend (all-HWcc, Popcorn) built and Host-tested (builds/rocksdb/<n>, tests/host_test.sh,
+tests/stress_test.sh); verifier review v1 FAIL (HIGH-1) -> fixes in v0.2 (§9). Megalon backend not implemented (§7).
 Decisions (user, 2026-10-18; state/TASKS.md): LSM workload = RocksDB; option (c) per-node memtables (each node writes
 only its own memtable, other nodes read it, SSTs shared read-only, cross-node synchronisation only through HWcc, no
 CAS on SWcc: docs/hwcc-contract.md); visibility model "A: CXL mode patch" (LMDB-port style: arena blocks and SSTs in
@@ -37,7 +38,16 @@ node v (writer of everything below except the global stamp)          node u (rea
   the immutable SST/MANIFEST side. With the WAL off the secondary has no memtable content; memtables are always read
   directly (model A). This is not the rejected model B (secondary replaying a WAL into private memtables, stale
   reads). Freshness: node v drops a memtable from its descriptor only after the SST holding its content is in the
-  MANIFEST and the new gen is published; a remote Get that sees a newer gen first catches the secondary up to it.
+  MANIFEST and the new gen is published; a remote Get whose descriptor snapshot has flush_gen > applied first
+  catches the secondary up (synchronously); other gen changes (compaction installs) are caught up by the view's
+  background thread, and the files the secondary still refers to are kept by the view's persistent pin (§9).
+- Get retry (§9, MED-3): a get is repeated while any node's descriptor gen moved during its reads.
+- Visibility detail: a remote reader sees a memtable entry as soon as it is linked, which can be before the
+  writer's RocksDB sequence is published (and before its reply): a write may become visible early, never late;
+  per key the highest stamp wins. Freshness is read-after-ack per key (loadgen plugin, tools/check_log.py).
+- Raw pointers in shared memory: the descriptor holds skiplist head VAs and skiplist links are absolute VAs, valid
+  because every node maps the device at the same `map_va` (config/cxl_region.yaml; docs/hwcc-contract.md §3 asks for
+  offsets: recorded deviation, RocksDB's skiplist cannot store offsets without restructuring).
 - Expected cost (recorded): the global stamp is one HWcc line hit by every Put on every node (cross-node hot line,
   one fetch_add per Put); it is the same on every system and appears in all-HWcc too.
 
@@ -116,3 +126,28 @@ Decision: G1 (user, 2026-10-18).
 - Ops `get`, `update` (put of an existing key, whole 1,000 B value), `mixed` with put ratio 0.05/0.5/0.8; SLO request
   p99 < 1 ms; per-op split T/C via opsplit.h (Popcorn swmc_acct, Megalon CohSnap); stats of RocksDB (flush,
   compaction bytes/time, stall), pools usage, remote lookups, filter drops.
+
+## 9. Verifier review v1 (2026-10-18) and changes in v0.2
+- HIGH-1 (fixed): the secondary's current SuperVersion refers to SSTs/MANIFEST between gets, but the reader epoch
+  was held only during a get, so a compaction-deleted file could be reclaimed and its extents/slot reused while the
+  secondary still referred to it. Fix: each RemoteView owns a persistent epoch slot (not thread-local) pinned at
+  the gen the secondary is caught up to; set before OpenAsSecondary, raised only after a catch-up installed the
+  newer state, cleared when the view closes. A file in the state caught up at gen a was removed by an edit
+  published at R > a, so its tag T >= R > a and it is not freed.
+- MED-2 (added): tests/stress_test.sh: tiny pools (12 arena blocks, 200 extents, 160 directory slots, 8 MiB files),
+  64 KiB MANIFEST limit (rollovers), update-only phases between mixed phases (no reader epochs while compactions
+  delete files); requires reuse of blocks, extents and slots and >= 2 MANIFESTs per node.
+- MED-3 (fixed): G1 can drop the version a get would have found in one DB while the successor version appears in
+  another DB after the get read it. Every drop becomes visible only through an install (gen++), so Node::get repeats
+  while any node's gen changed during its reads (stats get_retries, get_retry_limit after 1,000 attempts).
+- MED-4 (VM pass criteria): a get that finds a value on one node but gets an error from another still answers;
+  every run must require remote_errors = get_errors = update_errors = remoteN.errors = remoteN.catchup_errors = 0
+  (host_test.sh / stress_test.sh do; the VM packet must too).
+- MED-5 (packet): space is not bounded by construction (image ~28.6 GB per node in a ~47.8 GiB share; L0-L5,
+  compaction transients and cross-node stale copies until G1 reaches them). Stats export pools.extents_free and
+  pools.blocks_free; exhaustion gives NoSpace (files) or abort (arena). The VM packet needs a stop rule on
+  pools.extents_free, a fresh image per run and a bounded run length per mix.
+- LOW: retired-name fallback now takes the newest retired slot (per-slot creation serial); raw VAs documented (§2);
+  tools/check_log.py = offline exact check of log=1 runs; early visibility documented (§2); each DB instance
+  (primary and every secondary) has its own DRAM block cache (RocksDB default, 32 MiB), to record in the manifest.
+- User confirmations (2026-10-18): bloom filter 10 bits/key and the 1,008 B stored value stay.

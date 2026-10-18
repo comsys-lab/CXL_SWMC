@@ -1,7 +1,11 @@
 // Read-only view of another node's DB (DESIGN.md §2): its memtables read directly through the HWcc descriptor
 // (rocksdb/cxl.h RemoteMemtableGet), its SSTs through a RocksDB secondary instance over the shared files
 // (OpenAsSecondary / TryCatchUpWithPrimary, used only for the immutable SST/MANIFEST side; WAL off).
-// Every access runs inside this thread's reader epoch for the node (shared.h).
+// Every access runs inside this thread's reader epoch for the node (shared.h). In addition the view keeps a
+// persistent pin = the gen its secondary is caught up to (verifier HIGH-1, 2026-10-18): the secondary's current
+// SuperVersion refers to files between gets, so those files must outlive every get. A file in the secondary state
+// caught up at gen a was removed (if at all) by an edit published at gen R > a, so its retire tag T >= R > a = pin
+// and it is not freed; the pin rises only after the catch-up installed the newer state.
 #pragma once
 
 #include <atomic>
@@ -52,8 +56,13 @@ struct RemoteStats {
 
 class RemoteView {
  public:
-  RemoteView(Shared *sh, uint32_t node) : sh_(sh), v_(node) {}
-  ~RemoteView() { stop_ = true; if (bg_.joinable()) bg_.join(); }
+  RemoteView(Shared *sh, uint32_t node) : sh_(sh), v_(node), pin_(sh->alloc_epoch_slot()) {}
+  ~RemoteView() {
+    stop_ = true;
+    if (bg_.joinable()) bg_.join();
+    db_.reset();
+    sh_->slot_set(pin_, v_, 0);
+  }
 
   bool open(ROCKSDB_NAMESPACE::Options o, const std::string &sec_dir, std::string *err) {
     o.db_host_id = "cxl-secondary";  // not the primary: no shared arena, no descriptor hook
@@ -63,10 +72,9 @@ class RemoteView {
     o.max_open_files = -1;
     o.env->CreateDirIfMissing(sec_dir);
     o.env->CreateDirIfMissing(o.wal_dir);
-    epoch_enter_now();
-    const uint64_t g0 = desc_gen(&sh_->hwcc()->desc[v_]);
+    const uint64_t g0 = desc_gen(&sh_->hwcc()->desc[v_]);  // the state the open loads is at least g0
+    sh_->slot_set(pin_, v_, std::max<uint64_t>(g0, 1));
     auto s = ROCKSDB_NAMESPACE::DB::OpenAsSecondary(o, CxlFs::dir_of(v_), sec_dir, &db_);
-    sh_->epoch_exit(v_);
     if (!s.ok()) return *err = "OpenAsSecondary node " + std::to_string(v_) + ": " + s.ToString(), false;
     applied_.store(g0);
     bg_ = std::thread([this] { background(); });
@@ -140,6 +148,10 @@ class RemoteView {
       return;
     }
     applied_.store(g0, std::memory_order_release);
+    sh_->slot_set(pin_, v_, std::max<uint64_t>(g0, 1));  // the new state is installed: release the older files
+#ifdef RDB_NEGATIVE_NO_PIN
+    sh_->slot_set(pin_, v_, 0);  // negative-control build only (tests/stress_test.sh must then FAIL)
+#endif
   }
   // keeps the secondary close to the primary so a get rarely waits for a catch-up
   void background() {
@@ -156,6 +168,7 @@ class RemoteView {
 
   Shared *sh_;
   const uint32_t v_;
+  const uint32_t pin_;  // epoch slot pinning the secondary's state (never thread-local)
   std::unique_ptr<ROCKSDB_NAMESPACE::DB> db_;
   std::atomic<uint64_t> applied_{0};
   std::mutex cmu_;

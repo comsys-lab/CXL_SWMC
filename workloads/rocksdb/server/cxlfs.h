@@ -42,6 +42,7 @@ inline void pack_name(const std::string &s, uint64_t w[kNameWords]) {
 struct SlotView {
   bool live = false;     // state 1
   bool retired = false;  // state 2: deleted, name kept until the slot is reclaimed (remote openers, shared.h)
+  uint64_t serial = 0;
   std::string name;
   uint64_t size = 0;
 };
@@ -58,6 +59,7 @@ inline SlotView read_slot(const FileHead *fh) {
     v.retired = st == 2;
     uint64_t w[kNameWords];
     for (uint32_t i = 0; i < kNameWords; i++) w[i] = cxl::hwcc::load_relaxed(&fh->name[i]);
+    v.serial = cxl::hwcc::load_relaxed(&fh->serial);
     __atomic_thread_fence(__ATOMIC_ACQUIRE);
     if (cxl::hwcc::load_relaxed(&fh->seq) != s1) continue;
     char b[kNameWords * 8 + 1] = {};
@@ -185,6 +187,11 @@ class CxlFs final : public FileSystemWrapper {
   const char *Name() const override { return kClassName(); }
 
   static std::string dir_of(uint32_t node) { return kCxlRoot + std::to_string(node); }
+  std::string stats_text() const {
+    std::lock_guard<std::mutex> g(mu_);
+    return "fs.created=" + std::to_string(created_) + "\nfs.deleted=" + std::to_string(deleted_) +
+           "\nfs.manifests=" + std::to_string(manifests_) + "\nfs.live=" + std::to_string(names_.size()) + "\n";
+  }
 
   // ---- files ----
   IOStatus NewSequentialFile(const std::string &f, const FileOptions &o, std::unique_ptr<FSSequentialFile> *r,
@@ -434,6 +441,7 @@ class CxlFs final : public FileSystemWrapper {
     // A remote secondary may open a file its version refers to after the owner deleted it (the data stays until the
     // reader epochs pass): a live file first, else a retired one of that name.
     int64_t retired = -1;
+    uint64_t newest = 0;
     for (uint32_t s = 0; s < sh_->params().max_files; s++) {
       SlotView v = read_slot(sh_->hwcc()->head(p.node, s));
       if (v.name != p.name) continue;
@@ -441,7 +449,7 @@ class CxlFs final : public FileSystemWrapper {
         *slot = s;
         return true;
       }
-      if (v.retired && retired < 0) retired = s;
+      if (v.retired && (retired < 0 || v.serial > newest)) retired = s, newest = v.serial;
     }
     if (retired >= 0) *slot = uint32_t(retired);
     return retired >= 0;
@@ -460,8 +468,11 @@ class CxlFs final : public FileSystemWrapper {
   IOStatus create_locked(const std::string &name, uint32_t *slot, bool publish = true) {
     if (!sh_->get_slot(slot)) return IOStatus::NoSpace("CXL directory full");
     cxl::hwcc::store_release(&sh_->hwcc()->head(sh_->me(), *slot)->size, uint64_t(0));
+    cxl::hwcc::store_relaxed(&sh_->hwcc()->head(sh_->me(), *slot)->serial, ++serial_);
     if (publish) set_slot_locked(*slot, name, 1);
     names_[name] = *slot;
+    created_++;
+    if (name.compare(0, 9, "MANIFEST-") == 0) manifests_++;
     return IOStatus::OK();
   }
   void delete_locked(const std::string &name) {
@@ -473,12 +484,14 @@ class CxlFs final : public FileSystemWrapper {
     for (uint64_t k = 0; k * kUnit < size; k++) exts.push_back(__atomic_load_n(&ex[k], __ATOMIC_RELAXED));
     set_slot_locked(slot, name, 2);  // retired: name kept for remote openers until the slot is reclaimed
     sh_->retire_file(slot, exts);
+    deleted_++;
   }
 
   Shared *sh_;
-  std::mutex mu_;
+  mutable std::mutex mu_;
   std::unordered_map<std::string, uint32_t> names_;  // this node's files
   std::vector<FileLock *> locks_;                    // CXL locks handed out (no RTTI in librocksdb)
+  uint64_t serial_ = 0, created_ = 0, deleted_ = 0, manifests_ = 0;
 };
 
 }  // namespace rdbw

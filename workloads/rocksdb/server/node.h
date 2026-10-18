@@ -60,6 +60,8 @@ struct NodeOpts {
   uint64_t image_file_bytes = 60ull << 20;  // image SST size (< target_file_size_base, << max_ext MiB)
   bool gc_filter = true;           // G1 compaction filter (user decision 2026-10-18)
   uint64_t write_buffer_mb = 64;   // RocksDB default; smaller only in Host tests (forces flushes and compactions)
+  uint64_t target_file_mb = 0;     // 0 = RocksDB default (64 MiB); Host stress tests only (files below max_ext)
+  uint64_t max_manifest_kb = 0;    // 0 = max_ext / 2 MiB; Host stress tests only (forces MANIFEST rollovers)
 };
 
 // G1 (DESIGN.md §5): drop an entry when another node's DB holds the key with a higher stamp.
@@ -153,7 +155,24 @@ class Node {
 
   // ---- requests ----
   // Newest value over every node's DB (highest stamp). *stored = stamp + value.
+  // Retried while any node's descriptor gen moved during the reads (verifier MED-3): a G1 drop in one DB becomes
+  // visible only through an install (gen++), so a get whose reads saw no gen change cannot miss the newest value
+  // because it was dropped from a DB read earlier/later than the DB holding its successor.
   bool get(const std::string &key, std::string *stored, uint64_t *remote_errors) {
+    for (uint32_t attempt = 0;; attempt++) {
+      uint64_t g0[kMaxTargets];
+      for (uint32_t v = 0; v < p_.nr_nodes; v++) g0[v] = desc_gen(&h_->desc[v]);
+      const bool found = get_once(key, stored, remote_errors);
+      bool moved = false;
+      for (uint32_t v = 0; v < p_.nr_nodes; v++) moved |= desc_gen(&h_->desc[v]) != g0[v];
+      if (!moved || attempt >= 1000) {
+        if (moved) get_retry_limit_.fetch_add(1, std::memory_order_relaxed);
+        return found;
+      }
+      get_retries_.fetch_add(1, std::memory_order_relaxed);
+    }
+  }
+  bool get_once(const std::string &key, std::string *stored, uint64_t *remote_errors) {
     std::string cand;
     bool found = false;
     uint64_t best = 0;
@@ -188,6 +207,9 @@ class Node {
   const StaleFilter *filter() const { return filter_.get(); }
   std::shared_ptr<rdb::Statistics> statistics() const { return stats_; }
   uint64_t desc_installs() const { return installs_.load(); }
+  uint64_t get_retries() const { return get_retries_.load(); }
+  uint64_t get_retry_limit() const { return get_retry_limit_.load(); }
+  const CxlFs &fs() const { return *fs_; }
 
  private:
   uint8_t *map_device() {
@@ -209,8 +231,10 @@ class Node {
     o.bottommost_compression = rdb::kNoCompression;
     o.max_open_files = -1;
     o.write_buffer_size = size_t(o_.write_buffer_mb) << 20;
+    if (o_.target_file_mb) o.target_file_size_base = o_.target_file_mb << 20;
     o.arena_block_size = kUnit;  // = RocksDB's default for write_buffer_size 64 MiB (min(1 MiB, wbs / 8))
-    o.max_manifest_file_size = (uint64_t(p_.max_ext) / 2) << 20;  // roll well before a file exceeds max_ext MiB
+    o.max_manifest_file_size = o_.max_manifest_kb ? o_.max_manifest_kb << 10  // roll well before max_ext MiB
+                                                  : (uint64_t(p_.max_ext) / 2) << 20;
     if (primary) o.statistics = stats_;  // secondaries keep their own (none)
     rdb::BlockBasedTableOptions t;
     t.filter_policy.reset(rdb::NewBloomFilterPolicy(10));
@@ -273,7 +297,8 @@ class Node {
   void build_image(const char *who) {
     const uint64_t t0 = now_ns();
     const uint64_t mine = (p_.keys - o_.node + p_.nr_nodes - 1) / p_.nr_nodes;  // keys of this node
-    const uint64_t per_file = std::max<uint64_t>(1, o_.image_file_bytes / (kKeyBytes + kStampBytes + kValueBytes + 16));
+    const uint64_t file_bytes = std::min<uint64_t>(o_.image_file_bytes, (uint64_t(p_.max_ext) * kUnit) * 3 / 4);
+    const uint64_t per_file = std::max<uint64_t>(1, file_bytes / (kKeyBytes + kStampBytes + kValueBytes + 16));
     const uint64_t files = (mine + per_file - 1) / per_file;
     std::vector<std::string> paths(files);
     std::atomic<uint64_t> next{0};
@@ -333,7 +358,7 @@ class Node {
   std::vector<RemoteView *> views_;  // index = node; nullptr for this node
   std::vector<std::unique_ptr<RemoteView>> own_views_;
   std::set<uint64_t> published_;
-  std::atomic<uint64_t> installs_{0};
+  std::atomic<uint64_t> installs_{0}, get_retries_{0}, get_retry_limit_{0};
   static constexpr size_t kStripes = 4096;
   std::mutex stripes_[kStripes];  // process-local (this node's writers only)
 };
