@@ -155,6 +155,30 @@ int main() {
     auto r = confirm_search(92500, {84000}, 0.02, 0.01, 5, [&](double, const char *) { return n++ ? -1 : 0; });
     check(r.exhausted && r.probes.size() == 1, "exhausted during the second confirm -> exhausted, 1 probe recorded");
   }
+  {  // 8. KneeRamp (--ramp-knee): low-rate failures with a falling percentile do not end the ramp
+    struct St { double x; bool pass, sat; double p; };
+    auto feed = [](uint32_t k, std::vector<St> v, double *good, double *knee) {
+      loadgen::KneeRamp kr(k);
+      int at = -1;
+      for (size_t i = 0; i < v.size(); i++)
+        if (kr.add(v[i].x, v[i].pass, v[i].sat, v[i].p)) { at = int(i); break; }
+      *good = kr.good(), *knee = kr.knee();
+      return at;
+    };
+    double g, kn;
+    int at = feed(2, {{1, 0, 0, 130}, {2.25, 0, 0, 120}, {5, 1, 0, 60}, {11, 1, 0, 80}, {12, 0, 0, 120}, {13.2, 0, 0, 150}}, &g, &kn);
+    check(at == 5 && g == 11 && kn == 12, "popcorn-like: low-rate fails, passes, knee run of 2 -> good 11 knee 12");
+    at = feed(2, {{1, 1, 0, 50}, {2, 0, 0, 150}, {3, 0, 0, 120}, {4, 0, 0, 130}}, &g, &kn);
+    check(at == 3 && g == 1 && kn == 3, "falling percentile restarts the run: knee = 3");
+    at = feed(2, {{1, 1, 0, 50}, {2, 0, 1, 500}}, &g, &kn);
+    check(at == 1 && g == 1 && kn == 2, "saturated fail ends the ramp at once");
+    at = feed(2, {{1, 0, 0, 110}, {2, 0, 0, 120}, {3, 0, 0, 130}}, &g, &kn);
+    check(at == -1 && g == 0, "fails before any pass (not saturated) never end the ramp");
+    at = feed(1, {{1, 1, 0, 50}, {2, 1, 0, 70}, {3, 0, 0, 110}}, &g, &kn);
+    check(at == 2 && g == 2 && kn == 3, "K = 1: first fail after a pass ends the ramp (old rule after a pass)");
+    at = feed(2, {{1, 1, 0, 50}, {2, 0, 0, 150}, {3, 1, 0, 80}, {4, 0, 0, 110}, {5, 0, 0, 1.0 / 0.0}}, &g, &kn);
+    check(at == 4 && g == 3 && kn == 4, "a pass resets the run; inf percentile counts as rising");
+  }
   std::printf(fails ? "SLO SEARCH TEST FAIL (%d)\n" : "SLO SEARCH TEST PASS\n", fails);
   return fails ? 1 : 0;
 }

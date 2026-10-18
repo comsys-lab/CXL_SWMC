@@ -97,4 +97,36 @@ inline ConfirmOutcome confirm_search(double good, std::vector<double> passes, do
   return o;
 }
 
+// Knee ramp (--ramp-knee K, opt-in; RecSys methodology, user decisions 2026-10-19, state/PROJECT.md): a failed ramp
+// step does not end the ramp by itself. Reason: when updates arrive at an absolute rate, a query at a LOW rate absorbs
+// every invalidation since the previous one, so tail latency can be worst at low load and fall as the load rises.
+// The ramp ends at the real knee = the first step of a run of K consecutive failed steps after the last pass whose
+// SLO percentile does not fall from step to step (a falling percentile = still the low-rate regime: the run restarts
+// at that step), or at the first saturated failure (the SLO stream falls behind / the queue cap aborts the step).
+// Fails before the first pass never end the ramp unless saturated. Result bracket: good = the last pass before the
+// knee (the highest pass below it), bad = knee. Failed steps below `good` are the low-rate violations (reported).
+class KneeRamp {
+ public:
+  explicit KneeRamp(uint32_t k) : k_(k) {}
+  // after each ramp step; true = the ramp ends here (good()/knee() final; good() == 0: no pass below the knee)
+  bool add(double x, bool pass, bool saturated, double pslo) {
+    if (pass) {
+      good_ = x, run_ = 0;
+      return false;
+    }
+    if (run_ == 0 || !(pslo >= last_)) run_ = 1, knee_ = x;  // NaN-safe: inf >= inf holds
+    else run_++;
+    last_ = pslo;
+    if (saturated) return true;
+    return good_ > 0 && run_ >= k_;
+  }
+  double good() const { return good_; }
+  double knee() const { return knee_; }
+  bool any_pass() const { return good_ > 0; }
+
+ private:
+  uint32_t k_, run_ = 0;
+  double good_ = 0, knee_ = 0, last_ = 0;
+};
+
 }  // namespace loadgen

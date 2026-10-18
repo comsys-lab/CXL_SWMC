@@ -92,6 +92,18 @@
 #   <E>/h1-runs.tsv (8 columns: name system mix phase round run_dir steps lifetime), appended as parts finish;
 #   <E>/order.txt before the first lifetime. Lifetime names: r1 <sys>-<mix>-slo-r1 / <sys>-<mix>-fix-r1 (hw, pop),
 #   mg-<mix>-r1 (entries -slo / -fix), mgoff-<mix>-fix-r<n>; cont <sys>-<mix>-r<n> (entries -slo / -fix).
+# BLOCK=stream — RecSys streaming block (user decisions 2026-10-19, state/PROJECT.md "RecSys experiment methodology";
+#   workloads/recsys/DESIGN.md §5.1; every RecSys experiment from then on; BLOCK=h1 and the other blocks unchanged):
+#   env STREAM_RATES (update rates in trace samples/s, multiples of 50 in [50, 2000]; Ekko avg 41.47 -> 50, peak
+#   393.27 -> 400; > 400 = stress, labelled), PRETOUCH_DIR (pretouch-gate.sh at block start and end), optional SYSTEMS
+#   (subset of "hw pop mg", default "hw pop"); EKKO and RS_T_MS are refused. Servers: --publish-ms 0 --update-mode stream,
+#   node 0 --update-threads 14 --serve-threads 1, node 1 --update-threads 1 --serve-threads 14 (N0X below). Per rate
+#   (in STREAM_RATES order), per system (order shuffle(seed recsys-stream-<rate>), <E>/order.txt) one lifetime
+#   <sys>-u<rate>: warmup (1 query/s + the update stream, 10 + 50 s, unmeasured) -> slo (query p95 <= 100 ms, start 1,
+#   factor 1.5, precision 0.02, confirm 3 x 30 s as H1, --tol 0.02, --max-steps 40, --min-step-queries 100,
+#   --ramp-knee 2) -> stream_check.py (FAIL stops; NOTE "update rate not sustained" recorded) -> check_breakdown.py.
+#   loadgen rc 1 with a note is recorded (MAIN NOTE), not a stop. <E>/stream-results.tsv (one row per lifetime),
+#   <E>/rate-basis.txt (formula and rounding).
 set -uo pipefail
 E=${1:?evidence dir}
 P=/home/comsys/sungsu/destijl-control X=$(cd "$(dirname "$0")" && pwd)
@@ -109,7 +121,7 @@ fi
 : "${PLAIN_BUILD:?}"
 MB=$MEG_BUILD SEED=${SEED:-20261016} ROUNDS=${ROUNDS:-3} FIXED=${FIXED:-1} XT=${XT:-28800}
 BLOCK=${BLOCK:-main} V1_RATE=${V1_RATE:-1} V1_WINDOW_S=${V1_WINDOW_S:-130}
-case $BLOCK in main|v1|h1) ;; *) echo "SEQUENCE STOP: BLOCK must be main, v1 or h1"; exit 2;; esac
+case $BLOCK in main|v1|h1|stream) ;; *) echo "SEQUENCE STOP: BLOCK must be main, v1, h1 or stream"; exit 2;; esac
 if [ $BLOCK = h1 ]; then  # H1-HOOK v2 inputs (see the header)
   [ "${H1_PARENT_LOCK:-}" = H1-main ] || { echo "SEQUENCE STOP: BLOCK=h1 needs H1_PARENT_LOCK=H1-main"; exit 2; }
   [[ "${H1_N:-}" =~ ^[1-9]$ ]] && [[ "${H1_SEED:-}" =~ ^[0-9]+$ ]] || { echo "SEQUENCE STOP: H1_N / H1_SEED"; exit 2; }
@@ -126,6 +138,13 @@ if [ $BLOCK = h1 ]; then  # H1-HOOK v2 inputs (see the header)
   H1MG=0; [ "$H1_SYSTEMS" = "hw pop mg" ] && H1MG=1
   [ "${H1_MEASURE_RUN:-0}" = 1 ] || { echo "SEQUENCE STOP: BLOCK=h1 needs H1_MEASURE_RUN=1 (h1-gate.sh + measure-run.sh, README item 8)"; exit 2; }
   SEED=$H1_SEED EKKO=${EKKO:-per-mix}
+elif [ $BLOCK = stream ]; then  # RecSys streaming block (header "BLOCK=stream")
+  [ -z "${EKKO:-}" ] && [ -z "${RS_T_MS:-}" ] || { echo "SEQUENCE STOP: BLOCK=stream takes STREAM_RATES, not EKKO / RS_T_MS"; exit 2; }
+  : "${STREAM_RATES:?}"
+  for r in $STREAM_RATES; do [[ $r =~ ^[1-9][0-9]*$ ]] && [ $((r % 50)) = 0 ] && [ $r -le 2000 ] || { echo "SEQUENCE STOP: STREAM_RATES entry $r is not a multiple of 50 in [50, 2000] samples/s"; exit 2; }; done
+  [ -d "${PRETOUCH_DIR:-}" ] || { echo "SEQUENCE STOP: BLOCK=stream needs PRETOUCH_DIR"; exit 2; }
+  case " ${SYSTEMS:-hw pop} " in *" mgoff "*|*" mgrow "*) echo "SEQUENCE STOP: BLOCK=stream systems are hw, pop, mg"; exit 2;; esac
+  EKKO=stream
 else
   : "${EKKO:?}"
 fi
@@ -143,6 +162,7 @@ SLO_PCT=95 SLO_MS=100
 # fewer row updates: at T = 1 s peak publishes 19,192 rows per round (1.15 M rows / 60 s vs 0.58 M at T = 60 s).
 T_MS=${RS_T_MS:-60000}
 [[ $T_MS =~ ^[1-9][0-9]*$ ]] || { echo "SEQUENCE STOP: bad RS_T_MS"; exit 2; }
+[ $BLOCK != stream ] || T_MS=0   # streaming: no publication period (--publish-ms 0 --update-mode stream)
 if [ $BLOCK = h1 ] && [ -z "${RS_T_MS:-}" ]; then echo "SEQUENCE STOP: BLOCK=h1 needs RS_T_MS (pins-recsys.sh)"; exit 2; fi
 if [ "$T_MS" != 60000 ]; then
   [ $BLOCK != main ] || { echo "SEQUENCE STOP: RS_T_MS != 60000 only with BLOCK v1 or h1"; exit 2; }
@@ -189,7 +209,16 @@ ekko_set() {  # <avg|peak|f087|f149|f253|f330|f350|f370|f400|f385|f392>: EKKO_FR
  --proc-sysfs /sys/kernel/swmc/page_coherence --proc-kthread cxl_recv"
   SA=$(echo $SA)
 }
-if [ $BLOCK != h1 ]; then ekko_set "$EKKO" || { echo "SEQUENCE STOP: EKKO must be avg, peak, f087, f149, f253, f330, f350, f370, f400, f385 or f392"; exit 2; }; fi
+# BLOCK=stream: server arguments of every node (the updater node adds N0X: 14 update threads = node 1's serving
+# threads, 1 serving thread, so 1 + 8 + 14 + 1 = 24 Megalon registrations on each node; node 1 has 1 update thread)
+N0X=""
+if [ $BLOCK = stream ]; then
+  SA="--nodes 2 --row-div 1 --serve-threads 14 --update-threads 1 --load-threads 8 --start-timeout-ms $((XT * 1000 / 2)) --update-mode stream
+ --verify-rows 1 --proc-sysfs /sys/kernel/swmc/instr --proc-sysfs /sys/kernel/cxl_shm/instr
+ --proc-sysfs /sys/kernel/swmc/page_coherence --proc-kthread cxl_recv"
+  SA=$(echo $SA) N0X="--update-threads 14 --serve-threads 1"
+fi
+if [ $BLOCK != h1 ] && [ $BLOCK != stream ]; then ekko_set "$EKKO" || { echo "SEQUENCE STOP: EKKO must be avg, peak, f087, f149, f253, f330, f350, f370, f400, f385 or f392"; exit 2; }; fi
 export SLO_MS SLO_RULE="DeepRecSys ISCA'20: query p${SLO_PCT} <= ${SLO_MS} ms (MOT1 v6, user 2026-10-16)"
 HOST_PLAIN=$PLAIN_BUILD/bin/recsys-server
 SSH="ssh -o BatchMode=yes -o ConnectTimeout=8"
@@ -406,6 +435,7 @@ life_start() {  # <sys> <name>: prepare + session start of one server lifetime -
     pop) dax_root; pop_setup
          SE=(SYSTEM=Popcorn-$RECV_MODE V=$VM_PLAIN HOST_SERVER=$HOST_PLAIN "SERVER_ARGS=$SA" NODE0_ARGS=--preloaded "NODE_ENV=ENV:XTIMEOUT=$XT");;
   esac
+  [ -z "$N0X" ] || SE+=("NODE0_ARGS=$([ $s = pop ] && echo "--preloaded ")$N0X")   # BLOCK=stream (later value wins in env)
   servers_gone || stop "a recsys-server runs before $s"
   env "${SE[@]}" T_MS=$T_MS bash $X/session.sh start "$S" > "$S.start.out" 2>&1 || { tail -3 "$S.start.out"; stop "$s session start"; }
   tail -1 "$S.start.out"
@@ -562,6 +592,37 @@ h1_check() {  # <sys> <part> <note>: v1_check --h1 + check_breakdown of <part>; 
   local notes; notes=$(sed -n 's/^\[[a-z]*\] NOTE: //p' "$f" | tr '\n' ';' | sed 's/;$//')
   if [ -n "$notes" ]; then echo "RUNCHECK PASS (NOTE: $notes)" >> "$f"; else echo "RUNCHECK PASS" >> "$f"; fi
 }
+# BLOCK=stream part (RecSys methodology 2026-10-19): warm-up 60 s (1 query/s + the update stream) then the SLO search
+# from 1 q/s with >= 100 queries per step and the knee ramp (loadgen --min-step-queries 100 --ramp-knee 2), then
+# stream_check.py (update validity; FAIL stops, NOTE = update rate not sustained, recorded) and check_breakdown.py.
+stream_slo() {  # <sys> <rate>
+  local s=$1 r=$2 rc RD=$LS/slo note="" sc
+  measure "$LS" warmup "${LGC[@]}" --opt seed=$((SEED + 100)) --seed $((SEED + 100)) --mode fixed --rates 1 \
+    --warmup-s 10 --step-warmup-s 0 --step-measure-s 50 --drain-s 10
+  rc=$?; [ $rc = 0 ] || stop "$NAME warm-up rc $rc"
+  measure "$LS" slo "${LGC[@]}" --opt seed=$SEED --seed $SEED --slo query:$SLO_PCT:$SLO_MS --raw --tol 0.02 \
+    --mode slo --start 1 --factor 1.5 --precision 0.02 --confirm-precision 0.01 --max-confirm-probes 6 --confirm-step-down 0.05 \
+    --max-steps 40 --min-step-queries 100 --ramp-knee 2
+  rc=$?
+  grep -q 'workload_finish":"ok' "$RD/loadgen/summary.json" 2>/dev/null || stop "$NAME slo: loadgen workload finish (rc $rc)"
+  if [ $rc = 1 ]; then
+    note=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("note",""))' "$RD/loadgen/summary.json" 2>/dev/null)
+    [ -n "$note" ] || stop "$NAME slo: loadgen rc 1 without a note"
+    echo "MAIN NOTE $NAME slo: $note"
+  elif [ $rc != 0 ]; then stop "$NAME slo rc $rc"; fi
+  python3 $X/stream_check.py "$RD" > "$RD/stream-check.txt" 2>&1
+  sc=$(grep -m1 '^STREAMCHECK' "$RD/stream-check.txt")
+  case "$sc" in "STREAMCHECK PASS"*|"STREAMCHECK NOTE"*) ;; *) stop "$NAME: ${sc:-stream_check.py failed}";; esac
+  python3 $X/check_breakdown.py "$RD" > "$RD/breakdown-check.txt" 2>&1
+  grep -q "^BREAKDOWN PASS" "$RD/breakdown-check.txt" || stop "$NAME: $(cat "$RD/breakdown-check.txt")"
+  python3 -I -c 'import json,sys
+s=json.load(open(sys.argv[1])); c=s.get("confirm",{})
+f=lambda v: "" if v is None else str(v)
+print("\t".join([sys.argv[2], sys.argv[3], sys.argv[4], f(s.get("max_offered_x_pass")), f(c.get("x_mean")), f(s.get("confirmed")),
+  str(len(s.get("low_rate_violations",[]))), sys.argv[5].split(" ")[1], s.get("note","")]))' \
+    "$RD/loadgen/summary.json" "$NAME" "$s" "$r" "$sc" >> "$E/stream-results.tsv" || stop "$NAME: results row"
+  echo "$NAME: $sc"
+}
 h1_entry() {  # <name> <sys> <phase> <part> <steps> <lifetime kind>
   printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$1" "$2" "$H1_MIX" "$3" "$H1_N" "${LS#$E/}/$4" "$5" "$6" >> "$E/h1-runs.tsv"
 }
@@ -690,6 +751,27 @@ if [ $BLOCK = h1 ]; then  # H1-HOOK v2 driver (header)
   done
   bash $PTG "$PRETOUCH_DIR" "$E/pretouch-gate.txt" || stop "pretouch gate at block end"
   echo "$(date -Is) SEQUENCE DONE H1-recsys $H1MODE r$H1_N ($(($(wc -l < "$E/h1-runs.tsv") - 1)) entries)"
+  exit 0
+fi
+if [ $BLOCK = stream ]; then  # RecSys streaming driver (header "BLOCK=stream")
+  bash $PTG "$PRETOUCH_DIR" "$E/pretouch-gate.txt" || stop "pretouch gate at block start"
+  { echo "# update rate basis (RecSys methodology, user 2026-10-19; workloads/recsys/DESIGN.md §5.1): rates in trace samples/s, multiples of 50"
+    echo "ekko_avg: 3.08% distinct rows per 3600 s -> 41.47 samples/s -> 50; ekko_peak: 4.3% distinct rows per 600 s -> 393.27 samples/s -> 400 (recsys-rate, workspaces/recsys-mid/ekko10min)"
+    echo "rates: $STREAM_RATES (> 400 = stress)"; } > "$E/rate-basis.txt"
+  printf '# name\tsystem\trate_sps\tresult_q_s\tconfirm_x_mean\tconfirmed\tlow_rate_violations\tstreamcheck\tnote\n' > "$E/stream-results.tsv"
+  { echo "# RecSys streaming block: per rate (in STREAM_RATES order) one lifetime per system, order shuffle(seed recsys-stream-<rate>)"
+    for r in $STREAM_RATES; do echo "u$r: $(h1shuffle recsys-stream-$r ${SYSTEMS:-hw pop})"; done; } | tee "$E/order.txt"
+  for r in $STREAM_RATES; do
+    lab=""; [ $r -le 400 ] || lab=" (stress, above Ekko peak)"
+    LGC=(--opt samples=$D/$UPD_FILE --opt queries=$D/$QRY_FILE
+         --opt quantiles=$D/dist_quantile.txt --fixed update=$r --mix query=1 --x-stream query)
+    for s in $(h1shuffle recsys-stream-$r ${SYSTEMS:-hw pop}); do
+      echo "$(date -Is) stream u$r$lab system $s"
+      life_start $s $s-u$r; stream_slo $s $r; life_stop $s
+    done
+  done
+  bash $PTG "$PRETOUCH_DIR" "$E/pretouch-gate.txt" || stop "pretouch gate at block end"
+  echo "$(date -Is) SEQUENCE DONE $OWNER (stream rates $STREAM_RATES)"
   exit 0
 fi
 RATEF=$E/sequence-update-rate.txt

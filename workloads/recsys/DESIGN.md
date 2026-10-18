@@ -99,6 +99,41 @@ each system's API and measures its coherence actions; it cannot prove a coherenc
   non-overload steps only (v1_check --h1).
 - Row values are synthetic: emb = f(key, seq, seed) in [-0.05, 0.05) (D5).
 
+### 5.1 Streaming updates (RecSys methodology, user decisions 2026-10-19; state/PROJECT.md "RecSys experiment methodology")
+Every RecSys experiment from 2026-10-19 on uses this mode; H1 results and the H1 harness (§5, T = 1 s) are unchanged.
+- Server: `--update-mode stream` (requires `--publish-ms 0`). An update request is acknowledged on acceptance (frame
+  read), then every update worker writes the rows it owns of that sample right away: deduplicated within the sample,
+  address order, plain = one stripe hold per row (§4), Megalon = one write section per touched object (§7.1). No
+  publication period and no coalescing across samples: a writer that cannot keep up shows as queue depth and lag, not
+  as fewer rows written. `published_seq` (min over workers of the last sample fully written) still marks visibility.
+  The default (`--update-mode batch`) is the §5 behaviour, byte for byte.
+- Threads (main-block.sh BLOCK=stream): node 0 (updater) `--update-threads 14 --serve-threads 1`, node 1 (serving)
+  `--update-threads 1 --serve-threads 14`, so update threads = serving threads (14) and threads never limit the update
+  rate; Megalon registrations 1 + 8 + 14 + 1 = 24 <= 32 per node.
+- Stats (stream mode only): `update_mode`, `stats_mono_ns` (server clock of the snapshot), `update_accepted_seq`,
+  `update_lag_samples` (accepted - published_seq = backlog), `update_lag_ns_{sum,n}` (acceptance to the owning
+  worker's rows written, per sample and worker), `update_lag_ns_max` (max since the previous stats read),
+  `update_queue.w<i>` (current queue depth per worker), with `rows_written`, `update_queue_max` as before.
+- Validity (experiments/recsys/stream_check.py, per measured step from the node-0 stats snapshots): written samples/s
+  = d(published_seq) / dt >= 0.98 x offered and backlog growth <= max(50 samples, 1 s of updates). A result whose
+  steps at or below it are not all valid is reported "update rate not sustained" (STREAMCHECK NOTE).
+- Rate: trace samples/s (Criteo 1TB day 23, MLPerf DLRMv2 multi-hot, samples [0, 2M) in file order; the loadgen
+  replays it at a fixed rate and wraps), multiples of 50. Basis (Ekko OSDI'22 §6.2.1 + Fig. 9, §4.4): R such that
+  the distinct rows touched in an interval reach Ekko's fraction, computed by recsys-rate on this trace
+  (workspaces/recsys-mid/ekko10min, 2026-10-19): average 3.08 % of rows per 3600 s -> 41.47 samples/s -> 50; peak
+  (update-intensive model, busiest 480 min) 4.3 % of rows per 600 s -> 393.27 samples/s -> 400. Rounding: to the
+  nearest multiple of 50. Points: 50, 100, 200, 400 (Ekko peak), 600 and 800 (stress, above Ekko peak; labelled).
+  Command (frac = 0.043 at t = 600 s, 8 windows; 0.0308 at 3600 s): `recsys-rate --samples
+  builds/recsys-inputs/1/updates-day23-0-2M.smp --frac F --t-ms T --windows W` -> rate_samples_per_s. At 400
+  samples/s this trace touches 0.77 % of rows per 60 s and 14.9 % per 3600 s (Ekko: ~10 %; this trace re-touches
+  less within an hour). The §5 mapping (F per 60 s = fraction / intervals) understated both points by 2-3x.
+- SLO search (loadgen `--min-step-queries 100 --ramp-knee 2`, RecSys only; defaults keep every other workload's
+  search unchanged): ramp from 1 query/s, every measured step >= 100 queries (step length scaled), a failed step at a
+  low rate is recorded and the ramp goes on (tail latency can be worst at low load: each query absorbs every
+  invalidation since the previous one); the ramp ends at the knee (2 consecutive failed steps after a pass with a
+  non-falling p95, or a saturated step); max under SLO = the highest pass below the knee, confirmed as before;
+  summary.json `low_rate_violations` lists the failed steps below the result with their p95.
+
 ## 6. Serving (DLRMv2 dense part, CPU, fp32)
 - Model = torchrec DLRM_DCN as in MLPerf DLRMv2: bottom MLP 13-512-256-128 (ReLU); x0 = [dense_out, sum-pooled
   embeddings of 26 features] = 3456; LowRankCrossNet 3 layers rank 512; top MLP 1024-1024-512-256 (ReLU) + 1, sigmoid.

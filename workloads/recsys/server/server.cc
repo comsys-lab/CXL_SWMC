@@ -4,7 +4,7 @@
 // (MemC3: S = 2^16 u32 counters, row -> hash(table, key) mod S; used by the plain backend). Every node accepts both ops; the harness sends updates to the
 // updater node (0) and queries to the serving node (1). Threads: one reader per connection, U update workers (rows
 // sharded by stripe % U on plain, by Megalon object % U on Megalon; Monolith-style touched-row publication every T,
-// workers independent), S serving workers (a
+// workers independent; --update-mode stream: every sample written right away, acknowledged on acceptance), S serving workers (a
 // query is split into chunks of pairs; workers claim chunks). Backend (--backend plain|megalon): where the records live
 // and which coherence actions wrap each record access; Server<Backend> is compiled per backend. Per-operation time
 // split (MOT1 v6 Fig 2): optime.h.
@@ -71,6 +71,8 @@ struct Opts {
   uint32_t min_chunk = 16;
   uint32_t rank = 512;          // DCNv2 low rank (MLPerf 512)
   uint64_t publish_us = 0;      // publication interval T (0 = write each sample immediately)
+  bool stream = false;          // --update-mode stream (T = 0 only): reply on acceptance, every worker writes its rows
+                                // of each sample right away (RecSys methodology 2026-10-19, DESIGN.md §5.1)
   double publish_frac = 0;      // operating point: target fraction of all rows published per T (reported; the
                                 // harness sets the sample rate with recsys-rate; 0 = none)
   uint64_t run_id = 0, start_timeout_ms = 3600000;
@@ -151,6 +153,7 @@ struct Stats {
   std::atomic<uint64_t> samples{0}, rows_touched{0}, rows_written{0}, update_misses{0}, flushes{0}, flush_ns{0},
       flush_ns_max{0}, flush_overruns{0}, lock_spins{0}, write_ns{0}, accum_cyc{0}, publish_rounds{0},
       round_rows{0}, round_rows_max{0}, uq_max{0};
+  std::atomic<uint64_t> accepted_seq{0}, lag_ns_sum{0}, lag_n{0}, lag_ns_max{0};  // stream mode (DESIGN.md §5.1)
   OpAcc op_query, op_row_update;  // MOT1 v6 Fig 2 (optime.h)
   std::atomic<uint32_t> coh_pc_threads{0}, coh_mg_threads{0};
 };
@@ -290,6 +293,7 @@ class Server {
       << "\npublish_rounds=" << st_.publish_rounds << "\nround_rows=" << st_.round_rows
       << "\nround_rows_max_worker=" << st_.round_rows_max << "\nupdate_rate_sustained=" << (st_.flush_overruns ? 0 : 1)
       << "\nupdate_queue_max=" << st_.uq_max << "\naccum_ns=" << tsc_to_ns(st_.accum_cyc)
+      << "\nupdate_mode=" << (o_.stream ? "stream" : o_.publish_us ? "publish" : "immediate") << stream_text()
       << "\nver_stripes=" << p_.ver_stripes << "\ntsc_khz=" << tsc_khz()
       << "\nop.coh_src=pc_threads:" << st_.coh_pc_threads << ",mg_threads:" << st_.coh_mg_threads << "\n" << op_tags()
       << op_text() << "mem.vm_rss_kb=" << status_kb("VmRSS:")
@@ -317,6 +321,20 @@ class Server {
   }
 
  private:
+  // Stream mode: what a run needs to be judged (achieved update rate, lag not growing; DESIGN.md §5.1). Rates follow
+  // from deltas of two snapshots (stats_mono_ns). update_lag_ns_* = acceptance (frame read) to the owning worker's rows
+  // written, per (sample, worker); _max is reset by every stats read (one reader per node: the loadgen snapshots).
+  std::string stream_text() {
+    if (!o_.stream) return "";
+    std::ostringstream o;
+    const uint64_t acc = st_.accepted_seq.load(), pub = load_acquire(&h_->nodes[o_.node].published_seq);
+    o << "\nstats_mono_ns=" << now_ns() << "\nupdate_accepted_seq=" << acc
+      << "\nupdate_lag_samples=" << (acc > pub ? acc - pub : 0) << "\nupdate_lag_ns_sum=" << st_.lag_ns_sum
+      << "\nupdate_lag_n=" << st_.lag_n << "\nupdate_lag_ns_max=" << st_.lag_ns_max.exchange(0);
+    if (uq_)
+      for (uint32_t w = 0; w < o_.update_threads; w++) o << "\nupdate_queue.w" << w << "=" << uq_[w].size();
+    return o.str();
+  }
   std::string op_text() const {
     std::ostringstream o;
     st_.op_query.text(o, "query");
@@ -558,7 +576,7 @@ class Server {
   struct UpdJob {
     Job job;
     Sample s;
-    uint64_t seq;
+    uint64_t seq, t_arr;
     std::atomic<uint32_t> left;
   };
   struct Touched {
@@ -575,9 +593,13 @@ class Server {
     std::memcpy(&u->s, j.p.data() + sizeof(rq), sizeof(Sample));
     if (rq.seq == 0) return bad(j);
     u->seq = rq.seq;
+    u->t_arr = j.t_arr;
     u->left = o_.update_threads;
-    if (o_.publish_us) {  // accepted: reply now (workers are independent)
+    if (o_.publish_us || o_.stream) {  // accepted: reply now (workers are independent)
       st_.samples++;
+      uint64_t a = st_.accepted_seq.load();
+      while (rq.seq > a && !st_.accepted_seq.compare_exchange_weak(a, rq.seq)) {
+      }
       UpdateResp r{u->seq, load_acquire(&h_->nodes[o_.node].published_seq)};
       j.c->reply(frame::kStatusOk, j.h.req_id, &r, sizeof(r));
     } else {
@@ -719,7 +741,8 @@ class Server {
         st_.accum_cyc += tsc() - a0;
         continue;
       }
-      // T = 0: write this sample's rows now (deduplicated), reply when every worker is done
+      // T = 0: write this sample's rows now (deduplicated), reply when every worker is done (stream mode: the sample
+      // was acknowledged on acceptance; record this worker's lag instead)
       ot.begin();
       rows.clear();
       Touched t;
@@ -738,6 +761,14 @@ class Server {
       done_seq_[w] = accepted;
       publish();
       ot.end(&st_.op_row_update, rows.size());  // before the reply (send excluded from T)
+      if (o_.stream) {
+        const uint64_t lag = now_ns() - u->t_arr;
+        st_.lag_ns_sum += lag, st_.lag_n++;
+        uint64_t mx = st_.lag_ns_max.load();
+        while (lag > mx && !st_.lag_ns_max.compare_exchange_weak(mx, lag)) {
+        }
+        continue;
+      }
       if (u->left.fetch_sub(1) == 1) {
         st_.samples++;
         UpdateResp r{u->seq, load_acquire(&h_->nodes[o_.node].published_seq)};
@@ -1009,6 +1040,7 @@ void usage() {
                "usage: recsys-server --node K --nodes N --run-id 0x.. [--port P] [--region yaml]\n"
                "  [--serve-threads S (14)] [--update-threads U (4)] [--chunk-pairs C (0 = adaptive)] [--min-chunk M (16)] [--load-threads L (8)]\n"
                "  [--publish-ms T | --publish-us T (0 = write each sample immediately)] [--publish-frac F (target rows/T, reported)]\n"
+               "  [--update-mode batch|stream]   stream (T = 0 only): reply on acceptance, rows written right away (batch = default)\n"
                "  [--dim D (128)] [--row-cap R (26000000)] [--row-div N (1)] [--ver-stripes S (65536)]\n"
                "  [--multi-hot-div N (1)] [--rank R (512)] [--seed N] [--verify-rows 0|1] [--warm-up 0|1]\n"
                "  [--check-stride N (4096)] [--megalon-time-sample N (0 = off)] [--start-timeout-ms T] [--backend plain|megalon] [--megalon-lib PATH]\n"
@@ -1043,6 +1075,11 @@ int main(int argc, char **argv) {
     else if (a == "--load-threads") o.load_threads = std::stoul(v());
     else if (a == "--publish-ms") o.publish_us = std::stoull(v()) * 1000;
     else if (a == "--publish-us") o.publish_us = std::stoull(v());
+    else if (a == "--update-mode") {
+      const std::string m = v();
+      if (m != "stream" && m != "batch") usage();
+      o.stream = m == "stream";
+    }
     else if (a == "--dim") o.p.dim = std::stoul(v());
     else if (a == "--row-cap") o.p.row_cap = std::stoull(v());
     else if (a == "--row-div") o.p.row_div = std::stoull(v());
@@ -1100,6 +1137,10 @@ int main(int argc, char **argv) {
     return 0;
   }
   if (o.run_id == 0 && !o.preload_only) usage();
+  if (o.stream && o.publish_us) {
+    std::fprintf(stderr, "recsys-server: --update-mode stream needs --publish-ms 0 (no publication period)\n");
+    return 2;
+  }
   if ((o.preload_only || o.preloaded) && o.backend != "plain") {
     std::fprintf(stderr, "recsys-server: --preload-only/--preloaded are for the plain backend\n");
     return 2;

@@ -52,6 +52,20 @@ asyncio peer (e.g. for a LangChain VectorStore client).
    scripts match it), result = the lowest probed rate, `confirmed` false. Cost of a failed first confirm: one confirm
    (`--confirm-reps` × (`--step-warmup-s` + `--confirm-s` + `--drain-s`), ≈ 2 min at 3 × (3 + 30 + 5) s) per probe,
    typically 2-6 probes (H1 r1 shapes replayed offline: mean 4.5, worst case 6 = ≈ 12 min).
+Opt-in for workloads whose tail latency can be worst at LOW load (RecSys: updates at an absolute rate, so a query
+at a low rate absorbs every invalidation since the previous one; user decisions 2026-10-19; defaults 0 = off, every
+other caller unchanged, manifest key `min_step_queries= ramp_knee=` only when set):
+- `--min-step-queries N`: every measured step (ramp, bisect, confirm, fill, overload) lasts at least N / (SLO-stream
+  rate) s, so a nearest-rank p95 is not the slowest of a handful of queries (RecSys: 100 -> 100 s at 1 query/s).
+- `--ramp-knee K`: a failed ramp step does not end the ramp. The ramp ends at the knee = the first step of K
+  consecutive failed steps after the last pass whose SLO percentile does not fall from step to step (a falling
+  percentile = still the low-rate regime; the run restarts there), or at the first saturated step (SLO stream falls
+  behind / queue cap). Fails before the first pass never end it (unless saturated); there the rate grows by f².
+  Ramp steps run without the early "SLO already exceeded" abort, so every low-rate p95 is complete. Bisect and
+  confirm then work between the highest pass below the knee and the knee as above (result = definition (가)).
+  `summary.json` adds `ramp_policy` {knee_k, min_step_queries, knee_offered} and `low_rate_violations` (failed
+  ramp/bisect steps below the result: phase, offered_x, x, pslo_ms, n, reason). Code: `slo_search.h` KneeRamp
+  (unit test in `test/slo_search_test.cc`). No pass below the knee: note "no passing ramp step below the knee".
 Every ramp/bisect step is a (throughput, tail latency) point; the ramp gives the low-load part of the curve,
 the bisection the knee, the first failing ramp step a point past it; afterwards `fill` points at the result x
 0.7/0.8/0.9 (the bend) and `overload` points at the first-fail rate x 1.05/1.1/1.2 (past the knee), both measured
