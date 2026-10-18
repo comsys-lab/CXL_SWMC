@@ -13,7 +13,8 @@ usage: v1_check.py <measurement dir> <hw|pop|mg|mgoff> [--h1] [--oppoint-report]
   "V1CHECK OPFAIL <system> ..." and exit 3 instead of FAIL / 1. Any other failure (torn rows, misses, queries, system
   checks) keeps FAIL / 1. Without the flag the behaviour is unchanged.
 --h1 (H1 main runs, reports/H1-main-packet.md §8.1 "DLRM: v1_check-style invariants (torn rows 0, updater sustained
-  +-2 %, flush_overruns 0)"; coordinator 2026-10-17): updater limit 0.98 x offered. SLO searches (summary mode slo)
+  +-2 %, flush_overruns 0)"; coordinator 2026-10-17): updater limit 0.98 x updates sent in the step (v0.6.8, user
+  2026-10-18; was 0.98 x the nominal offered rate, which flagged Poisson-low steps). SLO searches (summary mode slo)
   include points past the knee on purpose: the update checks (updater, flush_overruns 0, round guard, rows per full
   round +-15 %) use only the steps that passed the SLO, outside the overload phase, at offered x <=
   max_offered_x_pass, each over its own node-0 snapshots; violations on other steps are NOTEs, never a stop. Fixed
@@ -26,7 +27,9 @@ Reads <dir>/loadgen/stats/step<N>-{begin,end}-t{0,1}.txt of the measured step(s)
 node 1; window deltas) and <dir>/breakdown.csv. Checks (FAIL = stop the block):
   all   torn_rows delta 0, misses 0, update_misses 0; >= 1 query; >= 2 publication rounds in the window;
         flush_overruns delta 0 and update_rate_sustained=1 (no round longer than T); the updater keeps up: every
-        measured loadgen step has update achieved/offered >= 0.95, no saturated/aborted step (steps.jsonl); rows
+        measured loadgen step has update completions in the window (achieved x measure_s) >= 0.95 x updates sent in
+        the step (v0.6.8; loadgen's own keep-up rule; >= 100 sent, else FAIL; achieved/offered is printed as
+        information only), no saturated/aborted step (steps.jsonl); rows
         published per round within +-15% of rows_per_round_target (when a target is set), normalised by the samples
         published in the window (v1.2.7, user 2026-10-17): rows_per_full_round = d(round_rows) / (d(published_seq) /
         (R x T)), R = the configured update rate (manifest loadgen_args "--fixed update=R"), T = publish_us / 1e6 of
@@ -157,15 +160,27 @@ def main():
         return bool(d.get('pass')) and d.get('phase') != 'overload' and not d.get('aborted') \
             and float(d.get('offered_x', 0)) <= xmax * (1 + 1e-9)
     bad = opfail
+    lim = 0.98 if h1 else 0.95
     for d in meas:
         u = d.get('streams', {}).get('update', {})
         off, ach = float(u.get('offered', 0)), float(u.get('achieved', 0))
-        vals[f'update_achieved_offered.step{d.get("step")}'] = f'{ach:.2f}/{off:.2f}'
+        sent, win = int(u.get('sent', 0) or 0), float(d.get('measure_s', 0))
+        # completions inside the window: loadgen sets achieved = completions in [ws, we_eff) / win with win = we_eff - ws
+        # <= measure_s (we_eff = min(we, last send)); steps.jsonl has no win, so achieved x measure_s over-counts by
+        # at most one inter-arrival gap / measure_s (< 0.1 % at >= 188 updates/s; aborted steps fail separately)
+        comp = ach * win
+        vals[f'update_achieved_offered.step{d.get("step")}'] = f'{ach:.2f}/{off:.2f}'  # nominal rate: information only
+        vals[f'update_completed_sent.step{d.get("step")}'] = f'{comp:.0f}/{sent}'
         bad_step = d.get('aborted') or 'saturated' in str(d.get('reason', ''))
-        lim = 0.98 if h1 else 0.95
         rec = bad if checked(d) else (lambda t: notes.append(t + ' [not a checked step]'))
-        if off <= 0 or not ach >= lim * off:
-            rec(f'step {d.get("step")} ({d.get("phase")}): updater behind (update achieved {ach} < {lim} x offered {off})')
+        # v0.6.8 (user 2026-10-18 "응 그렇게 진행해"): the updater keeps up when its completions in the window reach
+        # lim x the updates SENT in the step (loadgen.cc keep-up rule `achieved * win < (1 - tol) * sent`), not lim x the
+        # nominal offered rate (a Poisson count over a 15 s step is itself noisy, sd ~1.9 % at 2,830 updates)
+        if off <= 0 or sent < 100:
+            rec(f'step {d.get("step")} ({d.get("phase")}): updater not judgeable (offered {off}, updates sent {sent} < 100)')
+        elif comp < lim * sent:
+            rec(f'step {d.get("step")} ({d.get("phase")}): updater behind (update completions {comp:.0f} < {lim} x sent {sent}; '
+                f'achieved {ach} /s, offered {off} /s)')
         if bad_step:
             rec(f'step {d.get("step")} ({d.get("phase")}): aborted/saturated ({d.get("reason", "")})')
     # windows for the round accounting: whole span, or the checked steps' own snapshots (H1 SLO)

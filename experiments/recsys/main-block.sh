@@ -456,10 +456,16 @@ h1_warmup() {  # unmeasured warm-up before an SLO part (as every earlier lifetim
     --warmup-s 10 --step-warmup-s 0 --step-measure-s 70 --drain-s 10
   local rc=$?; [ $rc = 0 ] || stop "$NAME warm-up rc $rc"
 }
+# v0.6.8 (user 2026-10-18 "응 그렇게 진행해"): the SLO search runs with loadgen --tol 0.02, so a step whose update
+# completions in the window fall below 98 % of the updates SENT in it fails inside the search (ramp stops there, bisect
+# and confirm count it as a failed probe). loadgen applies --tol to every stream with >= 100 sent, so the query stream
+# is judged by the same rule. Fixed parts keep loadgen's default --tol (0.05; a fixed run never stops on it, the
+# operating point is judged by v1_check.py --h1 over the L2+L1 span: update completions >= 0.98 x sent).
+H1_SLO_TOL=0.02
 h1_slo() {  # <sys>: warm-up + full SLO search -> $LS/slo
   local s=$1 rc RD=$LS/slo note=""
   h1_warmup
-  measure "$LS" slo "${LGC[@]}" --opt seed=$SEED --seed $SEED --slo query:$SLO_PCT:$SLO_MS --raw \
+  measure "$LS" slo "${LGC[@]}" --opt seed=$SEED --seed $SEED --slo query:$SLO_PCT:$SLO_MS --raw --tol $H1_SLO_TOL \
     --mode slo --start 1 --factor 1.5 --precision 0.02 --confirm-precision 0.01 --max-confirm-probes 6 --confirm-step-down 0.05 --max-steps 20
   rc=$?
   echo "$NAME slo: loadgen seed $SEED" >> "$E/seeds.txt"
