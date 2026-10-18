@@ -9,11 +9,11 @@
 #   3 verify op on both nodes (every entry of each node's DB complete and ordered), stats op, expected activity
 #   4 opsplit rows (get/update with T > 0, C within [0, T]) and clean-stop counts
 # usage: host_test.sh <work dir (new)> <rocksdb build dir> <loadgen build dir with the rocksdb plugin> [keys (200000)]
-#        env: CPUS0 / CPUS1 / CPUSL (node0 / node1 / loadgen CPU lists, default Host node1)
+#        env: CPUS0 / CPUS1 / CPUSL (node0 / node1 / loadgen CPU lists), RATES, STEP_S, UPDATE_RATIO, WBMB
 set -uo pipefail
 WD=$1; B=$(cd "$2" && pwd); LG=$(cd "$3" && pwd); N=${4:-200000}
 HERE=$(cd "$(dirname "$0")" && pwd); W=$(cd "$HERE/.." && pwd)
-C0=${CPUS0:-18-23,50-55}; C1=${CPUS1:-24-29,56-61}; CL=${CPUSL:-30-31,62-63}
+C0=${CPUS0:-18-20,50-52}; C1=${CPUS1:-21-23,53-55}; CL=${CPUSL:-18-23,50-55}  # Host sys partition (measure.slice CPUs are exclusive)
 CTL=$W/../lmdb/tools/lmdb_ctl.py  # same stats (10) / verify (11) ops
 mkdir "$WD" || exit 2; WD=$(cd "$WD" && pwd); cd "$WD"
 RESULT=0
@@ -52,8 +52,8 @@ fi
 
 echo "== 2 loadgen"
 taskset -c "$CL" "$LG/loadgen" --workload rocksdb --target 127.0.0.1:17200,127.0.0.1:17201 --out lg \
-  --opt keys=$N --opt log=1 --opt update_ratio=${UPDATE_RATIO:-0.5} --mode fixed --rates ${RATES:-2000,8000} --mix mixed=1 \
-  --warmup-s 2 --step-warmup-s 1 --step-measure-s ${STEP_S:-10} --drain-s 5 --stats-op 10 > lg.log 2>&1 || fail loadgen
+  --opt keys=$N --opt log=1 --opt update_ratio=${UPDATE_RATIO:-0.5} --mode fixed --rates ${RATES:-4000,12000} --mix mixed=1 \
+  --warmup-s 2 --step-warmup-s 1 --step-measure-s ${STEP_S:-15} --drain-s 5 --stats-op 10 > lg.log 2>&1 || fail loadgen
 tail -3 lg.log; head -9 lg/rocksdb.txt
 
 echo "== 3 verify + stats"
