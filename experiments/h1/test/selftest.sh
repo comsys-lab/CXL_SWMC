@@ -20,8 +20,14 @@
 #   I  D1: H1_PLAN and gate threshold overrides refused without H1_DRY=1; D3: a real stage refuses pgid != pid and passes
 #      the pgid check under setsid (it then stops at the real pretouch gate, which has a dummy dir; lock released)
 #   J  r1 skip: r1-vdb refused after a stopped r1-lmdb, starts after h1-accept.sh --skip lmdb (logged); --skip refused
-#      for an accepted stage, for r2 and twice; a skipped stage cannot be accepted; r2 still refuses
-#   K  check.py W7 (knee bracket at the probe limit or rel_width > 5 %, weakest named; legacy runs without the field: no W7)
+#      for an accepted stage, for r2 and twice; a skipped stage cannot be accepted; r2 / r3 with the skipped lmdb among
+#      the chosen workloads refused (H1 v0.6.5)
+#   L  r2 subset preconditions (H1 v0.6.5, user 2026-10-18: r2 = LMDB + vector DB while RecSys r1 is on hold): with
+#      no recsys r1 at all, r2 --workloads vdb,lmdb runs (order lmdb, vdb); r2 (all four) and r2 --workloads
+#      lmdb,recsys refused; an unaccepted chosen r1 (lmdb ran, not yet accepted) refused; r3 --workloads lmdb,vdb
+#      refused with vdb r2 unaccepted, r3 --workloads kv refused (no r2), r3 --workloads lmdb runs
+#   K  check.py W7 (knee bracket at the probe limit or rel_width > 5 %, weakest named; legacy runs without the field: no W7);
+#      W4 names both rounds' confirm searches when one did not pass its first confirm (v0.6.5), legacy runs: no note
 # Prints "SELFTEST PASS" or "SELFTEST FAIL <case>".
 set -uo pipefail
 O=${1:?out dir}
@@ -182,8 +188,11 @@ grep -q "previous stage lmdb SKIPPED (not accepted): selftest: injected STOP" "$
 bash $H/h1-accept.sh "$O/J" 1 vdb selftest >> "$O/J.out" 2>&1 || fail "J accept vdb"
 stage J r1-recsys || fail "J r1-recsys"
 bash $H/h1-accept.sh "$O/J" 1 recsys selftest >> "$O/J.out" 2>&1 || fail "J accept recsys"
-stage J r2 --workloads kv && fail "J r2 ran with r1 lmdb skipped"
-grep -q "SEQUENCE STOP: r1 of lmdb not checked PASS + accepted" "$O/J.out" || fail "J r2 refusal reason"
+stage J r2 --workloads kv,lmdb && fail "J r2 ran with r1 lmdb skipped"
+grep -q "SEQUENCE STOP: r1 of lmdb not checked PASS + accepted (skipped)" "$O/J.out" || fail "J r2 refusal reason"
+stage J r3 --workloads lmdb && fail "J r3 ran with r1 lmdb skipped"
+[ "$(grep -c "SEQUENCE STOP: r1 of lmdb not checked PASS + accepted (skipped)" "$O/J.out")" = 2 ] || fail "J r3 refusal reason"
+[ ! -e "$O/J/kv/r2" ] && [ ! -e "$O/J/lmdb/r3" ] || fail "J refused stage left a round dir"
 echo "J OK"
 # K W7 (verifier MED-1 on v0.6.3): copy of A's kv r1 with knee-bracket fields added: pop u50 (weakest) at the probe
 #   limit, mg u80 rel_width 0.06 -> two W7 WARNs (weakest named), hw u5 rel_width 0.01 -> OK; untouched legacy runs: no W7
@@ -204,5 +213,53 @@ grep -q "^WARN W7 pop-u50-slo-r1 knee bracket: pop u50: rel_width 0.0954, finish
   && grep -q "^WARN W7 mg-u80-r1-slo knee bracket: mg u80: rel_width 0.06, .*not the weakest (pop)" "$C" \
   && grep -q "^OK   W7 hw-u5-slo-r1 knee bracket" "$C" && [ "$(grep -c "W7 " "$C")" = 3 ] \
   && tail -n 1 "$C" | grep -q "^H1CHECK PASS" || fail "K W7 ($(grep W7 "$C"; tail -n 1 "$C"))"
+# K2 W4 search note (v0.6.5): r2 of kv with pop u50 confirm x +20 % vs r1, r1 at the probe limit (v0.6.3 summary),
+#   r2 bisected (v0.6.5 summary with step_down) -> the W4 WARN names both searches; hw u5 +20 % with legacy summaries
+#   (no confirm_search): W4 WARN without the note
+python3 -I -B - "$O/K/kv" <<'PY' || fail "K2 edit"
+import json, os, sys
+d = sys.argv[1]
+def ed(rnd, name, f):
+    p = os.path.join(d, rnd, "run", name, "slo", "loadgen", "summary.json")
+    s = json.load(open(p)); f(s); json.dump(s, open(p, "w"))
+ed("r2", "pop-u50-r2", lambda s: (s["confirm"].update(x_mean=s["confirm"]["x_mean"] * 1.2),
+   s.update(confirm_search={"finish": "bracket within confirm precision", "step_down": 0.05})))
+ed("r2", "hw-u5-r2", lambda s: s["confirm"].update(x_mean=s["confirm"]["x_mean"] * 1.2))
+PY
+python3 -B $H/check.py --plan $H/h1-plan.tsv --workload kv --round 2 --skip-fig2 "$O/K" > "$O/K2.out" 2>&1
+C=$O/K/kv/r2/check.txt
+grep -q "^WARN W4 u50 pop x vs r1: .*confirm search r1 'probe limit (hi/lo 1.0954 > 1 + 0.01)' (v0.6.3), r2 'bracket within confirm precision' (v0.6.5)" "$C" \
+  && grep "^WARN W4 u5 hw x vs r1" "$C" | grep -vq "confirm search" && grep -q "^OK   W4 u80 mg x vs r1" "$C" \
+  || fail "K2 W4 note ($(grep W4 "$C" | head -4))"
 echo "K OK"
+# L r2 for a chosen subset (H1 v0.6.5): preconditions per chosen workload only
+mkdir "$O/L"
+la() { bash $H/h1-accept.sh "$O/L" "$1" "$2" selftest >> "$O/L.out" 2>&1 || fail "L accept r$1 $2"; }
+stage L r1-kv || fail "L r1-kv"; la 1 kv
+stage L r1-lmdb || fail "L r1-lmdb"
+stage L r2 --workloads lmdb && fail "L r2 ran with r1 lmdb not accepted"
+grep -q "SEQUENCE STOP: r1 of lmdb not checked PASS + accepted (r2/r3 need r1 accepted for each chosen workload)" "$O/L.out" \
+  || fail "L unaccepted refusal reason"
+la 1 lmdb
+stage L r1-vdb || fail "L r1-vdb"; la 1 vdb
+[ ! -e "$O/L/recsys" ] || fail "L recsys dir exists"
+stage L r2 && fail "L r2 (all four) ran without recsys r1"
+grep -q "SEQUENCE STOP: r1 of recsys not checked PASS + accepted" "$O/L.out" || fail "L r2 all reason"
+stage L r2 --workloads lmdb,recsys && fail "L r2 lmdb,recsys ran without recsys r1"
+[ ! -e "$O/L/lmdb/r2" ] || fail "L refused r2 left lmdb/r2"
+stage L r2 --workloads vdb,lmdb || fail "L r2 lmdb,vdb with recsys r1 missing (see $O/L.out)"
+grep -q "\[r2\] stage start: round 2, workloads \[lmdb vdb\]" "$O/L/h1-state.txt" || fail "L r2 order"
+grep -q "STAGE DONE r2 \[lmdb vdb\]" "$O/L/h1-state.txt" || fail "L no STAGE DONE r2 [lmdb vdb]"
+for w in lmdb vdb; do tail -n 1 "$O/L/$w/r2/check.txt" | grep -q "^H1CHECK PASS" || fail "L $w r2 check"
+  [ -f "$O/L/$w/collect-all-r2/slo-summary.csv" ] || fail "L $w collect-all-r2"; done
+[ ! -e "$O/L/kv/r2" ] && [ ! -e "$O/L/recsys" ] || fail "L r2 ran outside the subset"
+la 2 lmdb
+stage L r3 --workloads lmdb,vdb && fail "L r3 ran with vdb r2 not accepted"
+grep -q "SEQUENCE STOP: r2 of vdb not checked PASS + accepted" "$O/L.out" || fail "L r3 vdb reason"
+stage L r3 --workloads kv && fail "L r3 kv ran without r2"
+grep -q "SEQUENCE STOP: r2 of kv not checked PASS + accepted" "$O/L.out" || fail "L r3 kv reason"
+[ ! -e "$O/L/lmdb/r3" ] && [ ! -e "$O/L/kv/r3" ] || fail "L refused r3 left a round dir"
+stage L r3 --workloads lmdb || fail "L r3 lmdb"
+grep -q "STAGE DONE r3 \[lmdb\]" "$O/L/h1-state.txt" || fail "L no STAGE DONE r3 [lmdb]"
+echo "L OK"
 echo "SELFTEST PASS"

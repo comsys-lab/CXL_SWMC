@@ -77,7 +77,10 @@ struct Config {
   double confirm_s = 30;
   uint32_t confirm_reps = 3;
   double confirm_precision = 0.01;  // after a failed confirm: confirm-length bisection to hi/lo <= 1 + this (2026-10-18)
-  uint32_t max_confirm_probes = 5;  // confirms after the first one (>= 2: the legacy "three rates" note stays true)
+  uint32_t max_confirm_probes = 6;  // confirms after the first one (>= 2: the legacy "three rates" note stays true)
+  // while no rate is confirmed: next candidate = max(nearest ramp/bisect pass below the last failed confirm f,
+  // f / (1 + this)) (H1 v0.6.5, 2026-10-18; v0.6.3 jumped to the next lower ramp pass however far below)
+  double confirm_step_down = 0.05;
   std::vector<double> overload = {1.05, 1.1, 1.2};  // SLO mode: extra points at first-fail x f (past the knee)
   std::vector<double> fill = {0.7, 0.8, 0.9};       // SLO mode: extra points at the result x f (bend before the knee)
   double tol = 0.05;            // achieved >= (1 - tol) * offered
@@ -107,7 +110,10 @@ void usage() {
                "  --confirm-s S --confirm-reps N        SLO mode: repeats at the found rate (30 s x 3)\n"
                "  --confirm-precision P --max-confirm-probes N   SLO mode: after a failed confirm, bisect with full\n"
                "                                        confirms between the highest confirmed pass and the lowest\n"
-               "                                        confirm fail to hi/lo <= 1 + P, at most N confirms (0.01, 5)\n"
+               "                                        confirm fail to hi/lo <= 1 + P, at most N confirms (0.01, 6)\n"
+               "  --confirm-step-down S                 SLO mode: until a confirm passes, the next candidate below a\n"
+               "                                        failed confirm f is max(nearest ramp/bisect pass below f,\n"
+               "                                        f / (1 + S)); S in [0.02, 0.05] (0.05)\n"
                "  --overload f1,f2,...|none             SLO mode: points at first-fail rate x f, measured in full\n"
                "                                        (no early SLO abort) for the curve past the knee (1.05,1.1,1.2)\n"
                "  --fill f1,f2,...|none                 SLO mode: points at the result x f for the bend (0.7,0.8,0.9)\n"
@@ -171,6 +177,7 @@ Config parse(int argc, char **argv) {
     else if (a == "--confirm-reps") c.confirm_reps = std::stoul(need(i));
     else if (a == "--confirm-precision") c.confirm_precision = std::atof(need(i).c_str());
     else if (a == "--max-confirm-probes") c.max_confirm_probes = std::stoul(need(i));
+    else if (a == "--confirm-step-down") c.confirm_step_down = std::atof(need(i).c_str());
     else if (a == "--fill") {
       std::string v = need(i);
       c.fill.clear();
@@ -204,6 +211,7 @@ Config parse(int argc, char **argv) {
   if (c.factor <= 1 || c.precision <= 0 || c.conns == 0) die("bad --factor/--precision/--conns");
   if (c.confirm_precision <= 0 || c.max_confirm_probes < 2 || c.confirm_reps == 0)
     die("bad --confirm-precision (> 0) / --max-confirm-probes (>= 2) / --confirm-reps (>= 1)");
+  if (!(c.confirm_step_down >= 0.02 && c.confirm_step_down <= 0.05)) die("bad --confirm-step-down (0.02 .. 0.05)");
   if (c.arrival != "poisson" && c.arrival != "uniform") die("--arrival poisson|uniform");
   return c;
 }
@@ -330,13 +338,13 @@ class Engine {
       search_note(s, "bisect", m);
       (s.pass ? good : bad) = m;
     }
-    // confirm phase (decision 2026-10-18 "A+C"): confirm `good`; if most repeats fail, bisect between the highest
-    // confirmed pass (lower ramp/bisect passes re-confirmed first) and the lowest confirm fail with full confirms to
-    // --confirm-precision instead of stepping down by --precision (the old step-down left up to one precision step
-    // between the reported max and the knee unmeasured)
+    // confirm phase (decision 2026-10-18 "A+C", fallback H1 v0.6.5): confirm `good`; if most repeats fail, step down
+    // from the last failed confirm by at most --confirm-step-down (a known ramp/bisect pass closer below is taken
+    // instead) until a confirm passes, then bisect between the highest confirmed pass and the lowest confirm fail
+    // with full confirms to --confirm-precision (slo_search.h)
     std::vector<double> passes;
     for (auto &f : search_) if (f.pass) passes.push_back(f.offered);
-    const ConfirmOutcome o = confirm_search(good, passes, c_.precision, c_.confirm_precision, c_.max_confirm_probes,
+    const ConfirmOutcome o = confirm_search(good, passes, c_.confirm_step_down, c_.confirm_precision, c_.max_confirm_probes,
                                             [&](double x, const char *) -> int {
       Probe p;
       p.offered = x;
@@ -744,7 +752,7 @@ class Engine {
       << " step_warmup_s=" << c_.step_warmup_s << " step_measure_s=" << c_.step_measure_s
       << " drain_s=" << c_.drain_s << " confirm_s=" << c_.confirm_s << " confirm_reps=" << c_.confirm_reps
       << " confirm_precision=" << c_.confirm_precision << " max_confirm_probes=" << c_.max_confirm_probes
-      << " overload=" << [&] { std::string o; for (double f : c_.overload) o += (o.empty() ? "" : ",") + fmt(f); return o.empty() ? std::string("none") : o; }()
+      << " confirm_step_down=" << c_.confirm_step_down << " overload=" << [&] { std::string o; for (double f : c_.overload) o += (o.empty() ? "" : ",") + fmt(f); return o.empty() ? std::string("none") : o; }()
       << "\ntol=" << c_.tol << " max_err=" << c_.max_err << " abort_queue_s=" << c_.abort_queue_s
       << " lag_limit_us=" << c_.lag_limit_us << "\nstats_op=" << c_.stats_op << "\n";
     for (auto &kv : c_.mix) m << "mix." << kv.first << "=" << kv.second << "\n";
@@ -782,7 +790,7 @@ class Engine {
         << (confirmed_ && best_bad_ > 0 ? fmt(best_bad_ / best_ - 1) : std::string("null")) << "}"
         << ",\"confirm_search\":{\"finish\":\"" << confirm_search_finish_ << "\",\"precision\":" << fmt(c_.precision)
         << ",\"confirm_precision\":" << fmt(c_.confirm_precision) << ",\"max_probes\":" << c_.max_confirm_probes
-        << ",\"probes\":" << (probes_.empty() ? 0 : probes_.size() - 1) << "},\"confirm_probes\":[";
+        << ",\"step_down\":" << fmt(c_.confirm_step_down) << ",\"probes\":" << (probes_.empty() ? 0 : probes_.size() - 1) << "},\"confirm_probes\":[";
       for (size_t k = 0; k < probes_.size(); k++) {
         auto &p = probes_[k];
         s << (k ? "," : "") << "{\"offered_x\":" << fmt(p.offered) << ",\"role\":\"" << p.role << "\",\"reps\":"

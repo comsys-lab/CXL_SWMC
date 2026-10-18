@@ -36,19 +36,22 @@ asyncio peer (e.g. for a LangChain VectorStore client).
 3. Confirm the best passing rate with `--confirm-reps` × `--confirm-s` (3 × 30 s; a confirm passes when at most
    half of its repeats fail). If it fails (since 2026-10-18, decision "A+C"; before: step down by the precision and
    confirm again, at most twice, which left up to one precision step between the result and the knee unmeasured):
-   bisect geometrically with full confirms between the highest confirmed pass and the lowest confirm-failed rate
-   until hi/lo ≤ 1 + `--confirm-precision` (1 %), at most `--max-confirm-probes` (5) confirms after the first. The
-   lower bound starts as the highest ramp/bisect pass below the failed rate, confirmed first (a fail moves to the
-   next lower pass; none left: the failed rate / (1 + precision)). Code: `slo_search.h` (unit test
+   first find a confirmed lower bound, then bisect geometrically with full confirms between the highest confirmed
+   pass and the lowest confirm-failed rate until hi/lo ≤ 1 + `--confirm-precision` (1 %), at most
+   `--max-confirm-probes` (6) confirms after the first. Lower bound (H1 v0.6.5, 2026-10-18; v0.6.3 took the next
+   lower ramp/bisect pass however far below, e.g. LMDB hw-u50 r1 160.6k fail -> 146.0k fail -> 64.9k): after a failed
+   confirm at f the next candidate is max(highest ramp/bisect pass below f, f / (1 + `--confirm-step-down`)), default
+   0.05, allowed 0.02-0.05, so the search never jumps more than one geometric step below the last failed confirm
+   unless a known pass lies closer; repeated until a confirm passes. Code: `slo_search.h` (unit test
    `test/slo_search_test.cc`). Reported: confirm mean/sd of x and of the SLO percentile at the highest confirmed
    pass; `summary.json` adds `confirmed`, `bracket` {lo_offered = the result, hi_offered = the lowest failed rate
    above it (ramp/bisect step or failed confirm; also `min_offered_x_fail`), hi_phase, hi_x, rel_width},
-   `confirm_search` {finish, precision, confirm_precision, max_probes, probes} and `confirm_probes` (every confirm:
+   `confirm_search` {finish, precision, confirm_precision, max_probes, step_down, probes} and `confirm_probes` (every confirm:
    offered_x, role first|lower|step-down|bisect, reps, fails, pass, x_mean, pslo_mean_ms). No confirmed pass within
    the probes: note "confirm failed at three rates; the knee is noisy (longer --confirm-s?)" (unchanged text; harness
    scripts match it), result = the lowest probed rate, `confirmed` false. Cost of a failed first confirm: one confirm
    (`--confirm-reps` × (`--step-warmup-s` + `--confirm-s` + `--drain-s`), ≈ 2 min at 3 × (3 + 30 + 5) s) per probe,
-   typically 2-4 probes.
+   typically 2-6 probes (H1 r1 shapes replayed offline: mean 4.5, worst case 6 = ≈ 12 min).
 Every ramp/bisect step is a (throughput, tail latency) point; the ramp gives the low-load part of the curve,
 the bisection the knee, the first failing ramp step a point past it; afterwards `fill` points at the result x
 0.7/0.8/0.9 (the bend) and `overload` points at the first-fail rate x 1.05/1.1/1.2 (past the knee), both measured

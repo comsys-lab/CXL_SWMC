@@ -30,7 +30,9 @@ WARN checks:
   W2 confirm x_sd / x_mean > 5 % or confirm fails >= 1
   W3 fixed window achieved (all streams) / offered < 0.95 or pass = False (expected possible for the weakest system at L1)
   W4 (n > 1) a system's confirm x_mean differs from round 1 by > 10 %, or this round's weakest system differs from
-     levels.tsv
+     levels.tsv; the x message names both rounds' confirm searches (finish, fallback version: v0.6.5 = summary
+     confirm_search has step_down, else v0.6.3) when either first confirm failed: the confirm fallback changed
+     between r1 (v0.6.3.2) and r2 (v0.6.5) and only matters after a failed first confirm (packet v0.6.5 §8.1)
   W5 Megalon C_sampled_ns > T_mg_on_ns on a row
   C1/C2 (n > 1; REPORT, not FAIL: separate vs continuous, user decision 2026-10-18) hw/pop T r1 (separate lifetime)
      vs r<n> (continuous) beyond max(5 %, 2 x run-to-run spread), C_diff beyond max(10 %, 2 x |dT_mg|); see compare().
@@ -201,6 +203,12 @@ def compare(W, n, E, mixes, skip):
 def confirm_x(rd):
     s = js(os.path.join(rd, "loadgen", "summary.json")) or {}
     return s.get("confirm", {}).get("x_mean")
+
+
+def search_tag(rd):
+    """(finish, fallback version) of a run's confirm search; finish "" for runs before the 2026-10-18 loadgen."""
+    cs = (js(os.path.join(rd, "loadgen", "summary.json")) or {}).get("confirm_search") or {}
+    return cs.get("finish") or "", "v0.6.5" if "step_down" in cs else "v0.6.3" if cs else "pre-A+C"
 
 
 def main():
@@ -377,8 +385,13 @@ def main():
                 r1 = next((x["dir"] for x in (runs(os.path.join(E, W, "r1", "run")) or [])
                            if x["mix"] == m and x["sys"] == s and x["phase"] == "slo"), "")
                 x1 = confirm_x(r1) if r1 else None
+                rn = next((x["dir"] for x in rs["slo"] if x["mix"] == m and x["sys"] == s), "")
+                t1, tn = search_tag(r1) if r1 else ("", "?"), search_tag(rn) if rn else ("", "?")
+                note = "" if not any(t[0] and t[0] != "first confirm passed" for t in (t1, tn)) else \
+                    f"; confirm search r1 '{t1[0]}' ({t1[1]}), r{n} '{tn[0]}' ({tn[1]}): fallback differs by version " \
+                    "after a failed first confirm (packet v0.6.5 §8.1)"
                 res("W", f"W4 {m} {s} x vs r1", x1 and abs(xs[(m, s)] / float(x1) - 1) <= 0.10,
-                    f"r{n} {xs[(m, s)]:g} vs r1 {x1}")
+                    f"r{n} {xs[(m, s)]:g} vs r1 {x1}{note}")
     if n > 1:
         compare(W, n, E, mixes, a.skip_fig2)
     verdict = f"H1CHECK {'FAIL' if nfail else 'PASS'} {W} r{n}: {nfail} FAIL, {nwarn} WARN, {nrep} REPORT"

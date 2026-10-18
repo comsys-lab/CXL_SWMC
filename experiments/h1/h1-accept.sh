@@ -1,6 +1,7 @@
 #!/bin/bash
 # Record the main session's acceptance of one H1 main stage result (user decision 2026-10-17: each workload's round-1
-# result is checked by the main session before the next workload starts; rounds 2/3 only after all four r1 pass).
+# result is checked by the main session before the next workload starts; rounds 2/3 of a workload only after its r1
+# is accepted, H1 v0.6.5).
 # usage: h1-accept.sh <evidence root E> <round n> <workload W> [<free-text remark>] [--user-ack "<state/TASKS.md ref>"]
 # check.txt REPORT lines (separate vs continuous beyond the run-to-run spread, user decision 2026-10-18) must be seen
 # by the user before r3: with REPORT lines the record needs --user-ack naming the user's decision in state/TASKS.md.
@@ -11,13 +12,13 @@
 # --skip (round 1 only): the r1 stage of W ended in STOP / check FAIL / REPORT / an unexplained WARN and main moves on
 # to the next r1 stage. Writes <E>/accept/r1-<W>-skip.txt (reason, time, check.txt sha256 or "none", stage log
 # references); never the acceptance record. Refused if r1-<W>.txt (accepted) or a skip record already exists.
-# h1-main.sh lets the NEXT r1 stage start on it; r2/r3 still need all four r1 accepted (a skipped workload's r1 is
-# re-run in a new evidence root).
+# h1-main.sh lets the NEXT r1 stage start on it; r2/r3 refuse a skipped workload (r1 accepted for each chosen workload;
+# a skipped workload's r1 is re-run in a new evidence root).
 set -uo pipefail
 E=${1:?} N=${2:?} W=${3:?} REMARK=${4:-} ACK=
 if [ "$REMARK" = --skip ]; then
   R=${5:?--skip needs a reason}
-  [ "$N" = 1 ] || { echo "SKIP REFUSED: --skip is for round 1 only (r2/r3 need every r1 accepted)"; exit 1; }
+  [ "$N" = 1 ] || { echo "SKIP REFUSED: --skip is for round 1 only (r2/r3 need r1 accepted for each chosen workload)"; exit 1; }
   A=$E/accept/r1-$W.txt S=$E/accept/r1-$W-skip.txt C=$E/$W/r1/check.txt
   [ ! -e "$A" ] || { echo "SKIP REFUSED: $A exists (r1 $W is accepted)"; exit 1; }
   [ ! -e "$S" ] || { echo "SKIP REFUSED: $S exists"; exit 1; }

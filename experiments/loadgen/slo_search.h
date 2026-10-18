@@ -4,9 +4,11 @@
 // Input: `good` = the best ramp/bisect pass (one short step), `passes` = every ramp/bisect pass (unconfirmed), and a
 // confirm callback (one confirm = confirm_reps x confirm_s, majority rule; 1 pass, 0 fail, -1 streams exhausted).
 // 1. Confirm `good`; a pass ends the search (bracket above it = the bisect/ramp first fail).
-// 2. Otherwise (decision 2026-10-18 "A+C", replaces "step down by the precision, at most twice"): hi = good, and
-//    a) while no rate is confirmed yet: confirm the highest ramp/bisect pass below hi ("lower"); none left -> the
-//       rate hi / (1 + precision) ("step-down"); a fail lowers hi;
+// 2. Otherwise hi = good (the lowest failed confirm), and
+//    a) while no rate is confirmed yet (H1 v0.6.5, decision 2026-10-18 "탐색 fallback 수정"; v0.6.3 jumped to the
+//       next lower ramp pass however far below): confirm c = max(highest ramp/bisect pass below hi ("lower"),
+//       hi / (1 + step_down) ("step-down")), i.e. never more than one geometric step below the last failed confirm
+//       unless a known pass lies closer; a fail lowers hi and the next step starts from it;
 //    b) once lo is confirmed: confirm sqrt(lo * hi) ("bisect") until hi / lo <= 1 + confirm_precision;
 //    at most max_probes confirms after the first. Result = the highest confirmed pass (lo).
 // Finish reasons (summary.json confirm_search.finish): "first confirm passed", "bracket within confirm precision",
@@ -39,7 +41,8 @@ struct ConfirmOutcome {
 };
 
 // confirm(x, role) -> 1 pass, 0 fail, -1 streams exhausted (outcome.exhausted, search stops)
-inline ConfirmOutcome confirm_search(double good, std::vector<double> passes, double precision, double confirm_precision,
+// step_down: geometric step below the last failed confirm while nothing is confirmed (loadgen --confirm-step-down)
+inline ConfirmOutcome confirm_search(double good, std::vector<double> passes, double step_down, double confirm_precision,
                                      uint32_t max_probes, const std::function<int(double, const char *)> &confirm) {
   ConfirmOutcome o;
   auto run = [&](double x, const char *role) {
@@ -68,8 +71,8 @@ inline ConfirmOutcome confirm_search(double good, std::vector<double> passes, do
     const char *role;
     if (lo == 0) {
       while (ci < passes.size() && passes[ci] >= hi) ci++;
-      if (ci < passes.size()) m = passes[ci++], role = "lower";
-      else m = hi / (1 + precision), role = "step-down";
+      m = hi / (1 + step_down), role = "step-down";
+      if (ci < passes.size() && passes[ci] >= m) m = passes[ci++], role = "lower";
     } else if (hi / lo > 1 + confirm_precision) {
       m = std::sqrt(lo * hi), role = "bisect";
     } else {

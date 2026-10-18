@@ -3,8 +3,10 @@
 #   r1-kv, r1-lmdb, r1-vdb, r1-recsys   round 1 of one workload, in this order; the main session reviews each check
 #                                       and records its acceptance (h1-accept.sh) before the next stage may start
 #   r2, r3 [--workloads w1,w2]          repeats for all four or a user-chosen subset (plan change 2026-10-18), fixed
-#                                       order, each followed by its check; a check FAIL stops the stage; r2 needs all
-#                                       four r1 stages accepted, r3 additionally r2 accepted for each chosen workload
+#                                       order, each followed by its check; a check FAIL stops the stage; r2 needs r1
+#                                       accepted (not skipped) for each CHOSEN workload, r3 r1 and r2 accepted for each
+#                                       chosen workload (H1 v0.6.5, user 2026-10-18: r2 = LMDB + vector DB while
+#                                       RecSys r1 is on hold)
 # Orchestration only: every VM action happens inside the workload blocks (their H1 hook, experiments/h1/README.md).
 # Lifetimes (H1-HOOK v2, user decision 2026-10-18): no server lifetime only for the fixed phase except r1 hw/pop.
 #   r1 (per mix): hw, pop SLO-only lifetimes (Latin order between them), then mg: SLO -> levels-cb.sh (L1/L2 of the
@@ -74,7 +76,8 @@ accepted() {  # W n -> 0 if r<n> of W has check PASS and an acceptance record ma
     && grep -q "check_sha256=$(sha256sum < "$c" | cut -c1-64)" "$a"
 }
 # r1 chain (user decision 2026-10-18, overnight runs never sit idle): the previous r1 stage accepted, OR skipped by the
-# main session (h1-accept.sh --skip: <E>/accept/r1-<W>-skip.txt, only without an acceptance record). r2/r3 stay strict.
+# main session (h1-accept.sh --skip: <E>/accept/r1-<W>-skip.txt, only without an acceptance record). r2/r3 stay strict
+# for the chosen workloads (a skip record never counts; other workloads are not looked at, v0.6.5).
 SKIPNOTE=
 prev_r1() {  # W
   accepted $1 1 && return 0
@@ -86,7 +89,7 @@ case $STAGE in
   r1-lmdb) prev_r1 kv || { echo "SEQUENCE STOP: r1-kv not checked PASS + accepted (nor skipped)"; exit 2; };;
   r1-vdb) prev_r1 lmdb || { echo "SEQUENCE STOP: r1-lmdb not checked PASS + accepted (nor skipped)"; exit 2; };;
   r1-recsys) prev_r1 vdb || { echo "SEQUENCE STOP: r1-vdb not checked PASS + accepted (nor skipped)"; exit 2; };;
-  r2|r3) for w in $ORDER; do accepted $w 1 || { echo "SEQUENCE STOP: r1 of $w not checked PASS + accepted (r2/r3 need all four r1)"; exit 2; }; done
+  r2|r3) for w in $WL; do accepted $w 1 || { echo "SEQUENCE STOP: r1 of $w not checked PASS + accepted$([ -f "$E/accept/r1-$w-skip.txt" ] && echo " (skipped)") (r2/r3 need r1 accepted for each chosen workload)"; exit 2; }; done
          if [ $N = 3 ]; then for w in $WL; do accepted $w 2 || { echo "SEQUENCE STOP: r2 of $w not checked PASS + accepted"; exit 2; }; done; fi;;
 esac
 if [ "$DRY" = 1 ]; then
