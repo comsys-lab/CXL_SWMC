@@ -43,6 +43,23 @@
 #      manifest files, accept record attempt=recsys/r1-a3, collect-all-r1 only r1-a3 runs); retry after acceptance
 #      refused; r2 recsys uses r1-a3 levels; retry refused for a check-PASS attempt and after a skip; a broken layout
 #      is refused by attempts.py and h1-accept.sh
+#   O  v0.6.9 (user 2026-10-18: H1 RecSys T = 1 s): (1) v1_check.py short-T rules on a synthetic T = 1 s copy of the
+#      RECSYS-V1 v1.4 hw val window (3rd argument dir, read-only): 130 rounds at +1 % PASS; a round-edge snapshot
+#      (flushes off by 2 <= U) PASS with NOTE, the same at T = 60 s FAIL (unchanged); off by 5 > U FAIL (OPFAIL with
+#      --oppoint-report); update_rate_sustained=0 from overruns before the window PASS with NOTE; an overrun in the
+#      window FAIL; rows +20 % FAIL; (2) --h1 SLO copy of the stopped r1-recsys hw-peak part (4th argument) rewritten to
+#      T = 1 s: rows +20 % over < 45 checked rounds NOTE, over >= 45 rounds FAIL, +0 % PASS; (3) main-block.sh ekko_set /
+#      rate_for at RS_T_MS=1000 with builds/recsys-calib/1 (real recsys-rate runs, Host compute): peak / avg server
+#      --publish-frac = the T = 1 s calibration, loadgen update rate = the T = 60 s Ekko rate, T check written once per
+#      Ekko point; a calibration whose ref rate differs stops; RS_T_MS=60000 unchanged; static: BLOCK=h1 needs RS_T_MS,
+#      pins-recsys.sh BLOCK_ENV has RS_T_MS=1000 and RATE_T_DIR
+#   P  v0.6.9 new evidence root (h1-main.sh --from-root) and invalid rounds (h1-accept.sh --invalid): in E1 (all four
+#      r1 accepted, r2 recsys run, not accepted): --invalid r2 recsys recorded, then accept r2 recsys refused, --invalid
+#      of the accepted r1 recsys refused; r1-recsys --from-root E1 into E2: prev-root.txt with 4 records, E1 gets only
+#      accept/r1-recsys-superseded.txt (E1 listing otherwise unchanged), r2 recsys in E1 refused, E2 r1 accepted, r2
+#      --workloads recsys in E2 runs at E2's levels, r2 (all four) in E2 refused; refused: a second --from-root (already
+#      superseded), --from-root for r2, non-empty E2, E1 with vdb not accepted; a --from-root stage that stops is retried
+#      in E2 (previous stage found in E1 through prev-root.txt) and a tampered E1 acceptance record blocks that retry
 #   K  check.py W7 (knee bracket at the probe limit or rel_width > 5 %, weakest named; legacy runs without the field: no W7);
 #      W4 names both rounds' confirm searches when one did not pass its first confirm (v0.6.5), legacy runs: no note
 # Prints "SELFTEST PASS" or "SELFTEST FAIL <case>".
@@ -444,4 +461,174 @@ mkdir -p "$O/N4/recsys/r1/run" "$O/N4/recsys/r1-a2"
 python3 -I -B $H/attempts.py dir "$O/N4" recsys 1 > /dev/null 2>&1; [ $? = 2 ] || fail "N4 resolver accepted a bad layout"
 bash $H/h1-accept.sh "$O/N4" 1 recsys x > "$O/N4.out" 2>&1 && fail "N4 accept on a bad layout"
 echo "N OK"
+# O v0.6.9: short-T (T = 1 s) operating-point rules and the T = 1 s Ekko calibration path
+VC=$H/../recsys/v1_check.py
+RV=${3:-/home/comsys/sungsu/destijl-control/recovery/RECSYS-V1-v1.4}
+mkdir -p "$O/O1/base/loadgen" && cp -r "$RV/hw/val/loadgen/stats" "$RV/hw/val/loadgen/steps.jsonl" "$RV/hw/val/loadgen/summary.json" "$O/O1/base/loadgen/" \
+  && cp "$RV/hw/val/manifest.txt" "$RV/hw/val/breakdown.csv" "$O/O1/base/" || fail "O1 copy"
+ov() {  # <case> <python: edits of b / e (dicts of the step001 begin / end t0 snapshot)> [v1_check flags]
+  local c=$1 ed=$2; shift 2
+  rm -rf "$O/O1/$c"; cp -r "$O/O1/base" "$O/O1/$c" && python3 -I -B -c '
+import sys
+d = sys.argv[1] + "/loadgen/stats/"
+def rd(p): return [l.rstrip("\n") for l in open(p)]
+def wr(p, lines, kv):
+    seen = set(); out = []
+    for l in lines:
+        k = l.split("=", 1)[0]
+        if k in kv: out.append(f"{k}={kv[k]}"); seen.add(k)
+        else: out.append(l)
+    out += [f"{k}={v}" for k, v in kv.items() if k not in seen]
+    open(p, "w").write("\n".join(out) + "\n")
+b = dict(publish_us=1000000, publish_rounds=500, flushes=2000, round_rows=9000000, published_seq=90000, flush_overruns=0,
+         update_rate_sustained=1, rows_per_round_target=19192, publish_frac="0.00014302685789816636")
+e = dict(b, publish_rounds=630, flushes=2520, round_rows=9000000 + 130 * 19400, published_seq=90000 + round(130 * 188.7608))
+exec(sys.argv[2])
+for n, kv in (("step001-begin-t0.txt", b), ("step001-end-t0.txt", e)):
+    wr(d + n, rd(d + n), kv)' "$O/O1/$c" "$ed" || fail "O1 edit $c"
+  python3 -I -B $VC "$O/O1/$c" hw "$@" > "$O/O1/$c.out" 2>&1; echo "rc=$?" >> "$O/O1/$c.out"
+}
+ok1() { grep -q "$2" "$O/O1/$1.out" && grep -qx "rc=$3" "$O/O1/$1.out" || fail "O1 $1 ($(cut -c1-400 "$O/O1/$1.out"))"; }
+ov t1 ''
+ok1 t1 "^V1CHECK PASS hw .*short_T_s=1.0 .*rows_per_round_target=19192 .*rows_per_full_round_vs_target_pct=1.1" 0
+grep -q "NOTES" "$O/O1/t1.out" && fail "O1 t1 has notes"
+ov edge 'e["flushes"] = 2518'
+ok1 edge "^V1CHECK PASS hw .*round_edge_snapshots=1 .*NOTES: round edge at 1 snapshot(s) (short T; <= 1 round each): step 0 end 2518/630" 0
+ov edge60 'e["flushes"] = 2518; b["publish_us"] = e["publish_us"] = 60000000'
+ok1 edge60 "^V1CHECK FAIL hw .*round guard: step 0 end snapshot flushes 2518 != 4 x publish_rounds 630" 1
+grep -q "short_T_s" "$O/O1/edge60.out" && fail "O1 edge60 treated as short T"
+ov guard 'e["flushes"] = 2515'
+ok1 guard "^V1CHECK FAIL hw round guard: step 0 end snapshot flushes 2515 != 4 x publish_rounds 630" 1
+ov guardopr 'e["flushes"] = 2515' --oppoint-report
+ok1 guardopr "^V1CHECK OPFAIL hw round guard" 3
+ov sust 'b["update_rate_sustained"] = e["update_rate_sustained"] = 0; b["flush_overruns"] = e["flush_overruns"] = 3'
+ok1 sust "^V1CHECK PASS hw .*NOTES: update_rate_sustained=0 from 3 flush overruns before the window (none in the window; short T)" 0
+ov over 'e["update_rate_sustained"] = 0; e["flush_overruns"] = 1'
+ok1 over "^V1CHECK FAIL hw update rate not sustained (flush overruns 1 in the checked span); update_rate_sustained=0" 1
+ov rows20 'e["round_rows"] = 9000000 + 130 * 23100'
+ok1 rows20 "^V1CHECK FAIL hw rows per full round 23100 vs target 19192 (> 15% off" 1
+# O2 --h1 SLO part at T = 1 s: rows +20 % over < 45 checked rounds NOTE, >= 45 FAIL, +0 % PASS
+RS=${4:-/home/comsys/sungsu/destijl-control/recovery/H1-main-v1/recsys/r1/run/hw-peak-slo-r1/slo}
+mkdir -p "$O/O2/real/loadgen" && cp -r "$RS/loadgen/stats" "$RS/loadgen/steps.jsonl" "$RS/loadgen/summary.json" "$O/O2/real/loadgen/" \
+  && cp "$RS/manifest.txt" "$RS/breakdown.csv" "$O/O2/real/" || fail "O2 copy"
+o2() {  # <case> <rounds per measured step> <rows factor>
+  rm -rf "$O/O2/$1"; cp -r "$O/O2/real" "$O/O2/$1" && python3 -I -B -c '
+import glob, json, os, re, sys
+d, k, fac = sys.argv[1], int(sys.argv[2]), float(sys.argv[3])
+st = d + "/loadgen/stats/"
+steps = sorted(int(re.search(r"step(\d+)-begin-t0", p).group(1)) for p in glob.glob(st + "step*-begin-t0.txt"))
+pr, rr, ps = 100, 0, 0
+def wr(p, kv):
+    out, seen = [], set()
+    for l in open(p):
+        key = l.split("=", 1)[0]
+        if key in kv: out.append(f"{key}={kv[key]}\n"); seen.add(key)
+        else: out.append(l)
+    out += [f"{a}={v}\n" for a, v in kv.items() if a not in seen]
+    open(p, "w").write("".join(out))
+def snap():
+    return dict(publish_us=1000000, publish_rounds=pr, flushes=4 * pr, round_rows=rr, published_seq=ps, flush_overruns=0,
+                update_rate_sustained=1, rows_per_round_target=19192)
+for n in steps:
+    pr += 3; rr += 3 * 19192; ps += round(3 * 188.7608)
+    wr(st + f"step{n:03d}-begin-t0.txt", snap())
+    pr += k; rr += round(k * 19192 * fac); ps += round(k * 188.7608)
+    wr(st + f"step{n:03d}-end-t0.txt", snap())' "$O/O2/$1" "$2" "$3" || fail "O2 edit $1"
+  python3 -I -B $VC "$O/O2/$1" hw --h1 > "$O/O2/$1.out" 2>&1; echo "rc=$?" >> "$O/O2/$1.out"
+}
+o2 short 2 1.2
+NCK=$(grep -o "checked_steps=[0-9,]*" "$O/O2/short.out" | tr ',' '\n' | grep -c .)
+[ "$NCK" -ge 3 ] && [ $((NCK * 2)) -lt 45 ] || fail "O2 checked steps $NCK (test needs >= 3 and 2 x n < 45)"
+grep -q "^V1CHECK PASS hw .*NOTES: .*rows per full round 2[0-9]* vs target 19192 (> 15% off) over only $((NCK * 2)).0 full rounds (< 45; short T: not judged)" "$O/O2/short.out" \
+  && grep -qx "rc=0" "$O/O2/short.out" || fail "O2 short ($(cut -c1-500 "$O/O2/short.out"))"
+o2 long 15 1.2
+grep -q "^V1CHECK FAIL hw rows per full round 230[0-9]* vs target 19192" "$O/O2/long.out" || fail "O2 long ($(cut -c1-400 "$O/O2/long.out"))"
+o2 good 15 1.0
+grep -q "^V1CHECK PASS hw .*rows_per_full_round_vs_target_pct=0.0" "$O/O2/good.out" || fail "O2 good ($(cut -c1-400 "$O/O2/good.out"))"
+# O3 main-block.sh ekko_set / rate_for at RS_T_MS=1000 (functions extracted; real recsys-rate on the Host, niced on node 1)
+PP=/home/comsys/sungsu/destijl-control MB=$H/../recsys/main-block.sh
+mkdir -p "$O/O3"
+{ echo 'stop() { echo "STOPPED: $*"; exit 1; }'
+  sed -n '/^calv() {/p' "$MB"; sed -n '/^ekko_set() {/,/^}/p' "$MB"; sed -n '/^declare -A TCHK/p' "$MB"; sed -n '/^rate_for() {/,/^}/p' "$MB"
+  echo 'rate_for "$1" "$E/r1.txt" && rate_for "$1" "$E/r2.txt" && echo "PF=$PUBLISH_FRAC UR=$UPD_RATE TCHK=${TCHK[$1]:-} SA=$SA LGC=${LGC[*]}"'; } > "$O/O3/fn.sh"
+grep -q "^rate_for() {" "$O/O3/fn.sh" && grep -q "^ekko_set() {" "$O/O3/fn.sh" || fail "O3 extract"
+o3() {  # <case> <ekko> <T_MS> <RATE_T_DIR> [BLOCK]
+  mkdir -p "$O/O3/$1"
+  env -i PATH="$PATH" E="$O/O3/$1" T_MS=$3 RATE_T_DIR=$4 BLOCK=${5:-h1} XT=7200 PLAIN_BUILD=$PP/builds/recsys/12 D=$PP/builds/recsys-inputs/1 \
+    UPD_FILE=updates-day23-0-2M.smp QRY_FILE=queries-day23-89137318-1M.smp bash "$O/O3/fn.sh" "$2" > "$O/O3/$1.out" 2>&1; echo "rc=$?" >> "$O/O3/$1.out"
+}
+CAL=$PP/builds/recsys-calib/1
+o3 peak peak 1000 $CAL
+grep -q "^PF=0.00014302685789816636 UR=188.7608 TCHK=ok SA=.*--publish-frac 0.00014302685789816636 .*LGC=.*--fixed update=188.7608" "$O/O3/peak.out" \
+  && grep -q "^EKKO=peak publish_frac=0.00014302685789816636 update_rate=188.7608 samples/s T_ms=1000 " "$O/O3/peak.out" \
+  && [ "$(grep -c "^EKKO=peak" "$O/O3/peak.out")" = 2 ] && [ -f "$O/O3/peak/r1.txt.T1000" ] && [ -f "$O/O3/peak/r2.txt.T1000" ] \
+  && grep -qx "rows_per_round_target=19192" "$O/O3/peak/update-rate-T1000-peak.txt" && grep -qx "rate_samples_per_s=188.7608" "$O/O3/peak/r1.txt" \
+  || fail "O3 peak ($(cut -c1-400 "$O/O3/peak.out"))"
+o3 avg avg 1000 $CAL
+grep -q "^PF=1.523274789203064e-05 UR=14.7233 TCHK=ok .*--publish-frac 1.523274789203064e-05 .*--fixed update=14.7233" "$O/O3/avg.out" \
+  && grep -qx "rows_per_round_target=2044" "$O/O3/avg/update-rate-T1000-avg.txt" || fail "O3 avg ($(cut -c1-400 "$O/O3/avg.out"))"
+mkdir -p "$O/O3/calbad" && cp $CAL/rate-T1000-*.txt "$O/O3/calbad/" && sed -i 's/^ref_rate_samples_per_s=.*/ref_rate_samples_per_s=188.7000/' "$O/O3/calbad/rate-T1000-peak.txt"
+o3 bad peak 1000 "$O/O3/calbad"
+grep -q "STOPPED: .*ref_rate_samples_per_s != the Ekko peak rate 188.7608" "$O/O3/bad.out" && grep -qx "rc=1" "$O/O3/bad.out" || fail "O3 bad calibration ($(cat "$O/O3/bad.out"))"
+o3 t60 peak 60000 "" v1
+grep -q "^PF=0.0043 UR=188.7608 TCHK= SA=.*--publish-frac 0.0043 " "$O/O3/t60.out" && [ ! -e "$O/O3/t60/r1.txt.T60000" ] \
+  && [ -z "$(ls "$O/O3/t60" | grep -v '^r[12].txt$')" ] || fail "O3 T = 60 s path ($(cut -c1-300 "$O/O3/t60.out"))"
+grep -q 'BLOCK=h1 needs RS_T_MS' "$MB" && grep -q "RS_T_MS=1000 RATE_T_DIR=\$P/builds/recsys-calib/1" $H/plugins/pins-recsys.sh || fail "O3 static RS_T_MS"
+echo "O OK"
+# P v0.6.9 --from-root / --invalid
+mkdir "$O/P1"
+pa() { bash $H/h1-accept.sh "$O/$1" "$2" "$3" selftest >> "$O/P.out" 2>&1; }
+for w in kv lmdb vdb recsys; do stage P1 r1-$w || fail "P1 r1-$w"; pa P1 1 $w || fail "P1 accept $w"; done
+stage P1 r2 --workloads recsys || fail "P1 r2 recsys"
+cp -r "$O/P1" "$O/P1b"; cp -r "$O/P1" "$O/P1c"     # copies for the stop/retry and tamper cases
+bash $H/h1-accept.sh "$O/P1" 2 recsys --invalid "selftest: T = 60 s round-phase artifact" >> "$O/P.out" 2>&1 || fail "P invalid r2"
+grep -q "^INVALID r2 recsys" "$O/P1/accept/r2-recsys-invalid.txt" && grep -qx "reason=selftest: T = 60 s round-phase artifact" "$O/P1/accept/r2-recsys-invalid.txt" \
+  && grep -q "^check_sha256=$(sha256sum < "$O/P1/recsys/r2/check.txt" | cut -c1-64)" "$O/P1/accept/r2-recsys-invalid.txt" || fail "P invalid record"
+pa P1 2 recsys && fail "P accepted an invalid round"
+bash $H/h1-accept.sh "$O/P1" 2 recsys --invalid "again" >> "$O/P.out" 2>&1 && fail "P second invalid"
+bash $H/h1-accept.sh "$O/P1" 1 recsys --invalid "x" >> "$O/P.out" 2>&1 && fail "P invalid of an accepted r1"
+grep -q "INVALID REFUSED: .*r1-recsys.txt exists" "$O/P.out" || fail "P invalid-accepted reason"
+lst() { (cd "$1" && find . -type f -not -path ./accept/r1-recsys-superseded.txt -printf '%P %s\n' | LC_ALL=C sort | sha256sum | cut -c1-64); }
+E1SHA=$(lst "$O/P1")
+mkdir "$O/P2"; echo x > "$O/P2/data"
+stage P2 r1-recsys --from-root "$O/P1" "selftest" && fail "P --from-root into a non-empty root"
+rm "$O/P2/data"
+stage P2 r2 --from-root "$O/P1" "x" && fail "P --from-root for r2"
+grep -q "SEQUENCE STOP: --from-root is for r1-<W> stages only" "$O/P2.out" || fail "P r2 reason"
+stage P2 r1-recsys --from-root "$O/P1" "selftest: T = 1 s re-measurement" || fail "P --from-root (see $O/P2.out)"
+F=$O/P2/prev-root.txt
+grep -qx "from_root=$O/P1" "$F" && grep -qx "workload=recsys" "$F" && grep -qx "previous_stage=vdb" "$F" \
+  && [ "$(grep -c '^record: accept_sha256 accept/r1-' "$F")" = 4 ] && grep -qx "superseded: $O/P1/accept/r1-recsys-superseded.txt" "$F" || fail "P prev-root.txt ($(cat "$F"))"
+grep -q "^SUPERSEDED r1 recsys .* by the new evidence root $O/P2" "$O/P1/accept/r1-recsys-superseded.txt" \
+  && grep -qx "attempt=recsys/r1" "$O/P1/accept/r1-recsys-superseded.txt" || fail "P superseded record"
+[ "$(lst "$O/P1")" = "$E1SHA" ] || fail "P E1 changed beyond the supersession record"
+grep -q "new evidence root from $O/P1 (previous stage vdb accepted there)" "$O/P2/h1-state.txt" && grep -q "^from_root: $O/P1 workload=recsys" "$O/P2/h1-manifest.txt" || fail "P logs"
+stage P1 r2 --workloads recsys && fail "P r2 recsys in E1 after supersession"
+pa P1 1 recsys && fail "P re-accept of a superseded r1"
+pa P2 1 recsys || fail "P accept E2 r1"
+stage P2 r2 --workloads recsys || fail "P r2 recsys in E2 (see $O/P2.out)"
+python3 -I -B - "$O/P2" <<'PY' || fail "P E2 r2 levels"
+import csv, sys
+o = sys.argv[1]
+lv = {r["mix"]: r for r in csv.DictReader(open(f"{o}/recsys/levels.tsv"), delimiter="\t")}
+fx = list(csv.DictReader(open(f"{o}/recsys/r2/collect/fix-steps.csv")))
+assert len(fx) == 8 and all(float(r["offered_x"]) == float(lv[r["mix"]][r["level"] + "_rate"]) for r in fx), fx[:1]
+PY
+stage P2 r2 && fail "P r2 (all four) in E2"
+mkdir "$O/P3"; stage P3 r1-recsys --from-root "$O/P1" "again" && fail "P second --from-root"
+grep -q "already superseded" "$O/P3.out" || fail "P second reason"
+# E1 whose vdb is not accepted
+mkdir "$O/P4" "$O/P4e"; for w in kv lmdb vdb; do stage P4 r1-$w || fail "P4 r1-$w"; [ $w = vdb ] || pa P4 1 $w || fail "P4 accept $w"; done
+stage P4e r1-recsys --from-root "$O/P4" "x" && fail "P from a root with vdb unaccepted"
+grep -q "r1-vdb is not checked PASS + accepted in $O/P4" "$O/P4e.out" || fail "P4 reason"
+# a --from-root stage that stops, then --retry in E2 (previous stage looked up in E1)
+mkdir "$O/P5"; STUB_FAIL=rc stage P5 r1-recsys --from-root "$O/P1b" "selftest stop" && fail "P5 rc 0"
+[ -f "$O/P5/prev-root.txt" ] && [ -f "$O/P1b/accept/r1-recsys-superseded.txt" ] || fail "P5 records"
+stage P5 r1-recsys --retry "selftest retry" || fail "P5 retry in E2 (see $O/P5.out)"
+grep -q "previous stage vdb accepted in the predecessor root $O/P1b (prev-root.txt sha256s verified)" "$O/P5/h1-state.txt" || fail "P5 retry note"
+mkdir "$O/P6"; STUB_FAIL=rc stage P6 r1-recsys --from-root "$O/P1c" "selftest stop" && fail "P6 rc 0"
+echo "tampered" >> "$O/P1c/accept/r1-vdb.txt"
+stage P6 r1-recsys --retry "x" && fail "P6 retry after a tampered E1 record"
+grep -q "SEQUENCE STOP: r1-vdb not checked PASS + accepted (nor skipped)" "$O/P6.out" || fail "P6 reason"
+echo "P OK"
 echo "SELFTEST PASS"

@@ -56,6 +56,11 @@
 #   MG_COH_SAMPLE (default empty = Megalon's 1 in 64): MEGALON_COH_CHECK_SAMPLE for every Megalon lifetime (mg, mgoff,
 #   mgrow; BLOCK v1 and h1) and v1_check.py --mg-sample (the value must reach both servers). v1.4: 1 (user decision
 #   2026-10-18: time every section of the table objects, about 26 write sections per round).
+# RS_T_MS / RATE_T_DIR (H1 v0.6.9, RECSYS-V1 v1.5): publication period T in ms (default 60000 = every block before
+#   v0.6.9) and, for T != 60 s, the T-specific calibration dir (rate-T<ms>-<avg|peak>.txt; see ekko_set below).
+#   BLOCK=h1 needs RS_T_MS explicitly (H1 RecSys: 1000, user decision 2026-10-18). The update sample rate is the Ekko
+#   rate at T = 60 s in every case; the window lengths (warm-up 70 s, V1 130 s, H1 settle / L2 / L1 60 s, SLO steps
+#   15 s) are unchanged in seconds, i.e. they hold about 70 / 130 / 60 / 15 rounds at T = 1 s.
 # BLOCK=h1 — H1-HOOK v2 (experiments/h1/README.md "Hook contract H1-HOOK v2", reports/H1-main-packet.md v0.3 §2-§3;
 #   user decisions 2026-10-18; called once per round by experiments/h1/hook.sh):
 #   env H1MODE r1|cont, H1_N, H1_SEED (loadgen seed of every part), H1_MIXES "<mix>=EKKO=<avg|peak> ...", H1_SETTLE_S
@@ -126,13 +131,38 @@ else
 fi
 MEGALON_BASE=${MEGALON_BASE:-$P/builds/megalon/75}
 UPD_FILE=${UPD_FILE:-updates-day23-0-2M.smp} QRY_FILE=${QRY_FILE:-queries-day23-89137318-1M.smp}
-T_MS=60000 SLO_PCT=95 SLO_MS=100
-ekko_set() {  # <avg|peak>: PUBLISH_FRAC, EKKO_RULE and the server arguments SA of that operating point
+SLO_PCT=95 SLO_MS=100
+# Publication period T (H1 v0.6.9, user decision 2026-10-18 "T=1로 바로 가는게 좋아보여"): RS_T_MS = the updater's
+# --publish-ms. Default 60000 (every earlier block, unchanged). BLOCK=h1 requires it explicitly (pins-recsys.sh).
+# The Ekko operating point is defined at the reference T = 60 s and is an UPDATE SAMPLE RATE: EKKO_FRAC60 of all rows
+# published per 60 s round -> recsys-rate (--t-ms 60000, 20 windows, checked against D/rate-frac<EKKO_FRAC60>.txt)
+# gives the loadgen update rate (avg 14.7233, peak 188.7608 samples/s). With RS_T_MS != 60000 the SAME sample rate is
+# replayed and only the round length changes; the server's --publish-frac (rows_per_round_target, used by v1_check's
+# +-15 % window check) is the T-specific calibration RATE_T_DIR/rate-T<RS_T_MS>-<avg|peak>.txt (recsys-rate at that T,
+# integer target whose rate is closest to the T = 60 s rate; builds/recsys-calib/1 for T = 1 s). Shorter T coalesces
+# fewer row updates: at T = 1 s peak publishes 19,192 rows per round (1.15 M rows / 60 s vs 0.58 M at T = 60 s).
+T_MS=${RS_T_MS:-60000}
+[[ $T_MS =~ ^[1-9][0-9]*$ ]] || { echo "SEQUENCE STOP: bad RS_T_MS"; exit 2; }
+if [ $BLOCK = h1 ] && [ -z "${RS_T_MS:-}" ]; then echo "SEQUENCE STOP: BLOCK=h1 needs RS_T_MS (pins-recsys.sh)"; exit 2; fi
+if [ "$T_MS" != 60000 ]; then
+  [ $BLOCK != main ] || { echo "SEQUENCE STOP: RS_T_MS != 60000 only with BLOCK v1 or h1"; exit 2; }
+  [ -d "${RATE_T_DIR:-}" ] || { echo "SEQUENCE STOP: RS_T_MS=$T_MS needs RATE_T_DIR (T-specific calibration dir)"; exit 2; }
+fi
+calv() { sed -n "s/^$2=//p" "$1" 2>/dev/null | head -1; }   # calv <file> <key>
+ekko_set() {  # <avg|peak>: EKKO_FRAC60, PUBLISH_FRAC (server; = EKKO_FRAC60 at T = 60 s), EKKO_RULE, server arguments SA
   case $1 in
-    avg) PUBLISH_FRAC=0.000513333333; EKKO_RULE="Ekko OSDI'22 average: 3.08% of rows per hour -> 0.0308/60 per T = 60 s";;
-    peak) PUBLISH_FRAC=0.0043; EKKO_RULE="Ekko OSDI'22 peak: 4.3% of rows per 10 min -> 0.043/10 per T = 60 s";;
+    avg) EKKO_FRAC60=0.000513333333; EKKO_RULE="Ekko OSDI'22 average: 3.08% of rows per hour -> 0.0308/60 per T = 60 s";;
+    peak) EKKO_FRAC60=0.0043; EKKO_RULE="Ekko OSDI'22 peak: 4.3% of rows per 10 min -> 0.043/10 per T = 60 s";;
     *) return 1;;
   esac
+  PUBLISH_FRAC=$EKKO_FRAC60 RATE_TF=
+  if [ "$T_MS" != 60000 ]; then
+    RATE_TF=$RATE_T_DIR/rate-T$T_MS-$1.txt
+    PUBLISH_FRAC=$(calv "$RATE_TF" publish_frac_arg)
+    [ -n "$PUBLISH_FRAC" ] && [ "$(calv "$RATE_TF" ref_frac)" = "$EKKO_FRAC60" ] && [ "$(calv "$RATE_TF" t_ms)" = "$T_MS.000" ] \
+      || { echo "SEQUENCE STOP: $RATE_TF missing or not the T = $T_MS ms calibration of Ekko $1"; return 1; }
+    EKKO_RULE="$EKKO_RULE; same update sample rate at T = $T_MS ms (rows_per_round_target $(calv "$RATE_TF" rows_per_round_target), $RATE_TF)"
+  fi
   SA="--nodes 2 --row-div 1 --serve-threads 14 --update-threads 4 --load-threads 8 --start-timeout-ms $((XT * 1000 / 2)) --publish-frac $PUBLISH_FRAC
  --verify-rows 1 --proc-sysfs /sys/kernel/swmc/instr --proc-sysfs /sys/kernel/cxl_shm/instr
  --proc-sysfs /sys/kernel/swmc/page_coherence --proc-kthread cxl_recv"
@@ -185,7 +215,7 @@ if [ $BLOCK = h1 ]; then  # parent lock rule: H1 main holds the lock; this block
 else
   bash $G lock "$OWNER" || { echo "SEQUENCE STOP: lock"; exit 2; }
 fi
-export LOADGEN PROFILE=main RUN_KIND=measurement STATS_OP=10 READY_TIMEOUT=$((XT / 2)) IDLE_WAIT_S=2400  # idle: an overrunning T = 60 s round may take > 10 min (Megalon)
+export LOADGEN PROFILE=main RUN_KIND=measurement STATS_OP=10 READY_TIMEOUT=$((XT / 2)) IDLE_WAIT_S=2400  # idle: an overrunning T = 60 s round may take > 10 min (Megalon); at T = 1 s the last round ends within ~1 s
 SHMR=$E/shm-pop; PS=(K=$K8 GT=$GT8 C=$C8 R=$SHMR INIT_STATE=shared)   # per page MSI lifetime (system(): shm-<name>)
 CHOWNED=0
 stop_servers() {  # this block's servers only: every session dir's guest run dir + the preload pid dir
@@ -519,20 +549,36 @@ precheck
 # update rate for the Ekko operating point (Host compute, after the lock check and the input sha256 check in
 # precheck): samples per T so that one round publishes PUBLISH_FRAC of all rows; checked against the calibration
 # file builds/recsys-inputs/1/rate-frac<frac>.txt (+-2 %) when V1_EXPECT_RATE is set or BLOCK=h1
+declare -A TCHK   # RS_T_MS != 60000: the T-specific recsys-rate check, once per Ekko point per block (about 30 s)
 rate_for() {  # <ekko> <out file>: sets UPD_RATE and LGC for that operating point
   ekko_set "$1" || stop "bad Ekko point $1"
-  nice -n 19 numactl --cpunodebind=1 --membind=1 "$PLAIN_BUILD/bin/recsys-rate" --samples "$D/$UPD_FILE" --frac $PUBLISH_FRAC \
-    --t-ms $T_MS --windows 20 > "$2" || stop "recsys-rate"
+  nice -n 19 numactl --cpunodebind=1 --membind=1 "$PLAIN_BUILD/bin/recsys-rate" --samples "$D/$UPD_FILE" --frac $EKKO_FRAC60 \
+    --t-ms 60000 --windows 20 > "$2" || stop "recsys-rate"
   UPD_RATE=$(sed -n 's/^rate_samples_per_s=//p' "$2")
   awk -v x="$UPD_RATE" 'BEGIN{exit !(x > 0)}' || stop "bad update rate $UPD_RATE"
   local ex=${V1_EXPECT_RATE:-}
-  [ $BLOCK = h1 ] && ex=$(sed -n 's/^rate_samples_per_s=//p' "$D/rate-frac$PUBLISH_FRAC.txt" 2>/dev/null)
+  [ $BLOCK = h1 ] && ex=$(sed -n 's/^rate_samples_per_s=//p' "$D/rate-frac$EKKO_FRAC60.txt" 2>/dev/null)
   if [ $BLOCK = h1 ] || [ -n "$ex" ]; then
-    [ -n "$ex" ] || stop "no calibration file $D/rate-frac$PUBLISH_FRAC.txt"
+    [ -n "$ex" ] || stop "no calibration file $D/rate-frac$EKKO_FRAC60.txt"
     awk -v x="$UPD_RATE" -v y="$ex" 'BEGIN{exit !(x >= 0.98 * y && x <= 1.02 * y)}' \
       || stop "update rate $UPD_RATE differs from the expected $ex by more than 2%"
   fi
-  echo "EKKO=$1 publish_frac=$PUBLISH_FRAC update_rate=$UPD_RATE samples/s ($EKKO_RULE; $2)"
+  if [ "$T_MS" != 60000 ]; then  # v0.6.9: the T-specific target must be the calibration of THIS sample rate at T
+    [ "$(calv "$RATE_TF" ref_rate_samples_per_s)" = "$UPD_RATE" ] || stop "$RATE_TF ref_rate_samples_per_s != the Ekko $1 rate $UPD_RATE"
+    if [ -z "${TCHK[$1]:-}" ]; then
+      nice -n 19 numactl --cpunodebind=1 --membind=1 "$PLAIN_BUILD/bin/recsys-rate" --samples "$D/$UPD_FILE" --frac $PUBLISH_FRAC \
+        --t-ms $T_MS --windows "$(calv "$RATE_TF" windows)" > "$E/update-rate-T$T_MS-$1.txt" || stop "recsys-rate T=$T_MS"
+      local k
+      for k in rows_per_round_target windows rate_samples_per_s; do
+        [ "$(calv "$E/update-rate-T$T_MS-$1.txt" $k)" = "$(calv "$RATE_TF" $k)" ] || stop "T = $T_MS ms recsys-rate $k differs from $RATE_TF"
+      done
+      awk -v x="$(calv "$RATE_TF" rate_samples_per_s)" -v y="$UPD_RATE" 'BEGIN{exit !(x >= 0.99 * y && x <= 1.01 * y)}' \
+        || stop "T = $T_MS ms calibration rate differs from the Ekko $1 rate $UPD_RATE by more than 1%"
+      TCHK[$1]=ok
+    fi
+    cp "$E/update-rate-T$T_MS-$1.txt" "$2.T$T_MS" || stop "copy T check"
+  fi
+  echo "EKKO=$1 publish_frac=$PUBLISH_FRAC update_rate=$UPD_RATE samples/s T_ms=$T_MS ($EKKO_RULE; $2)"
   # seq_base and wrap=1 are appended by session.sh measure (it refuses them from the caller)
   LGC=(--opt samples=$D/$UPD_FILE --opt queries=$D/$QRY_FILE
        --opt quantiles=$D/dist_quantile.txt --fixed update=$UPD_RATE --mix query=1 --x-stream query)

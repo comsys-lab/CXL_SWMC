@@ -20,6 +20,22 @@ usage: v1_check.py <measurement dir> <hw|pop|mg|mgoff> [--h1] [--oppoint-report]
   max_offered_x_pass, each over its own node-0 snapshots; violations on other steps are NOTEs, never a stop. Fixed
   runs (L2/L1 <= the weakest max) keep every check over the whole span as FAIL. Torn rows / misses and the system
   checks are whole-span FAILs in every mode.
+Short publication period (H1 v0.6.9, user decision 2026-10-18: H1 RecSys T = 1 s; "short T" = publish_us of the
+  node-0 end snapshot < 10 s; T = 60 s windows are judged exactly as before):
+  - round guard: a snapshot with 0 < |flushes - U x publish_rounds| <= U (U = update threads) lies inside a round edge
+    (the workers finish a round at different times; at T = 1 s a snapshot hits an edge with probability = edge length /
+    1 s). It is a NOTE ("round edge"), because with >= 45 rounds in the judged span its effect on the window rows per
+    round is at most one round per snapshot (<= 1/45 = 2.2 % at either end). |difference| > U stays an
+    operating-point FAIL (accounting off by more than one round of every worker).
+  - rows per full round: the same window-level rule and +-15 % (sum of the rows of every round that fired in the
+    judged span, normalised by the samples those rounds published; it never judges single rounds, whose rows vary by
+    sd 9 % (peak) / 25 % (avg) at T = 1 s). It is judged when the span holds >= 45 full rounds (SHORT_T_MIN_ROUNDS;
+    three 15 s SLO steps); with fewer it is a NOTE (simulation on the trace: single 15 s windows at Ekko avg fall
+    outside +-15 % in 1.8 % of windows, 45 s windows never: builds/recsys-calib/1/sim.txt).
+  - update_rate_sustained (server-lifetime flag) = 0 while the judged window has flush_overruns delta 0: NOTE with the
+    lifetime count (the overrun happened before the window, e.g. the first rounds after READY; at T = 60 s the
+    warm-up absorbs round 1). flush_overruns in the judged window stays an operating-point FAIL: a round longer than
+    T = 1 s means the next round is skipped and rows become visible > 2 T after their update.
 Round accounting guard (verifier LOW 15): flushes = update_threads x publish_rounds at both window snapshots of
   node 0 (update_threads from the manifest's server_args); else FAIL (a snapshot inside a round edge).
 A missing rows_per_round_target (0) is a FAIL (verifier LOW 18).
@@ -57,6 +73,10 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from breakdown import op_c_window  # noqa: E402  (window C incl. the Megalon ratio estimate from window deltas)
+
+
+SHORT_T_S = 10            # v0.6.9: publish_us below this (s) = short-T rules (docstring); H1 RecSys T = 1 s
+SHORT_T_MIN_ROUNDS = 45   # short T: rows per full round judged over >= 45 full rounds (three 15 s SLO steps)
 
 
 def kv(path):
@@ -203,6 +223,10 @@ def main():
     else:
         wins, other = [(0, b0, e0)], []
     dd = lambda b, e, k: e.get(k, 0) - b.get(k, 0)  # noqa: E731
+    t_s = e0.get('publish_us', 0) / 1e6
+    short_t = 0 < t_s < SHORT_T_S  # v0.6.9: T = 1 s rules (docstring); T = 60 s unchanged
+    if short_t:
+        vals['short_T_s'] = t_s
     vals['publish_rounds'] = d0('publish_rounds')
     if vals['publish_rounds'] < 2:
         opfail(f'{vals["publish_rounds"]} publication rounds in the whole span (need >= 2)')
@@ -216,7 +240,11 @@ def main():
     if not h1slo:
         vals['update_rate_sustained'] = e0.get('update_rate_sustained', -1)
         if vals['update_rate_sustained'] != 1:
-            opfail(f'update_rate_sustained={vals["update_rate_sustained"]}')
+            if short_t and vals['update_rate_sustained'] == 0 and vals['flush_overruns'] == 0:
+                notes.append(f'update_rate_sustained=0 from {e0.get("flush_overruns", -1)} flush overruns before the window '
+                             f'(none in the window; short T)')
+            else:
+                opfail(f'update_rate_sustained={vals["update_rate_sustained"]}')
     for n, b, e in other:
         o = dd(b, e, 'flush_overruns')
         if o:
@@ -225,11 +253,18 @@ def main():
     if not ut or ut <= 0:
         fails.append('round guard: --update-threads not found in the manifest server_args')
     else:
+        edges = []
         for n, b, e in wins:
             for tag, snap in (('begin', b), ('end', e)):
                 fl, prr = snap.get('flushes', -1), snap.get('publish_rounds', -1)
                 if fl != ut * prr:
-                    opfail(f'round guard: step {n} {tag} snapshot flushes {fl} != {ut} x publish_rounds {prr} (snapshot inside a round edge)')
+                    if short_t and fl >= 0 and prr >= 0 and abs(fl - ut * prr) <= ut:
+                        edges.append(f'step {n} {tag} {fl}/{prr}')
+                    else:
+                        opfail(f'round guard: step {n} {tag} snapshot flushes {fl} != {ut} x publish_rounds {prr} (snapshot inside a round edge)')
+        if edges:
+            vals['round_edge_snapshots'] = len(edges)
+            notes.append(f'round edge at {len(edges)} snapshot(s) (short T; <= 1 round each): ' + ', '.join(edges))
     tgt = e0.get('rows_per_round_target', 0)
     if tgt <= 0:
         fails.append('no rows_per_round_target in the node-0 end snapshot (Ekko operating point not checkable)')
@@ -237,7 +272,6 @@ def main():
         vals['rows_per_round_target'] = tgt
         if pr > 0:
             vals['rows_per_round_window_mean'] = round(rr / pr)
-        t_s = e0.get('publish_us', 0) / 1e6
         vals['samples_published'] = pub
         if not rate or rate <= 0 or t_s <= 0:
             fails.append(f'rows per round: cannot normalise (update rate {rate}, T {t_s} s)')
@@ -253,7 +287,10 @@ def main():
             vals['full_round_equiv'] = round(pub / per_t, 3)
             vals['rows_per_full_round'] = round(per)
             vals['rows_per_full_round_vs_target_pct'] = round((per / tgt - 1) * 100, 1)
-            if abs(per - tgt) > 0.15 * tgt:
+            if abs(per - tgt) > 0.15 * tgt and short_t and pub / per_t < SHORT_T_MIN_ROUNDS:
+                notes.append(f'rows per full round {per:.0f} vs target {tgt} (> 15% off) over only {pub / per_t:.1f} full '
+                             f'rounds (< {SHORT_T_MIN_ROUNDS}; short T: not judged)')
+            elif abs(per - tgt) > 0.15 * tgt:
                 opfail(f'rows per full round {per:.0f} vs target {tgt} (> 15% off: Ekko operating point not met)')
     cq, cu = op_c_window(b1, e1, 'query'), op_c_window(b0, e0, 'row_update')
     vals['query_C_ms_per_q'] = round(cq / vals['queries'] / 1e6, 4) if vals['queries'] > 0 else ''

@@ -16,12 +16,41 @@
 # a skipped workload's r1 is re-run in a new evidence root).
 # v0.6.8: <E>/<W>/r<n> means the CURRENT attempt of the round (attempts.py; <E>/<W>/r<n>-a<k> after
 # `h1-main.sh --retry`); the record names the attempt dir (attempt=...). The record path stays <E>/accept/r<n>-<W>.txt.
+#        h1-accept.sh <E> <n> <W> --invalid "<reason>"   (v0.6.9, user decision 2026-10-18: H1 RecSys r2 at T = 60 s
+#                                                     recorded invalid, a round-phase artifact)
+# --invalid (any round): records that round n of W is NOT used (e.g. measured under conditions the user has since
+# replaced). Writes <E>/accept/r<n>-<W>-invalid.txt (reason, time, attempt, check.txt sha256 or "none", last check
+# line, state tail); nothing is deleted. Refused if the round is accepted (an accepted r1 is superseded instead:
+# h1-main.sh --from-root) or already has an invalid record. An invalid round is never accepted afterwards, and
+# h1-main.sh's accepted() is false for it (r<n+1> of W refused in E). Acceptance and --skip are refused for a round
+# with a supersession or invalid record.
 set -uo pipefail
 E=${1:?} N=${2:?} W=${3:?} REMARK=${4:-} ACK=
 H=$(cd "$(dirname "$0")" && pwd)
 RD=$(python3 -I -B $H/attempts.py dir "$E" "$W" "$N" 2>&1); ARC=$?
 [ $ARC != 2 ] || { echo "REFUSED: $RD"; exit 1; }
 [ $ARC = 0 ] || RD=$E/$W/r$N
+for x in superseded invalid; do
+  if [ -e "$E/accept/r$N-$W-$x.txt" ]; then
+    [ "$REMARK" = --invalid ] && [ $x = superseded ] && { echo "INVALID REFUSED: r$N $W is superseded ($E/accept/r$N-$W-$x.txt)"; exit 1; }
+    echo "REFUSED: r$N $W has a $x record ($E/accept/r$N-$W-$x.txt)"; exit 1
+  fi
+done
+if [ "$REMARK" = --invalid ]; then
+  R=${5:?--invalid needs a reason}
+  A=$E/accept/r$N-$W.txt I=$E/accept/r$N-$W-invalid.txt C=$RD/check.txt
+  [ ! -e "$A" ] || { echo "INVALID REFUSED: $A exists (r$N $W is accepted; an accepted r1 is superseded with h1-main.sh --from-root)"; exit 1; }
+  [ -d "$RD" ] || { echo "INVALID REFUSED: $RD missing"; exit 1; }
+  mkdir -p "$E/accept"
+  ( set -o noclobber
+    { echo "INVALID r$N $W $(date -Is) by main session (not used; nothing deleted)"; echo "reason=$R"
+      echo "attempt=${RD#$E/}"; echo "check_sha256=$([ -f "$C" ] && sha256sum < "$C" | cut -c1-64 || echo none)"
+      echo "check_last=$([ -f "$C" ] && tail -n 1 "$C" || echo none)"
+      echo "files=$(find "$RD" -type f | wc -l) listing_sha256=$(cd "$RD" && find . -type f -printf '%P %s\n' | LC_ALL=C sort | sha256sum | cut -c1-64)"
+      grep "\[r$N\(-$W\)\?\]" "$E/h1-state.txt" 2>/dev/null | tail -n 3 | sed 's/^/state_tail: /'; } > "$I" ) \
+    || { echo "INVALID REFUSED: cannot write $I"; exit 1; }
+  echo "INVALID r$N $W -> $I"; exit 0
+fi
 if [ "$REMARK" = --skip ]; then
   R=${5:?--skip needs a reason}
   [ "$N" = 1 ] || { echo "SKIP REFUSED: --skip is for round 1 only (r2/r3 need r1 accepted for each chosen workload)"; exit 1; }

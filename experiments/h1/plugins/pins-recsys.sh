@@ -14,6 +14,10 @@
 # has no default and is required with --backend megalon (main-block.sh passes MG_RPO_OPT MG_TABLE_N to mg and mgoff).
 # MG_COH_SAMPLE=1: every Megalon section timed (RECSYS-V1 v1.4 user decision 2026-10-18 for the table objects, ~26
 # write sections per round; user: every-section timing also in H1, Q-H5 decided; unused while recsys has no Megalon).
+# Re-pinned 2026-10-18 (H1 v0.6.9, branch h1-v069; user decision "T=1로 바로 가는게 좋아보여"): publication period
+# T = 1 s (RS_T_MS=1000) with the T = 1 s Ekko calibration builds/recsys-calib/1 (same update sample rates as T = 60 s:
+# avg 14.7233, peak 188.7608 samples/s; rows_per_round_target avg 2,044, peak 19,192); main-block.sh (RS_T_MS,
+# RATE_T_DIR) and v1_check.py (short-T rules) re-pinned; builds and builds/recsys-inputs/1 unchanged.
 . "$(dirname "${BASH_SOURCE[0]}")/pins-common.inc"
 HR=$P/CXL_SWMC                      # live tree (main-block.sh resolves session.sh / v1_check.py / host-gate.sh next to itself)
 HOOK_FILE=$HR/experiments/recsys/main-block.sh
@@ -22,11 +26,15 @@ BLOCK_ENV=(BLOCK=h1 POP_BUILD=12 POP_BUNDLE_SHA=$POP_BUNDLE_SHA C8=$CPOP K8=$KPO
   D=$P/builds/recsys-inputs/1 PLAIN_BUILD=$P/builds/recsys/12 MEG_BUILD=$P/builds/recsys-megalon/14 MEGALON_BASE=$MEG77
   VM_PLAIN=/home/comsys/rs12 VM_MEG=/home/comsys/rsm14 LOADGEN=$P/builds/recsys-loadgen/9/loadgen XT=7200
   MG_RPO_OPT=--mg-rows-per-object MG_TABLE_N=0 MG_COH_SAMPLE=1
+  RS_T_MS=1000 RATE_T_DIR=$P/builds/recsys-calib/1
   EXPECT_DAX_UUID=$EXPECT_DAX_UUID)
 PIN_SHA256="$COMMON_SHA256
 9c330ba688b96019792dee4bb80e91965cfb7e5d5c21265bb3a2e805df3db5a8  $P/builds/recsys-inputs/1/MANIFEST.txt
 83e7048cb5d727ae50e5492c8a6c84e123b5190bc8bbbbdc89d71e625fbe522a  $P/builds/recsys-inputs/1/rate-frac0.0043.txt
 1df9b01d68d56d4aed1e24538945a44623863bf424c36a56cfa732c6ea16073c  $P/builds/recsys-inputs/1/rate-frac0.000513333333.txt
+7675ab03e4dee4eb8ce6227ad31bbe4c7c4923410a6b3f230a3da5cc38a73f23  $P/builds/recsys-calib/1/MANIFEST.txt
+15a20f7c01314a3b44c6b4e2561379146321aeea4c732017e16fe723b9aa28ce  $P/builds/recsys-calib/1/rate-T1000-peak.txt
+3b70e3e27b2f703916eccc535ab45bab7b8290b2373d56429ed2674881a6ea3c  $P/builds/recsys-calib/1/rate-T1000-avg.txt
 564c1b823ce144f02565f6404c221b56a362c275ae787d1ad67076c9a26ca684  $P/builds/recsys/12/manifest.txt
 1b502b6220ff1ba17cd944d0884ddee6a1dceeda5c8579298b27736294660cd3  $P/builds/recsys/12/bin/recsys-server
 9ba94ba5e75982ab0eb9ba6aa5d4b9fcb784518bc271a50ce0245720342442a5  $P/builds/recsys/12/bin/recsys-rate
@@ -36,9 +44,9 @@ PIN_SHA256="$COMMON_SHA256
 f9c1753f3bef2ab0941153058860227145f2d7b7e33a210bdc3338fad14eacda  $P/builds/recsys-megalon/14/lib/libmegalon.so
 de2e9a4cd7ee41df5d9a938836802b0ee5186ba69b42252e3ab747f0bfeae193  $P/builds/recsys-loadgen/9/manifest.txt
 61bb70687ef15823a33a56c282d53eecdbcc1c1e574589eeba7791b4a65d81c0  $P/builds/recsys-loadgen/9/loadgen
-f68bc5e6ede82eb6df79efc8848e5a2e0c740ad86ee13a28b392ba46d7779e66  $HOOK_FILE
+f7f0bbeb567b89c766d913f7f98becd29768a15e2ae900778471874a77f12ac7  $HOOK_FILE
 68c5b9ceaf986e9e05e941d586a9a5cb5bb162b1963181ce02efa5d34cce5b54  $HR/experiments/recsys/session.sh
-98e3d2b41b2e1de3a104f258a825865132dac6a25ed0dda079f3cb19c3090708  $HR/experiments/recsys/v1_check.py
+0bd4d06ea0b0678b77d1276aec2f13db70a8eceed7e7ab11f61905052e8ac4ac  $HR/experiments/recsys/v1_check.py
 32d171199d6a47d15fcfa6971522e253fe21d857e91c9049c201e55a0cdac230  $HR/experiments/recsys/check_breakdown.py
 e6b2455d64266df3f2a62f9bc5359b91ddd80588c109a6cae3efde66abceb74c  $HR/experiments/recsys/breakdown.py
 f6742a6e473ec417f394cf2acf541f4fd1209d7ac523bbfb253e81c7b5f6f439  $HR/experiments/recsys/precheck.sh

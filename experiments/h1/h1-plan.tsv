@@ -12,7 +12,8 @@
 #   label     mix name in the figures
 #   settle_s  (H1-HOOK v2, dec 2026-10-18) discarded interval at the L2 rate after the SLO search (continuous
 #             lifetimes) or after READY (separate fixed lifetimes), before the L2 and L1 windows; same per workload
-#             (proposal, packet §3.3: KV/LMDB 30 s, vector DB 60 s, DLRM 60 s = one publication round T)
+#             (proposal, packet §3.3: KV/LMDB 30 s, vector DB 60 s, DLRM 60 s = one publication round at T = 60 s;
+#             since v0.6.9 DLRM runs at T = 1 s (RS_T_MS, pins-recsys.sh), so the 60 s settle holds 60 rounds)
 vdb	u5	U=5	1.0526315789	3	search:99:100	search 95 / update 5	60
 vdb	u50	U=50	2	3	search:99:100	search 50 / update 50	60
 vdb	u90	U=90	10	3	search:99:100	search 10 / update 90 (big-ann streaming 4:4:1)	60

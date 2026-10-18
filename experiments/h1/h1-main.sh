@@ -30,7 +30,19 @@
 # first failing step ("SEQUENCE STOP"); every block rolls back in its own EXIT trap; this script releases the lock.
 # usage: h1-main.sh <stage> <evidence root E>
 #        h1-main.sh r1-<W> <E> --retry "<reason>"   (v0.6.8, user decision 2026-10-18 "응 그렇게 진행해")
-#   E: for r1-kv it must exist and be empty except sequence* files; later stages use the same E.
+#        h1-main.sh r1-<W> <E2> --from-root <E1> "<reason>"   (v0.6.9, user decision 2026-10-18: H1 RecSys at T = 1 s)
+#   E: for r1-kv (and for --from-root) it must exist and be empty except sequence* files; later stages use the same E.
+# --from-root (round 1 stages only; v0.6.9): starts a NEW evidence root E2 at r1-<W> on top of the accepted r1 stages
+#   of an earlier root E1, for a re-measurement of an ACCEPTED r1 stage under changed conditions (H1 RecSys T = 60 s ->
+#   1 s). Preconditions (before the lock): E2 empty except sequence*; E1 has h1-manifest.txt; the stage before W in
+#   ORDER is ACCEPTED in E1 (not skipped; check sha verified by accepted()); no supersession record for W in E1 yet.
+#   After the lock: E2/prev-root.txt (from_root, workload, reason, sha256 of every E1 r1 acceptance record and its
+#   check.txt, E1 h1-manifest.txt sha) and, if W's r1 is accepted in E1, E1/accept/r1-<W>-superseded.txt (new file;
+#   nothing in E1 is changed or removed). From then on E1's r1 of W no longer counts as accepted (E1 r2/r3 of W are
+#   refused) and E2's first stage looks up its previous-stage acceptance in E1, re-verifying the recorded sha256s
+#   (also for a later --retry in E2). r2/r3 of W then run in E2 (--workloads W).
+# Supersession / invalid records (v0.6.9): <E>/accept/r<n>-<W>-superseded.txt (above) and r<n>-<W>-invalid.txt
+#   (h1-accept.sh --invalid) make accepted() false for that round; h1-accept.sh refuses to accept such a round.
 # --retry (round 1 stages only): re-runs a STOPPED r1 stage of W in a new attempt dir <E>/<W>/r1-a<k> (attempts.py;
 #   the stopped <E>/<W>/r1[-a<k-1>] stays untouched as evidence). Allowed only when the current attempt has no
 #   acceptance record and no skip record, its check.txt (if any) is not PASS, no <E>/<W>/collect-all-r1 exists, and the
@@ -47,9 +59,14 @@
 set -uo pipefail
 export PYTHONDONTWRITEBYTECODE=1
 STAGE=${1:?usage: h1-main.sh <stage> <evidence root> [--workloads w1,w2 | --retry <reason>]} E=${2:?usage: h1-main.sh <stage> <evidence root>}
-SUBSET= RETRY=
+SUBSET= RETRY= FROMROOT= FROMREASON=
 if [ -n "${3:-}" ]; then
-  if [ "$3" = --retry ]; then
+  if [ "$3" = --from-root ]; then
+    [ -n "${4:-}" ] && [ -n "${5:-}" ] && [ -z "${6:-}" ] || { echo "SEQUENCE STOP: usage: h1-main.sh r1-<W> <E2> --from-root <E1> \"<reason>\""; exit 2; }
+    case $STAGE in r1-*) ;; *) echo "SEQUENCE STOP: --from-root is for r1-<W> stages only"; exit 2;; esac
+    FROMROOT=$(readlink -f "$4") FROMREASON=$5
+    [ "$FROMROOT" != "$(readlink -f "$E")" ] || { echo "SEQUENCE STOP: --from-root names the new root itself"; exit 2; }
+  elif [ "$3" = --retry ]; then
     [ -n "${4:-}" ] && [ -z "${5:-}" ] || { echo "SEQUENCE STOP: usage: h1-main.sh r1-<W> <E> --retry \"<reason>\""; exit 2; }
     case $STAGE in r1-*) ;; *) echo "SEQUENCE STOP: --retry is for r1-<W> stages only"; exit 2;; esac
     RETRY=$4
@@ -80,7 +97,7 @@ case $STAGE in
 esac
 [ -f "$PLAN" ] || { echo "SEQUENCE STOP: no plan $PLAN"; exit 2; }
 for w in $ORDER; do grep -q "^$w	" "$PLAN" || { echo "SEQUENCE STOP: workload $w not in the plan"; exit 2; }; done
-if [ "$STAGE" = r1-kv ] && [ -z "$RETRY" ]; then
+if { [ "$STAGE" = r1-kv ] && [ -z "$RETRY" ]; } || [ -n "$FROMROOT" ]; then
   [ -d "$E" ] && [ -z "$(ls -A "$E" | grep -v '^sequence')" ] || { echo "SEQUENCE STOP: $E missing or not empty"; exit 2; }
 else
   [ -f "$E/h1-manifest.txt" ] || { echo "SEQUENCE STOP: $E has no h1-manifest.txt (start with r1-kv)"; exit 2; }
@@ -91,11 +108,32 @@ rdir() {  # W n -> current attempt dir of round n (attempts.py; <E>/<W>/r<n> whe
   d=$(python3 -I -B $H/attempts.py dir "$E" "$1" "$2" 2>/dev/null); rc=$?
   case $rc in 0) echo "$d";; 1) echo "$E/$1/r$2";; *) return 2;; esac
 }
-accepted() {  # W n -> 0 if r<n> of W (current attempt) has check PASS and an acceptance record matching the check file
-  local d; d=$(rdir $1 $2) || return 1
-  local c=$d/check.txt a=$E/accept/r$2-$1.txt
+accepted() {  # W n [root] -> 0 if r<n> of W (current attempt) has check PASS and an acceptance record matching the
+              # check file, and no supersession / invalid record (v0.6.9); root defaults to E
+  local R=${3:-$E} d rc
+  d=$(python3 -I -B $H/attempts.py dir "$R" "$1" "$2" 2>/dev/null); rc=$?
+  case $rc in 0) ;; 1) d=$R/$1/r$2;; *) return 1;; esac
+  local c=$d/check.txt a=$R/accept/r$2-$1.txt
+  [ ! -e "$R/accept/r$2-$1-superseded.txt" ] && [ ! -e "$R/accept/r$2-$1-invalid.txt" ] || return 1
   [ -f "$c" ] && tail -n 1 "$c" | grep -q "^H1CHECK PASS" && [ -f "$a" ] \
     && grep -q "check_sha256=$(sha256sum < "$c" | cut -c1-64)" "$a"
+}
+prevw() {  # W -> the r1 stage before W in ORDER (empty for the first)
+  local p= w; for w in $ORDER; do [ "$w" = "$1" ] && { echo "$p"; return 0; }; p=$w; done; return 1
+}
+# v0.6.9: an evidence root started with --from-root names its predecessor root in prev-root.txt; its first workload's
+# previous-stage acceptance is looked up there, and every sha256 recorded at the root start must still match
+fromroot_ok() {  # W -> 0 if E/prev-root.txt exists for workload W, its records still match and the previous stage is accepted in E1
+  local f=$E/prev-root.txt R x p
+  [ -f "$f" ] && grep -qx "workload=$1" "$f" || return 1
+  R=$(sed -n 's/^from_root=//p' "$f")
+  [ -d "$R" ] || return 1
+  while read -r x; do
+    set -- $x   # accept_sha256 <rel path> <sha> check_sha256 <rel path> <sha>
+    [ "$(sha256sum < "$R/$2" 2>/dev/null | cut -c1-64)" = "$3" ] && [ "$(sha256sum < "$R/$5" 2>/dev/null | cut -c1-64)" = "$6" ] || return 1
+  done < <(sed -n 's/^record: //p' "$f")
+  p=$(sed -n 's/^previous_stage=//p' "$f")
+  [ -z "$p" ] || accepted "$p" 1 "$R"
 }
 # r1 chain (user decision 2026-10-18, overnight runs never sit idle): the previous r1 stage accepted, OR skipped by the
 # main session (h1-accept.sh --skip: <E>/accept/r1-<W>-skip.txt, only without an acceptance record). r2/r3 stay strict
@@ -103,10 +141,28 @@ accepted() {  # W n -> 0 if r<n> of W (current attempt) has check PASS and an ac
 SKIPNOTE=
 prev_r1() {  # W
   accepted $1 1 && return 0
+  [ -n "$FROMROOT" ] && [ -n "$1" ] && return 1   # a new root (--from-root): the previous stage must be accepted in E1 (checked below)
+  if [ -f "$E/prev-root.txt" ] && [ "$(prevw "$(sed -n 's/^workload=//p' "$E/prev-root.txt")")" = "$1" ] && [ ! -e "$E/$1" ]; then
+    fromroot_ok "$(sed -n 's/^workload=//p' "$E/prev-root.txt")" && { SKIPNOTE="previous stage $1 accepted in the predecessor root $(sed -n 's/^from_root=//p' "$E/prev-root.txt") (prev-root.txt sha256s verified)"; return 0; }
+    return 1
+  fi
   local s=$E/accept/r1-$1-skip.txt
   [ -f "$s" ] && [ ! -e "$E/accept/r1-$1.txt" ] || return 1
   SKIPNOTE="previous stage $1 SKIPPED (not accepted): $(sed -n 's/^reason=//p' "$s")"
 }
+if [ -n "$FROMROOT" ]; then  # v0.6.9: new root on top of E1's accepted r1 stages
+  ffail() { echo "SEQUENCE STOP: --from-root refused for $STAGE: $*"; exit 2; }
+  [ -f "$FROMROOT/h1-manifest.txt" ] || ffail "$FROMROOT has no h1-manifest.txt"
+  PW=$(prevw "$WL") || ffail "workload $WL not in ORDER"
+  [ -z "$PW" ] || accepted "$PW" 1 "$FROMROOT" || ffail "r1-$PW is not checked PASS + accepted in $FROMROOT (a skip does not count)"
+  [ ! -e "$FROMROOT/accept/r1-$WL-superseded.txt" ] || ffail "$FROMROOT/accept/r1-$WL-superseded.txt exists (already superseded)"
+  for x in "$FROMROOT"/accept/r1-*.txt; do  # every E1 r1 acceptance (not skip / superseded / invalid records) must still verify
+    [ -e "$x" ] || continue; w=${x##*/r1-}; w=${w%.txt}
+    case $w in *-skip|*-superseded|*-invalid) continue;; esac
+    accepted "$w" 1 "$FROMROOT" || ffail "the acceptance record $x no longer matches its check.txt"
+  done
+  SKIPNOTE="new evidence root from $FROMROOT (previous stage ${PW:-none} accepted there)"
+else
 case $STAGE in
   r1-lmdb) prev_r1 kv || { echo "SEQUENCE STOP: r1-kv not checked PASS + accepted (nor skipped)"; exit 2; };;
   r1-vdb) prev_r1 lmdb || { echo "SEQUENCE STOP: r1-lmdb not checked PASS + accepted (nor skipped)"; exit 2; };;
@@ -114,6 +170,7 @@ case $STAGE in
   r2|r3) for w in $WL; do accepted $w 1 || { echo "SEQUENCE STOP: r1 of $w not checked PASS + accepted$([ -f "$E/accept/r1-$w-skip.txt" ] && echo " (skipped)") (r2/r3 need r1 accepted for each chosen workload)"; exit 2; }; done
          if [ $N = 3 ]; then for w in $WL; do accepted $w 2 || { echo "SEQUENCE STOP: r2 of $w not checked PASS + accepted"; exit 2; }; done; fi;;
 esac
+fi
 # --retry preconditions (v0.6.8): the current r1 attempt of WL exists, was not accepted or skipped, did not pass its
 # check, left no collect-all-r1, and its stage ended with SEQUENCE STOP; the new attempt is r1-a<k+1> (attempts.py)
 AT= PREV= RETRYINFO=
@@ -171,6 +228,7 @@ trap 'bash $G unlock $OWNER' EXIT
   for f in v6_fig2_split.py v6_common.py v6_fig1_curves.py; do echo "analysis/$f sha256=$(sha256sum < $H/../analysis/$f | cut -c1-64)"; done
   echo "stage=$STAGE round=$N workloads=$WL seed_base=$H1_SEED_BASE dry=$DRY"
   [ -z "$RETRY" ] || echo "retry: $RETRYINFO"
+  [ -z "$FROMROOT" ] || echo "from_root: $FROMROOT workload=$WL previous_stage=$PW reason=$FROMREASON"
   echo "pretouch_dir=${PRETOUCH_DIR:-} measure_env_dir=${MEASURE_ENV_DIR:-} measure_part_dir=${MEASURE_PART_DIR:-}"
   echo "manifest=${H1_MANIFEST:-} manifest_sha256=${H1_MANIFEST_SHA:-}"
   for f in measure-env.sh measure-env-part.sh measure-run.sh; do echo "scripts/host/$f sha256=$(sha256sum < $H/../../scripts/host/$f | cut -c1-64)"; done
@@ -182,6 +240,32 @@ gates() {  # tag
   MEASURE_ENV_DIR=$MEASURE_ENV_DIR MEASURE_PART_DIR=$MEASURE_PART_DIR bash $H/h1-gate.sh check "$E/gate-$1.txt" || stop "h1 gate ($1)"
   log "gate $1: PASS"
 }
+if [ -n "$FROMROOT" ]; then  # v0.6.9: records written under the lock, before anything runs
+  [ ! -e "$E/prev-root.txt" ] || stop "$E/prev-root.txt exists"
+  { echo "# H1 evidence root started from a predecessor root (h1-main.sh --from-root, packet v0.6.9)"
+    echo "from_root=$FROMROOT"; echo "workload=$WL"; echo "previous_stage=$PW"; echo "reason=$FROMREASON"
+    echo "created=$(date -Is) stage=$STAGE pid=$$"
+    echo "from_root_h1_manifest_at_start_sha256=$(sha256sum < "$FROMROOT/h1-manifest.txt" | cut -c1-64)"
+    echo "manifest=${H1_MANIFEST:-} manifest_sha256=${H1_MANIFEST_SHA:-}"
+    for x in "$FROMROOT"/accept/r1-*.txt; do
+      [ -e "$x" ] || continue; w=${x##*/r1-}; w=${w%.txt}
+      case $w in *-skip|*-superseded|*-invalid) continue;; esac
+      d=$(python3 -I -B $H/attempts.py dir "$FROMROOT" "$w" 1 2>/dev/null) || d=$FROMROOT/$w/r1
+      echo "record: accept_sha256 ${x#$FROMROOT/} $(sha256sum < "$x" | cut -c1-64) check_sha256 ${d#$FROMROOT/}/check.txt $(sha256sum < "$d/check.txt" | cut -c1-64)"
+    done; } > "$E/prev-root.txt" || stop "prev-root.txt"
+  if [ -e "$FROMROOT/accept/r1-$WL.txt" ]; then
+    SD=$(python3 -I -B $H/attempts.py dir "$FROMROOT" "$WL" 1 2>/dev/null) || SD=$FROMROOT/$WL/r1
+    ( set -o noclobber
+      { echo "SUPERSEDED r1 $WL $(date -Is) by the new evidence root $E (h1-main.sh --from-root, packet v0.6.9)"
+        echo "reason=$FROMREASON"; echo "new_root=$E"; echo "attempt=${SD#$FROMROOT/}"
+        echo "accept_record_sha256=$(sha256sum < "$FROMROOT/accept/r1-$WL.txt" | cut -c1-64)"
+        echo "check_sha256=$(sha256sum < "$SD/check.txt" | cut -c1-64)"
+        echo "note=nothing in this root is changed or removed; r1 $WL here no longer counts as accepted (r2/r3 of $WL refused here)"
+      } > "$FROMROOT/accept/r1-$WL-superseded.txt" ) || stop "cannot write $FROMROOT/accept/r1-$WL-superseded.txt"
+    echo "superseded: $FROMROOT/accept/r1-$WL-superseded.txt" >> "$E/prev-root.txt"
+  else echo "superseded: none (r1 $WL not accepted in $FROMROOT)" >> "$E/prev-root.txt"; fi
+  fromroot_ok "$WL" || stop "prev-root.txt does not verify right after writing it"
+fi
 log "stage start: round $N, workloads [$WL], pid $$ pgid $PGID, manifest $([ $MAN_ON = 1 ] && echo "$H1_MANIFEST ok" || echo "off (dry)")"
 [ -z "$SKIPNOTE" ] || log "$SKIPNOTE"
 [ -z "$RETRY" ] || log "RETRY $RETRYINFO"

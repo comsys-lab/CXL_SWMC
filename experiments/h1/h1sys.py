@@ -15,7 +15,7 @@ SLO = {"recsys": ("hw", "pop")}
 NO_MEGALON_NOTE = {
     "recsys": "Megalon not measured in H1 for recsys (user decision 2026-10-18); Megalon RecSys numbers: "
               "RECSYS-V1 v1.4 (recovery/RECSYS-V1-v1.4/cdiff.txt: query T 4762 ms (timers on) vs all-HWcc 201 ms, "
-              "C_diff 4577 ms per query at 1 query/s)",
+              "C_diff 4577 ms per query at 1 query/s; measured at T = 60 s, while H1 RecSys runs at T = 1 s since v0.6.9)",
 }
 
 
