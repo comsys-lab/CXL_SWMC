@@ -57,11 +57,12 @@ at a low rate absorbs every invalidation since the previous one; user decisions 
 other caller unchanged, manifest key `min_step_queries= ramp_knee=` only when set):
 - `--min-step-queries N`: every measured step (ramp, bisect, confirm, fill, overload) lasts at least N / (SLO-stream
   rate) s, so a nearest-rank p95 is not the slowest of a handful of queries (RecSys: 100 -> 100 s at 1 query/s).
-- `--ramp-knee K` (`--ramp-knee-rise X`, 1.2): a failed ramp step does not end the ramp; after a failed step the
+- `--ramp-knee K` (`--ramp-knee-rise X`, 1.2; `--ramp-knee-floor F`, 1.5): a failed ramp step does not end the ramp; after a failed step the
   rate grows by f (after a pass: the adaptive step above). The ramp stops (a) at once when the queue cap aborts a
   step, (b) after a pass, when the SLO stream falls behind, or (c) after a pass, after K consecutive failed steps
   whose SLO percentile rose >= X x the previous step's (queueing past the knee; low-rate failures have a flat or
-  falling percentile). Knee = the first step of the final run of failed ramp steps (every ramp step at or above it
+  falling percentile) and the stopping step's percentile is > F x SLO (user decision 2026-10-19 (c): chance rises of
+  low-rate failures just above the SLO never stop the ramp). Knee = the first step of the final run of failed ramp steps (every ramp step at or above it
   failed); bisect (own budget of 12 steps, `ramp_policy.bisect_cut` if it ends above the precision) and confirm work
   between the highest pass below the knee and the knee (result = definition (가)). Ramp steps run without the early
   "SLO already exceeded" abort, so every low-rate p95 is complete. `summary.json` adds `ramp_policy` {knee_k,

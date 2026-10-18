@@ -158,7 +158,7 @@ int main() {
   {  // 8. KneeRamp (--ramp-knee 2, rise 1.2): low-rate failures do not end the ramp; bracket = final failing run
     struct St { double x; bool pass, hard, behind; double p; };
     auto feed = [](std::vector<St> v, double *good, double *knee, std::string *why) {
-      loadgen::KneeRamp kr(2, 1.2);
+      loadgen::KneeRamp kr(2, 1.2, 150);  // floor 1.5 x SLO 100 ms (user decision (c))
       int at = -1;
       for (size_t i = 0; i < v.size(); i++)
         if (kr.add(v[i].x, v[i].pass, v[i].hard, v[i].behind, v[i].p)) { at = int(i); break; }
@@ -186,6 +186,14 @@ int main() {
     check(at == 5 && g == 3.4 && kn == 5, "a pass resets the run; inf percentile counts as rising");
     at = feed({{1, 1, 0, 0, 50}, {1.5, 0, 0, 0, 110}, {2.25, 0, 0, 0, 115}, {3.4, 0, 0, 0, 112}}, &g, &kn, &why);
     check(at == -1 && g == 1 && kn == 1.5, "no stop yet: bracket = last pass 1 / first fail of the final run 1.5");
+    // verifier MED-2 probe: one marginal pass, two chance rises of low-rate fails (115, 140 ms <= 150): no stop;
+    // the ramp goes on to the real knee (rises 90 -> 130 -> 220 ms > 150)
+    at = feed({{1, 1, 0, 0, 95}, {1.5, 0, 0, 0, 115}, {2.25, 0, 0, 0, 140}, {3.4, 0, 0, 0, 120}, {5.1, 1, 0, 0, 85},
+               {11, 1, 0, 0, 70}, {25, 1, 0, 0, 90}, {30, 0, 0, 0, 130}, {36, 0, 0, 0, 220}}, &g, &kn, &why);
+    check(at == 8 && g == 25 && kn == 30 && why == "percentile rising",
+          "MED-2 probe: rises 95->115->140 below 1.5 x SLO do not stop; knee 30 after 90->130->220 (good 25)");
+    at = feed({{1, 1, 0, 0, 80}, {2, 0, 0, 0, 110}, {3, 0, 0, 0, 140}, {4, 0, 0, 0, 170}}, &g, &kn, &why);
+    check(at == 3 && kn == 2, "rising run continues past the floor: stop at the first step above 150 ms, knee 2");
   }
   std::printf(fails ? "SLO SEARCH TEST FAIL (%d)\n" : "SLO SEARCH TEST PASS\n", fails);
   return fails ? 1 : 0;

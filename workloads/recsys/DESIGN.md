@@ -133,7 +133,8 @@ Every RecSys experiment from 2026-10-19 on uses this mode; H1 results and the H1
   search unchanged): ramp from 1 query/s, every measured step >= 100 queries (step length scaled), a failed step at a
   low rate is recorded and the ramp goes on (tail latency can be worst at low load: each query absorbs every
   invalidation since the previous one; after a failed step the rate grows by x1.5). The ramp stops past the knee:
-  after a pass, 2 consecutive failed steps whose p95 rose >= 1.2x each (queueing; low-rate p95 is flat or falling),
+  after a pass, 2 consecutive failed steps whose p95 rose >= 1.2x each (queueing; low-rate p95 is flat or falling)
+  with the stopping step's p95 > 1.5 x SLO = 150 ms (user decision 2026-10-19, option (c)),
   or the query stream falls behind; or at once when the queue cap aborts a step. Knee = the first step of the final
   run of failed ramp steps; max under SLO = the highest pass below it (bisect, own budget of 12 steps, then
   confirm as before);

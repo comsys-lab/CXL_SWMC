@@ -102,13 +102,15 @@ inline ConfirmOutcome confirm_search(double good, std::vector<double> passes, do
 // every invalidation since the previous one, so tail latency can be worst at low load and fall as the load rises.
 // Stop rule (when to stop ramping): (a) a hard saturation (the queue cap aborted the step), or (b) after a pass, the SLO
 // stream falls behind, or (c) after a pass, K consecutive failed steps whose SLO percentile rose by >= `rise` x the
-// previous step's (queueing past the knee; low-rate failures have a flat or falling percentile).
+// previous step's (queueing past the knee; low-rate failures have a flat or falling percentile) AND the stopping
+// step's percentile is above `floor` (user decision 2026-10-19, verifier MED-2 option (c): 1.5 x SLO, so two
+// chance rises of low-rate failures just above the SLO never end the ramp).
 // Bracket (independent of the stop rule): knee = the first step of the final run of failed steps (every ramp step at
 // or above it failed), good = the last pass before it = the highest pass below the knee (definition (가)).
 // Failed steps below `good` are the low-rate violations (reported).
 class KneeRamp {
  public:
-  KneeRamp(uint32_t k, double rise) : k_(k), rise_(rise) {}
+  KneeRamp(uint32_t k, double rise, double floor = 0) : k_(k), rise_(rise), floor_(floor) {}
   // after each ramp step; true = stop ramping (good()/knee() are the bracket; good() == 0: no pass below the knee)
   bool add(double x, bool pass, bool hard, bool behind, double pslo) {
     const bool prev_pass = n_ == 0 || last_pass_;
@@ -124,7 +126,7 @@ class KneeRamp {
     if (good_ > 0 && behind) return why_ = "saturated (SLO stream falls behind)", true;
     if (good_ > 0 && prev > 0 && pslo >= rise_ * prev) run_++;  // inf >= anything: counts as rising
     else run_ = 0;
-    if (good_ > 0 && run_ >= k_) return why_ = "percentile rising", true;
+    if (good_ > 0 && run_ >= k_ && pslo > floor_) return why_ = "percentile rising", true;
     return false;
   }
   double good() const { return good_; }
@@ -134,7 +136,7 @@ class KneeRamp {
 
  private:
   uint32_t k_, run_ = 0, n_ = 0;
-  double rise_, good_ = 0, knee_ = 0, prev_p_ = 0;
+  double rise_, floor_, good_ = 0, knee_ = 0, prev_p_ = 0;
   bool last_pass_ = false;
   const char *why_ = "";
 };
