@@ -82,12 +82,27 @@ Options:
   memtable" for received requests and adds a hop.
 Decision: G1 (user, 2026-10-18).
 
-## 6. Initial image, sizes
-- 54M keys split by key hash into the two node DBs (27M each), built offline on the Host as SST files and copied
-  into each node's file pool at prepare (ingested as the bottom level), unmeasured. Per node ≈ 28.4 GB + space
-  amplification; SWcc split in two halves (≈ 47.8 GiB per node) for arena + file pools.
-- RocksDB options: defaults except WAL off, compression none, max_open_files -1. write_buffer_size 64 MiB (arena
-  block 1 MiB), block cache default. Every non-default option is listed in the run manifest.
+## 6. Initial image, sizes, options (as implemented, plain backend)
+- 54M keys split by key index (key i on node i mod nr_nodes; 27M each). Each node builds its share at prepare as SST
+  files of disjoint key ranges (SstFileWriter, `--prepare-threads`, ~60 MiB each) written straight into its own file
+  pool and ingested with `move_files` (FS LinkFile shares the extents) into the bottom level; values stamp 0,
+  writer 0xffff; unmeasured. Per node ≈ 28.4 GB + space amplification; SWcc split in equal 1 MiB-aligned shares
+  (≈ 47.8 GiB per node): `--arena-blocks` (512 = 512 MiB) + file extents (the rest).
+- Stored value = 8 B global stamp + the 1,000 B request value (1,008 B; deviation from kv/lmdb's 1,000 B: the
+  stamp orders versions across the per-node DBs). Get returns the 1,000 B value and the stamp.
+- Per-node ordering: a Put takes a process-local key stripe (4,096 mutexes) around stamp fetch_add + db->Put, so
+  one node's DB never holds a lower stamp above a higher one for the same key (concurrent RocksDB writers).
+- RocksDB options (non-defaults): WAL off per write (`disableWAL`), WAL dir local (empty); compression none (all
+  levels); `max_open_files` -1; bloom filter 10 bits/key (BlockBasedTable; RocksDB's default has no filter, but a
+  get here probes every node's DB, and the other DB rarely holds the key); `arena_block_size` 1 MiB (= the default
+  for 64 MiB write buffers, set explicitly to pin the object unit); `max_manifest_file_size` = max_ext/2 MiB (a
+  MANIFEST must fit one directory slot); info LOG local. Everything else default (write_buffer_size 64 MiB,
+  max_write_buffer_number 2, leveled compaction, block cache default). `--write-buffer-mb` exists for Host tests only.
+- HWcc app bytes (2 nodes, defaults): stamp, node lines, descriptors, directory (2,048 slots x (128 B head + 768 B
+  extent list) per node), epochs (64 slots per node); `rocksdb-server --print-app-bytes`.
+- Threads per node: `--threads` request workers (one FIFO queue for gets and updates), RocksDB flush/compaction
+  threads (default `max_background_jobs`), one catch-up thread per remote view, one reclaim thread. Every thread
+  that reads another node's state owns one epoch slot.
 
 ## 7. Megalon (paper first, artifact where it matches)
 - Objects: every 1 MiB arena block and every 1 MiB file extent of both nodes, created by node 0 at prepare

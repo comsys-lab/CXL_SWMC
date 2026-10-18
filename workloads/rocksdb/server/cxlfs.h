@@ -329,6 +329,12 @@ class CxlFs final : public FileSystemWrapper {
     set_slot_locked(slot, pt.name, 1);
     return IOStatus::OK();
   }
+  IOStatus SyncFile(const std::string &f, const FileOptions &fo, const IOOptions &io, bool use_fsync,
+                    IODebugContext *d) override {
+    Path p;
+    if (!parse(f, &p)) return target()->SyncFile(f, fo, io, use_fsync, d);
+    return IOStatus::OK();  // appends are visible once Append returns (size published)
+  }
   IOStatus NumFileLinks(const std::string &f, const IOOptions &io, uint64_t *c, IODebugContext *d) override {
     Path p;
     if (!parse(f, &p)) return target()->NumFileLinks(f, io, c, d);

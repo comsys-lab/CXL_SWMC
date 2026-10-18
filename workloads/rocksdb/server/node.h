@@ -211,7 +211,7 @@ class Node {
     o.write_buffer_size = size_t(o_.write_buffer_mb) << 20;
     o.arena_block_size = kUnit;  // = RocksDB's default for write_buffer_size 64 MiB (min(1 MiB, wbs / 8))
     o.max_manifest_file_size = (uint64_t(p_.max_ext) / 2) << 20;  // roll well before a file exceeds max_ext MiB
-    o.statistics = stats_;
+    if (primary) o.statistics = stats_;  // secondaries keep their own (none)
     rdb::BlockBasedTableOptions t;
     t.filter_policy.reset(rdb::NewBloomFilterPolicy(10));
     o.table_factory.reset(rdb::NewBlockBasedTableFactory(t));
