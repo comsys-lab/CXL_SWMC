@@ -1,6 +1,7 @@
 # Megalon config for recsys on 2 VMs (workloads/recsys/DESIGN.md §7, reports/RECSYS-design.md §3). Same file on both VMs; node id,
 # run id and region config come from recsys-server (--node, --run-id, --region).
-# Objects: one per slot, 167,731,776 x 576 B = 96,613,502,976 B; object_arena_size 91 GiB = 97,710,505,984 B.
+# Objects (Megalon-native, 2026-10-18): one per row, 134,184,588 x 576 B = 77,290,322,688 B (was one per slot,
+# 167,731,776 x 576 B = 96,613,502,976 B); object_arena_size kept at 91 GiB = 97,710,505,984 B (fits, unchanged).
 # Records (deviation R1, megalon 2fd5998 / builds/megalon/69 and later): with objects enabled the record pool is
 # logical_scr_size / 4 B, independent of `slots`. 245MB = 256,901,120 B -> 64,225,280 records; SCR footprint =
 # records x 4 B + 14,848 B (obs, Host) must fit hwcc - msg_ring - app = 257,814,528 B at full size (app 10,485,760 B).
@@ -13,13 +14,14 @@ region_config: ""
 reinit: false
 attach_mprotect: true
 stuck_timeout_ms: 600000        # 10 min (was 10 s). RECSYS-main-h1-v5: node 1's replica HashMap doubles at 2^26 x 7/8 =
-                                # 58.7M objects (and 2^27 x 7/8 = 117.4M) during node 0's 167.7M creates; the rehash on
+                                # 58.7M objects (and 2^27 x 7/8 = 117.4M) during node 0's creates (167.7M then, 134.2M now:
+                                # still past 117.4M); the rehash on
                                 # the VM outlasted 10 s while the 64 MiB NR log was full, and the port's stuck-peer abort
                                 # fired. Upstream NR waits for a lagging replica without a bound; the port's bound only
                                 # turns a dead peer into an abort, so a longer bound is closer to the artifact.
 log_sync_interval_us: 100
 nr_log_size: 64MB
-attach_timeout_s: 7200          # node 0 creates and writes 167.7M objects first (Host estimate ~1 h, report §5)
+attach_timeout_s: 7200          # node 0 creates and writes 134.2M objects first (was 167.7M; Host estimate ~1 h, report §5)
 start_barrier_timeout_s: 7200
 object_arena_size: 97710505984
 object_align: 64

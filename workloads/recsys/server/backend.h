@@ -1,10 +1,15 @@
-// recsys backends (DESIGN.md §7): where the slots live and which coherence actions wrap each slot access.
-//   plain   all-HWcc and Popcorn: tables at fixed SWcc offsets, direct loads/stores.
-//   megalon one Megalon object per slot (paper §4 objects), every slot access in one read/write section.
+// recsys backends (DESIGN.md §7): where the row records live and which coherence actions wrap each record access.
+// Addressing is the same in every system (user decision 2026-10-18, reports/H1-workload-porting.md Q11/Q12): the key
+// names its row, row r of table k is record (k, r); no hash table, no probing, no empty records.
+//   plain   all-HWcc and Popcorn: records at SWcc offset (row_base[k] + r) * slot_bytes, direct loads/stores.
+//           Consistency of a 9-line row copy is the application's job (kAppSeqlock): HWcc and Popcorn give coherence,
+//           not multi-line atomicity, so server.cc wraps record accesses in the HWcc striped version table (MemC3).
+//   megalon one Megalon object per row, object id = (table, row), found by Megalon's own index as in the artifact KV
+//           store. Every record access is one read/write section; the section validates/locks the object itself, so
+//           server.cc skips the striped version table (kAppSeqlock = false).
 // Interface used by server.cc (Server<Backend>): fits, name, usage, stats, thread_init(tid), create_objects (node 0),
-// check_objects (every node), read_slot(k, s, f) (f(const uint8_t *slot) may run more than once and must only
-// produce its result), write_slot(k, s, fill) (fill(uint8_t *slot) writes the whole slot, whole lines, reads nothing).
-// The HWcc striped version table (MemC3, S = 2^16) wraps these calls in server.cc identically for every backend.
+// check_objects (every node), read_slot(k, r, f) (f(const uint8_t *rec) may run more than once and must only
+// produce its result), write_slot(k, r, fill) (fill(uint8_t *rec) writes the whole record, whole lines, reads nothing).
 #pragma once
 
 #include <dlfcn.h>
@@ -31,6 +36,7 @@ namespace rsys {
 class PlainBackend {
  public:
   static constexpr const char *kLayoutTag = "";
+  static constexpr bool kAppSeqlock = true;  // MemC3 striped version table in server.cc
   PlainBackend(const cxl::region &r, uint8_t *map, const Params &p) : map_(map), p_(p) {
     base_ = r.swcc.offset;
     end_ = base_ + p.swcc_bytes();
@@ -45,7 +51,7 @@ class PlainBackend {
     return true;
   }
   std::string name() const { return "plain"; }
-  uint8_t *slot(uint32_t k, uint64_t s) const { return map_ + base_ + (p_.slot_base[k] + s) * p_.slot_bytes; }
+  uint8_t *slot(uint32_t k, uint64_t r) const { return map_ + base_ + (p_.row_base[k] + r) * p_.slot_bytes; }
   void thread_init(int, int = 0) const {}
   void set_time_sample(uint32_t) {}
   void (*coh_fn() const)(mshim::CohSnap *) { return nullptr; }  // no user-level coherence (Popcorn: swmc_acct)
@@ -130,16 +136,17 @@ inline uint64_t mono_ns() {
 class MegalonBackend {
  public:
   static constexpr const char *kLayoutTag = " backend=megalon";
+  static constexpr bool kAppSeqlock = false;  // read/write sections
   MegalonBackend(const cxl::region &, uint8_t *, const Params &p, const mshim::Api *api) : p_(p), api_(api) {}
   bool fits(std::string *err) const {
     if (p_.slot_bytes % 64) return *err = "megalon: slot must be whole lines", false;
     for (uint32_t k = 0; k < kSparse; k++)
-      if (p_.slots[k] >= (1ull << 40)) return *err = "megalon: slot index overflows the object id", false;
+      if (p_.rows[k] >= (1ull << 40)) return *err = "megalon: row index overflows the object id", false;
     return true;
   }
   std::string name() const { return "megalon"; }
   static constexpr uint64_t kBase = 0x5253ull << 48;  // "RS"
-  static uint64_t id(uint32_t k, uint64_t s) { return kBase | uint64_t(k) << 40 | s; }
+  static uint64_t id(uint32_t k, uint64_t row) { return kBase | uint64_t(k) << 40 | row; }  // = the key's (table, row)
   // tid: Megalon registration id; role: Role (per-thread timing slot)
   void thread_init(int tid, int role = kRoleMain) const {
     api_->reg(tid);
@@ -152,9 +159,9 @@ class MegalonBackend {
   void (*coh_fn() const)(mshim::CohSnap *) { return api_->thread_coh; }  // shim v2 CohSnap
   void (*anchor_fn() const)(mshim::AnchorSnap *) { return api_->version >= 3 ? api_->thread_anchor : nullptr; }
 
-  // Node 0 at prepare: one object per slot (all slots, empty ones too: a probe that reaches an empty slot reads it).
-  // par(f) runs f(i) on every thread of the server's registered prep pool (NR registrations are never freed, so
-  // threads are registered once and reused) and returns when all are done; threads create disjoint slot ranges.
+  // Node 0 at prepare: one object per row (no empty slots: nothing probes). par(f) runs f(i) on every thread of the
+  // server's registered prep pool (NR registrations are never freed, so threads are registered once and reused) and
+  // returns when all are done; threads create disjoint row ranges.
   template <class Par> bool create_objects(std::string *err, Par &&par) const {
     std::atomic<bool> ok{true};
     std::atomic<uint64_t> next{0};
@@ -163,16 +170,16 @@ class MegalonBackend {
     par([&](int) {
       for (;;) {
         const uint64_t c = next.fetch_add(1 << 14);
-        if (c >= p_.total_slots || !ok.load(std::memory_order_relaxed)) return;
-        const uint64_t end = std::min(p_.total_slots, c + (1 << 14));
+        if (c >= p_.total_rows || !ok.load(std::memory_order_relaxed)) return;
+        const uint64_t end = std::min(p_.total_rows, c + (1 << 14));
         uint32_t k = 0;
         for (uint64_t g = c; g < end; g++) {
-          while (k + 1 < kSparse && p_.slot_base[k + 1] <= g) k++;
-          const int rc = api_->create(id(k, g - p_.slot_base[k]), p_.slot_bytes);
+          while (k + 1 < kSparse && p_.row_base[k + 1] <= g) k++;
+          const int rc = api_->create(id(k, g - p_.row_base[k]), p_.slot_bytes);
           if (rc != 0) {
             std::lock_guard<std::mutex> l(mu);
             if (ok.exchange(false))
-              e = "ObjectCreate(table " + std::to_string(k) + ", slot " + std::to_string(g - p_.slot_base[k]) + ") = " +
+              e = "ObjectCreate(table " + std::to_string(k) + ", row " + std::to_string(g - p_.row_base[k]) + ") = " +
                   std::to_string(rc) + " (-12 ENOMEM: object_arena_size too small; -17 EEXIST: stale objects, MEGALON_REINIT=1)";
             return;
           }
@@ -182,20 +189,20 @@ class MegalonBackend {
     if (!ok) *err = e;
     return ok;
   }
-  // Every node: ObjectLookup of every `stride`-th slot plus the last slot of each table (size check).
+  // Every node: ObjectLookup of every `stride`-th row plus the last row of each table (size check).
   bool check_objects(std::string *err, uint64_t stride) const {
     auto one = [&](uint32_t k, uint64_t s) {
       size_t got = 0;
       const int rc = api_->lookup(id(k, s), &got);
       if (rc == 0 && got == p_.slot_bytes) return true;
-      *err = "ObjectLookup(table " + std::to_string(k) + ", slot " + std::to_string(s) + ") = " + std::to_string(rc) +
+      *err = "ObjectLookup(table " + std::to_string(k) + ", row " + std::to_string(s) + ") = " + std::to_string(rc) +
              " size " + std::to_string(got);
       return false;
     };
     for (uint32_t k = 0; k < kSparse; k++) {
-      for (uint64_t s = 0; s < p_.slots[k]; s += std::max<uint64_t>(stride, 1))
+      for (uint64_t s = 0; s < p_.rows[k]; s += std::max<uint64_t>(stride, 1))
         if (!one(k, s)) return false;
-      if (!one(k, p_.slots[k] - 1)) return false;
+      if (!one(k, p_.rows[k] - 1)) return false;
     }
     return true;
   }
@@ -248,8 +255,8 @@ class MegalonBackend {
     }
   }
   std::string usage() const {
-    return "megalon objects=" + std::to_string(p_.total_slots) + " object_bytes=" +
-           std::to_string(p_.total_slots * p_.slot_bytes) + " shim=" + api_->info;
+    return "megalon objects=" + std::to_string(p_.total_rows) + " (one per row) object_bytes=" +
+           std::to_string(p_.total_rows * p_.slot_bytes) + " shim=" + api_->info;
   }
   std::string stats() const {
     mshim::Stats s{};
