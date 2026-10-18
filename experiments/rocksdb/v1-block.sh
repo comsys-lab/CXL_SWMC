@@ -22,7 +22,9 @@
 #   EXPECT_DAX_UUID, MIN_MEM_G (16), REGION (CXL_SWMC/config/cxl_region.yaml; Popcorn on N > 2 needs
 #   config/cxl_region-ring2m.yaml: 2 MiB msg_ring), POP_IPS is set to NODES for the Popcorn bundle (p-popcorn-shm.sh
 #   drives only .100/.101 without it; bundle-n-v1 for N > 2); with MEASURE=1 also MEASURE_ENV / MEASURE_PART_SCRIPT
-#   (N-VM scripts, e.g. scripts/host/measure-env-n.sh) and EXPECT_RUNNING (default VM_DOMAINS) for h1-gate.sh.
+#   (N-VM scripts, e.g. scripts/host/measure-env-n.sh) and EXPECT_RUNNING (default VM_DOMAINS) for h1-gate.sh;
+#   GATE_SCRIPT (optional): a Host gate wrapper called as `bash $GATE_SCRIPT check <out>` (rc 0 = pass) instead of
+#   h1-gate.sh / host-gate.sh, for H0 and for every run (N-VM measurement gate, e.g. scripts/host/h3-gate.sh).
 set -uo pipefail
 export PYTHONDONTWRITEBYTECODE=1
 E=$1
@@ -108,7 +110,8 @@ dax_owner() {  # comsys | root
 step "PT pretouch check (start, ${#IPS[@]} VMs)"
 bash $X/pretouch-check-n.sh "$PRETOUCH_DIR" "$E/pretouch-check-start.txt" >> "$E/block.log" 2>&1 || stop "pretouch check (start)"
 step "H0 Host gate"
-if [ "${MEASURE:-0}" = 1 ]; then bash $P/CXL_SWMC/experiments/h1/h1-gate.sh check "$E/gate-H0.txt" || stop "h1 gate"
+if [ -n "${GATE_SCRIPT:-}" ]; then export GATE_SCRIPT; bash "$GATE_SCRIPT" check "$E/gate-H0.txt" || stop "gate ($GATE_SCRIPT)"
+elif [ "${MEASURE:-0}" = 1 ]; then bash $P/CXL_SWMC/experiments/h1/h1-gate.sh check "$E/gate-H0.txt" || stop "h1 gate"
 else bash $G check "$E/gate-H0.txt" || stop "host gate"; fi
 step "G1 install ($L)"
 NODES="${IPS[*]}" BUILD=$BUILD L=$L REGION=$REGION bash $X/install.sh "$E/install.log" > "$E/install.out" 2>&1 || stop "install (see install.out)"

@@ -78,7 +78,9 @@ LOCKF=$P/workspaces/MEASUREMENT.lock
 grep -q "^owner=${LOCK_OWNER:?LOCK_OWNER = owner of the measurement lock held by the calling block} " "$LOCKF" 2>/dev/null \
   || stop "measurement lock not held by $LOCK_OWNER ($(cat "$LOCKF" 2>/dev/null))"
 if [ "${GATE:-1}" = 1 ]; then
-  if [ "${H1_MEASURE_RUN:-0}" = 1 ]; then
+  if [ -n "${GATE_SCRIPT:-}" ]; then  # N-VM gate wrapper (v1-block.sh GATE_SCRIPT)
+    bash "$GATE_SCRIPT" check "$E/gate-$NAME.txt" || stop "gate ($GATE_SCRIPT)"
+  elif [ "${H1_MEASURE_RUN:-0}" = 1 ]; then
     : "${MEASURE_PART_DIR:?H1_MEASURE_RUN=1 needs MEASURE_PART_DIR}"
     bash $P/CXL_SWMC/experiments/h1/h1-gate.sh check "$E/gate-$NAME.txt" || stop "h1 gate"
   else
