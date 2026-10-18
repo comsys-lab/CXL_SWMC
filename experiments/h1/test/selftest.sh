@@ -586,6 +586,9 @@ grep -q "^PF=0.00012122107495683483 UR=156.1717 TCHK=ok .*--publish-frac 0.00012
 o3 f385 f385 1000 $CAL   # v0.6.13
 grep -q "^PF=0.00012660917511629578 UR=164.1683 TCHK=ok .*--publish-frac 0.00012660917511629578 .*--fixed update=164.1683" "$O/O3/f385.out" \
   && grep -qx "rows_per_round_target=16989" "$O/O3/f385/update-rate-T1000-f385.txt" || fail "O3 f385 ($(cut -c1-400 "$O/O3/f385.out"))"
+o3 f392 f392 1000 $CAL   # v0.6.14
+grep -q "^PF=0.00012925478446153594 UR=168.0200 TCHK=ok .*--publish-frac 0.00012925478446153594 .*--fixed update=168.0200" "$O/O3/f392.out" \
+  && grep -qx "rows_per_round_target=17344" "$O/O3/f392/update-rate-T1000-f392.txt" || fail "O3 f392 ($(cut -c1-400 "$O/O3/f392.out"))"
 mkdir -p "$O/O3/calnoref" && cp $CAL/rate-T1000-*.txt "$O/O3/calnoref/"
 o3 noref f253 1000 "$O/O3/calnoref"
 grep -q "^STOPPED: no calibration file $O/O3/calnoref/rate-frac0.00253.txt" "$O/O3/noref.out" || fail "O3 noref ($(cut -c1-400 "$O/O3/noref.out"))"
