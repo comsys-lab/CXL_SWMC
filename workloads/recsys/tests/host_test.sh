@@ -6,11 +6,14 @@
 # usage: host_test.sh <build dir> <loadgen build dir> <work dir (new)> [plain|megalon] [publish_ms] [extra server args]
 # env: STEP_S (5, measured seconds per step), PRELOAD (1: --preload-only then --preloaded, plain only), PORT (27100), ROW_DIV (200), UPD_RATE (2000), Q_RATES (5,10), MEGALON_CFG (template), MEGALON_SCR (logical_scr_size, 64MB), CPUS0/CPUS1/CPUSL,
 #      UPD_SMP / QRY_SMP (v2 samples files, e.g. real MLPerf day 23 from tools/mlperf_npz_to_samples.py; default: synthetic),
-#      SLO (loadgen --slo, default query:95:100), PUBLISH_FRAC (--publish-frac, reported only)
+#      SLO (loadgen --slo, default query:95:100), PUBLISH_FRAC (--publish-frac, reported only),
+#      MG_RPO (megalon: --mg-rows-per-object, default 1 = per row; 0 = one object per table), IMG_DIR (/dev/shm; a
+#      directory for the region file, e.g. a disk-backed one for multi-GB tables)
 # Checks: loadgen ok, torn_rows 0, no misses, queries and rows written > 0, Fig 2 op counters (op.query.n = queries,
 # op.row_update.n = rows_written, t_ns > 0), false_retries <= seq_retries, probes = lookups (direct addressing: one
 # record read per lookup, every backend); megalon: objects = rows, no stripe-table use (seq_retries, seq_spins,
-# lock_spins 0).
+# lock_spins 0); megalon objects = the count recsys-server --print-layout gives for MG_RPO (N = 1: = rows), update
+# write sections = objects written per round (<= rows written).
 set -euo pipefail
 B=$(cd "$1" && pwd); LG=$(cd "$2" && pwd); WD=$3; BACKEND=${4:-plain}; T=${5:-0}; shift $(( $# < 5 ? $# : 5 )); EXTRA=("$@")
 HERE=$(cd "$(dirname "$0")" && pwd); W=$(cd "$HERE/.." && pwd); ROOT=$(cd "$W/../.." && pwd)
@@ -18,10 +21,16 @@ HERE=$(cd "$(dirname "$0")" && pwd); W=$(cd "$HERE/.." && pwd); ROOT=$(cd "$W/..
 mkdir -p "$WD"; WD=$(cd "$WD" && pwd)
 PORT=${PORT:-27100} ROW_DIV=${ROW_DIV:-200} UPD_RATE=${UPD_RATE:-2000} Q_RATES=${Q_RATES:-5,10}
 CPUS0=${CPUS0:-16-21} CPUS1=${CPUS1:-22-29,54-61} CPUSL=${CPUSL:-30-31}
-IMG=/dev/shm/recsys-test-$$.img
+IMG=${IMG_DIR:-/dev/shm}/recsys-test-$$.img
 SA=(--nodes 2 --row-div "$ROW_DIV" --publish-ms "$T" --publish-frac "${PUBLISH_FRAC:-0}" --serve-threads 12 --update-threads 4 --verify-rows 1 "${EXTRA[@]}")
 read -r swcc_need <<< "$("$B/bin/recsys-server" "${SA[@]}" --print-layout | sed -n 's/.* swcc_bytes=\([0-9]*\).*/\1/p')"
 APP=$("$B/bin/recsys-server" "${SA[@]}" --print-app-bytes)
+MA=(); EXP_OBJS=
+if [ "$BACKEND" = megalon ]; then
+  MA=(--mg-rows-per-object "${MG_RPO:-1}")
+  EXP_OBJS=$("$B/bin/recsys-server" "${SA[@]}" "${MA[@]}" --print-layout | sed -n 's/^megalon rows_per_object .* objects \([0-9]*\) max_object_bytes \([0-9]*\)/\1/p')
+  "$B/bin/recsys-server" "${SA[@]}" "${MA[@]}" --print-layout | grep "^megalon rows_per_object" > "$WD/megalon-objects.txt"
+fi
 HW=$((256 << 20)) AL=$((2 << 20))
 LOGB=$((64 << 20))
 ARENA=$(( (swcc_need + AL - 1) / AL * AL ))
@@ -63,7 +72,7 @@ start() {  # node cpus extra-env...
   local XA=(); [ "$k" = 0 ] && XA=("${N0[@]}")
   env CXL_REGION_CONFIG="$WD/region.yaml" CXL_APP_HWCC_BYTES="$APP" "${NE[@]}" "$@" \
     numactl --physcpubind="$c" --membind=1 "$B/bin/recsys-server" --node "$k" --run-id "$RID" --port $((PORT + k)) \
-    --backend "$BACKEND" "${SA[@]}" "${XA[@]}" > "$WD/node$k.log" 2>&1 &
+    --backend "$BACKEND" "${SA[@]}" "${MA[@]}" "${XA[@]}" > "$WD/node$k.log" 2>&1 &
   PIDS+=($!)
 }
 if [ "$BACKEND" = megalon ]; then start 0 "$CPUS0" MEGALON_REINIT=1; else start 0 "$CPUS0"; fi
@@ -72,7 +81,7 @@ for k in 0 1; do
   for _ in $(seq 900); do grep -q "READY" "$WD/node$k.log" && break; grep -q FATAL "$WD/node$k.log" && { cat "$WD/node$k.log"; exit 1; }; sleep 1; done
   grep -q READY "$WD/node$k.log" || { echo "node$k not ready"; tail "$WD/node$k.log"; exit 1; }
 done
-grep -h "initial tables\|warm-up\|created" "$WD"/node*.log
+grep -h "initial tables\|initial object\|warm-up\|created" "$WD"/node*.log
 set +e
 numactl --physcpubind="$CPUSL" --membind=1 "$LG/loadgen" --workload recsys --target 127.0.0.1:$PORT,127.0.0.1:$((PORT + 1)) \
   --out "$WD/lg" --opt samples="$WD/updates.smp" --opt queries="$WD/queries.smp" \
@@ -85,7 +94,7 @@ kill -TERM "${PIDS[@]}"; wait 2>/dev/null || true; PIDS=()
 tail -5 "$WD/loadgen.log"
 cat "$WD/lg/recsys.txt"
 s() { sed -n "s/^$2=//p" "$WD/node$1.log" | tail -1; }
-echo "node0: samples=$(s 0 samples) rows_written=$(s 0 rows_written) flushes=$(s 0 flushes) flush_overruns=$(s 0 flush_overruns) published_seq=$(s 0 published_seq) lock_spins=$(s 0 lock_spins) update_misses=$(s 0 update_misses)"
+echo "node0: samples=$(s 0 samples) rows_written=$(s 0 rows_written) update_sections=$(s 0 update_sections) flush_ns_max=$(s 0 flush_ns_max) flushes=$(s 0 flushes) flush_overruns=$(s 0 flush_overruns) published_seq=$(s 0 published_seq) lock_spins=$(s 0 lock_spins) update_misses=$(s 0 update_misses)"
 echo "node0: publish_rounds=$(s 0 publish_rounds) round_rows=$(s 0 round_rows) rows_per_round_target=$(s 0 rows_per_round_target) update_rate_sustained=$(s 0 update_rate_sustained) update_queue_max=$(s 0 update_queue_max) op.row_update n=$(s 0 op.row_update.n) t_ns=$(s 0 op.row_update.t_ns) c_ns=$(s 0 op.row_update.c_ns)"
 echo "node1: queries=$(s 1 queries) lookups=$(s 1 lookups) probes=$(s 1 probes) seq_retries=$(s 1 seq_retries) false_retries=$(s 1 false_retries) seq_spins=$(s 1 seq_spins) misses=$(s 1 misses) torn_rows=$(s 1 torn_rows)"
 echo "node1: op.query n=$(s 1 op.query.n) t_ns=$(s 1 op.query.t_ns) c_ns=$(s 1 op.query.c_ns) $(sed -n 's/^op.coh_src=//p' "$WD/node1.log" | tail -1)"
@@ -98,10 +107,12 @@ FAIL=0
 [ "$(s 0 op.row_update.n)" = "$(s 0 rows_written)" ] && [ "$(s 0 op.row_update.t_ns)" -gt 0 ] || { echo "op.row_update counters wrong"; FAIL=1; }
 [ "$(s 1 false_retries)" -le "$(s 1 seq_retries)" ] || { echo "false_retries > seq_retries"; FAIL=1; }
 [ "$(s 1 probes)" = "$(s 1 lookups)" ] || { echo "probes != lookups (direct addressing: one record read per lookup)"; FAIL=1; }
-if [ "$BACKEND" = megalon ]; then  # one object per row, one section per lookup, no stripe table
+if [ "$BACKEND" = megalon ]; then  # objects per MG_RPO, one section per lookup, no stripe table
   ROWS=$(sed -n 's/.*initial tables: \([0-9]*\) rows (megalon).*/\1/p' "$WD/node0.log" | tail -1)
   OBJS=$(sed -n 's/.*created \([0-9]*\) objects.*/\1/p' "$WD/node0.log" | tail -1)
-  [ -n "$ROWS" ] && [ "$OBJS" = "$ROWS" ] || { echo "objects ($OBJS) != rows ($ROWS)"; FAIL=1; }
+  [ -n "$ROWS" ] && [ -n "$EXP_OBJS" ] && [ "$OBJS" = "$EXP_OBJS" ] || { echo "objects ($OBJS) != expected ($EXP_OBJS)"; FAIL=1; }
+  [ "${MG_RPO:-1}" != 1 ] || [ "$OBJS" = "$ROWS" ] || { echo "N=1: objects ($OBJS) != rows ($ROWS)"; FAIL=1; }
+  [ "$(s 0 update_sections)" -gt 0 ] && [ "$(s 0 update_sections)" -le "$(s 0 rows_written)" ] || { echo "update_sections not in (0, rows_written]"; FAIL=1; }
   [ "$(s 1 seq_retries)" = 0 ] && [ "$(s 1 seq_spins)" = 0 ] && [ "$(s 0 lock_spins)" = 0 ] || { echo "stripe table used on megalon"; FAIL=1; }
 fi
-[ "$FAIL" = 0 ] && echo "HOST TEST PASS ($BACKEND, T=${T} ms) -> $WD" || { echo "HOST TEST FAIL -> $WD"; exit 1; }
+[ "$FAIL" = 0 ] && echo "HOST TEST PASS ($BACKEND${MA[*]:+ ${MA[*]}}, T=${T} ms) -> $WD" || { echo "HOST TEST FAIL -> $WD"; exit 1; }

@@ -4,12 +4,15 @@
 //   plain   all-HWcc and Popcorn: records at SWcc offset (row_base[k] + r) * slot_bytes, direct loads/stores.
 //           Consistency of a 9-line row copy is the application's job (kAppSeqlock): HWcc and Popcorn give coherence,
 //           not multi-line atomicity, so server.cc wraps record accesses in the HWcc striped version table (MemC3).
-//   megalon one Megalon object per row, object id = (table, row), found by Megalon's own index as in the artifact KV
-//           store. Every record access is one read/write section; the section validates/locks the object itself, so
-//           server.cc skips the striped version table (kAppSeqlock = false).
+//   megalon one Megalon object per table (--mg-rows-per-object 0, main), per row (1, restructured best case) or per
+//           N-row chunk (N > 1); object id = (table, chunk), found by Megalon's own index as in the artifact KV store.
+//           Every row read is one read section on its object; the updater writes a round's touched rows of an object
+//           in one write section. The section validates/locks the object itself, so server.cc skips the striped
+//           version table (kAppSeqlock = false).
 // Interface used by server.cc (Server<Backend>): fits, name, usage, stats, thread_init(tid), create_objects (node 0),
 // check_objects (every node), read_slot(k, r, f) (f(const uint8_t *rec) may run more than once and must only
-// produce its result), write_slot(k, r, fill) (fill(uint8_t *rec) writes the whole record, whole lines, reads nothing).
+// produce its result); plain: write_slot(k, r, fill) (fill(uint8_t *rec) writes the whole record, whole lines, reads
+// nothing); Megalon: write_object(k, c, body) (one write section, body writes whole rows of object (k, c)).
 #pragma once
 
 #include <dlfcn.h>
@@ -137,16 +140,45 @@ class MegalonBackend {
  public:
   static constexpr const char *kLayoutTag = " backend=megalon";
   static constexpr bool kAppSeqlock = false;  // read/write sections
-  MegalonBackend(const cxl::region &, uint8_t *, const Params &p, const mshim::Api *api) : p_(p), api_(api) {}
+  // rows_per_object (--mg-rows-per-object, DESIGN.md §7): 0 = one object per table (main configuration, user decision
+  // 2026-10-18), 1 = one object per row (restructured best case; the 9819e1180/3ef27d8b6 behaviour), N > 1 = objects of
+  // N contiguous rows (the last object of a table holds the rest). Object (k, c) holds rows [c x n_k, ...) of table k
+  // contiguously, n_k = N (N > 0) or rows[k] (N = 0); row r is at byte (r mod n_k) x 576 of object (k, r / n_k).
+  MegalonBackend(const cxl::region &, uint8_t *, const Params &p, const mshim::Api *api, uint64_t rows_per_object)
+      : p_(p), api_(api), rpo_opt_(rows_per_object) {
+    for (uint32_t k = 0; k < kSparse; k++) {
+      const uint64_t n = rpo_opt_ ? std::min(rpo_opt_, p_.rows[k]) : p_.rows[k];
+      rpo_.push_back(n);
+      nobj_.push_back((p_.rows[k] + n - 1) / n);
+      obj_base_.push_back(total_obj_);
+      total_obj_ += nobj_.back();
+      max_obj_bytes_ = std::max(max_obj_bytes_, n * p_.slot_bytes);
+    }
+  }
   bool fits(std::string *err) const {
     if (p_.slot_bytes % 64) return *err = "megalon: slot must be whole lines", false;
     for (uint32_t k = 0; k < kSparse; k++)
-      if (p_.rows[k] >= (1ull << 40)) return *err = "megalon: row index overflows the object id", false;
+      if (p_.rows[k] >= (1ull << 40) || nobj_[k] >= (1ull << 40))
+        return *err = "megalon: row/chunk index overflows the object id", false;
     return true;
   }
   std::string name() const { return "megalon"; }
   static constexpr uint64_t kBase = 0x5253ull << 48;  // "RS"
-  static uint64_t id(uint32_t k, uint64_t row) { return kBase | uint64_t(k) << 40 | row; }  // = the key's (table, row)
+  // object id = (table, chunk index): "RS" | k << 40 | c (k < 26, c < 2^40: no collisions). N = 1: c = row, i.e. the
+  // key's (table, row) as before; N = 0: c = 0.
+  static uint64_t id(uint32_t k, uint64_t c) { return kBase | uint64_t(k) << 40 | c; }
+  uint64_t rows_per_object_opt() const { return rpo_opt_; }
+  uint64_t objects() const { return total_obj_; }
+  uint64_t max_object_bytes() const { return max_obj_bytes_; }
+  uint64_t chunk_of(uint32_t k, uint64_t r) const { return r / rpo_[k]; }
+  uint64_t row_offset(uint32_t k, uint64_t r) const { return (r % rpo_[k]) * p_.slot_bytes; }
+  uint64_t first_row(uint32_t k, uint64_t c) const { return c * rpo_[k]; }
+  uint64_t object_rows(uint32_t k, uint64_t c) const { return std::min(rpo_[k], p_.rows[k] - c * rpo_[k]); }
+  uint64_t object_bytes(uint32_t k, uint64_t c) const { return object_rows(k, c) * p_.slot_bytes; }
+  // global object index (table-major): update-worker ownership is gobj % U (one writer per object). N = 1: = the
+  // global row index row_base[k] + r.
+  uint64_t gobj(uint32_t k, uint64_t c) const { return obj_base_[k] + c; }
+  const std::vector<uint64_t> &obj_base() const { return obj_base_; }
   // tid: Megalon registration id; role: Role (per-thread timing slot)
   void thread_init(int tid, int role = kRoleMain) const {
     api_->reg(tid);
@@ -159,28 +191,32 @@ class MegalonBackend {
   void (*coh_fn() const)(mshim::CohSnap *) { return api_->thread_coh; }  // shim v2 CohSnap
   void (*anchor_fn() const)(mshim::AnchorSnap *) { return api_->version >= 3 ? api_->thread_anchor : nullptr; }
 
-  // Node 0 at prepare: one object per row (no empty slots: nothing probes). par(f) runs f(i) on every thread of the
-  // server's registered prep pool (NR registrations are never freed, so threads are registered once and reused) and
-  // returns when all are done; threads create disjoint row ranges.
+  // Node 0 at prepare: ObjectCreate of every object (no empty records: nothing probes). par(f) runs f(i) on every
+  // thread of the server's registered prep pool (NR registrations are never freed, so threads are registered once and
+  // reused) and returns when all are done; threads claim batches of global object indices (2^14 rows' worth, at least
+  // one object; N = 1: 2^14 objects as before).
   template <class Par> bool create_objects(std::string *err, Par &&par) const {
     std::atomic<bool> ok{true};
     std::atomic<uint64_t> next{0};
     std::string e;
     std::mutex mu;
+    const uint64_t batch = rpo_opt_ ? std::max<uint64_t>(1, (1 << 14) / rpo_opt_) : 1;
     par([&](int) {
       for (;;) {
-        const uint64_t c = next.fetch_add(1 << 14);
-        if (c >= p_.total_rows || !ok.load(std::memory_order_relaxed)) return;
-        const uint64_t end = std::min(p_.total_rows, c + (1 << 14));
+        const uint64_t c = next.fetch_add(batch);
+        if (c >= total_obj_ || !ok.load(std::memory_order_relaxed)) return;
+        const uint64_t end = std::min(total_obj_, c + batch);
         uint32_t k = 0;
         for (uint64_t g = c; g < end; g++) {
-          while (k + 1 < kSparse && p_.row_base[k + 1] <= g) k++;
-          const int rc = api_->create(id(k, g - p_.row_base[k]), p_.slot_bytes);
+          while (k + 1 < kSparse && obj_base_[k + 1] <= g) k++;
+          const uint64_t ch = g - obj_base_[k];
+          const int rc = api_->create(id(k, ch), object_bytes(k, ch));
           if (rc != 0) {
             std::lock_guard<std::mutex> l(mu);
             if (ok.exchange(false))
-              e = "ObjectCreate(table " + std::to_string(k) + ", row " + std::to_string(g - p_.row_base[k]) + ") = " +
-                  std::to_string(rc) + " (-12 ENOMEM: object_arena_size too small; -17 EEXIST: stale objects, MEGALON_REINIT=1)";
+              e = "ObjectCreate(table " + std::to_string(k) + ", chunk " + std::to_string(ch) + ", " +
+                  std::to_string(object_bytes(k, ch)) + " B) = " + std::to_string(rc) +
+                  " (-12 ENOMEM: object_arena_size too small; -17 EEXIST: stale objects, MEGALON_REINIT=1)";
             return;
           }
         }
@@ -189,26 +225,28 @@ class MegalonBackend {
     if (!ok) *err = e;
     return ok;
   }
-  // Every node: ObjectLookup of every `stride`-th row plus the last row of each table (size check).
+  // Every node: ObjectLookup of every `stride`-th object plus the last object of each table (size check).
   bool check_objects(std::string *err, uint64_t stride) const {
-    auto one = [&](uint32_t k, uint64_t s) {
+    auto one = [&](uint32_t k, uint64_t c) {
       size_t got = 0;
-      const int rc = api_->lookup(id(k, s), &got);
-      if (rc == 0 && got == p_.slot_bytes) return true;
-      *err = "ObjectLookup(table " + std::to_string(k) + ", row " + std::to_string(s) + ") = " + std::to_string(rc) +
-             " size " + std::to_string(got);
+      const int rc = api_->lookup(id(k, c), &got);
+      if (rc == 0 && got == object_bytes(k, c)) return true;
+      *err = "ObjectLookup(table " + std::to_string(k) + ", chunk " + std::to_string(c) + ") = " + std::to_string(rc) +
+             " size " + std::to_string(got) + " (want " + std::to_string(object_bytes(k, c)) + ")";
       return false;
     };
     for (uint32_t k = 0; k < kSparse; k++) {
-      for (uint64_t s = 0; s < p_.rows[k]; s += std::max<uint64_t>(stride, 1))
-        if (!one(k, s)) return false;
-      if (!one(k, p_.rows[k] - 1)) return false;
+      for (uint64_t c = 0; c < nobj_[k]; c += std::max<uint64_t>(stride, 1))
+        if (!one(k, c)) return false;
+      if (!one(k, nobj_[k] - 1)) return false;
     }
     return true;
   }
+  // One row read = one read section on the containing object: read_start, f(row) (copies the 576 B row), read_end;
+  // repeated until read_end accepts (no application seqlock).
   template <class F> auto read_slot(uint32_t k, uint64_t s, F f) const {
     using R = decltype(f(static_cast<const uint8_t *>(nullptr)));
-    const uint64_t oid = id(k, s);
+    const uint64_t oid = id(k, chunk_of(k, s)), off = row_offset(k, s);
     MegThr *t = me_;
     const bool timed = t && sample_ && ++t->tick % sample_ == 0;
     if (t) t->rsec.fetch_add(1, std::memory_order_relaxed);
@@ -219,14 +257,15 @@ class MegalonBackend {
       const int rc = api_->read_start(oid, &h);
       const uint64_t b = timed ? mono_ns() : 0;
       if (rc != 0) megalon_fatal("ObjectReadStart(" + std::to_string(oid) + ") = " + std::to_string(rc));
+      const uint8_t *row = static_cast<const uint8_t *>(h.ptr) + off;
       if constexpr (std::is_void_v<R>) {
-        f(static_cast<const uint8_t *>(h.ptr));
+        f(row);
         const uint64_t c = timed ? mono_ns() : 0;
         const bool ok = api_->read_end(&h);
         if (timed) account_read(t, a, b, c, ok);
         if (ok) return;
       } else {
-        R r = f(static_cast<const uint8_t *>(h.ptr));
+        R r = f(row);
         const uint64_t c = timed ? mono_ns() : 0;
         const bool ok = api_->read_end(&h);
         if (timed) account_read(t, a, b, c, ok);
@@ -235,27 +274,32 @@ class MegalonBackend {
       if (t) t->read_fail.fetch_add(1, std::memory_order_relaxed);
     }
   }
-  template <class F> void write_slot(uint32_t k, uint64_t s, F fill) const {
+  // One write section on object (k, c): body(uint8_t *object) writes whole rows (whole lines) at row_offset; write_end
+  // flushes the whole object (paper semantics, DESIGN.md §7 D3). Megalon allows one writer per object: the caller owns
+  // the object (updater: gobj % U; prepare: the claiming thread).
+  template <class F> void write_object(uint32_t k, uint64_t c, F body) const {
     MegThr *t = me_;
     const bool timed = t && sample_ && ++t->tick % sample_ == 0;
     if (t) t->wsec.fetch_add(1, std::memory_order_relaxed);
     if (timed) t->wsec_sampled.fetch_add(1, std::memory_order_relaxed);
     mshim::Obj h;
     const uint64_t a = timed ? mono_ns() : 0;
-    const int rc = api_->write_start(id(k, s), &h);
+    const int rc = api_->write_start(id(k, c), &h);
     const uint64_t b = timed ? mono_ns() : 0;
     if (rc != 0) megalon_fatal("ObjectWriteStart = " + std::to_string(rc));
-    if (h.size != p_.slot_bytes) megalon_fatal("object size " + std::to_string(h.size));
-    fill(h.ptr);  // whole slot = whole lines (D3)
-    const uint64_t c = timed ? mono_ns() : 0;
+    if (h.size != object_bytes(k, c)) megalon_fatal("object size " + std::to_string(h.size));
+    body(h.ptr);
+    const uint64_t d = timed ? mono_ns() : 0;
     api_->write_end(&h);
     if (timed) {
       t->ws_ns.fetch_add(b - a, std::memory_order_relaxed);
-      t->we_ns.fetch_add(mono_ns() - c, std::memory_order_relaxed);
+      t->we_ns.fetch_add(mono_ns() - d, std::memory_order_relaxed);
     }
   }
   std::string usage() const {
-    return "megalon objects=" + std::to_string(p_.total_rows) + " (one per row) object_bytes=" +
+    return "megalon objects=" + std::to_string(total_obj_) + " rows_per_object=" + std::to_string(rpo_opt_) +
+           (rpo_opt_ == 0 ? " (one per table)" : rpo_opt_ == 1 ? " (one per row)" : " (row chunks)") +
+           " max_object_bytes=" + std::to_string(max_obj_bytes_) + " object_bytes=" +
            std::to_string(p_.total_rows * p_.slot_bytes) + " shim=" + api_->info;
   }
   std::string stats() const {
@@ -311,6 +355,9 @@ class MegalonBackend {
   }
   Params p_;
   const mshim::Api *api_;
+  uint64_t rpo_opt_;
+  std::vector<uint64_t> rpo_, nobj_, obj_base_;  // per table: rows per object, objects, global index of object 0
+  uint64_t total_obj_ = 0, max_obj_bytes_ = 0;
   uint32_t sample_ = 32;
   mutable std::mutex thr_mu_;
   mutable std::vector<std::unique_ptr<MegThr>> thr_;

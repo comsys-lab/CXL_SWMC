@@ -2,7 +2,7 @@
 // SWcc: one directly addressed table per sparse feature (user decision 2026-10-18; was open addressing with linear
 //   probing): row r of table k is record row_base[k] + r, one cache-line-aligned record {key, embedding[dim], seq,
 //   csum} (576 B for dim 128; `slot_bytes`). Tables are contiguous, table k after table k-1, no empty records.
-//   Megalon stores the same records as one object per row (backend.h).
+//   Megalon stores the same records in objects of N contiguous rows (backend.h, --mg-rows-per-object).
 // HWcc (region.app): header, parameter tag, per-node lines, a striped version table (MemC3 NSDI'13 §3.2.1): S = 2^16
 //   u32 counters, row key -> counter hash(table, key) mod S (v6, user 2026-10-16; replaced one word per 64 slots).
 //   Identical in every system.
@@ -90,7 +90,7 @@ struct Params {
   static uint32_t key_table(uint64_t key) { return uint32_t(key >> 56) - 1; }
   static uint64_t key_row(uint64_t key) { return key & ((1ull << 56) - 1); }
   // Striped version counter of a row (MemC3): hash(table, key) mod S. The key carries the table. Also the update
-  // worker shard (stripe % U) on every backend.
+  // worker shard (stripe % U) on plain; Megalon shards by object % U (server.cc owner()).
   uint32_t stripe(uint64_t key) const { return uint32_t(mix64(key ^ seed ^ 0x5eed5a17c0ffee11ull) & (ver_stripes - 1)); }
   // Row of the j-th multi-hot id of table k in sample s (MLPerf ids as is; table cap / row_div: id mod rows, D1)
   uint64_t row_of(uint32_t k, const Sample &s, uint32_t j) const { return s.ids[hot_off[k] + j] % rows[k]; }

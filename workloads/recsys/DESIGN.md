@@ -20,7 +20,8 @@ each system's API and measures its coherence actions; it cannot prove a coherenc
 ## 2. Tables (SWcc)
 - Addressing (user decision 2026-10-18, reports/H1-workload-porting.md Q11/Q12; replaces v5/v6 open addressing with
   linear probing): every system addresses rows directly. Row r of table k is record (k, r). Plain: SWcc offset
-  (row_base[k] + r) x 576 B. Megalon: one object per row (§7). A lookup reads exactly one record (`probes` =
+  (row_base[k] + r) x 576 B. Megalon: row r of table k lives in object (k, r / n) at byte (r mod n) x 576, n = rows
+  per object (`--mg-rows-per-object`, §7.1). A lookup reads exactly one record (`probes` =
   `lookups`). The updater writes rows without resolving a slot. Reason: Megalon finds an object by its id through its
   own index. With the app hash table kept only on plain, hw would read ~2.7 slots per lookup plus probe in the
   updater while mg reads one, which biases C_diff = T(mgoff) - T(hw).
@@ -71,11 +72,13 @@ each system's API and measures its coherence actions; it cannot prove a coherenc
 
 ## 5. Updater, publication interval T and the Ekko operating points (v6)
 - One `update` request = one sample (seq 1..). U workers (`--update-threads`, 4); every worker receives every sample
-  and keeps the rows it owns (stripe % U == w) in a private map key -> latest seq (latest wins). Nothing in shared
+  and keeps the rows it owns in a private map key -> latest seq (latest wins); owner = stripe % U on plain, Megalon
+  object index % U on Megalon (one writer per object, §7.1). Nothing in shared
   memory is read or written per sample; with T > 0 the sample is acknowledged on acceptance (workers independent, no
   all-worker completion per sample).
 - Every T (`--publish-ms`, 60 s in the main runs) each worker publishes its touched rows once (Monolith §2.2.3):
-  sort its rows by address, write each row (plain: under its counter; Megalon: one write section, §4); then `published_seq`
+  sort its rows by address, write each row (plain: under its counter; Megalon: one write section per owned object
+  holding all of its touched rows, §7.1); then `published_seq`
   (HWcc node line, min over workers). A round longer than T is an overrun: `flush_overruns`, `update_rate_sustained=0`
   ("update rate not sustained"), logged per round (`recsys-server: round ... OVERRUN`); the next round starts at the
   next multiple of T (never bursted). T = 0 (diagnostic): every sample's rows are written before the reply.
@@ -142,10 +145,9 @@ each system's API and measures its coherence actions; it cannot prove a coherenc
 - plain (all-HWcc, Popcorn): records at fixed SWcc offsets (§2), direct loads/stores, MemC3 stripes (§4). Popcorn
   init_state=shared: `--preload-only` (node 0, plain mapping, no HWcc, before coherence is enabled) then `--preloaded`
   in the server run.
-- megalon (Megalon-native, 2026-10-18): one Megalon object per row (id `"RS"<<48 | table<<40 | row` = the key's
-  (table, row), 576 B), created by node 0 at prepare (134.2M, was 167.7M slots including empty ones), found by
-  Megalon's index. Each record access is one read or write section; write sections write the whole record (whole
-  lines); `write_end` flushes the whole object (576 B). No application version table around the sections (§4).
+- megalon (Megalon-native, 2026-10-18; object granularity §7.1): objects of contiguous rows, created by node 0 at
+  prepare, found by Megalon's index. Each row read is one read section on its object; write sections write whole
+  rows (whole lines); `write_end` flushes the whole object. No application version table around the sections (§4).
   Every node checks every 4096th object id/size by ObjectLookup (`--check-stride`; vectordb checks all).
 - Shim: the shared object-API shim `systems/megalon/shim` (`megalon_objapi.h`, `megalon_objapi.cc`, `build-shim.sh`
   -> `lib/libmegalon-objapi.so`, symbol `megalon_object_api`), generalised from vectordb's copy (which vectordb keeps);
@@ -159,6 +161,67 @@ each system's API and measures its coherence actions; it cannot prove a coherenc
   the kv `slots` (systems/megalon/recsys-2vm.yaml: 245MB = 64.2M records at full size).
 - Megalon thread registrations are never freed (max 32 per process): prepare work runs on a persistent pool
   (`--load-threads`, registered once); budget 1 + load + update + serve <= 32 (default 1 + 8 + 4 + 14 = 27).
+
+### 7.1 Megalon object granularity (`--mg-rows-per-object N`; user decision 2026-10-18, reports/PAPER-direction-2026-10-18.md §3.2-§3.3, §5.5-§5.6)
+- N = 0: one object per embedding table (MAIN configuration: the natural DLRM layout, one EmbeddingBag/TBE weight
+  tensor per table). 26 objects; largest 26M x 576 B = 14,976,000,000 B, total 77,290,322,688 B at full size.
+- N = 1: one object per row ("restructured best case": Megalon optimised by restructuring the application to its
+  object unit). Same objects, ids, sizes and sections as 9819e1180/3ef27d8b6 (134,184,588 objects of 576 B).
+- N > 1: objects of N contiguous rows (the last object of a table holds the rest). Sweep values: open (user).
+- Object (k, c) = rows [c n, c n + n) of table k contiguously, n = N (N > 0, capped at rows[k]) or rows[k] (N = 0);
+  id = `"RS"<<48 | k<<40 | c` (k < 26, c < 2^40, so no two (table, chunk) pairs collide; N = 1: c = row, the old id).
+  Object bytes = rows in it x 576 (whole lines). `--print-layout --mg-rows-per-object N` prints the object count and
+  the largest object.
+- Prepare (node 0): ObjectCreate of every object (threads claim batches of global object indices), then the initial
+  image in ONE write section per object: write_start, every row written in place through the section pointer (the API
+  maps the whole object, so no chunking is needed), write_end (= whole-object flush + unlock). Objects >= 1 GiB log
+  their fill and write_end times (`initial object table k chunk c: ...`).
+- Serving: each row lookup = one read section on the containing object (read_start, copy the 576 B row, read_end,
+  redo on failure). No MemC3 on the Megalon path, no application-level table lock.
+- Updater: Megalon allows one writer per object (C3PO log), so ownership is the global object index (table-major)
+  % U, not stripe % U. Each round (and each sample with T = 0), per owned object, ONE write section writes all
+  touched rows of that object in address order; write_end flushes the whole object (paper semantics, D3 of M2). This
+  is the application's own publication batch (Monolith touched-key push, §5), not an added optimisation.
+  `update_sections` (stats) counts these sections (N = 1: = rows written; plain: 0).
+- N = 0 limits: at most 26 owners (one per table), so U > 26 adds nothing, and with U = 4 the owners are k % 4
+  (worker 0: tables 0, 4, 8, ..., 24 incl. the 26M-row tables 0 and 20; worker 1: 9 and 21; worker 3: 19; worker 2:
+  none of the 26M-row tables). Every round each owner writes its tables' touched rows and flushes each whole table
+  (up to 15.0 GB per table), so round time ~ sum of its tables' flush times: with whole-table flushes of seconds the
+  Ekko rows/round are reached only if the round fits T, else `flush_overruns` and `update_rate_sustained=0`. A reader
+  whose table changed waits while the writer holds the object (odd counter) and then flushes the whole object itself
+  on the counter change (read_start/read_end PAGE_INCOHERENT). This is the expected collapse of the table
+  configuration (Host measurements: §7.2).
+- Capacity (Megalon ac0d92a, checked in source): object size is a size_t in ObjectCreate/the handle and an isize in
+  the NR index entry (types.rs obj_entry, cn_array_[1]); the arena offset is in 64 B units under bit 62; the
+  allocation is a bump pointer over object_arena_size (91 GiB in recsys-2vm.yaml >= 77.29 GB; objects are 576 B
+  multiples, so object_align 64 adds nothing);
+  the create log entry has a fixed size (CheckPut); cache_flush (helper.cc) and the replay flush (replica.rs
+  flush_mem_region) loop over size_t/usize lines without chunk limits; write sections do not log. No per-object
+  limit applies to a 15 GB object. Records: 26 objects need 26 records (pool 64.2M), so no reclaim/switch_rw after
+  the first write of each table (N = 0); the first write of each object (RO -> RW, switch_rw) replays on the peer as
+  one whole-object flush.
+- Layout hash: N != 1 appends ` rows_per_object=N` to the Megalon layout tag (both nodes must agree); N = 1 keeps
+  the 3ef27d8b6 tag. The option is required with `--backend megalon` (no silent default) and rejected with plain.
+- Deviations (this change): (a) N = 1 ownership is now global row % U instead of stripe(key) % U (both: one writer
+  per row; sections, ids, sizes and data unchanged; only the row -> worker map differs); (b) the initial image of an
+  object is written in one write section (one per row for N = 1, as before).
+
+### 7.2 Host measurements (2026-10-18, builds/recsys-megalon/14 at 77ba0fa69, file region, CPUs 20-23 only)
+Evidence: workspaces/recsys-table/host-test-1 (control dir). Host numbers only; the VM cost is not measured.
+- Whole-object flush of one full-size largest table (14,976,000,000 B, tools/mg_flush_time.cc, 2 processes): initial
+  write_end 0.480 s; per round (1000 rows written) write_end 0.474-0.499 s (mean 0.491 s), i.e. ~30 GB/s of
+  clflushopt over lines that are mostly not cached. Node 1's one-row read sections: 0.51 us mean, but one read per
+  round took 0.985-1.009 s = the writer holding the object during its write_end (~0.5 s) plus node 1's own
+  whole-object flush on the counter change (~0.5 s; read_retry_incoherent 3 = rounds, flush_bytes 3 x 14.976 GB).
+- recsys at ROW_DIV 6 (26 objects, five of 2.50 GB, 12.88 GB total), T = 1 s, 2000 samples/s: initial write_end of a
+  2.32 GiB table 0.08-0.27 s; ~21.7 tables written per round (update_sections 390 / 18 rounds), round max 0.42 s, no
+  overrun at this scale; node 1 read_retry_incoherent 415 (~ one whole-table flush per changed table per round per
+  node); serving C = 55 % of query T (100.8 of 183.4 s), achieved 3.8 queries/s with p50 571 ms on 2 serving CPUs.
+- Expected full-size behaviour (inferred, not measured): a 26M-row table costs ~0.5 s per whole-object flush on the
+  Host, twice per round for a reader (writer hold + own flush), and each owner flushes all of its tables per round
+  (with U = 4: worker 0 owns two 15 GB tables plus five smaller ones), so rounds take ~1-2 s on the Host and serving
+  stalls ~1 s per changed table per round; on the VMs flush throughput may differ. This is the reason for the
+  expected collapse of the table configuration, not a defect of the port.
 
 ## 8. Load generation and results
 - loadgen plugin `recsys` (loadgen/recsys_plugin.cc): `--fixed update=<rate>` (v6: recsys-rate output), `--mix query=1`,

@@ -3,11 +3,14 @@
 # shim, systems/megalon/shim, linked against libmegalon) and the Megalon ship libraries of MEGALON_BUILD;
 # RUNPATH $ORIGIN/../lib. recsys-server dlopen()s the shim only for --backend megalon.
 # usage: build-megalon.sh <out dir> <megalon build dir, e.g. builds/megalon/69>   (pin to node 1)
+# Also bin/mg-flush-time (tools/mg_flush_time.cc, dlopens the shim like recsys-server).
 set -euo pipefail
 OUT=$1; MB=$(cd "$2" && pwd)
 HERE=$(cd "$(dirname "$0")" && pwd); ROOT=$(cd "$HERE/../../.." && pwd)
 COMMIT=$(git -C "$HERE" rev-parse HEAD)
 INFO=$("$ROOT/systems/megalon/shim/build-shim.sh" "$OUT" "$MB" "recsys-megalon commit=${COMMIT:0:12}")
+mkdir -p "$OUT/bin"  # Megalon whole-object flush timing (tests/mg_flush_time.sh); listed in build.sh's manifest
+c++ -std=c++17 -O2 -g -Wall -Wextra -I"$ROOT/systems/megalon/shim" "$HERE/../tools/mg_flush_time.cc" -o "$OUT/bin/mg-flush-time" -ldl
 EXTRA_LDFLAGS="-Wl,--enable-new-dtags,-rpath,\$ORIGIN/../lib" "$HERE/build.sh" "$OUT"
 { echo "shim_info=$INFO"; echo "megalon_build=$MB"
   grep -E '^(source_commit|source_dirty_diff_sha256|build_id|flavor|wmeta_layout|cmake_effective)=' "$MB/manifest.txt" | sed 's/^/megalon./'
