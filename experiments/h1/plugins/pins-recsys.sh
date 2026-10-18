@@ -22,6 +22,8 @@
 # (avg/peak files byte-identical to calib/1, plus the three intermediate Ekko points f087 / f149 / f253 and their
 # T = 60 s references); main-block.sh (ekko_set points, EKKO_REF) re-pinned. The extra mixes run only through
 # h1-main.sh --add-mixes (experiments/h1/h1-plan-extra.tsv); builds and builds/recsys-inputs/1 unchanged.
+# Re-pinned 2026-10-19 (H1 v0.6.13, user: Popcorn/All-HWcc 0.2-0.3): RATE_T_DIR = builds/recsys-calib/5 (calib/4 points
+# byte-identical + f385 = 0.00385); main-block.sh re-pinned.
 # Re-pinned 2026-10-19 (H1 v0.6.12, user: search for Popcorn/All-HWcc 0.7-0.8): RATE_T_DIR = builds/recsys-calib/4
 # (avg/peak/f149/f253/f330 byte-identical to calib/3, + f350 / f370 / f400 = 0.0035 / 0.0037 / 0.004); main-block.sh re-pinned.
 # Re-pinned 2026-10-18 (H1 v0.6.11): RATE_T_DIR = builds/recsys-calib/3 (avg/peak/f149/f253 byte-identical to calib/2,
@@ -34,27 +36,29 @@ BLOCK_ENV=(BLOCK=h1 POP_BUILD=12 POP_BUNDLE_SHA=$POP_BUNDLE_SHA C8=$CPOP K8=$KPO
   D=$P/builds/recsys-inputs/1 PLAIN_BUILD=$P/builds/recsys/12 MEG_BUILD=$P/builds/recsys-megalon/14 MEGALON_BASE=$MEG77
   VM_PLAIN=/home/comsys/rs12 VM_MEG=/home/comsys/rsm14 LOADGEN=$P/builds/recsys-loadgen/9/loadgen XT=7200
   MG_RPO_OPT=--mg-rows-per-object MG_TABLE_N=0 MG_COH_SAMPLE=1
-  RS_T_MS=1000 RATE_T_DIR=$P/builds/recsys-calib/4
+  RS_T_MS=1000 RATE_T_DIR=$P/builds/recsys-calib/5
   EXPECT_DAX_UUID=$EXPECT_DAX_UUID)
 PIN_SHA256="$COMMON_SHA256
 9c330ba688b96019792dee4bb80e91965cfb7e5d5c21265bb3a2e805df3db5a8  $P/builds/recsys-inputs/1/MANIFEST.txt
 83e7048cb5d727ae50e5492c8a6c84e123b5190bc8bbbbdc89d71e625fbe522a  $P/builds/recsys-inputs/1/rate-frac0.0043.txt
 1df9b01d68d56d4aed1e24538945a44623863bf424c36a56cfa732c6ea16073c  $P/builds/recsys-inputs/1/rate-frac0.000513333333.txt
-facb519e6194dbafcfb6942b822a74fdc931a74591904ff473bb4e6e996bc2d8  $P/builds/recsys-calib/4/MANIFEST.txt
-15a20f7c01314a3b44c6b4e2561379146321aeea4c732017e16fe723b9aa28ce  $P/builds/recsys-calib/4/rate-T1000-peak.txt
-3b70e3e27b2f703916eccc535ab45bab7b8290b2373d56429ed2674881a6ea3c  $P/builds/recsys-calib/4/rate-T1000-avg.txt
-6a43d3ae7479b308ddf028fdb2a08c63169e5adacb214b35af85a220650920e8  $P/builds/recsys-calib/4/rate-T1000-f149.txt
-ac8181e9c34d31a7d094812298834f269002fcd35ba6d8f093734aaaee7b5965  $P/builds/recsys-calib/4/rate-T1000-f253.txt
-d6feb63171d4a4eee33700f9a8b6beb73edb6a3d382041fd7af30ff6a0169f56  $P/builds/recsys-calib/4/rate-T1000-f330.txt
-e22b73243b6c2facb5ce9b445f66e68c6fe4219f22dbef1feffd92f249d23f2b  $P/builds/recsys-calib/4/rate-T1000-f350.txt
-b15cda69a3f4dcd771a96773765dc677f23e130fc4ab00cd3844268c3ebb23a8  $P/builds/recsys-calib/4/rate-T1000-f370.txt
-0f7badcde3017e292680aff9c1be015cebf6d29ae65aeea420e039d8ca89e964  $P/builds/recsys-calib/4/rate-T1000-f400.txt
-451d588553b83f746bc1b048740526f9f613860852e26a1aa56d07d1141d4e4f  $P/builds/recsys-calib/4/rate-frac0.00149.txt
-c817114a34c0cb83886b5fb286f9956117affdeb6fb049209ab8ac8a017a8550  $P/builds/recsys-calib/4/rate-frac0.00253.txt
-d1649128a6053c84a8a4eb3f3e910c525fdfcbfce2772c5737acb2f8a085ff09  $P/builds/recsys-calib/4/rate-frac0.0033.txt
-95543ddcf8e8672b335d6e4c83c20efaf57d22ef3fb01a2bde51c9f74f63d74f  $P/builds/recsys-calib/4/rate-frac0.0035.txt
-b10e9b5fe31c3bdfe1e0938a4a87fcc51861ee96b9d3f51fac342f0c32f58871  $P/builds/recsys-calib/4/rate-frac0.0037.txt
-a52021666265eeffb04b719b90d566ac7d5399327c6c81fa47185a7b81d2c7a4  $P/builds/recsys-calib/4/rate-frac0.004.txt
+97c7f3e72d487f86260707bd6bae29b7b523d4d0d99ac728cdccfc6fe8aebcbb  $P/builds/recsys-calib/5/MANIFEST.txt
+451d588553b83f746bc1b048740526f9f613860852e26a1aa56d07d1141d4e4f  $P/builds/recsys-calib/5/rate-frac0.00149.txt
+c817114a34c0cb83886b5fb286f9956117affdeb6fb049209ab8ac8a017a8550  $P/builds/recsys-calib/5/rate-frac0.00253.txt
+d1649128a6053c84a8a4eb3f3e910c525fdfcbfce2772c5737acb2f8a085ff09  $P/builds/recsys-calib/5/rate-frac0.0033.txt
+95543ddcf8e8672b335d6e4c83c20efaf57d22ef3fb01a2bde51c9f74f63d74f  $P/builds/recsys-calib/5/rate-frac0.0035.txt
+b10e9b5fe31c3bdfe1e0938a4a87fcc51861ee96b9d3f51fac342f0c32f58871  $P/builds/recsys-calib/5/rate-frac0.0037.txt
+100c75f25a400514b02b7c4aa871bf76e605a68fd436c73da8b4ac291de8df4b  $P/builds/recsys-calib/5/rate-frac0.00385.txt
+a52021666265eeffb04b719b90d566ac7d5399327c6c81fa47185a7b81d2c7a4  $P/builds/recsys-calib/5/rate-frac0.004.txt
+3b70e3e27b2f703916eccc535ab45bab7b8290b2373d56429ed2674881a6ea3c  $P/builds/recsys-calib/5/rate-T1000-avg.txt
+6a43d3ae7479b308ddf028fdb2a08c63169e5adacb214b35af85a220650920e8  $P/builds/recsys-calib/5/rate-T1000-f149.txt
+ac8181e9c34d31a7d094812298834f269002fcd35ba6d8f093734aaaee7b5965  $P/builds/recsys-calib/5/rate-T1000-f253.txt
+d6feb63171d4a4eee33700f9a8b6beb73edb6a3d382041fd7af30ff6a0169f56  $P/builds/recsys-calib/5/rate-T1000-f330.txt
+e22b73243b6c2facb5ce9b445f66e68c6fe4219f22dbef1feffd92f249d23f2b  $P/builds/recsys-calib/5/rate-T1000-f350.txt
+b15cda69a3f4dcd771a96773765dc677f23e130fc4ab00cd3844268c3ebb23a8  $P/builds/recsys-calib/5/rate-T1000-f370.txt
+8972d5f4573af56bf3947e8fdaeef711dd3ec4f3d7b2ac45cf167602e3edf0ca  $P/builds/recsys-calib/5/rate-T1000-f385.txt
+0f7badcde3017e292680aff9c1be015cebf6d29ae65aeea420e039d8ca89e964  $P/builds/recsys-calib/5/rate-T1000-f400.txt
+15a20f7c01314a3b44c6b4e2561379146321aeea4c732017e16fe723b9aa28ce  $P/builds/recsys-calib/5/rate-T1000-peak.txt
 564c1b823ce144f02565f6404c221b56a362c275ae787d1ad67076c9a26ca684  $P/builds/recsys/12/manifest.txt
 1b502b6220ff1ba17cd944d0884ddee6a1dceeda5c8579298b27736294660cd3  $P/builds/recsys/12/bin/recsys-server
 9ba94ba5e75982ab0eb9ba6aa5d4b9fcb784518bc271a50ce0245720342442a5  $P/builds/recsys/12/bin/recsys-rate
@@ -64,7 +68,7 @@ a52021666265eeffb04b719b90d566ac7d5399327c6c81fa47185a7b81d2c7a4  $P/builds/recs
 f9c1753f3bef2ab0941153058860227145f2d7b7e33a210bdc3338fad14eacda  $P/builds/recsys-megalon/14/lib/libmegalon.so
 de2e9a4cd7ee41df5d9a938836802b0ee5186ba69b42252e3ab747f0bfeae193  $P/builds/recsys-loadgen/9/manifest.txt
 61bb70687ef15823a33a56c282d53eecdbcc1c1e574589eeba7791b4a65d81c0  $P/builds/recsys-loadgen/9/loadgen
-75d284c93f8badd178ec60d800b11ad091436d5b2a9abccd4eadb18272c0edfe  $HOOK_FILE
+759fbcc3480a9a223ec08b77dbe865de823d41f5f09095c64b65b09fbec54479  $HOOK_FILE
 68c5b9ceaf986e9e05e941d586a9a5cb5bb162b1963181ce02efa5d34cce5b54  $HR/experiments/recsys/session.sh
 0bd4d06ea0b0678b77d1276aec2f13db70a8eceed7e7ab11f61905052e8ac4ac  $HR/experiments/recsys/v1_check.py
 32d171199d6a47d15fcfa6971522e253fe21d857e91c9049c201e55a0cdac230  $HR/experiments/recsys/check_breakdown.py
