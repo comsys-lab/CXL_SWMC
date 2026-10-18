@@ -87,7 +87,7 @@ if [ "${GATE:-1}" = 1 ]; then
 fi
 T0=$(date +%s)
 if [ "$SYS" = Popcorn ]; then  # as experiments/lmdb/pilot-run.sh: enable BEFORE the servers
-  PS=(K=$K8 GT=$GT8 C=$C8 R=$E/shm-$NAME INIT_STATE=shared)
+  PS=(POP_IPS="${IPS[*]}" K=$K8 GT=$GT8 C=$C8 R=$E/shm-$NAME INIT_STATE=shared)  # POP_IPS: N-node bundle (popcorn-n)
   servers_gone || stop "rocksdb process or /dev/dax0.0 user before the cxl_shm load"
   for ph in precheck load chown; do env "${PS[@]}" bash $C8/p-popcorn-shm.sh $ph || stop "shm $ph"; done
   for ip in "${IPS[@]}"; do

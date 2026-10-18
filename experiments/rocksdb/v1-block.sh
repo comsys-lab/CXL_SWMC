@@ -19,7 +19,10 @@
 # optional: NODES (192.168.122.100 192.168.122.101), VM_DOMAINS (cxl_vm0 cxl_vm1; libvirt names in NODES order),
 #   BUILD (builds/rocksdb/3), LOADGEN_BUILD (builds/rocksdb-loadgen/1), C8 K8 GT8 RECV_MODE (needed when a run has
 #   SYS=Popcorn), MEASURE (0; 1 = H1_MEASURE_RUN=1 with MEASURE_PART_DIR: loadgen in measure.slice + h1-gate),
-#   EXPECT_DAX_UUID, MIN_MEM_G (16).
+#   EXPECT_DAX_UUID, MIN_MEM_G (16), REGION (CXL_SWMC/config/cxl_region.yaml; Popcorn on N > 2 needs
+#   config/cxl_region-ring2m.yaml: 2 MiB msg_ring), POP_IPS is set to NODES for the Popcorn bundle (p-popcorn-shm.sh
+#   drives only .100/.101 without it; bundle-n-v1 for N > 2); with MEASURE=1 also MEASURE_ENV / MEASURE_PART_SCRIPT
+#   (N-VM scripts, e.g. scripts/host/measure-env-n.sh) and EXPECT_RUNNING (default VM_DOMAINS) for h1-gate.sh.
 set -uo pipefail
 export PYTHONDONTWRITEBYTECODE=1
 E=$1
@@ -27,14 +30,17 @@ P=/home/comsys/sungsu/destijl-control X=$P/CXL_SWMC/experiments/rocksdb G=$P/CXL
 : "${OWNER:?}" "${EXPECT_K:?}" "${PRETOUCH_DIR:?}" "${L:?L = new guest install dir}" "${RUNS:?}"
 case "$L" in /home/comsys/?*) ;; *) echo "BLOCK STOP: L must be under /home/comsys/"; exit 2;; esac
 read -r -a IPS <<< "${NODES:-192.168.122.100 192.168.122.101}"
-export NODES="${IPS[*]}" VM_DOMAINS="${VM_DOMAINS:-cxl_vm0 cxl_vm1}"
+export NODES="${IPS[*]}" VM_DOMAINS="${VM_DOMAINS:-cxl_vm0 cxl_vm1}" POP_IPS="${IPS[*]}"
+REGION=${REGION:-$P/CXL_SWMC/config/cxl_region.yaml}
 BUILD=${BUILD:-$P/builds/rocksdb/3} LOADGEN_BUILD=${LOADGEN_BUILD:-$P/builds/rocksdb-loadgen/1}
 PAT='(^|[ /])bin/rocksdb-serve[r]( |$)'
 SSH="ssh -o BatchMode=yes -o ConnectTimeout=8"
 if grep -q "SYS=Popcorn" <<< "$RUNS"; then : "${C8:?}" "${K8:?}" "${GT8:?}" "${RECV_MODE:?}"; [ "$EXPECT_K" = "$K8" ] || { echo "BLOCK STOP: EXPECT_K != K8"; exit 2; }; fi
 if [ "${MEASURE:-0}" = 1 ]; then  # h1-gate.sh needs both (partition + measurement environment evidence)
   : "${MEASURE_PART_DIR:?MEASURE=1 needs MEASURE_PART_DIR}" "${MEASURE_ENV_DIR:?MEASURE=1 needs MEASURE_ENV_DIR}"
-  export H1_MEASURE_RUN=1 MEASURE_PART_DIR MEASURE_ENV_DIR
+  export H1_MEASURE_RUN=1 MEASURE_PART_DIR MEASURE_ENV_DIR EXPECT_RUNNING="${EXPECT_RUNNING:-$VM_DOMAINS}"
+  [ -z "${MEASURE_ENV:-}" ] || export MEASURE_ENV
+  [ -z "${MEASURE_PART_SCRIPT:-}" ] || export MEASURE_PART_SCRIPT
 fi
 [ -d "$E" ] && [ -z "$(ls -A "$E" | grep -vE '^(tasks-check\.txt|block\.out)$')" ] || { echo "BLOCK STOP: $E missing or not empty"; exit 2; }
 [ -s "$E/tasks-check.txt" ] || { echo "BLOCK STOP: $E/tasks-check.txt missing (state/TASKS.md: no other active VM user)"; exit 2; }
@@ -54,9 +60,9 @@ finish() {
   for r in "$E"/shm-*/; do  # every attempted cxl_shm load without "teardown PASS"
     r=${r%/}; [ -d "$r" ] && [ -f "$r/load-vm0.txt" ] || continue
     grep -q "teardown PASS" "$r/steps.log" 2>/dev/null && continue
-    env K=$K8 GT=$GT8 C=$C8 R=$r bash $C8/p-popcorn-shm.sh teardown >> "$E/cleanup.out" 2>&1 \
-      || { grep -q "instr_enabled=1 missing" "$r/steps.log" 2>/dev/null && env K=$K8 GT=$GT8 C=$C8 R=$r bash $C8/p-popcorn-shm.sh instr-on >> "$E/cleanup.out" 2>&1 \
-           && env K=$K8 GT=$GT8 C=$C8 R=$r bash $C8/p-popcorn-shm.sh teardown >> "$E/cleanup.out" 2>&1; }
+    env POP_IPS="$POP_IPS" K=$K8 GT=$GT8 C=$C8 R=$r bash $C8/p-popcorn-shm.sh teardown >> "$E/cleanup.out" 2>&1 \
+      || { grep -q "instr_enabled=1 missing" "$r/steps.log" 2>/dev/null && env POP_IPS="$POP_IPS" K=$K8 GT=$GT8 C=$C8 R=$r bash $C8/p-popcorn-shm.sh instr-on >> "$E/cleanup.out" 2>&1 \
+           && env POP_IPS="$POP_IPS" K=$K8 GT=$GT8 C=$C8 R=$r bash $C8/p-popcorn-shm.sh teardown >> "$E/cleanup.out" 2>&1; }
     grep -q "teardown PASS" "$r/steps.log" 2>/dev/null || echo "CLEANUP FAILED: $r (manual: reports/M5-pilot-kv.md §6)" | tee -a "$E/cleanup.out"
   done
   for ip in "${IPS[@]}"; do
@@ -105,9 +111,12 @@ step "H0 Host gate"
 if [ "${MEASURE:-0}" = 1 ]; then bash $P/CXL_SWMC/experiments/h1/h1-gate.sh check "$E/gate-H0.txt" || stop "h1 gate"
 else bash $G check "$E/gate-H0.txt" || stop "host gate"; fi
 step "G1 install ($L)"
-NODES="${IPS[*]}" BUILD=$BUILD L=$L bash $X/install.sh "$E/install.log" > "$E/install.out" 2>&1 || stop "install (see install.out)"
+NODES="${IPS[*]}" BUILD=$BUILD L=$L REGION=$REGION bash $X/install.sh "$E/install.log" > "$E/install.out" 2>&1 || stop "install (see install.out)"
 [ "$(grep -c '^ldd_not_found=0$' "$E/install.log")" = "${#IPS[@]}" ] || stop "install: ldd"
-WANT="$(sha256sum < $BUILD/bin/rocksdb-server | cut -c1-64) $(sha256sum < $X/rocksdb-node.sh | cut -c1-64) $(sha256sum < $P/CXL_SWMC/config/cxl_region.yaml | cut -c1-64)"
+WANT="$(sha256sum < $BUILD/bin/rocksdb-server | cut -c1-64) $(sha256sum < $X/rocksdb-node.sh | cut -c1-64) $(sha256sum < $REGION | cut -c1-64)"
+{ echo "region=$REGION sha256=$(sha256sum < $REGION | cut -c1-64) $(grep -E '^msg_ring:' $REGION) nodes=${#IPS[@]}"
+  case ${#IPS[@]} in 2) s=4096;; 4) s=1024;; 8) s=256;; *) s=unknown;; esac
+  echo "msg_ring_slots_per_window(popcorn-n, 2 MiB ring)=$s (meaningful with cxl_region-ring2m.yaml)"; } | tee -a "$E/block.log" > "$E/region.txt"
 step "G2 pre-check"
 for i in "${!IPS[@]}"; do
   $SSH comsys@${IPS[$i]} "EXPECT_K=$EXPECT_K L=$L EXPECT_SHA='$WANT' EXPECT_DAX_UUID=${EXPECT_DAX_UUID:-} MIN_MEM_G=${MIN_MEM_G:-16} bash -s" \

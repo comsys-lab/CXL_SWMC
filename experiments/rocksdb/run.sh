@@ -76,7 +76,7 @@ APP=$("$HOST_SERVER" --print-app-bytes $LAYOUT)
   echo "block_cache=per DB instance (primary + $((N - 1)) secondaries), RocksDB default 32 MiB each"
   [ -z "${SERVER_CPUS:-}" ] || echo "server_cpus=$SERVER_CPUS"
   for k in "${!NODE[@]}"; do
-    info=$($SSH comsys@"${NODE[$k]}" "uname -r; sha256sum $V/bin/rocksdb-server $V/bin/rocksdb-node.sh $V/cfg/cxl_region.yaml | cut -c1-64; nproc; grep MemTotal /proc/meminfo" < /dev/null | tr '\n' ' ')
+    info=$($SSH comsys@"${NODE[$k]}" "uname -r; sha256sum $V/bin/rocksdb-server $V/bin/rocksdb-node.sh $V/cfg/cxl_region.yaml | cut -c1-64; grep -E '^msg_ring:' $V/cfg/cxl_region.yaml; nproc; grep MemTotal /proc/meminfo" < /dev/null | tr '\n' ' ')
     [ -n "$info" ] || { echo "node$k info empty" >&2; exit 4; }
     echo "node$k=${NODE[$k]} $info"
   done
