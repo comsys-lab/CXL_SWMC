@@ -40,7 +40,8 @@ inline void pack_name(const std::string &s, uint64_t w[kNameWords]) {
   std::memcpy(w, b, sizeof(b));
 }
 struct SlotView {
-  bool live = false;
+  bool live = false;     // state 1
+  bool retired = false;  // state 2: deleted, name kept until the slot is reclaimed (remote openers, shared.h)
   std::string name;
   uint64_t size = 0;
 };
@@ -52,7 +53,9 @@ inline SlotView read_slot(const FileHead *fh) {
       continue;
     }
     SlotView v;
-    v.live = cxl::hwcc::load_relaxed(&fh->state) == 1;
+    const uint64_t st = cxl::hwcc::load_relaxed(&fh->state);
+    v.live = st == 1;
+    v.retired = st == 2;
     uint64_t w[kNameWords];
     for (uint32_t i = 0; i < kNameWords; i++) w[i] = cxl::hwcc::load_relaxed(&fh->name[i]);
     __atomic_thread_fence(__ATOMIC_ACQUIRE);
@@ -428,14 +431,20 @@ class CxlFs final : public FileSystemWrapper {
       *slot = it->second;
       return true;
     }
+    // A remote secondary may open a file its version refers to after the owner deleted it (the data stays until the
+    // reader epochs pass): a live file first, else a retired one of that name.
+    int64_t retired = -1;
     for (uint32_t s = 0; s < sh_->params().max_files; s++) {
       SlotView v = read_slot(sh_->hwcc()->head(p.node, s));
-      if (v.live && v.name == p.name) {
+      if (v.name != p.name) continue;
+      if (v.live) {
         *slot = s;
         return true;
       }
+      if (v.retired && retired < 0) retired = s;
     }
-    return false;
+    if (retired >= 0) *slot = uint32_t(retired);
+    return retired >= 0;
   }
   void set_slot_locked(uint32_t slot, const std::string &name, uint64_t state) {
     FileHead *fh = sh_->hwcc()->head(sh_->me(), slot);
@@ -462,7 +471,7 @@ class CxlFs final : public FileSystemWrapper {
     const uint32_t *ex = sh_->hwcc()->exts(sh_->me(), slot);
     std::vector<uint32_t> exts;
     for (uint64_t k = 0; k * kUnit < size; k++) exts.push_back(__atomic_load_n(&ex[k], __ATOMIC_RELAXED));
-    set_slot_locked(slot, "", 0);
+    set_slot_locked(slot, name, 2);  // retired: name kept for remote openers until the slot is reclaimed
     sh_->retire_file(slot, exts);
   }
 

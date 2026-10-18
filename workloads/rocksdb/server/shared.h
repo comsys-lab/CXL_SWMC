@@ -174,8 +174,14 @@ class Shared {
         for (uint32_t j : it->exts)
           if (--ext_refs_[j] == 0) free_ext_.push_back(j);
         if (it->slot != UINT32_MAX) {
-          FileHead *fh = h_->head(me_, it->slot);
+          FileHead *fh = h_->head(me_, it->slot);  // seqlock write (cxlfs.h read_slot): free, no name
+          const uint64_t sq = cxl::hwcc::load_relaxed(&fh->seq);
+          cxl::hwcc::store_relaxed(&fh->seq, sq + 1);
+          __atomic_thread_fence(__ATOMIC_RELEASE);
+          cxl::hwcc::store_relaxed(&fh->state, uint64_t(0));
+          for (uint32_t w = 0; w < kNameWords; w++) cxl::hwcc::store_relaxed(&fh->name[w], uint64_t(0));
           cxl::hwcc::store_relaxed(&fh->size, uint64_t(0));
+          cxl::hwcc::store_release(&fh->seq, sq + 2);
           free_slots_.push_back(it->slot);
         }
         it = retired_.erase(it);

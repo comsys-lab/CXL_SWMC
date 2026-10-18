@@ -97,17 +97,19 @@ class RemoteView {
         r = Res::kNotFound, done = true;
       } else if (mr == ROCKSDB_NAMESPACE::cxl::RemoteResult::kUnsupported) {
         r = Res::kError, done = true;
+        err_ = "memtable entry not decodable (memtable id " + std::to_string(d.m[i].id) + ")";
       }
     }
     if (!done) {
       auto s = db_->Get(ROCKSDB_NAMESPACE::ReadOptions(), key, stored);
       if (s.ok()) r = Res::kFound, st_.sst_hits.fetch_add(1, std::memory_order_relaxed);
       else if (s.IsNotFound()) r = Res::kNotFound;
-      else r = Res::kError;
+      else r = Res::kError, err_ = "secondary Get: " + s.ToString();
     }
     sh_->epoch_exit(v_);
     if (r == Res::kNotFound) st_.misses.fetch_add(1, std::memory_order_relaxed);
-    if (r == Res::kError) st_.errors.fetch_add(1, std::memory_order_relaxed);
+    if (r == Res::kError && st_.errors.fetch_add(1, std::memory_order_relaxed) < 20)
+      std::fprintf(stderr, "rocksdb-server: remote get node %u: %s\n", v_, err_.c_str());
     return r;
   }
 
@@ -158,6 +160,7 @@ class RemoteView {
   std::atomic<uint64_t> applied_{0};
   std::mutex cmu_;
   RemoteStats st_;
+  static thread_local inline std::string err_;  // last error of this thread (diagnostics)
   std::atomic<bool> stop_{false};
   std::thread bg_;
 };
