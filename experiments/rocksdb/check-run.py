@@ -39,6 +39,7 @@ def main():
     ap.add_argument("run")
     ap.add_argument("--nodes", type=int, required=True)
     ap.add_argument("--keys", type=int, default=0)
+    ap.add_argument("--verify", type=int, default=0)
     ap.add_argument("--stop-extents-free", type=int, default=2048)
     ap.add_argument("--stop-blocks-free", type=int, default=16)
     a = ap.parse_args()
@@ -93,7 +94,10 @@ def main():
             p = os.path.join(a.run, f"verify-node{k}.txt")
             if os.path.exists(p):
                 tot += num(kv(open(p).read()), "verify.entries")
-        if tot and tot < a.keys:
+            elif a.verify:
+                bad.append(f"node{k}: VERIFY=1 but no verify-node{k}.txt")
+        # >= not ==: a key can still be in two DBs (stale copy until G1 reaches it), never in none
+        if (tot or a.verify) and tot < a.keys:
             bad.append(f"verify entries over all nodes {tot} < keys {a.keys}")
         print(f"completeness: verify_entries_total={tot} keys={a.keys}")
     for b in bad:

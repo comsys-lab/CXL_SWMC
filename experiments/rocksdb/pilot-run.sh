@@ -100,12 +100,12 @@ if [ "$SYS" = Popcorn ]; then  # as experiments/lmdb/pilot-run.sh: enable BEFORE
     echo "$ip recv_mode=$m" >> "$E/recv-mode-$NAME.txt"
     [ "$m" = "$RECV_MODE" ] || { env "${PS[@]}" bash $C8/p-popcorn-shm.sh teardown; stop "recv_mode on $ip = $m"; }
   done
-  env "${PS[@]}" STATUS_TAG=pre bash $C8/p-popcorn-shm.sh status || { env "${PS[@]}" bash $C8/p-popcorn-shm.sh teardown; stop "status pre"; }
+  env "${PS[@]}" STATUS_TAG=runpre bash $C8/p-popcorn-shm.sh status || { env "${PS[@]}" bash $C8/p-popcorn-shm.sh teardown; stop "status pre"; }
 fi
 bash $X/run.sh "$NAME" "$E" -- "${LG[@]}"
 RC=$?
 if [ "$SYS" = Popcorn ]; then
-  env "${PS[@]}" STATUS_TAG=post bash $C8/p-popcorn-shm.sh status
+  env "${PS[@]}" STATUS_TAG=runpost bash $C8/p-popcorn-shm.sh status
   # Popcorn error counters over the run (verifier HIGH-1): transaction_error / send_drop / late_response deltas = 0
   python3 -I -B - "$E/shm-$NAME" "$N" > "$E/$NAME.popcorn-errors.txt" 2>&1 <<'EOP'
 import os, sys
@@ -117,7 +117,7 @@ def kv(p):
             k, v = l.rstrip('\n').split('=', 1); out[k] = v
     return out
 for k in range(n):
-    b, a = os.path.join(d, f'status-pre-vm{k}.txt'), os.path.join(d, f'status-post-vm{k}.txt')
+    b, a = os.path.join(d, f'status-runpre-vm{k}.txt'), os.path.join(d, f'status-runpost-vm{k}.txt')
     if not (os.path.exists(b) and os.path.exists(a)): bad.append(f'vm{k}: status files missing'); continue
     b, a = kv(b), kv(a)
     for c in ('transaction_error_count', 'send_drop_count', 'late_response_count'):

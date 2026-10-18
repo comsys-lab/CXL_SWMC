@@ -32,13 +32,17 @@ BUILD=${BUILD:-$P/builds/rocksdb/3} LOADGEN_BUILD=${LOADGEN_BUILD:-$P/builds/roc
 PAT='(^|[ /])bin/rocksdb-serve[r]( |$)'
 SSH="ssh -o BatchMode=yes -o ConnectTimeout=8"
 if grep -q "SYS=Popcorn" <<< "$RUNS"; then : "${C8:?}" "${K8:?}" "${GT8:?}" "${RECV_MODE:?}"; [ "$EXPECT_K" = "$K8" ] || { echo "BLOCK STOP: EXPECT_K != K8"; exit 2; }; fi
-if [ "${MEASURE:-0}" = 1 ]; then : "${MEASURE_PART_DIR:?MEASURE=1 needs MEASURE_PART_DIR}"; export H1_MEASURE_RUN=1 MEASURE_PART_DIR; fi
+if [ "${MEASURE:-0}" = 1 ]; then  # h1-gate.sh needs both (partition + measurement environment evidence)
+  : "${MEASURE_PART_DIR:?MEASURE=1 needs MEASURE_PART_DIR}" "${MEASURE_ENV_DIR:?MEASURE=1 needs MEASURE_ENV_DIR}"
+  export H1_MEASURE_RUN=1 MEASURE_PART_DIR MEASURE_ENV_DIR
+fi
 [ -d "$E" ] && [ -z "$(ls -A "$E" | grep -vE '^(tasks-check\.txt|block\.out)$')" ] || { echo "BLOCK STOP: $E missing or not empty"; exit 2; }
 [ -s "$E/tasks-check.txt" ] || { echo "BLOCK STOP: $E/tasks-check.txt missing (state/TASKS.md: no other active VM user)"; exit 2; }
 bash $G lock "$OWNER" || { echo "BLOCK STOP: lock"; exit 2; }
 DMESG_BAD='BUG:|Oops|WARNING:|Call Trace|general protection|segfault|[Ee]rror|ERROR|soft lockup|hung_task'
 finish() {
   set +eu
+  pkill -TERM -P $$ 2>/dev/null; sleep 1  # our own children first (pilot-run.sh, run.sh, loadgen)
   local out ip r
   for ip in "${IPS[@]}"; do
     out=$($SSH comsys@$ip "pkill -u comsys -f '$PAT'; for i in \$(seq 15); do pgrep -u comsys -f '$PAT' > /dev/null || break; sleep 1; done
@@ -82,6 +86,7 @@ dmesg_check() {  # tag; 1 on a new bad line, an ssh failure, a bad stored count 
   return $bad
 }
 trap finish EXIT
+trap 'echo "$(date -Is) BLOCK STOP signal" | tee -a "$E/block.log"; exit 130' INT TERM HUP
 stop() { echo "$(date -Is) BLOCK STOP $*" | tee -a "$E/block.log"; exit 1; }
 step() { echo "$(date -Is) == $*" | tee -a "$E/block.log"; }
 dax_owner() {  # comsys | root
@@ -97,7 +102,8 @@ dax_owner() {  # comsys | root
 step "PT pretouch check (start, ${#IPS[@]} VMs)"
 bash $X/pretouch-check-n.sh "$PRETOUCH_DIR" "$E/pretouch-check-start.txt" >> "$E/block.log" 2>&1 || stop "pretouch check (start)"
 step "H0 Host gate"
-bash $G check "$E/gate-H0.txt" || stop "host gate"
+if [ "${MEASURE:-0}" = 1 ]; then bash $P/CXL_SWMC/experiments/h1/h1-gate.sh check "$E/gate-H0.txt" || stop "h1 gate"
+else bash $G check "$E/gate-H0.txt" || stop "host gate"; fi
 step "G1 install ($L)"
 NODES="${IPS[*]}" BUILD=$BUILD L=$L bash $X/install.sh "$E/install.log" > "$E/install.out" 2>&1 || stop "install (see install.out)"
 [ "$(grep -c '^ldd_not_found=0$' "$E/install.log")" = "${#IPS[@]}" ] || stop "install: ldd"
@@ -125,7 +131,11 @@ while read -r name args; do
   env LOCK_OWNER=$OWNER NODES="${IPS[*]}" V=$L BUILD=$BUILD LOADGEN_BUILD=$LOADGEN_BUILD "${A[@]}" bash $X/pilot-run.sh "$name" "$E" < /dev/null 2>&1 \
     | tee -a "$E/runs.log" | grep -E "^PILOTRUN"
   [ ${PIPESTATUS[0]} = 0 ] || stop "$name"
-  grep -qE "^PILOTRUN $name (OK|NOTE)" "$E/runs.log" || stop "$name not OK/NOTE"
+  kind=""; for x in "${A[@]}"; do case $x in KIND=*) kind=${x#KIND=};; esac; done
+  if grep -q "^PILOTRUN $name OK" "$E/runs.log"; then :
+  elif grep -q "^PILOTRUN $name NOTE" "$E/runs.log" && [[ $kind =~ ^(slo|fix)$ ]]; then  # slo: confirm note; fix: aborted step (judged after)
+    echo "$(date -Is) $name NOTE accepted (KIND=$kind): $(grep "^PILOTRUN $name NOTE" "$E/runs.log")" | tee -a "$E/block.log"
+  else stop "$name not OK (a NOTE is accepted only for KIND=slo and KIND=fix)"; fi
   dmesg_check "$name" || stop "$name: dmesg check"
 done <<< "$RUNS"
 [ "$OWNED" = root ] || { step "dax0.0 -> root:root 600"; dax_owner root; }

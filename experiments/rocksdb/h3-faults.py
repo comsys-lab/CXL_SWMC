@@ -15,8 +15,8 @@ N VMs and turned into rates over the step window:
 A missing counter is left empty (the page_coherence directory must be in the server's sysfs list; it is for
 rocksdb-server). Normalisation (H3): write_faults_per_s / the reference's write_faults_per_s (default reference: the
 2-VM row with the same per-VM offered rate; --ref RUN[:STEP] fixes one reference), likewise for reads; fault time
-(instr sum_ns of read/write/wp and I->S/S->M/WP-upgrade faults, coherence IPI time, tx wait sums), cxl_recv kernel
-thread run time, and faults per request. Every VM of every step must report sys.swmc.instr.enabled = 1 (else exit 1).
+(per-thread swmc accounting of the server threads: I->S, S/I->M, WP-upgrade and non-transition faults with their
+ns; node-wide coherence IPI time), cxl_recv kernel thread run time, and faults per request. Every VM of every step must report sys.swmc.instr.enabled = 1 (else exit 1).
 Per-page read-fault CDF: not in these counters (node-wide only); see reports/ROCKSDB-V1-packet.md §H3 (kprobe + hist
 trigger on swmc_fault_account, guest root, separate grant).
 """
@@ -34,20 +34,23 @@ KEYS = {
     "fetch_commits": ["sys.swmc.instr.tx_fetch.ack"],
     "unmaps": ["sys.swmc.instr.serve.unmap_count"],
     "coh_ipis": ["sys.swmc.instr.ipi.coh_count"],
-    # fault time (ns summed over the faults of the step; instr histograms, verifier M4)
-    "read_fault_ns": ["sys.swmc.instr.fault_read.sum_ns"],
-    "write_fault_ns": ["sys.swmc.instr.fault_write.sum_ns"],
-    "wp_fault_ns": ["sys.swmc.instr.fault_wp.sum_ns"],
-    "is_fault_ns": ["sys.swmc.instr.fault_full_is.sum_ns"],
-    "sm_fault_ns": ["sys.swmc.instr.fault_full_sm.sum_ns"],
-    "wpu_fault_ns": ["sys.swmc.instr.fault_full_wpu.sum_ns"],
     "coh_ipi_ns": ["sys.swmc.instr.ipi.coh_ns"],
 }
+# Node-wide fault-time histograms (instr fault_read/write/wp sum_ns, fault_full_sm/wpu sum_ns, tx_*.wait_sum_ns)
+# fill only with instr/detail=1; the runs keep detail=0 (bundle), so fault time comes from the per-thread
+# accounting of the server's own threads (always filled): thr.<comm>.swmc.<kind>_fault_ns / <kind>_faults
+# (verifier re-review M-A). thr.* covers the rocksdb-server process only (RocksDB background threads included).
 PREFIX_SUMS = {  # summed over every matching key (several kernel threads / rounds)
     "cxl_recv_run_ns": ("kthr.cxl_recv", ".run_ns"),
     "cxl_recv_cpu_ticks": ("kthr.cxl_recv", ".cpu_ticks"),
-    "tx_fetch_wait_ns": ("sys.swmc.instr.tx_fetch.wait_sum", ""),
-    "tx_invalidate_wait_ns": ("sys.swmc.instr.tx_invalidate.wait_sum", ""),
+    "thr_is_faults": ("thr.", ".swmc.is_faults"),
+    "thr_is_fault_ns": ("thr.", ".swmc.is_fault_ns"),
+    "thr_sm_faults": ("thr.", ".swmc.sm_faults"),
+    "thr_sm_fault_ns": ("thr.", ".swmc.sm_fault_ns"),
+    "thr_wpu_faults": ("thr.", ".swmc.wpu_faults"),
+    "thr_wpu_fault_ns": ("thr.", ".swmc.wpu_fault_ns"),
+    "thr_nontrans_faults": ("thr.", ".swmc.nontrans_faults"),
+    "thr_nontrans_fault_ns": ("thr.", ".swmc.nontrans_fault_ns"),
 }
 
 
@@ -84,6 +87,8 @@ def rows(run):
         phase, offered, achieved, p99, measure_s = info.get(step, (None, None, None, None, 0))
         if not measure_s:
             continue  # warm-up and drain steps carry no measurement window
+        if len(rs) != n:
+            sys.exit(f"{run} step {step}: {len(rs)} targets in stats-steps.csv != nodes {n}")
         win = max(float(r["window_s"] or 0) for r in rs)
         o = {"run": os.path.basename(run.rstrip("/")), "system": m.get("system"), "nodes": n, "step": step,
              "phase": phase, "offered_x": offered, "per_vm_x": (offered / n if offered else None), "achieved": achieved,

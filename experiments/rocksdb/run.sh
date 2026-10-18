@@ -152,7 +152,7 @@ if [ -s "$RUN/loadgen/gets.bin" ]; then  # loadgen --opt log=1: exact check
   echo "check_log rc=$CRC" >> "$RUN/check-log.txt"; tail -n 2 "$RUN/check-log.txt"
 fi
 KRC=0
-python3 -I -B "$HERE/check-run.py" "$RUN" --nodes "$N" --keys "$KEYS" --stop-extents-free "$STOP_EXTENTS_FREE" \
+python3 -I -B "$HERE/check-run.py" "$RUN" --nodes "$N" --keys "$KEYS" --verify "$VERIFY" --stop-extents-free "$STOP_EXTENTS_FREE" \
   --stop-blocks-free "$STOP_BLOCKS_FREE" > "$RUN/check.txt" 2>&1 || KRC=$?
 cat "$RUN/check.txt"
 [ -f "$RUN/loadgen/rocksdb.txt" ] && tr '\n' ' ' < "$RUN/loadgen/rocksdb.txt" && echo
