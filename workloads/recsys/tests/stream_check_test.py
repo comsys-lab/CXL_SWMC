@@ -23,7 +23,7 @@ def mk(root, steps, best, mode="stream"):
                 continue
             for when, (t, pub, acc, lag) in (("begin", st["b"]), ("end", st["e"])):
                 with open(os.path.join(lg, "stats", f"step{n:03d}-{when}-t0.txt"), "w") as g:
-                    g.write(f"# when={when}\nupdate_mode={mode}\nstats_mono_ns={t}\npublished_seq={pub}\n"
+                    g.write(f"# when={when}\n" + (f"update_mode={mode}\n" if mode else "") + f"stats_mono_ns={t}\npublished_seq={pub}\n"
                             f"update_accepted_seq={acc}\nrows_written={pub * 200}\nupdate_lag_samples={lag}\n"
                             f"update_lag_ns_sum={pub * 1000000}\nupdate_lag_n={pub * 14}\nupdate_lag_ns_max=5000000\n"
                             "update_queue.w0=0\nupdate_queue.w1=3\n")
@@ -74,7 +74,9 @@ b = [dict(s) for s in base]; b[3] = step(3, "ramp", 6, False, written=0.5)
 run("invalid only above the result", b, 5, "PASS")
 b = [dict(s) for s in base]; b[4] = step(4, "confirm", 5, True, nostats=True)
 run("no snapshots at the result", b, 5, "FAIL")
-run("batch-mode server (no update_mode=stream)", base, 5, "FAIL", mode="publish")
+run("batch-mode server (no update_mode key)", base, 5, "FAIL", mode=None)
+b = [dict(s) for s in base]; b[2] = step(2, "ramp", 5, True, lag=(2500, 2510))
+run("backlog flat but 2510 > 5 s of updates", b, 5, "NOTE")
 run("no SLO result", base, None, "NOTE")
 print("STREAM CHECK TEST " + ("FAIL (%d)" % fails if fails else "PASS"))
 sys.exit(1 if fails else 0)

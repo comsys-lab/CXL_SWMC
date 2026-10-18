@@ -352,7 +352,8 @@ class Engine {
       }
       ramp_end_ = ended ? kr.why() : kr.knee() > 0 ? "max steps (last steps failed)" : "max steps";
       if (kr.good() == 0) return finish("no passing ramp step below the knee (" + ramp_end_ + ")");
-      if (kr.knee() == 0) return finish("max steps reached without reaching the knee (--ramp-knee); raise --max-steps");
+      // verifier MED (v1 delta): a failing run the stop rule never confirmed may be low-rate failures, not the knee
+      if (!ended) return finish("max steps reached before the knee was confirmed (" + ramp_end_ + "); raise --max-steps");
       good = kr.good(), bad = kr.knee();
       ramp_knee_ = bad;
       bisect_cap = n + c_.knee_bisect_steps;

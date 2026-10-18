@@ -67,8 +67,9 @@ other caller unchanged, manifest key `min_step_queries= ramp_knee=` only when se
   "SLO already exceeded" abort, so every low-rate p95 is complete. `summary.json` adds `ramp_policy` {knee_k,
   knee_rise, min_step_queries, knee_offered, ramp_end, bisect_cut} and `low_rate_violations` (failed ramp/bisect
   steps below the result: phase, offered_x, x, pslo_ms, n, reason). Code: `slo_search.h` KneeRamp (unit test in
-  `test/slo_search_test.cc`). Notes: "no passing ramp step below the knee (<why>)", "max steps reached without
-  reaching the knee (--ramp-knee); raise --max-steps".
+  `test/slo_search_test.cc`). Notes (no result): "no passing ramp step below the knee (<why>)", "max steps reached
+  before the knee was confirmed (<why>); raise --max-steps" (a failing run the stop rule did not confirm may be
+  low-rate failures).
 Every ramp/bisect step is a (throughput, tail latency) point; the ramp gives the low-load part of the curve,
 the bisection the knee, the first failing ramp step a point past it; afterwards `fill` points at the result x
 0.7/0.8/0.9 (the bend) and `overload` points at the first-fail rate x 1.05/1.1/1.2 (past the knee), both measured

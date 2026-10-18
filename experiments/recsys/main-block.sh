@@ -620,7 +620,7 @@ s=json.load(open(sys.argv[1])); c=s.get("confirm",{})
 f=lambda v: "" if v is None else str(v)
 print("\t".join([sys.argv[2], sys.argv[3], sys.argv[4], f(s.get("max_offered_x_pass")), f(c.get("x_mean")), f(s.get("confirmed")),
   str(len(s.get("low_rate_violations",[]))), sys.argv[5].split(" ")[1], "1" if sys.argv[5].startswith("STREAMCHECK PASS") else "0",
-  s.get("note","")]))' \
+  s.get("ramp_policy",{}).get("ramp_end",""), f(s.get("ramp_policy",{}).get("knee_offered")), s.get("note","")]))' \
     "$RD/loadgen/summary.json" "$NAME" "$s" "$r" "$sc" >> "$E/stream-results.tsv" || stop "$NAME: results row"
   echo "$NAME: $sc"
 }
@@ -759,7 +759,7 @@ if [ $BLOCK = stream ]; then  # RecSys streaming driver (header "BLOCK=stream")
   { echo "# update rate basis (RecSys methodology, user 2026-10-19; workloads/recsys/DESIGN.md §5.1): rates in trace samples/s, multiples of 50"
     echo "ekko_avg: 3.08% distinct rows per 3600 s -> 41.47 samples/s -> 50; ekko_peak: 4.3% distinct rows per 600 s -> 393.27 samples/s -> 400 (recsys-rate, workspaces/recsys-mid/ekko10min)"
     echo "rates: $STREAM_RATES (> 400 = stress)"; } > "$E/rate-basis.txt"
-  printf '# name\tsystem\trate_sps\tresult_q_s\tconfirm_x_mean\tconfirmed\tlow_rate_violations\tstreamcheck\tvalid\tnote\n' > "$E/stream-results.tsv"
+  printf '# name\tsystem\trate_sps\tresult_q_s\tconfirm_x_mean\tconfirmed\tlow_rate_violations\tstreamcheck\tvalid\tramp_end\tknee_q_s\tnote\n' > "$E/stream-results.tsv"
   { echo "# RecSys streaming block: per rate (in STREAM_RATES order) one lifetime per system, order shuffle(seed recsys-stream-<rate>)"
     for r in $STREAM_RATES; do echo "u$r: $(h1shuffle recsys-stream-$r ${SYSTEMS:-hw pop})"; done; } | tee "$E/order.txt"
   for r in $STREAM_RATES; do

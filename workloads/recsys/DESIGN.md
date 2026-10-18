@@ -117,7 +117,7 @@ Every RecSys experiment from 2026-10-19 on uses this mode; H1 results and the H1
 - Validity (experiments/recsys/stream_check.py, per measured step from the node-0 stats snapshots): samples fully
   written >= 0.98 x samples accepted in the window (d published_seq / d update_accepted_seq; accepted = sent, the
   arrivals are Poisson, so the nominal rate is not the reference) and backlog growth <= max(50 samples, 1 s of
-  updates). A result whose
+  updates) and backlog at the window end <= max(50, 5 s of updates). A result whose
   steps at or below it are not all valid is reported "update rate not sustained" (STREAMCHECK NOTE).
 - Rate: trace samples/s (Criteo 1TB day 23, MLPerf DLRMv2 multi-hot, samples [0, 2M) in file order; the loadgen
   replays it at a fixed rate and wraps), multiples of 50. Basis (Ekko OSDI'22 §6.2.1 + Fig. 9, §4.4): R such that

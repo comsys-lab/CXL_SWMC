@@ -8,7 +8,9 @@ the offered update stream:
         differs from R x dt by a few % at 50 samples/s; it is not compared with the nominal rate (written/s vs R is
         reported as nominal_ratio, information only). Accepted = sent: the server acknowledges on acceptance.
   lag   the backlog (update_lag_samples = accepted seq - published_seq) did not grow over the window: end - begin <=
-        max(LAG_ABS samples, R x LAG_S) (defaults 50 samples, 1 s of updates)
+        max(LAG_ABS samples, R x LAG_S) (defaults 50 samples, 1 s of updates), and the backlog at the window end is
+        <= max(LAG_ABS, R x LAG_MAX_S) (default 5 s of updates; a deficit below the growth tolerance accumulates
+        over a lifetime)
 Inputs: <run>/loadgen/steps.jsonl and the node-0 stats snapshots <run>/loadgen/stats/step<NNN>-{begin,end}-t0.txt
 (loadgen --stats-op; target 0 = the updater node). Every measured step without both snapshots is "nostats" (invalid).
 Outputs: <run>/stream-check.csv (one row per measured step) and lines on stdout:
@@ -18,7 +20,7 @@ Outputs: <run>/stream-check.csv (one row per measured step) and lines on stdout:
           is valid
     NOTE  some of those steps are invalid: "update rate not sustained" (the result is reported, marked invalid)
     FAIL  inputs missing (no steps, a step without snapshots at or below the result, not stream mode)
-usage: stream_check.py <run dir> [--ratio 0.98] [--lag-abs 50] [--lag-s 1]
+usage: stream_check.py <run dir> [--ratio 0.98] [--lag-abs 50] [--lag-s 1] [--lag-max-s 5]
 """
 import argparse
 import csv
@@ -53,6 +55,7 @@ def main():
     ap.add_argument("--ratio", type=float, default=0.98)
     ap.add_argument("--lag-abs", type=float, default=50)
     ap.add_argument("--lag-s", type=float, default=1.0)
+    ap.add_argument("--lag-max-s", type=float, default=5.0)
     a = ap.parse_args()
     lg = os.path.join(a.run, "loadgen")
     try:
@@ -99,10 +102,13 @@ def main():
         ratio = pub / acc if acc > 0 else 0
         tol = max(a.lag_abs, R * a.lag_s)
         ok_rate = acc > 0 and ratio >= a.ratio
-        ok_lag = lag_e - lag_b <= tol
+        cap = max(a.lag_abs, R * a.lag_max_s)
+        ok_lag = lag_e - lag_b <= tol and lag_e <= cap
         why = [] if ok_rate else [f"written {pub} < {a.ratio} x accepted {acc} samples"]
-        if not ok_lag:
+        if lag_e - lag_b > tol:
             why.append(f"backlog grew {lag_b} -> {lag_e} samples (> {tol:g})")
+        if lag_e > cap:
+            why.append(f"backlog {lag_e} samples > {cap:g}")
         r.update(valid=ok_rate and ok_lag, why="; ".join(why), window_s=round(dt, 3), accepted_per_s=round(acc / dt, 3) if dt > 0 else 0,
                  written_per_s=round(written, 3), written_ratio=round(ratio, 4), nominal_ratio=round(written / R, 4) if R > 0 else 0, rows_written_per_s=round(rw / dt, 1) if dt > 0 else 0,
                  lag_samples_begin=lag_b, lag_samples_end=lag_e, lag_ms_mean=round(lns / ln / 1e6, 3) if ln else 0,
