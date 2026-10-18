@@ -190,7 +190,7 @@ for W in $WL; do
   if [ -n "$RETRY" ]; then S=$E/$W/$NEXTA LV=$S/levels.tsv   # round 1 retry: own levels.tsv (attempts.py)
   elif [ $N != 1 ]; then LV=$(python3 -I -B $H/attempts.py levels "$E" "$W" 2>&1) || stop "$W: attempts.py levels: $LV"; fi
   MIXES=$(awk -F'\t' -v w="$W" '!/^#/ && $1 == w { printf "%s=%s ", $2, $3 }' "$PLAN")
-  [ ! -e "$S" ] || stop "$S exists (stage dirs are immutable; a stopped r1 stage is re-run with --retry)"
+  [ ! -e "$S" ] || stop "$S exists (stage dirs are immutable; a stopped r1 stage is re-run with --retry; r2/r3 have no retry path yet)"
   SETTLE=$(awk -F'\t' -v w="$W" '!/^#/ && $1 == w { print $8; exit }' "$PLAN")
   [[ $SETTLE =~ ^[1-9][0-9]*$ ]] || stop "$W: no settle_s in the plan"
   mkdir -p "$E/$W" && mkdir "$S" || stop "mkdir $S"
