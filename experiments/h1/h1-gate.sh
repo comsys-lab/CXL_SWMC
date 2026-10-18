@@ -22,7 +22,7 @@
 #   (6 % of the set average); EMU_AVG_MAX 25 % = one of the 4 emulator/vhost CPUs (the coordinator's example value).
 set -uo pipefail
 H=$(cd "$(dirname "$0")" && pwd)
-HG=$H/../vectordb/host-gate.sh PART=$H/../../scripts/host/measure-env-part.sh
+HG=$H/../vectordb/host-gate.sh PART=${MEASURE_PART_SCRIPT:-$H/../../scripts/host/measure-env-part.sh}   # N VMs: scripts/host/measure-env-n.sh
 case "${1:-}" in
   lock|unlock) exec bash "$HG" "$@";;
   check|judge) LOG=${2:?log file};;
