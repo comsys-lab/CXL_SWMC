@@ -1,20 +1,26 @@
 #!/bin/bash
-# Popcorn shared-memory phases on the 2 VMs, driven from the Host (grant-gated:
+# Popcorn shared-memory phases on N = 2..8 VMs, driven from the Host (grant-gated:
 # module load, sudo on the guests, /dev/dax0.0 access). Usage: p-popcorn-shm.sh <phase>
-#   precheck  both guests: Popcorn kernel, tools hashes, cxl_shm not loaded,
+# Node k = position k in POP_IPS (default: IP0 IP1 = .100 .101, i.e. the 2-VM
+# behaviour of earlier packets). N > 2 passes `nodes=N` to p-popcorn-guest.sh load
+# (guest popcorn.env needs PARAMS_N<N>; tools dir of the popcorn-n bundle).
+# 2-node-only phases (refused for N > 2): preload, shared-check, overhead.
+#   plan [phase ...]  print the per-VM command plan (nothing is executed; no R needed)
+#   precheck  all guests: Popcorn kernel, tools hashes, cxl_shm not loaded,
 #             nobody uses /dev/dax0.0, root:root 600 (read-only + sudo status)
-#   load      insmod cxl_shm on VM0 (node 0), then VM1 (node 1), with
+#   load      insmod cxl_shm on node 0, 1, ..., N-1 in turn, with
 #             init_state=$INIT_STATE (invalid|shared, default invalid) and the
 #             optional receive-path parameters $LOAD_EXTRA ("name=value ...",
-#             guest script allowlist); wait for the link
-#   enable    enable_page_coherence on both at once (init_state=shared: barrier)
+#             guest script allowlist); then every node waits for its N-1 links
+#   enable    enable_page_coherence on all N at once (init_state=shared: barrier)
 #   chown     /dev/dax0.0 -> comsys (for unprivileged faultlat / vdb-server)
 #   preload   init_state=shared only, before enable: node 0 writes pattern P
 #             through a plain mapping on PPAGES pages from PBASE (faultlat)
 #   shared-check  after enable: node 1 and node 0 read P with no coherence
 #             transaction (init S), then node 1 writes Q (INVALIDATE) and node 0
 #             reads Q (FETCH); checks data and counter deltas
-#   smoke     faultlat smoke.sh --execute (windows from $BASE), collect results
+#   smoke     faultlat smoke.sh (N=2) or smoke-n.sh (N>2) --execute (windows from $BASE),
+#             collect results
 #   status    counters and state of both guests -> $R/status-<STATUS_TAG>-vm<k>.txt
 #   instr-check  (build >= 8, after enable + chown) both guests: instr/ sysfs
 #             present and enabled, a comsys process touches one page of IPAGE
@@ -38,14 +44,15 @@
 #             settings per repeat 1 0 a / a 0 1 alternating.
 #   teardown  waits (<= 120 s) for faultlat to exit; no user of /dev/dax0.0
 #             left; dax0.0 back to root:root 600; disable coherence and unload
-#             cxl_shm (VM1, then VM0). ONLY=<k> tears down that VM alone (the
+#             cxl_shm (node N-1 down to 0). ONLY=<k> tears down that VM alone (the
 #             other one is unreachable and goes to p-popcorn-deploy.sh rollback).
 #             Requires the line instr_enabled=1 (Popcorn build >= 8 only; see instr-on).
 # smoke also checks acceptance: per node, counter deltas transaction_error /
 # send_drop / late_response = 0, remote_request_count delta > 0, and no
 # BUG/Oops/WARNING in dmesg; on a failed step it waits (<= 120 s) until no
 # faultlat runs on either guest, then stops.
-# Env (required): K GT R; optional: IP0 IP1 (default .100/.101), BASE (smoke
+# Env (required): K GT R; optional: POP_IPS ("ip0 ip1 ..."; else IP0 IP1, default .100/.101),
+# LINK_WAIT (s, default 60), BASE (smoke
 # base page, default 25000000), RUN (smoke run id), C (bundle dir, for smoke.sh),
 # STATUS_TAG, ONLY, INIT_STATE, PBASE (default 25010000), PPAGES (default 1024),
 # PRUN (preload run id, default preload-v1), IPAGE (instr-check page,
@@ -53,8 +60,24 @@
 # (default 3), ORUN (overhead run id, default overhead-v1), OPAGES (default 1024).
 set -euo pipefail
 umask 077
-: "${K:?}" "${GT:?}" "${R:?}"
-IP=("${IP0:-192.168.122.100}" "${IP1:-192.168.122.101}")
+PHASE=${1:-}
+: "${K:?}" "${GT:?}"
+[ "$PHASE" = plan ] || : "${R:?}"
+if [ -n "${POP_IPS:-}" ]; then read -r -a IP <<< "$POP_IPS"; else IP=("${IP0:-192.168.122.100}" "${IP1:-192.168.122.101}"); fi
+N=${#IP[@]}
+[ "$N" -ge 2 ] && [ "$N" -le 8 ] || { echo "POP_IPS must list 2..8 guests (got $N)"; exit 2; }
+for ip in "${IP[@]}"; do [[ "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "bad IP '$ip' in POP_IPS"; exit 2; }; done
+[ "$(printf '%s\n' "${IP[@]}" | sort -u | wc -l)" = "$N" ] || { echo "POP_IPS has duplicates"; exit 2; }
+ALL=(); for ((k = 0; k < N; k++)); do ALL+=("$k"); done
+REV=(); for ((k = N - 1; k >= 0; k--)); do REV+=("$k"); done
+LINK_WAIT=${LINK_WAIT:-60}
+NARG=; [ "$N" -gt 2 ] && NARG="nodes=$N"   # N=2: no extra argument (old guest tools keep working)
+smoke_n() {  # smoke-n.sh: $C (bundle) first, then next to this script, then the repo copy
+  local d; d=$(dirname "$(readlink -f "$0")")
+  for f in ${C:+"$C/smoke-n.sh"} "$d/smoke-n.sh" "$d/../../workloads/faultlat/smoke-n.sh"; do [ -f "$f" ] && { echo "$f"; return; }; done
+  echo "smoke-n.sh not found" >&2; return 1
+}
+two_only() { [ "$N" = 2 ] || { echo "phase $PHASE is 2-node only (N=$N)"; exit 2; }; }
 BASE=${BASE:-25000000}
 INIT_STATE=${INIT_STATE:-invalid}
 [[ "$INIT_STATE" =~ ^(invalid|shared)$ ]] || { echo "INIT_STATE must be invalid or shared"; exit 2; }
@@ -80,9 +103,12 @@ FLAGS=(-F /dev/null -o BatchMode=yes -o PasswordAuthentication=no -o KbdInteract
 on() { local k=$1; shift; ssh -T "${FLAGS[@]}" "comsys@${IP[$k]}" "$@" < /dev/null; }
 G() { local k=$1; shift; on "$k" "sudo -n $GT/p-popcorn-guest.sh $*"; }
 log() { printf '[%s] %s\n' "$(date +%T)" "$*" | tee -a "$R/steps.log"; }
-[ -d "$R" ] || { test -d "$(dirname "$R")" && mkdir -m 0700 "$R"; }
-NODES=(0 1)
-if [ -n "${ONLY:-}" ]; then [[ "$ONLY" =~ ^[01]$ ]] || { echo "ONLY must be 0 or 1"; exit 2; }; NODES=("$ONLY"); fi
+[ "$PHASE" = plan ] || [ -d "$R" ] || { test -d "$(dirname "$R")" && mkdir -m 0700 "$R"; }
+SEL=("${ALL[@]}")
+if [ -n "${ONLY:-}" ]; then
+  [[ "$ONLY" =~ ^[0-7]$ ]] && [ "$ONLY" -lt "$N" ] || { echo "ONLY must be 0..$((N - 1))"; exit 2; }
+  SEL=("$ONLY")
+fi
 wait_no_faultlat() {  # bounded wait (120 s) until no faultlat runs on the given nodes
   local i k busy
   for ((i = 0; i < 60; i++)); do
@@ -114,9 +140,32 @@ sys.exit(1 if bad else 0)
 PY
 }
 
-case "${1:-}" in
+case "$PHASE" in
+plan)
+  shift
+  ph=("$@"); [ ${#ph[@]} -gt 0 ] || ph=(precheck load enable chown smoke status teardown)
+  echo "# plan: N=$N K=$K GT=$GT INIT_STATE=$INIT_STATE LOAD_EXTRA='$LOAD_EXTRA' (nothing executed)"
+  for k in "${ALL[@]}"; do echo "# node $k = comsys@${IP[$k]}"; done
+  g() { echo "ssh comsys@${IP[$1]} 'sudo -n $GT/p-popcorn-guest.sh ${*:2}'"; }
+  for p in "${ph[@]}"; do
+    echo "## $p"
+    case $p in
+      precheck) for k in "${ALL[@]}"; do echo "ssh comsys@${IP[$k]} 'uname -r; cd $GT && sha256sum --quiet -c tools.sha256'"; g "$k" status; done ;;
+      load) for k in "${ALL[@]}"; do g "$k" load "$k" "$INIT_STATE" $NARG $LOAD_EXTRA; done
+            for k in "${ALL[@]}"; do g "$k" wait-link "$LINK_WAIT"; done ;;
+      enable) for k in "${ALL[@]}"; do [ "$k" = 0 ] && continue; echo "$(g "$k" enable 30) &"; done; g 0 enable 30; echo "wait" ;;
+      chown) for k in "${ALL[@]}"; do echo "ssh comsys@${IP[$k]} 'sudo -n chown comsys /dev/dax0.0'"; done ;;
+      smoke) if [ "$N" = 2 ]; then echo "NODE0=comsys@${IP[0]} NODE1=comsys@${IP[1]} smoke.sh <RUN> $BASE --execute"
+             else NODE_HOSTS="$(for ip in "${IP[@]}"; do printf 'comsys@%s ' "$ip"; done)" GDIR=$GT GOUT=/home/comsys/popcorn-results \
+                    CXL_REGION_CONFIG=$GT/cxl_region.yaml bash "$(smoke_n)" "${RUN:-<RUN>}" "$BASE"; fi ;;
+      status) for k in "${ALL[@]}"; do g "$k" status; done ;;
+      teardown) for k in "${SEL[@]}"; do echo "ssh comsys@${IP[$k]} 'sudo -n chown root:root /dev/dax0.0 && sudo -n chmod 600 /dev/dax0.0'"; done
+                for k in "${REV[@]}"; do [[ " ${SEL[*]} " == *" $k "* ]] || continue; g "$k" disable; g "$k" unload; done ;;
+      *) echo "(no plan for phase $p)" ;;
+    esac
+  done ;;
 precheck)
-  for k in 0 1; do
+  for k in "${ALL[@]}"; do
     test "$(on $k 'uname -r')" = "$K"
     on $k "cd $GT && sha256sum --quiet -c tools.sha256"
     G $k status > "$R/status-pre-vm$k.txt"
@@ -127,41 +176,49 @@ precheck)
   done
   log "shm precheck PASS" ;;
 load)
-  # shellcheck disable=SC2086
-  G 0 load 0 "$INIT_STATE" $LOAD_EXTRA | tee "$R/load-vm0.txt"; grep -q 'load OK (node 0)' "$R/load-vm0.txt"
-  # shellcheck disable=SC2086
-  G 1 load 1 "$INIT_STATE" $LOAD_EXTRA | tee "$R/load-vm1.txt"; grep -q 'load OK (node 1)' "$R/load-vm1.txt"
-  grep -qx "init_state=$INIT_STATE" "$R/load-vm0.txt" && grep -qx "init_state=$INIT_STATE" "$R/load-vm1.txt"
-  for k in 0 1; do G $k wait-link 30 | tee "$R/link-vm$k.txt"; grep -q 'link OK' "$R/link-vm$k.txt"; done
-  log "load PASS (links up)" ;;
+  for k in "${ALL[@]}"; do
+    # shellcheck disable=SC2086
+    G $k load $k "$INIT_STATE" $NARG $LOAD_EXTRA | tee "$R/load-vm$k.txt"; grep -q "load OK (node $k)" "$R/load-vm$k.txt"
+    grep -qx "init_state=$INIT_STATE" "$R/load-vm$k.txt" && grep -qx "nr_nodes=$N" "$R/load-vm$k.txt" ||
+      { log "STOP: vm$k loaded with unexpected init_state/nr_nodes"; exit 1; }
+  done
+  for k in "${ALL[@]}"; do G $k wait-link "$LINK_WAIT" | tee "$R/link-vm$k.txt"; grep -q 'link OK' "$R/link-vm$k.txt"; done
+  log "load PASS (N=$N, all links up)" ;;
 enable)
-  # Both at once: with init_state=shared the first enable is a cross-node barrier (<= 600 s in the kernel).
-  G 1 enable 30 > "$R/enable-vm1.txt" 2>&1 & p1=$!
+  # All at once: with init_state=shared the first enable is a cross-node barrier (<= 600 s in the kernel).
+  pids=()
+  for k in "${ALL[@]}"; do [ "$k" = 0 ] && continue; G $k enable 30 > "$R/enable-vm$k.txt" 2>&1 & pids+=($!); done
   G 0 enable 30 > "$R/enable-vm0.txt" 2>&1 || true
-  wait "$p1" || true
-  cat "$R/enable-vm0.txt" "$R/enable-vm1.txt"
-  grep -q 'enable OK' "$R/enable-vm0.txt" && grep -q 'enable OK' "$R/enable-vm1.txt" || { log "STOP: enable failed"; exit 1; }
-  log "enable PASS" ;;
+  for p in "${pids[@]}"; do wait "$p" || true; done
+  ok=0
+  for k in "${ALL[@]}"; do cat "$R/enable-vm$k.txt"; grep -q 'enable OK' "$R/enable-vm$k.txt" || ok=1; done
+  [ "$ok" = 0 ] || { log "STOP: enable failed"; exit 1; }
+  log "enable PASS (N=$N)" ;;
 chown)
-  for k in 0 1; do
+  for k in "${ALL[@]}"; do
     on $k 'sudo -n chown comsys /dev/dax0.0 && stat -c "%U:%G %a" /dev/dax0.0' | tee "$R/chown-vm$k.txt"
     grep -qx 'comsys:root 600' "$R/chown-vm$k.txt"
   done
   log "chown PASS" ;;
 smoke)
   : "${RUN:?}" "${C:?}"
-  for k in 0 1; do G $k status > "$R/status-smoke-before-vm$k.txt"; done
+  for k in "${ALL[@]}"; do G $k status > "$R/status-smoke-before-vm$k.txt"; done
   rc=0
-  NODE0=comsys@${IP[0]} NODE1=comsys@${IP[1]} GDIR=$GT GOUT=/home/comsys/popcorn-results \
-    CXL_REGION_CONFIG=$GT/cxl_region.yaml bash "$C/smoke.sh" "$RUN" "$BASE" --execute 2>&1 | tee "$R/smoke.log" || rc=$?
+  if [ "$N" = 2 ]; then
+    NODE0=comsys@${IP[0]} NODE1=comsys@${IP[1]} GDIR=$GT GOUT=/home/comsys/popcorn-results \
+      CXL_REGION_CONFIG=$GT/cxl_region.yaml bash "$C/smoke.sh" "$RUN" "$BASE" --execute 2>&1 | tee "$R/smoke.log" || rc=$?
+  else
+    NODE_HOSTS="$(for ip in "${IP[@]}"; do printf 'comsys@%s ' "$ip"; done)" GDIR=$GT GOUT=/home/comsys/popcorn-results \
+      CXL_REGION_CONFIG=$GT/cxl_region.yaml bash "$C/smoke-n.sh" "$RUN" "$BASE" --execute 2>&1 | tee "$R/smoke.log" || rc=$?
+  fi
   if [ "$rc" != 0 ] || ! grep -q "smoke $RUN: PASS" "$R/smoke.log"; then
-    # a failed pair step can leave the other node's faultlat running (or waiting in a fault): let it end first
-    wait_no_faultlat 0 1 && log "faultlat gone on both guests" || log "faultlat still running after 120 s"
-    for k in 0 1; do G $k status > "$R/status-smoke-failed-vm$k.txt" || true; done
+    # a failed parallel step can leave other nodes' faultlat running (or waiting in a fault): let them end first
+    wait_no_faultlat "${ALL[@]}" && log "faultlat gone on all guests" || log "faultlat still running after 120 s"
+    for k in "${ALL[@]}"; do G $k status > "$R/status-smoke-failed-vm$k.txt" || true; done
     log "STOP: smoke failed ($RUN, rc $rc); next: teardown"; exit 1
   fi
   ok=0
-  for k in 0 1; do
+  for k in "${ALL[@]}"; do
     G $k status > "$R/status-smoke-after-vm$k.txt"
     mkdir -p "$R/smoke-vm$k"
     scp -q "${FLAGS[@]}" "comsys@${IP[$k]}:/home/comsys/popcorn-results/$RUN/*" "$R/smoke-vm$k/"
@@ -170,6 +227,7 @@ smoke)
   [ "$ok" = 0 ] || { log "STOP: smoke acceptance failed ($RUN)"; exit 1; }
   log "smoke PASS ($RUN, acceptance OK)" ;;
 preload)
+  two_only
   [ "$INIT_STATE" = shared ] || { echo "preload needs INIT_STATE=shared"; exit 2; }
   for k in 0 1; do
     G $k status > "$R/status-preload-before-vm$k.txt"
@@ -180,6 +238,7 @@ preload)
   wait_no_faultlat 0 1
   log "preload PASS (node 0 wrote $PPAGES pages from swcc page $PBASE through a plain mapping)" ;;
 shared-check)
+  two_only
   [ "$INIT_STATE" = shared ] || { echo "shared-check needs INIT_STATE=shared"; exit 2; }
   # status to a file first: `ssh | grep -q` under pipefail fails with 255 (grep exits early, ssh gets EPIPE)
   for k in 0 1; do G $k status > "$R/status-sharedcheck-vm$k.txt"; grep -qx 'swmc.init_state=shared (initialized)' "$R/status-sharedcheck-vm$k.txt"; done
@@ -204,7 +263,7 @@ shared-check)
     { log "STOP: shared-check counters unexpected"; exit 1; }
   log "shared-check PASS (init-S reads without messages; first write INVALIDATE; data checked)" ;;
 instr-check)
-  for k in 0 1; do
+  for k in "${ALL[@]}"; do
     G $k status > "$R/status-instr-vm$k.txt"
     grep -qx 'instr_enabled=1' "$R/status-instr-vm$k.txt" || { log "STOP: instr not enabled on vm$k"; exit 1; }
     grep -qx 'dax0.0=comsys:root 600' "$R/status-instr-vm$k.txt" || { log "STOP: dax0.0 not comsys-owned on vm$k (chown phase?)"; exit 1; }
@@ -230,7 +289,7 @@ instr-check)
         { log "STOP: build-12 instr files (build $PBUILD, revoke_samples) missing on vm$k"; exit 1; }
     fi
   done
-  for k in 0 1; do
+  for k in "${ALL[@]}"; do
     page=$((IPAGE + k))   # one fresh page per node
     ssh -T "${FLAGS[@]}" "comsys@${IP[$k]}" "python3 -I - $GT/popcorn.env $page $PBUILD" > "$R/thread-swmc-vm$k.txt" <<'PY'
 import ctypes, mmap, os, re, struct, sys
@@ -286,9 +345,10 @@ print('per-thread file OK:', ' '.join('%s=%s' % (k, kv[k]) for k in ('read_fault
       'read_msg_wait_ns', 'write_faults', 'wp_faults', 'write_transactions', 'write_msg_wait_ns')))
 PY
   done | tee "$R/instr-check.txt"
-  for k in 0 1; do G $k instr-dump > "$R/instr-after-vm$k.txt"; done
-  log "instr-check PASS (instr/ present and enabled; per-thread file readable by its owner on both)" ;;
+  for k in "${ALL[@]}"; do G $k instr-dump > "$R/instr-after-vm$k.txt"; done
+  log "instr-check PASS (instr/ present and enabled; per-thread file readable by its owner on all $N)" ;;
 overhead)
+  two_only
   PRUN=$ORUN   # fl() writes to popcorn-results/$PRUN
   for k in 0 1; do G $k status > "$R/status-overhead-before-vm$k.txt"; done
   order=()
@@ -350,18 +410,18 @@ PY
   log "overhead done ($((i)) runs; numbers in overhead.txt; instrumentation enabled=1 on both)" ;;
 instr-on)
   # recovery after an interrupted `overhead`: instrumentation back on (ONLY=<k> for one VM)
-  for k in "${NODES[@]}"; do
+  for k in "${SEL[@]}"; do
     G $k instr 1 > "$R/instr-on-vm$k.txt"; cat "$R/instr-on-vm$k.txt"
     G $k status > "$R/status-instr-on-vm$k.txt"
     grep -qx 'instr_enabled=1' "$R/status-instr-on-vm$k.txt" || { log "STOP: instr still not enabled on vm$k"; exit 1; }
   done
-  log "instr-on PASS on vm${NODES[*]}" ;;
+  log "instr-on PASS on vm${SEL[*]}" ;;
 status)
-  for k in 0 1; do G $k status > "$R/status-${STATUS_TAG:-now}-vm$k.txt"; done
+  for k in "${ALL[@]}"; do G $k status > "$R/status-${STATUS_TAG:-now}-vm$k.txt"; done
   log "status recorded (${STATUS_TAG:-now})" ;;
 teardown)
-  wait_no_faultlat "${NODES[@]}" || { log "STOP: faultlat still running after 120 s"; exit 1; }
-  for k in "${NODES[@]}"; do
+  wait_no_faultlat "${SEL[@]}" || { log "STOP: faultlat still running after 120 s"; exit 1; }
+  for k in "${SEL[@]}"; do
     on $k "pgrep -a -x 'vdb-server|faultlat' || true" > "$R/procs-teardown-vm$k.txt"
     test ! -s "$R/procs-teardown-vm$k.txt" || { log "STOP: processes still running on vm$k"; exit 1; }
     G $k status > "$R/status-teardown-vm$k.txt"
@@ -374,12 +434,12 @@ teardown)
       | tee "$R/unchown-vm$k.txt"
     grep -qx 'root:root 600' "$R/unchown-vm$k.txt"
   done
-  for k in 1 0; do
-    [[ " ${NODES[*]} " == *" $k "* ]] || continue
+  for k in "${REV[@]}"; do
+    [[ " ${SEL[*]} " == *" $k "* ]] || continue
     G $k disable | tee -a "$R/teardown-vm$k.txt"   # 0 also when already off; EBUSY = mappings left -> stop
     G $k unload | tee -a "$R/teardown-vm$k.txt"
     grep -q 'unload OK\|cxl_shm not loaded' "$R/teardown-vm$k.txt"
   done
-  log "teardown PASS on vm${NODES[*]} (coherence off, cxl_shm unloaded, dax0.0 root:root 600)" ;;
+  log "teardown PASS on vm${SEL[*]} (coherence off, cxl_shm unloaded, dax0.0 root:root 600)" ;;
 *) sed -n '2,40p' "$0"; exit 2 ;;
 esac

@@ -1,6 +1,6 @@
 #!/bin/bash
 # Popcorn guest control (runs ON a guest, as root via `sudo -n`; grant-gated).
-#   p-popcorn-guest.sh load <node_id> <invalid|shared> [name=value ...] | wait-link <sec> | enable <sec> | status
+#   p-popcorn-guest.sh load <node_id> <invalid|shared> [nodes=N] [name=value ...] | wait-link <sec> | enable <sec> | status
 #                      | disable | unload
 #                      | instr <0|1> | instr-dump
 # Expected values come from popcorn.env next to this script (frozen in the
@@ -17,8 +17,12 @@
 #             receive-path parameters (only recv_mode, max_workers,
 #             worker_spin_us, fallback_us, starve_us; checked after the load
 #             in /sys/module/cxl_shm/parameters) (initializes only this node's ring lines
-#             at msg_ring, registers the swcc range; no SWcc write)
-#   wait-link waits until the link to the peer is up (cxl_shm counters)
+#             at msg_ring, registers the swcc range; no SWcc write).
+#             N nodes (popcorn-n): `nodes=N` (2..8) selects the frozen PARAMS_N<N>
+#             from popcorn.env (falls back to PARAMS when N equals its nr_nodes);
+#             without it PARAMS is used as before. The region-config check runs
+#             `faultlat params --nodes <nr_nodes of the selected PARAMS>`.
+#   wait-link waits until the links to all nr_nodes-1 peers are up (cxl_shm counters)
 #   enable    syscall 470 (enable_page_coherence), retried while EAGAIN;
 #             checks the managed range reported by the kernel. With
 #             INIT_STATE=shared the first enable blocks in the cross-node
@@ -61,19 +65,30 @@ links_up() { echo $(( $(cat $CS/link_up) - $(cat $CS/link_down) )); }
 case "${1:-}" in
 load)
   id=${2:?node_id}; mode=${3:?init_state}; shift 3
-  extra=()
+  extra=() reqn=
   for a in "$@"; do
+    if [[ "$a" =~ ^nodes=([2-8])$ ]]; then reqn=${BASH_REMATCH[1]}; continue; fi
     [[ "$a" =~ ^(recv_mode|max_workers|worker_spin_us|fallback_us|starve_us)=[a-z0-9]+$ ]] ||
       { echo "STOP: extra parameter '$a' not allowed"; exit 1; }
     extra+=("$a")
   done
   [[ "$id" =~ ^[0-9]$ ]] || { echo "STOP: bad node_id"; exit 1; }
   [[ "$mode" =~ ^(invalid|shared)$ ]] || { echo "STOP: bad init_state"; exit 1; }
-  [[ "$PARAMS" == *" init_state=invalid" ]] || { echo "STOP: frozen PARAMS lack init_state=invalid"; exit 1; }
-  want="${PARAMS% init_state=invalid} init_state=$mode"
+  sel=$PARAMS
+  if [ -n "$reqn" ]; then
+    v=PARAMS_N$reqn
+    if [ -n "${!v:-}" ]; then sel=${!v}
+    elif [[ " $PARAMS " != *" nr_nodes=$reqn "* ]]; then echo "STOP: popcorn.env has no $v (nodes=$reqn)"; exit 1; fi
+  fi
+  [[ "$sel" =~ (^| )nr_nodes=([2-8])( |$) ]] || { echo "STOP: frozen PARAMS lack nr_nodes=2..8"; exit 1; }
+  nr=${BASH_REMATCH[2]}
+  [ -z "$reqn" ] || [ "$nr" = "$reqn" ] || { echo "STOP: selected PARAMS have nr_nodes=$nr, requested $reqn"; exit 1; }
+  [ "$id" -lt "$nr" ] || { echo "STOP: node_id $id >= nr_nodes $nr"; exit 1; }
+  [[ "$sel" == *" init_state=invalid" ]] || { echo "STOP: frozen PARAMS lack init_state=invalid"; exit 1; }
+  want="${sel% init_state=invalid} init_state=$mode"
   ! loaded || { echo "STOP: cxl_shm already loaded"; exit 1; }
   u=$(dax_users); [ -z "$u" ] || { echo "STOP: /dev/dax0.0 in use: $u"; exit 1; }
-  p=$(CXL_REGION_CONFIG=$H/cxl_region.yaml "$H/faultlat" params --init-state "$mode")
+  p=$(CXL_REGION_CONFIG=$H/cxl_region.yaml "$H/faultlat" params --nodes "$nr" --init-state "$mode")
   [ "$p" = "$want" ] || { echo "STOP: params from region config differ: '$p' vs '$want'"; exit 1; }
   [ "$(sha256sum "$KO" | cut -d' ' -f1)" = "$KO_SHA" ] || { echo "STOP: $KO hash differs"; exit 1; }
   [ "$(modinfo -F vermagic "$KO" | cut -d' ' -f1)" = "$K" ] || { echo "STOP: vermagic"; exit 1; }
@@ -90,16 +105,20 @@ load)
   done
   echo "version=$(cat /sys/module/cxl_shm/version 2>/dev/null)"
   dmesg | grep -E 'shm_cxl|swmc-popcorn|swmc_kmsg' | tail -n 8
+  echo "load_nodes=$nr"
   echo "load OK (node $id)" ;;
 wait-link)
   t=${2:?seconds}
   loaded || { echo "STOP: cxl_shm not loaded"; exit 1; }
+  need=$(( $(cat /sys/module/cxl_shm/parameters/nr_nodes) - 1 ))
+  [ "$need" -ge 1 ] || { echo "STOP: nr_nodes parameter unreadable"; exit 1; }
   for ((i = 0; i < t * 10; i++)); do
-    [ "$(links_up)" -ge 1 ] && { dmesg | grep 'shm_cxl: link to node' | tail -n 2; echo "link OK"; exit 0; }
+    [ "$(links_up)" -ge "$need" ] &&
+      { dmesg | grep 'shm_cxl: link to node' | tail -n "$((need + 1))"; echo "link OK ($(links_up)/$need peers up)"; exit 0; }
     sleep 0.1
   done
-  dmesg | grep -E 'shm_cxl' | tail -n 5
-  echo "STOP: link not up after $t s"; exit 1 ;;
+  dmesg | grep -E 'shm_cxl' | tail -n $((need + 4))
+  echo "STOP: links up $(links_up) of $need after $t s"; exit 1 ;;
 enable)
   t=${2:?seconds}
   loaded || { echo "STOP: cxl_shm not loaded"; exit 1; }

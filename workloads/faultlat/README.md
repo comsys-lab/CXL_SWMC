@@ -111,6 +111,16 @@ ping-pong with a per-turn sequence check (every turn must see all earlier
 increments). Any data mismatch or sequence error makes the step exit 2 and
 stops the sequence. Uses 5 windows from `<base-page>`.
 
+`smoke-n.sh <run-id> <base-page> [--execute]` is the same check for N = 2..8
+nodes (cxl_shm nr_nodes=N; env NODE_HOSTS="comsys@ip0 ... comsys@ipN-1", node k
+= position k; PAGES a multiple of N): n1 node N-1 writes, all others read at
+once; n2 node 0 overwrites pages held S by N-1 nodes, all others check at once;
+n3 every node writes its own slice at once, node k checks slice k+1 mod N;
+n4 N-way write-write conflicts, then node 0 writes a pattern, all others check;
+n5 token ring (`pingpong --nodes N`). Parallel steps wait for every node and
+fail if any failed. Driven by `scripts/deploy/p-popcorn-shm.sh smoke` when
+POP_IPS lists more than 2 guests.
+
 ## Scenarios (scenarios.sh)
 
 | Step | Node | What is measured | Local transition | Peer work |

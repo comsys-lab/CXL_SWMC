@@ -1,0 +1,20 @@
+# Shared CXL region layout with a 2 MiB Popcorn message ring (user decision 2026-10-18: from H3 on, every system and
+# every N, including the N=2 reference). Identical to config/cxl_region.yaml except msg_ring; that file (132 KiB
+# ring) stays the default and is pinned by H1 / RecSys T=1 / earlier packets, which must keep using it.
+# Select this file explicitly (harness REGION / CXL_REGION_CONFIG); never mix the two in one comparison.
+# Ring need (cxl_shm v7, 256 slots per window minimum): N=2 69632, N=4 397312, N=8 1851392 B; 2 MiB gives
+# 4096 / 1024 / 256 slots per window at N = 2 / 4 / 8 (cxl_shm rounds slots down to a power of two).
+# Sizes/offsets in bytes; "auto" means derived (see systems/common/cxl_region.h).
+device: /dev/dax0.0
+map_va: 0x600000000000    # fixed VA of the whole-device mapping, identical on every node (raw pointers in shared data)
+device_size: auto          # /sys/bus/dax/devices/<dev>/size (observed 103060340736)
+align: 2097152             # 2 MiB; must be a multiple of 4096
+hwcc_offset: 0
+hwcc_size: 268435456       # 256 MiB HW-coherent budget, shared by system, workload and message ring
+msg_ring: [266338304, 2097152]  # last 2 MiB of hwcc: Popcorn cxl_shm message rings (ring_coherent=1), N = 2..8
+# Workload control state ("app") sits directly below msg_ring; its size is the workload's computed need for
+# the run, passed as $CXL_APP_HWCC_BYTES (not set here). Systems allocate only the rest (cxl_region.h
+# hwcc_alloc = hwcc - app - msg_ring = at most 266338304 B here). Rules: docs/hwcc-contract.md.
+swcc_offset: auto          # align_up(hwcc_offset + hwcc_size, align)
+swcc_size: auto            # up to device end, stopping at the first reserved range above swcc_offset
+reserved: []               # e.g. [[100931731456, 2147483648]] to exclude a range from all systems
