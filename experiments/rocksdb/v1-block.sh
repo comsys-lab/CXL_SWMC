@@ -44,6 +44,11 @@ if [ "${MEASURE:-0}" = 1 ]; then  # h1-gate.sh needs both (partition + measureme
   [ -z "${MEASURE_ENV:-}" ] || export MEASURE_ENV
   [ -z "${MEASURE_PART_SCRIPT:-}" ] || export MEASURE_PART_SCRIPT
 fi
+if [ -n "${GATE_SCRIPT:-}" ]; then  # h3-gate.sh (popcorn-n): needs the running set and both measurement evidence dirs
+  [ -f "$GATE_SCRIPT" ] || { echo "BLOCK STOP: GATE_SCRIPT $GATE_SCRIPT missing"; exit 2; }
+  : "${MEASURE_ENV_DIR:?GATE_SCRIPT needs MEASURE_ENV_DIR}" "${MEASURE_PART_DIR:?GATE_SCRIPT needs MEASURE_PART_DIR}"
+  export GATE_SCRIPT MEASURE_ENV_DIR MEASURE_PART_DIR EXPECT_RUNNING="${EXPECT_RUNNING:-$VM_DOMAINS}"
+fi
 [ -d "$E" ] && [ -z "$(ls -A "$E" | grep -vE '^(tasks-check\.txt|block\.out)$')" ] || { echo "BLOCK STOP: $E missing or not empty"; exit 2; }
 [ -s "$E/tasks-check.txt" ] || { echo "BLOCK STOP: $E/tasks-check.txt missing (state/TASKS.md: no other active VM user)"; exit 2; }
 bash $G lock "$OWNER" || { echo "BLOCK STOP: lock"; exit 2; }
