@@ -12,11 +12,12 @@
 #     (kvm-nx-lpage-recovery is a KVM kthread child, not checked);
 #   - vCPU thread "CPU j/KVM" pinned per topology: 4 vCPUs (VM8): host core 2i + j/2, thread (j%2)*32;
 #     16 vCPUs (2-VM topology): host core 2(j/2) + i, thread (j%2)*32;
-#   - optional EXPECT_RUNNING="cxl_vm0 cxl_vm1 ..." must equal the running cxl_vm* set (H3 N subset).
+#   - EXPECT_RUNNING="cxl_vm0 cxl_vm1 ..." (required) must equal the running cxl_vm0..7 set (the H3 N subset).
 set -uo pipefail
 H=$(cd "$(dirname "$0")" && pwd)
 V="virsh -c qemu:///system"
-[ "${1:-}" = check ] && [ -n "${2:-}" ] || { echo "usage: $0 check <base state dir> [<part apply dir>]"; exit 2; }
+[ "${1:-}" = check ] && [ -n "${2:-}" ] || { echo "usage: EXPECT_RUNNING='cxl_vm0 ...' $0 check <base state dir> [<part apply dir>]"; exit 2; }
+[[ "${EXPECT_RUNNING:-}" =~ ^(cxl_vm[0-7]( |$))+$ ]] || { echo "CHECK FAIL: EXPECT_RUNNING (cxl_vm0..7 names) is required"; exit 2; }
 B=$2 A=${3:-}
 if [ -n "$A" ]; then out=$(bash "$H/measure-env-part.sh" check "$B" "$A" 2>&1); brc=$?; want='^PART CHECK PASS'
 else out=$(bash "$H/measure-env.sh" check "$B" 2>&1); brc=$?; want='^CHECK PASS$'; fi
@@ -26,10 +27,8 @@ rc=0
 if [ $brc != 0 ] || ! grep -qE "$want" <<< "$last"; then printf '%s\n' "$last"; rc=1; else echo "base: $last"; fi
 running=$($V list --name 2>/dev/null | grep -E '^cxl_vm[0-7]$' | sort | tr '\n' ' ')
 [ -n "$running" ] || { echo "CHECK FAIL: no running cxl_vm0..7"; rc=1; }
-if [ -n "${EXPECT_RUNNING:-}" ]; then
-  exp=$(tr ' ' '\n' <<< "$EXPECT_RUNNING" | grep . | sort | tr '\n' ' ')
-  [ "$exp" = "$running" ] || { echo "CHECK FAIL: running VMs [$running] != EXPECT_RUNNING [$exp]"; rc=1; }
-fi
+exp=$(tr ' ' '\n' <<< "$EXPECT_RUNNING" | grep . | sort | tr '\n' ' ')
+[ "$exp" = "$running" ] || { echo "CHECK FAIL: running VMs [$running] != EXPECT_RUNNING [$exp]"; rc=1; }
 for vm in $running; do
   i=${vm#cxl_vm}; emu=$([ $((i % 2)) = 0 ] && echo 16,48 || echo 17,49)
   [ "$($V emulatorpin "$vm" | awk '/\*:/{print $2}')" = "$emu" ] || { echo "CHECK FAIL: $vm emulatorpin (want $emu)"; rc=1; }

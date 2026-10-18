@@ -34,13 +34,15 @@ ITERS=${ITERS:-10000}
 CFG=${CXL_REGION_CONFIG:-/home/comsys/cxl_region.yaml}
 [ $((PAGES % N)) = 0 ] || { echo "PAGES ($PAGES) must be a multiple of N ($N)"; exit 2; }
 out=$GOUT/$run
+# same ssh options as scripts/deploy/p-popcorn-shm.sh (known_hosts entries for every node are a precondition)
+FLAGS=(-F /dev/null -o BatchMode=yes -o PasswordAuthentication=no -o KbdInteractiveAuthentication=no -o StrictHostKeyChecking=yes -o UpdateHostKeys=no -o ForwardAgent=no -o ClearAllForwardings=yes -o ControlMaster=no -o ControlPath=none -o ConnectTimeout=8 -o ConnectionAttempts=1)
 
 cmd() { echo "CXL_REGION_CONFIG=$CFG $GDIR/run.sh $out $*"; }
 step() {  # step <k> <name> <faultlat args...>
   local k=$1; shift
   if [ "$exec_" = --execute ]; then
     echo "[$(date +%T)] node$k ${NODE[$k]} $1"
-    ssh -o BatchMode=yes "${NODE[$k]}" "$(cmd "$@" --cpu "$CPU")" < /dev/null
+    ssh -T "${FLAGS[@]}" "${NODE[$k]}" "$(cmd "$@" --cpu "$CPU")" < /dev/null
   else
     echo "ssh ${NODE[$k]} '$(cmd "$@" --cpu "$CPU")'"
   fi
@@ -53,7 +55,7 @@ par() {
     echo "[$(date +%T)] parallel $fn on nodes $*"
     for k in "$@"; do
       # shellcheck disable=SC2046
-      ssh -o BatchMode=yes "${NODE[$k]}" "$(cmd $($fn "$k") --cpu "$CPU")" < /dev/null & pids+=($!)
+      ssh -T "${FLAGS[@]}" "${NODE[$k]}" "$(cmd $($fn "$k") --cpu "$CPU")" < /dev/null & pids+=($!)
     done
     for p in "${pids[@]}"; do wait "$p" || rc=1; done
     return $rc
