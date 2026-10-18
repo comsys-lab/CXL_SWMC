@@ -29,7 +29,15 @@
 # Holds the measurement lock (owner H1-main) for the stage; hooks run with H1_PARENT_LOCK=H1-main. Stops at the
 # first failing step ("SEQUENCE STOP"); every block rolls back in its own EXIT trap; this script releases the lock.
 # usage: h1-main.sh <stage> <evidence root E>
+#        h1-main.sh r1-<W> <E> --retry "<reason>"   (v0.6.8, user decision 2026-10-18 "응 그렇게 진행해")
 #   E: for r1-kv it must exist and be empty except sequence* files; later stages use the same E.
+# --retry (round 1 stages only): re-runs a STOPPED r1 stage of W in a new attempt dir <E>/<W>/r1-a<k> (attempts.py;
+#   the stopped <E>/<W>/r1[-a<k-1>] stays untouched as evidence). Allowed only when the current attempt has no
+#   acceptance record and no skip record, its check.txt (if any) is not PASS, no <E>/<W>/collect-all-r1 exists, and the
+#   stage's last line in h1-state.txt is "SEQUENCE STOP" (nothing running: the measurement lock is taken as usual).
+#   The new attempt gets attempt.txt (attempt number, predecessor dir, its last state line, check and file-list
+#   sha256, the reason) and its own levels.tsv; gate / manifest-check files get the suffix -a<k>; check.py,
+#   collect.py and h1-accept.sh read the current attempt (attempts.py), so the other workloads' acceptances stay valid.
 # env: PRETOUCH_DIR, MEASURE_ENV_DIR, MEASURE_PART_DIR (required unless H1_DRY=1; exported with H1_MEASURE_RUN=1 so the
 #   hooks gate with h1-gate.sh and start loadgen through scripts/host/measure-run.sh), H1_PLAN (default h1-plan.tsv next to this script),
 #   settle_s per workload from the plan (column 8),
@@ -38,11 +46,17 @@
 #   figures), H1_DRY=1 (Host self-test: plugin "stub", gates skipped, LOCK must be a test lock under h1-main/).
 set -uo pipefail
 export PYTHONDONTWRITEBYTECODE=1
-STAGE=${1:?usage: h1-main.sh <stage> <evidence root> [--workloads w1,w2]} E=${2:?usage: h1-main.sh <stage> <evidence root>}
-SUBSET=
+STAGE=${1:?usage: h1-main.sh <stage> <evidence root> [--workloads w1,w2 | --retry <reason>]} E=${2:?usage: h1-main.sh <stage> <evidence root>}
+SUBSET= RETRY=
 if [ -n "${3:-}" ]; then
-  [ "$3" = --workloads ] && [ -n "${4:-}" ] || { echo "SEQUENCE STOP: usage: h1-main.sh r2|r3 <E> --workloads w1,w2"; exit 2; }
-  SUBSET=${4//,/ }
+  if [ "$3" = --retry ]; then
+    [ -n "${4:-}" ] && [ -z "${5:-}" ] || { echo "SEQUENCE STOP: usage: h1-main.sh r1-<W> <E> --retry \"<reason>\""; exit 2; }
+    case $STAGE in r1-*) ;; *) echo "SEQUENCE STOP: --retry is for r1-<W> stages only"; exit 2;; esac
+    RETRY=$4
+  else
+    [ "$3" = --workloads ] && [ -n "${4:-}" ] || { echo "SEQUENCE STOP: usage: h1-main.sh r2|r3 <E> --workloads w1,w2"; exit 2; }
+    SUBSET=${4//,/ }
+  fi
 fi
 H=$(cd "$(dirname "$0")" && pwd)
 G=$H/../vectordb/host-gate.sh PG=$H/../vectordb/pretouch-gate.sh
@@ -66,14 +80,20 @@ case $STAGE in
 esac
 [ -f "$PLAN" ] || { echo "SEQUENCE STOP: no plan $PLAN"; exit 2; }
 for w in $ORDER; do grep -q "^$w	" "$PLAN" || { echo "SEQUENCE STOP: workload $w not in the plan"; exit 2; }; done
-if [ "$STAGE" = r1-kv ]; then
+if [ "$STAGE" = r1-kv ] && [ -z "$RETRY" ]; then
   [ -d "$E" ] && [ -z "$(ls -A "$E" | grep -v '^sequence')" ] || { echo "SEQUENCE STOP: $E missing or not empty"; exit 2; }
 else
   [ -f "$E/h1-manifest.txt" ] || { echo "SEQUENCE STOP: $E has no h1-manifest.txt (start with r1-kv)"; exit 2; }
 fi
 # stage preconditions: acceptance records of the previous stage(s) (h1-accept.sh; the check.txt sha256 must still match)
-accepted() {  # W n -> 0 if r<n> of W has check PASS and an acceptance record matching the check file
-  local c=$E/$1/r$2/check.txt a=$E/accept/r$2-$1.txt
+rdir() {  # W n -> current attempt dir of round n (attempts.py; <E>/<W>/r<n> when none exists yet); rc 2 = bad layout
+  local d rc
+  d=$(python3 -I -B $H/attempts.py dir "$E" "$1" "$2" 2>/dev/null); rc=$?
+  case $rc in 0) echo "$d";; 1) echo "$E/$1/r$2";; *) return 2;; esac
+}
+accepted() {  # W n -> 0 if r<n> of W (current attempt) has check PASS and an acceptance record matching the check file
+  local d; d=$(rdir $1 $2) || return 1
+  local c=$d/check.txt a=$E/accept/r$2-$1.txt
   [ -f "$c" ] && tail -n 1 "$c" | grep -q "^H1CHECK PASS" && [ -f "$a" ] \
     && grep -q "check_sha256=$(sha256sum < "$c" | cut -c1-64)" "$a"
 }
@@ -94,6 +114,22 @@ case $STAGE in
   r2|r3) for w in $WL; do accepted $w 1 || { echo "SEQUENCE STOP: r1 of $w not checked PASS + accepted$([ -f "$E/accept/r1-$w-skip.txt" ] && echo " (skipped)") (r2/r3 need r1 accepted for each chosen workload)"; exit 2; }; done
          if [ $N = 3 ]; then for w in $WL; do accepted $w 2 || { echo "SEQUENCE STOP: r2 of $w not checked PASS + accepted"; exit 2; }; done; fi;;
 esac
+# --retry preconditions (v0.6.8): the current r1 attempt of WL exists, was not accepted or skipped, did not pass its
+# check, left no collect-all-r1, and its stage ended with SEQUENCE STOP; the new attempt is r1-a<k+1> (attempts.py)
+AT= PREV= RETRYINFO=
+if [ -n "$RETRY" ]; then
+  rfail() { echo "SEQUENCE STOP: --retry refused for $STAGE: $*"; exit 2; }
+  PREV=$(python3 -I -B $H/attempts.py dir "$E" "$WL" 1 2>&1) || rfail "no previous attempt of r1-$WL or bad attempt layout ($PREV)"
+  NEXTA=$(python3 -I -B $H/attempts.py next "$E" "$WL" 1 2>&1) || rfail "attempts.py next: $NEXTA"
+  [ ! -e "$E/accept/r1-$WL.txt" ] || rfail "r1 $WL is accepted ($E/accept/r1-$WL.txt)"
+  [ ! -e "$E/accept/r1-$WL-skip.txt" ] || rfail "r1 $WL was skipped ($E/accept/r1-$WL-skip.txt; a skipped stage is not retried here)"
+  ! { [ -f "$PREV/check.txt" ] && tail -n 1 "$PREV/check.txt" | grep -q "^H1CHECK PASS"; } || rfail "$PREV/check.txt is PASS (accept or skip it instead)"
+  [ ! -e "$E/$WL/collect-all-r1" ] && [ ! -e "$E/$WL/collect-all-r1.log" ] || rfail "$E/$WL/collect-all-r1[.log] exists"
+  LAST=$(grep -F "[$STAGE] " "$E/h1-state.txt" 2>/dev/null | tail -n 1)
+  [[ "$LAST" == *"[$STAGE] SEQUENCE STOP"* ]] || rfail "the last $STAGE line in h1-state.txt is not a SEQUENCE STOP ('$LAST')"
+  AT=-${NEXTA#r1-}
+  RETRYINFO="attempt=${AT#-a} dir=$WL/$NEXTA predecessor=${PREV#$E/} reason=$RETRY"
+fi
 if [ "$DRY" = 1 ]; then
   case "${LOCK:-}" in */h1-main/*) ;; *) echo "SEQUENCE STOP: H1_DRY=1 needs LOCK=<test lock under workspaces/h1-main/>"; exit 2;; esac
 else
@@ -131,9 +167,10 @@ bash $G lock $OWNER || { echo "SEQUENCE STOP: lock"; exit 2; }
 trap 'bash $G unlock $OWNER' EXIT
 { echo "# H1 main stage $STAGE"; echo "start=$(date -Is)"; echo "cxl_swmc_commit=$(git -C $H rev-parse HEAD 2>/dev/null)"
   echo "cxl_swmc_dirty_h1=$(git -C $H status --porcelain -- . | wc -l)"; echo "plan=$PLAN sha256=$(sha256sum < "$PLAN" | cut -c1-64)"
-  for f in h1-main.sh hook.sh h1-gate.sh levels.py levels-cb.sh collect.py check.py h1-accept.sh; do echo "$f sha256=$(sha256sum < $H/$f | cut -c1-64)"; done
+  for f in h1-main.sh hook.sh h1-gate.sh levels.py levels-cb.sh collect.py check.py h1-accept.sh h1sys.py attempts.py; do echo "$f sha256=$(sha256sum < $H/$f | cut -c1-64)"; done
   for f in v6_fig2_split.py v6_common.py v6_fig1_curves.py; do echo "analysis/$f sha256=$(sha256sum < $H/../analysis/$f | cut -c1-64)"; done
   echo "stage=$STAGE round=$N workloads=$WL seed_base=$H1_SEED_BASE dry=$DRY"
+  [ -z "$RETRY" ] || echo "retry: $RETRYINFO"
   echo "pretouch_dir=${PRETOUCH_DIR:-} measure_env_dir=${MEASURE_ENV_DIR:-} measure_part_dir=${MEASURE_PART_DIR:-}"
   echo "manifest=${H1_MANIFEST:-} manifest_sha256=${H1_MANIFEST_SHA:-}"
   for f in measure-env.sh measure-env-part.sh measure-run.sh; do echo "scripts/host/$f sha256=$(sha256sum < $H/../../scripts/host/$f | cut -c1-64)"; done
@@ -147,46 +184,65 @@ gates() {  # tag
 }
 log "stage start: round $N, workloads [$WL], pid $$ pgid $PGID, manifest $([ $MAN_ON = 1 ] && echo "$H1_MANIFEST ok" || echo "off (dry)")"
 [ -z "$SKIPNOTE" ] || log "$SKIPNOTE"
+[ -z "$RETRY" ] || log "RETRY $RETRYINFO"
 for W in $WL; do
-  T0=$(date +%s) S=$E/$W/r$N
+  T0=$(date +%s) S=$E/$W/r$N LV=$E/$W/levels.tsv
+  if [ -n "$RETRY" ]; then S=$E/$W/$NEXTA LV=$S/levels.tsv   # round 1 retry: own levels.tsv (attempts.py)
+  elif [ $N != 1 ]; then LV=$(python3 -I -B $H/attempts.py levels "$E" "$W" 2>&1) || stop "$W: attempts.py levels: $LV"; fi
   MIXES=$(awk -F'\t' -v w="$W" '!/^#/ && $1 == w { printf "%s=%s ", $2, $3 }' "$PLAN")
-  [ ! -e "$S" ] || stop "$S exists (stage dirs are immutable; use a new evidence root for a rerun)"
+  [ ! -e "$S" ] || stop "$S exists (stage dirs are immutable; a stopped r1 stage is re-run with --retry)"
   SETTLE=$(awk -F'\t' -v w="$W" '!/^#/ && $1 == w { print $8; exit }' "$PLAN")
   [[ $SETTLE =~ ^[1-9][0-9]*$ ]] || stop "$W: no settle_s in the plan"
-  mkdir -p "$S/run" || stop "mkdir $S"
-  gates "$W-r$N-start"
+  mkdir -p "$E/$W" && mkdir "$S" || stop "mkdir $S"
+  if [ -n "$RETRY" ]; then  # the new attempt's manifest: written first, before anything else lands in $S
+    { echo "# H1 stage attempt (h1-main.sh --retry, packet v0.6.8 §3)"
+      echo "workload=$W"; echo "round=$N"; echo "attempt=${AT#-a}"; echo "predecessor=${PREV##*/}"
+      echo "predecessor_dir=$PREV"
+      echo "predecessor_state_last=$LAST"
+      echo "predecessor_check=$([ -f "$PREV/check.txt" ] && echo "$(sha256sum < "$PREV/check.txt" | cut -c1-64) $(tail -n 1 "$PREV/check.txt")" || echo none)"
+      echo "predecessor_accept=none predecessor_skip=none"
+      echo "predecessor_files=$(find "$PREV" -type f | wc -l) listing_sha256=$(cd "$PREV" && find . -type f -printf '%P %s\n' | LC_ALL=C sort | sha256sum | cut -c1-64)"
+      echo "predecessor_h1_runs_sha256=$(sha256sum < "$PREV/run/h1-runs.tsv" 2>/dev/null | cut -c1-64)"
+      echo "reason=$RETRY"; echo "created=$(date -Is)"; echo "stage=$STAGE pid=$$"
+      echo "manifest=${H1_MANIFEST:-} manifest_sha256=${H1_MANIFEST_SHA:-}"; } > "$S/attempt.txt" || stop "attempt.txt"
+    CUR=$(python3 -I -B $H/attempts.py dir "$E" "$W" 1 2>&1)
+    [ "$CUR" = "$S" ] || stop "attempts.py resolves $CUR, not the new attempt $S"
+  fi
+  mkdir "$S/run" || stop "mkdir $S/run"
+  gates "$W-r$N$AT-start"
   if [ $N = 1 ]; then  # r1: per mix hw/pop SLO-only lifetimes, mg SLO -> levels (callback) -> settle -> L2 -> L1,
                        # then hw/pop separate fixed lifetimes (dec 2026-10-18)
-    [ ! -e "$E/$W/levels.tsv" ] || stop "$W: levels.tsv exists before r1"
-    log "$W r1: mixes [$MIXES], settle ${SETTLE}s"
-    env H1_SETTLE_S=$SETTLE H1_LEVELS_CMD=$H/levels-cb.sh H1_PLAN="$PLAN" H1_W=$W H1_LEVELS_OUT="$E/$W/levels.tsv"       bash $H/hook.sh "$W" r1 "$S/run" 1 "$MIXES" || stop "$W r1"
-    for m in $MIXES; do grep -q "^${m%%=*}	" "$E/$W/levels.tsv" 2>/dev/null || stop "$W: levels.tsv has no row for ${m%%=*}"; done
-    log "$W levels: $(($(grep -c . "$E/$W/levels.tsv") - 1)) mixes (levels.tsv, computed in the mg lifetimes of r1)"
+    [ ! -e "$LV" ] || stop "$W: levels.tsv exists before r1 ($LV)"
+    log "$W r1$AT: mixes [$MIXES], settle ${SETTLE}s"
+    env H1_SETTLE_S=$SETTLE H1_LEVELS_CMD=$H/levels-cb.sh H1_PLAN="$PLAN" H1_W=$W H1_LEVELS_OUT="$LV"       bash $H/hook.sh "$W" r1 "$S/run" 1 "$MIXES" || stop "$W r1$AT"
+    for m in $MIXES; do grep -q "^${m%%=*}	" "$LV" 2>/dev/null || stop "$W: levels.tsv has no row for ${m%%=*}"; done
+    log "$W levels: $(($(grep -c . "$LV") - 1)) mixes ($LV, computed in r1 $(python3 -I -B $H/h1sys.py slo "$W" | grep -qw mg && echo "in the mg lifetimes" || echo "right after the hw/pop SLO-only lifetimes of each mix"))"
   else                 # r2/r3: every system one lifetime SLO -> settle -> L2 -> L1 at the r1 levels
-    [ -f "$E/$W/levels.tsv" ] || stop "$W: no levels.tsv"
+    [ -f "$LV" ] || stop "$W: no levels.tsv ($LV)"
     log "$W r$N: mixes [$MIXES], settle ${SETTLE}s"
-    env H1_SETTLE_S=$SETTLE bash $H/hook.sh "$W" cont "$S/run" "$N" "$MIXES" "$E/$W/levels.tsv" || stop "$W r$N"
+    env H1_SETTLE_S=$SETTLE bash $H/hook.sh "$W" cont "$S/run" "$N" "$MIXES" "$LV" || stop "$W r$N"
   fi
-  gates "$W-r$N-end"
-  manifest_check "$W r$N before collect" > "$E/manifest-$W-r$N.txt" || stop "$(cat "$E/manifest-$W-r$N.txt")"
-  nice -n 19 python3 -B $H/collect.py --plan "$PLAN" --workload "$W" --levels "$E/$W/levels.tsv" ${H1_NO_FIGS:+--no-figs} "$S" \
-    > "$S/collect.log" 2>&1 || stop "$W r$N collect: $(tail -n 1 "$S/collect.log")"
+  gates "$W-r$N$AT-end"
+  manifest_check "$W r$N$AT before collect" > "$E/manifest-$W-r$N$AT.txt" || stop "$(cat "$E/manifest-$W-r$N$AT.txt")"
+  nice -n 19 python3 -B $H/collect.py --plan "$PLAN" --workload "$W" --levels "$LV" ${H1_NO_FIGS:+--no-figs} "$S" \
+    > "$S/collect.log" 2>&1 || stop "$W r$N$AT collect: $(tail -n 1 "$S/collect.log")"
   python3 -B $H/check.py --plan "$PLAN" --workload "$W" --round "$N" $([ "$DRY" = 1 ] && echo --skip-fig2) "$E" > "$S/check.log" 2>&1
   CRC=$?
-  log "$W r$N ($(( ($(date +%s) - T0) / 60 )) min): $(tail -n 1 "$S/check.txt" 2>/dev/null || echo 'no check.txt')"
-  [ $CRC = 0 ] || stop "$W r$N check FAIL (see $S/check.txt)"
+  log "$W r$N$AT ($(( ($(date +%s) - T0) / 60 )) min): $(tail -n 1 "$S/check.txt" 2>/dev/null || echo 'no check.txt')"
+  [ $CRC = 0 ] || stop "$W r$N$AT check FAIL (see $S/check.txt)"
   grep -q "^REPORT" "$S/check.txt" && log "$W r$N: REPORT lines (separate vs continuous beyond the run-to-run spread): report to the user before r3; h1-accept.sh needs --user-ack"
 done
 # collect-all after every stage, per workload of the stage: every round present so far (r1 only = single round, no
 # variance; r1 + r2 for a subset; ...) into <W>/collect-all-r<n> (immutable; one per round count)
 for W in $WL; do
-  nice -n 19 python3 -B $H/collect.py --plan "$PLAN" --workload "$W" --levels "$E/$W/levels.tsv" --out-name collect-all-r$N \
+  LV=$(python3 -I -B $H/attempts.py levels "$E" "$W" 2>&1) || stop "$W: attempts.py levels: $LV"
+  nice -n 19 python3 -B $H/collect.py --plan "$PLAN" --workload "$W" --levels "$LV" --out-name collect-all-r$N \
     ${H1_NO_FIGS:+--no-figs} "$E/$W" > "$E/$W/collect-all-r$N.log" 2>&1 || stop "$W collect-all-r$N: $(tail -n 1 "$E/$W/collect-all-r$N.log")"
 done
 log "collect-all-r$N done for [$WL] (rounds 1..$N; slo-summary.csv states single round / mean and sd)"
-manifest_check "stage end" > "$E/manifest-end-$STAGE.txt" || stop "$(cat "$E/manifest-end-$STAGE.txt")"
+manifest_check "stage end" > "$E/manifest-end-$STAGE$AT.txt" || stop "$(cat "$E/manifest-end-$STAGE$AT.txt")"
 if [ $N = 1 ]; then
-  log "STAGE DONE $STAGE: main session reviews $E/$WL/r1/check.txt, then: bash $H/h1-accept.sh $E 1 $WL"
+  log "STAGE DONE $STAGE: main session reviews $S/check.txt, then: bash $H/h1-accept.sh $E 1 $WL"
 else
   log "STAGE DONE $STAGE [$WL]: review each r$N/check.txt (REPORT lines -> user first), then h1-accept.sh $E $N <W> [--user-ack ...]"
 fi

@@ -11,7 +11,8 @@ the workload's own block, reached through its H1 hook. One block runs at a time,
 | freeze-manifest.sh | writes the frozen code manifest that h1-main.sh checks at every stage start (H1_MANIFEST, H1_MANIFEST_SHA) |
 | h1-gate.sh | H1 Host gate: measure-env-part check, build processes, CPU busy of the node1 measurement sets (meas ≤ 10 % avg / 50 % per CPU, emu ≤ 25 %); lock/unlock delegated to host-gate.sh |
 | levels-cb.sh | r1 callback inside the mg lifetime: levels.py --mix for that mix (appended to levels.tsv), prints `<L2_rate> <L1_rate>` |
-| h1-main.sh | one stage per call (`r1-kv`, `r1-lmdb`, `r1-vdb`, `r1-recsys`, `r2`, `r3`; user decision 2026-10-17; `r2`/`r3` take `--workloads w1,w2` for a user-chosen subset, plan change 2026-10-18). Every stage ends with `<W>/collect-all-r<n>` (rounds 1..n). Takes the lock `H1-main`. Per workload: gates, SLO phase, levels.py (r1 only), fixed phase, gates, collect.py, check.py. Refuses a stage until the previous stage is checked PASS and accepted (r2: r1 of each chosen workload; r3: r1 and r2 of each chosen workload; v0.6.5) |
+| h1-main.sh | one stage per call (`r1-kv`, `r1-lmdb`, `r1-vdb`, `r1-recsys`, `r2`, `r3`; user decision 2026-10-17; `r2`/`r3` take `--workloads w1,w2` for a user-chosen subset, plan change 2026-10-18). Every stage ends with `<W>/collect-all-r<n>` (rounds 1..n). Takes the lock `H1-main`. Per workload: gates, SLO phase, levels.py (r1 only), fixed phase, gates, collect.py, check.py. Refuses a stage until the previous stage is checked PASS and accepted (r2: r1 of each chosen workload; r3: r1 and r2 of each chosen workload; v0.6.5). `r1-<W> <E> --retry "<reason>"` (v0.6.8) re-runs a STOPPED, unaccepted, unskipped r1 stage in a new attempt dir `<W>/r1-a<k>` (attempt.txt names the predecessor and the reason) |
+| attempts.py | v0.6.8: current attempt of a workload x round (`<W>/r<n>` or the highest `<W>/r<n>-a<k>`) and the levels.tsv of the current r1 attempt; used by h1-main.sh, check.py, collect.py (collect-all skips superseded attempts), h1-accept.sh |
 | check.py | per workload x round acceptance checks F1-F9 (FAIL) and W1-W6 (WARN, judged by the main session) -> `r<n>/check.txt` |
 | h1-accept.sh | main session records its acceptance of a checked stage (`accept/r<n>-<W>.txt` with the check.txt sha256); `--skip "<reason>"` (r1 only, user 2026-10-18) records a not-accepted r1 stage (`accept/r1-<W>-skip.txt`) so the next r1 stage may start; r2/r3 refuse a chosen workload whose r1 is skipped or not accepted |
 | hook.sh | runs one round of one workload (H1MODE r1 or cont) through `plugins/pins-<W>.sh`. It refuses FILL_ tokens, a missing hook marker and pin hash mismatches. Afterwards it checks `SEQUENCE DONE` and `h1-runs.tsv` (one run per mix x system) |
@@ -31,6 +32,10 @@ the workload's own block, reached through its H1 hook. One block runs at a time,
 <E>/<W>/r<n>/collect/  runs-index.csv steps-all.csv slo-summary.csv fix-steps.csv cdiff.csv fig/ notes.txt; r<n>/check.txt
 <E>/<W>/collect-all-r<n>/  after each stage: rounds 1..n of W (slo-summary.csv rounds_note: single round, or mean / sd;
                        fig/<W>-<mix>-r<k>-* per round, with <tag>-windows.txt naming each window's lifetime)
+<E>/<W>/r1-a<k>/   v0.6.8 retry attempt k >= 2 of a stopped r1 stage (h1-main.sh --retry): attempt.txt (predecessor,
+                   its last state line, check / file-list sha256, reason), run/, collect/, check.txt and its own
+                   levels.tsv + levels-<mix>.log; every consumer reads the current (highest) attempt (attempts.py), the
+                   stopped attempts stay untouched; gate-/manifest- files of the stage carry the suffix -a<k>
 ```
 
 ## Hook contract H1-HOOK v2 (user decision 2026-10-18 "H1 lifetime 구성 변경"; owner = each workload's agent)

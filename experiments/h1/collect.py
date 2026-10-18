@@ -35,7 +35,9 @@ Coherence CPU per window (CLAUDE.md: CPU spent on coherence next to throughput a
   coh_cpu_vcpus = (recv_cpu_s for Popcorn | meg_bg_cpu_s for Megalon | 0 for all-HWcc) / window_s
 usage: collect.py --plan h1-plan.tsv --workload W [--levels levels.tsv] [--out-name collect] [--no-figs] WDIR
   WDIR = one round of a workload (<E>/<W>/r<n>: run/ with h1-runs.tsv v2) or the workload root (<E>/<W>, every round; --out-name
-  collect-all); runs = every h1-runs.tsv below WDIR outside collect* dirs. Figures use the lowest round present.
+  collect-all); runs = every h1-runs.tsv below WDIR outside collect* dirs and outside superseded stage attempts (v0.6.8,
+  attempts.py: after `h1-main.sh --retry` only the current attempt r<n>-a<k> of a round counts). Figures use the lowest
+  round present.
 Systems per workload (h1sys.py, v0.6.7): recsys = hw, pop (user decision 2026-10-18; no Megalon in H1 RecSys):
   slo-summary has hw, pop rows; Fig 1 hw, pop curves; Fig 2 v6_fig2_split.py --megalon-c none (rows All HWcc,
   Popcorn); no cdiff rows; systems.txt (and each <tag>-windows.txt) states that the Megalon RecSys numbers come from
@@ -50,6 +52,7 @@ sys.path.insert(0, os.path.join(EXP, "loadgen"))
 from export_csv import knee_bracket  # noqa: E402
 sys.path.insert(0, HERE)
 from h1sys import slo_systems, fix_systems, has_megalon, NO_MEGALON_NOTE  # noqa: E402
+import attempts  # noqa: E402  (v0.6.8: superseded stage attempts are not collected)
 SYSTEMS = ("hw", "pop", "mg")             # SLO phase (Fig 1): Megalon timers on (dec Q6); per workload slo_systems(W)
 FIXSYS = ("hw", "pop", "mg", "mgoff")     # fixed phase (Fig 2): + Megalon timers off for C_diff (dec 2026-10-17 "(a)")
 CURVE_PHASES = ("ramp", "bisect", "fill", "overload")
@@ -86,8 +89,13 @@ def plan_rows(path, w):
 
 def runs_of(wdir):
     runs = []
+    try:  # v0.6.8: a workload root may hold superseded attempts (r<n> stopped, r<n>-a<k> current): skip those
+        old = attempts.superseded(wdir)
+    except ValueError as e:
+        fail(f"attempt layout: {e}")
     for idx in sorted(glob.glob(os.path.join(wdir, "**", "h1-runs.tsv"), recursive=True)):
-        if any(part.startswith("collect") for part in os.path.relpath(idx, wdir).split(os.sep)[:-1]):
+        parts = os.path.relpath(idx, wdir).split(os.sep)[:-1]
+        if any(part.startswith("collect") for part in parts) or (parts and parts[0] in old):
             continue
         d = os.path.dirname(idx)
         for line in open(idx):

@@ -2,7 +2,7 @@
 # Host self-test of the staged H1 orchestration (no VM, no SSH, no sudo, no shared memory). Writes only below <out dir>.
 # Never run while a VM measurement holds workspaces/MEASUREMENT.lock (the coordinator says "Host free").
 # usage: selftest.sh <out dir under workspaces/h1-main/ (must not exist)> [<real SLO run dirs root for case E>]
-#        [<RECSYS-V1 v1.4 evidence dir for case M (read-only)>]
+#        [<RECSYS-V1 v1.4 evidence dir for case M (read-only)>] [<H1 r1-recsys SLO part dir for case N1 (read-only)>]
 #   A  stages through the stub hook: r1-kv; r1-lmdb refused before acceptance; h1-accept.sh; r1-lmdb, r1-vdb,
 #      r1-recsys (each accepted after its check PASS); r2 refused while an r1 is unaccepted (checked before the last
 #      accept); r2 --workloads kv,vdb,recsys; r3 --workloads lmdb refused (no r2); r3 --workloads kv; collect-all-r<n> after
@@ -20,7 +20,8 @@
 #   D  real plugin pins-vdb.sh with FILL_ tokens (not dry): HOOK STOP "unpinned" (skipped once fully pinned)
 #   E  levels.py + collect.py on the real KV-main H1 v2 SLO runs (read-only; mix u5 only): weakest pop
 #   F  h1-accept.sh refuses a check.txt with REPORT lines without --user-ack, accepts with it
-#   G  check.compare(): synthetic Fig 2 CSVs r1 / r2: hw +3 % inside the threshold, pop +12 % -> REPORT, C_diff inside
+#   G  check.compare(): synthetic Fig 2 CSVs r1 / r2: hw +3 % inside the threshold, pop +12 % -> REPORT, C_diff inside;
+#      v0.6.8: the same for recsys (no Megalon) -> the REPORT text says the threshold is uncalibrated
 #   H  stage-start integrity: a matching manifest passes; an altered hash, an unlisted experiments/h1 file or a wrong
 #      H1_MANIFEST_SHA stop the stage before the lock
 #   I  D1: H1_PLAN and gate threshold overrides refused without H1_DRY=1; D3: a real stage refuses pgid != pid and passes
@@ -32,6 +33,16 @@
 #      no recsys r1 at all, r2 --workloads vdb,lmdb runs (order lmdb, vdb); r2 (all four) and r2 --workloads
 #      lmdb,recsys refused; an unaccepted chosen r1 (lmdb ran, not yet accepted) refused; r3 --workloads lmdb,vdb
 #      refused with vdb r2 unaccepted, r3 --workloads kv refused (no r2), r3 --workloads lmdb runs
+#   N  v0.6.8: (1) v1_check.py updater judgment on a copy of the stopped r1-recsys hw-peak SLO part (4th argument;
+#      read-only): real data PASS (steps 7/10 completed = sent); low sent + full completions PASS; completions 96 % of
+#      sent on a checked step FAIL, on an overload step NOTE; < 100 sent FAIL; (2) main-block.sh: --tol $H1_SLO_TOL
+#      (0.02) only in h1_slo, not in h1_fix / h1_warmup, no --tol in the kv/lmdb/vectordb scripts; (3) r1 retry
+#      (h1-main.sh --retry, attempts.py): stopped r1-recsys (levels row avg written) -> plain rerun, retry without
+#      reason, retry for r2, retry of an accepted stage, retry while the stage's last state line is not a STOP: refused;
+#      attempt 2 stops, attempt 3 passes (attempt.txt chain, stopped r1 unchanged, own levels.tsv, F8 on it, -a3
+#      manifest files, accept record attempt=recsys/r1-a3, collect-all-r1 only r1-a3 runs); retry after acceptance
+#      refused; r2 recsys uses r1-a3 levels; retry refused for a check-PASS attempt and after a skip; a broken layout
+#      is refused by attempts.py and h1-accept.sh
 #   K  check.py W7 (knee bracket at the probe limit or rel_width > 5 %, weakest named; legacy runs without the field: no W7);
 #      W4 names both rounds' confirm searches when one did not pass its first confirm (v0.6.5), legacy runs: no note
 # Prints "SELFTEST PASS" or "SELFTEST FAIL <case>".
@@ -158,6 +169,19 @@ rep = [l for l in check.lines if l.startswith("REPORT")]
 assert len(rep) == 1 and " pop " in rep[0], check.lines
 assert any(l.startswith("OK") and " hw " in l for l in check.lines), check.lines
 assert any(l.startswith("OK") and "C_diff" in l for l in check.lines), check.lines
+check.lines.clear()
+# v0.6.8 (verifier LOW on v0.6.7): for a workload without Megalon (recsys) the C1 REPORT says the threshold is uncalibrated
+def figr(n, hw, pop):
+    d = os.path.join(o, "recsys", f"r{n}", "collect", "fig"); os.makedirs(d)
+    open(os.path.join(d, "recsys-avg-fig2.csv"), "w").write("# megalon_c: none\n" + hdr +
+        f"L1,query,All HWcc,{hw},0,,\nL1,query,Popcorn,{pop},1,,\n")
+figr(1, 1000, 2000)
+figr(2, 1030, 2240)
+check.compare("recsys", 2, o, ["avg"], False)
+rep = [l for l in check.lines if l.startswith("REPORT")]
+assert len(rep) == 1 and " pop " in rep[0] and rep[0].endswith("threshold uncalibrated for this workload: no Megalon "
+       "run-to-run spread term (v0.6.7 R3, fixed 5 % in r2)"), check.lines
+assert not any("uncalibrated" in l for l in check.lines if " kv " in l or "u5" in l), check.lines
 print("G OK")
 PYEOF
 # H stage-start code integrity (verifier MED-3): matching manifest passes; a changed hash or an unlisted file stops
@@ -304,4 +328,120 @@ cat "$F/recsys-avg-fig2.csv" | grep -q "Megalon (timers off)" || fail "M2 edit"
 python3 -B $H/check.py --plan $H/h1-plan.tsv --workload recsys --round 1 "$O/M2" > "$O/M2-check2.out" 2>&1
 grep -q "^FAIL F5 avg Fig 2 C/T: .*Megalon row 'Megalon (timers off)' for recsys" "$C" || fail "M2 Megalon row not refused ($(grep F5 "$C"))"
 echo "M OK"
+# N v0.6.8 (user 2026-10-18 "응 그렇게 진행해")
+# N1 v1_check.py updater judgment on a copy of the stopped r1-recsys hw-peak SLO part (read-only source): the real data
+#    (steps 7 / 10 sent 2760 / 2759, all completed; old rule FAIL vs nominal 188.761/s) -> PASS; a checked step with
+#    low sent and full completions (achieved/offered 0.95) -> PASS; a checked step with completions 96 % of sent -> FAIL
+#    "updater behind"; the same lag on a non-checked (overload) step -> NOTE only
+RS=${4:-/home/comsys/sungsu/destijl-control/recovery/H1-main-v1/recsys/r1/run/hw-peak-slo-r1/slo}
+VC=$H/../recsys/v1_check.py
+mkdir -p "$O/N1/real/loadgen" && cp -r "$RS/loadgen/stats" "$RS/loadgen/steps.jsonl" "$RS/loadgen/summary.json" "$O/N1/real/loadgen/" \
+  && cp "$RS/manifest.txt" "$RS/breakdown.csv" "$O/N1/real/" || fail "N1 copy"
+python3 -I -B $VC "$O/N1/real" hw --h1 > "$O/N1/real.out" 2>&1 || fail "N1 real data not PASS ($(cut -c1-300 "$O/N1/real.out"))"
+grep -q "^V1CHECK PASS hw .*update_achieved_offered.step7=183.96/188.76 update_completed_sent.step7=2759/2760" "$O/N1/real.out" \
+  || fail "N1 real values ($(cut -c1-300 "$O/N1/real.out"))"
+nv() {  # <case> <python edit of the steps list d (list of dicts)>: copy of real with steps.jsonl edited
+  cp -r "$O/N1/real" "$O/N1/$1" && python3 -I -B -c '
+import json, sys
+p = sys.argv[1] + "/loadgen/steps.jsonl"
+d = [json.loads(l) for l in open(p) if l.strip()]
+exec(sys.argv[2])
+open(p, "w").write("".join(json.dumps(x) + "\n" for x in d))' "$O/N1/$1" "$2" || fail "N1 edit $1"
+  python3 -I -B $VC "$O/N1/$1" hw --h1 > "$O/N1/$1.out" 2>&1; echo $? >> "$O/N1/$1.out"
+}
+nv lowsent 'u = d[5]["streams"]["update"]; u["sent"] = u["done"] = 2690; u["achieved"] = 2690 / 15'
+grep -q "^V1CHECK PASS" "$O/N1/lowsent.out" && grep -q "update_achieved_offered.step5=179.33/188.76 update_completed_sent.step5=2690/2690" "$O/N1/lowsent.out" \
+  || fail "N1 low sent, full completions ($(cut -c1-300 "$O/N1/lowsent.out"))"
+nv lag 'u = d[5]["streams"]["update"]; u["achieved"] = 0.96 * u["sent"] / 15'
+grep -q "^V1CHECK FAIL hw step 5 (ramp): updater behind (update completions 2684 < 0.98 x sent 2796" "$O/N1/lag.out" && tail -n 1 "$O/N1/lag.out" | grep -qx 1 \
+  || fail "N1 real lag not FAIL ($(cut -c1-300 "$O/N1/lag.out"))"
+nv lagnc 'u = d[25]["streams"]["update"]; u["achieved"] = 0.96 * u["sent"] / 15'
+grep -q "^V1CHECK PASS .*NOTES: .*step 25 (overload): updater behind .*\[not a checked step\]" "$O/N1/lagnc.out" \
+  || fail "N1 lag on a non-checked step ($(cut -c1-300 "$O/N1/lagnc.out"))"
+nv fewsent 'u = d[5]["streams"]["update"]; u["sent"] = u["done"] = 90; u["achieved"] = 6'
+grep -q "^V1CHECK FAIL hw step 5 (ramp): updater not judgeable" "$O/N1/fewsent.out" || fail "N1 < 100 sent ($(cut -c1-300 "$O/N1/fewsent.out"))"
+# N2 recsys BLOCK=h1 loadgen args: the SLO search passes --tol 0.02 (H1_SLO_TOL), the fixed part and warm-up do not
+MB=$H/../recsys/main-block.sh
+fn() { sed -n "/^$1() {/,/^}/p" "$MB"; }
+grep -qx "H1_SLO_TOL=0.02" "$MB" && fn h1_slo | grep -qF -- '--tol $H1_SLO_TOL' && ! fn h1_fix | grep -qF -- "--tol" \
+  && ! fn h1_warmup | grep -qF -- "--tol" && [ "$(grep -v '^ *#' "$MB" | grep -cF -- '--tol')" = 1 ] || fail "N2 recsys h1 loadgen --tol"
+for f in $H/../kv/*.sh $H/../lmdb/*.sh $H/../vectordb/*.sh; do [ -f "$f" ] || continue; grep -v '^ *#' "$f" | grep -qF -- "--tol" && fail "N2 --tol in $f"; done
+# N3 r1 retry (attempts.py): r1-recsys stops after its avg mix (levels.tsv row avg written, peak hw/pop SLO entries)
+mkdir "$O/N"
+na() { bash $H/h1-accept.sh "$O/N" "$1" "$2" selftest >> "$O/N.out" 2>&1; }
+for w in kv lmdb vdb; do stage N r1-$w || fail "N r1-$w"; na 1 $w || fail "N accept $w"; done
+STUB_FAIL=note:hw:peak stage N r1-recsys && fail "N r1-recsys rc 0"
+grep -q "\[r1-recsys\] SEQUENCE STOP" "$O/N/h1-state.txt" && grep -q "^avg	" "$O/N/recsys/levels.tsv" || fail "N stop setup"
+L1SHA=$(cd "$O/N/recsys/r1" && find . -type f -printf '%P %s\n' | LC_ALL=C sort | sha256sum | cut -c1-64)
+na 1 recsys && fail "N accepted a stopped stage"
+stage N r1-recsys && fail "N r1-recsys rerun without --retry"
+grep -q "recsys/r1 exists (stage dirs are immutable; a stopped r1 stage is re-run with --retry)" "$O/N/h1-state.txt" || fail "N rerun reason"
+stage N r1-recsys --retry && fail "N --retry without reason"
+stage N r2 --retry "x" && fail "N --retry for r2"
+grep -q "SEQUENCE STOP: --retry is for r1-<W> stages only" "$O/N.out" || fail "N r2 retry reason"
+stage N r1-kv --retry "x" && fail "N --retry of an accepted stage"
+grep -q "SEQUENCE STOP: --retry refused for r1-kv: r1 kv is accepted" "$O/N.out" || fail "N accepted retry reason"
+# a stage that is still running (its last state line is not a STOP) is refused: copy with a later progress line
+cp -r "$O/N" "$O/N-run" && echo "$(date -Is) [r1-recsys] gate recsys-r1-start: PASS" >> "$O/N-run/h1-state.txt"
+stage N-run r1-recsys --retry "x" && fail "N retry of a running stage"
+grep -q "refused for r1-recsys: the last r1-recsys line in h1-state.txt is not a SEQUENCE STOP" "$O/N-run.out" || fail "N running reason"
+# attempt 2 stops at once (block rc), attempt 3 completes
+STUB_FAIL=rc stage N r1-recsys --retry "selftest: attempt 2 injected rc" && fail "N attempt 2 rc 0"
+[ -f "$O/N/recsys/r1-a2/attempt.txt" ] && [ ! -e "$O/N/recsys/r1-a2/levels.tsv" ] || fail "N attempt 2 layout"
+stage N r1-recsys --retry "selftest: after injected STOPs" || fail "N attempt 3 (see $O/N.out)"
+A3=$O/N/recsys/r1-a3
+grep -qx "attempt=3" "$A3/attempt.txt" && grep -qx "predecessor=r1-a2" "$A3/attempt.txt" && grep -qx "round=1" "$A3/attempt.txt" \
+  && grep -qx "reason=selftest: after injected STOPs" "$A3/attempt.txt" && grep -q "^predecessor_state_last=.*\[r1-recsys\] SEQUENCE STOP" "$A3/attempt.txt" \
+  && grep -qx "predecessor=r1" "$O/N/recsys/r1-a2/attempt.txt" || fail "N attempt.txt ($(cat "$A3/attempt.txt"))"
+[ "$(cd "$O/N/recsys/r1" && find . -type f -printf '%P %s\n' | LC_ALL=C sort | sha256sum | cut -c1-64)" = "$L1SHA" ] || fail "N stopped attempt changed"
+grep -q "RETRY attempt=3 dir=recsys/r1-a3 predecessor=recsys/r1-a2 reason=selftest: after injected STOPs" "$O/N/h1-state.txt" \
+  && grep -q "^retry: attempt=3 " "$O/N/h1-manifest.txt" && [ -f "$O/N/manifest-recsys-r1-a3.txt" ] && [ -f "$O/N/manifest-end-r1-recsys-a3.txt" ] \
+  && grep -q "STAGE DONE r1-recsys: main session reviews $A3/check.txt" "$O/N/h1-state.txt" || fail "N retry logs"
+[ "$(python3 -I -B $H/attempts.py dir "$O/N" recsys 1)" = "$A3" ] && [ "$(python3 -I -B $H/attempts.py levels "$O/N" recsys)" = "$A3/levels.tsv" ] \
+  && [ "$(python3 -I -B $H/attempts.py dir "$O/N" kv 1)" = "$O/N/kv/r1" ] && [ "$(python3 -I -B $H/attempts.py levels "$O/N" kv)" = "$O/N/kv/levels.tsv" ] \
+  || fail "N attempts.py resolution"
+tail -n 1 "$A3/check.txt" | grep -q "^H1CHECK PASS recsys r1" && grep -q "^avg	" "$A3/levels.tsv" && grep -q "^peak	" "$A3/levels.tsv" \
+  && [ "$(grep -c . "$O/N/recsys/levels.tsv")" = 2 ] || fail "N attempt 3 check / levels"
+grep -q "^OK   F8 peak levels weakest" "$A3/check.txt" || fail "N F8 reads the attempt's levels.tsv"
+na 1 recsys || fail "N accept attempt 3"
+grep -qx "attempt=recsys/r1-a3" "$O/N/accept/r1-recsys.txt" && grep -q "check_sha256=$(sha256sum < "$A3/check.txt" | cut -c1-64)" "$O/N/accept/r1-recsys.txt" \
+  || fail "N accept record"
+stage N r1-recsys --retry "x" && fail "N retry after acceptance"
+grep -q "refused for r1-recsys: r1 recsys is accepted" "$O/N.out" || fail "N retry-after-accept reason"
+# collect-all-r1 of recsys: runs of the current attempt only (the stopped r1 has 6 entries, r1-a2 none)
+python3 -I -B - "$O/N" <<'PY' || fail "N collect-all"
+import csv, sys
+o = sys.argv[1]
+ri = list(csv.DictReader(open(f"{o}/recsys/collect-all-r1/runs-index.csv")))
+assert len(ri) == 8 and all("/r1-a3/" in r["run_dir"] for r in ri), [r["run_dir"] for r in ri]
+old = [l for l in open(f"{o}/recsys/r1/run/h1-runs.tsv") if not l.startswith("#")]
+assert len(old) == 6, old
+PY
+# r2 of recsys after the retry: levels from r1-a3, W4 against r1-a3
+stage N r2 --workloads recsys || fail "N r2 recsys after retry (see $O/N.out)"
+python3 -I -B - "$O/N" <<'PY' || fail "N r2 levels"
+import csv, sys
+o = sys.argv[1]
+lv = {r["mix"]: r for r in csv.DictReader(open(f"{o}/recsys/r1-a3/levels.tsv"), delimiter="\t")}
+fx = list(csv.DictReader(open(f"{o}/recsys/r2/collect/fix-steps.csv")))
+assert len(fx) == 8 and all(float(r["offered_x"]) == float(lv[r["mix"]][r["level"] + "_rate"]) for r in fx), fx[:1]
+ck = open(f"{o}/recsys/r2/check.txt").read()
+assert "OK   W4 avg hw x vs r1" in ck and ck.strip().splitlines()[-1].startswith("H1CHECK PASS"), ck[-400:]
+PY
+na 2 recsys || fail "N accept r2 recsys"
+grep -qx "attempt=recsys/r2" "$O/N/accept/r2-recsys.txt" || fail "N r2 accept record"
+# a retry is refused after a skip record and for a check-PASS (unaccepted) attempt
+mkdir "$O/N2"; stage N2 r1-kv || fail "N2 r1-kv"
+stage N2 r1-kv --retry "x" && fail "N2 retry of a PASS attempt"
+grep -q "refused for r1-kv: .*check.txt is PASS" "$O/N2.out" || fail "N2 PASS reason"
+mkdir "$O/N3"; stage N3 r1-kv || fail "N3 r1-kv"; bash $H/h1-accept.sh "$O/N3" 1 kv selftest >> "$O/N3.out" 2>&1 || fail "N3 accept"
+STUB_FAIL=rc stage N3 r1-lmdb && fail "N3 lmdb rc 0"
+bash $H/h1-accept.sh "$O/N3" 1 lmdb --skip "selftest" >> "$O/N3.out" 2>&1 || fail "N3 skip"
+stage N3 r1-lmdb --retry "x" && fail "N3 retry of a skipped stage"
+grep -q "refused for r1-lmdb: r1 lmdb was skipped" "$O/N3.out" || fail "N3 skip reason"
+# a broken attempt layout (attempt dir without attempt.txt) is refused by the resolver and by h1-accept.sh
+mkdir -p "$O/N4/recsys/r1/run" "$O/N4/recsys/r1-a2"
+python3 -I -B $H/attempts.py dir "$O/N4" recsys 1 > /dev/null 2>&1; [ $? = 2 ] || fail "N4 resolver accepted a bad layout"
+bash $H/h1-accept.sh "$O/N4" 1 recsys x > "$O/N4.out" 2>&1 && fail "N4 accept on a bad layout"
+echo "N OK"
 echo "SELFTEST PASS"

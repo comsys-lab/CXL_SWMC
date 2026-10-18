@@ -3,7 +3,8 @@
 2026-10-17: the main session reviews each round-1 result before the next workload; rounds 2/3 stop on a FAIL).
 
 Reads only Host-side results of <E>/<W>/r<n>/ (run/ = the block dir with h1-runs.tsv v2, collect/) and
-<E>/<W>/levels.tsv (+ the r1 (and r2) results for n > 1).
+<E>/<W>/levels.tsv (+ the r1 (and r2) results for n > 1). v0.6.8: r<n> is the current attempt of the round and
+levels.tsv the one of the current r1 attempt (attempts.py: <E>/<W>/r<n>-a<k> after `h1-main.sh --retry`).
 Writes <E>/<W>/r<n>/check.txt (one line per check, last line "H1CHECK PASS ..." or "H1CHECK FAIL ..."); exit 1 on FAIL.
 FAIL = integrity: the round cannot enter Fig 1 / Fig 2. WARN = plausibility: recorded, judged by the main session
 (h1-accept.sh copies the accepted WARN lines).
@@ -53,6 +54,12 @@ import argparse, csv, json, os, sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from h1sys import slo_systems, fix_systems, has_megalon, NO_MEGALON_NOTE  # noqa: E402
+import attempts  # noqa: E402  (v0.6.8: current attempt of a round, levels.tsv of the current r1 attempt)
+
+
+def rdir(E, W, n):
+    """round dir of W: the current attempt (attempts.py; <E>/<W>/r<n> when no retry exists)"""
+    return attempts.round_dir(E, W, n) or os.path.join(E, W, f"r{n}")
 
 SYSTEMS = ("hw", "pop", "mg")            # SLO phase (Fig 1, Megalon timers on); per workload: slo_systems(W)
 FIXSYS = ("hw", "pop", "mg", "mgoff")    # fixed phase (Fig 2; mgoff = Megalon timers off for C_diff); fix_systems(W)
@@ -145,7 +152,7 @@ def fnum(v):
 def fig2_t(E, W, n, m):
     """{(load, op, key): ns} from the round's official Fig 2 CSV: T_ns of hw / pop, T_mg_on_ns of mg (timers on),
     C_diff_ns; None if missing"""
-    f2 = fig2_rows(os.path.join(E, W, f"r{n}", "collect", "fig", f"{W}-{m}-fig2.csv"))
+    f2 = fig2_rows(os.path.join(rdir(E, W, n), "collect", "fig", f"{W}-{m}-fig2.csv"))
     if f2 is None:
         return None
     out = {}
@@ -202,7 +209,9 @@ def compare(W, n, E, mixes, skip):
                     sp = max(sp, abs(an - g(t2, k)) / g(t2, k))
                 d, thr = abs(an - a1) / a1, max(0.05, 2 * sp)
                 res("R", f"C1 {m} {load}/{op} {k} T r1-sep vs r{n}-cont", d <= thr,
-                    f"|dT|/T {d:.3f} > threshold {thr:.3f} (5 % or 2 x spread {sp:.3f}); T r1 {a1:g} r{n} {an:g} ns")
+                    f"|dT|/T {d:.3f} > threshold {thr:.3f} (5 % or 2 x spread {sp:.3f}); T r1 {a1:g} r{n} {an:g} ns"
+                    + ("" if has_megalon(W) else "; threshold uncalibrated for this workload: no Megalon run-to-run "
+                       "spread term (v0.6.7 R3, fixed 5 % in r2)"))
             if not has_megalon(W):
                 continue  # C2: no C_diff (no Megalon in H1 for this workload)
             c1, cn = g(t1, "cdiff"), g(tn, "cdiff")
@@ -239,7 +248,7 @@ def main():
     if not MG:
         lines.append(f"INFO systems {' '.join(SYSTEMS)}: {NO_MEGALON_NOTE.get(W, 'no Megalon for ' + W)}; F9/W5/W6/C2 "
                      "not applicable (C_diff absent by design)")
-    S = os.path.join(E, W, f"r{n}")
+    S = rdir(E, W, n)
     mixes = plan_mixes(a.plan, W)
     rs = {}
     allr = runs(os.path.join(S, "run"))  # H1-HOOK v2: one block dir per workload and round
@@ -395,8 +404,8 @@ def main():
     except OSError:
         bad = ["notes.txt missing"]
     res("F", "F7 collect notes", not bad, "; ".join(l.strip() for l in bad[:3]))
-    lv = {x["mix"]: x for x in (csv.DictReader(open(os.path.join(E, W, "levels.tsv")), delimiter="\t")
-                                if os.path.isfile(os.path.join(E, W, "levels.tsv")) else [])}
+    lvp = attempts.levels_path(E, W)
+    lv = {x["mix"]: x for x in (csv.DictReader(open(lvp), delimiter="\t") if os.path.isfile(lvp) else [])}
     for m in mixes:
         if not all((m, s) in xs for s in SYSTEMS):
             continue
@@ -408,7 +417,7 @@ def main():
             res("W", f"W4 {m} weakest vs r1 levels", lv.get(m, {}).get("weakest") == weakest,
                 f"levels.tsv {lv.get(m, {}).get('weakest')} vs round {n} {weakest}")
             for s in SYSTEMS:
-                r1 = next((x["dir"] for x in (runs(os.path.join(E, W, "r1", "run")) or [])
+                r1 = next((x["dir"] for x in (runs(os.path.join(rdir(E, W, 1), "run")) or [])
                            if x["mix"] == m and x["sys"] == s and x["phase"] == "slo"), "")
                 x1 = confirm_x(r1) if r1 else None
                 rn = next((x["dir"] for x in rs["slo"] if x["mix"] == m and x["sys"] == s), "")

@@ -7,6 +7,8 @@
 # only (experiments/h1/h1sys.py -> H1_SYSTEMS="hw pop"); the Megalon settings below stay pinned but no mg / mgoff
 # lifetime runs; the Megalon RecSys numbers come from RECSYS-V1 v1.4.
 # Mixes = EKKO avg / peak. Re-pinned 2026-10-18 (branch recsys-v14) for the table-object builds.
+# Re-pinned 2026-10-18 (H1 v0.6.8, branch h1-v068): main-block.sh (h1_slo loadgen --tol 0.02) and v1_check.py (updater
+# keep-up judged against updates sent, not the nominal offered rate); builds and inputs unchanged.
 # Plain = builds/recsys/12 (same source 77ba0fa69 as recsys-megalon/14; server.cc is shared, so the older plain build
 # is not used), guest dirs /home/comsys/rs12 and /home/comsys/rsm14 (installed by RECSYS-V1 v1.4). --mg-rows-per-object
 # has no default and is required with --backend megalon (main-block.sh passes MG_RPO_OPT MG_TABLE_N to mg and mgoff).
@@ -34,9 +36,9 @@ PIN_SHA256="$COMMON_SHA256
 f9c1753f3bef2ab0941153058860227145f2d7b7e33a210bdc3338fad14eacda  $P/builds/recsys-megalon/14/lib/libmegalon.so
 de2e9a4cd7ee41df5d9a938836802b0ee5186ba69b42252e3ab747f0bfeae193  $P/builds/recsys-loadgen/9/manifest.txt
 61bb70687ef15823a33a56c282d53eecdbcc1c1e574589eeba7791b4a65d81c0  $P/builds/recsys-loadgen/9/loadgen
-57c07bf94615d8c84634e60e62241623230b10e51c6ecc92cece0eadee65d800  $HOOK_FILE
+f68bc5e6ede82eb6df79efc8848e5a2e0c740ad86ee13a28b392ba46d7779e66  $HOOK_FILE
 68c5b9ceaf986e9e05e941d586a9a5cb5bb162b1963181ce02efa5d34cce5b54  $HR/experiments/recsys/session.sh
-22b5d043c733b2c477436154054bef975272426a71d6607e66abeb97bdc8951f  $HR/experiments/recsys/v1_check.py
+98e3d2b41b2e1de3a104f258a825865132dac6a25ed0dda079f3cb19c3090708  $HR/experiments/recsys/v1_check.py
 32d171199d6a47d15fcfa6971522e253fe21d857e91c9049c201e55a0cdac230  $HR/experiments/recsys/check_breakdown.py
 e6b2455d64266df3f2a62f9bc5359b91ddd80588c109a6cae3efde66abceb74c  $HR/experiments/recsys/breakdown.py
 f6742a6e473ec417f394cf2acf541f4fd1209d7ac523bbfb253e81c7b5f6f439  $HR/experiments/recsys/precheck.sh

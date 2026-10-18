@@ -14,25 +14,31 @@
 # references); never the acceptance record. Refused if r1-<W>.txt (accepted) or a skip record already exists.
 # h1-main.sh lets the NEXT r1 stage start on it; r2/r3 refuse a skipped workload (r1 accepted for each chosen workload;
 # a skipped workload's r1 is re-run in a new evidence root).
+# v0.6.8: <E>/<W>/r<n> means the CURRENT attempt of the round (attempts.py; <E>/<W>/r<n>-a<k> after
+# `h1-main.sh --retry`); the record names the attempt dir (attempt=...). The record path stays <E>/accept/r<n>-<W>.txt.
 set -uo pipefail
 E=${1:?} N=${2:?} W=${3:?} REMARK=${4:-} ACK=
+H=$(cd "$(dirname "$0")" && pwd)
+RD=$(python3 -I -B $H/attempts.py dir "$E" "$W" "$N" 2>&1); ARC=$?
+[ $ARC != 2 ] || { echo "REFUSED: $RD"; exit 1; }
+[ $ARC = 0 ] || RD=$E/$W/r$N
 if [ "$REMARK" = --skip ]; then
   R=${5:?--skip needs a reason}
   [ "$N" = 1 ] || { echo "SKIP REFUSED: --skip is for round 1 only (r2/r3 need r1 accepted for each chosen workload)"; exit 1; }
-  A=$E/accept/r1-$W.txt S=$E/accept/r1-$W-skip.txt C=$E/$W/r1/check.txt
+  A=$E/accept/r1-$W.txt S=$E/accept/r1-$W-skip.txt C=$RD/check.txt
   [ ! -e "$A" ] || { echo "SKIP REFUSED: $A exists (r1 $W is accepted)"; exit 1; }
   [ ! -e "$S" ] || { echo "SKIP REFUSED: $S exists"; exit 1; }
-  [ -d "$E/$W/r1" ] || { echo "SKIP REFUSED: $E/$W/r1 missing (stage never started)"; exit 1; }
+  [ -d "$RD" ] || { echo "SKIP REFUSED: $RD missing (stage never started)"; exit 1; }
   mkdir -p "$E/accept"
   { echo "SKIP r1 $W $(date -Is) by main session (not accepted)"; echo "reason=$R"
-    echo "check_sha256=$([ -f "$C" ] && sha256sum < "$C" | cut -c1-64 || echo none)"
+    echo "attempt=${RD#$E/}"; echo "check_sha256=$([ -f "$C" ] && sha256sum < "$C" | cut -c1-64 || echo none)"
     echo "check_last=$([ -f "$C" ] && tail -n 1 "$C" || echo none)"
     echo "stage_log=$E/sequence-r1-$W.log state_log=$E/h1-state.txt"
     grep "\[r1-$W\]" "$E/h1-state.txt" 2>/dev/null | tail -n 3 | sed 's/^/state_tail: /'; } > "$S"
   echo "SKIPPED r1 $W -> $S"; exit 0
 fi
 [ "${5:-}" = --user-ack ] && ACK=${6:?--user-ack needs a reference}
-C=$E/$W/r$N/check.txt A=$E/accept/r$N-$W.txt
+C=$RD/check.txt A=$E/accept/r$N-$W.txt
 [ -f "$C" ] && tail -n 1 "$C" | grep -q "^H1CHECK PASS" || { echo "ACCEPT REFUSED: $C missing or not PASS"; exit 1; }
 [ ! -e "$A" ] || { echo "ACCEPT REFUSED: $A exists"; exit 1; }
 [ ! -e "$E/accept/r$N-$W-skip.txt" ] || { echo "ACCEPT REFUSED: r$N $W was skipped ($E/accept/r$N-$W-skip.txt)"; exit 1; }
@@ -41,6 +47,6 @@ if grep -q "^REPORT" "$C" && [ -z "$ACK" ]; then
 fi
 mkdir -p "$E/accept"
 { echo "ACCEPT r$N $W $(date -Is) by main session check_sha256=$(sha256sum < "$C" | cut -c1-64)"
-  echo "remark=$REMARK"; [ -z "$ACK" ] || echo "user_ack=$ACK"
+  echo "remark=$REMARK"; echo "attempt=${RD#$E/}"; [ -z "$ACK" ] || echo "user_ack=$ACK"
   grep "^WARN\|^REPORT" "$C" | sed 's/^/accepted: /'; } > "$A"
 echo "ACCEPTED r$N $W -> $A"
