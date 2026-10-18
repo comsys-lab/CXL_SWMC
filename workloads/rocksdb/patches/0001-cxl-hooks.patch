@@ -1,0 +1,460 @@
+
+--- a/db/column_family.cc
++++ b/db/column_family.cc
+@@ -9,6 +9,8 @@
+ 
+ #include "db/column_family.h"
+ 
++#include "rocksdb/cxl.h"
++
+ #include <algorithm>
+ #include <cinttypes>
+ #include <cmath>
+@@ -1446,6 +1448,20 @@
+                              : nullptr);
+   SuperVersion* old_superversion = super_version_;
+   super_version_ = new_superversion;
++  // CXL: publish the CXL primary's memtables (default column family) after
++  // every SuperVersion install; the hook runs with the DB mutex held.
++  if (id_ == 0 && cxl::IsPrimary(ioptions_.db_host_id) &&
++      cxl::GetHooks().on_superversion) {
++    std::vector<cxl::MemtableInfo> mts;
++    int height = 0;
++    const void* head = mem_->CxlHead(&height);
++    mts.push_back({mem_->GetID(), head, height});
++    for (ReadOnlyMemTable* m : imm_.current()->CxlMemlist()) {
++      head = m->CxlHead(&height);
++      mts.push_back({m->GetID(), head, height});
++    }
++    cxl::GetHooks().on_superversion(mts);
++  }
+   if (old_superversion == nullptr || old_superversion->current != current() ||
+       old_superversion->mem != mem_ ||
+       old_superversion->imm != imm_.current()) {
+
+--- a/db/memtable.cc
++++ b/db/memtable.cc
+@@ -200,7 +200,10 @@
+                write_buffer_manager->cost_to_cache()))
+                  ? &mem_tracker_
+                  : nullptr,
+-             mutable_cf_options.memtable_huge_page_size),
++             mutable_cf_options.memtable_huge_page_size,
++             // CXL: memtables of the CXL primary live in shared memory
++             cxl::IsPrimary(ioptions.db_host_id) ? cxl::GetHooks().blocks
++                                                 : nullptr),
+       table_(ioptions.memtable_factory->CreateMemTableRep(
+           comparator_, &arena_, mutable_cf_options.prefix_extractor.get(),
+           ioptions.logger, column_family_id)),
+@@ -269,6 +272,7 @@
+ }
+ 
+ MemTable::~MemTable() {
++  arena_.SetCxlOwner(GetID());  // CXL: the block source learns the memtable id
+   mem_tracker_.FreeMem();
+   assert(refs_ == 0);
+ }
+
+--- a/db/memtable.h
++++ b/db/memtable.h
+@@ -123,6 +123,13 @@
+   // operations on the same MemTable (unless this Memtable is immutable).
+   virtual size_t ApproximateMemoryUsage() = 0;
+ 
++  // CXL: skiplist head node and max height of the point table (nullptr if
++  // the representation is not a skiplist).
++  virtual const void* CxlHead(int* max_height) const {
++    *max_height = 0;
++    return nullptr;
++  }
++
+   // used by MemTableListVersion::MemoryAllocatedBytesExcludingLast
+   virtual size_t MemoryAllocatedBytes() const = 0;
+ 
+@@ -608,6 +615,10 @@
+ 
+   size_t ApproximateMemoryUsage() override;
+ 
++  const void* CxlHead(int* max_height) const override {
++    return table_->CxlHead(max_height);
++  }
++
+   // As a cheap version of `ApproximateMemoryUsage()`, this function doesn't
+   // require external synchronization. The value may be less accurate though
+   size_t ApproximateMemoryUsageFast() const {
+
+--- a/db/memtable_list.h
++++ b/db/memtable_list.h
+@@ -174,6 +174,9 @@
+ 
+   int NumNotFlushed() const { return static_cast<int>(memlist_.size()); }
+ 
++  // CXL: unflushed immutable memtables, newest first.
++  const std::list<ReadOnlyMemTable*>& CxlMemlist() const { return memlist_; }
++
+   int NumFlushed() const { return static_cast<int>(memlist_history_.size()); }
+ 
+   // Gets the newest user defined timestamps from the immutable memtables.
+
+--- a/include/rocksdb/cxl.h
++++ b/include/rocksdb/cxl.h
+@@ -0,0 +1,149 @@
++// CXL: hooks for the CXL_SWMC rocksdb workload (workloads/rocksdb/DESIGN.md). Not part of upstream RocksDB.
++// Header-only so the patch adds no build-system entries.
++//
++// One primary DB per process uses these hooks; it is recognised by DBOptions::db_host_id == Hooks::primary_host_id
++// (secondary instances opened in the same process for remote views keep another db_host_id and are unaffected).
++//  - blocks: memtable arenas of the primary take their blocks from this source (shared memory), the arena's 2 KiB
++//    inline block is not used, and the destructor returns the blocks with the memtable id instead of freeing them.
++//  - on_superversion: called with the DB mutex held after every SuperVersion install of the primary's default
++//    column family, with its memtables (mutable first, then immutables newest first).
++//  - RemoteMemtableGet: read-only lookup in a memtable skiplist given its head node (any process mapping the same
++//    memory at the same address); InlineSkipList node layout and memtable entry format of this RocksDB version.
++#pragma once
++
++#include <atomic>
++#include <cstddef>
++#include <cstdint>
++#include <cstring>
++#include <functional>
++#include <string>
++#include <vector>
++
++#include "rocksdb/rocksdb_namespace.h"
++
++namespace ROCKSDB_NAMESPACE {
++namespace cxl {
++
++class BlockSource {
++ public:
++  virtual ~BlockSource() = default;
++  // A block of `bytes` (<= the source's block size) or nullptr when exhausted (RocksDB then aborts the write).
++  virtual char* Get(size_t bytes) = 0;
++  // All blocks of one arena at its destruction; owner = the memtable id (0 if never set).
++  virtual void Put(const std::vector<char*>& blocks, uint64_t owner) = 0;
++};
++
++struct MemtableInfo {
++  uint64_t id;       // MemTable::GetID()
++  const void* head;  // skiplist head node (nullptr: not a skiplist memtable)
++  int max_height;    // skiplist max height (levels of the head node)
++};
++
++struct Hooks {
++  std::string primary_host_id;  // empty = hooks off
++  BlockSource* blocks = nullptr;
++  std::function<void(const std::vector<MemtableInfo>&)> on_superversion;
++};
++
++inline Hooks& GetHooks() {
++  static Hooks h;
++  return h;
++}
++inline bool IsPrimary(const std::string& db_host_id) {
++  const Hooks& h = GetHooks();
++  return !h.primary_host_id.empty() && db_host_id == h.primary_host_id;
++}
++
++// ---- remote lookup ----
++enum class RemoteResult { kNotFound, kFound, kDeleted, kUnsupported };
++
++// Read access to skiplist memory. Plain: direct loads (acquire for links). A coherence backend may supply its own
++// (e.g. copies inside read sections); `next` must return the level-n link of node x, `read` copies n bytes at p.
++struct DirectAccess {
++  const void* next(const void* x, int n) const {
++    const auto* links = static_cast<const std::atomic<const void*>*>(x);
++    return (links - n)->load(std::memory_order_acquire);
++  }
++  void read(const void* p, void* out, size_t n) const { std::memcpy(out, p, n); }
++};
++
++namespace detail {
++// varint32 decode from a bounded buffer; returns bytes used, 0 on error
++inline size_t varint32(const unsigned char* p, size_t avail, uint32_t* v) {
++  uint32_t r = 0;
++  for (size_t i = 0; i < 5 && i < avail; i++) {
++    r |= uint32_t(p[i] & 0x7f) << (7 * i);
++    if (!(p[i] & 0x80)) {
++      *v = r;
++      return i + 1;
++    }
++  }
++  return 0;
++}
++// user key of the entry at node x (entry = varint32 ikey_len, ikey = user key + 8 B trailer, varint32 vlen, value).
++// The entry starts right after next_[0] (InlineSkipList: Key() = &next_[1]). `buf` receives at least the internal key.
++template <class A>
++inline bool entry_ikey(const A& a, const void* x, std::string* buf, size_t* hdr) {
++  const char* key = static_cast<const char*>(x) + sizeof(void*);
++  unsigned char lenb[5];
++  a.read(key, lenb, 5);
++  uint32_t klen;
++  size_t h = varint32(lenb, 5, &klen);
++  if (!h || klen < 8) return false;
++  buf->resize(klen);
++  a.read(key + h, &(*buf)[0], klen);
++  *hdr = h;
++  return true;
++}
++}  // namespace detail
++
++// Newest entry of user_key in the skiplist at head (internal key order: user key bytewise ascending, then sequence
++// descending). value receives the value of a kTypeValue entry; *seq the entry's sequence number.
++template <class A = DirectAccess>
++inline RemoteResult RemoteMemtableGet(const void* head, int max_height, const std::string& user_key,
++                                      std::string* value, uint64_t* seq, const A& a = A()) {
++  const void* x = head;
++  std::string ik;
++  size_t hdr = 0;
++  const void* found = nullptr;
++  for (int level = max_height - 1; level >= 0;) {
++    const void* nx = a.next(x, level);
++    if (nx != nullptr) {
++      if (!detail::entry_ikey(a, nx, &ik, &hdr)) return RemoteResult::kUnsupported;
++      size_t ulen = ik.size() - 8;
++      int c = std::memcmp(ik.data(), user_key.data(), std::min(ulen, user_key.size()));
++      bool less = c < 0 || (c == 0 && ulen < user_key.size());
++      if (less) {
++        x = nx;
++        continue;
++      }
++    }
++    if (level == 0) {
++      found = nx;
++      break;
++    }
++    level--;
++  }
++  if (found == nullptr) return RemoteResult::kNotFound;
++  // `ik` holds the internal key of `found` (the last node examined at level 0)
++  size_t ulen = ik.size() - 8;
++  if (ulen != user_key.size() || std::memcmp(ik.data(), user_key.data(), ulen) != 0) return RemoteResult::kNotFound;
++  uint64_t trailer;
++  std::memcpy(&trailer, ik.data() + ulen, 8);
++  *seq = trailer >> 8;
++  unsigned type = unsigned(trailer & 0xff);
++  if (type == 0x0 || type == 0x7) return RemoteResult::kDeleted;  // kTypeDeletion, kTypeSingleDeletion
++  if (type != 0x1) return RemoteResult::kUnsupported;             // only kTypeValue entries are written here
++  const char* vp = static_cast<const char*>(found) + sizeof(void*) + hdr + ik.size();
++  unsigned char lenb[5];
++  a.read(vp, lenb, 5);
++  uint32_t vlen;
++  size_t vh = detail::varint32(lenb, 5, &vlen);
++  if (!vh) return RemoteResult::kUnsupported;
++  value->resize(vlen);
++  if (vlen) a.read(vp + vh, &(*value)[0], vlen);
++  return RemoteResult::kFound;
++}
++
++}  // namespace cxl
++}  // namespace ROCKSDB_NAMESPACE
+
+--- a/include/rocksdb/memtablerep.h
++++ b/include/rocksdb/memtablerep.h
+@@ -251,6 +251,12 @@
+   // that was allocated through the allocator.  Safe to call from any thread.
+   virtual size_t ApproximateMemoryUsage() = 0;
+ 
++  // CXL: skiplist head node and max height (nullptr for other representations).
++  virtual const void* CxlHead(int* max_height) const {
++    *max_height = 0;
++    return nullptr;
++  }
++
+   virtual ~MemTableRep() {}
+ 
+   // Iteration over the contents of a skip collection
+
+--- a/memory/arena.cc
++++ b/memory/arena.cc
+@@ -10,6 +10,8 @@
+ #include "memory/arena.h"
+ 
+ #include <algorithm>
++#include <cstdio>
++#include <cstdlib>
+ 
+ #include "logging/logging.h"
+ #include "port/malloc.h"
+@@ -33,16 +35,26 @@
+   return block_size;
+ }
+ 
+-Arena::Arena(size_t block_size, AllocTracker* tracker, size_t huge_page_size)
+-    : kBlockSize(OptimizeBlockSize(block_size)), tracker_(tracker) {
++Arena::Arena(size_t block_size, AllocTracker* tracker, size_t huge_page_size,
++             cxl::BlockSource* cxl_source)
++    : kBlockSize(OptimizeBlockSize(block_size)),
++      cxl_source_(cxl_source),
++      tracker_(tracker) {
+   assert(kBlockSize >= kMinBlockSize && kBlockSize <= kMaxBlockSize &&
+          kBlockSize % kAlignUnit == 0);
+   TEST_SYNC_POINT_CALLBACK("Arena::Arena:0", const_cast<size_t*>(&kBlockSize));
+-  alloc_bytes_remaining_ = sizeof(inline_block_);
+-  blocks_memory_ += alloc_bytes_remaining_;
+-  aligned_alloc_ptr_ = inline_block_;
+-  unaligned_alloc_ptr_ = inline_block_ + alloc_bytes_remaining_;
+-  if (MemMapping::kHugePageSupported) {
++  if (cxl_source_ != nullptr) {
++    // CXL: no inline block (it lives in this object, outside shared memory)
++    alloc_bytes_remaining_ = 0;
++    aligned_alloc_ptr_ = nullptr;
++    unaligned_alloc_ptr_ = nullptr;
++  } else {
++    alloc_bytes_remaining_ = sizeof(inline_block_);
++    blocks_memory_ += alloc_bytes_remaining_;
++    aligned_alloc_ptr_ = inline_block_;
++    unaligned_alloc_ptr_ = inline_block_ + alloc_bytes_remaining_;
++  }
++  if (MemMapping::kHugePageSupported && cxl_source_ == nullptr) {
+     hugetlb_size_ = huge_page_size;
+     if (hugetlb_size_ && kBlockSize > hugetlb_size_) {
+       hugetlb_size_ = ((kBlockSize - 1U) / hugetlb_size_ + 1U) * hugetlb_size_;
+@@ -54,6 +66,9 @@
+ }
+ 
+ Arena::~Arena() {
++  if (cxl_source_ != nullptr && !cxl_blocks_.empty()) {
++    cxl_source_->Put(cxl_blocks_, cxl_owner_);
++  }
+   if (tracker_ != nullptr) {
+     assert(tracker_->is_freed());
+     tracker_->FreeMem();
+@@ -143,6 +158,20 @@
+ }
+ 
+ char* Arena::AllocateNewBlock(size_t block_bytes) {
++  if (cxl_source_ != nullptr) {
++    char* b = cxl_source_->Get(block_bytes);
++    if (b == nullptr) {
++      fprintf(stderr, "CXL arena: block source exhausted (%zu bytes)\n",
++              block_bytes);
++      abort();
++    }
++    cxl_blocks_.push_back(b);
++    blocks_memory_ += block_bytes;
++    if (tracker_ != nullptr) {
++      tracker_->Allocate(block_bytes);
++    }
++    return b;
++  }
+   // NOTE: std::make_unique zero-initializes the block so is not appropriate
+   // here
+   char* block = new char[block_bytes];
+
+--- a/memory/arena.h
++++ b/memory/arena.h
+@@ -19,6 +19,7 @@
+ #include "memory/allocator.h"
+ #include "port/mmap.h"
+ #include "rocksdb/env.h"
++#include "rocksdb/cxl.h"
+ 
+ namespace ROCKSDB_NAMESPACE {
+ 
+@@ -39,8 +40,12 @@
+   // huge_page_size: if 0, don't use huge page TLB. If > 0 (should set to the
+   // supported hugepage size of the system), block allocation will try huge
+   // page TLB first. If allocation fails, will fall back to normal case.
++  // CXL: with a block source (memtables of the CXL primary DB) every block
++  // comes from the source, the inline block and huge pages are not used, and
++  // the destructor hands the blocks back to the source with the owner id.
+   explicit Arena(size_t block_size = kMinBlockSize,
+-                 AllocTracker* tracker = nullptr, size_t huge_page_size = 0);
++                 AllocTracker* tracker = nullptr, size_t huge_page_size = 0,
++                 cxl::BlockSource* cxl_source = nullptr);
+   ~Arena();
+ 
+   char* Allocate(size_t bytes) override;
+@@ -79,9 +84,12 @@
+   size_t BlockSize() const override { return kBlockSize; }
+ 
+   bool IsInInlineBlock() const {
+-    return blocks_.empty() && huge_blocks_.empty();
++    return blocks_.empty() && huge_blocks_.empty() && cxl_blocks_.empty();
+   }
+ 
++  // CXL: owner id passed to the block source at destruction (memtable id).
++  void SetCxlOwner(uint64_t owner) { cxl_owner_ = owner; }
++
+   // check and adjust the block_size so that the return value is
+   //  1. in the range of [kMinBlockSize, kMaxBlockSize].
+   //  2. the multiple of align unit.
+@@ -115,6 +123,10 @@
+ 
+   // Bytes of memory in blocks allocated so far
+   size_t blocks_memory_ = 0;
++  // CXL: blocks from cxl_source_ (returned to it, never freed here)
++  cxl::BlockSource* cxl_source_ = nullptr;
++  std::vector<char*> cxl_blocks_;
++  uint64_t cxl_owner_ = 0;
+   // Non-owned
+   AllocTracker* tracker_;
+ };
+
+--- a/memory/concurrent_arena.cc
++++ b/memory/concurrent_arena.cc
+@@ -27,10 +27,11 @@
+ }  // namespace
+ 
+ ConcurrentArena::ConcurrentArena(size_t block_size, AllocTracker* tracker,
+-                                 size_t huge_page_size)
++                                 size_t huge_page_size,
++                                 cxl::BlockSource* cxl_source)
+     : shard_block_size_(std::min(kMaxShardBlockSize, block_size / 8)),
+       shards_(),
+-      arena_(block_size, tracker, huge_page_size) {
++      arena_(block_size, tracker, huge_page_size, cxl_source) {
+   Fixup();
+ }
+ 
+
+--- a/memory/concurrent_arena.h
++++ b/memory/concurrent_arena.h
+@@ -45,9 +45,14 @@
+   // in fact just passed to the constructor of arena_.  The core-local
+   // shards compute their shard_block_size as a fraction of block_size
+   // that varies according to the hardware concurrency level.
++  // CXL: cxl_source is passed to arena_ (see Arena).
+   explicit ConcurrentArena(size_t block_size = Arena::kMinBlockSize,
+                            AllocTracker* tracker = nullptr,
+-                           size_t huge_page_size = 0);
++                           size_t huge_page_size = 0,
++                           cxl::BlockSource* cxl_source = nullptr);
++
++  // CXL: see Arena::SetCxlOwner
++  void SetCxlOwner(uint64_t owner) { arena_.SetCxlOwner(owner); }
+ 
+   char* Allocate(size_t bytes) override {
+     return AllocateImpl(bytes, false /*force_arena*/,
+
+--- a/memtable/inlineskiplist.h
++++ b/memtable/inlineskiplist.h
+@@ -78,6 +78,13 @@
+                           int32_t branching_factor = 4);
+   // No copying allowed
+   InlineSkipList(const InlineSkipList&) = delete;
++
++  // CXL: head node and max height, for read-only lookups by another process
++  // that maps the same memory at the same address (rocksdb/cxl.h).
++  const void* CxlHead(int* max_height) const {
++    *max_height = kMaxHeight_;
++    return head_;
++  }
+   InlineSkipList& operator=(const InlineSkipList&) = delete;
+ 
+   // Allocates a key and a skip-list node, returning a pointer to the key
+
+--- a/memtable/skiplistrep.cc
++++ b/memtable/skiplistrep.cc
+@@ -77,6 +77,10 @@
+     return skip_list_.Contains(key);
+   }
+ 
++  const void* CxlHead(int* max_height) const override {
++    return skip_list_.CxlHead(max_height);
++  }
++
+   size_t ApproximateMemoryUsage() override {
+     // All memory is allocated through allocator; nothing to report here
+     return 0;

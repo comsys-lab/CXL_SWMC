@@ -1,0 +1,103 @@
+# rocksdb workload — design (DRAFT v0.1, not implemented)
+
+Status 2026-10-18: draft by the fork session (port owner). Nothing built or run. Open items are marked OPEN.
+Decisions (user, 2026-10-18; state/TASKS.md): LSM workload = RocksDB; option (c) per-node memtables (each node writes
+only its own memtable, other nodes read it, SSTs shared read-only, cross-node synchronisation only through HWcc, no
+CAS on SWcc: docs/hwcc-contract.md); visibility model "A: CXL mode patch" (LMDB-port style: arena blocks and SSTs in
+shared memory, a remote node reads the other node's memtable skiplist directly, publication through HWcc; an
+acknowledged write is visible at once, as in kv/lmdb); Megalon object = one 1 MiB RocksDB arena block, no application
+change; motivation without code restructuring; dataset 54M keys (24 B key, 1,000 B value), mixes u5/u50/u80 (put
+ratio 0.05/0.5/0.8, as kv), YCSB scrambled Zipf 0.99, request p99 < 1 ms.
+
+Limitation (as every workload): both VMs share physically HW-coherent memory; a missing flush or a cross-node CAS on
+SWcc can be masked by hardware. Tests prove protocol logic and API use, not a SW coherence protocol.
+
+## 1. Source
+- RocksDB v11.8.1 (GitHub release 2026-08-07), tarball `rocksdb-v11.8.1.tar.gz` sha256
+  618d9726a7cb1cf4ce034f4cdca49de98aa64867dda06b91371a791ae8921aff (downloaded 2026-10-18, user approval).
+  Pristine tree outside the repo (workspaces/rocksdb/src/rocksdb-11.8.1); the repo keeps a patch series
+  `workloads/rocksdb/patches/*.patch` (every change marked `CXL`) and a fetch/verify script.
+- Build: static librocksdb per backend (plain, megalon), no compression libraries, no gflags, WAL disabled at run time.
+
+## 2. Structure: one RocksDB DB per node, read by every node
+```
+node v (writer of everything below except the global stamp)          node u (reader of node v's state)
+ HWcc app: v's descriptor (seqlock) {gen, memtables[K]: head node VA, state}   reads it (acquire)
+           v's FS directory + extent map (name -> extents, size)               reads it (acquire)
+           v's retire epochs; u's reader epochs (written by u)                 writes only its own reader slot
+ SWcc  : v's arena pool (1 MiB blocks)  <- memtable skiplist nodes             traverses v's skiplist read-only
+         v's file pool  (1 MiB extents) <- SST, MANIFEST, OPTIONS              opens v's DB as a secondary instance
+                                                                              (TryCatchUpWithPrimary on gen change)
+```
+- Get(k) on any node = lookup in its own DB + lookup in every other node's DB (memtables direct, SSTs via the
+  secondary view); the answer is the value with the highest global stamp (value header {key, stamp, writer}, as lmdb).
+- Put(k) on node v = stamp = fetch_add(global_stamp) in HWcc, then v's own db->Put (WAL off). The reply is sent after
+  the memtable insert, so the write is visible to every later Get on any node.
+- Remote SST view (user, 2026-10-18): RocksDB's own `DB::OpenAsSecondary` / `TryCatchUpWithPrimary`, used ONLY for
+  the immutable SST/MANIFEST side. With the WAL off the secondary has no memtable content; memtables are always read
+  directly (model A). This is not the rejected model B (secondary replaying a WAL into private memtables, stale
+  reads). Freshness: node v drops a memtable from its descriptor only after the SST holding its content is in the
+  MANIFEST and the new gen is published; a remote Get that sees a newer gen first catches the secondary up to it.
+- Expected cost (recorded): the global stamp is one HWcc line hit by every Put on every node (cross-node hot line,
+  one fetch_add per Put); it is the same on every system and appears in all-HWcc too.
+
+## 3. Who writes what (answer to the LMDB lesson: no structure on the write path is written by two nodes)
+| structure | location | writers | access |
+| --- | --- | --- | --- |
+| global stamp | HWcc, 1 line | every node | fetch_add per Put (the only multi-writer word on the write path) |
+| memtable skiplist nodes (key, value, next pointers) | SWcc, v's arena blocks | node v only (its write threads; CAS among v's own threads stays inside one node) | other nodes: loads only |
+| memtable descriptor {gen, heads} | HWcc, v's lines | node v | seqlock write on memtable switch/flush; readers acquire |
+| SST, MANIFEST, OPTIONS, CURRENT files | SWcc, v's file extents | node v (flush, compaction) | write once, then read-only for every node |
+| FS directory/extent map | HWcc, v's lines | node v | release store of size after the data |
+| reader epochs | HWcc, one line per (reader node, target node) | the reader node | v frees a retired memtable arena or file only when every reader epoch passed its retire gen |
+| WAL | none | — | disabled (no durability, as kv) |
+No cross-node lock exists on the Put path: each node's writes contend only with its own threads (RocksDB's normal
+write path). Flush and compaction of node v's DB run on node v only.
+
+## 4. RocksDB changes (patch series; everything else uses public APIs)
+1. `memory/arena.*`: a memtable arena takes its blocks from the node's shared arena pool (1 MiB blocks; the inline
+   2 KiB block is disabled for such arenas because it lives in the process heap); `~Arena` retires the blocks with the
+   current gen instead of freeing them.
+2. Memtable publication: accessor for the skiplist head node of the memtable and range-del table; publication of the
+   node's memtable list into the HWcc descriptor whenever the SuperVersion changes (memtable switch, flush install).
+3. Remote memtable lookup (new file): read-only search of a foreign InlineSkipList from its head node (same node
+   layout, same internal-key order), decoding the memtable entry format.
+4. Megalon build only: skiplist node reads and the stores of an insert go through Megalon sections on the containing
+   1 MiB block object (read: read_start, copy, read_end, retry; insert: one write section for the new node's block,
+   then one per predecessor block whose next pointer changes; write_end flushes the whole object per the paper).
+Public-API parts (not patches): FileSystem plugin over the file pool; secondary instance for the remote SST view;
+CompactionFilter (§5); server, loadgen plugin, image builder.
+
+## 5. Stale copies across the per-node DBs (space) — decided G1 (user, 2026-10-18)
+A key updated on node u while its latest version lives in node v's DB leaves the old version in v's DB; v's own
+compaction never sees u's newer version. Without cleanup each DB tends to hold every key it ever wrote: worst case
+2 x 54M x ~1.05 KB ≈ 115 GB > 95.7 GiB SWcc.
+Options:
+- (G1) CompactionFilter (RocksDB plugin API): while compacting entry (k, stamp s), drop it if another node's DB holds
+  k with a higher stamp (remote Get, bloom filters keep misses cheap). Safe (two DBs cannot both be newer); keeps the
+  total near 1 x dataset plus compaction lag. Cost: extra remote reads inside compaction, on every system.
+- (G2) No cleanup; restore the initial image per run and refuse to run when a node's pools fill. Simple, but the
+  space bound depends on the run length and the update rate.
+- (G3) Key ownership (updates forwarded to the key's owner node). Rejected: violates "each node writes its own
+  memtable" for received requests and adds a hop.
+Decision: G1 (user, 2026-10-18).
+
+## 6. Initial image, sizes
+- 54M keys split by key hash into the two node DBs (27M each), built offline on the Host as SST files and copied
+  into each node's file pool at prepare (ingested as the bottom level), unmeasured. Per node ≈ 28.4 GB + space
+  amplification; SWcc split in two halves (≈ 47.8 GiB per node) for arena + file pools.
+- RocksDB options: defaults except WAL off, compression none, max_open_files -1. write_buffer_size 64 MiB (arena
+  block 1 MiB), block cache default. Every non-default option is listed in the run manifest.
+
+## 7. Megalon (paper first, artifact where it matches)
+- Objects: every 1 MiB arena block and every 1 MiB file extent of both nodes, created by node 0 at prepare
+  (no ObjectCreate during the run; pools are fixed).
+- File extents are written once by flush/compaction (one write section per extent fill), then read on Megalon's
+  read-only path (one read section per RandomAccessFile::Read span inside an extent).
+- Deviation candidates (to document): the extent unit for files (follows the arena unit); every memtable node access
+  (local and remote) goes through sections.
+
+## 8. Requests, metrics (as kv/lmdb)
+- Ops `get`, `update` (put of an existing key, whole 1,000 B value), `mixed` with put ratio 0.05/0.5/0.8; SLO request
+  p99 < 1 ms; per-op split T/C via opsplit.h (Popcorn swmc_acct, Megalon CohSnap); stats of RocksDB (flush,
+  compaction bytes/time, stall), pools usage, remote lookups, filter drops.
