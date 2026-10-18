@@ -1,4 +1,4 @@
-# rocksdb workload — design (v0.2: plain backend implemented, Megalon backend open)
+# rocksdb workload — design (v0.3: plain backend tested; Megalon backend written, untested)
 
 Status 2026-10-18: plain backend (all-HWcc, Popcorn) built and Host-tested (builds/rocksdb/<n>, tests/host_test.sh,
 tests/stress_test.sh); verifier review v1 FAIL (HIGH-1) -> fixes in v0.2 (§9). Megalon backend not implemented (§7).
@@ -114,13 +114,32 @@ Decision: G1 (user, 2026-10-18).
   threads (default `max_background_jobs`), one catch-up thread per remote view, one reclaim thread. Every thread
   that reads another node's state owns one epoch slot.
 
-## 7. Megalon (paper first, artifact where it matches)
-- Objects: every 1 MiB arena block and every 1 MiB file extent of both nodes, created by node 0 at prepare
-  (no ObjectCreate during the run; pools are fixed).
-- File extents are written once by flush/compaction (one write section per extent fill), then read on Megalon's
-  read-only path (one read section per RandomAccessFile::Read span inside an extent).
-- Deviation candidates (to document): the extent unit for files (follows the arena unit); every memtable node access
-  (local and remote) goes through sections.
+## 7. Megalon (paper first, artifact where it matches) — implemented in v0.3, not yet built/tested
+- Objects (user decision 2026-10-18): one 1 MiB object per arena block and per 1 MiB file extent of every node,
+  id `"RK" << 48 | kind << 44 | node << 36 | index` (kind 0 block, 1 extent), all created by node 0 at prepare
+  (index order) before any node opens its DB; every node looks them all up and keeps their addresses (Megalon maps
+  the whole device at map_va, objects are 64 B aligned, so addresses come from the objects, not from SwccPlan
+  offsets). No ObjectCreate during the run (fixed pools). `--file-extents` explicit; object_arena_size >= nr_nodes
+  x (arena_blocks + file_extents) MiB (config/megalon-2vm.yaml).
+- Section placement (user decision 2026-10-18, "remote reads only"):
+  - every write is a write section on its object: a memtable entry (MemTable::Add encode), the new node's links and
+    each predecessor's link (InlineSkipList::Insert, CAS inside the section), the skiplist head init, the height
+    stash (patches/0002-cxl-write-sections.patch, rocksdb/cxl.h WriteScope; plain: no hook set, one null check);
+    every file extent fill (FS Append). write_end flushes the whole 1 MiB object (paper semantics, D3 of M2).
+  - reads of ANOTHER node's memtable (RemoteMemtableGet: each link and each key/value copy is one read section on
+    its block, retried until read_end accepts) or files (FS reads of a remote node: one read section per extent
+    span) are read sections;
+  - the owner node reads its own memtables and files directly (local Get, flush/compaction iteration, insert
+    search): single writer, HW coherent within a node.
+- Recorded deviations: (1) owner-local reads without sections; (2) D3 write contract ("a write section writes whole
+  lines and never reads prior contents"): RocksDB's CAS and partial-line entry writes read/modify lines inside the
+  section; safe here because the owner is the only writer of its objects, so its cache never holds another node's
+  stale lines of them; (3) owner-private skiplist scratch (the sequential-insert Splice, allocated in the arena) is
+  written without sections (never read by another node); (4) file extents use the arena's 1 MiB unit.
+- Threads: Megalon allows 32 thread registrations per process; every thread that opens a section registers lazily
+  (workers, RocksDB flush/compaction threads, catch-up threads, image threads: keep --prepare-threads small).
+- Same server binary for both backends (--backend plain|megalon); the build carries lib/libmegalon-objapi.so when
+  given a Megalon build. C per op: opsplit Source kMegalon, Formula kLMDB (all-HWcc = the plain backend).
 
 ## 8. Requests, metrics (as kv/lmdb)
 - Ops `get`, `update` (put of an existing key, whole 1,000 B value), `mixed` with put ratio 0.05/0.5/0.8; SLO request

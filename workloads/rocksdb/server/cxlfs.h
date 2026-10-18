@@ -88,7 +88,7 @@ class CxlFileReader {
       const uint32_t k = uint32_t(o / kUnit);
       const uint32_t j = __atomic_load_n(&ex[k], __ATOMIC_RELAXED);
       const size_t in = size_t(o % kUnit), take = std::min<size_t>(n - done, kUnit - in);
-      sh_->backend()->read(out + done, sh_->extent_addr(node_, j) + in, take);
+      sh_->backend()->file_read(node_, j, in, out + done, take);
       done += take;
     }
     return n;
@@ -151,7 +151,7 @@ class CxlWritableFile final : public FSWritableFile {
       }
       const uint32_t j = __atomic_load_n(&ex[k], __ATOMIC_RELAXED);
       const size_t take = std::min<size_t>(n, kUnit - in);
-      sh_->backend()->write(sh_->extent_addr(sh_->me(), j) + in, p, take);
+      sh_->backend()->file_write(sh_->me(), j, in, p, take);
       p += take;
       n -= take;
       size_ += take;

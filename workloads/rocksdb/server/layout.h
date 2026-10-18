@@ -39,7 +39,8 @@ struct Params {
 struct alignas(64) NodeLine {  // written only by node v
   uint64_t loaded;             // run_id once the node's DB is open and its image ingested
   uint64_t puts;               // diagnostics
-  uint8_t pad[48];
+  uint64_t objects;            // node 0 only: run_id once every Megalon object of every node exists
+  uint8_t pad[40];
 };
 static_assert(sizeof(NodeLine) == 64, "node line");
 

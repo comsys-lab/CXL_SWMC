@@ -62,6 +62,8 @@ struct NodeOpts {
   uint64_t write_buffer_mb = 64;   // RocksDB default; smaller only in Host tests (forces flushes and compactions)
   uint64_t target_file_mb = 0;     // 0 = RocksDB default (64 MiB); Host stress tests only (files below max_ext)
   uint64_t max_manifest_kb = 0;    // 0 = max_ext / 2 MiB; Host stress tests only (forces MANIFEST rollovers)
+  std::string backend = "plain";   // plain | megalon
+  std::string megalon_lib;         // default <exe dir>/../lib/libmegalon-objapi.so
 };
 
 // G1 (DESIGN.md §5): drop an entry when another node's DB holds the key with a higher stamp.
@@ -109,12 +111,39 @@ class Node {
     std::string err;
     if (!cxl::region_load(o_.region.empty() ? nullptr : o_.region.c_str(), &r_, &err)) die("region: " + err);
     if (p_.nr_nodes == 0 || p_.nr_nodes > kMaxTargets || o_.node >= p_.nr_nodes || p_.keys == 0) die("bad node/nodes/keys");
-    be_ = std::make_unique<PlainBackend>();
+    MegalonBackend *meg = nullptr;
+    if (o_.backend == "megalon") {
+      cxl::proc::name_thread("megalon-lib");  // threads Megalon starts while it initialises inherit this name
+      const mshim::Api *api = megalon_load(o_.megalon_lib, &err);
+      cxl::proc::name_thread(who);
+      if (!api) die(err);
+      if (api->node_id() != o_.node) die("megalon node id " + std::to_string(api->node_id()) + " != --node");
+      if (!mapped_by(r_.map_va, r_.device_size, r_.device, &err)) die(err);
+      map_ = reinterpret_cast<uint8_t *>(r_.map_va);
+      be_ = std::make_unique<MegalonBackend>(api);
+      meg = static_cast<MegalonBackend *>(be_.get());
+    } else {
+      be_ = std::make_unique<PlainBackend>();
+      map_ = map_device();
+    }
+    be_->thread_init();
     HwccLayout lay(p_, be_->layout_tag());
-    map_ = map_device();
     if (!plan_.make(r_, p_, &err)) die(err);
     if (!cxl::hwcc::app_init(r_, map_, lay.L, o_.run_id, p_.nr_nodes, o_.node, o_.start_timeout_ms, &err)) die(err);
     h_ = std::make_unique<Hwcc>(cxl::hwcc::app_base(r_, map_), lay, p_);
+    if (meg) {  // node 0 creates every node's objects, then all look them up
+      const uint64_t t0 = now_ns();
+      if (o_.node == 0) {
+        if (!meg->create(p_, plan_, &err)) die(err);
+        cxl::hwcc::store_release(&h_->nodes[0].objects, o_.run_id);
+      } else if (!cxl::hwcc::poll_until([&] { return cxl::hwcc::load_acquire(&h_->nodes[0].objects) == o_.run_id; },
+                                         o_.start_timeout_ms)) {
+        die("node 0 did not create the Megalon objects in time");
+      }
+      std::fprintf(stderr, "%s: megalon objects ready (%lu per node) in %.1f s\n", who,
+                   (unsigned long)(plan_.arena_blocks + plan_.file_extents), (now_ns() - t0) / 1e9);
+    }
+    if (!be_->setup(r_, map_, p_, plan_, o_.node, &err)) die(err);
     sh_ = std::make_unique<Shared>(r_, map_, p_, plan_, h_.get(), be_.get(), o_.node);
     std::fprintf(stderr, "%s: node %u/%u run %#lx %s\n%s: region %s\n%s: app layout %lu B (used %lu, hash %016lx), swcc %s, backend %s\n",
                  who, o_.node, p_.nr_nodes, (unsigned long)o_.run_id, p_.describe().c_str(), who,
@@ -210,6 +239,7 @@ class Node {
   uint64_t get_retries() const { return get_retries_.load(); }
   uint64_t get_retry_limit() const { return get_retry_limit_.load(); }
   const CxlFs &fs() const { return *fs_; }
+  Backend &backend() const { return *be_; }
 
  private:
   uint8_t *map_device() {

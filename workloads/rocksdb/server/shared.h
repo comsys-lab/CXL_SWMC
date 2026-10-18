@@ -43,15 +43,8 @@ class Shared {
   uint8_t *map() const { return map_; }
   uint64_t my_gen() const { return desc_gen(&h_->desc[me_]); }
 
-  uint8_t *block_addr(uint32_t node, uint64_t i) const { return map_ + plan_.block_off(node, i); }
-  uint8_t *extent_addr(uint32_t node, uint32_t j) const { return map_ + plan_.extent_off(node, j); }
-  bool block_index(const char *p, uint64_t *i) const {
-    const uint64_t off = uint64_t(reinterpret_cast<const uint8_t *>(p) - map_);
-    const uint64_t lo = plan_.block_off(me_, 0), hi = plan_.block_off(me_, plan_.arena_blocks);
-    if (off < lo || off >= hi || (off - lo) % kUnit) return false;
-    *i = (off - lo) / kUnit;
-    return true;
-  }
+  uint8_t *block_addr(uint32_t node, uint64_t i) const { return be_->block(node, i); }
+  bool block_index(const char *p, uint64_t *i) const { return be_->block_index(me_, p, i); }
 
   // ---- owner side (node me): allocation and deferred free ----
   char *get_block() {

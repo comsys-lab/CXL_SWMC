@@ -1,0 +1,122 @@
+
+--- a/db/memtable.cc
++++ b/db/memtable.cc
+@@ -1145,6 +1145,7 @@
+ 
+   KeyHandle handle = table->Allocate(encoded_len, &buf);
+ 
++  std::optional<cxl::WriteScope> cxl_w(std::in_place, buf);  // CXL: the entry bytes
+   char* p = EncodeVarint32(buf, internal_key_size);
+   memcpy(p, key.data(), key_size);
+   Slice key_slice(p, key_size);
+@@ -1159,6 +1160,7 @@
+ 
+   UpdateEntryChecksum(kv_prot_info, key, value, type, s,
+                       buf + encoded_len - moptions_.protection_bytes_per_key);
++  cxl_w.reset();  // CXL: section ends before the links are made (InlineSkipList::Insert)
+   Slice encoded(buf, encoded_len - moptions_.protection_bytes_per_key);
+   if (kv_prot_info != nullptr) {
+     TEST_SYNC_POINT_CALLBACK("MemTable::Add:Encoded", &encoded);
+
+--- a/include/rocksdb/cxl.h
++++ b/include/rocksdb/cxl.h
+@@ -54,6 +54,36 @@
+   return !h.primary_host_id.empty() && db_host_id == h.primary_host_id;
+ }
+ 
++// ---- write sections (coherence backends; DESIGN.md §7) ----
++// When set, every store RocksDB makes into a shared memtable object (new entry, its links, a predecessor's link,
++// the skiplist head) is bracketed by write_begin(addr) / write_end(token) of the object holding addr. write_begin
++// returns nullptr for memory outside the shared pools (no section). Sections never nest: each scope covers one
++// object and ends before the next one starts. Owner-private scratch in the arena (the skiplist Splice) and reads by
++// the owner node take no section (single writer, HW coherent within a node; recorded deviation).
++struct Sections {
++  void* (*write_begin)(const void* addr) = nullptr;
++  void (*write_end)(void* token) = nullptr;
++};
++inline Sections& GetSections() {
++  static Sections s;
++  return s;
++}
++class WriteScope {
++ public:
++  explicit WriteScope(const void* addr) {
++    const Sections& s = GetSections();
++    if (s.write_begin) token_ = s.write_begin(addr);
++  }
++  ~WriteScope() {
++    if (token_) GetSections().write_end(token_);
++  }
++  WriteScope(const WriteScope&) = delete;
++  WriteScope& operator=(const WriteScope&) = delete;
++
++ private:
++  void* token_ = nullptr;
++};
++
+ // ---- remote lookup ----
+ enum class RemoteResult { kNotFound, kFound, kDeleted, kUnsupported };
+ 
+
+--- a/memtable/inlineskiplist.h
++++ b/memtable/inlineskiplist.h
+@@ -50,6 +50,7 @@
+ #include "memory/allocator.h"
+ #include "port/likely.h"
+ #include "port/port.h"
++#include "rocksdb/cxl.h"
+ #include "rocksdb/slice.h"
+ #include "test_util/sync_point.h"
+ #include "util/atomic.h"
+@@ -852,6 +853,7 @@
+          kBranching_ == static_cast<uint32_t>(branching_factor));
+   assert(kScaledInverseBranching_ > 0);
+ 
++  cxl::WriteScope cxl_w(head_);  // CXL
+   for (int i = 0; i < kMaxHeight_; ++i) {
+     head_->SetNext(i, nullptr);
+   }
+@@ -882,7 +884,10 @@
+   // however, so that it can perform the proper links.  Since we're not
+   // using the pointers at the moment, StashHeight temporarily borrow
+   // storage from next_[0] for that purpose.
+-  x->StashHeight(height);
++  {
++    cxl::WriteScope cxl_w(x);  // CXL
++    x->StashHeight(height);
++  }
+   return x;
+ }
+ 
+@@ -1156,8 +1161,16 @@
+                compare_(x->Key(), splice->next_[i]->Key()) < 0);
+         assert(splice->prev_[i] == head_ ||
+                compare_(splice->prev_[i]->Key(), x->Key()) < 0);
+-        x->NoBarrier_SetNext(i, splice->next_[i]);
+-        if (splice->prev_[i]->CASNext(i, splice->next_[i], x)) {
++        {
++          cxl::WriteScope cxl_w(x);  // CXL
++          x->NoBarrier_SetNext(i, splice->next_[i]);
++        }
++        bool linked;
++        {
++          cxl::WriteScope cxl_w(splice->prev_[i]);  // CXL
++          linked = splice->prev_[i]->CASNext(i, splice->next_[i], x);
++        }
++        if (linked) {
+           // success
+           break;
+         }
+@@ -1200,7 +1213,11 @@
+       assert(splice->prev_[i] == head_ ||
+              compare_(splice->prev_[i]->Key(), x->Key()) < 0);
+       assert(splice->prev_[i]->Next(i) == splice->next_[i]);
+-      x->NoBarrier_SetNext(i, splice->next_[i]);
++      {
++        cxl::WriteScope cxl_w(x);  // CXL
++        x->NoBarrier_SetNext(i, splice->next_[i]);
++      }
++      cxl::WriteScope cxl_w(splice->prev_[i]);  // CXL
+       splice->prev_[i]->SetNext(i, x);
+     }
+   }

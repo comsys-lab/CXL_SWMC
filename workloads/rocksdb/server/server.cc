@@ -39,7 +39,6 @@ namespace {
 struct Opts {
   NodeOpts n;
   uint32_t port = 7200, threads = 8;
-  std::string backend = "plain";
 };
 
 struct Conn {
@@ -102,10 +101,12 @@ class Server {
     if (o_.threads == 0) die("--threads must be > 0");
     node_.start("rocksdb-server");
     ws_.reset(new WorkerStats[o_.threads]);
-    opt_.reset(new opsplit::Table({"get", "update"}, o_.threads, opsplit::Source::kPopcorn, nullptr,
-                                  opsplit::Formula::kLMDB));
+    const bool meg = o_.n.backend == "megalon";
+    // C by the plain all-HWcc (no Megalon there): Formula::kLMDB, as the lmdb workload
+    opt_.reset(new opsplit::Table({"get", "update"}, o_.threads, meg ? opsplit::Source::kMegalon : opsplit::Source::kPopcorn,
+                                  node_.backend().api(), opsplit::Formula::kLMDB));
     oth_.reset(new opsplit::Thread[o_.threads]);
-    std::fprintf(stderr, "rocksdb-server: opsplit tsc_hz %.0f source popcorn\n", opt_->tsc_hz());
+    std::fprintf(stderr, "rocksdb-server: opsplit tsc_hz %.0f source %s\n", opt_->tsc_hz(), meg ? "megalon" : "popcorn");
     for (uint32_t i = 0; i < o_.threads; i++) std::thread([this, i] { worker(i); }).detach();
     std::thread([this] { listen_loop(); }).detach();
   }
@@ -117,7 +118,7 @@ class Server {
       g += ws_[i].gets, gnf += ws_[i].get_not_found, ge += ws_[i].get_errors, gns += ws_[i].get_ns;
       u += ws_[i].updates, ue += ws_[i].update_errors, uns += ws_[i].update_ns, re += ws_[i].remote_errors;
     }
-    o << "node=" << o_.n.node << "\nbackend=" << o_.backend << "\ngets=" << g << "\nget_not_found=" << gnf
+    o << "node=" << o_.n.node << "\nbackend=" << o_.n.backend << "\ngets=" << g << "\nget_not_found=" << gnf
       << "\nget_errors=" << ge << "\nget_ns=" << gns << "\nupdates=" << u << "\nupdate_errors=" << ue
       << "\nupdate_ns=" << uns << "\nremote_errors=" << re << "\nqueue=" << q_.size()
       << "\nstamp=" << cxl::hwcc::load_acquire(node_.hwcc().stamp) << "\ndesc_installs=" << node_.desc_installs()
@@ -156,13 +157,14 @@ class Server {
                    ROCKSDB_NAMESPACE::BLOCK_CACHE_HIT, ROCKSDB_NAMESPACE::BLOCK_CACHE_MISS,
                    ROCKSDB_NAMESPACE::BLOOM_FILTER_USEFUL})
       o << "rocksdb.ticker." << t << "=" << st->getTickerCount(t) << "\n";
-    o << opt_->text() << cxl::proc::text(pst_);
+    o << node_.backend().stats() << opt_->text() << cxl::proc::text(pst_);
     return o.str();
   }
 
  private:
   void worker(uint32_t i) {
     cxl::proc::name_thread("rdb-worker");
+    node_.backend().thread_init();
     WorkerStats &st = ws_[i];
     opsplit::Thread &ot = oth_[i];
     ot.init(opt_.get(), i);
@@ -312,6 +314,30 @@ class Server {
 
 volatile sig_atomic_t g_stop = 0;
 
+// Megalon reads its node id, run id and region from the environment (as workloads/lmdb/server/node.h megalon_env)
+void megalon_env(NodeOpts &o, const char *argv0) {
+  auto env = [](const char *k, const std::string &v) {
+    const char *cur = getenv(k);
+    if (cur && *cur && v != cur) {
+      std::fprintf(stderr, "rocksdb-server: %s=%s contradicts the option (%s)\n", k, cur, v.c_str());
+      std::exit(2);
+    }
+    setenv(k, v.c_str(), 1);
+  };
+  env("MEGALON_NODE_ID", std::to_string(o.node));
+  if (!getenv("MEGALON_RUN_ID") || !*getenv("MEGALON_RUN_ID")) setenv("MEGALON_RUN_ID", std::to_string(o.run_id).c_str(), 1);
+  else if (std::stoull(getenv("MEGALON_RUN_ID"), nullptr, 0) != o.run_id) env("MEGALON_RUN_ID", std::to_string(o.run_id));
+  if (!o.region.empty()) env("CXL_REGION_CONFIG", o.region);
+  if (o.megalon_lib.empty()) {
+    char exe[4096];
+    ssize_t n = readlink("/proc/self/exe", exe, sizeof(exe) - 1);
+    if (n <= 0) die(std::string("readlink /proc/self/exe for ") + argv0);
+    exe[n] = 0;
+    std::string d(exe);
+    o.megalon_lib = d.substr(0, d.rfind('/')) + "/../lib/libmegalon-objapi.so";
+  }
+}
+
 void usage() {
   std::fprintf(stderr,
                "usage: rocksdb-server --node K --nodes N --run-id 0x.. --keys N\n"
@@ -319,7 +345,10 @@ void usage() {
                "  [--max-ext E (192)] [--arena-blocks B (512)] [--file-extents X (0 = rest)] [--local-dir D]\n"
                "  [--prepare-threads T (8)] [--no-gc-filter] [--write-buffer-mb M (64)] [--target-file-mb M (64)]\n"
                "  [--max-manifest-kb K (max_ext/2 MiB)] (the last three: Host tests only)\n"
-               "  [--start-timeout-ms T] [--backend plain]\n"
+               "  [--start-timeout-ms T] [--backend plain|megalon] [--megalon-lib PATH]\n"
+               "--backend megalon: Megalon (RACKOBJ_CONFIG, object_arena_size >= 2 x (arena_blocks + file_extents) MiB,\n"
+               "  --file-extents explicit) maps the device; MEGALON_NODE_ID / MEGALON_RUN_ID / CXL_REGION_CONFIG default to\n"
+               "  --node / --run-id / --region; at most 32 threads open sections (keep --prepare-threads small).\n"
                "All nodes need identical --nodes/--keys/--epoch-slots/--max-files/--max-ext/--arena-blocks/--file-extents\n"
                "(checked through the HWcc layout hash). CXL_APP_HWCC_BYTES must be at least the app layout size:\n"
                "rocksdb-server --print-app-bytes [params].\n");
@@ -356,15 +385,17 @@ int main(int argc, char **argv) {
     else if (a == "--target-file-mb") o.n.target_file_mb = std::stoull(v());
     else if (a == "--max-manifest-kb") o.n.max_manifest_kb = std::stoull(v());
     else if (a == "--start-timeout-ms") o.n.start_timeout_ms = std::stoull(v());
-    else if (a == "--backend") o.backend = v();
+    else if (a == "--backend") o.n.backend = v();
+    else if (a == "--megalon-lib") o.n.megalon_lib = v();
     else if (a == "--print-app-bytes") print_bytes = true;
     else usage();
   }
   if (print_bytes) {
-    std::printf("%lu\n", (unsigned long)HwccLayout(o.n.p, "").L.bytes());
+    std::printf("%lu\n", (unsigned long)HwccLayout(o.n.p, o.n.backend == "megalon" ? " backend=megalon" : "").L.bytes());
     return 0;
   }
-  if (o.n.run_id == 0 || o.n.p.keys == 0 || o.backend != "plain") usage();
+  if (o.n.run_id == 0 || o.n.p.keys == 0 || (o.n.backend != "plain" && o.n.backend != "megalon")) usage();
+  if (o.n.backend == "megalon") megalon_env(o.n, argv[0]);
   signal(SIGPIPE, SIG_IGN);
   signal(SIGTERM, [](int) { g_stop = 1; });
   signal(SIGINT, [](int) { g_stop = 1; });

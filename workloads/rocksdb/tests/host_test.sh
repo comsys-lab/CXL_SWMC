@@ -10,7 +10,8 @@
 #   3 verify op on both nodes (every entry of each node's DB complete and ordered), stats op, expected activity
 #   4 opsplit rows (get/update with T > 0, C within [0, T]) and clean-stop counts
 # usage: host_test.sh <work dir (new)> <rocksdb build dir> <loadgen build dir with the rocksdb plugin> [keys (200000)]
-#        env: CPUS0 / CPUS1 / CPUSL (node0 / node1 / loadgen CPU lists), RATES, STEP_S, UPDATE_RATIO, WBMB
+#        env: CPUS0 / CPUS1 / CPUSL (node0 / node1 / loadgen CPU lists), RATES, STEP_S, UPDATE_RATIO, WBMB,
+#             BACKEND=megalon (the build must carry lib/libmegalon-objapi.so; MEG_EXTENTS file extents per node)
 set -uo pipefail
 WD=$1; B=$(cd "$2" && pwd); LG=$(cd "$3" && pwd); N=${4:-200000}
 HERE=$(cd "$(dirname "$0")" && pwd); W=$(cd "$HERE/.." && pwd)
@@ -34,14 +35,23 @@ swcc_offset: auto
 swcc_size: auto
 reserved: []
 EOF
+BACKEND=${BACKEND:-plain}
 SP=(--keys $N --arena-blocks 256)
+BE=(); ENV0=()
+if [ "$BACKEND" = megalon ]; then
+  EXT=${MEG_EXTENTS:-1024}
+  SP+=(--file-extents $EXT --backend megalon)
+  sed -e "s/^object_arena_size: .*/object_arena_size: $(( (2 * (256 + EXT) + 64) / 1024 + 1 ))GB/" "$W/config/megalon-2vm.yaml" > megalon.yaml
+  export RACKOBJ_CONFIG=$WD/megalon.yaml
+  ENV0=(MEGALON_REINIT=1)
+fi
 export CXL_APP_HWCC_BYTES=$("$B/bin/rocksdb-server" --print-app-bytes "${SP[@]}")
 echo "keys=$N app_bytes=$CXL_APP_HWCC_BYTES build=$B loadgen=$LG"
 grep -E '^(source|rocksdb_version|patch|sha256)' "$B/manifest.txt"
 
 R=$(rid)
 P=(--nodes 2 --run-id "$R" --region "$WD/region.yaml" --threads 4 --write-buffer-mb ${WBMB:-4} --prepare-threads 2 "${SP[@]}")
-taskset -c "$C0" "$B/bin/rocksdb-server" --node 0 --port 17200 --local-dir "$WD/local0" "${P[@]}" > srv0.log 2>&1 &
+env "${ENV0[@]}" taskset -c "$C0" "$B/bin/rocksdb-server" --node 0 --port 17200 --local-dir "$WD/local0" "${P[@]}" > srv0.log 2>&1 &
 taskset -c "$C1" "$B/bin/rocksdb-server" --node 1 --port 17201 --local-dir "$WD/local1" "${P[@]}" > srv1.log 2>&1 &
 for _ in $(seq 1200); do grep -q READY srv0.log && grep -q READY srv1.log && break
   grep -q FATAL srv0.log srv1.log && break; sleep 0.5; done
@@ -84,7 +94,7 @@ sys.exit(1 if bad else 0)
 PY
 
 echo "== 4 opsplit"
-python3 -I "$W/../kv/tools/opsplit.py" lg --system all-HWcc --out opsplit.csv || fail opsplit
+python3 -I "$W/../kv/tools/opsplit.py" lg --system $([ "$BACKEND" = megalon ] && echo Megalon || echo all-HWcc) --out opsplit.csv || fail opsplit
 python3 -I - opsplit.csv <<'PY' || fail "opsplit check"
 import csv, sys
 rows = list(csv.DictReader(open(sys.argv[1]))); bad = []
@@ -93,7 +103,10 @@ for o in ("get", "update"):
     if not rs or any(float(r["T_us_per_op[measured]"]) <= 0 for r in rs): bad.append(f"{o}: no rows with ops > 0 and T > 0")
 for r in rows:
     c, t = float(r["C_us_per_op[derived]"]), float(r["T_us_per_op[measured]"])
-    if c < 0 or c > t * 1.0001 + 0.01: bad.append(f"{r['step']} {r['op']}: C {c} T {t}")
+    if c < 0: bad.append(f"{r['step']} {r['op']}: C {c} < 0")
+    if c > t * 1.0001 + 0.01:  # Megalon sampled C may exceed T: WARN only (as workloads/lmdb/tests/host_test.sh)
+        (print(f"WARN {r['step']} {r['op']}: sampled C {c} > T {t}") if r["c_source"] == "megalon"
+         else bad.append(f"{r['step']} {r['op']}: C {c} > T {t}"))
 print("opsplit:", "OK" if not bad else "BAD " + "; ".join(bad),
       " ".join(f"{r['step']}:{r['op']}:n={r['ops[measured]']}:T={r['T_us_per_op[measured]']}us" for r in rows))
 sys.exit(1 if bad else 0)

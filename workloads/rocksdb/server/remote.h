@@ -96,8 +96,8 @@ class RemoteView {
     for (uint64_t i = 0; i < d.n && !done; i++) {
       if (!d.m[i].head) continue;
       uint64_t seq;
-      auto mr = ROCKSDB_NAMESPACE::cxl::RemoteMemtableGet(reinterpret_cast<const void *>(d.m[i].head),
-                                                          int(d.m[i].height), key, stored, &seq);
+      auto mr = sh_->backend()->remote_get(v_, reinterpret_cast<const void *>(d.m[i].head), int(d.m[i].height), key,
+                                           stored, &seq);
       if (mr == ROCKSDB_NAMESPACE::cxl::RemoteResult::kFound) {
         r = Res::kFound, done = true;
         st_.mem_hits.fetch_add(1, std::memory_order_relaxed);

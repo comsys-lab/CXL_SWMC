@@ -1,0 +1,31 @@
+# Megalon config for the rocksdb Megalon backend (workloads/rocksdb/DESIGN.md §7), 2 VMs.
+# Same file on both VMs; node id, run id and region config come from rocksdb-server (--node, --run-id, --region).
+# Only objects are used (one 1 MiB object per arena block and per file extent of every node); key_space/slots stay small
+# (copied from systems/megalon/vectordb-2vm.yaml via workloads/lmdb/config; only object_arena_size differs).
+mount_directory: /mydata        # required by the config parser; unused
+key_space: 10000
+slots: 10240
+logical_scr_size: 64MB
+node_id: 0                      # overridden by MEGALON_NODE_ID (rocksdb-server sets it from --node)
+region_config: ""               # $CXL_REGION_CONFIG
+reinit: false                   # node 0: MEGALON_REINIT=1
+attach_mprotect: true
+stuck_timeout_ms: 10000
+log_sync_interval_us: 100
+nr_log_size: 64MB
+attach_timeout_s: 600
+start_barrier_timeout_s: 600
+object_arena_size: 4GB                # >= nr_nodes x (arena_blocks + file_extents) MiB + alignment; set per run
+object_align: 64
+object_max_count: 1000000       # hwcc flavor only (static records): >= object count
+replicate: false
+flush: false
+evict: false
+partition_ratio: 0.0
+excluded_files:
+excluded_directories:
+  - /usr
+  - /proc
+  - /etc
+  - /dev
+  - /sys
