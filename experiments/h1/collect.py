@@ -36,6 +36,10 @@ Coherence CPU per window (CLAUDE.md: CPU spent on coherence next to throughput a
 usage: collect.py --plan h1-plan.tsv --workload W [--levels levels.tsv] [--out-name collect] [--no-figs] WDIR
   WDIR = one round of a workload (<E>/<W>/r<n>: run/ with h1-runs.tsv v2) or the workload root (<E>/<W>, every round; --out-name
   collect-all); runs = every h1-runs.tsv below WDIR outside collect* dirs. Figures use the lowest round present.
+Systems per workload (h1sys.py, v0.6.7): recsys = hw, pop (user decision 2026-10-18; no Megalon in H1 RecSys):
+  slo-summary has hw, pop rows; Fig 1 hw, pop curves; Fig 2 v6_fig2_split.py --megalon-c none (rows All HWcc,
+  Popcorn); no cdiff rows; systems.txt (and each <tag>-windows.txt) states that the Megalon RecSys numbers come from
+  RECSYS-V1 v1.4.
 Exit 0 with "COLLECT OK" (notes allowed), 1 on unreadable inputs ("COLLECT FAIL").
 """
 import argparse, csv, glob, hashlib, json, os, subprocess, sys
@@ -44,7 +48,9 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 EXP = os.path.dirname(HERE)
 sys.path.insert(0, os.path.join(EXP, "loadgen"))
 from export_csv import knee_bracket  # noqa: E402
-SYSTEMS = ("hw", "pop", "mg")             # SLO phase (Fig 1): Megalon timers on (dec Q6)
+sys.path.insert(0, HERE)
+from h1sys import slo_systems, fix_systems, has_megalon, NO_MEGALON_NOTE  # noqa: E402
+SYSTEMS = ("hw", "pop", "mg")             # SLO phase (Fig 1): Megalon timers on (dec Q6); per workload slo_systems(W)
 FIXSYS = ("hw", "pop", "mg", "mgoff")     # fixed phase (Fig 2): + Megalon timers off for C_diff (dec 2026-10-17 "(a)")
 CURVE_PHASES = ("ramp", "bisect", "fill", "overload")
 notes = []
@@ -229,10 +235,15 @@ def main():
     ap.add_argument("wdir")
     a = ap.parse_args()
     W, wdir = a.workload, a.wdir
+    SYSTEMS, FIXSYS, MG = slo_systems(W), fix_systems(W), has_megalon(W)  # per workload (v0.6.7)
+    mgnote = NO_MEGALON_NOTE.get(W, f"no Megalon for {W}")
     out = os.path.join(wdir, a.out_name)
     if os.path.exists(out):
         fail(f"{out} exists (result dirs are immutable; collect into a fresh copy)")
     os.makedirs(os.path.join(out, "fig"))
+    if not MG:
+        with open(os.path.join(out, "systems.txt"), "w") as f:
+            f.write(f"systems {' '.join(SYSTEMS)} (h1sys.py): {mgnote}\n")
     mixes = plan_rows(a.plan, W)
     runs = runs_of(wdir)
     levels = {}
@@ -369,21 +380,24 @@ def main():
                 # continuous, mgoff separate; r2/r3 hw/pop/mg continuous) -> <tag>-windows.txt beside the figure
                 with open(os.path.join(out, "fig", f"{tag}-windows.txt"), "w") as f:
                     f.write(f"# Fig 2 windows of {W} {m['mix']} round {fr}" + ("" if multi else " (single round)") + "\n")
+                    if not MG:
+                        f.write(f"# {mgnote}\n")
                     for l, k, _, d, st, life in sorted(sel):
                         f.write(f"{l} {k} {'separate' if life == 'sep' else 'continuous'} lifetime, step {st}, {d}\n")
-                if {(l, k) for l, k, *_ in sel} == {(l, k) for l in ("L1", "L2") for k in FIXSYS} and len(sel) == 8:
+                if {(l, k) for l, k, *_ in sel} == {(l, k) for l in ("L1", "L2") for k in FIXSYS} and len(sel) == 2 * len(FIXSYS):
                     # Megalon C = C_diff = T(mgoff) - T(hw) (dec 2026-10-17 "(a)"): v6_fig2_split.py --megalon-c diff
                     # (default since CXL_SWMC 5b650ab4f) needs all four systems per load and refuses otherwise
                     f2 = os.path.join(an, "v6_fig2_split.py")
-                    cmd = [sys.executable, "-B", f2, "--megalon-c", "diff", "--out", os.path.join(out, "fig"),
+                    mc = ["--megalon-c", "diff"] if MG else ["--megalon-c", "none", "--megalon-note", mgnote]
+                    cmd = [sys.executable, "-B", f2] + mc + ["--out", os.path.join(out, "fig"),
                            "--tag", tag] + [f"{l}:{k}={d}:{st}" for l, k, _, d, st, _ in sel]
                     p = subprocess.run(cmd, capture_output=True, text=True)
                     if p.returncode != 0:
                         note(f"fig2 {tag}: rc {p.returncode}: {(p.stderr or p.stdout).strip()[-300:]}")
-                    else:
+                    elif MG:  # no C_diff without Megalon (v0.6.7 recsys)
                         cdiff(os.path.join(out, "fig", f"{tag}-fig2.csv"), W, m["mix"], cd_rows, fr)
                 else:
-                    note(f"fig2 {tag}: windows {sorted((l, k) for l, k, *_ in sel)} are not L1/L2 x hw/pop/mg/mgoff")
+                    note(f"fig2 {tag}: windows {sorted((l, k) for l, k, *_ in sel)} are not L1/L2 x {'/'.join(FIXSYS)}")
         write_csv(os.path.join(out, "cdiff.csv"), CD_HEADER, cd_rows)
     with open(os.path.join(out, "notes.txt"), "w") as f:
         f.write("\n".join(notes) + ("\n" if notes else ""))

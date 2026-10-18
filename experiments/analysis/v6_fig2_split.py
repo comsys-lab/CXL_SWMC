@@ -27,10 +27,14 @@ Megalon C method (--megalon-c; user decision 2026-10-17, state/TASKS.md "(a) 차
                   overhead. Popcorn C from kernel counters as above, T(pop) - T(hw) as a cross-check column. Same
                   offered rate (1%), same measure window length, same mix (loadgen mix.*) and workload per load.
   sampled         the previous definition (sampled-scaled C of the mg run; no mgoff); output identical to before.
+  none            no Megalon (H1 v0.6.7, user decision 2026-10-18: RecSys measures all-HWcc and Popcorn only): each load
+                  needs exactly hw and pop (mg / mgoff refused); rows All HWcc and Popcorn as in "sampled"; a CSV meta
+                  line "megalon_c" states it, with --megalon-note (where the Megalon numbers are).
 
 usage: v6_fig2_split.py --out DIR --tag kv-ycsb-b {L1|L2}:SYS=DIR[:STEPS] ...   SYS in hw, pop, mg, mgoff
        e.g. L1:hw=R/hw:2 L1:pop=R/pop:2 L1:mg=R/mg:2 L1:mgoff=R/mg-t0:2 L2:hw=R/hw:1 ... L2:mgoff=R/mg-t0:1
        v6_fig2_split.py --megalon-c sampled ... (no mgoff runs)
+       v6_fig2_split.py --megalon-c none [--megalon-note TEXT] ... L1:hw=.. L1:pop=.. L2:hw=.. L2:pop=..
 One PNG per load (<tag>-fig2-<load>.png) and one CSV for all loads (<tag>-fig2.csv).
 """
 import argparse, os, sys
@@ -55,8 +59,10 @@ def main():
     ap.add_argument("--out", required=True)
     ap.add_argument("--tag", required=True)
     ap.add_argument("--ops", help="operation order (default: discovered, sorted)")
-    ap.add_argument("--megalon-c", choices=("diff", "sampled"), default="diff",
-                    help="Megalon C: diff = T(mg timers off) - T(hw) (default, needs mgoff runs); sampled = old path")
+    ap.add_argument("--megalon-c", choices=("diff", "sampled", "none"), default="diff",
+                    help="Megalon C: diff = T(mg timers off) - T(hw) (default, needs mgoff runs); sampled = old path; "
+                         "none = no Megalon runs (hw and pop only)")
+    ap.add_argument("--megalon-note", default="", help="--megalon-c none: where the Megalon numbers come from (CSV meta)")
     a = ap.parse_args()
     if a.megalon_c == "diff":
         return main_diff(a)
@@ -70,9 +76,12 @@ def main():
         loads.setdefault(load, {})[k] = (run, run.select(steps))
     rates = {}
     for load, ent in loads.items():
-        miss = [k for k in ("hw", "pop", "mg") if k not in ent]
+        need = ("hw", "pop") if a.megalon_c == "none" else ("hw", "pop", "mg")
+        miss = [k for k in need if k not in ent]
         if miss:
-            sys.exit(f"load {load}: missing runs for {miss} (each load needs hw, pop and mg at the same rate)")
+            sys.exit(f"load {load}: missing runs for {miss} (each load needs {', '.join(need)} at the same rate)")
+        if a.megalon_c == "none" and set(ent) != set(need):
+            sys.exit(f"load {load}: --megalon-c none takes hw and pop only, got {sorted(ent)}")
         rates[load] = {k: offered(r, st) for k, (r, st) in ent.items()}
         lo, hi = min(rates[load].values()), max(rates[load].values())
         if hi > lo * RATE_TOL:
@@ -124,7 +133,9 @@ def main():
                   "wseq/wseq_end x write_sections/anchor.write_sampled (no scaling with events_always; no probe "
                   "correction); so those Megalon C terms are sampled estimates, not measured sums: " + "; ".join(lean))] \
         if lean else []
-    v6.write_csv(csvp, lean_meta + [
+    none_meta = [("megalon_c", "none: no Megalon runs for this figure (all-HWcc and Popcorn only)"
+                   + (f"; {a.megalon_note}" if a.megalon_note else ""))] if a.megalon_c == "none" else []
+    v6.write_csv(csvp, none_meta + lean_meta + [
         ("figure", f"MOT1 v6 Fig 2 coherence management vs rest per operation ({a.tag}); PNGs {a.tag}-fig2-<load>.png"),
         ("formula", "T_o = t_ns / ops; C_o = C / ops with C = pop_is_ns+pop_sm_ns+pop_wp_ns+pop_ipi_ns (Popcorn) | "
                     "meg_check_C_ns+meg_vcopy_ns_sampled*meg_vcopy_cnt/"

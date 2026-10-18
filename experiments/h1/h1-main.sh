@@ -17,6 +17,8 @@
 #   r2, r3 (per mix): hw, pop, mg Latin square, each one lifetime SLO -> settle -> L2 -> L1 = the "continuous" sample.
 #   check.py r2 compares hw/pop r1 separate vs r2 continuous against the run-to-run spread (mg, continuous in both
 #   rounds); REPORT lines block the r2 acceptance (r3) until the user has seen them.
+# Systems per workload (v0.6.7, h1sys.py; user decision 2026-10-18): recsys = hw, pop only (no mg / mgoff lifetimes;
+#   r1 levels computed right after the hw/pop SLO-only lifetimes of the mix; Megalon RecSys numbers: RECSYS-V1 v1.4).
 # Per workload W and round n (stage dir <E>/<W>/r<n>/run/, must not exist):
 #   1. gate: pretouch gate (standing rule 2026-10-17) and h1-gate.sh (partition check, no build, node1 measurement CPU
 #      sets quiet; VM/node0 load not judged, user 2026-10-18)

@@ -3,13 +3,15 @@
 # (init_state=shared + preload, recv_mode poll), Megalon = recsys-megalon/14 on Megalon 77 with ONE OBJECT PER
 # EMBEDDING TABLE (MG_RPO_OPT N = MG_TABLE_N = 0; main configuration, reports/PAPER-direction-2026-10-18.md §5.5),
 # mgoff = the same with MEGALON_COH_TIMERS=0. The per-row variant (N = 1, "mgrow") is RECSYS-V1 v1.4 only; it is not
-# an H1 system (H1-HOOK v2 / check.py / collect.py know hw pop mg mgoff only; open question in H1 packet v0.6.6).
+# an H1 system. v0.6.7 (user decision 2026-10-18 "그냥 recsys는 megalon 측정 하지마"): H1 RecSys measures hw and pop
+# only (experiments/h1/h1sys.py -> H1_SYSTEMS="hw pop"); the Megalon settings below stay pinned but no mg / mgoff
+# lifetime runs; the Megalon RecSys numbers come from RECSYS-V1 v1.4.
 # Mixes = EKKO avg / peak. Re-pinned 2026-10-18 (branch recsys-v14) for the table-object builds.
 # Plain = builds/recsys/12 (same source 77ba0fa69 as recsys-megalon/14; server.cc is shared, so the older plain build
 # is not used), guest dirs /home/comsys/rs12 and /home/comsys/rsm14 (installed by RECSYS-V1 v1.4). --mg-rows-per-object
 # has no default and is required with --backend megalon (main-block.sh passes MG_RPO_OPT MG_TABLE_N to mg and mgoff).
 # MG_COH_SAMPLE=1: every Megalon section timed (RECSYS-V1 v1.4 user decision 2026-10-18 for the table objects, ~26
-# write sections per round; H1 use to be confirmed, H1 packet v0.6.6 Q-H5).
+# write sections per round; user: every-section timing also in H1, Q-H5 decided; unused while recsys has no Megalon).
 . "$(dirname "${BASH_SOURCE[0]}")/pins-common.inc"
 HR=$P/CXL_SWMC                      # live tree (main-block.sh resolves session.sh / v1_check.py / host-gate.sh next to itself)
 HOOK_FILE=$HR/experiments/recsys/main-block.sh
@@ -32,7 +34,7 @@ PIN_SHA256="$COMMON_SHA256
 f9c1753f3bef2ab0941153058860227145f2d7b7e33a210bdc3338fad14eacda  $P/builds/recsys-megalon/14/lib/libmegalon.so
 de2e9a4cd7ee41df5d9a938836802b0ee5186ba69b42252e3ab747f0bfeae193  $P/builds/recsys-loadgen/9/manifest.txt
 61bb70687ef15823a33a56c282d53eecdbcc1c1e574589eeba7791b4a65d81c0  $P/builds/recsys-loadgen/9/loadgen
-9236acd603d80f1293155e62f4cb14def128d611a61012cb75f5fe18530202d9  $HOOK_FILE
+57c07bf94615d8c84634e60e62241623230b10e51c6ecc92cece0eadee65d800  $HOOK_FILE
 68c5b9ceaf986e9e05e941d586a9a5cb5bb162b1963181ce02efa5d34cce5b54  $HR/experiments/recsys/session.sh
 22b5d043c733b2c477436154054bef975272426a71d6607e66abeb97bdc8951f  $HR/experiments/recsys/v1_check.py
 32d171199d6a47d15fcfa6971522e253fe21d857e91c9049c201e55a0cdac230  $HR/experiments/recsys/check_breakdown.py

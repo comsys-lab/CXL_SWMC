@@ -6,9 +6,11 @@
 # r1:   per mix hw, pop SLO-only lifetimes; mg lifetime SLO -> $H1_LEVELS_CMD <mix> -> settle -> L2 -> L1; mgoff lifetime
 #       (settle -> L2 -> L1) right after mg; hw, pop separate fixed lifetimes
 # cont: per mix hw, pop, mg each SLO -> settle -> L2 -> L1 at H1_LEVELS; mgoff lifetime right after mg
-# env: H1MODE r1|cont, H1_N, H1_MIXES, H1_LEVELS (cont) / H1_LEVELS_CMD (r1), H1_SETTLE_S, H1_SEED, H1_PARENT_LOCK,
+# H1_SYSTEMS (hook.sh, h1sys.py; v0.6.7): "hw pop mg" as above; "hw pop" (recsys): r1 per mix hw, pop SLO-only
+#   lifetimes -> $H1_LEVELS_CMD <mix> -> hw, pop separate fixed lifetimes; cont hw, pop each SLO -> fix; no mg / mgoff.
+# env: H1MODE r1|cont, H1_N, H1_MIXES, H1_SYSTEMS, H1_LEVELS (cont) / H1_LEVELS_CMD (r1), H1_SETTLE_S, H1_SEED, H1_PARENT_LOCK,
 #   LOCK (test lock), STUB_WORKLOAD, STUB_FAIL (optional): "note:<sys>:<mix>" = that SLO run ends with a note;
-#   "rc" = the block fails at once.
+#   "rc" = the block fails at once; "mgextra" = with H1_SYSTEMS "hw pop", an mg SLO entry is written anyway.
 set -uo pipefail
 D=${1:?}
 : "${H1MODE:?}" "${H1_N:?}" "${H1_PARENT_LOCK:?}" "${STUB_WORKLOAD:?}" "${H1_SETTLE_S:?}"
@@ -19,6 +21,9 @@ import json, os, subprocess, sys
 d = sys.argv[1]
 mode, n, w = os.environ["H1MODE"], os.environ["H1_N"], os.environ["STUB_WORKLOAD"]
 settle = int(os.environ["H1_SETTLE_S"])
+systems = os.environ["H1_SYSTEMS"].split()
+assert systems in (["hw", "pop", "mg"], ["hw", "pop"]), systems
+mgon = "mg" in systems
 fail = os.environ.get("STUB_FAIL", "")
 base = {"hw": 100.0, "pop": 40.0, "mg": 80.0}
 stream = {"vdb": "search", "recsys": "query"}.get(w, "mixed")
@@ -114,21 +119,23 @@ for spec in os.environ["H1_MIXES"].split():
             life = f"{sysk}-{mix}-slo-r{n}"
             entry(life, sysk, mix, "slo", slo_part(life, sysk, mix), "-", "sep")
         life = f"mg-{mix}-r{n}"
-        entry(life + "-slo", "mg", mix, "slo", slo_part(life, "mg", mix), "-", "cont")
+        if mgon or fail == "mgextra":  # mgextra: a Megalon run where the workload has none (hook must refuse)
+            entry(life + "-slo", "mg", mix, "slo", slo_part(life, "mg", mix), "-", "cont")
         p = subprocess.run([os.environ["H1_LEVELS_CMD"], mix], capture_output=True, text=True)
         if p.returncode != 0:
             print(f"SEQUENCE STOP: levels callback {mix}: {p.stderr.strip()}")
             sys.exit(1)
         l2, l1 = map(float, p.stdout.split())
-        entry(life + "-fix", "mg", mix, "fix", fix_part(life, "mg", l2, l1), "1,2", "cont")
-        lo = f"mgoff-{mix}-fix-r{n}"
-        entry(lo, "mgoff", mix, "fix", fix_part(lo, "mgoff", l2, l1), "1,2", "sep")
+        if mgon:
+            entry(life + "-fix", "mg", mix, "fix", fix_part(life, "mg", l2, l1), "1,2", "cont")
+            lo = f"mgoff-{mix}-fix-r{n}"
+            entry(lo, "mgoff", mix, "fix", fix_part(lo, "mgoff", l2, l1), "1,2", "sep")
         for sysk in ("hw", "pop"):
             lf = f"{sysk}-{mix}-fix-r{n}"
             entry(lf, sysk, mix, "fix", fix_part(lf, sysk, l2, l1), "1,2", "sep")
     else:
         l2, l1 = rates_cont(mix)
-        for sysk in ("hw", "pop", "mg"):
+        for sysk in systems:
             life = f"{sysk}-{mix}-r{n}"
             entry(life + "-slo", sysk, mix, "slo", slo_part(life, sysk, mix), "-", "cont")
             entry(life + "-fix", sysk, mix, "fix", fix_part(life, sysk, l2, l1), "1,2", "cont")

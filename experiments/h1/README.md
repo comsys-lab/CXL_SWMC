@@ -80,6 +80,13 @@ The block file carries the literal marker `H1-HOOK v2` (hook.sh refuses v1). It 
    numactl --physcpubind=$LG_CPUS --membind=1 $LOADGEN ...` (measure.slice; user.slice can no longer reach 56-63).
    Without H1_MEASURE_RUN (validation packets) both stay as they are. measure-run.sh clears the environment: pass any
    variable loadgen needs with --env.
+9. Systems per workload (v0.6.7, experiments/h1/h1sys.py; user decision 2026-10-18 "그냥 recsys는 megalon 측정
+   하지마"): hook.sh passes `H1_SYSTEMS` ("hw pop mg" for kv, lmdb, vdb; "hw pop" for recsys). With "hw pop" the block
+   runs no mg and no mgoff lifetime: r1 per mix = 3a (hw, pop SLO-only), then `"$H1_LEVELS_CMD" <mix>` outside any
+   lifetime (levels over hw, pop), then 3d (hw, pop fixed lifetimes); cont = hw, pop in the order shuffle(seed
+   `H1-<W>-latin`) rotated by n mod 2, each `slo` then `fix`. h1-runs.tsv then has no mg / mgoff entries (hook.sh
+   refuses them); levels.tsv x_mg is "-"; Fig 2 uses `v6_fig2_split.py --megalon-c none` (rows All HWcc, Popcorn).
+   The Megalon RecSys numbers come from RECSYS-V1 v1.4.
 
 ## Self-test
 `bash experiments/h1/test/selftest.sh /home/comsys/sungsu/destijl-control/workspaces/h1-main/selftest-<n>` must print

@@ -67,6 +67,12 @@
 #   --factor 1.5 --precision 0.05 --max-steps 20); <lifetime>/fix = settle (loadgen --warmup-s H1_SETTLE_S at the
 #   L2 rate, discarded, no stats snapshot) + L2 window + L1 window (60 s each, no SLO abort). A fix-only lifetime starts
 #   with the settle right after READY (no extra warm-up). The Ekko point (publish_frac, update rate) is per mix.
+#   H1_SYSTEMS (from hook.sh / experiments/h1/h1sys.py; required): "hw pop" (H1 v0.6.7, user decision 2026-10-18 "그냥
+#   recsys는 megalon 측정 하지마": no Megalon lifetime in H1 RecSys) or "hw pop mg" (the earlier flow below).
+#   "hw pop": r1 per mix: hw and pop SLO-only lifetimes (order seed H1-recsys-r1-<mix>), then "$H1_LEVELS_CMD" <mix>
+#     outside any lifetime (non-zero = LEVELS STOP), then hw and pop fix-only lifetimes (order seed H1-recsys-r1-<mix>-fix);
+#     cont: hw, pop in the order shuffle(seed H1-recsys-latin) rotated left by n mod 2, each slo -> fix; no mgoff.
+#   "hw pop mg":
 #   r1, per mix (mix order: shuffle seed H1-recsys-r1): hw and pop SLO-only lifetimes (order seed H1-recsys-r1-<mix>);
 #     mg lifetime: slo -> "$H1_LEVELS_CMD" <mix> (non-zero = LEVELS STOP: stop, roll back) -> fix at those rates;
 #     mgoff lifetime (MEGALON_COH_TIMERS=0) right after mg: fix only; hw and pop fix-only lifetimes (order seed
@@ -111,6 +117,8 @@ if [ $BLOCK = h1 ]; then  # H1-HOOK v2 inputs (see the header)
   [ -d "${PRETOUCH_DIR:-}" ] && [ -n "${MEASURE_ENV_DIR:-}" ] && [ -n "${EXPECT_DAX_UUID:-}" ] \
     || { echo "SEQUENCE STOP: BLOCK=h1 needs PRETOUCH_DIR, MEASURE_ENV_DIR and EXPECT_DAX_UUID"; exit 2; }
   [ -z "${SYSTEMS:-}" ] || { echo "SEQUENCE STOP: SYSTEMS is not used with BLOCK=h1"; exit 2; }
+  case "${H1_SYSTEMS:-}" in "hw pop"|"hw pop mg") ;; *) echo "SEQUENCE STOP: BLOCK=h1 needs H1_SYSTEMS 'hw pop' or 'hw pop mg' (got '${H1_SYSTEMS:-}')"; exit 2;; esac
+  H1MG=0; [ "$H1_SYSTEMS" = "hw pop mg" ] && H1MG=1
   [ "${H1_MEASURE_RUN:-0}" = 1 ] || { echo "SEQUENCE STOP: BLOCK=h1 needs H1_MEASURE_RUN=1 (h1-gate.sh + measure-run.sh, README item 8)"; exit 2; }
   SEED=$H1_SEED EKKO=${EKKO:-per-mix}
 else
@@ -533,17 +541,22 @@ if [ $BLOCK = h1 ]; then  # H1-HOOK v2 driver (header)
   lv_rates() {  # <mix>: "<L2_rate> <L1_rate>" from H1_LEVELS (cont)
     awk -F'\t' -v m="$1" 'NR == 1 { for (i = 1; i <= NF; i++) c[$i] = i; next }
       $1 == m { print $(c["L2_rate"]), $(c["L1_rate"]); f = 1 } END { exit f ? 0 : 1 }' "$H1_LEVELS"; }
-  if [ $H1MODE = cont ]; then
+  if [ $H1MODE = cont ] && [ $H1MG = 0 ]; then  # v0.6.7: hw, pop only
+    base=($(h1shuffle H1-recsys-latin hw pop)); rot=$(( H1_N % 2 ))
+    ord="${base[*]:$rot} ${base[*]:0:$rot}"; ord=$(echo $ord)
+  elif [ $H1MODE = cont ]; then
     base=($(h1shuffle H1-recsys-latin hw pop mg)); rot=$(( H1_N % 3 ))
     ord="${base[*]:$rot} ${base[*]:0:$rot}"; ord=$(echo $ord)
   fi
-  { echo "# H1 DLRM recsys $H1MODE round $H1_N (H1-HOOK v2; loadgen seed $SEED; settle $H1_SETTLE_S s at L2; mixes: shuffle seed H1-recsys-r$H1_N)"
+  { echo "# H1 DLRM recsys $H1MODE round $H1_N (H1-HOOK v2; systems $H1_SYSTEMS; loadgen seed $SEED; settle $H1_SETTLE_S s at L2; mixes: shuffle seed H1-recsys-r$H1_N)"
     echo "mixes: $mixes"; echo "H1_MIXES: $H1_MIXES"
     for m in $mixes; do
-      if [ $H1MODE = r1 ]; then
+      if [ $H1MODE = r1 ] && [ $H1MG = 0 ]; then
+        echo "$m: slo-only $(h1shuffle H1-recsys-r1-$m hw pop); levels; fix-only $(h1shuffle H1-recsys-r1-$m-fix hw pop)"
+      elif [ $H1MODE = r1 ]; then
         echo "$m: slo-only $(h1shuffle H1-recsys-r1-$m hw pop); mg (slo -> levels -> fix); mgoff (fix); fix-only $(h1shuffle H1-recsys-r1-$m-fix hw pop)"
       else
-        echo "$m: $ord (each slo -> fix; mgoff fix right after mg; latin seed H1-recsys-latin rotated left by $rot); levels $(lv_rates $m || echo MISSING)"
+        echo "$m: $ord (each slo -> fix$([ $H1MG = 1 ] && echo "; mgoff fix right after mg"); latin seed H1-recsys-latin rotated left by $rot); levels $(lv_rates $m || echo MISSING)"
       fi
     done; } | tee "$E/order.txt"
   for m in $mixes; do
@@ -553,15 +566,20 @@ if [ $BLOCK = h1 ]; then  # H1-HOOK v2 driver (header)
         rate_for ${EK[$m]} "$E/update-rate-$s-$m-slo-r1.txt"
         life_start $s $s-$m-slo-r1; h1_slo $s; h1_entry $NAME $s slo slo - sep; life_stop $s
       done
+      if [ $H1MG = 1 ]; then
       rate_for ${EK[$m]} "$E/update-rate-mg-$m-r1.txt"
       life_start mg mg-$m-r1; h1_slo mg; h1_entry $NAME-slo mg slo slo - cont
+      fi
+      # levels of the mix: inside the mg lifetime (hw pop mg) or after the hw/pop SLO-only lifetimes (hw pop, v0.6.7)
       lv=$("$H1_LEVELS_CMD" $m 2> "$E/levels-cb-$m.err") || stop "LEVELS STOP $m: $(cat "$E/levels-cb-$m.err")"
       read -r l2 l1 <<< "$lv"
       awk -v a="$l2" -v b="$l1" 'BEGIN { exit !(a > 0 && b > a) }' || stop "LEVELS STOP $m: bad rates '$lv'"
       echo "levels $m: L2=$l2 L1=$l1" | tee -a "$E/levels-used.txt"
+      if [ $H1MG = 1 ]; then
       h1_fix mg $l2 $l1; h1_entry $NAME-fix mg fix fix $H1STEPS cont; life_stop mg
       rate_for ${EK[$m]} "$E/update-rate-mgoff-$m-fix-r1.txt"
       life_start mgoff mgoff-$m-fix-r1; h1_fix mgoff $l2 $l1; h1_entry $NAME mgoff fix fix $H1STEPS sep; life_stop mgoff
+      fi
       for s in $(h1shuffle H1-recsys-r1-$m-fix hw pop); do
         rate_for ${EK[$m]} "$E/update-rate-$s-$m-fix-r1.txt"
         life_start $s $s-$m-fix-r1; h1_fix $s $l2 $l1; h1_entry $NAME $s fix fix $H1STEPS sep; life_stop $s

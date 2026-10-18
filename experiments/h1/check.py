@@ -41,12 +41,21 @@ WARN checks:
   W7 per SLO run with the loadgen knee bracket (loadgen since 2026-10-18 "A+C"; older runs: no W7): confirm search
      ended at the probe limit (summary confirm_search.finish "probe limit ...") or bracket rel_width > 5 % (hi/lo - 1);
      the message names system, mix, rel_width, finish and whether the system is the mix's weakest (it defines L1/L2)
+Systems per workload (h1sys.py, v0.6.7; user decision 2026-10-18 "그냥 recsys는 megalon 측정 하지마"): recsys = hw, pop
+  only. For such a workload every check above expects only its systems: F1 slo/fix entries hw, pop; F4 4 windows per
+  mix (L1/L2 x hw/pop); F5 Fig 2 rows exactly All HWcc and Popcorn (v6_fig2_split.py --megalon-c none; a Megalon row is
+  FAIL); F6 Popcorn only; F9, W5, W6 and C2 do not apply (C_diff absent by design: an INFO line names the RECSYS-V1
+  v1.4 source); F8 / W1 / W4 / W7 over hw, pop; C1 has no Megalon run-to-run spread: r2 threshold 5 %, r3 max(5 %,
+  2 x the system's own r2 -> r3 change).
 usage: check.py --plan h1-plan.tsv --workload W --round n [--skip-fig2] E
 """
 import argparse, csv, json, os, sys
 
-SYSTEMS = ("hw", "pop", "mg")            # SLO phase (Fig 1, Megalon timers on)
-FIXSYS = ("hw", "pop", "mg", "mgoff")    # fixed phase (Fig 2; mgoff = Megalon timers off for C_diff)
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from h1sys import slo_systems, fix_systems, has_megalon, NO_MEGALON_NOTE  # noqa: E402
+
+SYSTEMS = ("hw", "pop", "mg")            # SLO phase (Fig 1, Megalon timers on); per workload: slo_systems(W)
+FIXSYS = ("hw", "pop", "mg", "mgoff")    # fixed phase (Fig 2; mgoff = Megalon timers off for C_diff); fix_systems(W)
 SPLIT = {"vdb": "opsplit-steps.csv", "kv": "opsplit.csv", "lmdb": "opsplit.csv", "recsys": "breakdown.csv"}
 lines, nfail, nwarn, nrep = [], 0, 0, 0
 
@@ -173,11 +182,15 @@ def compare(W, n, E, mixes, skip):
         for (load, op) in sorted({(l, o) for l, o, _ in tn}):
             g = lambda t, k: (t or {}).get((load, op, k))
             mg1, mgn = g(t1, "mg"), g(tn, "mg")
-            if not (mg1 and mgn):
+            if not has_megalon(W):  # v0.6.7 (recsys): no continuous-in-every-round Megalon run -> no spread term
+                mg1 = mgn = None
+                spread = 0.0
+            elif not (mg1 and mgn):
                 res("F", f"C1 {m} {load}/{op} spread", False, f"T_mg_on r1 {mg1} r{n} {mgn}")
                 continue
-            spread = abs(mgn - mg1) / mg1
-            if t2 and g(t2, "mg"):
+            else:
+                spread = abs(mgn - mg1) / mg1
+            if mgn and t2 and g(t2, "mg"):
                 spread = max(spread, abs(mgn - g(t2, "mg")) / g(t2, "mg"))
             for k in ("hw", "pop"):
                 a1, an = g(t1, k), g(tn, k)
@@ -190,6 +203,8 @@ def compare(W, n, E, mixes, skip):
                 d, thr = abs(an - a1) / a1, max(0.05, 2 * sp)
                 res("R", f"C1 {m} {load}/{op} {k} T r1-sep vs r{n}-cont", d <= thr,
                     f"|dT|/T {d:.3f} > threshold {thr:.3f} (5 % or 2 x spread {sp:.3f}); T r1 {a1:g} r{n} {an:g} ns")
+            if not has_megalon(W):
+                continue  # C2: no C_diff (no Megalon in H1 for this workload)
             c1, cn = g(t1, "cdiff"), g(tn, "cdiff")
             dmg = abs(mgn - mg1)
             if t2 and g(t2, "mg"):  # r3: the r2 -> r3 change of mg is run-to-run spread too (verifier LOW-1)
@@ -220,6 +235,10 @@ def main():
     ap.add_argument("E")
     a = ap.parse_args()
     W, n, E = a.workload, a.round, a.E
+    SYSTEMS, FIXSYS, MG = slo_systems(W), fix_systems(W), has_megalon(W)  # per workload (v0.6.7)
+    if not MG:
+        lines.append(f"INFO systems {' '.join(SYSTEMS)}: {NO_MEGALON_NOTE.get(W, 'no Megalon for ' + W)}; F9/W5/W6/C2 "
+                     "not applicable (C_diff absent by design)")
     S = os.path.join(E, W, f"r{n}")
     mixes = plan_mixes(a.plan, W)
     rs = {}
@@ -316,6 +335,8 @@ def main():
                 elif lab == "All HWcc":
                     if C != 0:
                         errs.append(f"all-HWcc C {C} ({where})")
+                elif lab.startswith("Megalon") and not MG:
+                    errs.append(f"Megalon row '{lab}' for {W} (no Megalon in H1 for this workload) ({where})")
                 elif lab == "Megalon (timers off)":  # sampled C of the timers-on run: missing or 0 = FAIL, > T = WARN
                     mgrows.append(x)
                     cs, ton = fnum(x.get("C_sampled_ns")), fnum(x.get("T_mg_on_ns"))
@@ -332,8 +353,13 @@ def main():
                     errs.append(f"unexpected system row '{lab}' ({where})")
             if not popc > 0:
                 errs.append("Popcorn C summed over ops and loads = 0")
+            want_lab = {"All HWcc", "Popcorn"} | ({"Megalon (timers off)"} if MG else set())
+            if not MG and {x["system"] for x in f2} != want_lab:  # v0.6.7: exactly All HWcc + Popcorn
+                errs.append(f"system rows {sorted({x['system'] for x in f2})} != {sorted(want_lab)}")
             res("F", f"F5 {m} Fig 2 C/T", not errs and len(f2) > 0, "; ".join(errs[:5]) or "no rows")
-        if a.skip_fig2:
+        if not MG:
+            pass  # F9 / W6: no Megalon rows by design (INFO line above)
+        elif a.skip_fig2:
             res("W", f"F9 {m} C_diff", False, "skipped (--skip-fig2, self-test only)")
         elif f2 is not None:  # Fig 2 Megalon C = C_diff_ns of the "Megalon (timers off)" rows (dec 2026-10-17 "(a)")
             miss = [f"{x['load']}/{x['op']}" for x in mgrows
@@ -360,8 +386,8 @@ def main():
             res("W", f"W3 {m} {x['system']} {x['level']} window", ach is not None and off and ach / off >= 0.95
                 and x["pass"] == "True", f"achieved {ach} / offered {off}, pass {x['pass']}")
         if all((m, s) in xs for s in SYSTEMS):
-            res("W", f"W1 {m} all-HWcc highest", xs[(m, "hw")] >= 0.98 * max(xs[(m, "pop")], xs[(m, "mg")]),
-                f"x hw {xs[(m, 'hw')]:g} pop {xs[(m, 'pop')]:g} mg {xs[(m, 'mg')]:g}")
+            res("W", f"W1 {m} all-HWcc highest", xs[(m, "hw")] >= 0.98 * max(xs[(m, k)] for k in SYSTEMS if k != "hw"),
+                "x " + " ".join(f"{k} {xs[(m, k)]:g}" for k in SYSTEMS))
     try:
         bad = [l for l in open(os.path.join(S, "collect", "notes.txt"))
                if any(t in l for t in ("no overload step", "fig1", "fig2", "export_csv"))

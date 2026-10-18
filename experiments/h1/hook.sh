@@ -13,6 +13,8 @@
 #   phase fix: hw, pop (r1 "sep", cont mode "cont"), mg ("cont"), mgoff ("sep": its own lifetime settle -> L2 -> L1,
 #              no SLO search, right after the mg lifetime of the mix; user decision 2026-10-18: Megalon 77, no runtime
 #              timer switch); steps "<L2 step>,<L1 step>" (measured fixed steps of that run dir's loadgen)
+#   systems per workload (h1sys.py, v0.6.7): recsys has no mg / mgoff entries (user decision 2026-10-18); the block
+#   gets the list as H1_SYSTEMS ("hw pop mg" or "hw pop") and must run exactly those.
 #   every run dir holds loadgen/summary.json and loadgen/steps.jsonl.
 set -uo pipefail
 W=${1:?} MODE=${2:?} D=${3:?} N=${4:?} ARG=${5:?} LV=${6:-}
@@ -28,7 +30,8 @@ grep -q "H1-HOOK v2" "$HOOK_FILE" || stop "hook missing: $HOOK_FILE has no 'H1-H
 if [ -n "$PIN_SHA256" ]; then echo "$PIN_SHA256" | sha256sum --quiet -c - || stop "pinned file hash mismatch"; fi
 [ -d "$D" ] && [ -z "$(ls -A "$D")" ] || stop "$D missing or not empty"
 [[ "${H1_SETTLE_S:-}" =~ ^[1-9][0-9]*$ ]] || stop "bad H1_SETTLE_S"
-XE=(H1_MIXES="$ARG" H1_SEED=$(( ${H1_SEED_BASE:-20261017} + N )) H1_SETTLE_S=$H1_SETTLE_S)
+SYS=$(python3 -I -B $H/h1sys.py slo "$W") || stop "h1sys.py"
+XE=(H1_MIXES="$ARG" H1_SEED=$(( ${H1_SEED_BASE:-20261017} + N )) H1_SETTLE_S=$H1_SETTLE_S H1_SYSTEMS="$SYS")
 case $MODE in
   r1) [ "$N" = 1 ] || stop "r1 mode is round 1"; : "${H1_LEVELS_CMD:?}" "${H1_PLAN:?}" "${H1_W:?}" "${H1_LEVELS_OUT:?}"
       XE+=(H1_LEVELS_CMD="$H1_LEVELS_CMD" H1_PLAN="$H1_PLAN" H1_W="$H1_W" H1_LEVELS_OUT="$H1_LEVELS_OUT" H1_STAGE_DIR="$D");;
@@ -45,18 +48,19 @@ RC=$?
 [ $RC = 0 ] || stop "block rc $RC ($(grep -m1 'STOP' "$D/sequence.log" || tail -n 1 "$D/sequence.log"))"
 tail -n 3 "$D/sequence.log" | grep -q "SEQUENCE DONE" || stop "no SEQUENCE DONE in sequence.log"
 [ -f "$D/h1-runs.tsv" ] || stop "no h1-runs.tsv"
-python3 -I -B - "$D" "$MODE" "$N" $MIXTAGS <<'EOF' || stop "h1-runs.tsv incomplete"
+python3 -I -B - "$D" "$MODE" "$N" "$SYS" $MIXTAGS <<'EOF' || stop "h1-runs.tsv incomplete"
 import json, os, sys
-d, mode, n, mixes = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4:]
+d, mode, n, systems, mixes = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4].split(), sys.argv[5:]
 r1 = mode == "r1"
 want = {}
 for m in mixes:
-    for s in ("hw", "pop", "mg"):
+    for s in systems:
         want[(m, s, "slo")] = "sep" if r1 and s != "mg" else "cont"
     for s in ("hw", "pop"):
         want[(m, s, "fix")] = "sep" if r1 else "cont"
-    want[(m, "mg", "fix")] = "cont"
-    want[(m, "mgoff", "fix")] = "sep"
+    if "mg" in systems:
+        want[(m, "mg", "fix")] = "cont"
+        want[(m, "mgoff", "fix")] = "sep"
 seen = {}
 for line in open(os.path.join(d, "h1-runs.tsv")):
     if not line.strip() or line.startswith("#"):

@@ -13,7 +13,10 @@ Refused (exit 1, "LEVELS STOP <reason>"; the sequence stops, a methodology judgm
   - a run with a non-empty summary note (e.g. "confirm failed at three rates"), no confirm result, or
     workload_finish != ok;
   - a run whose summary SLO differs from the plan row's slo;
-  - a mix without exactly one SLO run per system and round (systems hw, pop, mg).
+  - a mix without exactly one SLO run per system and round (the workload's systems, h1sys.py: hw, pop, mg; recsys
+    hw, pop since v0.6.7, user decision 2026-10-18).
+L1 = min over the workload's systems; for recsys (no Megalon) the r1 callback runs after the hw and pop SLO-only
+lifetimes of the mix (main-block.sh BLOCK=h1), and x_mg is "-".
 
 usage: levels.py --plan h1-plan.tsv --workload W --out levels.tsv SLO_DIR [SLO_DIR ...]
   SLO_DIR  one SLO-phase evidence dir per round (holds the hook's h1-runs.tsv)
@@ -24,7 +27,10 @@ levels.tsv (tab separated, one row per mix, header line first):
 """
 import argparse, json, os, sys
 
-SYSTEMS = ("hw", "pop", "mg")
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from h1sys import slo_systems  # noqa: E402  (v0.6.7: systems per workload; recsys = hw, pop)
+
+SYSTEMS = ("hw", "pop", "mg")  # levels.tsv columns x_hw x_pop x_mg (fixed header; "-" for a system not measured)
 
 
 def stop(msg):
@@ -102,13 +108,17 @@ def main():
         plan = [r for r in plan if r["mix"] == a.mix]
         if not plan:
             stop(f"mix {a.mix} not in the plan for {a.workload}")
+    systems = slo_systems(a.workload)
     runs = [r for d in a.slo_dirs for r in read_runs(d) if r["phase"] == "slo"]
+    extra = sorted({r["sys"] for r in runs} - set(systems))
+    if extra:
+        stop(f"SLO runs of systems {extra} not measured for {a.workload} (h1sys.py: {' '.join(systems)})")
     nround = len(a.slo_dirs)
     lines = ["\t".join(["mix", "weakest", "x_hw", "x_pop", "x_mg", "L1_x", "L2_x", "factor", "L1_rate", "L2_rate",
                         "rounds", "sources"])]
     for row in plan:
         xs, src, per_round = {}, [], []
-        for k in SYSTEMS:
+        for k in systems:
             sel = [r for r in runs if r["mix"] == row["mix"] and r["sys"] == k]
             rounds = sorted(r["round"] for r in sel)
             if len(sel) != nround or len(set(rounds)) != nround:
@@ -120,7 +130,7 @@ def main():
                 src.append(r["dir"])
                 per_round.append(f"{row['mix']} {k} r{r['round']} x_mean={x:g} x_sd={sd:g} ({p})")
             xs[k] = sum(vals) / len(vals)
-        weakest = min(SYSTEMS, key=lambda k: xs[k])
+        weakest = min(systems, key=lambda k: xs[k])
         l1 = xs[weakest]
         l2 = 0.5 * l1
         r1, r2 = (round(v * row["factor"], row["round"]) for v in (l1, l2))
@@ -132,7 +142,7 @@ def main():
             print(v)
         print(f"{a.workload} {row['mix']}: weakest {weakest} x={l1:g}; L1_x={l1:g} L2_x={l2:g}; "
               f"rates L1={r1} L2={r2} (factor {row['factor']:g})")
-        lines.append("\t".join([row["mix"], weakest] + [f"{xs[k]:.6g}" for k in SYSTEMS] +
+        lines.append("\t".join([row["mix"], weakest] + [f"{xs[k]:.6g}" if k in xs else "-" for k in SYSTEMS] +
                                [f"{l1:.6g}", f"{l2:.6g}", f"{row['factor']:g}", str(r1), str(r2), str(nround),
                                 ",".join(src)]))
     if a.mix and os.path.isfile(a.out):  # append one row; refuse an existing row for this mix

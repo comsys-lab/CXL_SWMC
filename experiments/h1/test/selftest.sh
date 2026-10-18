@@ -2,13 +2,19 @@
 # Host self-test of the staged H1 orchestration (no VM, no SSH, no sudo, no shared memory). Writes only below <out dir>.
 # Never run while a VM measurement holds workspaces/MEASUREMENT.lock (the coordinator says "Host free").
 # usage: selftest.sh <out dir under workspaces/h1-main/ (must not exist)> [<real SLO run dirs root for case E>]
+#        [<RECSYS-V1 v1.4 evidence dir for case M (read-only)>]
 #   A  stages through the stub hook: r1-kv; r1-lmdb refused before acceptance; h1-accept.sh; r1-lmdb, r1-vdb,
 #      r1-recsys (each accepted after its check PASS); r2 refused while an r1 is unaccepted (checked before the last
-#      accept); r2 --workloads kv,vdb; r3 --workloads lmdb refused (no r2); r3 --workloads kv; collect-all-r<n> after
+#      accept); r2 --workloads kv,vdb,recsys; r3 --workloads lmdb refused (no r2); r3 --workloads kv; collect-all-r<n> after
 #      every stage (rounds_note single round / n rounds). Checks: every check.txt H1CHECK PASS; levels from r1 (weakest pop,
 #      vdb u5 rate 42.105, kv integer 40/20); r2/r3 fixed windows at the r1 levels; collect-all slo-summary has 3
 #      rounds per mix x system; fixed phase with 4 systems (mgoff = Megalon timers off); coherence CPU pop 0.4 /
-#      mg, mgoff 0.2667 / hw 0; lock released after every stage
+#      mg, mgoff 0.2667 / hw 0; lock released after every stage. v0.6.7: recsys runs hw, pop only (h1sys.py): r1 and
+#      r2 without any mg / mgoff run dir or entry, levels.tsv x_mg "-", 4 fixed windows per mix, 2 slo-summary rows per
+#      mix, check.txt INFO line naming RECSYS-V1 v1.4; kv/lmdb/vdb unchanged (8 windows, 3 slo rows)
+#   M  v0.6.7 recsys without Megalon: (1) a block that writes an mg SLO entry for recsys anyway -> LEVELS STOP
+#      ("not measured") and HOOK STOP; (2) check.py F5 on a real hw/pop Fig 2 CSV (v6_fig2_split.py --megalon-c none
+#      on recovery/RECSYS-V1-v1.4 hw/pop val windows, read-only) -> OK; the same CSV with a Megalon row -> F5 FAIL
 #   B  STUB_FAIL=note:mg:u50 in r1-kv: SEQUENCE STOP at levels ("note")
 #   C  STUB_FAIL=rc in r1-kv: SEQUENCE STOP at the SLO hook
 #   D  real plugin pins-vdb.sh with FILL_ tokens (not dry): HOOK STOP "unpinned" (skipped once fully pinned)
@@ -53,16 +59,16 @@ stage A r1-recsys || fail "A r1-recsys"
 stage A r2 && fail "A r2 ran before r1-recsys was accepted"
 acc 1 recsys
 # r2 for a user-chosen subset (plan change 2026-10-18), r3 only where r2 is accepted
-stage A r2 --workloads kv,vdb || fail "A r2 subset"
-for w in kv vdb; do acc 2 $w; done
+stage A r2 --workloads kv,vdb,recsys || fail "A r2 subset"
+for w in kv vdb recsys; do acc 2 $w; done
 stage A r3 --workloads lmdb && fail "A r3 ran for lmdb without r2"
 stage A r3 --workloads kv || fail "A r3 kv"
 grep -q "STAGE DONE r3 \[kv\]" "$O/A/h1-state.txt" || fail "A no STAGE DONE r3 [kv]"
-[ ! -e "$O/A/lmdb/r2" ] && [ ! -e "$O/A/recsys/r2" ] && [ ! -e "$O/A/vdb/r3" ] || fail "A ran rounds outside the subset"
+[ ! -e "$O/A/lmdb/r2" ] && [ ! -e "$O/A/recsys/r3" ] && [ ! -e "$O/A/vdb/r3" ] || fail "A ran rounds outside the subset"
 python3 -I -B - "$O/A" <<'EOF' || fail "A content"
-import csv, sys
+import csv, glob, os, sys
 o = sys.argv[1]
-done = {"kv": (1, 2, 3), "lmdb": (1,), "vdb": (1, 2), "recsys": (1,)}
+done = {"kv": (1, 2, 3), "lmdb": (1,), "vdb": (1, 2), "recsys": (1, 2)}
 for w, rs in done.items():
     for n in rs:
         last = open(f"{o}/{w}/r{n}/check.txt").read().strip().splitlines()[-1]
@@ -71,10 +77,24 @@ lv = {r["mix"]: r for r in csv.DictReader(open(f"{o}/vdb/levels.tsv"), delimiter
 assert lv["u5"]["weakest"] == "pop" and float(lv["u5"]["L1_x"]) == 40 and lv["u5"]["L1_rate"] == "42.105", lv["u5"]
 kv = {r["mix"]: r for r in csv.DictReader(open(f"{o}/kv/levels.tsv"), delimiter="\t")}
 assert kv["u80"]["L1_rate"] == "40" and kv["u80"]["L2_rate"] == "20", kv["u80"]
+rs = {r["mix"]: r for r in csv.DictReader(open(f"{o}/recsys/levels.tsv"), delimiter="\t")}
+assert rs["avg"]["weakest"] == "pop" and rs["avg"]["x_mg"] == "-" and rs["avg"]["L1_rate"] == "40.0", rs["avg"]
+for n in (1, 2):  # v0.6.7: no Megalon in H1 recsys
+    ents = [l.split("\t")[1] for l in open(f"{o}/recsys/r{n}/run/h1-runs.tsv") if not l.startswith("#")]
+    assert sorted(set(ents)) == ["hw", "pop"] and len(ents) == 8, (n, ents)
+    assert not glob.glob(f"{o}/recsys/r{n}/run/mg*"), n
+    ck = open(f"{o}/recsys/r{n}/check.txt").read()
+    assert "INFO systems hw pop: Megalon not measured in H1 for recsys" in ck and "RECSYS-V1 v1.4" in ck, ck[:300]
+    assert not [l for l in ck.splitlines() if l.split()[1:2] and l.split()[1] in ("F9", "W5", "W6", "C2")], n
+    assert open(f"{o}/recsys/r{n}/collect/systems.txt").read().startswith("systems hw pop"), n
+for w in ("kv", "lmdb", "vdb"):
+    assert "INFO" not in open(f"{o}/{w}/r1/check.txt").read(), w
+    assert not os.path.exists(f"{o}/{w}/r1/collect/systems.txt"), w
 for w, ncell in (("kv", 3), ("lmdb", 3), ("vdb", 3), ("recsys", 2)):
+    nsys = 2 if w == "recsys" else 4
     for n in done[w]:
         fx = list(csv.DictReader(open(f"{o}/{w}/r{n}/collect/fix-steps.csv")))
-        assert len(fx) == 8 * ncell, (w, n, len(fx))  # hw, pop, mg, mgoff x L1/L2
+        assert len(fx) == 2 * nsys * ncell, (w, n, len(fx))  # hw, pop, mg, mgoff (recsys hw, pop) x L1/L2
         want = {"hw": 0.0, "pop": 0.4, "mg": 0.2667, "mgoff": 0.2667}
         for r in fx:
             assert abs(float(r["coh_cpu_vcpus"]) - want[r["system"]]) < 1e-3, r
@@ -85,7 +105,7 @@ for w, ncell in (("kv", 3), ("lmdb", 3), ("vdb", 3), ("recsys", 2)):
     for n in done[w]:  # collect-all after every stage: rounds 1..n
         ss = list(csv.DictReader(open(f"{o}/{w}/collect-all-r{n}/slo-summary.csv")))
         note = "single round (no variance)" if n == 1 else f"{n} rounds: mean and sample sd"
-        assert len(ss) == 3 * ncell and all(r["rounds"] == str(n) and r["rounds_note"] == note for r in ss), ss[:1]
+        assert len(ss) == (nsys - 1 if nsys == 4 else 2) * ncell and all(r["rounds"] == str(n) and r["rounds_note"] == note for r in ss), ss[:1]
         sa = list(csv.DictReader(open(f"{o}/{w}/collect-all-r{n}/steps-all.csv")))
         assert len(sa) > 0 and sa[0]["label"].startswith(w + "/"), sa[:1]
 print("A content OK")
@@ -262,4 +282,26 @@ grep -q "SEQUENCE STOP: r2 of kv not checked PASS + accepted" "$O/L.out" || fail
 stage L r3 --workloads lmdb || fail "L r3 lmdb"
 grep -q "STAGE DONE r3 \[lmdb\]" "$O/L/h1-state.txt" || fail "L no STAGE DONE r3 [lmdb]"
 echo "L OK"
+# M v0.6.7 recsys without Megalon
+mkdir -p "$O/M/run"
+printf 'owner=H1-main selftest\n' > "$O/M/lock"
+LOCK=$O/M/lock STUB_FAIL=mgextra H1_SETTLE_S=60 H1_LEVELS_CMD=$H/levels-cb.sh H1_PLAN=$H/h1-plan.tsv H1_W=recsys \
+  H1_LEVELS_OUT=$O/M/levels.tsv bash $H/hook.sh recsys r1 "$O/M/run" 1 "avg=EKKO=avg" > "$O/M.out" 2>&1 && fail "M1 rc 0"
+grep -q "HOOK STOP recsys r1 1: block rc" "$O/M.out" && grep -q "LEVELS STOP .*not measured for recsys" "$O/M/levels-avg.log" \
+  || fail "M1 reason ($(cat "$O/M.out"; cat "$O/M/levels-avg.log" 2>/dev/null))"
+RV=${3:-/home/comsys/sungsu/destijl-control/recovery/RECSYS-V1-v1.4}
+mkdir -p "$O/M2" && cp -r "$O/A/recsys" "$O/M2/recsys" && rm -rf "$O/M2/recsys/r2" || fail "M2 copy"
+F=$O/M2/recsys/r1/collect/fig
+nice -n 19 python3 -B $H/../analysis/v6_fig2_split.py --megalon-c none --megalon-note selftest --out "$O/M2/fig" --tag rs \
+  L1:hw=$RV/hw/val:1 L1:pop=$RV/pop/val:1 L2:hw=$RV/hw/val:1 L2:pop=$RV/pop/val:1 > "$O/M2-fig2.out" 2>&1 || fail "M2 fig2 none"
+cp "$O/M2/fig/rs-fig2.csv" "$F/recsys-avg-fig2.csv" && cp "$O/M2/fig/rs-fig2.csv" "$F/recsys-peak-fig2.csv"
+python3 -B $H/check.py --plan $H/h1-plan.tsv --workload recsys --round 1 "$O/M2" > "$O/M2-check.out" 2>&1
+C=$O/M2/recsys/r1/check.txt
+grep -q "^OK   F5 avg Fig 2 C/T" "$C" && grep -q "^OK   F5 peak Fig 2 C/T" "$C" && ! grep -q "^[A-Z]* *\(F9\|W5\|W6\) " "$C" \
+  || fail "M2 F5 hw/pop ($(grep 'F5\|F9' "$C"))"
+sed 's/^\(L1,query,\)Popcorn,/\1Megalon (timers off),/' "$O/M2/fig/rs-fig2.csv" > "$F/recsys-avg-fig2.csv"
+cat "$F/recsys-avg-fig2.csv" | grep -q "Megalon (timers off)" || fail "M2 edit"
+python3 -B $H/check.py --plan $H/h1-plan.tsv --workload recsys --round 1 "$O/M2" > "$O/M2-check2.out" 2>&1
+grep -q "^FAIL F5 avg Fig 2 C/T: .*Megalon row 'Megalon (timers off)' for recsys" "$C" || fail "M2 Megalon row not refused ($(grep F5 "$C"))"
+echo "M OK"
 echo "SELFTEST PASS"
