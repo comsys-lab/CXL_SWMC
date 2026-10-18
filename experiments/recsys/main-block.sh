@@ -12,7 +12,7 @@
 #   RECV_MODE, optional POP_BUILD (10, >= 10), POP_BUNDLE_SHA (build-10 deploy-v1 packet hash), D (inputs dir with MANIFEST.txt),
 #   VM_PLAIN (guest dir: build-3 server, all-HWcc + page MSI), VM_MEG (guest dir: Megalon build + recsys-2vm.yaml),
 #   MEG_BUILD (recsys-megalon build on MEGALON_BASE, default builds/megalon/75), PLAIN_BUILD (v6 recsys build dir), EKKO
-#   (avg | peak | f087 | f149 | f253, v0.6.10), LOADGEN; optional SEED (20261016), UPD_FILE / QRY_FILE (names in D; default the day-23 slices of
+#   (avg | peak | f087 | f149 | f253 (v0.6.10) | f330 (v0.6.11)), LOADGEN; optional SEED (20261016), UPD_FILE / QRY_FILE (names in D; default the day-23 slices of
 #   builds/recsys-inputs/1),
 #   ROUNDS (3), FIXED (1; 0 = no fixed-load window), XT (server lifetime bound, s, default 28800),
 #   SYSTEMS (subset of "hw pop mg", seeded order kept), L_FROM (fixed-load-L.txt; needed when hw is not in SYSTEMS
@@ -63,7 +63,7 @@
 #   15 s) are unchanged in seconds, i.e. they hold about 70 / 130 / 60 / 15 rounds at T = 1 s.
 # BLOCK=h1 — H1-HOOK v2 (experiments/h1/README.md "Hook contract H1-HOOK v2", reports/H1-main-packet.md v0.3 §2-§3;
 #   user decisions 2026-10-18; called once per round by experiments/h1/hook.sh):
-#   env H1MODE r1|cont, H1_N, H1_SEED (loadgen seed of every part), H1_MIXES "<mix>=EKKO=<avg|peak|f087|f149|f253> ...", H1_SETTLE_S
+#   env H1MODE r1|cont, H1_N, H1_SEED (loadgen seed of every part), H1_MIXES "<mix>=EKKO=<avg|peak|f087|f149|f253|f330> ...", H1_SETTLE_S
 #   (60 s = one publication period T), H1_PARENT_LOCK=H1-main (the lock must name owner=H1-main; never lock/unlock),
 #   PRETOUCH_DIR (pretouch-gate.sh at block start and end), MEASURE_ENV_DIR (Host gate before every loadgen part),
 #   EXPECT_DAX_UUID (guest precheck); r1: H1_LEVELS_CMD (prints "<L2_rate> <L1_rate>" for a mix); cont: H1_LEVELS.
@@ -154,7 +154,7 @@ calv() { sed -n "s/^$2=//p" "$1" 2>/dev/null | head -1; }   # calv <file> <key>
 # f087 = 0.000874, f149 = 0.00149, f253 = 0.00253. Same definition as avg/peak (update SAMPLE RATE calibrated at
 # T = 60 s by recsys-rate); their T = 60 s reference files are in RATE_T_DIR (builds/recsys-calib/2), not in D.
 # EKKO_REF = the T = 60 s reference file of the point (rate_for checks the computed rate against it, +-2 %).
-ekko_set() {  # <avg|peak|f087|f149|f253>: EKKO_FRAC60, EKKO_REF, PUBLISH_FRAC (server; = EKKO_FRAC60 at T = 60 s), EKKO_RULE, SA
+ekko_set() {  # <avg|peak|f087|f149|f253|f330>: EKKO_FRAC60, EKKO_REF, PUBLISH_FRAC (server; = EKKO_FRAC60 at T = 60 s), EKKO_RULE, SA
   local mid="geometric point between Ekko avg (0.0308/60) and peak (0.043/10) per T = 60 s (user 2026-10-18)"
   case $1 in
     avg) EKKO_FRAC60=0.000513333333; EKKO_RULE="Ekko OSDI'22 average: 3.08% of rows per hour -> 0.0308/60 per T = 60 s";;
@@ -162,6 +162,7 @@ ekko_set() {  # <avg|peak|f087|f149|f253>: EKKO_FRAC60, EKKO_REF, PUBLISH_FRAC (
     f087) EKKO_FRAC60=0.000874; EKKO_RULE="$mid: 1/4 -> 0.000874";;
     f149) EKKO_FRAC60=0.00149; EKKO_RULE="$mid: 2/4 -> 0.00149";;
     f253) EKKO_FRAC60=0.00253; EKKO_RULE="$mid: 3/4 -> 0.00253";;
+    f330) EKKO_FRAC60=0.0033; EKKO_RULE="v0.6.11 (user 2026-10-18): geometric mean of f253 (0.00253) and Ekko peak (0.0043) per T = 60 s -> 0.0033";;
     *) return 1;;
   esac
   case $1 in
@@ -182,7 +183,7 @@ ekko_set() {  # <avg|peak|f087|f149|f253>: EKKO_FRAC60, EKKO_REF, PUBLISH_FRAC (
  --proc-sysfs /sys/kernel/swmc/page_coherence --proc-kthread cxl_recv"
   SA=$(echo $SA)
 }
-if [ $BLOCK != h1 ]; then ekko_set "$EKKO" || { echo "SEQUENCE STOP: EKKO must be avg, peak, f087, f149 or f253"; exit 2; }; fi
+if [ $BLOCK != h1 ]; then ekko_set "$EKKO" || { echo "SEQUENCE STOP: EKKO must be avg, peak, f087, f149, f253 or f330"; exit 2; }; fi
 export SLO_MS SLO_RULE="DeepRecSys ISCA'20: query p${SLO_PCT} <= ${SLO_MS} ms (MOT1 v6, user 2026-10-16)"
 HOST_PLAIN=$PLAIN_BUILD/bin/recsys-server
 SSH="ssh -o BatchMode=yes -o ConnectTimeout=8"
@@ -599,7 +600,7 @@ rate_for() {  # <ekko> <out file>: sets UPD_RATE and LGC for that operating poin
        --opt quantiles=$D/dist_quantile.txt --fixed update=$UPD_RATE --mix query=1 --x-stream query)
 }
 h1shuffle() { local seed=$1; shift; python3 -c 'import random,sys; v=sys.argv[2:]; random.Random(sys.argv[1]).shuffle(v); print(" ".join(v))' "$seed" "$@"; }
-h1_ekko() { case $1 in EKKO=avg|EKKO=peak|EKKO=f087|EKKO=f149|EKKO=f253) echo ${1#EKKO=};; *) return 1;; esac; }
+h1_ekko() { case $1 in EKKO=avg|EKKO=peak|EKKO=f087|EKKO=f149|EKKO=f253|EKKO=f330) echo ${1#EKKO=};; *) return 1;; esac; }
 if [ $BLOCK = h1 ]; then  # H1-HOOK v2 driver (header)
   printf '# name\tsystem\tmix\tphase\tround\trun_dir\tsteps\tlifetime\n' > "$E/h1-runs.tsv"
   declare -A EK

@@ -563,7 +563,7 @@ o3() {  # <case> <ekko> <T_MS> <RATE_T_DIR> [BLOCK]
   env -i PATH="$PATH" E="$O/O3/$1" T_MS=$3 RATE_T_DIR=$4 BLOCK=${5:-h1} XT=7200 PLAIN_BUILD=$PP/builds/recsys/12 D=$PP/builds/recsys-inputs/1 \
     UPD_FILE=updates-day23-0-2M.smp QRY_FILE=queries-day23-89137318-1M.smp bash "$O/O3/fn.sh" "$2" > "$O/O3/$1.out" 2>&1; echo "rc=$?" >> "$O/O3/$1.out"
 }
-CAL=$PP/builds/recsys-calib/2   # v0.6.10 (avg/peak byte-identical to calib/1)
+CAL=$PP/builds/recsys-calib/3   # v0.6.11 (avg/peak = calib/1, f149/f253 = calib/2, + f330)
 o3 peak peak 1000 $CAL
 grep -q "^PF=0.00014302685789816636 UR=188.7608 TCHK=ok SA=.*--publish-frac 0.00014302685789816636 .*LGC=.*--fixed update=188.7608" "$O/O3/peak.out" \
   && grep -q "^EKKO=peak publish_frac=0.00014302685789816636 update_rate=188.7608 samples/s T_ms=1000 " "$O/O3/peak.out" \
@@ -577,6 +577,9 @@ grep -q "^PF=1.523274789203064e-05 UR=14.7233 TCHK=ok .*--publish-frac 1.5232747
 o3 f149 f149 1000 $CAL
 grep -q "^PF=4.5713148517473555e-05 UR=51.8558 TCHK=ok .*--publish-frac 4.5713148517473555e-05 .*--fixed update=51.8558" "$O/O3/f149.out" \
   && grep -qx "rows_per_round_target=6134" "$O/O3/f149/update-rate-T1000-f149.txt" || fail "O3 f149 ($(cut -c1-400 "$O/O3/f149.out"))"
+o3 f330 f330 1000 $CAL
+grep -q "^PF=0.00010698695143737372 UR=135.6000 TCHK=ok .*--publish-frac 0.00010698695143737372 .*--fixed update=135.6000" "$O/O3/f330.out" \
+  && grep -qx "rows_per_round_target=14356" "$O/O3/f330/update-rate-T1000-f330.txt" || fail "O3 f330 ($(cut -c1-400 "$O/O3/f330.out"))"
 mkdir -p "$O/O3/calnoref" && cp $CAL/rate-T1000-*.txt "$O/O3/calnoref/"
 o3 noref f253 1000 "$O/O3/calnoref"
 grep -q "^STOPPED: no calibration file $O/O3/calnoref/rate-frac0.00253.txt" "$O/O3/noref.out" || fail "O3 noref ($(cut -c1-400 "$O/O3/noref.out"))"
@@ -586,7 +589,7 @@ grep -q "STOPPED: .*ref_rate_samples_per_s != the Ekko peak rate 188.7608" "$O/O
 o3 t60 peak 60000 "" v1
 grep -q "^PF=0.0043 UR=188.7608 TCHK= SA=.*--publish-frac 0.0043 " "$O/O3/t60.out" && [ ! -e "$O/O3/t60/r1.txt.T60000" ] \
   && [ -z "$(ls "$O/O3/t60" | grep -v '^r[12].txt$')" ] || fail "O3 T = 60 s path ($(cut -c1-300 "$O/O3/t60.out"))"
-grep -q 'BLOCK=h1 needs RS_T_MS' "$MB" && grep -q "RS_T_MS=1000 RATE_T_DIR=\$P/builds/recsys-calib/2" $H/plugins/pins-recsys.sh || fail "O3 static RS_T_MS"
+grep -q 'BLOCK=h1 needs RS_T_MS' "$MB" && grep -q "RS_T_MS=1000 RATE_T_DIR=\$P/builds/recsys-calib/3" $H/plugins/pins-recsys.sh || fail "O3 static RS_T_MS"
 echo "O OK"
 # P v0.6.9 --from-root / --invalid
 mkdir "$O/P1"
