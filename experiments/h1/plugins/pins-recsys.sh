@@ -22,6 +22,8 @@
 # (avg/peak files byte-identical to calib/1, plus the three intermediate Ekko points f087 / f149 / f253 and their
 # T = 60 s references); main-block.sh (ekko_set points, EKKO_REF) re-pinned. The extra mixes run only through
 # h1-main.sh --add-mixes (experiments/h1/h1-plan-extra.tsv); builds and builds/recsys-inputs/1 unchanged.
+# Re-pinned 2026-10-20 (branch eval-run1, no H1 behaviour change): main-block.sh gained evaluation-only paths in
+# BLOCK=stream behind EVAL_RUN (RS_THREADS, REGION, fixed-load windows, mgoff); BLOCK=h1 and every other block unchanged.
 # Re-pinned 2026-10-19 (H1 v0.6.14, user: Popcorn/All-HWcc 0.2-0.3): RATE_T_DIR = builds/recsys-calib/6 (calib/5 points
 # byte-identical + f392 = 0.00392); main-block.sh re-pinned.
 # Re-pinned 2026-10-19 (H1 v0.6.13, user: Popcorn/All-HWcc 0.2-0.3): RATE_T_DIR = builds/recsys-calib/5 (calib/4 points
@@ -76,7 +78,7 @@ c753d2f0f6806cdd42a82fbba108bff75549a4863691798a022e4ff404434d24  $P/builds/recs
 f9c1753f3bef2ab0941153058860227145f2d7b7e33a210bdc3338fad14eacda  $P/builds/recsys-megalon/14/lib/libmegalon.so
 de2e9a4cd7ee41df5d9a938836802b0ee5186ba69b42252e3ab747f0bfeae193  $P/builds/recsys-loadgen/9/manifest.txt
 61bb70687ef15823a33a56c282d53eecdbcc1c1e574589eeba7791b4a65d81c0  $P/builds/recsys-loadgen/9/loadgen
-1faa3193238954a2fb9b09857aed6b8511eb48f68377d155e142746308cdd32c  $HOOK_FILE
+10f90636d033be811bf39a04769ebef33020f74bb437a254bbc3f56655b763eb  $HOOK_FILE
 68c5b9ceaf986e9e05e941d586a9a5cb5bb162b1963181ce02efa5d34cce5b54  $HR/experiments/recsys/session.sh
 0bd4d06ea0b0678b77d1276aec2f13db70a8eceed7e7ab11f61905052e8ac4ac  $HR/experiments/recsys/v1_check.py
 32d171199d6a47d15fcfa6971522e253fe21d857e91c9049c201e55a0cdac230  $HR/experiments/recsys/check_breakdown.py

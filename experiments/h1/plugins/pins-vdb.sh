@@ -9,6 +9,10 @@
 # Re-pinned 2026-10-20 (H1 v0.6.19c, no H1 behaviour change): m4-run.sh KIND=urate gained URATE_PARTS="warm fix"
 # (fixed-load lifetime per update rate, user decision); the shared fix-part step check now also runs for KIND=urate
 # (condition widened from KIND=h1 to h1|urate; KIND=h1 unchanged).
+# Re-pinned 2026-10-20 (branch eval-run1, no H1 behaviour change): m4-run.sh and v6-block.sh gained evaluation-only
+# paths behind EVAL_RUN (experiments/eval: VDB_SEARCH_THREADS, DATASET=28m-x for KIND=h1, X_MEGALON_H1CAP, parent lock
+# eval-vdb-run<k>, EVAL_REGION / EVAL_DATASET); without EVAL_RUN the server arguments and every H1 path are unchanged
+# (checked: identical SERVER_ARGS for h1/urate/fixed kinds; H1 selftest PASS workspaces/h1-main/selftest-eval-run1-*).
 . "$(dirname "${BASH_SOURCE[0]}")/pins-common.inc"
 HR=$P/CXL_SWMC                      # live tree; v6-block.sh uses $P/CXL_SWMC/experiments/vectordb itself. Every file it
                                     # runs is hash-pinned below (hook: see the v6-block.sh pin; builds vdb/15, vdb-megalon/14 from 934fa9312)
@@ -31,9 +35,9 @@ b07edd6bcf1ccb0a6a9aea7b7dab1f137908111d916bd89e93af448fdc5c4cf5  $P/builds/vdb-
 e9d4942ee33b2f65cf7117d87942296e1365d0234873c2c4159545f40708db54  $P/workspaces/vdb-data/seg32-c32m-a27m-m16-efc128-b1/SHA256SUMS
 4e4e7134710f9b131368d7b3f71c07ab56d97e72ad329649bda27f893f6d65be  $HR/systems/megalon/vectordb-2vm.yaml
 eeb6b23f173d85a3c86ade0fb804b363e3c84a36bf9c0f56a7cbcab25e738b53  $HR/config/cxl_region.yaml
-7e8cc73998280bd606598ab26003b1ba80a81dd736c58e3f8207a9482d36f2e6  $HOOK_FILE
+3ade71506288006d9deddd5272259a58f364022786a988a3d59f240560b7f346  $HOOK_FILE
 27a11c2c75f748fa7b47111496e30170ab5a35c0b65bd56422c6b3b6fb4d7503  $HR/experiments/vectordb/m4-lib.sh
-cc42fad19461befb54e78aec98c587c41b97c10c456461cfd6aee10e12a8d3b8  $HR/experiments/vectordb/m4-run.sh
+72044c23f3b2451eabb18f93ab76711f2c0858c2e30b79bdfd1793660dcf774e  $HR/experiments/vectordb/m4-run.sh
 4d917368a0946c0a5052dd0d1e31e5ab900914e74c75bd02d37dc164708b66fb  $HR/experiments/vectordb/m4-precheck.sh
 5a4cd27c57b9aebe82a3d9b1652690b0496ddd1e81da4e9479a02d33085f3ad6  $HR/experiments/vectordb/run.sh
 1edcdda88f30200fd55c1b5a18cb4b9d6db57aa02647f8ad549e4e7f6aabb31f  $HR/experiments/vectordb/host-gate.sh
