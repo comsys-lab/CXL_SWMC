@@ -15,7 +15,9 @@
 #      SLO_URATE (optional): after the fixed invocations, one more part "slo" = loadgen --mode slo with the update stream
 #      --fixed update=SLO_URATE and the knee ramp of urate-block.sh at Host scale (SLO_ARGS, default: --start 5 --factor
 #      1.5 --precision 0.05 --step-warmup-s 2 --step-measure-s 6 --confirm-s 10 --confirm-reps 1 --min-step-queries 30
-#      --ramp-knee 2 --ramp-knee-floor 1.5 --max-steps 30 --fill none --overload none); urate_check.py judges it
+#      --ramp-knee 2 --ramp-knee-floor 1.5 --max-steps 30 --fill none --overload none --drain-s 60); urate_check.py judges it
+#      OPCOH (optional, e.g. fake with VDB_OPCOH_FAKE=1): after the stop, opsplit.py + tests/opcoh_check.py <mode> on every
+#      part with OPCOH_PARTS = all parts (closure over the lifetime); a failure fails the pilot
 set -euo pipefail
 B=$(cd "$1" && pwd) LG=$2 D=$(cd "$3" && pwd) WF=$4 INIT=$(cd "$5" && pwd) S=$6
 HERE=$(cd "$(dirname "$0")" && pwd); ROOT=$(cd "$HERE/../../.." && pwd)
@@ -69,12 +71,12 @@ for R in $URATES; do
 done
 if [ -n "${SLO_URATE:-}" ]; then
   O=$S/slo; mkdir "$O"
-  SA=${SLO_ARGS:---start 5 --factor 1.5 --precision 0.05 --step-warmup-s 2 --step-measure-s 6 --confirm-s 10 --confirm-reps 1 --min-step-queries 30 --ramp-knee 2 --ramp-knee-floor 1.5 --max-steps 30 --fill none --overload none}
+  SA=${SLO_ARGS:---start 5 --factor 1.5 --precision 0.05 --step-warmup-s 2 --step-measure-s 6 --confirm-s 10 --confirm-reps 1 --min-step-queries 30 --ramp-knee 2 --ramp-knee-floor 1.5 --max-steps 30 --fill none --overload none --drain-s 60}
   set +e
   # shellcheck disable=SC2086
   numactl --physcpubind="$LGCPUS" --membind=1 "$LG" --workload vectordb --target 127.0.0.1:$PORT0,127.0.0.1:$((PORT0 + 1)) --out "$O/loadgen" \
     --stats-op 10 --opt data="$D" --opt writes="$WF" --opt seed=20261019 --seed 20261019 --opt w_start=$WS \
-    --mode slo $SA --fixed update=$SLO_URATE --mix search=1 --x-stream search --slo search:99:100 --tol 0.02 --warmup-s 5 --drain-s 5 --raw > "$O/loadgen.log" 2>&1
+    --mode slo $SA --fixed update=$SLO_URATE --mix search=1 --x-stream search --slo search:99:100 --tol 0.02 --warmup-s 5 --raw > "$O/loadgen.log" 2>&1
   lrc=$?
   set -e
   WS=$(sed -n 's/^next_w=//p' "$O/loadgen/vectordb.txt")
@@ -87,6 +89,15 @@ fi
 for p in "${PIDS[@]}"; do kill -TERM "$p"; done
 wait || true
 PIDS=()
+if [ -n "${OPCOH:-}" ]; then
+  PL=""; for R in $URATES; do PL="$PL $S/u$R"; done; [ -z "${SLO_URATE:-}" ] || PL="$PL $S/slo"
+  for O in $PL; do
+    python3 "$ROOT/experiments/vectordb/opsplit.py" "$O" > "$O/opsplit.log" 2>&1 || { echo "${O##*/}: opsplit failed"; RC=1; }
+    OPCOH_PARTS="$PL" python3 "$HERE/opcoh_check.py" "$O" "$OPCOH" > "$O/opcoh-check.txt" 2>&1
+    echo "${O##*/}: $(tail -n 1 "$O/opcoh-check.txt" | cut -c1-300)"
+    grep -q "^OPCOH_CHECK PASS" "$O/opcoh-check.txt" || RC=1
+  done
+fi
 for k in 0 1; do
   sed -n '/vdb-server: stopping/,$p' "$S/node$k.log" | grep -E "^(node|P|elements|updates|inserts|deletes|searches|timeouts|bad_records|writer_threads|write_jobs_accepted|write_jobs_done|write_backlog|dlog_count\.[0-9])=" | tr '\n' ' '; echo
 done | tee "$S/final.txt"

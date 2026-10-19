@@ -17,7 +17,9 @@
 #     (updates/s, independent of the search rate) and --tol 0.02 in every part; part warm = unmeasured warm-up
 #     (1 search/s, 10 + 50 s, its stats snapshots kept, never used); part slo = the knee-ramp SLO search (RecSys
 #     methodology 2026-10-19, state/PROJECT.md): --start URATE_START (default 1) --factor 1.5 --precision 0.02,
-#     confirm 3 x 30 s as H1, --max-steps 40 --min-step-queries 100 --ramp-knee 2 --ramp-knee-floor 1.5. Seeds: warm
+#     confirm 3 x 30 s as H1, --max-steps 40 --min-step-queries 100 --ramp-knee 2 --ramp-knee-floor 1.5, --drain-s 60
+#     (a step ends when every response is in, at most 60 s: a write backlog left by a saturated step is served
+#     before the next step, and no response is lost after loadgen's drain, which the opcoh_check closure needs). Seeds: warm
 #     SEED + 100, slo SEED. Any loadgen note of the slo part is a NOTE (a result, not an error); warm must end without.
 #   KIND=fixed|pfix: RATE (total req/s of the scaled streams = L / (1 - U/100)); TRACE (0 | 1, default 0; Megalon only)
 #   DATASET: 28m (default: pubmed-a27m-b1m-q10k, image seg32c32m-a27m) | 1m (pubmed-a1m-b1m-q10k, writes
@@ -135,7 +137,7 @@ case "$KIND" in
          LG=("${NL[@]}" --raw --fixed update=$URATE --tol 0.02)
          export PART_SEED_warm=$((SEED + 100)) PART_SEED_slo=$SEED PARTS="warm slo" PART_RATES= PART_RATES_CMD=
          export PART_ARGS_warm="--mode fixed --rates 1 --warmup-s 10 --step-warmup-s 0 --step-measure-s 50 --drain-s 10"
-         export PART_ARGS_slo="--mode slo --start $US --factor 1.5 --precision 0.02 --confirm-precision 0.01 --max-confirm-probes 6 --confirm-step-down 0.05 --max-steps 40 --warmup-s 10 --step-warmup-s 3 --step-measure-s 15 --confirm-s 30 --confirm-reps 3 --min-step-queries 100 --ramp-knee 2 --ramp-knee-floor 1.5";;
+         export PART_ARGS_slo="--mode slo --start $US --factor 1.5 --precision 0.02 --confirm-precision 0.01 --max-confirm-probes 6 --confirm-step-down 0.05 --max-steps 40 --warmup-s 10 --step-warmup-s 3 --step-measure-s 15 --confirm-s 30 --confirm-reps 3 --min-step-queries 100 --ramp-knee 2 --ramp-knee-floor 1.5 --drain-s 60";;
   *) stop "bad KIND";;
 esac
 SSH="ssh -o BatchMode=yes -o ConnectTimeout=8"

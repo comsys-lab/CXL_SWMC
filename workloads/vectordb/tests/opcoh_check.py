@@ -235,7 +235,7 @@ if r.returncode == 0:
         if x["n_ops"] not in ("", "0") and x["C_ms"] and x["T_ms"] and float(x["C_ms"]) > float(x["T_ms"]):
             print(f"OPCOH_CHECK WARN: step {x['step']} {x['op']}: C_ms {x['C_ms']} > T_ms {x['T_ms']} (sampled C, not a failure)")
     for x in rows:
-        if x["op"] == "update" and x["win_n"]:
+        if x["op"] == "update" and x["win_n"] and x["T_ms"]:  # a step without matched update records has no T_ms
             check(abs(float(x["win_T_ms"]) - float(x["T_ms"])) <= 0.5 * float(x["T_ms"]) + 1e-6, "window T ~ record T")
 print("OPCOH_CHECK " + ("PASS" if not fails else "FAIL: " + "; ".join(fails)))
 sys.exit(1 if fails else 0)
