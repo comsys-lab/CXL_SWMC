@@ -18,10 +18,10 @@ SSH="ssh -o BatchMode=yes -o ConnectTimeout=8"
 # "<guest path> <Host file>" per install dir
 PLAIN="$PD/bin/recsys-server $PB/bin/recsys-server
 $PD/bin/recsys-node.sh $C/scripts/guest/recsys-node.sh
-$PD/cfg/cxl_region.yaml $C/config/cxl_region.yaml"
+$PD/cfg/cxl_region.yaml ${REGION:-$C/config/cxl_region.yaml}"
 MEG="$VM/bin/recsys-server $MB/bin/recsys-server
 $VM/bin/recsys-node.sh $C/scripts/guest/recsys-node.sh
-$VM/cfg/cxl_region.yaml $C/config/cxl_region.yaml
+$VM/cfg/cxl_region.yaml ${REGION:-$C/config/cxl_region.yaml}
 $VM/cfg/megalon.yaml $MCFG"
 for f in "$MB"/lib/*; do MEG="$MEG
 $VM/lib/$(basename "$f") $f"; done

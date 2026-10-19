@@ -51,7 +51,8 @@ SEED_BASE=20261014 OWNER="VDB-V1"
 : "${KPOP:?}" "${GTPOP:?}" "${CPOP:?}" "${PLAIN_BUILD:?}" "${VPLAIN:?}" "${MEG_BUILD:?}" "${VMEG:?}" "${MEG_CFG:?}" "${LOADGEN_BUILD:?}"
 : "${MEG_LIB:?}" "${PRETOUCH_DIR:?}"
 if [ -n "${H1MODE:-}" ]; then
-  [ "${H1_PARENT_LOCK:-}" = H1-main ] || { echo "SEQUENCE STOP: H1MODE needs H1_PARENT_LOCK=H1-main"; exit 2; }
+  [ "${H1_PARENT_LOCK:-}" = H1-main ] || { [ -n "${EVAL_RUN:-}" ] && [ "${H1_PARENT_LOCK:-}" = "eval-vdb-run$EVAL_RUN" ]; } \
+    || { echo "SEQUENCE STOP: H1MODE needs H1_PARENT_LOCK=H1-main (or eval-vdb-run<EVAL_RUN> from experiments/eval)"; exit 2; }
   [[ "${H1_N:-}" =~ ^[1-9]$ ]] && [[ "${H1_SEED:-}" =~ ^[0-9]+$ ]] || { echo "SEQUENCE STOP: H1_N / H1_SEED"; exit 2; }
   : "${H1_MIXES:?}"; [[ "${H1_SETTLE_S:-}" =~ ^[1-9][0-9]*$ ]] || { echo "SEQUENCE STOP: bad H1_SETTLE_S"; exit 2; }
   # README item 8: H1 measurement runs use experiments/h1/h1-gate.sh and scripts/host/measure-run.sh (m4-run.sh, run.sh)
@@ -67,11 +68,15 @@ for b in "$PLAIN_BUILD" "$MEG_BUILD" "$LOADGEN_BUILD"; do
 done
 grep -qx "megalon_build=$MEG_LIB" $MEG_BUILD/manifest.txt || { echo "SEQUENCE STOP: $MEG_BUILD is not on $MEG_LIB"; exit 2; }
 grep -q "^shim_kind=shared$" $MEG_BUILD/manifest.txt || { echo "SEQUENCE STOP: $MEG_BUILD has no shared (v3) shim"; exit 2; }
+# evaluation run sets (experiments/eval/runset-vdb.sh, EVAL_RUN set): region file and dataset of the eval; unset = as before
+RF=$P/CXL_SWMC/config/cxl_region.yaml DS=28m
+if [ -n "${EVAL_RUN:-}" ]; then RF=${EVAL_REGION:?EVAL_RUN needs EVAL_REGION} DS=${EVAL_DATASET:?EVAL_RUN needs EVAL_DATASET}
+else [ -z "${EVAL_REGION:-}${EVAL_DATASET:-}" ] || { echo "SEQUENCE STOP: EVAL_REGION / EVAL_DATASET need EVAL_RUN"; exit 2; }; fi
 GUEST_INIT=/home/comsys/vdb/init/seg32c32m-a27m HOST_IMAGE=$P/workspaces/vdb-data/seg32-c32m-a27m-m16-efc128-b1
 VP=${VPLAIN#/home/comsys/} VM=${VMEG#/home/comsys/}
 INSTALL="$VP/bin/vdb-server $PLAIN_BUILD/bin/vdb-server
 $VP/bin/vdb-node.sh $P/CXL_SWMC/scripts/guest/vdb-node.sh
-$VP/cfg/cxl_region.yaml $P/CXL_SWMC/config/cxl_region.yaml
+$VP/cfg/cxl_region.yaml $RF
 $VM/bin/vdb-server $MEG_BUILD/bin/vdb-server
 $VM/bin/vdb-node.sh $P/CXL_SWMC/scripts/guest/vdb-node.sh
 $VM/lib/libmegalon-objapi.so $MEG_BUILD/lib/libmegalon-objapi.so
@@ -81,11 +86,11 @@ $VM/lib/libtbbmalloc.so.2 $MEG_BUILD/lib/libtbbmalloc.so.2
 $VM/lib/libhwloc.so.15 $MEG_BUILD/lib/libhwloc.so.15
 $VM/lib/libatomic.so.1 $MEG_BUILD/lib/libatomic.so.1
 $VM/cfg/megalon.yaml $MEG_CFG
-$VM/cfg/cxl_region.yaml $P/CXL_SWMC/config/cxl_region.yaml"
+$VM/cfg/cxl_region.yaml $RF"
 . $X/m4-lib.sh
 # rates (total req/s of the update + search streams; mix 95/5 unless stated): search 10/s; L = 0.5 x 158.479 search/s
 RATE_LOW=10.526 RATE_L=$(rate 158.479 5) RATE_TRACE=20
-COMMON=(DATASET=28m PLAIN_BUILD=$PLAIN_BUILD VPLAIN=$VPLAIN MEG_BUILD=$MEG_BUILD VMEG=$VMEG
+COMMON=(DATASET=$DS PLAIN_BUILD=$PLAIN_BUILD VPLAIN=$VPLAIN MEG_BUILD=$MEG_BUILD VMEG=$VMEG
         LOADGEN_BIN=$LOADGEN_BUILD/loadgen KIND=pfix)
 PE=(C8=$CPOP K8=$KPOP GT8=$GTPOP RECV_MODE=poll)  # m4-run.sh's Popcorn variables (named C8/K8/GT8), given the bundle
 dax_root() {  # before a Popcorn run: back to root:root 600 (no server of ours runs between runs); fresh stat check

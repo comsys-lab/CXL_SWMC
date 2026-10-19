@@ -73,7 +73,7 @@ case "${DATASET:-28m}" in
        INIT=/home/comsys/vdb/init/seg32c32m-a27m NA=26990000 NB=1000000 MAXIDS=28000000;;
   1m)  D=$P/workspaces/vdb-data/pubmed-a1m-b1m-q10k W=$P/workspaces/vdb-data/writes-a1m-b1m-u1m.bin
        INIT=/home/comsys/vdb/init/seg32c32m NA=1000000 NB=1000000 MAXIDS=2000000;;
-  28m-x) [ "$KIND" = urate ] || stop "DATASET=28m-x is for KIND=urate only"
+  28m-x) [ "$KIND" = urate ] || { [ "$KIND" = h1 ] && [ "${EVAL_RUN:-}" ]; } || stop "DATASET=28m-x is for KIND=urate (or KIND=h1 with EVAL_RUN) only"
        for v in X_NB X_MAXIDS X_MAXW X_MAXD X_INIT_CAP; do [[ "${!v:-}" =~ ^[1-9][0-9]*$ ]] || stop "DATASET=28m-x needs $v"; done
        [ -d "${X_DATA:-}" ] && [ -f "${X_WRITES:-}" ] || stop "DATASET=28m-x needs X_DATA and X_WRITES"
        D=$X_DATA W=$X_WRITES INIT=/home/comsys/vdb/init/seg32c32m-a27m NA=26990000 NB=$X_NB MAXIDS=$X_MAXIDS
@@ -82,8 +82,24 @@ case "${DATASET:-28m}" in
 esac
 PLAIN_BUILD=${PLAIN_BUILD:-$P/builds/vdb/8} VPLAIN=${VPLAIN:-/home/comsys/vdb8}
 MEG_BUILD=${MEG_BUILD:-$P/builds/vdb-megalon/6} VMEG=${VMEG:-/home/comsys/vdbm6-28m}
+# Evaluation run sets (experiments/eval, EVAL_RUN=<k> set by runset-vdb.sh; unset = every earlier path, byte for byte):
+#   VDB_SEARCH_THREADS (threads = vCPUs rule: 15 search + 1 writer at 16 vCPU; default 14 as before),
+#   X_MEGALON_H1CAP=1 (DATASET=28m-x, SYS=Megalon only): the server capacity of the 28M image (--max-ids 28000000
+#   --max-writes 2097152 --max-deletes 1048576, no --init-capacity) with the 28m-x data and writes file, because the
+#   28m-x capacity (89 groups per segment) does not fit Megalon's object arena; a Megalon lifetime inserts far fewer
+#   than 1M records (H1 r1: <= 35k), so ids stay below 28M.
+ST=14
+if [ -n "${EVAL_RUN:-}" ]; then
+  [[ $EVAL_RUN =~ ^[1-9]$ ]] || stop "bad EVAL_RUN"
+  ST=${VDB_SEARCH_THREADS:-14}; [[ $ST =~ ^[1-9][0-9]?$ ]] && [ $ST -le 30 ] || stop "bad VDB_SEARCH_THREADS"
+  if [ "${X_MEGALON_H1CAP:-0}" = 1 ] && [ "$SYS" = Megalon ] && [ "${DATASET:-28m}" = 28m-x ]; then
+    MAXIDS=28000000 MAXW= MAXD= XSA=
+  fi
+else
+  [ -z "${VDB_SEARCH_THREADS:-}" ] && [ -z "${X_MEGALON_H1CAP:-}" ] || stop "VDB_SEARCH_THREADS / X_MEGALON_H1CAP need EVAL_RUN"
+fi
 SA="--nodes 2 --segments 32 --M 16 --efc 128 --ef 32 --max-writes ${MAXW:-2097152} --max-ids $MAXIDS --max-deletes ${MAXD:-1048576}
- --search-threads 14 --wait-timeout-ms 60000 --start-timeout-ms 5400000${XSA:-}"
+ --search-threads $ST --wait-timeout-ms 60000 --start-timeout-ms 5400000${XSA:-}"
 SA=$(echo $SA)
 export LOADGEN=${LOADGEN_BIN:-$P/builds/loadgen/4/loadgen} READY_TIMEOUT=5400 RUN_KIND=measurement TRACE STATS_OP=10 INIT
 [ "$KIND" = functional ] && RUN_KIND=functional
@@ -173,6 +189,7 @@ dax_unused() {
   done
 }
 echo "$(date -Is) $NAME: SYS=$SYS U=$U KIND=$KIND DATASET=${DATASET:-28m} REP=${REP:-} TRACE=$TRACE RATE=${RATE:-} RECV_MODE=${RECV_MODE:-} SEED=$SEED V=$V HOST_SERVER=$HOST_SERVER XENV=[$XENV] XARGS=[$XARGS] OPCOH_EXPECT=${OPCOH_EXPECT:-} OPCOH_CHECK_MODE=${OPCOH_CHECK_MODE:-}"
+[ -z "${EVAL_RUN:-}" ] || echo "$(date -Is) $NAME: EVAL_RUN=$EVAL_RUN search_threads=$ST X_MEGALON_H1CAP=${X_MEGALON_H1CAP:-0} max_ids=$MAXIDS server_args=[$(echo $SA)]"
 [ "$KIND" != urate ] || echo "$(date -Is) $NAME: URATE=$URATE URATE_START=${URATE_START:-1} URATE_PARTS=[$URATE_PARTS] RATE=${RATE:-}"
 servers_gone || stop "a vdb-server is running before the run"
 [ "${GATE:-1}" = 1 ] || [ "$KIND" = functional ] || stop "GATE=0 is allowed for KIND=functional only"

@@ -57,8 +57,12 @@ from h1sys import slo_systems, fix_systems, has_megalon, NO_MEGALON_NOTE  # noqa
 import attempts  # noqa: E402  (v0.6.8: current attempt of a round, levels.tsv of the current r1 attempt)
 
 
+ROUND_ROOTS = {}  # --round-root n=<root> (experiments/eval: run k of a run set lives in its own evidence root)
+
+
 def rdir(E, W, n):
     """round dir of W: the current attempt (attempts.py; <E>/<W>/r<n> when no retry exists)"""
+    E = ROUND_ROOTS.get(n, E)
     return attempts.round_dir(E, W, n) or os.path.join(E, W, f"r{n}")
 
 SYSTEMS = ("hw", "pop", "mg")            # SLO phase (Fig 1, Megalon timers on); per workload: slo_systems(W)
@@ -241,9 +245,17 @@ def main():
     ap.add_argument("--workload", required=True)
     ap.add_argument("--round", required=True, type=int)
     ap.add_argument("--skip-fig2", action="store_true", help="Host self-test only (stub data has no stats): F5 -> WARN")
+    ap.add_argument("--round-root", action="append", default=[],
+                    help="n=<root>: round n of W lives in <root>/<W>/r<n> (experiments/eval run sets; default E); the "
+                         "levels.tsv is then the one of round 1's root")
     ap.add_argument("E")
     a = ap.parse_args()
     W, n, E = a.workload, a.round, a.E
+    for x in a.round_root:
+        k, _, d = x.partition("=")
+        if not (k.isdigit() and os.path.isdir(d)):
+            sys.exit(f"bad --round-root {x}")
+        ROUND_ROOTS[int(k)] = d
     SYSTEMS, FIXSYS, MG = slo_systems(W), fix_systems(W), has_megalon(W)  # per workload (v0.6.7)
     if not MG:
         lines.append(f"INFO systems {' '.join(SYSTEMS)}: {NO_MEGALON_NOTE.get(W, 'no Megalon for ' + W)}; F9/W5/W6/C2 "
@@ -404,7 +416,7 @@ def main():
     except OSError:
         bad = ["notes.txt missing"]
     res("F", "F7 collect notes", not bad, "; ".join(l.strip() for l in bad[:3]))
-    lvp = attempts.levels_path(E, W)
+    lvp = attempts.levels_path(ROUND_ROOTS.get(1, E), W)
     lv = {x["mix"]: x for x in (csv.DictReader(open(lvp), delimiter="\t") if os.path.isfile(lvp) else [])}
     for m in mixes:
         if not all((m, s) in xs for s in SYSTEMS):

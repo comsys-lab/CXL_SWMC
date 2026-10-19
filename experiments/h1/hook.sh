@@ -20,6 +20,8 @@ set -uo pipefail
 W=${1:?} MODE=${2:?} D=${3:?} N=${4:?} ARG=${5:?} LV=${6:-}
 H=$(cd "$(dirname "$0")" && pwd)
 F=$H/plugins/pins-$W.sh; [ "${H1_DRY:-0}" = 1 ] && F=$H/plugins/pins-stub.sh
+# evaluation run sets (experiments/eval; EVAL_RUN=k): the eval's own pin file (its builds, region, Popcorn bundle)
+if [ -n "${EVAL_RUN:-}" ]; then [ "${H1_DRY:-0}" = 1 ] || F=$H/../eval/pins-$W.sh; fi
 stop() { echo "HOOK STOP $W $MODE $N: $*"; exit 1; }
 [ -f "$F" ] || stop "no plugin $F"
 grep -q "FILL_" "$F" && stop "unpinned ($F has FILL_ tokens; fill after the validation packets pass)"
@@ -40,7 +42,9 @@ case $MODE in
 esac
 MIXTAGS=$(for m in $ARG; do echo -n "${m%%=*} "; done)
 echo "$(date -Is) hook $W $MODE $N: ${BLOCK_CMD[*]} $D" > "$D/sequence.cmd"
-env "${BLOCK_ENV[@]}" H1MODE=$MODE H1_N=$N "${XE[@]}" H1_PARENT_LOCK=H1-main \
+# parent lock owner: H1-main, or eval-<W>-run<k> when called by experiments/eval/runset-<W>.sh (EVAL_RUN=k)
+PL=H1-main; [ -z "${EVAL_RUN:-}" ] || PL=eval-$W-run$EVAL_RUN
+env "${BLOCK_ENV[@]}" H1MODE=$MODE H1_N=$N "${XE[@]}" H1_PARENT_LOCK=$PL \
   PRETOUCH_DIR="${PRETOUCH_DIR:-}" MEASURE_ENV_DIR="${MEASURE_ENV_DIR:-}" MEASURE_PART_DIR="${MEASURE_PART_DIR:-}" \
   H1_MEASURE_RUN="${H1_MEASURE_RUN:-0}" \
   "${BLOCK_CMD[@]}" "$D" > "$D/sequence.log" 2>&1

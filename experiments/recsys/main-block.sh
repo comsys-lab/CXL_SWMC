@@ -143,7 +143,22 @@ elif [ $BLOCK = stream ]; then  # RecSys streaming block (header "BLOCK=stream")
   : "${STREAM_RATES:?}"
   for r in $STREAM_RATES; do [[ $r =~ ^[1-9][0-9]*$ ]] && [ $((r % 50)) = 0 ] && [ $r -le 2000 ] || { echo "SEQUENCE STOP: STREAM_RATES entry $r is not a multiple of 50 in [50, 2000] samples/s"; exit 2; }; done
   [ -d "${PRETOUCH_DIR:-}" ] || { echo "SEQUENCE STOP: BLOCK=stream needs PRETOUCH_DIR"; exit 2; }
-  case " ${SYSTEMS:-hw pop} " in *" mgoff "*|*" mgrow "*) echo "SEQUENCE STOP: BLOCK=stream systems are hw, pop, mg"; exit 2;; esac
+  if [ -z "${EVAL_RUN:-}" ]; then
+    case " ${SYSTEMS:-hw pop} " in *" mgoff "*|*" mgrow "*) echo "SEQUENCE STOP: BLOCK=stream systems are hw, pop, mg"; exit 2;; esac
+    [ -z "${RS_THREADS:-}${REGION:-}${STREAM_FIX_LEVELS:-}${STREAM_FIXONLY:-}${STREAM_LEVELS:-}" ] \
+      || { echo "SEQUENCE STOP: RS_THREADS / REGION / STREAM_FIX_LEVELS / STREAM_FIXONLY / STREAM_LEVELS need EVAL_RUN"; exit 2; }
+  else  # evaluation run sets (experiments/eval/runset-rs-*.sh; header "EVAL")
+    [[ $EVAL_RUN =~ ^[1-9]$ ]] || { echo "SEQUENCE STOP: bad EVAL_RUN"; exit 2; }
+    [ -f "${REGION:-}" ] || { echo "SEQUENCE STOP: EVAL_RUN needs REGION (region file of every lifetime)"; exit 2; }
+    [[ ${RS_THREADS:-} =~ ^[1-9][0-9]?$ ]] || { echo "SEQUENCE STOP: EVAL_RUN needs RS_THREADS"; exit 2; }
+    for s in ${SYSTEMS:-hw pop}; do case $s in hw|pop|mg|mgoff) ;; *) echo "SEQUENCE STOP: eval stream systems are hw, pop, mg, mgoff"; exit 2;; esac; done
+    for s in ${STREAM_FIXONLY:-}; do [[ " ${SYSTEMS:-hw pop} " == *" $s "* ]] || { echo "SEQUENCE STOP: STREAM_FIXONLY $s not in SYSTEMS"; exit 2; }; done
+    [[ " ${SYSTEMS:-} " != *" mgoff "* ]] || [[ " ${STREAM_FIXONLY:-} " == *" mgoff "* ]] || { echo "SEQUENCE STOP: mgoff is fix-only (STREAM_FIXONLY)"; exit 2; }
+    for t in ${STREAM_FIX_LEVELS:-}; do [[ $t =~ ^(L1|L2|[0-9]+(\.[0-9]+)?)$ ]] || { echo "SEQUENCE STOP: bad STREAM_FIX_LEVELS token $t"; exit 2; }; done
+    [ -n "${STREAM_FIX_LEVELS:-}" ] || [ -z "${STREAM_FIXONLY:-}" ] || { echo "SEQUENCE STOP: STREAM_FIXONLY needs STREAM_FIX_LEVELS"; exit 2; }
+    [ -z "${STREAM_LEVELS:-}" ] || [ -f "$STREAM_LEVELS" ] || { echo "SEQUENCE STOP: STREAM_LEVELS file missing"; exit 2; }
+    [[ ${STREAM_FIX_S:-60} =~ ^[1-9][0-9]*$ && ${STREAM_FIX_SETTLE_S:-60} =~ ^[1-9][0-9]*$ ]] || { echo "SEQUENCE STOP: bad STREAM_FIX_S / STREAM_FIX_SETTLE_S"; exit 2; }
+  fi
   EKKO=stream
 else
   : "${EKKO:?}"
@@ -217,6 +232,9 @@ if [ $BLOCK = stream ]; then
  --verify-rows 1 --proc-sysfs /sys/kernel/swmc/instr --proc-sysfs /sys/kernel/cxl_shm/instr
  --proc-sysfs /sys/kernel/swmc/page_coherence --proc-kthread cxl_recv"
   SA=$(echo $SA) N0X="--update-threads 14 --serve-threads 1"
+  if [ -n "${EVAL_RUN:-}" ]; then  # threads = vCPUs (user 2026-10-20): node 0 RS_THREADS update threads, node 1 RS_THREADS serving
+    SA=${SA/--serve-threads 14/--serve-threads $RS_THREADS} N0X="--update-threads $RS_THREADS --serve-threads 1"
+  fi
 fi
 if [ $BLOCK != h1 ] && [ $BLOCK != stream ]; then ekko_set "$EKKO" || { echo "SEQUENCE STOP: EKKO must be avg, peak, f087, f149, f253, f330, f350, f370, f400, f385 or f392"; exit 2; }; fi
 export SLO_MS SLO_RULE="DeepRecSys ISCA'20: query p${SLO_PCT} <= ${SLO_MS} ms (MOT1 v6, user 2026-10-16)"
@@ -365,7 +383,7 @@ precheck() {
     for f in "${VM_PLAIN#/home/comsys/}/bin/recsys-server $HOST_PLAIN" "${VM_MEG#/home/comsys/}/bin/recsys-server $MB/bin/recsys-server" \
              "${VM_MEG#/home/comsys/}/lib/libmegalon-objapi.so $MB/lib/libmegalon-objapi.so" "${VM_MEG#/home/comsys/}/lib/libmegalon.so $MB/lib/libmegalon.so" \
              "${VM_MEG#/home/comsys/}/cfg/megalon.yaml $P/CXL_SWMC/systems/megalon/recsys-2vm.yaml" \
-             "${VM_PLAIN#/home/comsys/}/cfg/cxl_region.yaml $P/CXL_SWMC/config/cxl_region.yaml" "${VM_MEG#/home/comsys/}/cfg/cxl_region.yaml $P/CXL_SWMC/config/cxl_region.yaml" \
+             "${VM_PLAIN#/home/comsys/}/cfg/cxl_region.yaml ${REGION:-$P/CXL_SWMC/config/cxl_region.yaml}" "${VM_MEG#/home/comsys/}/cfg/cxl_region.yaml ${REGION:-$P/CXL_SWMC/config/cxl_region.yaml}" \
              "${VM_PLAIN#/home/comsys/}/bin/recsys-node.sh $P/CXL_SWMC/scripts/guest/recsys-node.sh" "${VM_MEG#/home/comsys/}/bin/recsys-node.sh $P/CXL_SWMC/scripts/guest/recsys-node.sh"; do
       set -- $f
       grep -q "^$(sha256sum "$2" | cut -d' ' -f1)  /home/comsys/$1\$" "$E/precheck-${IPS[$i]}.out" || stop "${IPS[$i]} /home/comsys/$1 != $2"
@@ -624,6 +642,99 @@ print("\t".join([sys.argv[2], sys.argv[3], sys.argv[4], f(s.get("max_offered_x_p
     "$RD/loadgen/summary.json" "$NAME" "$s" "$r" "$sc" >> "$E/stream-results.tsv" || stop "$NAME: results row"
   echo "$NAME: $sc"
 }
+# ---- EVAL (EVAL_RUN set; experiments/eval/runset-rs-main.sh, runset-rs-h1.sh; evaluation-pipeline rev 3 §6.3) ----
+# Per rate: SLO lifetimes as above (systems not in STREAM_FIXONLY), each followed in the same lifetime by the fixed-load
+# part "fix" when its levels are known; fix-only lifetimes (STREAM_FIXONLY: mgoff always, mg for the Megalon probe /
+# no-SLO case) hold only the part "fix" (settle right after READY). STREAM_FIX_LEVELS = tokens in window order: a query
+# rate (e.g. "1") or L1 / L2 = the lower confirmed max under the SLO of hw and pop at that rate (confirm_x_mean of
+# stream-results.tsv) and half of it; taken from STREAM_LEVELS (tsv "rate L1 L2", e.g. run 1's stream-levels.tsv) when
+# given, else computed after the rate's SLO lifetimes, and then every system of the rate gets a fix-only lifetime.
+# A rate without a confirmed hw and pop result gets no L windows (NOTE in stream-levels.tsv). Part fix: loadgen
+# --warmup-s STREAM_FIX_SETTLE_S (60, discarded) then one STREAM_FIX_S (60) s window per level, seed SEED + 1.
+# Validity of every fixed window = stream_check.py's per-step rule (stream-check.csv); invalid windows are recorded
+# (fix-check.txt, stream-fix.tsv valid=0), not a stop; check_breakdown.py must PASS.
+eval_levels_known() {  # <rate> -> FIXRATES (comma list) and 0, or 1 when an L token has no value yet
+  local r=$1 t v l1 l2 out=""
+  l1=$(awk -v r="$r" '!/^#/ && $1 == r { print $2 }' "$E/stream-levels.tsv" 2>/dev/null | tail -1)
+  l2=$(awk -v r="$r" '!/^#/ && $1 == r { print $3 }' "$E/stream-levels.tsv" 2>/dev/null | tail -1)
+  for t in ${STREAM_FIX_LEVELS:-}; do
+    case $t in L1) v=$l1;; L2) v=$l2;; *) v=$t;; esac
+    [[ $v =~ ^[0-9]+(\.[0-9]+)?$ ]] || return 1
+    out="$out${out:+,}$v"
+  done
+  FIXRATES=$out
+}
+eval_levels_compute() {  # <rate>: L1 = min(confirmed hw, pop confirm_x_mean) from stream-results.tsv, L2 = L1 / 2
+  local r=$1 v
+  v=$(python3 -I - "$E/stream-results.tsv" "$r" <<'PY'
+import csv, sys
+rows = [x for x in csv.reader(open(sys.argv[1]), delimiter="\t") if x and not x[0].startswith("#")]
+x = {}
+for f in rows:
+    if f[2] == sys.argv[2] and f[1] in ("hw", "pop") and f[5] == "True" and f[4]:
+        x[f[1]] = float(f[4])
+if set(x) != {"hw", "pop"}:
+    print("NONE no confirmed hw and pop result (" + ",".join(sorted(x)) + ")")
+else:
+    l1 = round(min(x.values()), 3)
+    print(f"{l1} {round(l1 / 2, 3)} min(hw {x['hw']}, pop {x['pop']})")
+PY
+)
+  if [[ $v == NONE* ]]; then printf '%s\t-\t-\t%s\n' "$r" "NOTE ${v#NONE }" >> "$E/stream-levels.tsv"; return 1; fi
+  read -r l1 l2 src <<< "$v"
+  printf '%s\t%s\t%s\t%s\n' "$r" "$l1" "$l2" "computed: $src" >> "$E/stream-levels.tsv"
+}
+stream_fix() {  # <sys> <rate> <comma rates>: part fix in the current lifetime
+  local s=$1 r=$2 rates=$3 RD=$LS/fix rc fs=$((SEED + 1))
+  measure "$LS" fix "${LGC[@]}" --opt seed=$fs --seed $fs --raw --mode fixed --rates "$rates" \
+    --warmup-s "${STREAM_FIX_SETTLE_S:-60}" --step-warmup-s 5 --step-measure-s "${STREAM_FIX_S:-60}" --drain-s 10
+  rc=$?; [ $rc = 0 ] || stop "$NAME fix rc $rc"
+  python3 $X/stream_check.py "$RD" > "$RD/stream-check.txt" 2>&1
+  python3 $X/check_breakdown.py "$RD" > "$RD/breakdown-check.txt" 2>&1
+  grep -q "^BREAKDOWN PASS" "$RD/breakdown-check.txt" || stop "$NAME fix: $(cat "$RD/breakdown-check.txt")"
+  python3 -I - "$RD" "$NAME" "$s" "$r" "$rates" "${STREAM_FIX_LEVELS:-}" >> "$E/stream-fix.tsv" 2> "$RD/fix-check.txt" <<'PY' || stop "$NAME fix: $(cat "$RD/fix-check.txt")"
+import csv, json, os, sys
+rd, name, s, r, rates, toks = sys.argv[1:7]
+rates, toks = rates.split(","), toks.split()
+st = [json.loads(l) for l in open(os.path.join(rd, "loadgen", "steps.jsonl")) if l.strip()]
+m = [d for d in st if d.get("measure_s", 0) > 0 and d.get("phase") == "fixed"]
+assert len(m) == len(rates) == len(toks), f"{len(m)} measured fixed steps for levels {toks} = {rates}"
+v = {}
+p = os.path.join(rd, "stream-check.csv")
+if os.path.isfile(p):
+    v = {int(x["step"]): x["valid"] == "True" for x in csv.DictReader(open(p))}
+for d, t, x in zip(m, toks, rates):
+    ok = v.get(d["step"])
+    print("\t".join([name, s, r, t, x, str(d["step"]), "" if ok is None else ("1" if ok else "0")]))
+    print(f"FIX {name} level {t} rate {x} step {d['step']} valid {ok}", file=sys.stderr)
+PY
+  echo "$NAME fix: $(tr '\n' ';' < "$RD/fix-check.txt")"
+}
+eval_stream_rate() {  # <rate>
+  local r=$1 s ord="" defer=0 fixonly=" ${STREAM_FIXONLY:-} "
+  for s in $(h1shuffle recsys-stream-$r $(for x in ${SYSTEMS:-hw pop}; do [ $x = mgoff ] || echo $x; done)); do
+    ord="$ord $s"; [ $s = mg ] && [[ " ${SYSTEMS:-} " == *" mgoff "* ]] && ord="$ord mgoff"
+  done
+  echo "u$r eval order:$ord (fix-only:${STREAM_FIXONLY:-none}; levels: ${STREAM_FIX_LEVELS:-none})" | tee -a "$E/order.txt"
+  if [ -n "${STREAM_LEVELS:-}" ] && ! grep -q "^$r	" "$E/stream-levels.tsv" 2>/dev/null; then
+    awk -v r="$r" -v f="$STREAM_LEVELS" '!/^#/ && $1 == r && $2 ~ /^[0-9]/ { printf "%s\t%s\t%s\tfrom %s\n", $1, $2, $3, f }' "$STREAM_LEVELS" >> "$E/stream-levels.tsv"
+  fi
+  FIXRATES=; [ -z "${STREAM_FIX_LEVELS:-}" ] || eval_levels_known $r || defer=1
+  for s in $ord; do
+    echo "$(date -Is) stream u$r system $s"
+    if [[ $fixonly == *" $s "* ]]; then
+      [ $defer = 1 ] && continue
+      life_start $s $s-u$r-fix; stream_fix $s $r "$FIXRATES"; life_stop $s
+    else
+      life_start $s $s-u$r; stream_slo $s $r
+      [ -z "${STREAM_FIX_LEVELS:-}" ] || [ $defer = 1 ] || stream_fix $s $r "$FIXRATES"
+      life_stop $s
+    fi
+  done
+  [ $defer = 1 ] || return 0
+  eval_levels_compute $r && eval_levels_known $r || { echo "MAIN NOTE u$r: no fixed-load levels ($(tail -1 "$E/stream-levels.tsv"))"; return 0; }
+  for s in $ord; do life_start $s $s-u$r-fix; stream_fix $s $r "$FIXRATES"; life_stop $s; done
+}
 h1_entry() {  # <name> <sys> <phase> <part> <steps> <lifetime kind>
   printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$1" "$2" "$H1_MIX" "$3" "$H1_N" "${LS#$E/}/$4" "$5" "$6" >> "$E/h1-runs.tsv"
 }
@@ -760,12 +871,20 @@ if [ $BLOCK = stream ]; then  # RecSys streaming driver (header "BLOCK=stream")
     echo "ekko_avg: 3.08% distinct rows per 3600 s -> 41.47 samples/s -> 50; ekko_peak: 4.3% distinct rows per 600 s -> 393.27 samples/s -> 400 (recsys-rate, workspaces/recsys-mid/ekko10min)"
     echo "rates: $STREAM_RATES (> 400 = stress)"; } > "$E/rate-basis.txt"
   printf '# name\tsystem\trate_sps\tresult_q_s\tconfirm_x_mean\tconfirmed\tlow_rate_violations\tstreamcheck\tvalid\tramp_end\tknee_q_s\tnote\n' > "$E/stream-results.tsv"
+  if [ -n "${EVAL_RUN:-}" ]; then
+    printf '# name\tsystem\trate_sps\tlevel\toffered_q_s\tstep\tvalid\n' > "$E/stream-fix.tsv"
+    printf '# rate_sps\tL1_q_s\tL2_q_s\tsource\n' > "$E/stream-levels.tsv"
+    { echo "EVAL_RUN=$EVAL_RUN RS_THREADS=$RS_THREADS REGION=$REGION sha256=$(sha256sum < "$REGION" | cut -c1-64)"
+      echo "SYSTEMS=${SYSTEMS:-hw pop} STREAM_FIXONLY=${STREAM_FIXONLY:-} STREAM_FIX_LEVELS=${STREAM_FIX_LEVELS:-} STREAM_LEVELS=${STREAM_LEVELS:-}"
+      echo "STREAM_FIX_S=${STREAM_FIX_S:-60} STREAM_FIX_SETTLE_S=${STREAM_FIX_SETTLE_S:-60} server_args=[$SA] node0_extra=[$N0X]"; } | tee "$E/eval-params.txt"
+  fi
   { echo "# RecSys streaming block: per rate (in STREAM_RATES order) one lifetime per system, order shuffle(seed recsys-stream-<rate>)"
     for r in $STREAM_RATES; do echo "u$r: $(h1shuffle recsys-stream-$r ${SYSTEMS:-hw pop})"; done; } | tee "$E/order.txt"
   for r in $STREAM_RATES; do
     lab=""; [ $r -le 400 ] || lab=" (stress, above Ekko peak)"
     LGC=(--opt samples=$D/$UPD_FILE --opt queries=$D/$QRY_FILE
          --opt quantiles=$D/dist_quantile.txt --fixed update=$r --mix query=1 --x-stream query)
+    if [ -n "${EVAL_RUN:-}" ]; then eval_stream_rate $r; continue; fi
     for s in $(h1shuffle recsys-stream-$r ${SYSTEMS:-hw pop}); do
       echo "$(date -Is) stream u$r$lab system $s"
       life_start $s $s-u$r; stream_slo $s $r; life_stop $s
