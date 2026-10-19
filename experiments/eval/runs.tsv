@@ -1,2 +1,2 @@
-# Accepted-run registry of the evaluation run sets (registry.py; append-only; last line per (runset, k, evidence_dir) wins)
+# Template of the accepted-run registry: registry.py copies it to workspaces/eval-derived/runs.tsv on first use and appends only there (never to this tracked file)
 # workload	runset	k	evidence_dir	config_sha256	status	date	note

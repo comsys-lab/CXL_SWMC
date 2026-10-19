@@ -13,14 +13,20 @@ usage: registry.py add <workload> <runset> <k> <evidence_dir> <config_sha256> <s
        registry.py invalid <runset> <k> <evidence_dir> <note>
        registry.py get <runset> <k> [--status accepted|measured]  print evidence_dir and config_sha256 (exit 1 if none)
        registry.py list
-env EVAL_REGISTRY = the runs.tsv to use (default runs.tsv next to this script; tests point it elsewhere)
+env EVAL_REGISTRY = the runs.tsv to use (default /home/comsys/sungsu/destijl-control/workspaces/eval-derived/runs.tsv,
+outside the code tree, created from the tracked template runs.tsv next to this script on first use: a run never
+dirties the tree the drivers require clean; verifier M1). Tests point it elsewhere.
 """
 import datetime
 import os
+import shutil
 import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-REG = os.environ.get("EVAL_REGISTRY") or os.path.join(HERE, "runs.tsv")
+REG = os.environ.get("EVAL_REGISTRY") or "/home/comsys/sungsu/destijl-control/workspaces/eval-derived/runs.tsv"
+if not os.path.exists(REG):
+    os.makedirs(os.path.dirname(REG), exist_ok=True)
+    shutil.copyfile(os.path.join(HERE, "runs.tsv"), REG)
 COLS = ["workload", "runset", "k", "evidence_dir", "config_sha256", "status", "date", "note"]
 STATUS = ("started", "measured", "stopped", "accepted", "invalid")
 WORKLOADS = {"vdb": ("vdb",), "recsys": ("rs-main", "rs-h1")}
