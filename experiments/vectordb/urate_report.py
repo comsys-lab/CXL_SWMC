@@ -23,6 +23,13 @@ reports/experiments/vectorDB-update-rate.md). Host only, offline.
                             judged step invalid); the doc's "rung not sustained" can be read from these counts.
       also <E>/urate-steps.csv (every measured step of every lifetime, the same columns per step plus phase / pass /
       valid, then the coherence columns COH_COLS below) for plots (x from 0) and CSV export.
+  urate_report.py level <slo part dir>
+      stdout: the lifetime's L1 candidate (summary.json confirm.x_mean) if confirmed is true and loadgen wrote no note;
+      else exit 1 with the reason (urate-block.sh: fixed-load levels, user 2026-10-20)
+  table also writes <E>/urate-fixed.csv: one row per measured window of the fixed-load lifetimes <sys>-u<R>-fix (part
+      fix): rate_ups, system, writers, level (L2 | L1, from fix/h1-steps.txt), step, offered_search_s, valid
+      (urate_check.py per window), update_offered, the metric columns COLS and the coherence columns COH_COLS (source of
+      the H2-style common-load figures).
 MED-1: result_search_s, confirm_x_mean, confirm_x_* and every at_result column are left empty unless summary.json
 confirmed is true (an unconfirmed or truncated rung has no SLO result; result_offered_raw keeps loadgen's value).
 cxl_recv CPU (s per s): opsplit's window (bg_cpu_frac x bg_kthr_run_s / (bg_lib_run_s + bg_kthr_run_s), i.e.
@@ -333,12 +340,68 @@ def table(a):
         dw.writeheader()
         for r in allrows:
             dw.writerow({k: f(r.get(k)) for k in keys})
+    fixed_csv(E)
+    return 0
+
+
+def writers_of(life):
+    for line in open(os.path.join(life, "manifest.txt")):
+        m = re.search(r"--writer-threads (\d+)", line)
+        if m:
+            return m.group(1)
+    return ""
+
+
+def fixed_csv(E):
+    """<E>/urate-fixed.csv: the measured windows of the fixed-load lifetimes <sys>-u<R>-fix (part fix: L2 then L1)."""
+    rows = []
+    for d in sorted(glob.glob(os.path.join(E, "*-u*-fix", "fix"))):
+        m = re.fullmatch(r"(hw|pop)-u(\d+)-fix", os.path.basename(os.path.dirname(d)))
+        if not m:
+            continue
+        try:
+            st = [r for r in steps_of(d, m.group(1)) if r["phase"] == "fixed"]
+        except Exception as e:  # noqa: BLE001 (analysis only)
+            warn(f"{d}: fixed part unreadable ({e!r})")
+            continue
+        lv = {}
+        p = os.path.join(d, "h1-steps.txt")
+        if os.path.exists(p):
+            a, _, b = open(p).read().strip().partition(",")
+            lv = {int(a): "L2", int(b): "L1"}
+        elif len(st) == 2:
+            lv = {st[0]["step"]: "L2", st[1]["step"]: "L1"}
+        for r in st:
+            rows.append(dict(rate_ups=int(m.group(2)), system=m.group(1), writers=writers_of(os.path.dirname(d)),
+                             level=lv.get(r["step"], ""), offered_search_s=r["offered_x"], **r))
+    rows.sort(key=lambda r: (r["rate_ups"], r["system"], r["step"]))
+    keys = ["rate_ups", "system", "writers", "level", "step", "offered_search_s", "valid", "update_offered"] + COLS + COH_COLS
+    with open(os.path.join(E, "urate-fixed.csv"), "w", newline="") as fo:
+        dw = csv.DictWriter(fo, fieldnames=keys)
+        dw.writeheader()
+        for r in rows:
+            dw.writerow({k: f(r.get(k)) for k in keys})
+
+
+def level(a):
+    """L1 candidate of one SLO lifetime: confirm mean, only if confirmed is true and loadgen wrote no note."""
+    s = json.load(open(os.path.join(a[0], "loadgen", "summary.json")))
+    x = fl(s.get("confirm", {}).get("x_mean"))
+    if s.get("confirmed") is not True:
+        sys.exit("not confirmed")
+    if s.get("note"):
+        sys.exit("note: " + s["note"])
+    if not x or x <= 0:
+        sys.exit("no confirm mean")
+    print(x)
     return 0
 
 
 if __name__ == "__main__":
     if len(sys.argv) >= 2 and sys.argv[1] == "row" and len(sys.argv) == 8:
         sys.exit(row(sys.argv[2:]))
+    if len(sys.argv) == 3 and sys.argv[1] == "level":
+        sys.exit(level(sys.argv[2:]))
     if len(sys.argv) == 3 and sys.argv[1] == "table":
         sys.exit(table(sys.argv[2:]))
     sys.exit(__doc__ + "\n" + COH_DOC)

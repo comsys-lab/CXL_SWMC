@@ -18,7 +18,11 @@ result makes bisect/confirm longer), --x-knee = the highest knee it covers. Outs
 block then relies on the loadgen exhaustion NOTE (m4-run.sh) for the explicitly allowed rates.
 
 usage: urate_budget.py <m4-run.sh> [--start 1] [--x-floor 10] [--x-knee 400] [--g-min 1.2] [--rate R ...]
-  prints "seconds=<bound>" and, per --rate, "rate=<R> updates=<R x bound>"
+  prints "seconds=<bound>" and, per --rate, "rate=<R> updates=<R x bound>"; --start is the ramp start of the rates
+  given (urate-block.sh calls it once per rate with that rate's start, URATE_START_MAP).
+urate_budget.py <m4-run.sh> --fixed [--rate R ...]
+  fixed-load lifetime (URATE_PARTS="warm fix"): warm part + fix part (--warmup-s settle + 2 x (--step-warmup-s +
+  --step-measure-s), L2 and L1); prints "fixed_seconds=<bound>" and, per --rate, "fixed_rate=<R> updates=<R x bound>".
 """
 import argparse
 import re
@@ -49,11 +53,19 @@ def main():
     ap.add_argument("--x-knee", type=float, default=400.0)
     ap.add_argument("--g-min", type=float, default=1.2)
     ap.add_argument("--rate", type=int, action="append", default=[])
+    ap.add_argument("--fixed", action="store_true")
     a = ap.parse_args()
     text = open(a.m4run).read()
     w, s = part_args(text, "warm"), part_args(text, "slo")
     f = lambda d, k: float(d[k])  # noqa: E731
     t_warm = f(w, "warmup-s") + f(w, "step-warmup-s") + f(w, "step-measure-s")
+    if a.fixed:
+        x = part_args(text, "fix")
+        t_fix = f(x, "warmup-s") + 2 * (f(x, "step-warmup-s") + f(x, "step-measure-s"))
+        print(f"fixed_seconds={t_warm + t_fix:.0f} warm={t_warm:.0f} fix={t_fix:.0f} (settle {f(x, 'warmup-s'):g} s + 2 windows)")
+        for r in a.rate:
+            print(f"fixed_rate={r} updates={int(r * (t_warm + t_fix) + 0.5)}")
+        return 0
     sw, win, minq = f(s, "step-warmup-s"), f(s, "step-measure-s"), float(s.get("min-step-queries", 0))
     step = lambda x, window=win: sw + max(window, minq / x)  # noqa: E731
     ramp, x, n = 0.0, a.start, 0
