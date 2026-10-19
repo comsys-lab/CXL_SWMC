@@ -1,0 +1,58 @@
+#!/bin/bash
+# Run set "rs-main" (evaluation-pipeline rev 3 §3.3, §6.3; reports/experiments/two-workload-evaluation-2vm.md): RecSys
+# streaming SLO lifetimes of all-HWcc and Popcorn at RS_POINTS samples/s (experiments/recsys/main-block.sh
+# BLOCK=stream with EVAL_RUN), threads = vCPUs (node 0: RS_THREADS update threads, node 1: RS_THREADS serving), region
+# REGION (2 MiB ring), and the fixed-load windows of user decision 2026-10-20:
+#   RS_FIX_LEVELS (L1 L2: L1 = lower confirmed max of hw and pop at the rate, L2 = L1 / 2), a RS_FIX_FALLBACK_Q window
+#   where hw or pop has no confirmed result, plus a RS_MG_COMPARE_Q window at the RS_MG_POINTS rates (comparison with
+#   the Megalon windows of run set rs-h1); RS_FIX_SEP=1: per system a fix-only lifetime after both SLO lifetimes.
+#   Runs k != LEVELS_FROM_RUN take the levels of that run (its stream-levels.tsv; cut Q8); RS_LATER_FIX_SEP=0 then
+#   measures them in the SLO lifetime instead of separate lifetimes.
+# Layout: E/eval-manifest.txt, E/eval-state.txt, E/block/ (the block's evidence dir: stream-results.tsv,
+# stream-fix.tsv, stream-levels.tsv, <sys>-u<R>/{slo,fix}, <sys>-u<R>-fix/fix, rs-check.txt).
+# The block takes and releases the measurement lock itself (owner RECSYS-stream-block).
+# usage: runset-rs-main.sh <k> [--dry] [--v N]   (lib.sh)
+RUNSET=rs-main WL=recsys
+. "$(dirname "$0")/lib.sh"
+rs_checks
+for s in $RS_SYSTEMS; do case $s in hw|pop) ;; *) die "RS_SYSTEMS are hw, pop (Megalon: run set rs-h1)";; esac; done
+MAP=""
+for r in $RS_MG_POINTS; do
+  [[ " $RS_POINTS " == *" $r "* ]] || die "RS_MG_POINTS rate $r not in RS_POINTS"
+  [ -z "$RS_MG_COMPARE_Q" ] || MAP="$MAP $r=$(echo $RS_FIX_LEVELS | tr ' ' ','),$RS_MG_COMPARE_Q"
+done
+SEP=$RS_FIX_SEP LVF=
+if [ "$K" != "$LEVELS_FROM_RUN" ]; then
+  SEP=$RS_LATER_FIX_SEP
+  if E1=$(run_dir_of rs-main "$LEVELS_FROM_RUN"); then LVF=$E1/block/stream-levels.tsv; need_files "$LVF"
+  elif [ $DRY = 1 ]; then plan "levels: run $LEVELS_FROM_RUN of rs-main not accepted yet (a real run would stop here)"
+  else die "run $LEVELS_FROM_RUN of rs-main is not accepted (registry.py accept)"; fi
+fi
+need_env
+lock_free
+evidence_dir
+rs_env
+RSENV+=(SYSTEMS="$RS_SYSTEMS" STREAM_RATES="$RS_POINTS" STREAM_FIX_LEVELS="$RS_FIX_LEVELS" STREAM_FIX_LEVELS_MAP="${MAP# }"
+  STREAM_FIX_FALLBACK=$RS_FIX_FALLBACK_Q STREAM_FIX_SEP=$SEP STREAM_LEVELS=$LVF)
+BLK=(bash $TREE/experiments/recsys/main-block.sh $E/block)
+plan "rates [$RS_POINTS] systems [$RS_SYSTEMS] fix levels [$RS_FIX_LEVELS] map [${MAP# }] fallback ${RS_FIX_FALLBACK_Q:-none} sep $SEP levels ${LVF:-computed in this run}"
+plan "block: env ${RSENV[*]} ${BLK[*]}"
+plan "then: rs_check.py $E/block --rates '$RS_POINTS' --slo-systems '$RS_SYSTEMS' --fix-systems '$RS_SYSTEMS'"
+if [ $DRY = 1 ]; then
+  block_dry "missing or not empty" env "${RSENV[@]}" bash $TREE/experiments/recsys/main-block.sh @DIR@
+  echo "DRY START OK ($RUNSET run $K): stops here, before the lock"; exit 0
+fi
+mkdir "$E" && mkdir "$E/block" || die "mkdir $E"
+log() { echo "$(date -Is) [$RUNSET run $K] $*" | tee -a "$E/eval-state.txt"; }
+stop() { log "SEQUENCE STOP $*"; $REG add recsys rs-main $K "$E" $CSHA stopped "$*"; exit 1; }
+manifest "$RS_PLAIN_BUILD" "$RS_MEG_BUILD" "$(dirname "$RS_LOADGEN")"
+$REG add recsys rs-main $K "$E" $CSHA started "commit $COMMIT"
+log "block start"
+env "${RSENV[@]}" "${BLK[@]}" > "$E/block/sequence.log" 2>&1
+log "block rc $?: $(tail -n 1 "$E/block/sequence.log")"
+python3 -I -B $EVD/rs_check.py "$E/block" --rates "$RS_POINTS" --slo-systems "$RS_SYSTEMS" --fix-systems "$RS_SYSTEMS" > /dev/null
+log "check: $(tail -n 1 "$E/block/rs-check.txt")"
+tail -n 1 "$E/block/rs-check.txt" | grep -q "^RSCHECK PASS" || stop "check FAIL (see $E/block/rs-check.txt)"
+$REG add recsys rs-main $K "$E" $CSHA measured "$(tail -n 1 "$E/block/rs-check.txt")"
+export_run "$TREE/experiments/recsys/export.py" "$E"
+log "RUNSET DONE: review $E/block/rs-check.txt, then: python3 $EVD/registry.py accept rs-main $K $E"
