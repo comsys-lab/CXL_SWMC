@@ -7,6 +7,11 @@ For each distinct query row: exact top-K' by inner product (unit-norm vectors: c
 search with snapshot s: keep the candidates visible at s (ins_seq <= s < del_seq) in score order and take the
 first k; if fewer than k remain, recompute that search by brute force over every visible record.
 
+Inserted ids: id NA + j uses pool B row vec_ref of its INSERT record (gen_writes.py; row j unless --pool-b-rows reused
+rows under new ids, DESIGN.md §17). With reused rows two live ids can hold the same vector (equal scores): the
+recall file adds recall_tie_aware_* (a returned visible id whose score is >= the k-th exact score counts as a hit;
+at most k per search).
+
 Output: <out>.recall.txt (recall@k over measured OK responses and over all OK responses), <out>.gt.npy
 (uint64 [searches, k], rows in searches.bin order), <out>.manifest.txt.
 
@@ -49,8 +54,14 @@ def main():
     A = read_fbin(os.path.join(a.data, "pool_a.fbin"))
     B = read_fbin(os.path.join(a.data, "pool_b.fbin"))
     Q = read_fbin(os.path.join(a.data, "queries.fbin"))
-    NA, NB = A.shape[0], B.shape[0]
+    NA = A.shape[0]
     w = np.fromfile(a.writes, dtype=WDT)
+    wi0 = w[w["op"] == INSERT]
+    NB = int(wi0["id"].max()) - NA + 1 if len(wi0) else 0  # inserted id space NA .. NA + NB - 1
+    rowmap = np.arange(NB, dtype=np.int64)  # inserted id - NA -> pool B row
+    rowmap[wi0["id"].astype(np.int64) - NA] = wi0["vec_ref"]
+    if NB and rowmap.max() >= B.shape[0]:
+        sys.exit("writes file references pool B rows beyond pool_b.fbin")
     sr = np.fromfile(a.searches, dtype=search_dtype(a.k))
     if len(sr) and int(sr["k"][0]) != a.k:
         sys.exit(f"searches.bin has k={sr['k'][0]}, not {a.k}")
@@ -69,10 +80,10 @@ def main():
     Qu = np.ascontiguousarray(Q[qrows])
     best_s = np.full((len(qrows), a.kprime), -np.inf, dtype=np.float32)
     best_i = np.zeros((len(qrows), a.kprime), dtype=np.int64)
-    for base, X in ((0, A), (NA, B)):
+    for base, X, n_rows in ((0, A, NA), (NA, B, NB)):
         block = max(1024, (a.block_mb << 20) // (4 * max(1, len(qrows))))  # rows per block: bounded score matrix
-        for lo in range(0, X.shape[0], block):
-            blk = np.asarray(X[lo:lo + block])
+        for lo in range(0, n_rows, block):
+            blk = np.asarray(X[lo:lo + block]) if base == 0 else np.asarray(B[rowmap[lo:lo + block]])  # id order
             sc = Qu @ blk.T
             kk = min(a.kprime, sc.shape[1])
             loc = np.argpartition(-sc, kk - 1, axis=1)[:, :kk]
@@ -86,8 +97,22 @@ def main():
     best_i = np.take_along_axis(best_i, order, axis=1)
     row_of = {int(q): r for r, q in enumerate(qrows)}
 
+    def vecs_b(j):  # inserted ids (minus NA) -> their pool B vectors
+        return np.asarray(B[rowmap[j]])
+
+    def score(ids, q):
+        ids = np.asarray(ids, dtype=np.int64)
+        out = np.empty(len(ids), dtype=np.float32)
+        ma = ids < NA
+        if ma.any():
+            out[ma] = np.asarray(A[ids[ma]]) @ Q[q]
+        if (~ma).any():
+            out[~ma] = vecs_b(ids[~ma] - NA) @ Q[q]
+        return out
+
     gt = np.zeros((len(sr), a.k), dtype=np.uint64)
     hits = np.zeros(len(sr), dtype=np.float64)
+    hits_tie = np.zeros(len(sr), dtype=np.float64)
     fallback = invisible = dup = 0
     for n, rec in enumerate(sr):
         if rec["status"] != 0:
@@ -100,12 +125,16 @@ def main():
         else:
             fallback += 1
             ids = np.nonzero((ins <= s) & (s < dele))[0]
-            sc = np.concatenate([np.asarray(A[ids[ids < NA]]) @ Q[q], np.asarray(B[ids[ids >= NA] - NA]) @ Q[q]])
+            sc = np.concatenate([np.asarray(A[ids[ids < NA]]) @ Q[q], vecs_b(ids[ids >= NA] - NA) @ Q[q]])
             gt[n] = ids[np.argsort(-sc, kind="stable")[:a.k]]
         got = rec["ids"][:rec["n"]].astype(np.int64)
         hits[n] = len(np.intersect1d(got, gt[n])) / a.k
         bad = (got >= NA + NB)
         g = got[~bad]
+        gvis = g[(ins[g] <= s) & (s < dele[g])]
+        if len(gvis) and len(gt[n]):
+            kth = float(score(gt[n][-1:].astype(np.int64), q)[0])
+            hits_tie[n] = min(a.k, len(np.intersect1d(gvis, gt[n])) + int((score(np.setdiff1d(gvis, gt[n].astype(np.int64)), q) >= kth - 1e-6).sum())) / a.k
         invisible += int(bad.sum()) + int(((ins[g] > s) | (dele[g] <= s)).sum())  # E1 violation
         dup += len(got) - len(np.unique(got))
     np.save(a.out + ".gt.npy", gt)
@@ -116,6 +145,9 @@ def main():
                 f"not_ok={int((~oka).sum())}\n")
         f.write(f"recall_measured_ok={hits[okm].mean() if okm.any() else float('nan'):.5f}\n")
         f.write(f"recall_all_ok={hits[oka].mean() if oka.any() else float('nan'):.5f}\n")
+        f.write(f"recall_tie_aware_measured_ok={hits_tie[okm].mean() if okm.any() else float('nan'):.5f}\n")
+        f.write(f"recall_tie_aware_all_ok={hits_tie[oka].mean() if oka.any() else float('nan'):.5f}\n")
+        f.write(f"inserted_ids={NB} vector_rows_used={len(np.unique(rowmap)) if NB else 0}\n")
         f.write(f"invisible_returned={invisible}\nduplicate_ids={dup}\n")
         f.write("(searches never answered are not in searches.bin: take timeouts from the loadgen steps.jsonl)\n")
     with open(a.out + ".manifest.txt", "w") as m:

@@ -77,6 +77,10 @@ struct Opts {
   std::string trace_dir;    // sharing trace written at stop (empty: none; Megalon only; DESIGN.md §16)
   uint64_t trace_max_mb = 4096;  // per node trace buffer cap (records beyond it are dropped and counted)
   bool op_coh = true;       // per-operation time split (opcoh.h; --op-coh off disables the counter reads and blocks)
+  // --init-capacity C (DESIGN.md §17): the init dir was built for C elements per segment (C <= capacity, same chunk
+  // size). Chunk images are chunk-relative and per_chunk / lchunk do not depend on the capacity, so a larger run
+  // capacity only adds groups. 0 = the run capacity (every earlier build).
+  uint64_t init_capacity = 0;
   // Writer threads of this node (--writer-threads, default 1 = every run before the update-rate sweep). With N > 1
   // the node's writes are taken from one queue by N threads (DESIGN.md §17): segment writes stay serialised by the
   // segment's HWcc rwlock, an update's delete and insert stay on one thread in that order, the node's delete log is
@@ -330,6 +334,8 @@ class Server {
   }
 
  private:
+  uint64_t init_capacity() const { return o_.init_capacity ? o_.init_capacity : p_.g.capacity; }
+
   // ---------------------------------------------------------------- initial segments (prepare, node 0, unmeasured)
   // init_dir: segments.txt ("<s> <count> <ep_level> <upper_cur>"), per group g < ceil(count / per_chunk):
   // seg-<s>-v<g>.bin (vector chunk, used bytes) and seg-<s>-l<g>.bin (whole link chunk); manifest.txt with the graph
@@ -343,7 +349,7 @@ class Server {
     std::ifstream man(o_.init_dir + "/manifest.txt");
     std::string line, want = "graph " + std::to_string(p_.segments) + " " + std::to_string(p_.g.dim) + " " +
                              std::to_string(p_.g.M) + " " + std::to_string(p_.g.ef_construction) + " " +
-                             std::to_string(p_.g.capacity) + " " + std::to_string(p_.g.chunk_bytes);
+                             std::to_string(init_capacity()) + " " + std::to_string(p_.g.chunk_bytes);
     bool ok = false;
     while (std::getline(man, line)) ok = ok || line == want;
     if (!ok) die("init_dir manifest does not contain '" + want + "' (built for other parameters)");
@@ -383,7 +389,7 @@ class Server {
       std::ifstream man(o_.init_dir + "/manifest.txt");
       std::string line, want = "graph " + std::to_string(p_.segments) + " " + std::to_string(p_.g.dim) + " " +
                                std::to_string(p_.g.M) + " " + std::to_string(p_.g.ef_construction) + " " +
-                               std::to_string(p_.g.capacity) + " " + std::to_string(p_.g.chunk_bytes);
+                               std::to_string(init_capacity()) + " " + std::to_string(p_.g.chunk_bytes);
       bool ok = false;
       while (std::getline(man, line)) ok = ok || line == want;
       if (!ok) die("init_dir manifest does not contain '" + want + "' (built for other parameters)");
@@ -945,6 +951,7 @@ void usage() {
                "     stop; dedicated runs only; DESIGN.md §16)\n"
                "  [--op-coh on|off] per-operation time split block in every search/update response (default on; DESIGN.md §15)\n"
                "  [--writer-threads N] writer threads of this node (default 1; plain backend only for N > 1; DESIGN.md §17)\n"
+               "  [--init-capacity C] init dir built for C elements per segment (<= capacity; default the capacity; §17)\n"
                "--backend megalon: Megalon (RACKOBJ_CONFIG, object_arena_size > 0) maps the device; MEGALON_NODE_ID and\n"
                "  MEGALON_RUN_ID default to --node and --run-id, CXL_REGION_CONFIG to --region (DESIGN.md §12).\n"
                "All nodes need identical parameters (checked through the HWcc app layout hash).\n"
@@ -991,6 +998,7 @@ int main(int argc, char **argv) {
     else if (a == "--trace-dir") o.trace_dir = v();
     else if (a == "--trace-max-mb") o.trace_max_mb = std::stoull(v());
     else if (a == "--writer-threads") o.writer_threads = std::stoul(v());
+    else if (a == "--init-capacity") o.init_capacity = std::stoull(v());
     else if (a == "--op-coh" || a == "--query-coh") {
       const std::string x = v();
       if (x != "on" && x != "off") usage();
@@ -1004,6 +1012,11 @@ int main(int argc, char **argv) {
     return 0;
   }
   if (o.run_id == 0 && !o.preload_only) usage();
+  if (o.init_capacity > o.p.g.capacity) {
+    std::fprintf(stderr, "vdb-server: --init-capacity %lu exceeds the run capacity %lu\n", (unsigned long)o.init_capacity,
+                 (unsigned long)o.p.g.capacity);
+    return 2;
+  }
   if (o.writer_threads < 1 || o.writer_threads > 16 || (o.writer_threads > 1 && o.backend != "plain")) {
     std::fprintf(stderr, "vdb-server: --writer-threads must be 1..16 (> 1 only with the plain backend)\n");
     return 2;

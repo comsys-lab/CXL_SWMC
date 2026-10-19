@@ -8,7 +8,10 @@ DELETE (w_seq 2k+1) of a live id chosen uniformly, then INSERT (w_seq 2k+2) of t
 the loadgen plugin sends each pair as one UPDATE request. Mode "independent": INSERT/DELETE drawn per write
 (--insert-frac), sent as separate requests (earlier runs).
 
-Record ids: pool A row i -> id i (initial records, ins_seq 0); pool B row j -> id NA + j (inserted in pool B order).
+Record ids: pool A row i -> id i (initial records, ins_seq 0); the j-th insert -> id NA + j (new ids, never reused).
+Vectors: the j-th insert uses pool B row j (default). --pool-b-rows R < --pool-b (dataset deviation for the update-rate
+sweep, DESIGN.md §17): row j mod R, i.e. pool B vectors are reused under new ids once all R rows were inserted; then
+--pool-b is the number of inserts (ids), not of vector rows. Without the option the output is unchanged.
 Deletes pick uniformly among ids live at their w_seq (pool A and already inserted pool B ids).
 
 Output: <out> = binary records (little-endian, 24 B each):
@@ -33,7 +36,8 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--out", required=True)
     ap.add_argument("--pool-a", type=int, required=True)
-    ap.add_argument("--pool-b", type=int, required=True)
+    ap.add_argument("--pool-b", type=int, required=True, help="inserts available (new ids NA .. NA + pool_b - 1)")
+    ap.add_argument("--pool-b-rows", type=int, default=0, help="pool B vector rows (default = --pool-b; fewer = reuse)")
     ap.add_argument("--writes", type=int, required=True, help="W (must stay below the server's --max-writes)")
     ap.add_argument("--mode", choices=["update", "independent"], default="update")
     ap.add_argument("--insert-frac", type=float, default=0.5, help="independent mode only")
@@ -51,6 +55,9 @@ def main():
     if is_ins.sum() > a.pool_b:
         sys.exit(f"{is_ins.sum()} inserts exceed pool B ({a.pool_b})")
 
+    rows = a.pool_b_rows or a.pool_b
+    if rows > a.pool_b:
+        sys.exit("--pool-b-rows exceeds --pool-b")
     live = np.empty(a.pool_a + int(is_ins.sum()), dtype=np.uint64)  # O(1) swap-remove live set
     live[:a.pool_a] = np.arange(a.pool_a, dtype=np.uint64)
     nlive, next_b = a.pool_a, 0
@@ -59,7 +66,7 @@ def main():
     for k in range(W):
         if is_ins[k]:
             w["id"][k] = a.pool_a + next_b
-            w["vec_ref"][k] = next_b
+            w["vec_ref"][k] = next_b % rows
             live[nlive] = w["id"][k]
             nlive += 1
             next_b += 1
@@ -82,6 +89,8 @@ def main():
         for k, v in sorted(vars(a).items()):
             m.write(f"{k}={v}\n")
         m.write(f"inserts={int(is_ins.sum())} deletes={int(W - is_ins.sum())} live_at_end={nlive}\n")
+        if a.pool_b_rows:
+            m.write(f"vector_rows={rows} reused_inserts={max(0, int(is_ins.sum()) - rows)} (row = insert index mod rows)\n")
     print(f"writes={W} (ins {int(is_ins.sum())}, del {int(W - is_ins.sum())}) -> {a.out}")
 
 
