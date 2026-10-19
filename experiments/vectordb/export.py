@@ -66,17 +66,28 @@ def parts_h1(E, rnd):
     if len(rs) != 1:
         sys.exit(f"export.py: {E}: need exactly one round dir with run/h1-runs.tsv (found {len(rs)}; use --round)")
     run = os.path.dirname(rs[0])
+    # H2 level set (eval, user 2026-10-20 M4 = b): h2-runs.tsv lifetimes; mixes whose H2 set equals the H1 set
+    same = set()
+    p = os.path.join(run, "levels-h2-used.tsv")
+    if os.path.isfile(p):
+        with open(p) as f:
+            same = {x[0] for x in csv.reader(f, delimiter="\t") if x and not x[0].startswith("#") and x[5] == "same-as-h1"}
     out = []
-    for line in open(rs[0]):
-        if line.startswith("#") or not line.strip():
+    for tsvf, lset in ((rs[0], "h1"), (os.path.join(run, "h2-runs.tsv"), "h2")):
+        if not os.path.isfile(tsvf):
             continue
-        name, s, mix, ph, r, rd, steps, life = line.rstrip("\n").split("\t")
-        lv = {}
-        if ph == "fix":
-            a, b = steps.split(",")
-            lv = {int(a): "L2", int(b): "L1"}
-        out.append(dict(system=s, point=mix, upd_share=SHARE.get(mix), rate_unit="mix", phase=ph,
-                        part=os.path.join(run, rd), life=os.path.join(run, rd.split("/")[0]), levels=lv, lifetime=life))
+        for line in open(tsvf):
+            if line.startswith("#") or not line.strip():
+                continue
+            name, s, mix, ph, r, rd, steps, life = line.rstrip("\n").split("\t")
+            lv = {}
+            if ph == "fix":
+                a, b = steps.split(",")
+                lv = {int(a): "L2", int(b): "L1"}
+            ls = "h1 h2" if lset == "h1" and s in ("hw", "pop") and mix in same else lset
+            out.append(dict(system=s, point=mix, upd_share=SHARE.get(mix), rate_unit="mix", phase=ph, level_set=ls,
+                            part=os.path.join(run, rd), life=os.path.join(run, rd.split("/")[0]), levels=lv,
+                            lifetime=life))
     return out
 
 
@@ -219,7 +230,8 @@ def export(E, out, rnd, vcpus):
                     lines = rf * 4096 / 64 if rf is not None else None
                 else:
                     lines = 0.0
-                fixed.append(dict(c, level=p["levels"].get(r["step"], ""), step=r["step"], offered_x=rd(r["offered_x"]),
+                fixed.append(dict(c, level=p["levels"].get(r["step"], ""), level_set=p.get("level_set", "h2"),
+                                  step=r["step"], offered_x=rd(r["offered_x"]),
                                   achieved_x=r["search_per_s"], valid=r["valid"], slo_pass=r["pass"],
                                   wop_offered_per_s=up.get("offered"), wop_done_ratio=dr.get(r["step"]),
                                   n_rop=sr.get("done"), p95_ms=r["search_p95_ms"], p99_ms=r["search_p99_ms"],

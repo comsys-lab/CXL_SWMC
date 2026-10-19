@@ -25,14 +25,19 @@ Parameters: `eval.conf` only (`evalconf.py shell` shows the resolved values and 
 ## Runs (one at a time; each driver logs to E/eval-state.txt and runs.tsv)
 | Run set | Command (from live CXL_SWMC, inside a `workspaces/*-chain-*.sh` wrapper with `setsid nohup`) | Lifetimes | Time (estimate) |
 | --- | --- | --- | --- |
-| vdb run 1 | `bash experiments/eval/runset-vdb.sh 1` | 21: per mix hw/pop SLO-only, mg SLO+fix, mgoff fix, hw/pop fix | ~3.3 h (H1 r1: 3 h 16 min) |
-| vdb runs 2, 3 | `bash experiments/eval/runset-vdb.sh 2` (then 3); needs run 1 accepted | 12: hw/pop/mg SLO+fix, mgoff fix | ~2.2 h each (inference) |
+| vdb run 1 | `bash experiments/eval/runset-vdb.sh 1` | 21 H1: per mix hw/pop SLO-only, mg SLO+fix, mgoff fix, hw/pop fix; + up to 6 H2: hw/pop fix-only at the hw/pop levels (skipped where equal to the H1 levels) | ~4.1 h (H1 r1 3 h 16 min + ~50 min H2 windows) |
+| vdb runs 2, 3 | `bash experiments/eval/runset-vdb.sh 2` (then 3); needs run 1 accepted | 12 H1: hw/pop/mg SLO+fix, mgoff fix; + up to 6 H2 fix-only at run 1's H2 levels | ~3.0 h each (inference) |
 | rs-main run k | `bash experiments/eval/runset-rs-main.sh <k>` | per rate (50 100 200 400): hw, pop SLO; then hw, pop fix-only lifetimes (L1, L2, [1 q/s at 50 / 200], fallback 1 q/s) | ~4 h run 1 (3.0 h SLO + ~1 h fix-only lifetimes, inference) |
 | rs-h1 run k | `bash experiments/eval/runset-rs-h1.sh <k>`; run 1 after rs-main run 1 | run 1: Megalon probe 1 q/s at 50, 200; SLO(mg) only where the probe p95 <= 100 ms and valid; mg/mgoff fix-only | ~0.6 h without SLO(mg) (inference) |
 Evidence: `recovery/two-workload-eval-run<k>-<vdb|rs-main|rs-h1>-v<N>` (new N per attempt, never reused).
 Canonical CSVs: `workspaces/eval-derived/<vdb|recsys>/<runset>/run<k>/` (written by the driver; rerun by hand:
 `python3 experiments/{vectordb,recsys}/export.py --run k --runset R --config-sha256 S --out DIR E`).
 Merged spread: `python3 experiments/eval/merge.py --root workspaces/eval-derived --workload vdb --runset vdb --out DIR`.
+
+Fixed-load level sets (user 2026-10-20): fixed.csv `level_set` = h1 (3-system H1 figures: vector DB weakest of hw,
+pop, mg incl. mg/mgoff windows; RecSys 1 q/s Megalon-comparison and Megalon windows), h2 (hw/pop levels: vector DB H2
+set, RecSys L1/L2 and fallback), or "h1 h2" (one window serving both). Megalon RecSys: whole-table objects, section
+timing 1 in 64 (RS_MG_COH_SAMPLE=64).
 
 ## Acceptance and later runs
 - vdb: review `E/vdb/r<n>/check.txt` (H1 check.py: H1CHECK PASS; REPORT lines from run 2 on go to the user).

@@ -166,6 +166,24 @@ def export_stream(E, out, vcpus):
                     at_result_T_ms_rop=mean("T_ms_rop"), at_result_C_ms_rop=mean("C_ms_rop"),
                     at_result_pop_read_faults_per_rop=mean("pop_read_faults_per_rop"),
                     at_result_cxl_recv_cpu_s_per_s=mean("cxl_recv_cpu_s_per_s"), lifetime="sep", source_dir=part)
+        # level sets (user 2026-10-20): L1/L2 and the fallback window = h2 (hw/pop levels); the 1 q/s window at a
+        # Megalon-comparison rate (STREAM_FIX_LEVELS_MAP) and every Megalon window = h1; a fallback window at such a
+        # rate serves both
+        cmp_rates, nolv = set(), set()
+        ep = os.path.join(B, "eval-params.txt")
+        if os.path.isfile(ep):
+            m = re.search(r"STREAM_FIX_LEVELS_MAP=(.*?) STREAM_FIX_FALLBACK=", open(ep).read())
+            cmp_rates = {x.split("=")[0] for x in (m.group(1).split() if m else [])}
+        nolv = {x[0] for x in tsv(os.path.join(B, "stream-levels.tsv")) if len(x) > 1 and x[1] == "-"}
+
+        def lset(s, rate, level):
+            if s in ("mg", "mgoff"):
+                return "h1"
+            if level in ("L1", "L2"):
+                return "h2"
+            if rate in nolv:
+                return "h1 h2" if rate in cmp_rates else "h2"
+            return "h1" if rate in cmp_rates else "h2"
         for f in tsv(os.path.join(B, "stream-fix.tsv")):
             name, s, rate, level, offered, step, valid = f[:7]
             part, life = os.path.join(B, name, "fix"), os.path.join(B, name)
@@ -175,6 +193,7 @@ def export_stream(E, out, vcpus):
                 print(f"export.py WARNING: {part}: step {step} missing", file=sys.stderr)
                 continue
             fixed.append(fix_row(r, dict(system=s, point=rate, rate_unit="samples/s", vcpus_per_vm=vcpus, threads=st,
+                                         level_set=lset(s, rate, level),
                                          writers=wr), level, valid == "1" if valid else None, part,
                                  "probe" if os.path.basename(B) == "probe" else "sep" if name.endswith("-fix") else "cont"))
     probe = os.path.join(E, "probe", "stream-fix.tsv")
@@ -215,7 +234,8 @@ def export_v1(E, out, vcpus):
         for r in step_rows(part, s):
             if r["phase"] == "fixed":
                 fixed.append(fix_row(r, dict(system=s, point=rate, rate_unit="samples/s (T publication)",
-                                             vcpus_per_vm=vcpus, threads=st, writers=wr), "V1", None, part, "sep"))
+                                             vcpus_per_vm=vcpus, threads=st, writers=wr, level_set="h1"), "V1", None,
+                                 part, "sep"))
     return fixed
 
 

@@ -110,6 +110,34 @@ class Exports(unittest.TestCase):
             self.assertTrue(all(r["valid"] in ("True", "False") and r["wop_done_ratio"] for r in st))
             self.assertTrue(all(r["wop_offered_per_s"] for r in st))
 
+    def test_vdb_h2_level_set(self):  # user decision 2026-10-20 (M4 = b): h2-runs.tsv lifetimes and same-as-h1 mixes
+        src = os.path.join(REC, "H1-main-v1", "vdb", "r1", "run")
+        E = os.path.join(OUT, "vdb-h2-synthetic")
+        shutil.rmtree(E, ignore_errors=True)
+        run = os.path.join(E, "vdb", "r1", "run")
+        os.makedirs(run)
+        for d in os.listdir(src):  # symlinks to the real lifetimes (read-only)
+            if os.path.isdir(os.path.join(src, d)):
+                os.symlink(os.path.join(src, d), os.path.join(run, d))
+        shutil.copy(os.path.join(src, "h1-runs.tsv"), run)
+        with open(os.path.join(run, "h2-runs.tsv"), "w") as f:  # the u50 hw fix lifetime stands in for an H2 lifetime
+            f.write("# name\n" + "\t".join(["hw-u50-fixh2-r1", "hw", "u50", "fix", "1", "hw-u50-fix-r1/fix", "1,2", "sep"]) + "\n")
+        with open(os.path.join(run, "levels-h2-used.tsv"), "w") as f:
+            f.write("# mix\n" + "\t".join(["u5", "1", "1", "1", "1", "same-as-h1", "t"]) + "\n"
+                    + "\t".join(["u50", "1", "1", "1", "1", "measured", "t"]) + "\n")
+        out = os.path.join(OUT, "vdb-h2")
+        r = subprocess.run([sys.executable, "-B", os.path.join(EXP, "vectordb", "export.py"), "--run", "1", "--runset",
+                            "vdb", "--config-sha256", "test", "--out", out, E], capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr[-1000:])
+        ls = {}
+        for x in rows(out, "fixed.csv"):
+            ls.setdefault((x["system"], x["point"]), set()).add(x["level_set"])
+        self.assertEqual(ls[("hw", "u5")], {"h1 h2"})
+        self.assertEqual(ls[("pop", "u5")], {"h1 h2"})
+        self.assertEqual(ls[("hw", "u50")], {"h1", "h2"})
+        self.assertEqual(ls[("mg", "u5")], {"h1"})
+        self.assertEqual(len(rows(out, "fixed.csv")), 26)
+
     def test_h1_validity_unknown_without_counters(self):
         # H1 r1 (vdb/15) has no server write counters: valid empty (unknown), never the loadgen pass (verifier M3)
         self.assertTrue(all(r["valid"] == "" and r["slo_pass"] in ("True", "False") for r in rows(self.h1, "fixed.csv")))

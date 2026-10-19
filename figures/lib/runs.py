@@ -19,7 +19,7 @@ import pandas as pd
 
 KEYS = {  # merge keys per canonical CSV (besides workload); run is the repetition
     "slo_summary.csv": ["system", "point"],
-    "fixed.csv": ["system", "point", "level"],
+    "fixed.csv": ["system", "point", "level", "level_set"],
     "mg_probe.csv": ["point"],
 }
 

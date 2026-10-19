@@ -64,8 +64,16 @@ class RsEval(unittest.TestCase):
         tsv(os.path.join(E, "probe", "stream-results.tsv"), "# name", [])
         part(os.path.join(E, "slo", "mg-u50-fix"), src)
         part(os.path.join(E, "slo", "mgoff-u50-fix"), src)
+        part(os.path.join(E, "slo", "hw-u50-fix"), src)
+        part(os.path.join(E, "slo", "hw-u100-fix"), src)
         tsv(os.path.join(E, "slo", "stream-fix.tsv"), hdr,
-            [["mg-u50-fix", "mg", "50", "Q1", "1", "2", "1"], ["mgoff-u50-fix", "mgoff", "50", "Q1", "1", "3", "1"]])
+            [["mg-u50-fix", "mg", "50", "Q1", "1", "2", "1"], ["mgoff-u50-fix", "mgoff", "50", "Q1", "1", "3", "1"],
+             ["hw-u50-fix", "hw", "50", "L1", "40", "4", "1"], ["hw-u50-fix", "hw", "50", "Q1", "1", "5", "1"],
+             ["hw-u100-fix", "hw", "100", "Q1", "1", "6", "1"]])
+        tsv(os.path.join(E, "slo", "stream-levels.tsv"), "# rate", [["50", "40", "20", "computed"], ["100", "-", "-", "NOTE"]])
+        with open(os.path.join(E, "slo", "eval-params.txt"), "w") as f:
+            f.write("SYSTEMS=hw STREAM_FIXONLY= STREAM_FIX_LEVELS=L1 L2 STREAM_FIX_LEVELS_MAP=50=L1,L2,1 200=L1,L2,1 "
+                    "STREAM_FIX_FALLBACK=1 STREAM_FIX_SEP=1 STREAM_LEVELS=\n")
         tsv(os.path.join(E, "slo", "stream-results.tsv"), "# name", [])
         cls.dec = mg_decide.decide(os.path.join(E, "probe"), ["50", "200"], 100.0)
         tsv(os.path.join(E, "mg-decision.tsv"), "# rate_sps\tdecision", [x[:2] for x in cls.dec])
@@ -89,7 +97,15 @@ class RsEval(unittest.TestCase):
         m50 = next(r for r in fx if r["system"] == "mg" and r["point"] == "50")
         off = next(r for r in fx if r["system"] == "mgoff")
         self.assertEqual(m50["mgoff_T_ms_rop"], off["T_ms_rop"])
-        self.assertTrue(all(r["level"] == "Q1" for r in fx))
+        self.assertTrue(all(r["level"] == "Q1" for r in fx if r["system"] in ("mg", "mgoff")))
+
+    def test_level_sets(self):  # user decision 2026-10-20 (M4 = b): h1 / h2 tags
+        ls = {(r["system"], r["point"], r["level"]): r["level_set"] for r in self.rows("fixed.csv")}
+        self.assertEqual(ls[("hw", "50", "L1")], "h2")
+        self.assertEqual(ls[("hw", "50", "Q1")], "h1")      # Megalon comparison window
+        self.assertEqual(ls[("hw", "100", "Q1")], "h2")     # fallback at a non-Megalon rate
+        self.assertEqual(ls[("mg", "50", "Q1")], "h1")
+        self.assertEqual(ls[("mgoff", "50", "Q1")], "h1")
 
     def test_mg_probe_csv(self):
         pr = {r["point"]: r for r in self.rows("mg_probe.csv")}

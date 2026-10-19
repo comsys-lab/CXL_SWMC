@@ -6,6 +6,9 @@
 #     mgoff fix; hw, pop fix-only), levels L1 = weakest confirmed max, L2 = L1 / 2 (experiments/h1/levels.py)
 #   runs k >= 2 (VDB_LATER_RUNS=cont, cut Q8): H1 cont lifetimes (hw, pop, mg each SLO -> fix at the levels of run
 #     LEVELS_FROM_RUN; mgoff fix after mg), Latin order rotated by k (needs run LEVELS_FROM_RUN accepted; k <= 3)
+#   VDB_H2_LEVELS=1 (user 2026-10-20, M4 = b): per mix also the H2 level set (L1 = lower confirmed max of hw and pop,
+#     L2 = L1 / 2; runs >= 2: run LEVELS_FROM_RUN's), hw and pop fix-only lifetimes, skipped where equal to the H1 set
+#     (v6-block.sh h2_mix; <run dir>/levels-h2-used.tsv, h2-runs.tsv)
 #   every lifetime: 15 search + 1 writer per VM (threads = vCPUs), dataset 28m-x (3.4M pool B), region REGION (2 MiB
 #   ring), Popcorn bundle POP_C; Megalon capacity VDB_MG_CAPACITY (h1: --max-ids 28000000, see m4-run.sh).
 # Steps of a real run: evidence dir E (new) -> registry "started" -> lock eval-vdb-run<k> -> pretouch + H1 Host gate ->
@@ -31,7 +34,8 @@ for m in $VDB_POINTS; do
 done
 MIXES=${MIXES% }
 # mode, round label and levels
-LV= ROOTS=() MODE=r1 N=1
+LV= ROOTS=() MODE=r1 N=1 H2F=
+case $VDB_H2_LEVELS in 0|1) ;; *) die "bad VDB_H2_LEVELS";; esac
 if [ "$K" -gt 1 ] && [ "$VDB_LATER_RUNS" = cont ]; then
   [ "$K" -le 3 ] || die "cont mode supports runs 2 and 3 (H1 hook)"
   MODE=cont N=$K
@@ -39,6 +43,8 @@ if [ "$K" -gt 1 ] && [ "$VDB_LATER_RUNS" = cont ]; then
   if [ -n "$E1" ]; then
     LV=$(python3 -I -B $H/attempts.py levels "$E1" vdb) && [ -f "$LV" ] || die "no levels.tsv in $E1"
     ROOTS=(--round-root "1=$E1")
+    H2F=$(python3 -I -B $H/attempts.py dir "$E1" vdb 1)/run/levels-h2-used.tsv
+    [ "$VDB_H2_LEVELS" != 1 ] || [ -f "$H2F" ] || die "no H2 levels of run $LEVELS_FROM_RUN ($H2F)"
     for j in $(seq 2 $((K - 1))); do Ej=$(run_dir_of vdb $j) || die "run $j of vdb is not accepted"; ROOTS+=(--round-root "$j=$Ej"); done
     plan "levels from run $LEVELS_FROM_RUN: $LV"
   else plan "levels: run $LEVELS_FROM_RUN of vdb not accepted yet (a real run would stop here)"; fi
@@ -66,6 +72,7 @@ HENV=(EVAL_RUN=$K EVAL_REGION=$REGION EVAL_DATASET=$VDB_DATASET VDB_SEARCH_THREA
   X_INIT_CAP=$VDB_X_INIT_CAP X_MEGALON_H1CAP=$XMG H1_SEED_BASE=$SEEDB H1_SETTLE_S=$SETTLE H1_MEASURE_RUN=1
   PRETOUCH_DIR=${PRETOUCH_DIR:-} MEASURE_ENV_DIR=${MEASURE_ENV_DIR:-} MEASURE_PART_DIR=${MEASURE_PART_DIR:-})
 [ $MODE = r1 ] && HENV+=(H1_LEVELS_CMD=$H/levels-cb.sh H1_PLAN=$PLAN H1_W=vdb H1_LEVELS_OUT=$E/vdb/levels.tsv)
+[ "$VDB_H2_LEVELS" = 1 ] && HENV+=(EVAL_H2=1) && [ -n "$H2F" ] && HENV+=(EVAL_H2_FROM=$H2F)
 HOOK=(bash $H/hook.sh vdb $MODE $S/run $N "$MIXES" ${LV:+"$LV"})
 plan "block: env ${HENV[*]} ${HOOK[*]}"
 plan "then: collect.py --plan $PLAN --workload vdb --levels ${LV:-$E/vdb/levels.tsv} $S; check.py --round $N ${ROOTS[*]} $E"

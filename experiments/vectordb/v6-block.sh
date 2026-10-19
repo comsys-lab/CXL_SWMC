@@ -71,7 +71,8 @@ grep -q "^shim_kind=shared$" $MEG_BUILD/manifest.txt || { echo "SEQUENCE STOP: $
 # evaluation run sets (experiments/eval/runset-vdb.sh, EVAL_RUN set): region file and dataset of the eval; unset = as before
 RF=$P/CXL_SWMC/config/cxl_region.yaml DS=28m
 if [ -n "${EVAL_RUN:-}" ]; then RF=${EVAL_REGION:?EVAL_RUN needs EVAL_REGION} DS=${EVAL_DATASET:?EVAL_RUN needs EVAL_DATASET}
-else [ -z "${EVAL_REGION:-}${EVAL_DATASET:-}" ] || { echo "SEQUENCE STOP: EVAL_REGION / EVAL_DATASET need EVAL_RUN"; exit 2; }; fi
+else [ -z "${EVAL_REGION:-}${EVAL_DATASET:-}${EVAL_H2:-}${EVAL_H2_FROM:-}" ] || { echo "SEQUENCE STOP: EVAL_REGION / EVAL_DATASET / EVAL_H2 need EVAL_RUN"; exit 2; }; fi
+[ -z "${EVAL_H2_FROM:-}" ] || [ -f "$EVAL_H2_FROM" ] || { echo "SEQUENCE STOP: EVAL_H2_FROM missing"; exit 2; }
 GUEST_INIT=/home/comsys/vdb/init/seg32c32m-a27m HOST_IMAGE=$P/workspaces/vdb-data/seg32-c32m-a27m-m16-efc128-b1
 VP=${VPLAIN#/home/comsys/} VM=${VMEG#/home/comsys/}
 INSTALL="$VP/bin/vdb-server $PLAIN_BUILD/bin/vdb-server
@@ -170,6 +171,59 @@ h1_life() {  # <sys> <mix> <lifetime name> <parts "slo"|"slo fix"|"fix"> <life s
   [[ " $parts " == *" fix "* ]] && h1_line $s $m fix $L $life
   return 0
 }
+# ---- EVAL H2 level set (EVAL_RUN with EVAL_H2=1; user decision 2026-10-20 "M4 = (b)") ----
+# Per mix, after the mix's H1 lifetimes: H2 levels L1 = lower confirmed max of hw and pop (their SLO parts of this run:
+# summary.json confirm.x_mean, no note), L2 = L1 / 2, rates = round(x x plan factor, plan decimals) as levels.py; or, with
+# EVAL_H2_FROM (runs >= 2: run 1's levels-h2-used.tsv), those of run 1. If H2 L1 equals the H1 L1 of the mix (weakest
+# is hw or pop) nothing is measured (set same-as-h1); else hw and pop fix-only lifetimes <sys>-<mix>-fixh2-r<n> (settle,
+# L2, L1; order shuffle seed H1-vdb-r<n>-<mix>-h2). Recorded in <dir>/levels-h2-used.tsv (mix L1_x L2_x L1_rate
+# L2_rate set source) and <dir>/h2-runs.tsv (8 columns as h1-runs.tsv; NOT in h1-runs.tsv, so the H1 hook contract,
+# collect.py and check.py see exactly the H1 lifetimes).
+h2_mix() {  # <mix> <H1 levels.tsv>
+  local m=$1 lv=$2 row s rates L st
+  [ -f "$E/levels-h2-used.tsv" ] || printf '# mix\tL1_x\tL2_x\tL1_rate\tL2_rate\tset\tsource\n' > "$E/levels-h2-used.tsv"
+  [ -f "$E/h2-runs.tsv" ] || printf '# name\tsystem\tmix\tphase\tround\trun_dir\tsteps\tlifetime\n' > "$E/h2-runs.tsv"
+  row=$(python3 -I - "$m" "$lv" "$E/h1-runs.tsv" "$E" "${H1_PLAN:-$P/CXL_SWMC/experiments/h1/h1-plan.tsv}" "${EVAL_H2_FROM:-}" <<'PY'
+import csv, json, os, sys
+m, lv, runs, E, plan, frm = sys.argv[1:7]
+h1 = next((r for r in csv.DictReader(open(lv), delimiter="\t") if r["mix"] == m), None)
+assert h1, f"no H1 levels for {m} in {lv}"
+if frm:
+    r = next((x for x in csv.reader(open(frm), delimiter="\t") if x and x[0] == m), None)
+    assert r, f"no H2 levels for {m} in {frm}"
+    l1, l2, r1, r2 = r[1], r[2], r[3], r[4]
+    src = f"from {frm}"
+else:
+    p = next(x for x in csv.reader(open(plan), delimiter="\t") if x and x[0] == "vdb" and x[1] == m)
+    fac, dec = float(p[3]), int(p[4])
+    xs = {}
+    for f in csv.reader(open(runs), delimiter="\t"):
+        if f and not f[0].startswith("#") and f[2] == m and f[3] == "slo" and f[1] in ("hw", "pop"):
+            s = json.load(open(os.path.join(E, f[5], "loadgen", "summary.json")))
+            assert not s.get("note") and s.get("confirm", {}).get("x_mean"), f"{f[0]}: no confirmed max"
+            xs[f[1]] = float(s["confirm"]["x_mean"])
+    assert set(xs) == {"hw", "pop"}, f"hw/pop SLO results missing for {m}: {sorted(xs)}"
+    l1x = min(xs.values())
+    l1, l2 = repr(l1x), repr(l1x / 2)
+    r1, r2 = repr(round(l1x * fac, dec)), repr(round(l1x / 2 * fac, dec))
+    src = f"min(hw {xs['hw']}, pop {xs['pop']}) factor {fac:g} round {dec}"
+same = abs(float(l1) - float(h1["L1_x"])) <= 1e-9 * max(1.0, float(l1))
+print("\t".join([m, l1, l2, r1, r2, "same-as-h1" if same else "measured", src]))
+PY
+) || { echo "SEQUENCE STOP: H2 levels for $m"; exit 1; }
+  echo "$row" >> "$E/levels-h2-used.tsv"
+  [ "$(echo "$row" | cut -f6)" = measured ] || { echo "H2 levels $m: same as H1 (no extra windows)"; return 0; }
+  rates="$(echo "$row" | cut -f5),$(echo "$row" | cut -f4)"
+  [[ $rates =~ ^[0-9]+(\.[0-9]+)?,[0-9]+(\.[0-9]+)?$ ]] || { echo "SEQUENCE STOP: bad H2 rates $rates"; exit 1; }
+  for s in $(SHUFFLE_SEED=H1-vdb-r$H1_N-$m-h2 shuffle hw pop); do
+    L=$s-$m-fixh2-r$H1_N
+    parent_lock_check
+    one $s $L U=$(h1_mixu $m) KIND=h1 "H1_PARTS=fix" SETTLE_S=$H1_SETTLE_S SEED=$H1_SEED REP=h2-r$H1_N RATE=$rates < /dev/null
+    h1_runcheck $L $s $m fix
+    st=$(cat $E/$L/fix/h1-steps.txt); [[ $st =~ ^[0-9]+,[0-9]+$ ]] || { echo "SEQUENCE STOP: $L fix steps"; exit 1; }
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$s-$m-fixh2-r$H1_N" $s $m fix $H1_N "$L/fix" "$st" sep >> "$E/h2-runs.tsv"
+  done
+}
 h1_main() {
   local m s mixes base rot ord rates
   printf '# name\tsystem\tmix\tphase\tround\trun_dir\tsteps\tlifetime\n' > "$E/h1-runs.tsv"
@@ -186,6 +240,7 @@ h1_main() {
       rates=$(h1_levels "$H1_LEVELS_OUT" $m) || exit 1
       h1_life mgoff $m mgoff-$m-fix-r1 fix sep $rates
       for s in $(SHUFFLE_SEED=H1-vdb-r1-$m-fix shuffle hw pop); do h1_life $s $m $s-$m-fix-r1 fix sep $rates; done
+      [ "${EVAL_H2:-0}" = 1 ] && h2_mix $m "$H1_LEVELS_OUT"
     done
   else
     base=($(SHUFFLE_SEED=H1-vdb-latin shuffle hw pop mg)); rot=$(( H1_N % 3 ))
@@ -198,6 +253,7 @@ h1_main() {
         h1_life $s $m $s-$m-r$H1_N "slo fix" cont $rates
         [ $s = mg ] && h1_life mgoff $m mgoff-$m-fix-r$H1_N fix sep $rates
       done
+      [ "${EVAL_H2:-0}" = 1 ] && h2_mix $m "$H1_LEVELS"
     done
   fi
 }

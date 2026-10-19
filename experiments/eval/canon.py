@@ -12,6 +12,11 @@ urate_check.py write jobs done / accepted >= 0.98 with bounded backlog; RecSys s
 = that server ratio; wop_offered_per_s = the offered update stream. The loadgen ratio achieved / offered is NOT used:
 with Poisson arrivals it differs from 1 by sampling (e.g. 0.937 for every system at the same seed, H1 r1 u90 L2).
 fixed.csv slo_pass = the window met the SLO (loadgen pass), a separate fact from validity.
+fixed.csv level_set (user decision 2026-10-20, M4 = b): which figure set a window belongs to: "h1" = the 3-system H1
+levels (vector DB: weakest of hw, pop, mg; RecSys: the 1 q/s Megalon comparison windows and every Megalon window),
+"h2" = the hw/pop levels (vector DB H2 set; RecSys L1/L2 and the 1 q/s fallback), "h1 h2" = a window that serves both
+(vector DB hw/pop H1 windows of a mix whose H2 set equals its H1 set). H1 figures read rows containing h1, H2 figures
+rows containing h2.
 """
 import csv
 import json
@@ -36,7 +41,7 @@ SCHEMA = {
         "owner_wait_ms_rop", "cxl_recv_cpu_s_per_s", "slo_pct", "slo_ms", "lifetime"],
     "latency_hist.csv": KEY + ["system", "point", "step", "phase", "offered_x", "bin_hi_us", "count"],
     "fixed.csv": KEY + POINT + [
-        "level", "step", "offered_x", "achieved_x", "valid", "slo_pass", "n_rop", "p95_ms", "p99_ms", "wop_per_s",
+        "level", "level_set", "step", "offered_x", "achieved_x", "valid", "slo_pass", "n_rop", "p95_ms", "p99_ms", "wop_per_s",
         "wop_offered_per_s", "wop_done_ratio",
         "T_ms_rop", "C_ms_rop", "T_ms_wop", "C_ms_wop",
         "pop_read_faults_per_rop", "pop_write_faults_per_rop", "pop_read_faults_per_wop", "pop_write_faults_per_wop",
