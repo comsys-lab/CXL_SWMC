@@ -105,6 +105,15 @@ class Exports(unittest.TestCase):
                 self.assertEqual(s[k]["valid"], f[9])
                 self.assertEqual(s[k]["writers"], f[3])
             self.assertTrue(all(r["level"] in ("L1", "L2") for r in rows(d, "fixed.csv")))
+            # M3: validity from urate-check.csv (server write counters), with the done ratio
+            st = rows(d, "slo_steps.csv")
+            self.assertTrue(all(r["valid"] in ("True", "False") and r["wop_done_ratio"] for r in st))
+            self.assertTrue(all(r["wop_offered_per_s"] for r in st))
+
+    def test_h1_validity_unknown_without_counters(self):
+        # H1 r1 (vdb/15) has no server write counters: valid empty (unknown), never the loadgen pass (verifier M3)
+        self.assertTrue(all(r["valid"] == "" and r["slo_pass"] in ("True", "False") for r in rows(self.h1, "fixed.csv")))
+        self.assertTrue(all(r["valid"] == "" for r in rows(self.h1, "slo_steps.csv")))
 
     def test_recsys_stream_against_results(self):
         res = {(f[1], f[2]): f for f in tsv(os.path.join(REC, "RECSYS-stream-v1c", "stream-results.tsv"))}

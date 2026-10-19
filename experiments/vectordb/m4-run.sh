@@ -299,6 +299,11 @@ for RP in $PDIRS; do
       grep -q "^OPCOH_CHECK PASS" $RP/opcoh-check.txt || stop "opcoh_check $OPCOH_CHECK_MODE (see $RP/opcoh-check.txt)"
     fi
   fi
+  if [ -n "${EVAL_RUN:-}" ] && [ "$KIND" = h1 ]; then  # eval (verifier M3): update-stream validity per step from the
+    # server write counters (urate_check.py rule: write jobs done / accepted >= 0.98, backlog bounded); recorded in
+    # <part>/urate-check.{csv,txt} for export.py and check.py W8, never a stop (a build without the counters: FAIL text)
+    python3 $X/urate_check.py $RP --writers 1 > $RP/urate-check.txt 2>&1 || true
+  fi
   python3 $X/e1_check.py --writes $W --na $NA --nb $NB --searches $RP/loadgen/searches.bin --out $RP/e1 --sample 500 > /dev/null \
     || stop "E1 violation (see $RP/e1.e1.txt)"
   grep -q "workload_finish\":\"ok" $RP/loadgen/summary.json || stop "loadgen workload finish ($RP)"

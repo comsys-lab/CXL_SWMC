@@ -22,7 +22,10 @@ Formulas (per step; opsplit-steps.csv per operation, loadgen stats deltas over t
   sections, attributed to reads: an inference to be confirmed by the verifier); flushed_lines_per_rop = Megalon
   mg_flush_bytes_per_rop / 64, Popcorn read faults x 4096 / 64, all-HWcc 0 (H1-fig3). mgoff_T_ms_* on Megalon rows =
   T of the timers-off lifetime at the same mix and level (C_diff = T(mg) - T(mgoff) is computed by the plot).
-  valid: urate layout = urate_check.py per step; H1 layout = loadgen pass for fixed windows, empty for SLO steps.
+  valid (verifier M3): urate_check.py per step (<part>/urate-check.csv: urate sweep, and every eval op-mix part via
+  m4-run.sh EVAL_RUN); empty for evidence without the server write counters (H1 r1, vdb builds < 17). slo_summary
+  valid = urate-check.txt verdict (PASS 1 / NOTE 0), n_judged / n_invalid_judged from it. fixed.csv slo_pass = loadgen
+  pass of the window (SLO met), not validity.
 """
 import argparse
 import csv
@@ -145,6 +148,15 @@ def export(E, out, rnd, vcpus):
         f0 = next((d for d in js.values() if d.get("offered_x")), None)
         share = f0["streams"]["search"]["offered"] / f0["offered_x"] if f0 else 1.0
         rd = lambda v: None if canon.fl(v) is None else round(float(v) * share, 6)  # noqa: E731
+        # update-stream validity (verifier M3): urate_check.py per step (urate sweep; eval op-mix parts via m4-run.sh)
+        dr, ucv, ucj = {}, None, None
+        if os.path.isfile(os.path.join(part, "urate-check.csv")):
+            with open(os.path.join(part, "urate-check.csv")) as f:
+                dr = {int(x["step"]): canon.fl(x.get("done_ratio")) for x in csv.DictReader(f)}
+        if os.path.isfile(os.path.join(part, "urate-check.txt")):
+            txt = open(os.path.join(part, "urate-check.txt")).read()
+            ucv = "1" if "URATECHECK PASS" in txt else "0" if "URATECHECK NOTE" in txt else None
+            ucj = ur.check_counts(txt)[:2]
         if p["phase"] == "slo":
             best, at, cmin, cmax = canon.confirm_stats(part, "search")
             for r in rows:
@@ -155,6 +167,7 @@ def export(E, out, rnd, vcpus):
                         p95_ms=r["search_p95_ms"], p99_ms=r["search_p99_ms"], **{"pass": r["pass"]},
                         valid=r["valid"], at_result=int(r["step"] in at), aborted=d.get("aborted"),
                         wop_per_s=r["updates_per_s"] if r["updates_per_s"] is not None else up.get("achieved"),
+                        wop_offered_per_s=up.get("offered"), wop_done_ratio=dr.get(r["step"]),
                         T_ms_rop=r["T_ms_per_search"], C_ms_rop=r["C_ms_per_search"], T_ms_wop=r["T_ms_per_update"],
                         C_ms_wop=r["C_ms_per_update"], pop_read_faults_per_rop=r["pop_read_faults_per_search"],
                         pop_write_faults_per_rop=r["pop_write_faults_per_search"],
@@ -172,8 +185,8 @@ def export(E, out, rnd, vcpus):
             atr = [r for r in rows if r["step"] in at]
             mean = lambda k: canon.fl(ur.mean([r.get(k) for r in atr])) if atr else None  # noqa: E731
             cf = s.get("confirm", {}) if s.get("confirmed") is True else {}
-            uv = p.get("uvalid")
-            jd = p.get("ujudged") or [None, None]
+            uv = p.get("uvalid") if p.get("uvalid") is not None else ucv
+            jd = p.get("ujudged") or ucj or [None, None]
             r10, r10t = recall(part)
             out.add("slo_summary.csv", **c, slo_pct=slo.get("pct"), slo_ms=slo.get("ms"), result_x=rd(best),
                     confirm_x_mean=cf.get("x_mean"), confirm_x_sd=cf.get("x_sd"), confirm_x_min=cmin, confirm_x_max=cmax,
@@ -207,7 +220,8 @@ def export(E, out, rnd, vcpus):
                 else:
                     lines = 0.0
                 fixed.append(dict(c, level=p["levels"].get(r["step"], ""), step=r["step"], offered_x=rd(r["offered_x"]),
-                                  achieved_x=r["search_per_s"], valid=r["valid"] if r["valid"] != "" else r["pass"],
+                                  achieved_x=r["search_per_s"], valid=r["valid"], slo_pass=r["pass"],
+                                  wop_offered_per_s=up.get("offered"), wop_done_ratio=dr.get(r["step"]),
                                   n_rop=sr.get("done"), p95_ms=r["search_p95_ms"], p99_ms=r["search_p99_ms"],
                                   wop_per_s=r["updates_per_s"] if r["updates_per_s"] is not None else up.get("achieved"),
                                   T_ms_rop=T, C_ms_rop=C, T_ms_wop=r["T_ms_per_update"], C_ms_wop=r["C_ms_per_update"],

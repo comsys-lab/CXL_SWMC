@@ -105,7 +105,8 @@ def step_rows(part, system):
         out.append(dict(step=n, phase=d["phase"], offered_x=q.get("offered"), achieved_x=q.get("achieved"),
                         n_rop=q.get("done"), p50_ms=q.get("p50_ms"), p95_ms=q.get("p95_ms"), p99_ms=q.get("p99_ms"),
                         pass_=d["pass"], aborted=d.get("aborted"), valid=None if v is None else v == "True",
-                        wop_per_s=u.get("achieved"), T_ms_rop=T, C_ms_rop=C, T_ms_wop=col(b, "fig2_row_update_T_ms"),
+                        wop_per_s=u.get("achieved"), wop_offered_per_s=u.get("offered"),
+                        wop_done_ratio=canon.fl(sc.get(n, {}).get("written_ratio")), slo_pass=d["pass"], T_ms_rop=T, C_ms_rop=C, T_ms_wop=col(b, "fig2_row_update_T_ms"),
                         C_ms_wop=col(b, "fig2_row_update_C_ms["), pop_read_faults_per_rop=rf,
                         owner_wait_ms_rop=canon.fl(b.get("serve_read_msg_wait_ms_per_query")),
                         seg_is_ms_rop=canon.fl(b.get("serve_is_fault_ms_per_query")),
@@ -140,8 +141,8 @@ def export_stream(E, out, vcpus):
             for r in rows:
                 out.add("slo_steps.csv", **c, **{k: r[k] for k in (
                     "step", "phase", "offered_x", "achieved_x", "n_rop", "p50_ms", "p95_ms", "p99_ms", "valid", "aborted",
-                    "wop_per_s", "T_ms_rop", "C_ms_rop", "T_ms_wop", "C_ms_wop", "pop_read_faults_per_rop",
-                    "owner_wait_ms_rop", "cxl_recv_cpu_s_per_s")}, **{"pass": r["pass_"]}, at_result=int(r["step"] in at),
+                    "wop_per_s", "wop_offered_per_s", "wop_done_ratio", "T_ms_rop", "C_ms_rop", "T_ms_wop", "C_ms_wop",
+                    "pop_read_faults_per_rop", "owner_wait_ms_rop", "cxl_recv_cpu_s_per_s")}, **{"pass": r["pass_"]}, at_result=int(r["step"] in at),
                         slo_pct=slo.get("pct"), slo_ms=slo.get("ms"), lifetime="sep")
             js = {d["step"]: d for d in canon.measured_steps(part)}
             for step, bins in sorted(canon.latency_hist(part, "query").items()):
@@ -191,7 +192,8 @@ def export_stream(E, out, vcpus):
 
 
 def fix_row(r, c, level, valid, part, life):
-    keep = ("offered_x", "achieved_x", "n_rop", "p95_ms", "p99_ms", "wop_per_s", "T_ms_rop", "C_ms_rop", "T_ms_wop",
+    keep = ("offered_x", "achieved_x", "slo_pass", "n_rop", "p95_ms", "p99_ms", "wop_per_s", "wop_offered_per_s",
+            "wop_done_ratio", "T_ms_rop", "C_ms_rop", "T_ms_wop",
             "C_ms_wop", "pop_read_faults_per_rop", "seg_is_ms_rop", "seg_sm_ms_rop", "seg_wp_ms_rop",
             "seg_nontrans_ms_rop", "seg_inval_ipis_per_rop", "seg_processing_ms_rop", "mg_flush_bytes_per_rop",
             "flushed_lines_per_rop", "cxl_recv_cpu_s_per_s")

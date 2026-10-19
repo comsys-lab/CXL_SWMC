@@ -6,6 +6,12 @@ evidence.
 Generic names: rop = read op (vector DB search, RecSys query), wop = write op (vector DB update = delete + insert,
 RecSys row update / update sample); point = the workload's x value (vector DB mix u5/u50/u90 with upd_share 0.05 /
 0.5 / 0.9; RecSys samples/s); x = offered read ops/s. Every row starts with workload, run, config_sha256.
+Validity (verifier M3): valid = the update stream was sustained in that step (server counters: vector DB
+urate_check.py write jobs done / accepted >= 0.98 with bounded backlog; RecSys stream_check.py written / accepted >=
+0.98 with bounded lag); empty when the evidence has no such counters (vector DB builds < 17, e.g. H1 r1). wop_done_ratio
+= that server ratio; wop_offered_per_s = the offered update stream. The loadgen ratio achieved / offered is NOT used:
+with Poisson arrivals it differs from 1 by sampling (e.g. 0.937 for every system at the same seed, H1 r1 u90 L2).
+fixed.csv slo_pass = the window met the SLO (loadgen pass), a separate fact from validity.
 """
 import csv
 import json
@@ -25,12 +31,13 @@ SCHEMA = {
         "at_result_cxl_recv_cpu_s_per_s", "lifetime", "source_dir"],
     "slo_steps.csv": KEY + POINT + [
         "step", "phase", "offered_x", "achieved_x", "n_rop", "p50_ms", "p95_ms", "p99_ms", "pass", "valid",
-        "at_result", "aborted", "wop_per_s", "T_ms_rop", "C_ms_rop", "T_ms_wop", "C_ms_wop",
+        "at_result", "aborted", "wop_per_s", "wop_offered_per_s", "wop_done_ratio", "T_ms_rop", "C_ms_rop", "T_ms_wop", "C_ms_wop",
         "pop_read_faults_per_rop", "pop_write_faults_per_rop", "pop_read_faults_per_wop", "pop_write_faults_per_wop",
         "owner_wait_ms_rop", "cxl_recv_cpu_s_per_s", "slo_pct", "slo_ms", "lifetime"],
     "latency_hist.csv": KEY + ["system", "point", "step", "phase", "offered_x", "bin_hi_us", "count"],
     "fixed.csv": KEY + POINT + [
-        "level", "step", "offered_x", "achieved_x", "valid", "n_rop", "p95_ms", "p99_ms", "wop_per_s",
+        "level", "step", "offered_x", "achieved_x", "valid", "slo_pass", "n_rop", "p95_ms", "p99_ms", "wop_per_s",
+        "wop_offered_per_s", "wop_done_ratio",
         "T_ms_rop", "C_ms_rop", "T_ms_wop", "C_ms_wop",
         "pop_read_faults_per_rop", "pop_write_faults_per_rop", "pop_read_faults_per_wop", "pop_write_faults_per_wop",
         "seg_is_ms_rop", "seg_sm_ms_rop", "seg_wp_ms_rop", "seg_ipi_ms_rop", "seg_nontrans_ms_rop",

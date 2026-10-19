@@ -38,6 +38,9 @@ WARN checks:
   C1/C2 (n > 1; REPORT, not FAIL: separate vs continuous, user decision 2026-10-18) hw/pop T r1 (separate lifetime)
      vs r<n> (continuous) beyond max(5 %, 2 x run-to-run spread), C_diff beyond max(10 %, 2 x |dT_mg|); see compare().
      REPORT lines go to the user before r3; h1-accept.sh refuses them without --user-ack.
+  W8 (eval-run1, verifier M3; only where <part>/urate-check.csv exists = vector DB evaluation runs) the update stream
+     was not sustained (urate_check.py: server write jobs done / accepted < 0.98 or backlog growing) on a passing
+     confirm step of an SLO run or in a fixed window. Without the file (every H1 run) no W8 line is written.
   W6 C_diff_ns < 0 on a row (message carries the Popcorn cross-check pop_T_minus_hw_ns vs its C and the analysis warn)
   W7 per SLO run with the loadgen knee bracket (loadgen since 2026-10-18 "A+C"; older runs: no W7): confirm search
      ended at the probe limit (summary confirm_search.finish "probe limit ...") or bracket rel_width > 5 % (hi/lo - 1);
@@ -111,6 +114,15 @@ def runs(d):
                 out.append({"name": f[0], "sys": f[1], "mix": f[2], "phase": f[3], "round": f[4], "dir": rd,
                             "life": f[7] if len(f) == 8 else "sep"})
     return out
+
+
+def upd_valid(part):
+    """{step: bool} from <part>/urate-check.csv (written by m4-run.sh in evaluation runs only); None if absent"""
+    p = os.path.join(part, "urate-check.csv")
+    if not os.path.isfile(p):
+        return None
+    with open(p) as f:
+        return {int(r["step"]): r["valid"] == "True" for r in csv.DictReader(f)}
 
 
 def jl(p):
@@ -307,6 +319,11 @@ def main():
         if npass < 3:
             errs.append(f"{npass} passing curve steps")
         res("F", f"F2 {r['name']}", not errs, "; ".join(errs))
+        uv = upd_valid(r["dir"])
+        if uv is not None:  # W8 (eval-run1, verifier M3): update stream sustained on the passing confirm steps
+            bad = [str(x["step"]) for x in st if x.get("phase") == "confirm" and x.get("pass") and uv.get(x["step"]) is False]
+            res("W", f"W8 {r['name']} update stream at the result", not bad,
+                "update stream not sustained (urate-check.csv) on passing confirm steps " + ", ".join(bad))
         if c.get("x_mean"):
             xs[(r["mix"], r["sys"])] = float(c["x_mean"])
             sd = float(c.get("x_sd") or 0)
@@ -406,6 +423,11 @@ def main():
             ach, off = fnum(x.get("achieved_total")), fnum(x["offered_x"])  # offered_x = total rate argument
             res("W", f"W3 {m} {x['system']} {x['level']} window", ach is not None and off and ach / off >= 0.95
                 and x["pass"] == "True", f"achieved {ach} / offered {off}, pass {x['pass']}")
+            uv = upd_valid(x.get("run_dir", ""))
+            if uv is not None:  # W8 (eval-run1, verifier M3): update stream sustained in the fixed window
+                v = uv.get(int(x["step"])) if str(x.get("step", "")).isdigit() else None
+                res("W", f"W8 {m} {x['system']} {x['level']} update stream", v is True,
+                    f"urate-check valid {v} (step {x.get('step')})")
         if all((m, s) in xs for s in SYSTEMS):
             res("W", f"W1 {m} all-HWcc highest", xs[(m, "hw")] >= 0.98 * max(xs[(m, k)] for k in SYSTEMS if k != "hw"),
                 "x " + " ".join(f"{k} {xs[(m, k)]:g}" for k in SYSTEMS))
