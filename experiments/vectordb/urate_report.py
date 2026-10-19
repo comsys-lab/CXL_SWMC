@@ -13,8 +13,8 @@
       search T (ms), cxl_recv kernel-thread CPU (s per s); also <E>/urate-steps.csv (every measured step of every
       lifetime, the same columns per step plus phase / pass / valid) for plots (x from 0) and CSV export.
 Inputs per lifetime: <life>/slo/loadgen/{summary.json,steps.jsonl}, <life>/slo/urate-check.csv (urate_check.py),
-<life>/slo/opsplit-steps.csv (opsplit.py, written by m4-run.sh). Recall@10 is not computed here (offline:
-tools/compute_gt.py on <life>/slo/e1.sample.bin).
+<life>/slo/opsplit-steps.csv (opsplit.py, written by m4-run.sh) and, if urate-recall.sh ran, <life>/slo/recall.recall.txt
+(recall@10 of 500 sampled measured searches of that lifetime, plain and tie-aware; columns recall10, recall10_tie).
 """
 import csv
 import glob
@@ -106,7 +106,7 @@ def table(a):
     lives.sort()
     w = csv.writer(sys.stdout)
     w.writerow(["rate_ups", "pct_corpus_per_h", "system", "writers", "result_search_s", "confirm_x_mean", "confirmed",
-                "valid", "low_rate_violations", "ramp_end", "note"] + ["at_result_" + c for c in COLS])
+                "valid", "low_rate_violations", "ramp_end", "note", "recall10", "recall10_tie"] + ["at_result_" + c for c in COLS])
     allrows = []
     for rate, system, d in lives:
         s = json.load(open(os.path.join(d, "loadgen", "summary.json")))
@@ -119,13 +119,18 @@ def table(a):
             if m:
                 wr = m.group(1)
                 break
+        rc = {}
+        p = os.path.join(d, "recall.recall.txt")
+        if os.path.exists(p):
+            rc = dict(l.strip().split("=", 1) for l in open(p) if "=" in l and l.startswith("recall_"))
         at = [r for r in st if best is not None and r["phase"] == "confirm" and abs(r["offered_x"] - best) <= 1e-9 * max(1, best)]
         for r in st:
             allrows.append(dict(rate_ups=rate, system=system, writers=wr, result=best,
                                 at_result=int(r in at), **r))
         w.writerow([rate, round(rate * 3600 / NLIVE * 100, 3), system, wr, f(best), f(s.get("confirm", {}).get("x_mean")),
                     f(s.get("confirmed")), int("URATECHECK PASS" in uc), len(s.get("low_rate_violations", [])),
-                    s.get("ramp_policy", {}).get("ramp_end", ""), s.get("note", "")]
+                    s.get("ramp_policy", {}).get("ramp_end", ""), s.get("note", ""), rc.get("recall_measured_ok", ""),
+                    rc.get("recall_tie_aware_measured_ok", "")]
                    + [mean([fl(r[c]) for r in at]) if at else "" for c in COLS])
     keys = ["rate_ups", "system", "writers", "result", "at_result", "step", "phase", "offered_x", "pass", "valid",
             "update_offered"] + COLS

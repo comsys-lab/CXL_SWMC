@@ -13,28 +13,34 @@
 #   p99 <= 100 ms, knee ramp from URATE_START (1) search/s, >= 100 searches per step, --ramp-knee 2 --ramp-knee-floor
 #   1.5, confirm 3 x 30 s, --tol 0.02); then urate_check.py <life>/slo (FAIL stops the block; NOTE "update rate not
 #   sustained" recorded) and urate_report.py (one row per lifetime in <E>/urate-results.tsv).
-#   Update budget: every lifetime starts from the initial image and may consume at most the writes file's update count
-#   (pool B, 1,000,000 updates; ids and capacity of the 28M image allow 1,010,000 inserts). A rate R is refused before
-#   the block starts if R x URATE_BUDGET_S (1200 s: warm 60 s + a knee-ramp SLO search; estimate in the packet) exceeds
-#   that count (SEQUENCE STOP "update budget"): rates above ~830 updates/s need a longer writes file and more ids, a
-#   dataset decision (packet §open questions). A lifetime that still exhausts the stream stops the block (m4-run.sh).
+#   Update budget (verifier MEDIUM-1): every lifetime starts from the initial image and may consume at most the
+#   writes file's updates (DATASET 28m: 1,000,000 = pool B; 28m-x: X_NB, sized to the free ids of X_MAXIDS). The
+#   worst-case consumption is computed from m4-run.sh's KIND=urate loadgen parameters by urate_budget.py (scenario
+#   URATE_XFLOOR / URATE_XKNEE / URATE_GMIN, defaults 10 search/s, 400 search/s, 1.2; recorded in budget.txt). A rate
+#   whose bound exceeds the budget is refused before the block starts (SEQUENCE STOP "update budget") unless it is
+#   listed in URATE_PARTIAL_OK (explicit user decision): such a lifetime may run out of updates, which m4-run.sh
+#   records as a NOTE ("update stream exhausted"; the steps before it are kept, the SLO result may be missing).
 # usage: urate-block.sh <evidence dir (exists, holds only sequence* files)>
 # env (required): KPOP GTPOP CPOP (Popcorn release, guest tools, deploy bundle), PLAIN_BUILD VPLAIN (vdb build with the
 #   §17 counters + guest dir), LOADGEN_BUILD (loadgen with the knee ramp + vectordb plugin), PRETOUCH_DIR,
 #   EXPECT_DAX_UUID, WRITERS (1..16), H1_MEASURE_RUN=1 + MEASURE_PART_DIR + MEASURE_ENV_DIR (loadgen in measure.slice
 #   on 56-63 and experiments/h1/h1-gate.sh before every lifetime / part, as H1). Optional: URATES, SYSTEMS (subset of
-#   "hw pop"), URATE_START (1), URATE_BUDGET_S (1200), SEED (20261019).
+#   "hw pop"), URATE_START (1), URATE_XFLOOR / URATE_XKNEE / URATE_GMIN, URATE_PARTIAL_OK, SEED (20261019),
+#   URATE_DATASET (28m | 28m-x; 28m-x needs X_DATA X_WRITES X_NB X_MAXIDS X_MAXW X_MAXD X_INIT_CAP, m4-run.sh, and a
+#   vdb build >= 17).
 # dax0.0, lock, rollback, Host gate and stop rules: as v6-block.sh (m4-lib.sh; owner VDB-urate-<evidence dir name>).
 set -uo pipefail
 E=$1 R=0
 P=/home/comsys/sungsu/destijl-control X=$P/CXL_SWMC/experiments/vectordb
 SEED_BASE=${SEED:-20261019} OWNER="VDB-urate-$(basename "${E%/}")"
 : "${KPOP:?}" "${GTPOP:?}" "${CPOP:?}" "${PLAIN_BUILD:?}" "${VPLAIN:?}" "${LOADGEN_BUILD:?}" "${PRETOUCH_DIR:?}" "${WRITERS:?}"
-URATES=${URATES:-100 200 400 800 1600 3200} SYSTEMS=${SYSTEMS:-hw pop} URATE_START=${URATE_START:-1} BUDGET_S=${URATE_BUDGET_S:-1200}
+URATES=${URATES:-100 200 400 800 1600 3200} SYSTEMS=${SYSTEMS:-hw pop} URATE_START=${URATE_START:-1}
+XFLOOR=${URATE_XFLOOR:-10} XKNEE=${URATE_XKNEE:-400} GMIN=${URATE_GMIN:-1.2} PARTIAL_OK=${URATE_PARTIAL_OK:-} DS=${URATE_DATASET:-28m}
 [[ $WRITERS =~ ^[1-9][0-9]?$ ]] && [ "$WRITERS" -le 16 ] || { echo "SEQUENCE STOP: WRITERS must be 1..16"; exit 2; }
 for r in $URATES; do [[ $r =~ ^[1-9][0-9]*$ ]] || { echo "SEQUENCE STOP: bad URATES entry $r"; exit 2; }; done
 for s in $SYSTEMS; do case $s in hw|pop) ;; *) echo "SEQUENCE STOP: SYSTEMS is a subset of 'hw pop'"; exit 2;; esac; done
-[[ $BUDGET_S =~ ^[1-9][0-9]*$ ]] || { echo "SEQUENCE STOP: bad URATE_BUDGET_S"; exit 2; }
+for v in "$XFLOOR" "$XKNEE" "$GMIN" "$URATE_START"; do [[ $v =~ ^[0-9]+(\.[0-9]+)?$ ]] || { echo "SEQUENCE STOP: bad budget scenario value $v"; exit 2; }; done
+for r in $PARTIAL_OK; do [[ " $URATES " == *" $r "* ]] || { echo "SEQUENCE STOP: URATE_PARTIAL_OK entry $r not in URATES"; exit 2; }; done
 [ "${H1_MEASURE_RUN:-0}" = 1 ] && [ -d "${MEASURE_PART_DIR:-}" ] && [ -n "${MEASURE_ENV_DIR:-}" ] \
   || { echo "SEQUENCE STOP: needs H1_MEASURE_RUN=1, MEASURE_PART_DIR and MEASURE_ENV_DIR (loadgen CPUs 56-63 are in measure.slice)"; exit 2; }
 [[ "${EXPECT_DAX_UUID:-}" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]] || { echo "SEQUENCE STOP: EXPECT_DAX_UUID"; exit 2; }
@@ -42,10 +48,21 @@ export H1_MEASURE_RUN MEASURE_PART_DIR MEASURE_ENV_DIR
 for b in "$PLAIN_BUILD" "$LOADGEN_BUILD"; do
   grep -q "^source_commit=.* dirty=0$" $b/manifest.txt || { echo "SEQUENCE STOP: $b is not a clean build"; exit 2; }
 done
-WF=$P/workspaces/vdb-data/writes-a27m-b1m-u1m.bin   # m4-run.sh DATASET=28m
+case $DS in
+  28m) WF=$P/workspaces/vdb-data/writes-a27m-b1m-u1m.bin;;   # m4-run.sh DATASET=28m
+  28m-x) WF=${X_WRITES:?URATE_DATASET=28m-x needs X_WRITES}; : "${X_DATA:?}" "${X_NB:?}" "${X_MAXIDS:?}" "${X_MAXW:?}" "${X_MAXD:?}" "${X_INIT_CAP:?}"
+         export X_DATA X_WRITES X_NB X_MAXIDS X_MAXW X_MAXD X_INIT_CAP;;
+  *) echo "SEQUENCE STOP: URATE_DATASET is 28m or 28m-x"; exit 2;;
+esac
 AVAIL=$(( $(stat -c %s "$WF") / 48 ))               # update pairs (2 x 24 B records)
+[ "$DS" = 28m ] || [ "$X_NB" -ge "$AVAIL" ] || AVAIL=$X_NB
+BUDGET=$(python3 $X/urate_budget.py $X/m4-run.sh --start "$URATE_START" --x-floor "$XFLOOR" --x-knee "$XKNEE" --g-min "$GMIN" $(for r in $URATES; do echo --rate $r; done)) \
+  || { echo "SEQUENCE STOP: urate_budget.py"; exit 2; }
 for r in $URATES; do
-  [ $(( r * BUDGET_S )) -le $AVAIL ] || { echo "SEQUENCE STOP: update budget: rate $r x ${BUDGET_S} s = $(( r * BUDGET_S )) updates > $AVAIL in $WF (rates above $(( AVAIL / BUDGET_S ))/s need a dataset decision, packet §8)"; exit 2; }
+  need=$(echo "$BUDGET" | sed -n "s/^rate=$r updates=//p")
+  [ -n "$need" ] || { echo "SEQUENCE STOP: no budget for rate $r"; exit 2; }
+  [ "$need" -le "$AVAIL" ] || [[ " $PARTIAL_OK " == *" $r "* ]] \
+    || { echo "SEQUENCE STOP: update budget: rate $r needs up to $need updates (worst case: $(echo "$BUDGET" | head -n 1)) > $AVAIL in $WF; list it in URATE_PARTIAL_OK only with a user decision"; exit 2; }
 done
 GUEST_INIT=/home/comsys/vdb/init/seg32c32m-a27m HOST_IMAGE=$P/workspaces/vdb-data/seg32-c32m-a27m-m16-efc128-b1
 VP=${VPLAIN#/home/comsys/}
@@ -53,7 +70,7 @@ INSTALL="$VP/bin/vdb-server $PLAIN_BUILD/bin/vdb-server
 $VP/bin/vdb-node.sh $P/CXL_SWMC/scripts/guest/vdb-node.sh
 $VP/cfg/cxl_region.yaml $P/CXL_SWMC/config/cxl_region.yaml"
 . $X/m4-lib.sh
-COMMON=(DATASET=28m U=0 KIND=urate PLAIN_BUILD=$PLAIN_BUILD VPLAIN=$VPLAIN LOADGEN_BIN=$LOADGEN_BUILD/loadgen
+COMMON=(DATASET=$DS U=0 KIND=urate PLAIN_BUILD=$PLAIN_BUILD VPLAIN=$VPLAIN LOADGEN_BIN=$LOADGEN_BUILD/loadgen
         "XARGS=--writer-threads $WRITERS" URATE_START=$URATE_START)
 PE=(C8=$CPOP K8=$KPOP GT8=$GTPOP RECV_MODE=poll)  # m4-run.sh's Popcorn variables (named C8/K8/GT8)
 dax_root() {  # before a Popcorn run: back to root:root 600 (no server of ours runs between runs); fresh stat check
@@ -85,7 +102,10 @@ NLIVE=26990000  # live records (pool A; every update deletes one and inserts one
   for r in $URATES; do python3 -c 'import sys; r=int(sys.argv[1]); print("u%d: %.3f %% of the corpus per hour" % (r, r * 3600 / int(sys.argv[2]) * 100))' $r $NLIVE; done
   echo "writer threads per VM: $WRITERS (vdb-server --writer-threads; same for every system)"
   echo "update spread: writes file $WF (gen_writes.py seed 20261015, target VM uniform per update pair; identical for every system and rate)"
-  echo "update budget per lifetime: $AVAIL updates; URATE_BUDGET_S $BUDGET_S"; } > "$E/rate-basis.txt"
+  echo "update budget per lifetime: $AVAIL updates (dataset $DS, $WF); worst case per lifetime (urate_budget.py):"
+  echo "$BUDGET"; echo "rates allowed to exhaust the budget (URATE_PARTIAL_OK): ${PARTIAL_OK:-none}"
+  [ "$DS" = 28m ] || echo "dataset 28m-x: X_DATA=$X_DATA X_WRITES=$X_WRITES X_NB=$X_NB X_MAXIDS=$X_MAXIDS X_MAXW=$X_MAXW X_MAXD=$X_MAXD X_INIT_CAP=$X_INIT_CAP"
+  echo "writer threads $WRITERS > 1: HNSW graphs are not reproducible record by record (level draws depend on scheduling); recall is reported per system and rung (urate-recall.sh, offline)"; } > "$E/rate-basis.txt"
 printf '# name\tsystem\trate_ups\twriters\tresult_search_s\tconfirm_x_mean\tconfirmed\tlow_rate_violations\turatecheck\tvalid\tramp_end\tknee_search_s\tnote\n' > "$E/urate-results.tsv"
 { echo "# vector DB update-rate sweep: per rate (URATES order) one lifetime per system, order shuffle(seed vdb-urate-<rate>); loadgen seed $SEED_BASE (slo), +100 (warm)"
   for r in $URATES; do echo "u$r: $(SHUFFLE_SEED=vdb-urate-$r shuffle $SYSTEMS)"; done; } | tee "$E/order.txt"

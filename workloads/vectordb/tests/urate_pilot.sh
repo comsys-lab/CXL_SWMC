@@ -8,7 +8,9 @@
 # usage: urate_pilot.sh <vdb build dir> <loadgen binary> <data dir (pool_b/queries .fbin)> <writes.bin> <init image dir>
 #                       <scratch dir (must not exist)>
 # env: WRITERS (server --writer-threads, default 1), URATES ("800 1600 3200"), SEARCH (search/s, 20), MEASURE_S (20),
-#      SEGMENTS (32), CHUNK (33554432), MAXIDS (2000000; must match the image), DEVICE_SIZE (8 GiB),
+#      SEGMENTS (32), CHUNK (33554432), MAXIDS (2000000; must match the image unless INIT_CAP), DEVICE_SIZE (8 GiB),
+#      INIT_CAP (vdb-server --init-capacity: the image's capacity per segment when MAXIDS is larger; build >= 17),
+#      MAXW / MAXD (--max-writes / --max-deletes; 2097152 / 1048576),
 #      SEARCH_THREADS (4), CPUS0 / CPUS1 (server CPU sets; 18-20,50-52 / 21-23,53-55 = the node-1 CPUs user.slice may use
 #      on this Host), LGCPUS (loadgen CPU set; 18-23,50-55), NA / NB
 #      (pool sizes for e1_check; default from the writes manifest), PORT0 (19400),
@@ -27,7 +29,7 @@ CPUS0=${CPUS0:-18-20,50-52} CPUS1=${CPUS1:-21-23,53-55} LGCPUS=${LGCPUS:-18-23,5
 NA=${NA:-$(sed -n 's/^pool_a=//p' "$WF.manifest.txt")} NB=${NB:-$(sed -n 's/^pool_b=//p' "$WF.manifest.txt")}
 [ -e "$S" ] && { echo "refusing: $S exists"; exit 2; }
 mkdir -p "$S"
-PARAMS="--nodes 2 --segments $SEG --chunk-bytes $CHUNK --M 16 --efc 128 --ef 32 --max-writes 2097152 --max-ids $MAXIDS --max-deletes 1048576 --writer-threads $WRITERS"
+PARAMS="--nodes 2 --segments $SEG --chunk-bytes $CHUNK --M 16 --efc 128 --ef 32 --max-writes ${MAXW:-2097152} --max-ids $MAXIDS --max-deletes ${MAXD:-1048576} --writer-threads $WRITERS${INIT_CAP:+ --init-capacity $INIT_CAP}"
 truncate -s "$DEVSZ" "$S/device.img"
 sed -e "s|^device: .*|device: $S/device.img|" -e "s|^device_size: .*|device_size: $DEVSZ|" "$ROOT/config/cxl_region.yaml" > "$S/region.yaml"
 # shellcheck disable=SC2086

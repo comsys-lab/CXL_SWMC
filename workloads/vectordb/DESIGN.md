@@ -502,6 +502,33 @@ experiments/vectordb/urate-block.sh (m4-run.sh KIND=urate). H1 (YCSB-style mixes
   accepted - done, `write_lag_ns_sum` / `write_lag_n` (queue-to-finish time per job), `write_lag_max_ns` (window max,
   reset by every stats read). experiments/vectordb/urate_check.py judges each measured step (done >= 0.98 x accepted,
   backlog growth <= max(50, 1 s of updates), end backlog <= max(50, 5 s of updates)).
+- Deviations from the RecSys streaming block (state/PROJECT.md "RecSys experiment methodology"), each with its reason:
+  - `--drain-s 60` in the SLO part (RecSys: loadgen default 5 s). A drain ends as soon as every response is in, so
+    it costs time only after a step that left a backlog. Reasons: (1) a write backlog left by a saturated step is served
+    before the next step starts, so a step is not judged on its predecessor's backlog; (2) responses that arrive after
+    loadgen's drain are lost to loadgen but counted by the server, which breaks the per-lifetime opcoh closure
+    (observed on the Host with 5 s at queue-cap steps, workspaces/vdb-urate/pilot16-w8).
+  - `--min-step-queries 300` (RecSys 100; user 2026-10-20): the VDB SLO is p99, and with 100 searches the nearest-rank
+    p99 is the second-slowest search.
+  - SLO p99 <= 100 ms (H1 VDB SLO) instead of RecSys p95.
+- Reproducibility: with N > 1 writer threads the HNSW graph is not reproducible record by record (level draws and
+  insert order inside a segment depend on scheduling), so two lifetimes of the same rung differ in graph shape;
+  recall@10 is measured per system and rung from that lifetime's own searches (e1_check.py sample of 500 measured
+  searches -> experiments/vectordb/urate-recall.sh -> tools/compute_gt.py, offline after the block).
+- Update budget per lifetime (every lifetime starts from the initial image; no reclamation): inserts are bounded by
+  the free ids / segment capacity and by the writes file. experiments/vectordb/urate_budget.py bounds the update
+  consumption from the KIND=urate loadgen parameters (scenario: ramp growth >= 1.2 up to a 400 search/s knee, SLO
+  result >= 10 search/s); urate-block.sh refuses rates above the budget unless the user lists them in
+  URATE_PARTIAL_OK, and an exhausted stream in the SLO part is a NOTE (steps before it kept). Device limit (28M image,
+  96 GiB NVDIMM): at most 88 groups per segment -> capacity 941,512 (`--max-ids 30128384 --init-capacity 875000`),
+  i.e. about 3.14 M inserts per lifetime (3,363 B of SWcc per record). Longer traces: `DATASET=28m-x` in m4-run.sh
+  (X_DATA, X_WRITES, X_NB, X_MAXIDS, X_MAXW, X_MAXD, X_INIT_CAP).
+- `--init-capacity C` (build >= 17): accept an init dir built for C <= capacity elements per segment; chunk images are
+  chunk-relative and per_chunk / lchunk_bytes do not depend on the capacity, so a larger capacity only adds groups.
+- Dataset deviation option (gen_writes.py `--pool-b-rows R`): the j-th insert gets a new id NA + j and pool B row
+  j mod R (vectors reused under new ids; two live ids may hold the same vector; compute_gt.py maps ids to rows from
+  the writes file and adds a tie-aware recall). ON HOLD (user 2026-10-20): fresh PubMed_bge rows beyond the 28M kept
+  (prepare_data.py used all 28,000,000 rows of raw28m) are being considered instead.
 - Host test: tests/urate_pilot.sh (two servers on a scratch file, 1M image; per-rate fixed invocations, optional
   knee-ramp SLO part; E1 per invocation; final consistency: P = writes, elements = NA + updates, delete-log entries =
   updates, bad_records 0, backlog 0).

@@ -17,13 +17,16 @@
 #     (updates/s, independent of the search rate) and --tol 0.02 in every part; part warm = unmeasured warm-up
 #     (1 search/s, 10 + 50 s, its stats snapshots kept, never used); part slo = the knee-ramp SLO search (RecSys
 #     methodology 2026-10-19, state/PROJECT.md): --start URATE_START (default 1) --factor 1.5 --precision 0.02,
-#     confirm 3 x 30 s as H1, --max-steps 40 --min-step-queries 100 --ramp-knee 2 --ramp-knee-floor 1.5, --drain-s 60
+#     confirm 3 x 30 s as H1, --max-steps 40 --min-step-queries 300 (user 2026-10-20, Q3: the VDB SLO is p99) --ramp-knee 2 --ramp-knee-floor 1.5, --drain-s 60
 #     (a step ends when every response is in, at most 60 s: a write backlog left by a saturated step is served
 #     before the next step, and no response is lost after loadgen's drain, which the opcoh_check closure needs). Seeds: warm
 #     SEED + 100, slo SEED. Any loadgen note of the slo part is a NOTE (a result, not an error); warm must end without.
 #   KIND=fixed|pfix: RATE (total req/s of the scaled streams = L / (1 - U/100)); TRACE (0 | 1, default 0; Megalon only)
 #   DATASET: 28m (default: pubmed-a27m-b1m-q10k, image seg32c32m-a27m) | 1m (pubmed-a1m-b1m-q10k, writes
-#   writes-a1m-b1m-u1m.bin, image seg32c32m)
+#   writes-a1m-b1m-u1m.bin, image seg32c32m) | 28m-x (KIND=urate only: the 28M image with a longer update trace;
+#   env X_DATA (dir with pool_b.fbin, queries.fbin), X_WRITES (gen_writes.py file), X_NB (inserts = --pool-b of the
+#   file), X_MAXIDS, X_MAXW, X_MAXD, X_INIT_CAP (vdb-server --max-ids/--max-writes/--max-deletes/--init-capacity;
+#   build >= 17); workloads/vectordb/DESIGN.md §17)
 #   Builds / guest install dirs (defaults = M4): LOADGEN_BIN (builds/loadgen/4/loadgen), PLAIN_BUILD (builds/vdb/8), VPLAIN (/home/comsys/vdb8),
 #   MEG_BUILD (builds/vdb-megalon/6), VMEG (/home/comsys/vdbm6-28m)
 #   SYS=Popcorn: C8 / K8 / GT8 = the Popcorn deploy bundle dir, release and guest tools dir (names kept from build 8;
@@ -60,17 +63,23 @@ for t in $XENV; do [[ $t =~ ^ENV:[A-Z_][A-Z0-9_]*=[A-Za-z0-9_./-]*$ ]] || { echo
 stop() { echo "M4RUN $NAME STOP $*"; exit 1; }
 [ -d "$E" ] || stop "missing evidence dir $E"
 [ -e "$E/$NAME" ] && stop "$E/$NAME exists"
+MAXW= MAXD= XSA=  # set only by DATASET=28m-x (never inherited from the environment)
 case "${DATASET:-28m}" in
   28m) D=$P/workspaces/vdb-data/pubmed-a27m-b1m-q10k W=$P/workspaces/vdb-data/writes-a27m-b1m-u1m.bin
        INIT=/home/comsys/vdb/init/seg32c32m-a27m NA=26990000 NB=1000000 MAXIDS=28000000;;
   1m)  D=$P/workspaces/vdb-data/pubmed-a1m-b1m-q10k W=$P/workspaces/vdb-data/writes-a1m-b1m-u1m.bin
        INIT=/home/comsys/vdb/init/seg32c32m NA=1000000 NB=1000000 MAXIDS=2000000;;
+  28m-x) [ "$KIND" = urate ] || stop "DATASET=28m-x is for KIND=urate only"
+       for v in X_NB X_MAXIDS X_MAXW X_MAXD X_INIT_CAP; do [[ "${!v:-}" =~ ^[1-9][0-9]*$ ]] || stop "DATASET=28m-x needs $v"; done
+       [ -d "${X_DATA:-}" ] && [ -f "${X_WRITES:-}" ] || stop "DATASET=28m-x needs X_DATA and X_WRITES"
+       D=$X_DATA W=$X_WRITES INIT=/home/comsys/vdb/init/seg32c32m-a27m NA=26990000 NB=$X_NB MAXIDS=$X_MAXIDS
+       XSA=" --init-capacity $X_INIT_CAP" MAXW=$X_MAXW MAXD=$X_MAXD;;
   *) stop "bad DATASET";;
 esac
 PLAIN_BUILD=${PLAIN_BUILD:-$P/builds/vdb/8} VPLAIN=${VPLAIN:-/home/comsys/vdb8}
 MEG_BUILD=${MEG_BUILD:-$P/builds/vdb-megalon/6} VMEG=${VMEG:-/home/comsys/vdbm6-28m}
-SA="--nodes 2 --segments 32 --M 16 --efc 128 --ef 32 --max-writes 2097152 --max-ids $MAXIDS --max-deletes 1048576
- --search-threads 14 --wait-timeout-ms 60000 --start-timeout-ms 5400000"
+SA="--nodes 2 --segments 32 --M 16 --efc 128 --ef 32 --max-writes ${MAXW:-2097152} --max-ids $MAXIDS --max-deletes ${MAXD:-1048576}
+ --search-threads 14 --wait-timeout-ms 60000 --start-timeout-ms 5400000${XSA:-}"
 SA=$(echo $SA)
 export LOADGEN=${LOADGEN_BIN:-$P/builds/loadgen/4/loadgen} READY_TIMEOUT=5400 RUN_KIND=measurement TRACE STATS_OP=10 INIT
 [ "$KIND" = functional ] && RUN_KIND=functional
@@ -137,7 +146,7 @@ case "$KIND" in
          LG=("${NL[@]}" --raw --fixed update=$URATE --tol 0.02)
          export PART_SEED_warm=$((SEED + 100)) PART_SEED_slo=$SEED PARTS="warm slo" PART_RATES= PART_RATES_CMD=
          export PART_ARGS_warm="--mode fixed --rates 1 --warmup-s 10 --step-warmup-s 0 --step-measure-s 50 --drain-s 10"
-         export PART_ARGS_slo="--mode slo --start $US --factor 1.5 --precision 0.02 --confirm-precision 0.01 --max-confirm-probes 6 --confirm-step-down 0.05 --max-steps 40 --warmup-s 10 --step-warmup-s 3 --step-measure-s 15 --confirm-s 30 --confirm-reps 3 --min-step-queries 100 --ramp-knee 2 --ramp-knee-floor 1.5 --drain-s 60";;
+         export PART_ARGS_slo="--mode slo --start $US --factor 1.5 --precision 0.02 --confirm-precision 0.01 --max-confirm-probes 6 --confirm-step-down 0.05 --max-steps 40 --warmup-s 10 --step-warmup-s 3 --step-measure-s 15 --confirm-s 30 --confirm-reps 3 --min-step-queries 300 --ramp-knee 2 --ramp-knee-floor 1.5 --drain-s 60";;
   *) stop "bad KIND";;
 esac
 SSH="ssh -o BatchMode=yes -o ConnectTimeout=8"
@@ -248,7 +257,12 @@ NOTES=""
 for RP in $PDIRS; do
   [ -s $RP/loadgen/summary.json ] || stop "no loadgen output in $RP (lifetime stopped early?)"
   # writes file exhausted: loadgen ends fill/overload silently (note "") or notes "streams exhausted"; both are a STOP
-  ! grep -q '"reason":"stream [a-z]* exhausted' $RP/loadgen/steps.jsonl || stop "writes file exhausted in $RP (stream exhausted; packet: bigger writes file needs a dataset decision)"
+  if grep -q '"reason":"stream [a-z]* exhausted' $RP/loadgen/steps.jsonl; then
+    # KIND=urate slo part: the update budget of the lifetime ran out (urate-block.sh budget rule, explicit opt-in only):
+    # recorded as a NOTE, the steps before it are kept; anywhere else a STOP as before
+    { [ "$KIND" = urate ] && [ "${RP##*/}" = slo ]; } || stop "writes file exhausted in $RP (stream exhausted; packet: bigger writes file needs a dataset decision)"
+    NOTES="$NOTES ${RP##*/}: update stream exhausted (lifetime budget)"
+  fi
   if [ -n "${OPCOH_EXPECT:-}" ]; then
     { grep -qx "ok_without_coh=0" $RP/loadgen/vectordb.txt && grep -qx "updates_ok_without_coh=0" $RP/loadgen/vectordb.txt &&
       grep -qx "bad_coh_version=0" $RP/loadgen/vectordb.txt; } || stop "responses without an op coherence block ($RP)"
