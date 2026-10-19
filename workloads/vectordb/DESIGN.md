@@ -474,6 +474,38 @@ indexing unit; Megalon flushes the whole object at write end (no dirty-line trac
 - Tests: tests/megalon_trace_test.cc (fake API v2 with thread_coh) + tests/classify_sharing_test.py (constructed
   true/false/no-prior-copy events); host_smoke.sh BACKEND=megalon TRACE=1.
 
+## 17. Update-rate sweep: absolute update stream, several writer threads (vdb build >= 16; user 2026-10-19)
+
+Brief: reports/VDB-update-rate-axis-brief.md; packet reports/VDB-urate-packet.v1.md; harness
+experiments/vectordb/urate-block.sh (m4-run.sh KIND=urate). H1 (YCSB-style mixes, builds vdb/15) is unchanged.
+- Load: an absolute update stream of R updates/s (loadgen `--fixed update=R`), independent of the search rate
+  (`--mix search=1`, the swept x); the SLO search uses the RecSys knee ramp (state/PROJECT.md "RecSys experiment
+  methodology": start low, >= 100 searches per step, low-rate failures recorded, `--ramp-knee 2 --ramp-knee-floor 1.5`).
+  Updates go to the VM named in the writes file (uniform per update pair, gen_writes.py seed), identical for every
+  system and rate.
+- Writer threads (`--writer-threads N`, default 1 = every earlier build; N > 1 plain backend only): N threads per node
+  pop the node's single write queue. Correctness:
+  - segment writes (hnswlib addPoint, graph meta, the segment's Graph object scratch) stay serialised by the segment's
+    HWcc writer-preferring rwlock (id % S), across threads and nodes, exactly as across nodes before;
+  - an update's DELETE and INSERT are one job, run by one thread in that order (w_del published before w_ins);
+  - the node's delete log: index allocation, entry write and the release of `dlog_count` run under a node-local mutex,
+    so `dlog_count` never covers an unwritten entry (readers replay [cursor, dlog_count)); with N = 1 no lock is taken;
+  - applied bitmap and P: unchanged (fetch_or of the bit, CAS loop over contiguous set bits); writes of one node may now
+    complete out of w_seq order, as writes of different nodes always could; E1 (P >= s) still covers every write <= s;
+  - visibility does not depend on the physical order of a delete and the insert of the same id (ins_seq / del_seq
+    filter; deleted elements stay in the graph);
+  - HNSW levels: writer 0 keeps the node's generator (seed as before); writer w > 0 owns one seeded from (seed, node,
+    w). With N > 1 the level of a given record depends on scheduling (not reproducible record by record).
+  - `writes_applied` (diagnostic HWcc line) is incremented atomically when N > 1.
+- Write-path counters (every build >= 16, also with N = 1; stats text): `writer_threads`, `write_jobs_accepted`
+  (queued by a connection reader), `write_jobs_done` (finished by a writer, incl. bad requests), `write_backlog` =
+  accepted - done, `write_lag_ns_sum` / `write_lag_n` (queue-to-finish time per job), `write_lag_max_ns` (window max,
+  reset by every stats read). experiments/vectordb/urate_check.py judges each measured step (done >= 0.98 x accepted,
+  backlog growth <= max(50, 1 s of updates), end backlog <= max(50, 5 s of updates)).
+- Host test: tests/urate_pilot.sh (two servers on a scratch file, 1M image; per-rate fixed invocations, optional
+  knee-ramp SLO part; E1 per invocation; final consistency: P = writes, elements = NA + updates, delete-log entries =
+  updates, bad_records 0, backlog 0).
+
 ## 10. Future reference: E2 (not implemented)
 
 - No-wait: s_used = min(P, ref_w); no staleness bound.

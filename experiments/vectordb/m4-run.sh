@@ -12,6 +12,13 @@
 #     ("<L2> <L1>" on stdout, run inside the lifetime after the slo part; failure = "M4RUN <name> STOP LEVELS STOP").
 #     Checks per part dir <run>/<part> (opsplit, opcoh_check with OPCOH_PARTS = all parts, E1, loadgen finish; NOTE
 #     only for the slo part); fix parts get <run>/fix/h1-steps.txt "<L2 step>,<L1 step>" (measured fixed steps).
+#   KIND=urate (update-rate sweep, urate-block.sh; workloads/vectordb/DESIGN.md §17): one server lifetime, parts
+#     "warm slo" (run.sh PARTS); U=0 (searches only in --mix) plus the absolute update stream --fixed update=URATE
+#     (updates/s, independent of the search rate) and --tol 0.02 in every part; part warm = unmeasured warm-up
+#     (1 search/s, 10 + 50 s, its stats snapshots kept, never used); part slo = the knee-ramp SLO search (RecSys
+#     methodology 2026-10-19, state/PROJECT.md): --start URATE_START (default 1) --factor 1.5 --precision 0.02,
+#     confirm 3 x 30 s as H1, --max-steps 40 --min-step-queries 100 --ramp-knee 2 --ramp-knee-floor 1.5. Seeds: warm
+#     SEED + 100, slo SEED. Any loadgen note of the slo part is a NOTE (a result, not an error); warm must end without.
 #   KIND=fixed|pfix: RATE (total req/s of the scaled streams = L / (1 - U/100)); TRACE (0 | 1, default 0; Megalon only)
 #   DATASET: 28m (default: pubmed-a27m-b1m-q10k, image seg32c32m-a27m) | 1m (pubmed-a1m-b1m-q10k, writes
 #   writes-a1m-b1m-u1m.bin, image seg32c32m)
@@ -117,6 +124,18 @@ case "$KIND" in
       export PARTS=$H1_PARTS PART_RATES=${RATE:-} PART_RATES_CMD=${RATES_CMD:-}
       export PART_ARGS_slo="--mode slo --start 10 --factor 1.5 --precision 0.02 --confirm-precision 0.01 --max-confirm-probes 6 --confirm-step-down 0.05 --max-steps 25 --warmup-s 10 --step-warmup-s 3 --step-measure-s 15 --confirm-s 30 --confirm-reps 3"
       export PART_ARGS_fix="--mode fixed --rates @RATES@ --warmup-s $SETTLE_S --step-warmup-s 10 --step-measure-s 60 --drain-s 10";;
+  urate) [[ "${URATE:-}" =~ ^[1-9][0-9]*$ ]] || stop "bad URATE"
+         [ "$U" = 0 ] || stop "KIND=urate needs U=0 (updates come from --fixed update=URATE)"
+         US=${URATE_START:-1}; [[ $US =~ ^[0-9]+(\.[0-9]+)?$ ]] || stop "bad URATE_START"
+         NL=(); i=0
+         while [ $i -lt ${#LG[@]} ]; do  # drop the common --opt seed=.. and --seed .. (set per part, as KIND=h1)
+           case "${LG[$i]}" in --opt) [[ "${LG[$((i+1))]}" == seed=* ]] && { i=$((i+2)); continue; };; --seed) i=$((i+2)); continue;; esac
+           NL+=("${LG[$i]}"); i=$((i+1))
+         done
+         LG=("${NL[@]}" --raw --fixed update=$URATE --tol 0.02)
+         export PART_SEED_warm=$((SEED + 100)) PART_SEED_slo=$SEED PARTS="warm slo" PART_RATES= PART_RATES_CMD=
+         export PART_ARGS_warm="--mode fixed --rates 1 --warmup-s 10 --step-warmup-s 0 --step-measure-s 50 --drain-s 10"
+         export PART_ARGS_slo="--mode slo --start $US --factor 1.5 --precision 0.02 --confirm-precision 0.01 --max-confirm-probes 6 --confirm-step-down 0.05 --max-steps 40 --warmup-s 10 --step-warmup-s 3 --step-measure-s 15 --confirm-s 30 --confirm-reps 3 --min-step-queries 100 --ramp-knee 2 --ramp-knee-floor 1.5";;
   *) stop "bad KIND";;
 esac
 SSH="ssh -o BatchMode=yes -o ConnectTimeout=8"
@@ -132,7 +151,7 @@ dax_unused() {
     [ "$out" = "dax_users=[] rc=1" ] || return 1
   done
 }
-echo "$(date -Is) $NAME: SYS=$SYS U=$U KIND=$KIND DATASET=${DATASET:-28m} REP=${REP:-} TRACE=$TRACE RATE=${RATE:-} RECV_MODE=${RECV_MODE:-} SEED=$SEED V=$V HOST_SERVER=$HOST_SERVER XENV=[$XENV] XARGS=[$XARGS] OPCOH_EXPECT=${OPCOH_EXPECT:-} OPCOH_CHECK_MODE=${OPCOH_CHECK_MODE:-}"
+echo "$(date -Is) $NAME: SYS=$SYS U=$U KIND=$KIND URATE=${URATE:-} URATE_START=${URATE_START:-} DATASET=${DATASET:-28m} REP=${REP:-} TRACE=$TRACE RATE=${RATE:-} RECV_MODE=${RECV_MODE:-} SEED=$SEED V=$V HOST_SERVER=$HOST_SERVER XENV=[$XENV] XARGS=[$XARGS] OPCOH_EXPECT=${OPCOH_EXPECT:-} OPCOH_CHECK_MODE=${OPCOH_CHECK_MODE:-}"
 servers_gone || stop "a vdb-server is running before the run"
 [ "${GATE:-1}" = 1 ] || [ "$KIND" = functional ] || stop "GATE=0 is allowed for KIND=functional only"
 if [ "${GATE:-1}" = 1 ]; then  # H1 measurement runs: experiments/h1/h1-gate.sh (README item 8); validation: host-gate.sh
@@ -221,6 +240,7 @@ if [ -n "${OPCOH_EXPECT:-}" ]; then  # per-operation time split (vdb build >= 10
 fi
 # per loadgen output dir checks (KIND=h1: per part dir; closure of opcoh_check over every part of the lifetime)
 PDIRS=$R; [ "$KIND" = h1 ] && PDIRS=$(for p in $H1_PARTS; do echo -n "$R/$p "; done)
+[ "$KIND" = urate ] && PDIRS="$R/warm $R/slo"
 NOTES=""
 for RP in $PDIRS; do
   [ -s $RP/loadgen/summary.json ] || stop "no loadgen output in $RP (lifetime stopped early?)"
@@ -239,7 +259,9 @@ for RP in $PDIRS; do
     || stop "E1 violation (see $RP/e1.e1.txt)"
   grep -q "workload_finish\":\"ok" $RP/loadgen/summary.json || stop "loadgen workload finish ($RP)"
   note=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["note"])' $RP/loadgen/summary.json 2>/dev/null)
-  if [ -n "$note" ]; then
+  if [ -n "$note" ] && [ "$KIND" = urate ] && [ "${RP##*/}" = slo ]; then  # knee ramp: every note is a result
+    NOTES="$NOTES ${RP##*/}: $note"
+  elif [ -n "$note" ]; then
     { [[ $KIND =~ ^p?slo$ ]] || { [ "$KIND" = h1 ] && [ "${RP##*/}" = slo ]; }; } \
       && [ "$note" = "confirm failed at three rates; the knee is noisy (longer --confirm-s?)" ] || stop "loadgen note ($RP): $note"
     NOTES="$NOTES ${RP##*/}: $note"

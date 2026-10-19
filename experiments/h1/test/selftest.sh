@@ -36,7 +36,8 @@
 #   N  v0.6.8: (1) v1_check.py updater judgment on a copy of the stopped r1-recsys hw-peak SLO part (4th argument;
 #      read-only): real data PASS (steps 7/10 completed = sent); low sent + full completions PASS; completions 96 % of
 #      sent on a checked step FAIL, on an overload step NOTE; < 100 sent FAIL; (2) main-block.sh: --tol $H1_SLO_TOL
-#      (0.02) only in h1_slo, not in h1_fix / h1_warmup, no --tol in the kv/lmdb/vectordb scripts; (3) r1 retry
+#      (0.02) only in h1_slo, not in h1_fix / h1_warmup, no --tol in the kv/lmdb/vectordb scripts (v0.6.19: except
+#      m4-run.sh KIND=urate, not an H1 path); (3) r1 retry
 #      (h1-main.sh --retry, attempts.py): stopped r1-recsys (levels row avg written) -> plain rerun, retry without
 #      reason, retry for r2, retry of an accepted stage, retry while the stage's last state line is not a STOP: refused;
 #      attempt 2 stops, attempt 3 passes (attempt.txt chain, stopped r1 unchanged, own levels.tsv, F8 on it, -a3
@@ -392,7 +393,9 @@ fn() { sed -n "/^$1() {/,/^}/p" "$MB"; }
 grep -qx "H1_SLO_TOL=0.02" "$MB" && fn h1_slo | grep -qF -- '--tol $H1_SLO_TOL' && ! fn h1_fix | grep -qF -- "--tol" \
   && ! fn h1_warmup | grep -qF -- "--tol" && [ "$(sed '/^stream_slo() {/,/^}/d' "$MB" | grep -v '^ *#' | grep -cF -- '--tol')" = 1 ] \
   || fail "N2 recsys h1 loadgen --tol"   # v0.6.17: BLOCK=stream's stream_slo (not an H1 path) has its own --tol 0.02
-for f in $H/../kv/*.sh $H/../lmdb/*.sh $H/../vectordb/*.sh; do [ -f "$f" ] || continue; grep -v '^ *#' "$f" | grep -qF -- "--tol" && fail "N2 --tol in $f"; done
+# v0.6.19: m4-run.sh KIND=urate (vector DB update-rate sweep, urate-block.sh; not an H1 path) has its own --tol 0.02
+for f in $H/../kv/*.sh $H/../lmdb/*.sh $H/../vectordb/*.sh; do [ -f "$f" ] || continue; grep -v '^ *#' "$f" | sed '/^  urate) /,/;;$/d' | grep -qF -- "--tol" && fail "N2 --tol in $f"; done
+[ "$(grep -v '^ *#' $H/../vectordb/m4-run.sh | sed -n '/^  urate) /,/;;$/p' | grep -cF -- '--tol 0.02')" = 1 ] || fail "N2 m4-run.sh KIND=urate block not found"
 # N3 r1 retry (attempts.py): r1-recsys stops after its avg mix (levels.tsv row avg written, peak hw/pop SLO entries)
 mkdir "$O/N"
 na() { bash $H/h1-accept.sh "$O/N" "$1" "$2" selftest >> "$O/N.out" 2>&1; }

@@ -77,6 +77,11 @@ struct Opts {
   std::string trace_dir;    // sharing trace written at stop (empty: none; Megalon only; DESIGN.md §16)
   uint64_t trace_max_mb = 4096;  // per node trace buffer cap (records beyond it are dropped and counted)
   bool op_coh = true;       // per-operation time split (opcoh.h; --op-coh off disables the counter reads and blocks)
+  // Writer threads of this node (--writer-threads, default 1 = every run before the update-rate sweep). With N > 1
+  // the node's writes are taken from one queue by N threads (DESIGN.md §17): segment writes stay serialised by the
+  // segment's HWcc rwlock, an update's delete and insert stay on one thread in that order, the node's delete log is
+  // appended under a node-local mutex (entries published in index order), applied/P are unchanged (bitmap + CAS).
+  uint32_t writer_threads = 1;
 };
 
 struct Conn {
@@ -95,6 +100,7 @@ struct Job {
   std::shared_ptr<Conn> c;
   frame::header h;
   std::vector<uint8_t> p;
+  uint64_t t_acc = 0;  // write jobs: CLOCK_MONOTONIC when the connection reader queued it (write lag, DESIGN.md §17)
 };
 
 class Queue {
@@ -129,6 +135,9 @@ struct Stats {
       wait_ns{0}, replay_ns{0}, search_ns{0}, lock_ns{0}, insert_ns{0}, insert_lock_ns{0}, update_ns{0},
       search_busy_ns{0}, writer_busy_ns{0};
   std::atomic<uint64_t> opc_read_errors{0}, opc_register_errors{0}, opc_unattributed_ns{0}, opc_unattributed_t_ns{0};
+  // write path accounting (DESIGN.md §17): jobs queued by the connection readers / finished by a writer (incl. bad
+  // requests); lag = finish - queue time per job; lag max is a window value (reset by every stats read)
+  std::atomic<uint64_t> write_jobs_accepted{0}, write_jobs_done{0}, write_lag_ns_sum{0}, write_lag_n{0}, write_lag_max_ns{0};
 };
 
 // Window counters of one operation type (opcoh.h), keys in the KV convention (workloads/kv/server/opsplit.h,
@@ -207,7 +216,7 @@ class Server {
     if constexpr (std::is_same_v<Be, MegalonBackend>) {
       // Megalon maps the whole device at map_va when its library initialises (dlopen; joins the run and waits in its
       // start barrier for every node); the server uses that mapping and never maps the device itself.
-      if (2 + o_.search_threads > 32) die("megalon: at most 32 registered threads per node (main, writer, searchers)");
+      if (1 + o_.writer_threads + o_.search_threads > 32) die("megalon: at most 32 registered threads per node (main, writer, searchers)");
       // threads the library starts while it initialises inherit this name (stats: thr.megalon-lib.*, the coherence
       // library's own CPU); the main thread gets its process name back afterwards (pgrep -x vdb-server)
       cxl::proc::name_thread("megalon-lib");
@@ -269,7 +278,8 @@ class Server {
       die("not every node became ready in time");
     warm_up();
     opc_setup();
-    std::thread([this] { writer(); }).detach();
+    if (o_.writer_threads > 1) std::fprintf(stderr, "vdb-server: writer threads %u\n", o_.writer_threads);
+    for (uint32_t w = 0; w < o_.writer_threads; w++) std::thread([this, w] { writer(w); }).detach();
     for (uint32_t i = 0; i < o_.search_threads; i++) std::thread([this, i] { searcher(int(2 + i)); }).detach();
     std::thread([this] { listen_loop(); }).detach();
   }
@@ -298,6 +308,12 @@ class Server {
       << "\nreplay_ns_total=" << st_.replay_ns << "\nsearch_lock_ns_total=" << st_.lock_ns
       << "\ninsert_ns_total=" << st_.insert_ns << "\ninsert_lock_ns_total=" << st_.insert_lock_ns
       << "\nsearch_queue=" << search_queue_len();
+    {  // write path (DESIGN.md §17): done is read before accepted, so backlog >= 0
+      const uint64_t done = st_.write_jobs_done.load(), acc = st_.write_jobs_accepted.load();
+      o << "\nwriter_threads=" << o_.writer_threads << "\nwrite_jobs_accepted=" << acc << "\nwrite_jobs_done=" << done
+        << "\nwrite_backlog=" << (acc >= done ? acc - done : 0) << "\nwrite_lag_ns_sum=" << st_.write_lag_ns_sum
+        << "\nwrite_lag_n=" << st_.write_lag_n << "\nwrite_lag_max_ns=" << st_.write_lag_max_ns.exchange(0);
+    }
     o << "\nopcoh.enabled=" << int(oc_.on()) << "\nopcoh.pop_source=" << pop_src_name(oc_.src())
       << "\nopcoh.mg_cohsnap=" << int(oc_.mg_snap()) << "\nopcoh.tsc_khz=" << tsc_khz_ << "\nopcoh.clock_ns=" << clock_ns_
       << "\nopcoh.read_errors=" << st_.opc_read_errors << "\nopcoh.register_errors=" << st_.opc_register_errors
@@ -466,11 +482,16 @@ class Server {
   }
 
   // ---------------------------------------------------------------- writer (this node's writes, arrival order)
-  void writer() {
+  // wi = writer index (0 .. writer_threads - 1). Writer 0 uses the node's HNSW level generator rng_ (seeded as in
+  // every earlier build); further writers own a generator seeded from (seed, node, wi).
+  void writer(uint32_t wi) {
     cxl::proc::name_thread("vdb-writer");
     be_->thread_init(1);
     opc_thread_start();
     const uint32_t dim = p_.g.dim;
+    std::mt19937_64 own;
+    if (wi) own.seed((o_.seed * 1000003 + o_.node) ^ (0x9e3779b97f4a7c15ull * wi));
+    std::mt19937_64 &rng = wi ? own : rng_;
     for (;;) {
       Job j = wq_.pop();
       const uint64_t b0 = now_ns();
@@ -478,15 +499,15 @@ class Server {
       if (j.h.code == kOpInsert && n == sizeof(InsertReq) + dim * 4) {
         InsertReq rq;
         std::memcpy(&rq, j.p.data(), sizeof(rq));
-        if (!valid(rq.id, rq.w_seq)) { bad(j); continue; }
-        do_insert(rq.w_seq, rq.id, reinterpret_cast<const float *>(j.p.data() + sizeof(rq)));
+        if (!valid(rq.id, rq.w_seq)) { bad(j); job_done(j); continue; }
+        do_insert(rq.w_seq, rq.id, reinterpret_cast<const float *>(j.p.data() + sizeof(rq)), rng);
         publish(rq.w_seq);
         reply_write(j, rq.w_seq);
         st_.inserts++;
       } else if (j.h.code == kOpDelete && n == sizeof(DeleteReq)) {
         DeleteReq rq;
         std::memcpy(&rq, j.p.data(), sizeof(rq));
-        if (!valid(rq.id, rq.w_seq)) { bad(j); continue; }
+        if (!valid(rq.id, rq.w_seq)) { bad(j); job_done(j); continue; }
         do_delete(rq.w_seq, rq.id);
         publish(rq.w_seq);
         reply_write(j, rq.w_seq);
@@ -494,14 +515,14 @@ class Server {
       } else if (j.h.code == kOpUpdate && n == sizeof(UpdateReq) + dim * 4) {
         UpdateReq rq;
         std::memcpy(&rq, j.p.data(), sizeof(rq));
-        if (!valid(rq.del_id, rq.w_del) || !valid(rq.ins_id, rq.w_ins) || rq.w_ins != rq.w_del + 1) { bad(j); continue; }
+        if (!valid(rq.del_id, rq.w_del) || !valid(rq.ins_id, rq.w_ins) || rq.w_ins != rq.w_del + 1) { bad(j); job_done(j); continue; }
         const uint64_t t0 = now_ns();
         OpCohSrc::Start os;
         OpAcc oa;
         oc_.begin(&os);  // one section on this thread: delete + publish + insert + publish
         do_delete(rq.w_del, rq.del_id);
         publish(rq.w_del);
-        do_insert(rq.w_ins, rq.ins_id, reinterpret_cast<const float *>(j.p.data() + sizeof(rq)));
+        do_insert(rq.w_ins, rq.ins_id, reinterpret_cast<const float *>(j.p.data() + sizeof(rq)), rng);
         publish(rq.w_ins);
         oc_.fake_add(1, 1000, 0, 500);  // Host-test fake: 1000 ns S->M and 500 ns no-transition fault per update
         opc_end(os, &oa);
@@ -512,21 +533,32 @@ class Server {
         st_.inserts++;
       } else {
         bad(j);
+        job_done(j);
         continue;
       }
       st_.writer_busy_ns += now_ns() - b0;
+      job_done(j);
     }
+  }
+
+  void job_done(const Job &j) {
+    const uint64_t lag = now_ns() - j.t_acc;
+    st_.write_lag_ns_sum += lag;
+    st_.write_lag_n++;
+    uint64_t m = st_.write_lag_max_ns.load();
+    while (lag > m && !st_.write_lag_max_ns.compare_exchange_weak(m, lag)) {}
+    st_.write_jobs_done++;
   }
 
   bool valid(uint64_t id, uint32_t w) const { return id < p_.max_ids && w != 0 && w <= p_.max_writes; }
 
-  void do_insert(uint32_t w, uint64_t id, const float *vec) {
+  void do_insert(uint32_t w, uint64_t id, const float *vec, std::mt19937_64 &rng) {
     const uint64_t t0 = now_ns();
     SegLines &sl = h_->segs[p_.seg_of(id)];
     cxl::hwcc::write_lock(&sl.lock);
     const uint64_t t1 = now_ns();
     try {
-      g_[p_.seg_of(id)]->insert(id, w, vec, rng_);
+      g_[p_.seg_of(id)]->insert(id, w, vec, rng);
     } catch (const std::exception &e) {  // never leave the cross-VM write lock held (peers would spin)
       cxl::hwcc::write_unlock(&sl.lock);
       die(std::string("insert: ") + e.what());
@@ -538,7 +570,11 @@ class Server {
 
   void bad(Job &j) { j.c->reply(frame::kStatusBadRequest, j.h.req_id, nullptr, 0); }
 
+  // With several writer threads the append (entry index, entry write, release of dlog_count) runs under dlog_mu_, so
+  // dlog_count never covers an entry that is not written yet (readers replay [cursor, dlog_count)).
   void do_delete(uint32_t w, uint64_t id) {
+    std::unique_lock<std::mutex> g(dlog_mu_, std::defer_lock);
+    if (o_.writer_threads > 1) g.lock();
     const uint64_t e = dlog_next_++;
     if (e >= p_.max_deletes) die("max_deletes reached");
     DlogEntry de{};
@@ -558,7 +594,8 @@ class Server {
       while (q + 1 <= p_.max_writes && (load_acquire(&h_->applied[(q + 1) >> 6]) >> ((q + 1) & 63) & 1)) q++;
       if (q == p || cxl::hwcc::cas(h_->P, &p, q)) break;
     }
-    h_->nodes[o_.node].writes_applied++;
+    if (o_.writer_threads > 1) __atomic_fetch_add(&h_->nodes[o_.node].writes_applied, uint64_t(1), __ATOMIC_RELAXED);
+    else h_->nodes[o_.node].writes_applied++;
   }
 
   void reply_write(Job &j, uint32_t w) {
@@ -831,7 +868,11 @@ class Server {
       switch (h.code) {
         case kOpInsert:
         case kOpDelete:
-        case kOpUpdate: wq_.push(std::move(j)); break;
+        case kOpUpdate:
+          j.t_acc = now_ns();
+          st_.write_jobs_accepted++;
+          wq_.push(std::move(j));
+          break;
         case kOpSearch: push_search(std::move(j)); break;
         case kOpStats: {
           std::string t = stats_text();
@@ -862,8 +903,9 @@ class Server {
   std::condition_variable scv_;
   std::deque<Job> queries_;
   std::deque<QueryCtx *> tasks_;
-  uint64_t dlog_next_ = 0;  // writer
-  std::mt19937_64 rng_;     // writer: HNSW levels
+  uint64_t dlog_next_ = 0;  // writer (writer_threads > 1: under dlog_mu_)
+  std::mutex dlog_mu_;      // delete-log append with several writer threads
+  std::mt19937_64 rng_;     // writer 0: HNSW levels
   std::unique_ptr<uint32_t[]> del_seq_;
   std::vector<uint64_t> dcursor_;
   std::unique_ptr<std::mutex[]> dmu_;
@@ -902,6 +944,7 @@ void usage() {
                "  [--trace-dir DIR] [--trace-max-mb M (4096)]   Megalon sharing trace (HWcc wsec line; node<K>.vdbtrace.bin at\n"
                "     stop; dedicated runs only; DESIGN.md §16)\n"
                "  [--op-coh on|off] per-operation time split block in every search/update response (default on; DESIGN.md §15)\n"
+               "  [--writer-threads N] writer threads of this node (default 1; plain backend only for N > 1; DESIGN.md §17)\n"
                "--backend megalon: Megalon (RACKOBJ_CONFIG, object_arena_size > 0) maps the device; MEGALON_NODE_ID and\n"
                "  MEGALON_RUN_ID default to --node and --run-id, CXL_REGION_CONFIG to --region (DESIGN.md §12).\n"
                "All nodes need identical parameters (checked through the HWcc app layout hash).\n"
@@ -947,6 +990,7 @@ int main(int argc, char **argv) {
     else if (a == "--preloaded") o.preloaded = true;
     else if (a == "--trace-dir") o.trace_dir = v();
     else if (a == "--trace-max-mb") o.trace_max_mb = std::stoull(v());
+    else if (a == "--writer-threads") o.writer_threads = std::stoul(v());
     else if (a == "--op-coh" || a == "--query-coh") {
       const std::string x = v();
       if (x != "on" && x != "off") usage();
@@ -960,6 +1004,10 @@ int main(int argc, char **argv) {
     return 0;
   }
   if (o.run_id == 0 && !o.preload_only) usage();
+  if (o.writer_threads < 1 || o.writer_threads > 16 || (o.writer_threads > 1 && o.backend != "plain")) {
+    std::fprintf(stderr, "vdb-server: --writer-threads must be 1..16 (> 1 only with the plain backend)\n");
+    return 2;
+  }
   if ((o.preload_only || o.preloaded) && o.backend != "plain") {
     std::fprintf(stderr, "vdb-server: --preload-only/--preloaded are for the plain backend (Popcorn init_state=shared)\n");
     return 2;
