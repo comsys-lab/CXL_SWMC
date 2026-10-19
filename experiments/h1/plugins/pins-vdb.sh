@@ -4,7 +4,8 @@
 # object), mgoff = the same with MEGALON_COH_TIMERS=0. H1-HOOK v2 (CXL_SWMC 9a802a6f3, 935e487ab). Loadgen = vdb-loadgen/8 (H1 v0.6.5 confirm fallback, built from 9f3cdfbc4; before: vdb-loadgen/7 "A+C" 9e2dc0974, vdb-loadgen/6
 # with the w_start plugin option, built from 0dcf987bc; plugin provenance in vdb-manifest.txt).
 # Re-pinned 2026-10-20 (H1 v0.6.19, no H1 behaviour change): m4-run.sh gained KIND=urate (vector DB update-rate sweep,
-# urate-block.sh, reports/VDB-urate-packet.v1.md); KIND=h1 path, builds vdb/15, vdb-megalon/14, vdb-loadgen/8 unchanged.
+# urate-block.sh, reports/VDB-urate-packet.v1.md); opcoh_check.py skips update rows without matched records (raised
+# ValueError before; unchanged for every input it accepted); KIND=h1 path, builds vdb/15, vdb-megalon/14, vdb-loadgen/8 unchanged.
 . "$(dirname "${BASH_SOURCE[0]}")/pins-common.inc"
 HR=$P/CXL_SWMC                      # live tree; v6-block.sh uses $P/CXL_SWMC/experiments/vectordb itself. Every file it
                                     # runs is hash-pinned below (hook: see the v6-block.sh pin; builds vdb/15, vdb-megalon/14 from 934fa9312)
@@ -29,13 +30,13 @@ e9d4942ee33b2f65cf7117d87942296e1365d0234873c2c4159545f40708db54  $P/workspaces/
 eeb6b23f173d85a3c86ade0fb804b363e3c84a36bf9c0f56a7cbcab25e738b53  $HR/config/cxl_region.yaml
 7e8cc73998280bd606598ab26003b1ba80a81dd736c58e3f8207a9482d36f2e6  $HOOK_FILE
 27a11c2c75f748fa7b47111496e30170ab5a35c0b65bd56422c6b3b6fb4d7503  $HR/experiments/vectordb/m4-lib.sh
-2d2c0b11602bf1be78a808a32b36d54dc0cd40d6eb0c06389c4f7aef46e321bd  $HR/experiments/vectordb/m4-run.sh
+82e3d233904ce6f384419eb446529d27837ba94ea8693a58097468119019f529  $HR/experiments/vectordb/m4-run.sh
 4d917368a0946c0a5052dd0d1e31e5ab900914e74c75bd02d37dc164708b66fb  $HR/experiments/vectordb/m4-precheck.sh
 5a4cd27c57b9aebe82a3d9b1652690b0496ddd1e81da4e9479a02d33085f3ad6  $HR/experiments/vectordb/run.sh
 1edcdda88f30200fd55c1b5a18cb4b9d6db57aa02647f8ad549e4e7f6aabb31f  $HR/experiments/vectordb/host-gate.sh
 1baccf944c1ac66fce65b065c1043529cd72bc08b38f4b42fe43bd2640076031  $HR/experiments/vectordb/pretouch-gate.sh
 49ffaf143f484e4548e84105d20f584547fbd06c6cd38c1522ba4dccbd18e8fe  $HR/experiments/vectordb/opsplit.py
-070c89107f47abdb9d4534232a0a0c7ee8f664db0fdb4fd850020e3d3e680321  $HR/workloads/vectordb/tests/opcoh_check.py
+007ac132183846a76e6be86ec038b67a76f61a972c928a2794bd5858ad5e281f  $HR/workloads/vectordb/tests/opcoh_check.py
 68327dd3178d7af5b0ad9c614f0a6c41b4d99b2f6a23cf456f7751273996eecf  $HR/scripts/host/measure-env.sh
 256445b452eb6373b7bef81ef691f3a4e601d21c77c44b498ba268a01edb57e7  $HR/experiments/vectordb/h1-rates.sh
 aed8d7f32871398db375c502152587ee0b25a716dd60d4ff637e189aa3d42420  $HR/scripts/host/measure-run.sh
