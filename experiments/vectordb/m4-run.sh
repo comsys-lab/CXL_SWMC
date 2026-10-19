@@ -153,7 +153,8 @@ dax_unused() {
     [ "$out" = "dax_users=[] rc=1" ] || return 1
   done
 }
-echo "$(date -Is) $NAME: SYS=$SYS U=$U KIND=$KIND URATE=${URATE:-} URATE_START=${URATE_START:-} DATASET=${DATASET:-28m} REP=${REP:-} TRACE=$TRACE RATE=${RATE:-} RECV_MODE=${RECV_MODE:-} SEED=$SEED V=$V HOST_SERVER=$HOST_SERVER XENV=[$XENV] XARGS=[$XARGS] OPCOH_EXPECT=${OPCOH_EXPECT:-} OPCOH_CHECK_MODE=${OPCOH_CHECK_MODE:-}"
+echo "$(date -Is) $NAME: SYS=$SYS U=$U KIND=$KIND DATASET=${DATASET:-28m} REP=${REP:-} TRACE=$TRACE RATE=${RATE:-} RECV_MODE=${RECV_MODE:-} SEED=$SEED V=$V HOST_SERVER=$HOST_SERVER XENV=[$XENV] XARGS=[$XARGS] OPCOH_EXPECT=${OPCOH_EXPECT:-} OPCOH_CHECK_MODE=${OPCOH_CHECK_MODE:-}"
+[ "$KIND" != urate ] || echo "$(date -Is) $NAME: URATE=$URATE URATE_START=${URATE_START:-1}"
 servers_gone || stop "a vdb-server is running before the run"
 [ "${GATE:-1}" = 1 ] || [ "$KIND" = functional ] || stop "GATE=0 is allowed for KIND=functional only"
 if [ "${GATE:-1}" = 1 ]; then  # H1 measurement runs: experiments/h1/h1-gate.sh (README item 8); validation: host-gate.sh
