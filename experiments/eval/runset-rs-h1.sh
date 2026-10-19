@@ -72,20 +72,7 @@ $REG add recsys rs-h1 $K "$E" $CSHA started "commit $COMMIT"
 printf '# rate_sps\tdecision\tprobe_p95_ms\tprobe_valid\tsource\n' > "$E/mg-decision.tsv"
 if [ $PROBE = 1 ]; then
   block probe "$RS_MG_POINTS" mg mg "$RS_MG_PROBE_Q"
-  python3 -I - "$E/probe" "$RS_MG_POINTS" "$RS_SLO_MS" >> "$E/mg-decision.tsv" <<'PY' || stop "probe decision"
-import csv, json, os, sys
-B, rates, slo = sys.argv[1], sys.argv[2].split(), float(sys.argv[3])
-fx = [r for r in csv.reader(open(os.path.join(B, "stream-fix.tsv")), delimiter="\t") if r and not r[0].startswith("#")]
-for rate in rates:
-    w = [r for r in fx if r[1] == "mg" and r[2] == rate]
-    if len(w) != 1:
-        print(f"{rate}\tfix\t\t\tno probe window ({len(w)})"); continue
-    name, step = w[0][0], int(w[0][5])
-    st = {d["step"]: d for d in map(json.loads, open(os.path.join(B, name, "fix", "loadgen", "steps.jsonl")))}
-    p95 = st[step]["streams"]["query"]["p95_ms"]
-    ok = p95 <= slo and w[0][6] == "1"
-    print(f"{rate}\t{'slo' if ok else 'fix'}\t{p95}\t{w[0][6]}\tprobe {name} step {step} (rule: p95 <= {slo} ms and valid)")
-PY
+  python3 -I -B $EVD/mg_decide.py "$E/probe" "$RS_MG_POINTS" "$RS_SLO_MS" >> "$E/mg-decision.tsv" || stop "probe decision"
   log "probe decisions: $(grep -v '^#' "$E/mg-decision.tsv" | cut -f1,2 | tr '\t\n' '= ')"
 elif [ -n "$DEC" ]; then
   awk -F'\t' -v f="$DEC" '!/^#/ { printf "%s\t%s\t%s\t%s\tfrom %s\n", $1, $2, $3, $4, f }' "$DEC" >> "$E/mg-decision.tsv"

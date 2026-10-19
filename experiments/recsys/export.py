@@ -8,7 +8,8 @@ Layouts:
   streaming block (main-block.sh BLOCK=stream; recovery/RECSYS-stream-v*; eval run-set roots whose subdirs block/,
     probe/, slo/, fix/ are such blocks): stream-results.tsv (one row per SLO lifetime, part <name>/slo), eval
     stream-fix.tsv (fixed windows: part <name>/fix, level L1 / L2 / Q<q/s>), root mg-decision.tsv (Megalon probe).
-    point = update rate in trace samples/s.
+    point = update rate in trace samples/s. Rows of the run-1 Megalon probe block carry lifetime "probe" and stay in
+    fixed.csv only where the run has no other window of the same system, rate and level (verifier M5).
   validation block (main-block.sh BLOCK=v1; recovery/RECSYS-V1-v*): <sys>/val (one fixed window, level V1); point =
     the update rate of sequence-update-rate.txt (samples/s, publication period T).
 Outputs (DIR): slo_summary.csv, slo_steps.csv, latency_hist.csv (query stream), fixed.csv, mg_probe.csv.
@@ -175,7 +176,7 @@ def export_stream(E, out, vcpus):
                 continue
             fixed.append(fix_row(r, dict(system=s, point=rate, rate_unit="samples/s", vcpus_per_vm=vcpus, threads=st,
                                          writers=wr), level, valid == "1" if valid else None, part,
-                                 "sep" if name.endswith("-fix") else "cont"))
+                                 "probe" if os.path.basename(B) == "probe" else "sep" if name.endswith("-fix") else "cont"))
     probe = os.path.join(E, "probe", "stream-fix.tsv")
     dec = {f[0]: f[1] for f in tsv(os.path.join(E, "mg-decision.tsv"))}
     for f in tsv(probe):
@@ -235,6 +236,10 @@ def main():
         fixed = export_v1(E, out, a.vcpus)
     else:
         sys.exit(f"export.py: {E}: no stream-results.tsv and no <sys>/val parts")
+    # verifier M5: the run-1 Megalon probe window (lifetime "probe") stays in fixed.csv only where no other Megalon
+    # window of the same rate and level exists in this run (then it IS the run's mg window); never two rows per key
+    own = {(x["system"], x["point"], x["level"]) for x in fixed if x["lifetime"] != "probe"}
+    fixed = [x for x in fixed if x["lifetime"] != "probe" or (x["system"], x["point"], x["level"]) not in own]
     off = {(x["point"], x["level"]): x for x in fixed if x["system"] == "mgoff"}
     for x in fixed:
         if x["system"] == "mg" and (x["point"], x["level"]) in off:
