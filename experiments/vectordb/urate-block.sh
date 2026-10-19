@@ -1,5 +1,6 @@
 #!/bin/bash
-# Vector DB update-rate sweep (reports/VDB-urate-packet.v1.md; brief reports/VDB-update-rate-axis-brief.md; user
+# Vector DB update-rate sweep (experiment document reports/experiments/vectorDB-update-rate.md; packets
+# reports/packets/VDB-urate-packet.v1.md, v1.1.md; brief reports/VDB-update-rate-axis-brief.md; user
 # decisions 2026-10-19; workloads/vectordb/DESIGN.md §17). HNSW VectorDB 28M (as H1 VDB), systems hw (All-HWcc =
 # plain server, cxl_shm unloaded) and pop (Popcorn = plain server + cxl_shm build 12, init_state=shared + preload,
 # recv_mode poll), both on the Popcorn build-12 kernel, exactly as the H1 VDB lifetimes (recovery/H1-main-v1/vdb).
@@ -10,9 +11,10 @@
 #   --writer-threads, the same for every system; recorded in every manifest and checked per step).
 #   Per rate (URATES order), per system (order shuffle(seed vdb-urate-<R>), <E>/order.txt): one server lifetime
 #   <sys>-u<R> = m4-run.sh KIND=urate: part warm (1 search/s + the stream, 10 + 50 s, unmeasured) then part slo (search
-#   p99 <= 100 ms, knee ramp from URATE_START (1) search/s, >= 100 searches per step, --ramp-knee 2 --ramp-knee-floor
-#   1.5, confirm 3 x 30 s, --tol 0.02); then urate_check.py <life>/slo (FAIL stops the block; NOTE "update rate not
-#   sustained" recorded) and urate_report.py (one row per lifetime in <E>/urate-results.tsv).
+#   p99 <= 100 ms, knee ramp from URATE_START (1) search/s, >= 300 searches per step (--min-step-queries 300, user
+#   2026-10-20; reports/experiments/vectorDB-update-rate.md), --ramp-knee 2 --ramp-knee-floor 1.5, confirm 3 x 30 s,
+#   --tol 0.02); then urate_check.py <life>/slo (FAIL stops the block; NOTE "update rate not sustained" recorded) and
+#   urate_report.py (one row per lifetime in <E>/urate-results.tsv).
 #   Update budget (verifier MEDIUM-1): every lifetime starts from the initial image and may consume at most the
 #   writes file's updates (DATASET 28m: 1,000,000 = pool B; 28m-x: X_NB, sized to the free ids of X_MAXIDS). The
 #   worst-case consumption is computed from m4-run.sh's KIND=urate loadgen parameters by urate_budget.py (scenario
@@ -20,6 +22,8 @@
 #   whose bound exceeds the budget is refused before the block starts (SEQUENCE STOP "update budget") unless it is
 #   listed in URATE_PARTIAL_OK (explicit user decision): such a lifetime may run out of updates, which m4-run.sh
 #   records as a NOTE ("update stream exhausted"; the steps before it are kept, the SLO result may be missing).
+#   m4-run.sh writes that NOTE for every KIND=urate slo part; this block accepts it only for rates in URATE_PARTIAL_OK
+#   and stops otherwise (SEQUENCE STOP "update stream exhausted", verifier MED-2 2026-10-20; m4-run.sh unchanged).
 # usage: urate-block.sh <evidence dir (exists, holds only sequence* files)>
 # env (required): KPOP GTPOP CPOP (Popcorn release, guest tools, deploy bundle), PLAIN_BUILD VPLAIN (vdb build with the
 #   §17 counters + guest dir), LOADGEN_BUILD (loadgen with the knee ramp + vectordb plugin), PRETOUCH_DIR,
@@ -106,7 +110,7 @@ NLIVE=26990000  # live records (pool A; every update deletes one and inserts one
   echo "$BUDGET"; echo "rates allowed to exhaust the budget (URATE_PARTIAL_OK): ${PARTIAL_OK:-none}"
   [ "$DS" = 28m ] || echo "dataset 28m-x: X_DATA=$X_DATA X_WRITES=$X_WRITES X_NB=$X_NB X_MAXIDS=$X_MAXIDS X_MAXW=$X_MAXW X_MAXD=$X_MAXD X_INIT_CAP=$X_INIT_CAP"
   echo "writer threads $WRITERS > 1: HNSW graphs are not reproducible record by record (level draws depend on scheduling); recall is reported per system and rung (urate-recall.sh, offline)"; } > "$E/rate-basis.txt"
-printf '# name\tsystem\trate_ups\twriters\tresult_search_s\tconfirm_x_mean\tconfirmed\tlow_rate_violations\turatecheck\tvalid\tramp_end\tknee_search_s\tnote\n' > "$E/urate-results.tsv"
+printf '# name\tsystem\trate_ups\twriters\tresult_search_s\tconfirm_x_mean\tconfirmed\tlow_rate_violations\turatecheck\tvalid\tramp_end\tknee_search_s\tnote\tresult_offered_raw\n' > "$E/urate-results.tsv"
 { echo "# vector DB update-rate sweep: per rate (URATES order) one lifetime per system, order shuffle(seed vdb-urate-<rate>); loadgen seed $SEED_BASE (slo), +100 (warm)"
   for r in $URATES; do echo "u$r: $(SHUFFLE_SEED=vdb-urate-$r shuffle $SYSTEMS)"; done; } | tee "$E/order.txt"
 for r in $URATES; do
@@ -117,6 +121,10 @@ for r in $URATES; do
     one $s $L URATE=$r REP=urate-u$r SEED=$SEED_BASE < /dev/null
     python3 $X/urate_check.py $E/$L/slo --writers $WRITERS > $E/$L/slo/urate-check.txt 2>&1
     python3 $X/urate_check.py $E/$L/warm --writers $WRITERS > $E/$L/warm/urate-check.txt 2>&1
+    # update stream exhausted (m4-run.sh NOTE, same test as there): allowed only for rates in URATE_PARTIAL_OK
+    if grep -q '"reason":"stream [a-z]* exhausted' $E/$L/slo/loadgen/steps.jsonl && [[ " $PARTIAL_OK " != *" $r "* ]]; then
+      echo "$(date -Is) SEQUENCE STOP: $L: update stream exhausted at rate $r, which is not in URATE_PARTIAL_OK (${PARTIAL_OK:-none})"; exit 1
+    fi
     uc=$(grep -m1 '^URATECHECK' $E/$L/slo/urate-check.txt)
     case "$uc" in "URATECHECK PASS"*|"URATECHECK NOTE"*) ;; *) echo "$(date -Is) SEQUENCE STOP: $L: ${uc:-urate_check.py failed}"; exit 1;; esac
     python3 $X/urate_report.py row $E/$L/slo $L $s $r $WRITERS "$uc" >> "$E/urate-results.tsv" || { echo "SEQUENCE STOP: $L: results row"; exit 1; }
