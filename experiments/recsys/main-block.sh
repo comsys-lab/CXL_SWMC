@@ -228,7 +228,8 @@ ekko_set() {  # <avg|peak|f087|f149|f253|f330|f350|f370|f400|f385|f392>: EKKO_FR
   SA=$(echo $SA)
 }
 # BLOCK=stream: server arguments of every node (the updater node adds N0X: 14 update threads = node 1's serving
-# threads, 1 serving thread, so 1 + 8 + 14 + 1 = 24 Megalon registrations on each node; node 1 has 1 update thread)
+# threads, 1 serving thread, so 1 + 8 + 14 + 1 = 24 Megalon registrations on each node; node 1 has 1 update thread;
+# EVAL_RUN with RS_THREADS=16: 1 + 8 + 16 + 1 = 26 per node, limit 32 per process (workloads/recsys/DESIGN.md))
 N0X=""
 if [ $BLOCK = stream ]; then
   SA="--nodes 2 --row-div 1 --serve-threads 14 --update-threads 1 --load-threads 8 --start-timeout-ms $((XT * 1000 / 2)) --update-mode stream
@@ -688,12 +689,15 @@ eval_levels_compute() {  # <rate>: L1 = min(confirmed hw, pop confirm_x_mean) fr
   v=$(python3 -I - "$E/stream-results.tsv" "$r" <<'PY'
 import csv, sys
 rows = [x for x in csv.reader(open(sys.argv[1]), delimiter="\t") if x and not x[0].startswith("#")]
-x = {}
-for f in rows:
+x, excl = {}, []
+for f in rows:  # a result counts only if confirmed AND valid (update stream sustained, stream_check; verifier M2)
     if f[2] == sys.argv[2] and f[1] in ("hw", "pop") and f[5] == "True" and f[4]:
-        x[f[1]] = float(f[4])
+        if f[8] == "1":
+            x[f[1]] = float(f[4])
+        else:
+            excl.append(f"{f[1]} {f[4]} excluded: update stream not sustained")
 if set(x) != {"hw", "pop"}:
-    print("NONE no confirmed hw and pop result (" + ",".join(sorted(x)) + ")")
+    print("NONE no confirmed valid hw and pop result (" + ",".join(sorted(x)) + ")" + "".join("; " + e for e in excl))
 else:
     l1 = round(min(x.values()), 3)
     print(f"{l1} {round(l1 / 2, 3)} min(hw {x['hw']}, pop {x['pop']})")
