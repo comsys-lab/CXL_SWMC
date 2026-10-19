@@ -3,6 +3,8 @@
 # (init_state=shared + preload, recv_mode poll), Megalon = vdb-megalon on Megalon 77 (packed4, 32 MiB vector chunk
 # object), mgoff = the same with MEGALON_COH_TIMERS=0. H1-HOOK v2 (CXL_SWMC 9a802a6f3, 935e487ab). Loadgen = vdb-loadgen/8 (H1 v0.6.5 confirm fallback, built from 9f3cdfbc4; before: vdb-loadgen/7 "A+C" 9e2dc0974, vdb-loadgen/6
 # with the w_start plugin option, built from 0dcf987bc; plugin provenance in vdb-manifest.txt).
+# Re-pinned 2026-10-20 (H1 v0.6.19, no H1 behaviour change): m4-run.sh gained KIND=urate (vector DB update-rate sweep,
+# urate-block.sh, reports/VDB-urate-packet.v1.md); KIND=h1 path, builds vdb/15, vdb-megalon/14, vdb-loadgen/8 unchanged.
 . "$(dirname "${BASH_SOURCE[0]}")/pins-common.inc"
 HR=$P/CXL_SWMC                      # live tree; v6-block.sh uses $P/CXL_SWMC/experiments/vectordb itself. Every file it
                                     # runs is hash-pinned below (hook: see the v6-block.sh pin; builds vdb/15, vdb-megalon/14 from 934fa9312)
@@ -27,7 +29,7 @@ e9d4942ee33b2f65cf7117d87942296e1365d0234873c2c4159545f40708db54  $P/workspaces/
 eeb6b23f173d85a3c86ade0fb804b363e3c84a36bf9c0f56a7cbcab25e738b53  $HR/config/cxl_region.yaml
 7e8cc73998280bd606598ab26003b1ba80a81dd736c58e3f8207a9482d36f2e6  $HOOK_FILE
 27a11c2c75f748fa7b47111496e30170ab5a35c0b65bd56422c6b3b6fb4d7503  $HR/experiments/vectordb/m4-lib.sh
-c814123c944cb1fe5fd72e796991f9cfeb20abd1e33a7edbd9445fb873e7aba1  $HR/experiments/vectordb/m4-run.sh
+2d2c0b11602bf1be78a808a32b36d54dc0cd40d6eb0c06389c4f7aef46e321bd  $HR/experiments/vectordb/m4-run.sh
 4d917368a0946c0a5052dd0d1e31e5ab900914e74c75bd02d37dc164708b66fb  $HR/experiments/vectordb/m4-precheck.sh
 5a4cd27c57b9aebe82a3d9b1652690b0496ddd1e81da4e9479a02d33085f3ad6  $HR/experiments/vectordb/run.sh
 1edcdda88f30200fd55c1b5a18cb4b9d6db57aa02647f8ad549e4e7f6aabb31f  $HR/experiments/vectordb/host-gate.sh
