@@ -384,13 +384,20 @@ def fixed_csv(E):
 
 
 def level(a):
-    """L1 candidate of one SLO lifetime: confirm mean, only if confirmed is true and loadgen wrote no note."""
+    """L1 candidate of one SLO lifetime: confirm mean, only if confirmed is true, loadgen wrote no note and the update
+    rate was sustained (no more than half of the judged steps invalid; experiment doc §2, user 2026-10-20)."""
     s = json.load(open(os.path.join(a[0], "loadgen", "summary.json")))
     x = fl(s.get("confirm", {}).get("x_mean"))
     if s.get("confirmed") is not True:
         sys.exit("not confirmed")
     if s.get("note"):
         sys.exit("note: " + s["note"])
+    p = os.path.join(a[0], "urate-check.txt")
+    nj, nij = check_counts(open(p).read())[:2] if os.path.exists(p) else (None, None)
+    if nj is None:
+        sys.exit("no urate-check verdict")
+    if nij * 2 > nj:
+        sys.exit("update rate not sustained (%d of %d judged steps invalid)" % (nij, nj))
     if not x or x <= 0:
         sys.exit("no confirm mean")
     print(x)
