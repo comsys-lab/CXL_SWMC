@@ -7,6 +7,7 @@
                                       CONFIG_SHA256_VDB, CONFIG_SHA256_RECSYS, EVAL_CONF, EVAL_CONF_SHA256, P
   evalconf.py sha <vdb|recsys> [--conf F]   the config_sha256 of a workload
   evalconf.py dump <vdb|recsys> [--conf F]  the canonical text the sha256 is taken over
+  evalconf.py later [--conf F]        the [later] keys (excluded from config_sha256; verifier L5)
 
 config_sha256(workload) = sha256 of the sorted "KEY=value" lines of the measurement keys of that workload (global keys
 without the [run] mark, plus VDB_* or RS_*) followed by "sha256(KEY)=<file sha256>" for every such key whose value
@@ -28,8 +29,12 @@ LINE = re.compile(r'^([A-Z][A-Z0-9_]*)=(?:"([^"$`\\]*)"|([^\s"$`\\#]*))\s*(#.*)?
 PATHISH = re.compile(r"^(CXL_SWMC|builds|workspaces|recovery)(/|$)")
 
 
+LATER = set()  # keys whose comment carries "[later]" (filled by load)
+
+
 def load(path=DEFAULT):
     conf = {}
+    LATER.clear()
     for n, line in enumerate(open(path), 1):
         s = line.strip()
         if not s or s.startswith("#"):
@@ -41,6 +46,8 @@ def load(path=DEFAULT):
         if k in conf:
             raise ValueError(f"{path}:{n}: duplicate key {k}")
         conf[k] = v
+        if m.group(4) and "[later]" in m.group(4):
+            LATER.add(k)
     for k in ("RUNS", "VCPUS_PER_VM", "SEED_BASE", "LEVELS_FROM_RUN"):
         if not re.fullmatch(r"[1-9][0-9]*", conf.get(k, "")):
             raise ValueError(f"{path}: {k} must be a positive integer")
@@ -54,7 +61,7 @@ def absolute(conf):
 def measurement_keys(conf, workload):
     pre = PREFIX[workload]
     other = tuple(p for w, p in PREFIX.items() if w != workload)
-    return sorted(k for k in conf if k not in RUN_KEYS and not k.startswith(other) and
+    return sorted(k for k in conf if k not in RUN_KEYS and k not in LATER and not k.startswith(other) and
                   (k.startswith(pre) or not any(k.startswith(p) for p in PREFIX.values())))
 
 
@@ -72,7 +79,7 @@ def config_sha256(conf, workload):
 
 
 def main(argv):
-    if len(argv) < 2 or argv[1] not in ("shell", "sha", "dump"):
+    if len(argv) < 2 or argv[1] not in ("shell", "sha", "dump", "later"):
         sys.exit(__doc__)
     path = DEFAULT
     if "--conf" in argv:
@@ -92,6 +99,9 @@ def main(argv):
             print(f"{k}={shlex.quote(a[k])}")
     elif argv[1] == "sha":
         print(config_sha256(conf, argv[2]))
+    elif argv[1] == "later":
+        for k in sorted(LATER):
+            print(f"{k}={conf[k]}")
     else:
         sys.stdout.write(dump(conf, argv[2]))
 

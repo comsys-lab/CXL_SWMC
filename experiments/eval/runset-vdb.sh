@@ -47,8 +47,7 @@ SEEDB=$((SEED_BASE + K - N))   # loadgen seed of the run = SEED_BASE + k in both
 need_files "$VDB_PLAIN_BUILD/bin/vdb-server" "$VDB_MEG_BUILD/bin/vdb-server" "$VDB_LOADGEN_BUILD/loadgen" "$REGION" \
   "$VDB_MEG_CFG" "$POP_C/p-popcorn-shm.sh" "$VDB_X_DATA/pool_b.fbin" "$VDB_X_WRITES" "$EVD/pins-vdb.sh"
 [ "$(sha256sum < "$POP_C/packet.sha256" | cut -c1-64)" = "$POP_BUNDLE_SHA" ] || die "Popcorn bundle packet.sha256 != POP_BUNDLE_SHA"
-[ "$(grep -E '^msg_ring:' "$REGION" | cut -d'#' -f1 | tr -d ' ')" = "$(grep -E '^msg_ring:' "$POP_C/tools/cxl_region.yaml" | cut -d'#' -f1 | tr -d ' ')" ] \
-  || die "REGION msg_ring differs from the Popcorn bundle's region"
+ring_check
 APP=$("$VDB_PLAIN_BUILD/bin/vdb-server" --nodes 2 --segments 32 --M 16 --efc 128 --ef 32 --max-writes $VDB_X_MAXW \
   --max-ids $VDB_X_MAXIDS --max-deletes $VDB_X_MAXD --search-threads $VDB_SEARCH_THREADS --wait-timeout-ms 60000 \
   --start-timeout-ms 5400000 --init-capacity $VDB_X_INIT_CAP --print-app-bytes) || die "print-app-bytes"

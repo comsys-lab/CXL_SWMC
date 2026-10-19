@@ -5,7 +5,8 @@ usage: merge.py --root DERIVED_ROOT --workload vdb|recsys --runset R --out DIR [
 Writes DIR/<csv>-merged.csv for slo_summary.csv, fixed.csv and (when present) mg_probe.csv: one row per key group
 (slo_summary: system, point; fixed: system, point, level; mg_probe: point) with <col>_{mean,min,max,sd,n} of the
 numeric columns and "runs" (the runs present). slo_summary also gets ratio_to_hw = confirm_x_mean / all-HWcc's at the
-same point, computed per run and then aggregated (min-max spread of the per-run ratios). Latency curves and steps are
+same point, computed per run and then aggregated (min-max spread of the per-run ratios); for run set rs-h1 (Megalon
+only) all-HWcc of the same run k is taken from rs-main (verifier L7). Latency curves and steps are
 pooled by the figure scripts (latency_hist.csv), not here.
 """
 import argparse
@@ -15,6 +16,9 @@ import sys
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(HERE)), "figures", "lib"))
 import runs as R  # noqa: E402
+import pandas as pd  # noqa: E402
+
+HW_FROM = {"rs-h1": "rs-main"}  # run sets without all-HWcc: hw of the same run k from this run set (verifier L7)
 
 COLS = {
     "slo_summary.csv": ["result_x", "confirm_x_mean", "ratio_to_hw", "at_result_p95_ms", "at_result_p99_ms",
@@ -48,7 +52,14 @@ def main():
         if df.empty:
             continue
         if name == "slo_summary.csv":
-            df["ratio_to_hw"] = R.ratio_to(df, R.KEYS[name], "confirm_x_mean")
+            base = df
+            if a.runset in HW_FROM:  # verifier L7: all-HWcc of the same run k comes from another run set
+                try:
+                    hw = R.load(a.root, a.workload, HW_FROM[a.runset], name, runs, a.allow_mixed_config)
+                    base = pd.concat([df, hw[hw["system"] == "hw"]], ignore_index=True)
+                except FileNotFoundError:
+                    print(f"merge.py: no {HW_FROM[a.runset]} {name}: ratio_to_hw empty", file=sys.stderr)
+            df["ratio_to_hw"] = R.ratio_to(base, R.KEYS[name], "confirm_x_mean")[:len(df)]
         m = R.agg(df, R.KEYS[name], [c for c in cols if c in df.columns])
         p = os.path.join(a.out, name.replace(".csv", "-merged.csv"))
         m.to_csv(p, index=False)

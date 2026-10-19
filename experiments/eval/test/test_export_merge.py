@@ -196,5 +196,32 @@ class Merge(unittest.TestCase):
         self.assertEqual(len(R.load(self.root, "vdb", "vdb", "slo_summary.csv", allow_mixed_config=True)), 27)
 
 
+class CrossRunsetRatio(unittest.TestCase):
+    def test_megalon_ratio_uses_rs_main_hw(self):  # verifier L7
+        src = os.path.join(OUT, "rs-stream-v1c")
+        if not os.path.isdir(src):
+            export(os.path.join(EXP, "recsys", "export.py"), "RECSYS-stream-v1c", "rs-stream-v1c")
+        root = os.path.join(OUT, "l7-root")
+        shutil.rmtree(root, ignore_errors=True)
+        rs = rows(src, "slo_summary.csv")
+        for runset, keep in (("rs-main", lambda r: True), ("rs-h1", lambda r: r["system"] == "pop")):
+            d = os.path.join(root, "recsys", runset, "run1")
+            os.makedirs(d)
+            with open(os.path.join(d, "slo_summary.csv"), "w", newline="") as fo:
+                w = csv.DictWriter(fo, fieldnames=list(rs[0]))
+                w.writeheader()
+                for r in rs:
+                    if keep(r):
+                        w.writerow(dict(r, system="mg") if runset == "rs-h1" else r)
+        out = os.path.join(OUT, "l7-out")
+        subprocess.run([sys.executable, "-B", os.path.join(os.path.dirname(HERE), "merge.py"), "--root", root,
+                        "--workload", "recsys", "--runset", "rs-h1", "--out", out], check=True, capture_output=True)
+        m = {x["point"]: x for x in rows(out, "slo_summary-merged.csv")}
+        hw = {r["point"]: float(r["confirm_x_mean"]) for r in rs if r["system"] == "hw" and r["confirm_x_mean"]}
+        pop = {r["point"]: float(r["confirm_x_mean"]) for r in rs if r["system"] == "pop" and r["confirm_x_mean"]}
+        for p in pop:
+            self.assertAlmostEqual(float(m[p]["ratio_to_hw_mean"]), pop[p] / hw[p], 6)
+
+
 if __name__ == "__main__":
     unittest.main()

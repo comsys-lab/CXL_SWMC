@@ -48,6 +48,13 @@ Merged spread: `python3 experiments/eval/merge.py --root workspaces/eval-derived
 - A block STOP is a harness or system fault: no automatic retry; RecSys fixed windows that are not valid are recorded
   (valid=0), not stops.
 
+## Vector DB LEVELS stop (verifier L9)
+The vector DB has no fallback window: in run 1 a mix where a system's SLO search ends without a confirmed max (loadgen
+note) makes levels-cb.sh fail inside the Megalon lifetime ("LEVELS STOP"): the block stops, rolls back, the run set is
+"stopped" in the registry, and the remaining mixes are not measured. Main then: report the mix and system to the user
+(no automatic retry; Q4 rule), keep the evidence dir, and rerun only after the user's decision (same command, new
+v<N>; or a changed VDB_POINTS = a new config_sha256).
+
 ## Known limits (see PROGRESS / report)
 - Megalon vector DB uses the 28M capacity (VDB_MG_CAPACITY=h1): the 28m-x capacity (89 groups/segment, ~95.6 GiB of
   objects, inference) exceeds Megalon's object_arena_size 90GB. Pending user confirmation.

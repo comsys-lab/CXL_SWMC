@@ -69,6 +69,7 @@ manifest() {  # written into E at the real start
     echo "code_tree=$TREE commit=$COMMIT dirty_files=$DIRTY dirty_diff_sha256=$DIFFSHA"
     echo "eval_conf=$EVAL_CONF sha256=$EVAL_CONF_SHA256 config_sha256=$CSHA"
     python3 -I -B "$EVD/evalconf.py" dump "$WL" | sed 's/^/conf: /'
+    python3 -I -B "$EVD/evalconf.py" later | sed 's/^/later: /'
     local b
     for b in "$@"; do
       [ -f "$b/manifest.txt" ] && echo "build $b manifest_sha256=$(sha256sum < "$b/manifest.txt" | cut -c1-64) $(grep -m1 '^source_commit=' "$b/manifest.txt")"
@@ -78,6 +79,11 @@ manifest() {  # written into E at the real start
     echo "popcorn bundle $POP_C packet_sha256=$(sha256sum < "$POP_C/packet.sha256" | cut -c1-64) (expected $POP_BUNDLE_SHA)"
     echo "PRETOUCH_DIR=${PRETOUCH_DIR:-} MEASURE_ENV_DIR=${MEASURE_ENV_DIR:-} MEASURE_PART_DIR=${MEASURE_PART_DIR:-}"
   } > "$E/eval-manifest.txt"
+}
+ring_check() {  # REGION's msg_ring must equal the Popcorn bundle's region (cxl_shm module parameters come from it)
+  [ "$(grep -E '^msg_ring:' "$REGION" | cut -d'#' -f1 | tr -d ' ')" = "$(grep -E '^msg_ring:' "$POP_C/tools/cxl_region.yaml" | cut -d'#' -f1 | tr -d ' ')" ] \
+    || die "REGION msg_ring differs from the Popcorn bundle's region"
+  cmp -s "$REGION" "$POP_C/tools/cxl_region.yaml" || plan "note: REGION and the bundle region differ outside msg_ring"
 }
 # RecSys: environment of experiments/recsys/main-block.sh BLOCK=stream with EVAL_RUN (both RecSys run sets)
 rs_env() {
@@ -96,6 +102,7 @@ rs_checks() {  # static checks shared by the RecSys drivers
     "$POP_C/p-popcorn-shm.sh" "$RS_INPUTS/MANIFEST.txt" "$TREE/experiments/recsys/main-block.sh"
   [ "$(sha256sum < "$POP_C/packet.sha256" | cut -c1-64)" = "$POP_BUNDLE_SHA" ] || die "Popcorn bundle packet.sha256 != POP_BUNDLE_SHA"
   grep -qx "megalon_build=$RS_MEGALON_BASE" "$RS_MEG_BUILD/manifest.txt" || die "$RS_MEG_BUILD is not on $RS_MEGALON_BASE"
+  ring_check   # verifier L3: same check as runset-vdb.sh
   cmp -s "$RS_MEG_CFG" "$P/CXL_SWMC/systems/megalon/recsys-2vm.yaml" || die "main-block.sh prechecks systems/megalon/recsys-2vm.yaml: RS_MEG_CFG must be it"
   local app ring scr
   app=$("$RS_PLAIN_BUILD/bin/recsys-server" --nodes 2 --row-div 1 --serve-threads $RS_THREADS --update-threads 1 \
