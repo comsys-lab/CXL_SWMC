@@ -6,6 +6,9 @@
 # Re-pinned 2026-10-20 (H1 v0.6.19, no H1 behaviour change): m4-run.sh gained KIND=urate (vector DB update-rate sweep,
 # urate-block.sh, reports/VDB-urate-packet.v1.1.md; v1.1 adds DATASET=28m-x, used by KIND=urate only); opcoh_check.py skips update rows without matched records (raised
 # ValueError before; unchanged for every input it accepted); KIND=h1 path, builds vdb/15, vdb-megalon/14, vdb-loadgen/8 unchanged.
+# Re-pinned 2026-10-20 (H1 v0.6.19c, no H1 behaviour change): m4-run.sh KIND=urate gained URATE_PARTS="warm fix"
+# (fixed-load lifetime per update rate, user decision); the shared fix-part step check now also runs for KIND=urate
+# (condition widened from KIND=h1 to h1|urate; KIND=h1 unchanged).
 . "$(dirname "${BASH_SOURCE[0]}")/pins-common.inc"
 HR=$P/CXL_SWMC                      # live tree; v6-block.sh uses $P/CXL_SWMC/experiments/vectordb itself. Every file it
                                     # runs is hash-pinned below (hook: see the v6-block.sh pin; builds vdb/15, vdb-megalon/14 from 934fa9312)
@@ -30,7 +33,7 @@ e9d4942ee33b2f65cf7117d87942296e1365d0234873c2c4159545f40708db54  $P/workspaces/
 eeb6b23f173d85a3c86ade0fb804b363e3c84a36bf9c0f56a7cbcab25e738b53  $HR/config/cxl_region.yaml
 7e8cc73998280bd606598ab26003b1ba80a81dd736c58e3f8207a9482d36f2e6  $HOOK_FILE
 27a11c2c75f748fa7b47111496e30170ab5a35c0b65bd56422c6b3b6fb4d7503  $HR/experiments/vectordb/m4-lib.sh
-1897cb238a2bbee5be29c62859377c2de560331f07d915bb1192097352dbe188  $HR/experiments/vectordb/m4-run.sh
+cc42fad19461befb54e78aec98c587c41b97c10c456461cfd6aee10e12a8d3b8  $HR/experiments/vectordb/m4-run.sh
 4d917368a0946c0a5052dd0d1e31e5ab900914e74c75bd02d37dc164708b66fb  $HR/experiments/vectordb/m4-precheck.sh
 5a4cd27c57b9aebe82a3d9b1652690b0496ddd1e81da4e9479a02d33085f3ad6  $HR/experiments/vectordb/run.sh
 1edcdda88f30200fd55c1b5a18cb4b9d6db57aa02647f8ad549e4e7f6aabb31f  $HR/experiments/vectordb/host-gate.sh
