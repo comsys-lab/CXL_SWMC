@@ -520,15 +520,24 @@ experiments/vectordb/urate-block.sh (m4-run.sh KIND=urate). H1 (YCSB-style mixes
   consumption from the KIND=urate loadgen parameters (scenario: ramp growth >= 1.2 up to a 400 search/s knee, SLO
   result >= 10 search/s); urate-block.sh refuses rates above the budget unless the user lists them in
   URATE_PARTIAL_OK, and an exhausted stream in the SLO part is a NOTE (steps before it kept). Device limit (28M image,
-  96 GiB NVDIMM): at most 88 groups per segment -> capacity 941,512 (`--max-ids 30128384 --init-capacity 875000`),
-  i.e. about 3.14 M inserts per lifetime (3,363 B of SWcc per record). Longer traces: `DATASET=28m-x` in m4-run.sh
+  96 GiB NVDIMM): at most 89 groups per segment with --max-deletes <= 1,835,008 (88 with 2,097,152) -> capacity
+  952,211, i.e. about 3.48 M inserts per lifetime (3,363 B of SWcc per record). Longer traces: `DATASET=28m-x` in m4-run.sh
   (X_DATA, X_WRITES, X_NB, X_MAXIDS, X_MAXW, X_MAXD, X_INIT_CAP).
 - `--init-capacity C` (build >= 17): accept an init dir built for C <= capacity elements per segment; chunk images are
   chunk-relative and per_chunk / lchunk_bytes do not depend on the capacity, so a larger capacity only adds groups.
-- Dataset deviation option (gen_writes.py `--pool-b-rows R`): the j-th insert gets a new id NA + j and pool B row
-  j mod R (vectors reused under new ids; two live ids may hold the same vector; compute_gt.py maps ids to rows from
-  the writes file and adds a tie-aware recall). ON HOLD (user 2026-10-20): fresh PubMed_bge rows beyond the 28M kept
-  (prepare_data.py used all 28,000,000 rows of raw28m) are being considered instead.
+- Longer update trace for the sweep (user 2026-10-20): pool B extended with FRESH PubMed_bge rows (no vector reuse):
+  prepare_data.py had used all 28,000,000 rows of raw28m (binbin10/PubMed_bge@29f9db47, chunk_id 0 .. 27,999,999), so
+  tools/extend_pool_b.py takes upstream rows with chunk_id >= 28,000,000 from upstream shards 196.. of the same revision
+  (shard and row order; upstream rows are not in chunk_id order), skipping chunk_id / document / embedding duplicates
+  of the 28M and of earlier fresh rows; pool B = the old 1,000,000 rows followed by 2,400,000 fresh rows; pool A and
+  queries unchanged (symlinks). gen_writes.py over the 3.4 M pool B (seed 20261015, no reuse): 3,400,000 updates,
+  the cap per lifetime (device: 89 groups per segment -> capacity 952,211, `--max-ids 30470752 --max-deletes 1835008
+  --max-writes 6815744 --init-capacity 875000`). At 3200 updates/s the cap is about 1,060 s of streaming, below the
+  worst-case lifetime: the SLO search at 3200 (and, by the worst-case bound, at 1600) may run out of updates in
+  bisect / confirm / fill / overload; loadgen then ends with "streams exhausted" and the rung keeps the steps before it
+  (user decision 2026-10-20, option (a)). Fallback on hold: gen_writes.py `--pool-b-rows R` (reuse pool B vectors under
+  new ids; builds/vdb-inputs/1, HOLD.txt); compute_gt.py maps ids to rows from the writes file in both cases and
+  adds a tie-aware recall for duplicate vectors.
 - Host test: tests/urate_pilot.sh (two servers on a scratch file, 1M image; per-rate fixed invocations, optional
   knee-ramp SLO part; E1 per invocation; final consistency: P = writes, elements = NA + updates, delete-log entries =
   updates, bad_records 0, backlog 0).
