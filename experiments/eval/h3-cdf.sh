@@ -6,7 +6,7 @@
 # cxl_shm loads. Arguments: kind %di (0 = READ), ctx %dx: struct swmc_fault_ctx map_pfn at +8, transition at +48),
 # filter kind==0 && tr==1 (I->S read faults), keys=pfn, 2^17 entries (reports/packets/ROCKSDB-V1-packet.md §5.2).
 # Output: one hist file per VM for export_h3.py / experiments/rocksdb/h3-page-cdf.py (Dropped 0 = complete CDF).
-# Page sampling (verifier M2; default off, user decision pending): H3_CDF_PFN_MOD = M (power of two, 1 = off) keeps
+# Page sampling (verifier M2; user 2026-10-20: vector DB off, RecSys 16 via H3_RS_CDF_PFN_MOD): H3_CDF_PFN_MOD = M (power of two, 1 = off) keeps
 # only pages with pfn % M == 0 (filter term "!(pfn & (M-1))"): the hist then holds ~1/M of the pages, an unbiased
 # sample of the per-page distribution; the value is written to <dir>/cdf-setup.txt ("pfn_mod=M").
 # usage (env NODES = guest ips, node k = position k):

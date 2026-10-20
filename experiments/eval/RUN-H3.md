@@ -10,8 +10,8 @@ Design: reports/design/evaluation-pipeline.md rev 3 §2.3, §6.1, with the user'
   max under the SLO. No constant-total-load windows.
 - Fault figure: per-step Popcorn counters of every VM at the result (confirm repeats, `at_result`); latency curve per N
   from the same steps. CDF: one Popcorn lifetime at the N = 8 Popcorn max-under-SLO rate, kprobe hist, run 1 only.
-- Operating points: vector DB u50 (H3_VDB_POINT); RecSys H3_RS_RATE (200, pending user); systems H3_SYSTEMS
-  ("hw pop"; Megalon pending user, see "Megalon").
+- Operating points: vector DB u50 (H3_VDB_POINT); RecSys H3_RS_RATE (50 samples/s, user 2026-10-20); systems
+  H3_SYSTEMS ("hw pop"; no Megalon, user 2026-10-20, see "Megalon").
 - N = 2 is not measured again: its points are the u50 lifetimes of run set vdb and the H3_RS_RATE lifetimes of run set
   rs-main of the same run k (same sizing, threads, SLO rules); export below.
 
@@ -95,7 +95,7 @@ As the 2-VM drivers: `kill -TERM -- -<pgid>`; h3-block.sh's EXIT trap stops this
 the kprobe event, tears down every cxl_shm load without "teardown PASS", sets /dev/dax0.0 root:root 600 on every VM
 and releases the lock. Check `E/block/rollback.out` (ROLLBACK FAIL lines) and `E/block/cleanup.out`.
 
-## Megalon (H3_SYSTEMS, pending user)
+## Megalon (H3_SYSTEMS; user 2026-10-20: not in H3)
 Megalon is compiled for two nodes: builds/megalon/77 manifest `constants_rs_LOGICAL_NODE_NUM=2`,
 `constants_h_LOGICAL_NODE_NUM=2` (systems/megalon/src: src/common/constants.h `#define LOGICAL_NODE_NUM 2`,
 third-party/nr_rust/ffi/constants.rs; config.cc refuses node_id >= LOGICAL_NODE_NUM; NR log tails and the start
@@ -122,7 +122,8 @@ Megalon port tests, a smoke per N, and a run-set extension (mg + mgoff lifetimes
   smallest power-of-two pfn_mod that keeps it under half the map). On the 2-VM run-1 data at 80 s: vector DB u50
   ~102 k pages per VM (fits), RecSys 50 samples/s ~856 k pages on the serving VM (MAY OVERFLOW, suggests 16).
   Switch H3_CDF_PFN_MOD (eval.conf, default 1 = off; power of two) keeps only pages with pfn % M == 0 (filter
-  "!(pfn & (M-1))"), recorded in cdf-setup.txt and cdf.csv pfn_mod. Pending user decision.
+  "!(pfn & (M-1))"), recorded in cdf-setup.txt and cdf.csv pfn_mod. User 2026-10-20: vector DB 1 (H3_CDF_PFN_MOD), RecSys 16
+  (H3_RS_CDF_PFN_MOD, passed by runset-h3-rs.sh).
 - RecSys at N VMs keeps node 0 as updater only: serving vCPUs 16 / 24 / 28 at N = 2 / 4 / 8 (the plot states it).
 - Private memory of vdb-server / recsys-server at 48 / 24 GB guests not measured before (first lifetime = smoke).
   RecSys precheck MEM_MIN=8 (GiB available) at 24 GB guests is a smoke-level check only (verifier L6): the tables

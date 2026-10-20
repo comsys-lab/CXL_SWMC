@@ -49,7 +49,7 @@ VCPU=$((TV / N))
 [[ $EVAL_RUN =~ ^[1-9]$ ]] && [[ $SEED =~ ^[0-9]+$ ]] || die "bad EVAL_RUN / SEED"
 [[ $CDF =~ ^[01]$ ]] && [[ $CDF_S =~ ^[1-9][0-9]*$ ]] || die "bad CDF / CDF_S"
 [[ $RECV_MODE =~ ^(poll|idle|sleep)$ ]] || die "bad RECV_MODE"
-export H3_CDF_PFN_MOD=${H3_CDF_PFN_MOD:-1}   # kprobe hist page sampling (h3-cdf.sh; 1 = off, user decision pending)
+export H3_CDF_PFN_MOD=${H3_CDF_PFN_MOD:-1}   # kprobe hist page sampling (h3-cdf.sh; 1 = off; runset-h3-rs.sh passes 16)
 bash "$CDFS" filter > /dev/null || die "bad H3_CDF_PFN_MOD (power of two, 1 = off)"
 for s in $SYSTEMS; do case $s in hw|pop) ;; mg) die "Megalon in H3 needs Megalon builds with LOGICAL_NODE_NUM = $N (RUN-H3.md, 'Megalon')";; *) die "bad system $s";; esac; done
 [ "$CDF" = 0 ] || [[ " $SYSTEMS " == *" pop "* ]] || die "CDF=1 needs pop in SYSTEMS (the rate is Popcorn's max under the SLO)"
