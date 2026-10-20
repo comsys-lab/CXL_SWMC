@@ -47,20 +47,27 @@ Then: recsys-loadgen/13 Host check = `grep -c query_spread loadgen` and the N = 
 are file keys): record the hash at the first H3 run, not before.
 
 ## Order (main session; one H3 chain, after the 2-VM runs of run k)
+Topology chain: workspaces/vmN/vmN-chain-v2.sh (sha256 c5f65be03f0700c6ad24f0ff0cbfea6eefb99a04e4221272ff85eb88dfdcd929,
+after its verifier review; v1 is superseded). Run it ONLY after the 2-VM chain (and any other eval chain or block) has
+ended: v2 refuses live phases while any eval chain / *-chain-v*.sh / second vmN-chain runs (`nochain-check` phase shows
+it), so the topology switches and restores are separate steps between the H3 driver chains, never inside one. Live
+phases other than `pre` / `r-down` need the chain's own `PRE PASS (topo N)` (switch) or `R-DOWN PASS (topo N` (restore)
+line in VMN_E/steps.log: `pre` and `r-down` create a NEW evidence dir, every later phase uses the same VMN_E.
 | Step | What | Command / note | Time (estimate) |
 | --- | --- | --- | --- |
 | 0 | N = 2 export (2-VM run k accepted) | see "N = 2" | Host only |
-| 1 | switch 2 -> 4 VMs | `VMN_TOPO=4 VMN_LIVE=1 VMN_E=$P/recovery/VM8-v3-n4 bash $P/workspaces/vmN/vmN-chain-v1.sh <phase>`: `dry` (2-VM state, mandatory), then `pre gen down freeze overlays net define`, `start 0 1 2 3`, `pretouch-par 0 1 2 3`, `envcheck` | ~30 min |
+| 1 | switch 2 -> 4 VMs | `VMN_TOPO=4 VMN_LIVE=1 VMN_E=$P/recovery/VM8-v3-n4 bash $P/workspaces/vmN/vmN-chain-v2.sh <phase>`: `nochain-check`, `dry` (2-VM state, mandatory), then `pre` (creates VMN_E, PRE PASS (topo 4)) `gen down freeze overlays net define`, `start 0 1 2 3`, `pretouch-par 0 1 2 3`, `envcheck` | ~30 min |
 | 2 | gates and dry start | `export PRETOUCH_DIR=$P/recovery/VM8-v3-n4 MEASURE_ENV_DIR=<base> MEASURE_PART_DIR=<apply>`; `bash $C/experiments/eval/runset-h3-vdb.sh 4 <k> --dry`, `runset-h3-rs.sh 4 <k> --dry` -> `DRY START OK` | 1 min |
 | 3 | vector DB N = 4 | `bash $C/experiments/eval/runset-h3-vdb.sh 4 <k>` (hw + pop HSLO) | ~45 min |
 | 4 | RecSys N = 4 | `bash $C/experiments/eval/runset-h3-rs.sh 4 <k>` | ~50 min |
-| 5 | restore to 2 VMs | `VMN_TOPO=4 VMN_LIVE=1 VMN_SRC=$P/recovery/VM8-v3-n4 VMN_E=$P/recovery/VM8-v3-n4-restore ... dry-restore`, then `r-down r-undefine r-net r-unfreeze r-define r-start`, `pretouch-par 0 1`, `envcheck`, `r-delete` | ~15 min |
+| 5 | restore to 2 VMs | after the H3 driver chain has ended: `VMN_TOPO=4 VMN_LIVE=1 VMN_SRC=$P/recovery/VM8-v3-n4 VMN_E=$P/recovery/VM8-v3-n4-restore bash $P/workspaces/vmN/vmN-chain-v2.sh <phase>`: `nochain-check`, `dry-restore`, then `r-down` (creates VMN_E, R-DOWN PASS (topo 4)) `r-undefine r-net r-unfreeze r-define r-start`, `pretouch-par 0 1`, `envcheck`, `r-delete` | ~15 min |
 | 6 | switch 2 -> 8 VMs | as 1 with `VMN_TOPO=8 VMN_E=$P/recovery/VM8-v3-n8`, `start 0 1 2 3 4 5 6 7`, `pretouch-par 0 1 2 3 4 5 6 7` | ~30 min |
 | 7 | vector DB N = 8 | `runset-h3-vdb.sh 8 <k>` (run 1: + CDF lifetime at the Popcorn max rate) | ~45 min (+10 min CDF) |
 | 8 | RecSys N = 8 | `runset-h3-rs.sh 8 <k>` (run 1: + CDF) | ~50 min (+10 min CDF) |
 | 9 | restore to 2 VMs | as 5 with `VMN_TOPO=8` and the n8 dirs; then the 2-VM pretouch is the new PRETOUCH_DIR | ~15 min |
 Each driver is launched as the 2-VM drivers are: from the clean live tree, `setsid nohup bash ... > <log> 2>&1 &`,
-inside a workspaces/*-chain-*.sh wrapper. Guests 2..N-1 are overlays of vm0's frozen disk: the installs
+inside a workspaces/*-chain-*.sh wrapper that contains no topology phase (steps 3-4 and 7-8 each one such chain).
+Guests 2..N-1 are overlays of vm0's frozen disk: the installs
 (/home/comsys/vdb17r2m, /home/comsys/rs13r2m, /home/comsys/popcorn-12n, /home/comsys/vdb/init/seg32c32m-a27m on vm0)
 must exist on vm0 before the freeze; the block's precheck compares every VM's install sha256 with the Host builds and
 stops otherwise ("install needed").
