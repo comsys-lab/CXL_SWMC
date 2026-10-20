@@ -107,7 +107,26 @@ Megalon port tests, a smoke per N, and a run-set extension (mg + mgoff lifetimes
 ## Known limits
 - vector DB opcoh_check.py reads node0/node1 only: not run at N > 2 (the per-node opcoh error counters, the response
   coherence blocks and opsplit.py are checked); RecSys check_breakdown.py reads node 1 only (a FAIL is a NOTE here).
-- CDF hist map: 2^17 pages per VM; Dropped > 0 makes the CDF incomplete (cdf.csv complete = False). The hist covers the
-  CDF part's whole run (10 s ramp-in + CDF_S + drain; vector DB also the server stop).
+- CDF lifetime (both workloads, verifier M1): [RecSys: the usual 1 q/s warm-up] -> part settle (H3_CDF_S at the CDF
+  rate = the Popcorn max_offered_x_pass of the same block) -> h3 gate -> hist clear -> part cdf (H3_CDF_S at the same
+  rate) -> hist dump while the servers are up -> stop. The hist covers the cdf part only: its 10 s loadgen ramp-in +
+  H3_CDF_S + the 10 s drain. Vector DB: run.sh part hooks (PART_GATE_CMD = h3-gate.sh between parts, never the 2-VM
+  h1-gate.sh; PART_PRE_CMD / PART_POST_CMD = h3-cdf.sh part-pre / part-post).
+- kprobe target swmc_fault_account is built into vmlinux (popcorn_new kernel/swmc/popcorn_msi.c, obj-y via
+  CONFIG_SWMC_POPCORN_MSI=y in builds/popcorn_new/12/.config, "T swmc_fault_account" in its System.map), not in
+  cxl_shm.ko: arming the event before the cxl_shm load is valid. Argument offsets checked against struct
+  swmc_fault_ctx (include/swmc/page_coherence.h): map_pfn +8, transition +48.
+- CDF hist map: 2^17 pages per VM; Dropped > 0 makes the CDF incomplete (cdf.csv complete = False). Pre-CDF estimate
+  (verifier M2, information only): h3_cdf_estimate.py writes E/block/cdf/cdf-estimate.txt before the CDF lifetime
+  (upper bound of distinct I->S pages per VM = at_result I->S faults/s x (H3_CDF_S + 20 s) / pfn_mod, and the
+  smallest power-of-two pfn_mod that keeps it under half the map). On the 2-VM run-1 data at 80 s: vector DB u50
+  ~102 k pages per VM (fits), RecSys 50 samples/s ~856 k pages on the serving VM (MAY OVERFLOW, suggests 16).
+  Switch H3_CDF_PFN_MOD (eval.conf, default 1 = off; power of two) keeps only pages with pfn % M == 0 (filter
+  "!(pfn & (M-1))"), recorded in cdf-setup.txt and cdf.csv pfn_mod. Pending user decision.
 - RecSys at N VMs keeps node 0 as updater only: serving vCPUs 16 / 24 / 28 at N = 2 / 4 / 8 (the plot states it).
 - Private memory of vdb-server / recsys-server at 48 / 24 GB guests not measured before (first lifetime = smoke).
+  RecSys precheck MEM_MIN=8 (GiB available) at 24 GB guests is a smoke-level check only (verifier L6): the tables
+  are in the shared region; a server that needs more private memory fails at start (session start STOP).
+- run.sh part hooks change an H1-pinned file (re-pinned in experiments/h1/plugins/pins-vdb.sh): run the H1 selftest
+  in a new dir before the merge (lock-free window):
+  `bash experiments/h1/test/selftest.sh /home/comsys/sungsu/destijl-control/workspaces/h1-main/selftest-eval-h3-1`.
