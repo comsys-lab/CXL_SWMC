@@ -12,6 +12,7 @@ usage: EVAL_TEST_OUT=<scratch dir> python3 -B test_export_h3.py [-v]
 """
 import csv
 import os
+import shutil
 import subprocess
 import sys
 import unittest
@@ -103,6 +104,69 @@ class TwoVm(unittest.TestCase):
             self.assertTrue(close(hm[0]["result_x"], sm["confirm"]["x_mean"]))
             self.assertEqual(hm[0]["nodes"], "2")
             self.assertEqual(hm[0]["vcpus_per_vm"], "16")
+            # L3 validity from urate-check.csv, L4 source hash = the vdb run set's config_sha256 (registry)
+            self.assertTrue(hm[0]["check"].startswith("URATECHECK"))
+            self.assertIn(hm[0]["valid_at_result"], ("True", "False"))
+            self.assertEqual(hm[0]["source_config_sha256"], "2943b273264ff78a349c9071bc01cf9efe45734236f47454346ab54faeb9731b")
+            self.assertTrue(all(r["valid"] in ("True", "False") for r in hs if r["system"] == s and r["vm"] == "all"))
+
+
+class H3Layout(unittest.TestCase):
+    """--source h3 on a synthetic H3 block dir built from copies of the 2-VM pop u50 part (h3-results.tsv with
+    max_offered_x_pass, cdf/ with hist, cdf-rate.txt, cdf-setup.txt pfn_mod) and the pre-CDF estimate"""
+
+    def test_h3_source_and_estimate(self):
+        src = f"{P}/recovery/two-workload-eval-run1-vdb-v1/vdb/r1/run/pop-u50-slo-r1/slo"
+        if not os.path.isdir(src):
+            self.skipTest("no 2-VM run 1 evidence")
+        E = os.path.join(OUT, "h3E", "block")
+        part = os.path.join(E, "pop-n2", "slo")
+        os.makedirs(os.path.join(part, "loadgen"), exist_ok=True)
+        os.makedirs(os.path.join(E, "cdf"), exist_ok=True)
+        for f in ("loadgen/steps.jsonl", "loadgen/summary.json", "stats-steps.csv", "urate-check.csv", "urate-check.txt"):
+            shutil.copyfile(os.path.join(src, f), os.path.join(part, f))
+        sm = export_h3.canon.summary(part)
+        with open(os.path.join(E, "h3-results.tsv"), "w") as f:
+            f.write("# name\tsystem\tnodes\tvcpus_per_vm\tmax_offered_x_pass\tconfirm_x_mean\tconfirmed\tnote\trun_dir\n")
+            f.write(f"pop-n2\tpop\t2\t16\t{sm['max_offered_x_pass']}\t{sm['confirm']['x_mean']}\tTrue\t\tpop-n2/slo\n")
+        with open(os.path.join(E, "h3-params.txt"), "w") as f:
+            f.write("writes=x sha256=y U=50\n")
+        with open(os.path.join(E, "cdf", "cdf-rate.txt"), "w") as f:
+            f.write(f"cdf rate: Popcorn max_offered_x_pass {sm['max_offered_x_pass']} at N=2 (offered rate)\n")
+        with open(os.path.join(E, "cdf", "cdf-setup.txt"), "w") as f:
+            f.write("2026-10-20T00:00:00 pfn_mod=4 filter=[kind==0 && tr==1 && !(pfn & 3)]\n")
+        with open(os.path.join(E, "cdf", "hist-vm0.txt"), "w") as f:
+            f.write("{ pfn:          4 } hitcount:          2\n    Dropped: 0\n")
+        with open(os.path.join(E, "cdf", "hist-vm1.txt"), "w") as f:
+            f.write("{ pfn:          8 } hitcount:          1\n    Dropped: 3\n")
+        with open(os.path.join(OUT, "h3E", "eval-manifest.txt"), "w") as f:
+            f.write("eval_conf=x sha256=y config_sha256=" + "a" * 64 + "\n")
+        out = os.path.join(OUT, "h3-out")
+        export_h3.main(["--run", "1", "--runset", "h3-vdb-n2", "--config-sha256", "t", "--out", out, E])
+        with open(os.path.join(out, "cdf.csv")) as f:
+            cd = list(csv.DictReader(f))
+        self.assertEqual(len(cd), 2)
+        self.assertEqual((cd[0]["pfn_mod"], cd[0]["complete"], cd[0]["dropped"]), ("4", "False", "3"))
+        self.assertTrue(close(cd[0]["offered_x"], sm["max_offered_x_pass"]))
+        with open(os.path.join(out, "hosts-at-max.csv")) as f:
+            hm = list(csv.DictReader(f))
+        self.assertEqual(hm[0]["point"], "u50")
+        self.assertEqual(hm[0]["source_config_sha256"], "a" * 64)
+        sys.path.insert(0, EV)
+        import h3_cdf_estimate
+        per, mx, sug = h3_cdf_estimate.estimate(part, 2, 80, 1)
+        self.assertEqual(len(per), 2)
+        self.assertTrue(all(n == 3 for _, n, _, _ in per))
+        self.assertTrue(mx > 0 and sug >= 1)
+        _, mx4, _ = h3_cdf_estimate.estimate(part, 2, 80, 4)
+        self.assertTrue(close(mx4 * 4, mx, 1e-9))
+
+    def test_cdf_filter(self):
+        f = lambda m: subprocess.run(["bash", f"{EV}/h3-cdf.sh", "filter"], env=dict(os.environ, H3_CDF_PFN_MOD=m),
+                                     capture_output=True, text=True)
+        self.assertEqual(f("1").stdout.strip(), "kind==0 && tr==1")
+        self.assertEqual(f("16").stdout.strip(), "kind==0 && tr==1 && !(pfn & 15)")
+        self.assertNotEqual(f("12").returncode, 0)
 
 
 if __name__ == "__main__":

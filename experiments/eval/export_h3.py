@@ -15,7 +15,13 @@ Outputs (in --out):
                     the result rate (canon.confirm_stats), so the fault figure reads at_result rows.
   hosts-at-max.csv  one row per (system, nodes, vm): mean of the at_result steps of every rate column (the faults at
                     the max under the SLO), + result_x and confirm stats
-  cdf.csv           per-page I->S read-fault CDF of the CDF pass (h3-page-cdf.py rule; dropped > 0 = incomplete)
+  cdf.csv           per-page I->S read-fault CDF of the CDF pass (h3-page-cdf.py rule; dropped > 0 = incomplete;
+                    pfn_mod > 1 = pages sampled by pfn % pfn_mod == 0; offered_x = the CDF rate)
+  Every row: valid / wop_done_ratio = the step's update-stream validity from the part's kept check file (vector DB
+  urate-check.csv valid / done_ratio, RecSys stream-check.csv valid / written_ratio; empty when absent), check = its
+  verdict (URATECHECK / STREAMCHECK PASS|NOTE|FAIL); hosts-at-max valid_at_result = every at_result step valid;
+  source_config_sha256 = the config_sha256 in the measuring run set's eval-manifest.txt (N = 2 rows: the 2-VM run set's
+  hash, which differs from config_sha256 = the H3 hash of this export).
 Counter formulas: experiments/rocksdb/h3-faults.py KEYS / PREFIX_SUMS (loaded from that file: one source), summed
 over the targets of a step (vm = all) or per target; *_per_s = delta / window_s (aggregate: max window of the
 targets, as h3-faults.py); *_per_rop = delta / (achieved read ops/s x window_s) (aggregate only); cxl_recv_cpu_s_per_s
@@ -46,13 +52,15 @@ RATES = [c + "_per_s" for c in COUNTERS] + ["cxl_recv_cpu_s_per_s"]
 PER_ROP = ["read_faults_per_rop", "write_faults_per_rop", "is_faults_per_rop", "thr_is_fault_ns_per_rop"]
 SCHEMA = {
     "hslo.csv": KEY + ID + ["step", "phase", "vm", "offered_x", "achieved_x", "n_rop", "p50_ms", "p95_ms", "p99_ms",
-                            "pslo_ms", "pass", "at_result", "result_x", "window_s", "wop_per_s", "instr_enabled"]
-    + RATES + PER_ROP + ["lifetime", "source_dir"],
+                            "pslo_ms", "pass", "valid", "wop_done_ratio", "at_result", "result_x", "window_s",
+                            "wop_per_s", "instr_enabled"]
+    + RATES + PER_ROP + ["check", "lifetime", "source_config_sha256", "source_dir"],
     "hosts-at-max.csv": KEY + ID + ["vm", "result_x", "confirm_x_mean", "confirm_x_sd", "confirmed", "note",
-                                    "n_at_result", "offered_x", "achieved_x", "p95_ms", "p99_ms"] + RATES + PER_ROP
-    + ["lifetime", "source_dir"],
+                                    "n_at_result", "valid_at_result", "offered_x", "achieved_x", "p95_ms", "p99_ms"]
+    + RATES + PER_ROP + ["check", "lifetime", "source_config_sha256", "source_dir"],
     "cdf.csv": KEY + ["system", "nodes", "faults_per_page", "pages", "cum_pages_frac", "cum_faults_frac",
-                      "pages_total", "faults_total", "dropped", "complete", "rate_x", "source_dir"],
+                      "pages_total", "faults_total", "dropped", "complete", "pfn_mod", "offered_x",
+                      "source_config_sha256", "source_dir"],
 }
 WL = {"vdb": dict(rop="search", wop="update", slo_pct=99, rate_unit="mix"),
       "recsys": dict(rop="query", wop="update", slo_pct=95, rate_unit="samples/s")}
@@ -111,6 +119,26 @@ def rates(c, win, achieved):
     return o
 
 
+def validity(part):
+    """verifier L3: per-step update-stream validity from the kept check files of the part (vector DB urate_check.py:
+    urate-check.csv valid / done_ratio; RecSys stream_check.py: stream-check.csv valid / written_ratio) and the
+    verdict line (URATECHECK / STREAMCHECK ...); ({step: (valid, ratio)}, verdict) or ({}, "") when absent"""
+    for csvn, ratio, txt, tag in (("urate-check.csv", "done_ratio", "urate-check.txt", "URATECHECK"),
+                                  ("stream-check.csv", "written_ratio", "stream-check.txt", "STREAMCHECK")):
+        p = os.path.join(part, csvn)
+        if not os.path.isfile(p):
+            continue
+        with open(p) as f:
+            v = {int(r["step"]): (r.get("valid") == "True" if r.get("valid") in ("True", "False") else None, fl(r.get(ratio)))
+                 for r in csv.DictReader(f)}
+        verdict = ""
+        if os.path.isfile(os.path.join(part, txt)):
+            with open(os.path.join(part, txt)) as f:
+                verdict = next((" ".join(ln.split()[:2]) for ln in f if ln.startswith(tag)), "")
+        return v, verdict
+    return {}, ""
+
+
 def part_rows(part, wl, nodes, stream=None):
     """rows of hslo.csv (without KEY / ID) for one SLO part dir; stream = the read stream name"""
     stream = stream or WL[wl]["rop"]
@@ -120,6 +148,7 @@ def part_rows(part, wl, nodes, stream=None):
     sm = canon.summary(part) if os.path.isfile(os.path.join(part, "loadgen", "summary.json")) else {}
     result_x = fl((sm.get("confirm") or {}).get("x_mean")) if sm.get("confirmed") is True else None
     cs = step_counters(part)
+    val, verdict = validity(part)
     out = []
     for d in steps:
         n = d["step"]
@@ -130,7 +159,9 @@ def part_rows(part, wl, nodes, stream=None):
         ach = fl(st.get("achieved"))
         win = max((fl(r.get("window_s")) or 0) for r in rs) if rs else None
         wop = d["streams"].get(WL[wl]["wop"], {}) if wl in WL else {}
-        base = dict(step=n, phase=d.get("phase"), offered_x=d.get("offered_x"), at_result=n in at, result_x=result_x)
+        vv = val.get(n, (None, None))
+        base = dict(step=n, phase=d.get("phase"), offered_x=d.get("offered_x"), at_result=n in at, result_x=result_x,
+                    valid=vv[0], wop_done_ratio=vv[1], check=verdict)
         c = counters(rs)
         out.append(dict(base, vm="all", achieved_x=ach, n_rop=st.get("done"), p50_ms=st.get("p50_ms"),
                         p95_ms=st.get("p95_ms"), p99_ms=st.get("p99_ms"), pslo_ms=st.get("pslo_ms"),
@@ -149,7 +180,9 @@ def at_max(rows):
     out = []
     for vm in sorted({r["vm"] for r in rows}, key=lambda v: (v != "all", int(v) if v.isdigit() else -1)):
         rs = [r for r in rows if r["vm"] == vm and r["at_result"]]
-        o = dict(vm=vm, n_at_result=len(rs))
+        vs = [r.get("valid") for r in rs]
+        o = dict(vm=vm, n_at_result=len(rs), check=rs[0].get("check") if rs else None,
+                 valid_at_result=(all(vs) if vs and all(x is not None for x in vs) else None))
         for k in ["offered_x", "achieved_x", "p95_ms", "p99_ms"] + RATES + PER_ROP:
             v = [fl(r.get(k)) for r in rs if fl(r.get(k)) is not None]
             o[k] = sum(v) / len(v) if v else None
@@ -227,6 +260,18 @@ def lifetimes(E, source, wl, nodes, point, rnd):
             if os.path.isdir(os.path.join(base, f"{s}-u{point}", "slo"))]
 
 
+def source_sha(E):
+    """config_sha256 recorded by the run-set driver (eval-manifest.txt in E or its parent: H3 E/block, 2-VM E)"""
+    for d in (E, os.path.dirname(os.path.abspath(E))):
+        p = os.path.join(d, "eval-manifest.txt")
+        if os.path.isfile(p):
+            with open(p) as f:
+                mm = re.search(r"config_sha256=([0-9a-f]{64})", f.read())
+            if mm:
+                return mm.group(1)
+    return ""
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser()
     ap.add_argument("--run", type=int, required=True)
@@ -260,27 +305,37 @@ def main(argv=None):
     if not lts:
         sys.exit(f"no SLO lifetimes in {a.evidence}")
     warn = []
+    src_sha = source_sha(a.evidence)  # verifier L4: config_sha256 of the run set that measured the rows
+    if a.source == "2vm" and not src_sha:
+        warn.append("no eval-manifest.txt config_sha256 for the 2-VM evidence (source_config_sha256 empty)")
     for sysname, life, part in lts:
         rows, sm = part_rows(part, wl, nodes)
         if sysname == "pop" and any(r["instr_enabled"] is False for r in rows):
             warn.append(f"{life}: sys.swmc.instr.enabled != 1 on some VM/step (Popcorn counters incomplete)")
         for r in rows:
-            w.add("hslo.csv", system=SYSNAME.get(sysname, sysname), **idd, **r, lifetime=life, source_dir=part)
+            w.add("hslo.csv", system=SYSNAME.get(sysname, sysname), **idd, **r, lifetime=life,
+                  source_config_sha256=src_sha, source_dir=part)
         c = sm.get("confirm") or {}
         for r in at_max(rows):
             w.add("hosts-at-max.csv", system=SYSNAME.get(sysname, sysname), **idd, **r,
                   result_x=fl(c.get("x_mean")) if sm.get("confirmed") is True else None,
                   confirm_x_mean=fl(c.get("x_mean")), confirm_x_sd=fl(c.get("x_sd")), confirmed=sm.get("confirmed"),
-                  note=sm.get("note", ""), lifetime=life, source_dir=part)
+                  note=sm.get("note", ""), lifetime=life, source_config_sha256=src_sha, source_dir=part)
     cdir = os.path.join(a.evidence, "cdf")
     if a.source == "h3" and os.path.isdir(cdir):
         rows, tot = cdf_rows(cdir)
-        rate = None
+        rate = mod = None
         if os.path.isfile(os.path.join(cdir, "cdf-rate.txt")):
-            mm = re.search(r"confirm_x_mean ([0-9.]+)", open(os.path.join(cdir, "cdf-rate.txt")).read())
+            with open(os.path.join(cdir, "cdf-rate.txt")) as f:
+                mm = re.search(r"max_offered_x_pass ([0-9.]+)", f.read())
             rate = float(mm.group(1)) if mm else None
+        if os.path.isfile(os.path.join(cdir, "cdf-setup.txt")):
+            with open(os.path.join(cdir, "cdf-setup.txt")) as f:
+                mm = re.search(r"pfn_mod=(\d+)", f.read())
+            mod = int(mm.group(1)) if mm else None
         for r in rows:
-            w.add("cdf.csv", system="pop", nodes=nodes, **r, **tot, rate_x=rate, source_dir=cdir)
+            w.add("cdf.csv", system="pop", nodes=nodes, **r, **tot, pfn_mod=mod, offered_x=rate,
+                  source_config_sha256=src_sha, source_dir=cdir)
         if tot and not tot["complete"]:
             warn.append(f"cdf: Dropped = {tot['dropped']} (hist map full; incomplete CDF)")
     n = w.write(a.out)
