@@ -4,7 +4,9 @@
 # SYSTEMS one server lifetime with ONE aggregate SLO search (HSLO): the offered TOTAL read-op rate is split evenly over
 # the serving VMs, same SLO, ramp, confirm and overload rules as the 2-VM run sets, result = aggregate max under the
 # SLO; per-step Popcorn counters of every VM are recorded (stats snapshots) for the fault figure at the result.
-# CDF=1 adds one Popcorn lifetime at this block's Popcorn max-under-SLO rate with the kprobe hist (h3-cdf.sh).
+# CDF=1 adds one Popcorn lifetime at this block's Popcorn max-under-SLO rate RT (its max_offered_x_pass) with the
+# kprobe hist (h3-cdf.sh), both workloads: [RecSys: the usual 1 q/s warm-up] -> part settle (CDF_S at RT) -> h3 gate ->
+# hist clear -> part cdf (CDF_S at RT) -> hist dump while the servers are up -> stop (vector DB: run.sh part hooks).
 # Called by experiments/eval/runset-h3-{vdb,rs}.sh (never by hand in a real run).
 # usage: h3-block.sh <evidence dir (exists; empty except sequence*)>
 # env (all workloads): H3_WL (vdb | recsys), H3_N (2..8, divides H3_TOTAL_VCPU), H3_TOTAL_VCPU (32), SYSTEMS ("hw pop"
@@ -45,8 +47,10 @@ TV=${H3_TOTAL_VCPU:-32} N=$H3_N
 [[ $N =~ ^[2-8]$ ]] && [ $((TV % N)) = 0 ] || die "H3_N must be 2..8 and divide H3_TOTAL_VCPU ($TV)"
 VCPU=$((TV / N))
 [[ $EVAL_RUN =~ ^[1-9]$ ]] && [[ $SEED =~ ^[0-9]+$ ]] || die "bad EVAL_RUN / SEED"
-[[ $CDF =~ ^[01]$ ]] && [[ $CDF_S =~ ^[1-9][0-9]*$ ]] && [ $((CDF_S % 2)) = 0 ] || die "bad CDF / CDF_S (even seconds)"
+[[ $CDF =~ ^[01]$ ]] && [[ $CDF_S =~ ^[1-9][0-9]*$ ]] || die "bad CDF / CDF_S"
 [[ $RECV_MODE =~ ^(poll|idle|sleep)$ ]] || die "bad RECV_MODE"
+export H3_CDF_PFN_MOD=${H3_CDF_PFN_MOD:-1}   # kprobe hist page sampling (h3-cdf.sh; 1 = off, user decision pending)
+bash "$CDFS" filter > /dev/null || die "bad H3_CDF_PFN_MOD (power of two, 1 = off)"
 for s in $SYSTEMS; do case $s in hw|pop) ;; mg) die "Megalon in H3 needs Megalon builds with LOGICAL_NODE_NUM = $N (RUN-H3.md, 'Megalon')";; *) die "bad system $s";; esac; done
 [ "$CDF" = 0 ] || [[ " $SYSTEMS " == *" pop "* ]] || die "CDF=1 needs pop in SYSTEMS (the rate is Popcorn's max under the SLO)"
 [ -f "$REGION" ] && [ "$(sha256sum < "$C8/packet.sha256" | cut -c1-64)" = "$POP_BUNDLE_SHA" ] \
@@ -181,6 +185,7 @@ trap finish EXIT
 trap 'log "BLOCK STOP signal"; exit 130' INT TERM HUP
 gate() { bash "$HG" check "$E/gate-$1.txt" > /dev/null || stop "h3 gate ($1; see gate-$1.txt)"; }
 { echo "# H3 block $OWNER: $H3_WL N=$N vcpu/VM=$VCPU order [$ORDER] cdf=$CDF cdf_s=$CDF_S seed=$SEED"
+  echo "cdf_pfn_mod=$H3_CDF_PFN_MOD cdf_filter=[$(bash "$CDFS" filter)]"
   echo "nodes=${IPS[*]} domains=${DOMS[*]} server_args=[$SA] app_hwcc=$APP ring=$RING region_sha256=$(sha256sum < "$REGION" | cut -c1-64)"
   echo "host_server=$HOSTSRV sha256=$(sha256sum < "$HOSTSRV" | cut -c1-64) loadgen=$LOADGEN sha256=$(sha256sum < "$LOADGEN" | cut -c1-64)"
   [ $H3_WL = vdb ] && echo "writes=$X_WRITES sha256=$(sha256sum < "$X_WRITES" | cut -c1-64) U=$U"
@@ -208,8 +213,8 @@ for i in "${!IPS[@]}"; do
 done
 for i in "${!IPS[@]}"; do c=$(dmesg_count $i) || stop "dmesg baseline vm$i"; echo "$c" > "$E/dmesg-base-vm$i.txt"; done
 DMESG_DONE=1
-if [ $H3_WL = vdb ]; then printf '# name\tsystem\tnodes\tvcpus_per_vm\tresult_x\tconfirm_x_mean\tconfirmed\tnote\trun_dir\n' > "$E/h3-results.tsv"
-else printf '# name\tsystem\tnodes\tvcpus_per_vm\tresult_x\tconfirm_x_mean\tconfirmed\tnote\trun_dir\tstreamcheck\n' > "$E/h3-results.tsv"; fi
+if [ $H3_WL = vdb ]; then printf '# name\tsystem\tnodes\tvcpus_per_vm\tmax_offered_x_pass\tconfirm_x_mean\tconfirmed\tnote\trun_dir\n' > "$E/h3-results.tsv"
+else printf '# name\tsystem\tnodes\tvcpus_per_vm\tmax_offered_x_pass\tconfirm_x_mean\tconfirmed\tnote\trun_dir\tstreamcheck\n' > "$E/h3-results.tsv"; fi
 echo "$ORDER" > "$E/order.txt"
 OWNED=root
 # ---- Popcorn cxl_shm cycle (P-popcorn-deploy §6a, init_state=shared) on the N guests -------------------------------
@@ -256,23 +261,29 @@ sys_up() {  # <sys> <name>: dax owner + Popcorn cycle
     pop) pop_up "$2";;
   esac
 }
+# loadgen arguments of the CDF settle and cdf parts (both workloads): one CDF_S window at the CDF rate
+cdf_args() { echo "--mode fixed --rates $1 --warmup-s 10 --step-warmup-s 0 --step-measure-s $CDF_S --drain-s 10"; }
 # ---- vector DB lifetime: run.sh (N nodes, PARTS) with the H1 SLO part arguments --------------------------------------
-vdb_life() {  # <sys> <name> <parts: slo | cdf> [<cdf total rate>]
-  local s=$1 name=$2 parts=$3 R=$E/$2 k L RP note
+vdb_life() {  # <sys> <name> <kind: slo | cdf> [<cdf offered rate>]
+  local s=$1 name=$2 kind=$3 R=$E/$2 k L RP note parts=slo
+  [ $kind = slo ] || parts="settle cdf"
   local LG=(--opt data=$X_DATA --opt writes=$X_WRITES --opt k=10 --mix "update=$U,search=$((100 - U))" --slo search:99:100 --x-stream search --raw)
   local RE=(SYSTEM=$([ $s = pop ] && echo Popcorn-$RECV_MODE || echo all-HWcc) V=$V HOST_SERVER=$HOSTSRV LOADGEN=$LOADGEN INIT=$INIT
-    READY_TIMEOUT=5400 RUN_KIND=measurement TRACE=0 STATS_OP=10 NODE_ENV= PARTS=$parts H1_MEASURE_RUN=1 MEASURE_PART_DIR=$MEASURE_PART_DIR
+    READY_TIMEOUT=5400 RUN_KIND=measurement TRACE=0 STATS_OP=10 NODE_ENV= "PARTS=$parts" H1_MEASURE_RUN=1 MEASURE_PART_DIR=$MEASURE_PART_DIR
     "SERVER_ARGS=$SA$([ $s = pop ] && echo ' --preloaded')"
     "PART_ARGS_slo=--mode slo --start 10 --factor 1.5 --precision 0.02 --confirm-precision 0.01 --max-confirm-probes 6 --confirm-step-down 0.05 --max-steps 25 --warmup-s 10 --step-warmup-s 3 --step-measure-s 15 --confirm-s 30 --confirm-reps 3"
     PART_SEED_slo=$SEED
-    "PART_ARGS_cdf=--mode fixed --rates @RATES@ --warmup-s 10 --step-warmup-s 0 --step-measure-s $((CDF_S / 2)) --drain-s 10"
-    PART_SEED_cdf=$((SEED + 2)) "PART_RATES_CMD=bash $CDFS clear $E/cdf ${4:-0}")
+    "PART_GATE_CMD=bash $HG check")   # between parts: the N-VM gate (run.sh part hook), never the 2-VM h1-gate.sh
+  # CDF lifetime (verifier M1): part settle (CDF_S at the CDF rate) -> gate -> hist clear (PART_PRE_CMD) -> part cdf
+  # (CDF_S at the same rate) -> hist dump (PART_POST_CMD) while the servers are still up
+  [ $kind = slo ] || RE+=("PART_ARGS_settle=$(cdf_args "$4")" PART_SEED_settle=$((SEED + 3)) "PART_ARGS_cdf=$(cdf_args "$4")"
+    PART_SEED_cdf=$((SEED + 2)) "PART_PRE_CMD=bash $CDFS part-pre $E/cdf" "PART_POST_CMD=bash $CDFS part-post $E/cdf")
   gate $name; sys_up $s $name
   servers_gone || stop "a vdb-server runs before $name"
   log "$name: run.sh parts [$parts] ($s, N=$N)"
   env "${RE[@]}" bash $XV/run.sh "$name" "$E" -- "${LG[@]}" > "$E/$name.out" 2>&1; local rc=$?
   log "$name: run.sh rc $rc: $(tail -n 1 "$E/$name.out")"
-  [ $parts = cdf ] && { bash $CDFS dump "$E/cdf" >> "$E/block.log" 2>&1 || stop "cdf dump"; }
+  [ $kind = slo ] || { grep -q "CDF DUMP PASS" "$R/part-hooks.txt" 2>/dev/null || stop "$name: no CDF DUMP PASS (see $R/part-hooks.txt)"; }
   [ $s = pop ] && pop_down
   servers_gone || stop "servers left after $name"
   [ -d "$R" ] || stop "$name: no run dir"
@@ -283,7 +294,8 @@ vdb_life() {  # <sys> <name> <parts: slo | cdf> [<cdf total rate>]
     [ $s != pop ] || grep -qE "^vdb-server: op coherence on, popcorn source swmc_acct[ ,]" $L || stop "$name node$k: popcorn source != swmc_acct"
     { grep -qx "opcoh.read_errors=0" $L && grep -qx "opcoh.register_errors=0" $L; } || stop "$name node$k: opcoh errors"
   done
-  RP=$R/$parts note=""
+  for RP in $(for p in $parts; do echo $R/$p; done); do
+  note=""
   [ -s $RP/loadgen/summary.json ] || stop "$name: no loadgen output"
   grep -q '"reason":"stream [a-z]* exhausted' $RP/loadgen/steps.jsonl && stop "$name: writes file exhausted"
   { grep -qx "ok_without_coh=0" $RP/loadgen/vectordb.txt && grep -qx "updates_ok_without_coh=0" $RP/loadgen/vectordb.txt &&
@@ -296,10 +308,11 @@ vdb_life() {  # <sys> <name> <parts: slo | cdf> [<cdf total rate>]
   grep -q 'workload_finish":"ok' $RP/loadgen/summary.json || stop "$name: loadgen workload finish"
   note=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["note"])' $RP/loadgen/summary.json 2>/dev/null)
   if [ -n "$note" ]; then
-    [ $parts = slo ] && [ "$note" = "confirm failed at three rates; the knee is noisy (longer --confirm-s?)" ] || stop "$name: loadgen note: $note"
+    [ $kind = slo ] && [ "$note" = "confirm failed at three rates; the knee is noisy (longer --confirm-s?)" ] || stop "$name: loadgen note: $note"
     log "$name NOTE: $note"
   elif [ $rc != 0 ]; then stop "$name: run.sh rc $rc"; fi
-  [ $parts = slo ] && python3 -I -c 'import json,sys
+  done
+  [ $kind = slo ] && python3 -I -c 'import json,sys
 s=json.load(open(sys.argv[1])); c=s.get("confirm",{}); f=lambda v: "" if v is None else str(v)
 print("\t".join(sys.argv[2:6] + [f(s.get("max_offered_x_pass")), f(c.get("x_mean")), f(s.get("confirmed")), s.get("note",""), sys.argv[6]]))' \
     $RP/loadgen/summary.json "$name" $s $N $VCPU "$name/slo" >> "$E/h3-results.tsv"
@@ -344,12 +357,15 @@ rs_life() {  # <sys> <name> <slo | cdf> [<cdf query rate>]
 s=json.load(open(sys.argv[1])); c=s.get("confirm",{}); f=lambda v: "" if v is None else str(v)
 print("\t".join(sys.argv[2:6] + [f(s.get("max_offered_x_pass")), f(c.get("x_mean")), f(s.get("confirmed")), s.get("note",""), sys.argv[6], sys.argv[7]]))' \
       "$S/slo/loadgen/summary.json" "$name" $s $N $VCPU "$name/slo" "$(echo "$sc" | cut -d' ' -f2)" >> "$E/h3-results.tsv"
-  else
+  else  # CDF lifetime (verifier M1; same structure as the vector DB): settle -> gate -> clear -> cdf -> dump (servers up)
+    # shellcheck disable=SC2046
+    rs_measure "$S" settle "${LGC[@]}" --opt seed=$((SEED + 3)) --seed $((SEED + 3)) --raw $(cdf_args "$4") || stop "$name settle rc $?"
     gate "$name-cdf"
-    bash $CDFS clear "$E/cdf" "$4" > /dev/null || stop "cdf clear"
-    rs_measure "$S" cdf "${LGC[@]}" --opt seed=$((SEED + 2)) --seed $((SEED + 2)) --raw --mode fixed --rates "$4,$4" \
-      --warmup-s 10 --step-warmup-s 0 --step-measure-s $((CDF_S / 2)) --drain-s 10 || stop "$name cdf rc $?"
+    bash $CDFS clear "$E/cdf" >> "$E/block.log" 2>&1 || stop "cdf clear"
+    # shellcheck disable=SC2046
+    rs_measure "$S" cdf "${LGC[@]}" --opt seed=$((SEED + 2)) --seed $((SEED + 2)) --raw $(cdf_args "$4") || stop "$name cdf rc $?"
     bash $CDFS dump "$E/cdf" >> "$E/block.log" 2>&1 || stop "cdf dump"
+    python3 $XR/stream_check.py "$S/settle" > "$S/settle/stream-check.txt" 2>&1
     python3 $XR/stream_check.py "$S/cdf" > "$S/cdf/stream-check.txt" 2>&1
   fi
   bash $XR/session.sh stop "$S" > "$S.stop.out" 2>&1 || stop "$name session stop / final checks: $(tail -n 2 "$S.stop.out" | tr '\n' ' ')"
@@ -364,15 +380,21 @@ for s in $ORDER; do
 done
 if [ "$CDF" = 1 ]; then  # Popcorn lifetime at this block's Popcorn max under the SLO, kprobe hist on every VM
   row=$(awk -F'\t' '!/^#/ && $2 == "pop"' "$E/h3-results.tsv" | tail -n 1)
-  X=$(echo "$row" | cut -f6) CONF=$(echo "$row" | cut -f7)
-  if [ "$CONF" != True ] || ! [[ $X =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
+  RT=$(echo "$row" | cut -f5) CONF=$(echo "$row" | cut -f7)
+  if [ "$CONF" != True ] || ! [[ $RT =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
     log "CDF NOTE: no confirmed Popcorn result at N=$N ($row): CDF pass skipped"
   else
     mkdir -p "$E/cdf"
-    if [ $H3_WL = vdb ]; then RT=$(python3 -I -c 'import sys; print(round(float(sys.argv[1]) * 100 / (100 - int(sys.argv[2])), 3))' "$X" "$U")
-    else RT=$(python3 -I -c 'import sys; print(round(float(sys.argv[1]), 3))' "$X"); fi
-    echo "cdf rate: Popcorn confirm_x_mean $X read ops/s at N=$N -> offered $RT (total requests/s for the vector DB mix u$U)" | tee "$E/cdf/cdf-rate.txt"
-    log "== CDF pop n$N at $RT"
+    # verifier L2: the CDF rate is the offered rate of the result (loadgen max_offered_x_pass: the vector DB total
+    # request rate of the mix, the RecSys query rate), not a rate converted from achieved ops
+    echo "cdf rate: Popcorn max_offered_x_pass $RT at N=$N (offered rate of the confirmed result; loadgen --rates units)" | tee "$E/cdf/cdf-rate.txt"
+    # verifier M2 (behaviour unchanged): upper bound of distinct I->S pages per VM in the CDF part from the Popcorn
+    # SLO lifetime's at_result counters, against the 2^17-entry hist map; H3_CDF_PFN_MOD (default 1 = off) is applied
+    # by h3-cdf.sh setup and recorded in cdf-setup.txt
+    python3 -I -B $EV/h3_cdf_estimate.py "$E/pop-n$N/slo" --nodes $N --window-s $((CDF_S + 20)) --pfn-mod "${H3_CDF_PFN_MOD:-1}" \
+      > "$E/cdf/cdf-estimate.txt" 2>&1 || log "CDF NOTE: estimate failed (see cdf/cdf-estimate.txt)"
+    log "cdf estimate: $(tail -n 1 "$E/cdf/cdf-estimate.txt")"
+    log "== CDF pop n$N at $RT (pfn_mod ${H3_CDF_PFN_MOD:-1})"
     bash $CDFS setup "$E/cdf" >> "$E/block.log" 2>&1 && CDFUP=1 || { CDFUP=1; stop "cdf setup"; }
     if [ $H3_WL = vdb ]; then vdb_life pop pop-n$N-cdf cdf "$RT"; else rs_life pop pop-n$N-cdf cdf "$RT"; fi
     bash $CDFS teardown "$E/cdf" >> "$E/block.log" 2>&1 || stop "cdf teardown"
