@@ -26,7 +26,7 @@ def decide(B, rates, slo):
         name, step = w[0][0], int(w[0][5])
         with open(os.path.join(B, name, "fix", "loadgen", "steps.jsonl")) as f:
             st = {d["step"]: d for d in (json.loads(l) for l in f if l.strip())}
-        p95 = st[step]["streams"]["query"]["p95_ms"]
+        p95 = float(st[step]["streams"]["query"]["p95_ms"])   # loadgen writes "inf" when no query completed
         ok = p95 <= slo and w[0][6] == "1"
         out.append([rate, "slo" if ok else "fix", str(p95), w[0][6],
                     f"probe {name} step {step} (rule: p95 <= {slo:g} ms and valid)"])
