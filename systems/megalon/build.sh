@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
 # Build one Megalon flavor out of tree (De Stijl 2-VM port).
 #
-#   systems/megalon/build.sh <flavor> <n> [-j N] [--no-tests] [--wmeta artifact64|rev64|packed4]
+#   systems/megalon/build.sh <flavor> <n> [-j N] [--no-tests] [--wmeta artifact64|rev64|packed4] [--nodes N]
 #     flavor: megalon (SCR + LIMITED_SCR) | hwcc (FULL_COHERENCE; also used for popcorn)
+#     nodes:  Megalon node (VM) count, 2..15 (default 2). N != 2 needs a source with the build-time node count
+#             (branch megalon-n: CMake MEGALON_NODES, cargo env MEGALON_NODES); refused on an older source.
 #     wmeta:  HWcc record layout; artifact64 (default, upstream 64 B/record) | packed4 (paper's 4 B record;
 #             with flavor megalon the owner key moves to the NR replica, nr feature wmeta-rev) | rev64
 #             (packed4's owner-key path, 64 B per record; measurement control for false sharing)
@@ -22,21 +24,31 @@ set -euo pipefail
 
 ROOT=/home/comsys/sungsu/destijl-control
 SRC=${MEGALON_SRC:-$ROOT/CXL_SWMC/systems/megalon/src}   # MEGALON_SRC: e.g. a worktree of the submodule
+# CXL_SWMC tree this script belongs to (the live tree or a worktree of it); systems/common comes from it
+CXL_TREE=$(cd "$(dirname "$(realpath "$0")")/../.." && pwd)
 T=$ROOT/workspaces/toolchain
 TOOLCHAIN_FILE=$SRC/cmake-variant/toolchains/clang17-gcc.cmake
 
-usage() { echo "usage: $0 <megalon|hwcc> <n> [-j N] [--no-tests] [--wmeta artifact64|rev64|packed4]" >&2; exit 2; }
+usage() { echo "usage: $0 <megalon|hwcc> <n> [-j N] [--no-tests] [--wmeta artifact64|rev64|packed4] [--nodes N]" >&2; exit 2; }
 [ $# -ge 2 ] || usage
 FLAVOR=$1; N=$2; shift 2
-JOBS=60; RUN_TESTS=1; WMETA=artifact64
+JOBS=60; RUN_TESTS=1; WMETA=artifact64; NODES=2
 while [ $# -gt 0 ]; do
     case $1 in
         -j) JOBS=$2; shift 2 ;;
         --no-tests) RUN_TESTS=0; shift ;;
         --wmeta) [ $# -ge 2 ] || usage; WMETA=$2; shift 2 ;;
+        --nodes) [ $# -ge 2 ] || usage; NODES=$2; shift 2 ;;
         *) usage ;;
     esac
 done
+[[ $NODES =~ ^[0-9]+$ ]] && [ "$NODES" -ge 2 ] && [ "$NODES" -le 15 ] || { echo "--nodes must be 2..15" >&2; exit 2; }
+# a source without the build-time node count has LOGICAL_NODE_NUM fixed in constants.h / constants.rs
+NODES_PARAM=0
+grep -q 'MEGALON_NODES' "$SRC/CMakeLists.txt" && grep -q 'MEGALON_NODES' "$SRC/third-party/nr_rust/ffi/build.rs" && NODES_PARAM=1
+if [ "$NODES_PARAM" = 0 ] && [ "$NODES" != 2 ]; then
+    echo "source $SRC has no build-time node count (MEGALON_NODES); --nodes $NODES refused" >&2; exit 1
+fi
 case $FLAVOR in
     megalon) NR_FEATURES="scr"; NR_RUSTFLAGS="-C target-feature=+clflushopt" ;;
     hwcc)    NR_FEATURES="";    NR_RUSTFLAGS="" ;;
@@ -63,12 +75,19 @@ if [ -f "$OUT/CMakeCache.txt" ]; then
         echo "builds/megalon/$N already holds wmeta layout '${prevw:-artifact64}'; use another build number" >&2
         exit 1
     fi
+    prevn=$(sed -n 's/^MEGALON_NODES:STRING=//p' "$OUT/CMakeCache.txt")
+    if [ "${prevn:-2}" != "$NODES" ]; then
+        echo "builds/megalon/$N already holds a ${prevn:-2}-node build; use another build number" >&2
+        exit 1
+    fi
 fi
 exec > >(tee "$OUT/build.log") 2>&1
 
 # shellcheck disable=SC1091
 . "$T/env.sh"
-echo "== megalon build: flavor=$FLAVOR wmeta=$WMETA n=$N out=$OUT jobs=$JOBS $(date -Is)"
+echo "== megalon build: flavor=$FLAVOR wmeta=$WMETA nodes=$NODES n=$N out=$OUT jobs=$JOBS $(date -Is)"
+# cargo (build.rs) and cargo test read the node count from the environment; unset = 2
+if [ "$NODES_PARAM" = 1 ]; then export MEGALON_NODES=$NODES; else unset MEGALON_NODES; fi
 
 # ---- provenance ----
 COMMIT=$(git -C "$SRC" rev-parse HEAD)
@@ -92,7 +111,7 @@ echo "== cargo build (features='$NR_FEATURES')"
 ( cd "$SRC/third-party/nr_rust/ffi" &&
   CARGO_TARGET_DIR=$NR_TARGET RUSTFLAGS="$NR_RUSTFLAGS" cargo build --release "${feat_args[@]}" )
 [ -f "$NR_LIB" ] || { echo "missing $NR_LIB" >&2; exit 1; }
-printf 'features=%s\nflavor=%s\nwmeta=%s\nbuild_id=%s\n' "$NR_FEATURES" "$FLAVOR" "$WMETA" "$BUILD_ID" > "$NR_LIB.features"
+printf 'features=%s\nflavor=%s\nwmeta=%s\nbuild_id=%s\nnodes=%s\n' "$NR_FEATURES" "$FLAVOR" "$WMETA" "$BUILD_ID" "$NODES" > "$NR_LIB.features"
 
 NR_TESTS="not run"
 ENTRY_SIZE=unknown
@@ -114,13 +133,16 @@ fi
 
 # ---- C++ (cmake, out of tree) ----
 echo "== cmake configure"
+nodes_args=()
+[ "$NODES_PARAM" = 1 ] && nodes_args=(-DMEGALON_NODES="$NODES")
 cmake -S "$SRC" -B "$OUT" \
     -DCMAKE_TOOLCHAIN_FILE="$TOOLCHAIN_FILE" \
     -DCMAKE_BUILD_TYPE=Release \
     -DMEGALON_FLAVOR="$FLAVOR" \
     -DMEGALON_WMETA_LAYOUT="$WMETA" \
     -DMEGALON_NR_LIB="$NR_LIB" \
-    -DMEGALON_BUILD_ID="$BUILD_ID" -DCXL_COMMON_DIR="$ROOT/CXL_SWMC/systems/common" -DMEGALON_DEPS_DIR="$ROOT/CXL_SWMC/systems/megalon/src/third-party" > "$OUT/cmake.log" 2>&1 || { tail -40 "$OUT/cmake.log"; exit 1; }
+    "${nodes_args[@]}" \
+    -DMEGALON_BUILD_ID="$BUILD_ID" -DCXL_COMMON_DIR="$CXL_TREE/systems/common" -DMEGALON_DEPS_DIR="$ROOT/CXL_SWMC/systems/megalon/src/third-party" > "$OUT/cmake.log" 2>&1 || { tail -40 "$OUT/cmake.log"; exit 1; }
 grep -E 'MEGALON_FLAVOR=|linking nr lib' "$OUT/cmake.log" || true
 echo "== build"
 cmake --build "$OUT" -j "$JOBS" > "$OUT/make.log" 2>&1 || { grep -E 'error|Error' "$OUT/make.log" | head -40; exit 1; }
@@ -154,10 +176,19 @@ done
 
 maxver() { objdump -T "$1" 2>/dev/null | grep -oE "\b$2_[0-9]+(\.[0-9]+)*" | sort -V | tail -1; }
 NUMEXEC=$(sed -n 's/^pub const NUM_EXEC: usize = \([0-9]*\);.*/\1/p' "$SRC/third-party/nr_rust/ffi/constants.rs")
-LNN_RS=$(sed -n 's/^pub const LOGICAL_NODE_NUM: usize = \([0-9]*\);.*/\1/p' "$SRC/third-party/nr_rust/ffi/constants.rs")
 KEY_RS=$(sed -n 's/^pub const KEY_SIZE: usize = \([0-9]*\);.*/\1/p' "$SRC/third-party/nr_rust/ffi/constants.rs")
-LNN_H=$(sed -n 's/^#define LOGICAL_NODE_NUM \([0-9]*\).*/\1/p' "$SRC/src/common/constants.h")
 cache() { sed -n "s/^$1:[A-Z]*=//p" "$OUT/CMakeCache.txt"; }
+if [ "$NODES_PARAM" = 1 ]; then
+    # Rust: the value the library was compiled with (port tests print it; else the env given to cargo);
+    # C++: the cmake cache value (constants.h default 2 unless -DLOGICAL_NODE_NUM)
+    LNN_RS=$(sed -n 's/.*LOGICAL_NODE_NUM=\([0-9]*\) NR_LOG_ENTRY_SIZE=.*/\1/p' "$OUT/nr_tests.log" 2>/dev/null | head -1)
+    LNN_RS=${LNN_RS:-$MEGALON_NODES}
+    LNN_H=$(cache MEGALON_NODES)
+else
+    LNN_RS=$(sed -n 's/^pub const LOGICAL_NODE_NUM: usize = \([0-9]*\);.*/\1/p' "$SRC/third-party/nr_rust/ffi/constants.rs")
+    LNN_H=$(sed -n 's/^#define LOGICAL_NODE_NUM \([0-9]*\).*/\1/p' "$SRC/src/common/constants.h")
+fi
+[ "$LNN_RS" = "$NODES" ] && [ "$LNN_H" = "$NODES" ] || { echo "node count mismatch: rust=$LNN_RS c++=$LNN_H wanted=$NODES" >&2; exit 1; }
 
 # ---- manifest ----
 M=$OUT/manifest.txt
@@ -190,6 +221,8 @@ M=$OUT/manifest.txt
     echo "constants_rs_NUM_EXEC=$NUMEXEC"
     echo "constants_rs_KEY_SIZE=$KEY_RS"
     echo "constants_h_LOGICAL_NODE_NUM=$LNN_H"
+    echo "megalon_nodes=$NODES"
+    echo "cxl_tree=$CXL_TREE"
     echo "runpath_setting=$(cache MEGALON_RUNPATH)"
     for f in "$SHIP"/bin/* "$SHIP"/lib/*; do
         rel=${f#"$SHIP"/}
