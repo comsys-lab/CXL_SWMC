@@ -5,8 +5,8 @@
 # object_arena_size must hold every object: 28M ids, 32 segments, 82 groups, 32 MiB chunks, per-node delete logs
 # (max-deletes 1048576: 256 chunks x 256 KiB per node): object_bytes = 94410596352 + 8 x 67108864 = 94947467264 B
 # (88.43 GiB, 7296 objects) of 96636764160 (90 GiB).
-# NR log: 64 MiB -> 262144 entries of 256 B, half the entry count of 2 and 4 VMs (524288). nr_log_size: 128MB would
-# keep 524288 entries (128 MiB of SWcc, still fits); open decision, see workspaces/megalon-n/PROGRESS.md.
+# NR log: 128 MiB -> 524288 entries of 256 B, the same entry count as 2 and 4 VMs (64 MiB would halve it); 128 MiB of
+# SWcc still fits (main session decision 2026-10-20, equal log capacity across N).
 mount_directory: /mydata        # required by the config parser; unused
 key_space: 10000
 slots: 10240
@@ -17,7 +17,7 @@ reinit: false                   # node 0: MEGALON_REINIT=1
 attach_mprotect: true
 stuck_timeout_ms: 10000
 log_sync_interval_us: 100
-nr_log_size: 64MB
+nr_log_size: 128MB
 attach_timeout_s: 600
 start_barrier_timeout_s: 600
 object_arena_size: 90GB
