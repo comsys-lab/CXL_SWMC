@@ -31,7 +31,8 @@ if not os.path.exists(REG):
 COLS = ["workload", "runset", "k", "evidence_dir", "config_sha256", "status", "date", "note"]
 STATUS = ("started", "measured", "stopped", "accepted", "invalid")
 WORKLOADS = {"vdb": ("vdb",), "recsys": ("rs-main", "rs-h1")}
-H3_RUNSET = {"vdb": re.compile(r"h3-vdb-n[2-8]"), "recsys": re.compile(r"h3-rs-n[2-8]")}  # H3 run set per N (RUN-H3.md)
+# H3 run set per N (RUN-H3.md); new H2 vector DB VM-count scaling per N (h2n-n<N>, RUN-H2N.md)
+H3_RUNSET = {"vdb": re.compile(r"h3-vdb-n[2-8]|h2n-n[2-8]"), "recsys": re.compile(r"h3-rs-n[2-8]")}
 
 
 def valid_runset(w, rs):

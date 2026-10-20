@@ -37,7 +37,8 @@ done
 [ -z "$VER" ] || [[ $VER =~ ^[1-9][0-9]*$ ]] || die "bad --v"
 case $WL in vdb) CSHA=$CONFIG_SHA256_VDB;; recsys) CSHA=$CONFIG_SHA256_RECSYS;; *) die "bad WL";; esac
 # H3 drivers (runset-h3-*.sh) set CONF_WL=h3-vdb | h3-recsys: config_sha256 and the manifest dump over WL + H3_* keys
-case ${CONF_WL:-} in "") CONF_WL=$WL;; h3-vdb) CSHA=$CONFIG_SHA256_H3_VDB;; h3-recsys) CSHA=$CONFIG_SHA256_H3_RECSYS;; *) die "bad CONF_WL";; esac
+case ${CONF_WL:-} in "") CONF_WL=$WL;; h3-vdb) CSHA=$CONFIG_SHA256_H3_VDB;; h3-recsys) CSHA=$CONFIG_SHA256_H3_RECSYS;;
+  h2n) CSHA=$CONFIG_SHA256_H2N;; *) die "bad CONF_WL";; esac
 REG="python3 -I -B $EVD/registry.py"
 [ -z "${REGISTRY:-}" ] || REG="env EVAL_REGISTRY=$REGISTRY $REG"
 plan() { echo "PLAN ($RUNSET run $K): $*"; }

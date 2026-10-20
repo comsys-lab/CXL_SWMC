@@ -17,6 +17,8 @@ is an existing file (region file, Megalon configs, loadgen binary), so a changed
 H3 run sets (RUN-H3.md): config_sha256(h3-vdb) / config_sha256(h3-recsys) = the same over the workload's keys plus the
 H3_* keys; H3_* keys are never part of the vdb / recsys hashes (so adding H3 left the 2-VM hashes unchanged).
 `shell` also prints CONFIG_SHA256_H3_VDB and CONFIG_SHA256_H3_RECSYS; `sha` / `dump` accept h3-vdb and h3-recsys.
+New H2 (vector DB VM-count scaling, h2n.conf, RUN-H2N.md): config_sha256(h2n) = the vdb keys plus the H2N_* keys;
+H2N_* keys are never part of the vdb / recsys / H3 hashes (CONFIG_SHA256_H2N; `sha` / `dump` accept h2n).
 """
 import hashlib
 import os
@@ -71,8 +73,10 @@ def measurement_keys(conf, workload):
     if workload in H3:
         return sorted(measurement_keys(conf, H3[workload]) +
                       [k for k in conf if k.startswith("H3_") and k not in LATER])
+    if workload == "h2n":  # new H2 (vector DB VM-count scaling, h2n.conf): vdb keys + H2N_* (never in other hashes)
+        return sorted(measurement_keys(conf, "vdb") + [k for k in conf if k.startswith("H2N_") and k not in LATER])
     pre = PREFIX[workload]
-    other = tuple(p for w, p in PREFIX.items() if w != workload) + ("H3_",)
+    other = tuple(p for w, p in PREFIX.items() if w != workload) + ("H3_", "H2N_")
     return sorted(k for k in conf if k not in RUN_KEYS and k not in LATER and not k.startswith(other) and
                   (k.startswith(pre) or not any(k.startswith(p) for p in PREFIX.values())))
 
@@ -105,6 +109,7 @@ def main(argv):
         a["VDB_SEARCH_THREADS"], a["RS_THREADS"] = str(v - 1), str(v)
         a["CONFIG_SHA256_VDB"], a["CONFIG_SHA256_RECSYS"] = config_sha256(conf, "vdb"), config_sha256(conf, "recsys")
         a["CONFIG_SHA256_H3_VDB"], a["CONFIG_SHA256_H3_RECSYS"] = config_sha256(conf, "h3-vdb"), config_sha256(conf, "h3-recsys")
+        a["CONFIG_SHA256_H2N"] = config_sha256(conf, "h2n")
         a["P"] = P
         a["EVAL_CONF"] = os.path.abspath(path)
         a["EVAL_CONF_SHA256"] = hashlib.sha256(open(path, "rb").read()).hexdigest()

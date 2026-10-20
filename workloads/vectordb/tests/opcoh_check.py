@@ -3,6 +3,8 @@
 
 usage: opcoh_check.py <run or scratch dir> fake|megalon|none|hwcc|popcorn|megalon-vm|megalon-t0
   (host_smoke.sh scratch dirs and run.sh run dirs have the same layout: loadgen/, node<k>.log)
+  N nodes (h2n blocks, N = 2..8): OPCOH_NODES=N, else every contiguous node<k>.log from node0; server totals are
+  summed over all N nodes ("both nodes" below = every node).
   H1-HOOK v2 parts (several loadgen invocations in one server lifetime, run.sh PARTS): <dir> = one part dir
   (<lifetime>/<part>/loadgen); node<k>.log is read from <dir>, else from its parent (the lifetime dir). The server's
   totals at stop cover the whole lifetime, so the closure checks (opt.<op>.* = records' sums, one update record per
@@ -81,7 +83,25 @@ def node_log(k):
     return p if os.path.exists(p) else os.path.join(os.path.dirname(os.path.abspath(S)), f"node{k}.log")
 
 
-st = [final_stats(node_log(k)) for k in (0, 1)]
+def node_count():
+    """N servers of the lifetime: env OPCOH_NODES (the block's --nodes N), else the contiguous node<k>.log files from
+    node0 (2-VM run dirs: node0, node1). Every closure sums over all N nodes."""
+    if os.environ.get("OPCOH_NODES"):
+        n = int(os.environ["OPCOH_NODES"])
+        assert 2 <= n <= 8, "OPCOH_NODES must be 2..8"
+        missing = [k for k in range(n) if not os.path.exists(node_log(k))]
+        assert not missing, f"OPCOH_NODES={n} but no node log for nodes {missing}"
+        return n
+    n = 0
+    while os.path.exists(node_log(n)):
+        n += 1
+    assert n >= 2, "fewer than two node<k>.log files"
+    return n
+
+
+NODES = node_count()
+st = [final_stats(node_log(k)) for k in range(NODES)]
+print(f"nodes {NODES}")
 vt = dict(x.strip().split("=", 1) for x in open(os.path.join(lg, "vectordb.txt")) if "=" in x)
 c = logs["c"]
 srch, upd = logs[logs["op"] == 3], logs[logs["op"] == 4]
@@ -167,13 +187,13 @@ if mode == "hwcc":
     check(pop_zero and all((c[f] == 0).all() for f in mg_fields) and (c["c_ns"] == 0).all(), "all-HWcc: C = 0")
 elif mode == "popcorn":
     check(all(s["opcoh.pop_source"] == "swmc_acct" and s["opcoh.register_errors"] == 0 for s in st)
-          and ((c["src"] & 3) == 1).all(), "swmc_acct registered on both nodes")
+          and ((c["src"] & 3) == 1).all(), "swmc_acct registered on every node")
     meas = logs["measured"] == 1  # both sums over the measured steps only (warm-up excluded for both)
     check(int(logs["c"]["c_ns"][(logs["op"] == 4) & meas].sum()) > 0, "Popcorn update C > 0 over all measured steps")
     check(int(logs["c"]["c_ns"][(logs["op"] == 3) & meas].sum()) > 0, "Popcorn search C > 0 over all measured steps")
     check(all((c[f] == 0).all() for f in mg_fields), "no Megalon part")
 elif mode in ("megalon-vm", "megalon-t0"):
-    check(all(s["opt.meg_coh"] == 1 and s.get("opt.meg_anchor") == 1 for s in st), "CohSnap and AnchorSnap on both nodes")
+    check(all(s["opt.meg_coh"] == 1 and s.get("opt.meg_anchor") == 1 for s in st), "CohSnap and AnchorSnap on every node")
     check(((c["src"] & 12) == 12).all(), "src bits 2 and 3 on every record")
     check(pop_zero, "every Popcorn part 0 (cxl_shm unloaded)")
     check((cs["vcopy_cnt"] > 0).all() and (cs["mg_read_sections"] > 0).all(), "validation copies and read sections counted")
