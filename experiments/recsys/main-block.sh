@@ -746,6 +746,8 @@ eval_stream_rate() {  # <rate>
   for s in $(h1shuffle recsys-stream-$r $(for x in ${SYSTEMS:-hw pop}; do [ $x = mgoff ] || echo $x; done)); do
     ord="$ord $s"; [ $s = mg ] && [[ " ${SYSTEMS:-} " == *" mgoff "* ]] && ord="$ord mgoff"
   done
+  # mgoff without mg (rs-h1 fix block when mg's windows came from the probe): mgoff alone, last (rs-h1-v4 measured nothing)
+  [[ " ${SYSTEMS:-} " == *" mgoff "* && " ${SYSTEMS:-} " != *" mg "* ]] && ord="$ord mgoff"
   echo "u$r eval order:$ord (fix-only:${STREAM_FIXONLY:-none}; levels: $(eval_tokens $r | tr ' ' ',') fallback ${STREAM_FIX_FALLBACK:-none} sep ${STREAM_FIX_SEP:-1})" | tee -a "$E/order.txt"
   if [ -n "${STREAM_LEVELS:-}" ] && ! grep -q "^$r	" "$E/stream-levels.tsv" 2>/dev/null; then
     awk -v r="$r" -v f="$STREAM_LEVELS" -F'\t' '!/^#/ && $1 == r { printf "%s\t%s\t%s\tfrom %s (%s)\n", $1, $2, $3, f, $4 }' "$STREAM_LEVELS" | tail -1 >> "$E/stream-levels.tsv"
