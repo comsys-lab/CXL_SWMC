@@ -715,7 +715,14 @@ stream_fix() {  # <sys> <rate>: part fix in the current lifetime at FIXRATES (la
   rc=$?; [ $rc = 0 ] || stop "$NAME fix rc $rc"
   python3 $X/stream_check.py "$RD" > "$RD/stream-check.txt" 2>&1
   python3 $X/check_breakdown.py "$RD" > "$RD/breakdown-check.txt" 2>&1
-  grep -q "^BREAKDOWN PASS" "$RD/breakdown-check.txt" || stop "$NAME fix: $(cat "$RD/breakdown-check.txt")"
+  # a window in which no query completed has no breakdown row: it is a result (recorded with valid=0) when
+  # stream_check.py marks every window invalid (2026-10-20, rs-h1-v2: Megalon 50 samples/s, all queries timed out)
+  if ! grep -q "^BREAKDOWN PASS" "$RD/breakdown-check.txt"; then
+    grep -q "no breakdown row with queries > 0" "$RD/breakdown-check.txt" && [ -s "$RD/stream-check.csv" ] \
+      && ! awk -F, 'NR > 1 && $5 == "True"' "$RD/stream-check.csv" | grep -q . \
+      || stop "$NAME fix: $(cat "$RD/breakdown-check.txt")"
+    echo "$NAME fix: no completed query in any window, all windows invalid: recorded, not a stop" | tee -a "$RD/breakdown-check.txt"
+  fi
   python3 -I - "$RD" "$NAME" "$s" "$r" "$rates" "$FIXTOKS" >> "$E/stream-fix.tsv" 2> "$RD/fix-check.txt" <<'PY' || stop "$NAME fix: $(cat "$RD/fix-check.txt")"
 import csv, json, os, sys
 rd, name, s, r, rates, toks = sys.argv[1:7]
