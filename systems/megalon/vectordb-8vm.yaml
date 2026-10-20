@@ -3,8 +3,9 @@
 # --nodes 8. Same values as vectordb-2vm.yaml; only the node count differs.
 # Same file on every VM; node id, run id and region config come from vdb-server (--node, --run-id, --region).
 # object_arena_size must hold every object: 28M ids, 32 segments, 82 groups, 32 MiB chunks, per-node delete logs
-# (max-deletes 1048576: 256 chunks x 256 KiB per node): object_bytes = 94410596352 + 8 x 67108864 = 94947467264 B
-# (88.43 GiB, 7296 objects) of 96636764160 (90 GiB).
+# (h2n runs vdb-server --max-deletes 262144 per node, h2n.conf H2N_MG_MAXD_N8: 64 chunks x 256 KiB per node):
+# object_bytes = 94410596352 + 8 x 16777216 = 94544814080 B (88.05 GiB, 5760 objects, = the 2-VM total) of
+# 96636764160 (90 GiB); with 1048576 per node it would be 94947467264 B (88.43 GiB, 7296 objects), still fitting.
 # NR log: 128 MiB -> 524288 entries of 256 B, the same entry count as 2 and 4 VMs (64 MiB would halve it); 128 MiB of
 # SWcc still fits (main session decision 2026-10-20, equal log capacity across N).
 mount_directory: /mydata        # required by the config parser; unused

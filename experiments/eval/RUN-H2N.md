@@ -10,12 +10,15 @@ linearly with N; with coherence it scales less than all-HWcc and the gap widens 
   H2N_SLO_PART); the offered total rate is split evenly over the N VMs. No fixed-load windows, no CDF pass, no mgoff
   (C_diff needs fixed windows; `mgoff` is accepted by the block if H2N_SYSTEMS lists it).
 - Per step: stats snapshots of every VM (Popcorn fault counters, Megalon object counters), Host CXL.mem bandwidth
-  (cxl-bw-sampler.sh, started after the block's lock, stops itself at the unlock).
+  (cxl-bw-sampler.sh, started after the block's lock, stops itself at the unlock), Host CPU of each VM's QEMU emulator
+  and vhost threads, of their Host CPUs and of the loadgen (host-cpu-sampler.py, read only, 1 s, same lifetime).
 
 Files: h2n.conf (EVAL_CONF; config_sha256 = vdb keys + H2N_*), runset-h2n.sh (driver per N), h2n-block.sh (block),
 h2n_layout.py (delete-log layout per N), export_h2n.py (CSVs), cxl-bw-sampler.sh + cxl_bw.py (copies of
-workspaces/cxl-bw), test/test_export_h2n.py. Chain: workspaces/h2n/h2n-chain-v1.sh (one run k: install, switch,
-N = 2 / 4 / 8 blocks, restore, export; `--dry-run`, `--start` resume points).
+workspaces/cxl-bw), host-cpu-sampler.py, test/test_export_h2n.py. Chain: workspaces/h2n/h2n-chain-v2.sh (one run k:
+install, switch, N = 2 / 4 / 8 blocks, restore, export; `--dry-run`, `--start`, `--only-n`, `--from` resume points; a
+failed N is logged with its resume command and the chain continues; restore and export always run). Evidence:
+recovery/vdb-vm-scaling-run<k>-n<N>-v<V> (EVIDENCE_PREFIX + runset EVIDENCE_TAG n<N>).
 
 ## Delete-log layout per N (h2n_layout.py; backend.h:34-35 allocates one delete log per node)
 Total delete-log capacity is kept at the 2-VM total (2 x 1835008 entries); each VM's share of the 3,400,000 deletes
@@ -29,19 +32,22 @@ Megalon (28M capacity, VDB_MG_CAPACITY=h1): --max-deletes per node 1048576 / 524
 Writes files: N = 2 builds/vdb-inputs/3/writes-a27m-b3400k-u3400k.bin, N = 4 / 8 builds/vdb-inputs/4/*-vms4.bin,
 *-vms8.bin (same seed, ids and order; targets over N VMs; already built 2026-10-20 16:05).
 
-## Megalon per N (placeholders in h2n.conf until the megalon-n agent delivers)
+## Megalon per N (workspaces/megalon-n/build-n.sh)
 H2N_MG_LIB_N<N> (builds/megalon/<n>, manifest constants_h_LOGICAL_NODE_NUM = constants_rs_LOGICAL_NODE_NUM = N),
 H2N_MG_BUILD_N<N> (vdb-megalon build on it, shim_kind=shared), H2N_VMEG_N<N> (guest dir, installed on vm0 BEFORE the
-topology freeze: the chain's install step), H2N_MG_CFG_N<N> (Megalon config). N = 2: builds/megalon/77 +
-builds/vdb-megalon/14 + /home/comsys/vdbm14r2m + systems/megalon/vectordb-2vm.yaml. The driver refuses a real run with
+topology freeze: the chain's install step), H2N_MG_CFG_N<N> (Megalon config). Every N uses megalon 18ba703 built with
+MEGALON_NODES = N and the vdb server of CXL_SWMC 40606c074 (verifier review v1 M1): N = 2 builds/megalon/78-n2 +
+builds/vdb-megalon/15-n2 + /home/comsys/vdbm15r2m-n2 + systems/megalon/vectordb-2vm.yaml; N = 4 / 8 78-n<N> +
+15-n<N> + /home/comsys/vdbm15r2m-n<N> + vectordb-<N>vm.yaml. The driver refuses a real run with
 a placeholder for an N whose lifetime list contains mg (`--only` runs the other systems).
 
 ## Run (main session, after merging branch h2n into the live tree)
 ```
 P=/home/comsys/sungsu/destijl-control
-bash $P/workspaces/h2n/h2n-chain-v1.sh --run 1 --dry-run          # every command + estimate (H2N_DRY_CHECK=1: + runset dry starts)
-setsid nohup bash $P/workspaces/h2n/h2n-chain-v1.sh --run 1 > $P/workspaces/h2n/h2n-chain-v1-run1.log 2>&1 &
-# resume after a stop: --start N:<sys>:<mix> (e.g. 4:mg:u50), N (block from its first lifetime), N:up, restore, export
+bash $P/workspaces/h2n/h2n-chain-v2.sh --run 1 --dry-run          # every command + estimate (H2N_DRY_CHECK=1: + runset dry starts)
+setsid nohup bash $P/workspaces/h2n/h2n-chain-v2.sh --run 1 > $P/workspaces/h2n/h2n-chain-v2-run1.log 2>&1 &
+# after a restored chain with failed N: the RESUME lines of the chain log, e.g. --only-n "4" --from 4:mg:u50
+# after a chain STOP (switch / restore): --start N:<sys>:<mix>, N, N:up, restore, export
 ```
 Wall time per run (2-VM run 1 lifetimes: hw 9-12.5 min, pop 8.5-9.5 min + ~2 min cxl_shm cycle, mg SLO part ~10-15 min):
 N = 2 ~2.3 h (incl. switch 0.5 h), N = 4 ~2.1 h, N = 8 ~2.2 h, restore ~0.3 h: ~7 h.
@@ -52,9 +58,14 @@ then `EVAL_REGISTRY=$P/workspaces/eval-derived/h2n-runs.tsv python3 .../registry
 vdb/h2n-n<N>/run<k>[-all]/: steps.csv (aggregate steps), steps-n<N>-<mix>-<sys>.csv (latency-throughput per
 lifetime), steps-vm.csv (per-VM counters), summary.csv; vdb/h2n/run<k>/summary.csv, steps.csv (all N).
 summary.csv first columns: nodes, mix, system, max_under_slo_search_s (confirm x_mean, achieved searches/s over all
-VMs), faults_read, faults_write (Popcorn page faults/s, summed over VMs, mean of the confirm steps at the result),
-mg_fetch (megalon.read_retry_incoherent/s: stale copy flushed and the object re-read), mg_inval (megalon.flushes/s:
-reader stale-copy flushes + writer write-end flushes), cxl_rd_MBs, cxl_wr_MBs; then *_per_op and raw counters.
+VMs), faults_read, faults_write (Popcorn managed page faults/s, summed over VMs, mean of the confirm steps at the
+result; supersets incl. faults without a transition), coherence_events (is_faults + inv_commits: I->S + I/S->M incl.
+write-protect upgrades, per s), mg_fetch (megalon.read_retry_incoherent/s: stale copy flushed and the object re-read),
+mg_flush_writeend (megalon.flushes - read_retry_incoherent, per s: writers' write-end flushes), cxl_rd_MBs,
+cxl_wr_MBs; then *_per_op, Popcorn request wait (tx_wait_ns_per_op: instr detail only, empty at detail=0;
+msg_wait_ns_per_op / msg_wait_ns_per_round: always on), Host CPU (qemu_emu_cpu, qemu_vhost_cpu, qemu_vcpu_cpu in
+cores summed over VMs; emu_pcpu_busy_max; loadgen_cpu; lg_pcpu_busy_mean) and raw counters. export_h2n.py docstring =
+the column reference.
 
 ## Known limits
 - opcoh_check.py now reads N nodes (OPCOH_NODES); its closure has only been exercised on 2-node evidence; a FAIL is a

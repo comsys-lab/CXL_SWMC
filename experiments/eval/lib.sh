@@ -73,11 +73,11 @@ lock_free() {
     plan "MEASUREMENT.lock is held now ($(cat "$P/workspaces/MEASUREMENT.lock")): the real run would stop here"
   fi
 }
-# evidence dir: <RESULTS_ROOT>/<prefix>-run<k>-<runset>-v<N>
+# evidence dir: <RESULTS_ROOT>/<prefix>-run<k>-<tag>-v<N>, tag = EVIDENCE_TAG if the run set sets it, else <runset>
 evidence_dir() {
-  local n=${VER:-1}
-  if [ -z "$VER" ]; then while [ -e "$RESULTS_ROOT/$EVIDENCE_PREFIX-run$K-$RUNSET-v$n" ]; do n=$((n + 1)); done; fi
-  E=$RESULTS_ROOT/$EVIDENCE_PREFIX-run$K-$RUNSET-v$n
+  local n=${VER:-1} tag=${EVIDENCE_TAG:-$RUNSET}
+  if [ -z "$VER" ]; then while [ -e "$RESULTS_ROOT/$EVIDENCE_PREFIX-run$K-$tag-v$n" ]; do n=$((n + 1)); done; fi
+  E=$RESULTS_ROOT/$EVIDENCE_PREFIX-run$K-$tag-v$n
   [ ! -e "$E" ] || die "$E exists (evidence dirs are immutable; a failed attempt bumps v<N>)"
   plan "evidence dir $E (absent: OK)"
 }

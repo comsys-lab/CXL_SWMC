@@ -15,12 +15,13 @@
 #   of the current QEMU lifetimes), MEASURE_ENV_DIR MEASURE_PART_DIR (h3-gate.sh), EXPECT_DAX_UUID,
 #   VPLAIN PLAIN_BUILD LOADGEN X_DATA X_WRITES X_NB X_MAXIDS X_MAXW X_MAXD X_INIT_CAP,
 #   Megalon (only when a lifetime is mg / mgoff): MEG_BUILD VMEG MEG_CFG MEG_LIB MG_MAXD,
-#   H2N_SLO_PART (loadgen SLO part arguments), H2N_OPCOH_STRICT (0 | 1), H2N_CXLBW (0 | 1)
+#   H2N_SLO_PART (loadgen SLO part arguments), H2N_OPCOH_STRICT (0 | 1), H2N_CXLBW (0 | 1), H2N_HOSTCPU (0 | 1)
 # Order: lock -> [CXL.mem sampler] -> pretouch check (N VMs) -> h3 gate -> guest prechecks + install sha256 vs the Host
 # builds -> dmesg baseline -> lifetimes (each: h3 gate, dax owner, [Popcorn: shm load / preload / enable / recv_mode /
 # instr], run.sh part slo, checks, [teardown], dmesg check) -> pretouch check (end) -> BLOCK DONE.
 # Outputs: E/h2n-results.tsv (one row per lifetime), E/<sys>-<mix>-n<N>/ (run.sh run dir with part slo/), E/cxlbw/
-# (sampler: perf.csv, start/stop-epoch.txt), E/block.log, E/rollback.out. EXIT trap as h3-block.sh (servers stopped,
+# (sampler: perf.csv, start/stop-epoch.txt), E/hostcpu/ (host-cpu-sampler.py: samples.csv, manifest.txt), E/block.log,
+# E/rollback.out. EXIT trap as h3-block.sh (servers stopped,
 # cxl_shm teardown, dax0.0 root:root 600, final dmesg check, unlock; the sampler stops itself at the unlock).
 set -uo pipefail
 export PYTHONDONTWRITEBYTECODE=1
@@ -34,15 +35,15 @@ die() { echo "BLOCK STOP: $*"; exit 2; }
 # pending artifact (per-N Megalon build / install dir / config) is reported, not fatal, in a dry start only
 DRYB=${H2N_BLOCK_DRY:-0}
 pending() { if [ "$DRYB" = 1 ]; then echo "BLOCK DRY NOTE: $* (a real run stops here)"; else die "$*"; fi; }
-: "${H2N_N:?}" "${H2N_VCPU:?}" "${H2N_LIFETIMES:?}" "${H2N_SLO_PART:?}""${EVAL_RUN:?}" "${SEED:?}" "${REGION:?}" "${C8:?}" "${K8:?}" "${GT8:?}"
+: "${H2N_N:?}" "${H2N_VCPU:?}" "${H2N_LIFETIMES:?}" "${H2N_SLO_PART:?}" "${EVAL_RUN:?}" "${SEED:?}" "${REGION:?}" "${C8:?}" "${K8:?}" "${GT8:?}"
 : "${RECV_MODE:?}" "${POP_BUNDLE_SHA:?}" "${PRETOUCH_DIR:?}" "${MEASURE_ENV_DIR:?}" "${MEASURE_PART_DIR:?}" "${EXPECT_DAX_UUID:?}"
 : "${VPLAIN:?}" "${PLAIN_BUILD:?}" "${LOADGEN:?}" "${X_DATA:?}" "${X_WRITES:?}" "${X_NB:?}" "${X_MAXIDS:?}" "${X_MAXW:?}" "${X_MAXD:?}" "${X_INIT_CAP:?}"
-N=$H2N_N VCPU=$H2N_VCPU STRICT=${H2N_OPCOH_STRICT:-0} CXLBW=${H2N_CXLBW:-0}
+N=$H2N_N VCPU=$H2N_VCPU STRICT=${H2N_OPCOH_STRICT:-0} CXLBW=${H2N_CXLBW:-0} HOSTCPU=${H2N_HOSTCPU:-0}
 [[ $N =~ ^[2-8]$ ]] || die "H2N_N must be 2..8"
 [[ $VCPU =~ ^[2-9]$|^[1-9][0-9]$ ]] || die "bad H2N_VCPU"
 [[ $EVAL_RUN =~ ^[1-9]$ ]] && [[ $SEED =~ ^[0-9]+$ ]] || die "bad EVAL_RUN / SEED"
 [[ $RECV_MODE =~ ^(poll|idle|sleep)$ ]] || die "bad RECV_MODE"
-[[ $STRICT =~ ^[01]$ ]] && [[ $CXLBW =~ ^[01]$ ]] || die "bad H2N_OPCOH_STRICT / H2N_CXLBW"
+[[ $STRICT =~ ^[01]$ ]] && [[ $CXLBW =~ ^[01]$ ]] && [[ $HOSTCPU =~ ^[01]$ ]] || die "bad H2N_OPCOH_STRICT / H2N_CXLBW / H2N_HOSTCPU"
 [[ $X_MAXD =~ ^[1-9][0-9]*$ ]] || die "bad X_MAXD"
 # lifetimes: <sys>:<mix>, no repeats
 LIVES=() HASMG=0 HASPOP=0 seen=" "
@@ -74,7 +75,7 @@ HOSTSRV=$PLAIN_BUILD/bin/vdb-server
 python3 -I -B - "$X_WRITES" "$N" <<'PY' || die "writes file $X_WRITES does not target exactly $N VMs"
 import sys, numpy as np
 w = np.memmap(sys.argv[1], dtype=np.dtype([("op", "u1"), ("target", "u1"), ("p", "u1", 22)]), mode="r")
-t = np.unique(w["target"][: min(len(w), 2_000_000)])
+t = np.unique(w["target"])  # the whole file (verifier review v1 L8)
 sys.exit(0 if list(t) == list(range(int(sys.argv[2]))) else 1)
 PY
 INSTALL="${VPLAIN#/home/comsys/}/bin/vdb-server $HOSTSRV
@@ -121,8 +122,11 @@ SAMPLER=$EV/cxl-bw-sampler.sh   # copy of workspaces/cxl-bw/cxl-bw-sampler.sh (p
 [ $CXLBW = 0 ] || [ -f "$SAMPLER" ] || die "H2N_CXLBW=1 needs $SAMPLER"
 PARANOID=$(cat /proc/sys/kernel/perf_event_paranoid 2>/dev/null)
 [ $CXLBW = 0 ] || [ "${PARANOID:-9}" -le 0 ] || echo "BLOCK NOTE: kernel.perf_event_paranoid=$PARANOID > 0: the CXL.mem sampler will refuse (recorded; the block runs without it)"
+HCS=$EV/host-cpu-sampler.py   # Host CPU of each VM's QEMU emulator / vhost threads + loadgen, 1 s, until unlock (M4, L10)
+[ $HOSTCPU = 0 ] || [ -f "$HCS" ] || die "H2N_HOSTCPU=1 needs $HCS"
+LG_CPUS_H=56-63               # run.sh default LG_CPUS (loadgen CPUs), sampled as Host CPU busy
 OWNER=eval-h2n-n$N-run$EVAL_RUN
-echo "BLOCK PLAN: h2n vdb N=$N vcpu/VM=$VCPU threads $((VCPU - 1))+1 nodes=[${IPS[*]}] lifetimes=[${LIVES[*]}] app=$APP mg_app=$MGAPP ring=$RING cxlbw=$CXLBW opcoh_strict=$STRICT"
+echo "BLOCK PLAN: h2n vdb N=$N vcpu/VM=$VCPU threads $((VCPU - 1))+1 nodes=[${IPS[*]}] lifetimes=[${LIVES[*]}] app=$APP mg_app=$MGAPP ring=$RING cxlbw=$CXLBW hostcpu=$HOSTCPU opcoh_strict=$STRICT"
 echo "BLOCK PLAN: server_args plain=[$SA]${MGSA:+ megalon=[$MGSA]}"
 echo "BLOCK PLAN: $LAYOUT"
 if [ "$DRYB" = 1 ]; then echo "BLOCK DRY STOP: evidence-dir check reached ($E; dry: no lock, no VM contact)"; exit 0; fi
@@ -135,6 +139,11 @@ stop() { log "BLOCK STOP $*"; exit 1; }
 if [ $CXLBW = 1 ]; then  # stops by itself within ~10 s of the unlock (UNTIL_UNLOCK=1); a refusal is recorded, not fatal
   setsid nohup bash "$SAMPLER" "$E/cxlbw" > "$E/cxlbw.log" 2>&1 < /dev/null &
   log "cxl-bw sampler pid $! -> $E/cxlbw (sampler sha256 $(sha256sum < "$SAMPLER" | cut -c1-16), paranoid=$PARANOID)"
+fi
+if [ $HOSTCPU = 1 ]; then  # read only (/proc, /run/libvirt/qemu/<dom>.pid); stops by itself ~10 s after the unlock
+  setsid nohup nice -n 19 taskset -c 18-23 python3 -I -B "$HCS" "$E/hostcpu" --domains "${DOMS[*]}" --loadgen "$LOADGEN" \
+    --cpus "$LG_CPUS_H" > "$E/hostcpu.log" 2>&1 < /dev/null &
+  log "host-cpu sampler pid $! -> $E/hostcpu (sampler sha256 $(sha256sum < "$HCS" | cut -c1-16))"
 fi
 servers_gone() { local ip; for ip in "${IPS[@]}"; do [ "$($SSH comsys@$ip "pgrep -c -f -- '$PAT'" < /dev/null)" = 0 ] || return 1; done; }
 dax_unused() {  # every VM: sudo -n fuser prints nothing and rc 1 (anything else = in use; fail closed)

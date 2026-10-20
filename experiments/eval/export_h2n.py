@@ -4,11 +4,13 @@
 One aggregate SLO search per (N, mix, system) (h2n-block.sh); the figures read the latency-throughput steps of each
 (N, mix, system), the max under the SLO (bar chart, scaling plot) and the coherence counters at that point.
 
-usage: export_h2n.py --run K --nodes N --config-sha256 S --out DIR [--source h2n|2vm] [--cxlbw DIR] EVIDENCE [EVIDENCE..]
+usage: export_h2n.py --run K --nodes N --config-sha256 S --out DIR [--source h2n|2vm] [--cxlbw DIR] [--hostcpu DIR]
+                     EVIDENCE [EVIDENCE..]
        export_h2n.py --combine --out DIR EXPORT_DIR [EXPORT_DIR..]   (concatenate per-N exports: summary.csv, steps.csv)
-  --source h2n  EVIDENCE = h2n block dirs (<E>/block of runset-h2n.sh: h2n-results.tsv, <sys>-<mix>-n<N>/slo, cxlbw/).
-                Several dirs of one N (a resumed N: the stopped block's dir, then the resumed one): a later dir wins per
-                (mix, system). The CXL.mem sampler dir is <block>/cxlbw unless --cxlbw is given.
+  --source h2n  EVIDENCE = h2n block dirs (<E>/block of runset-h2n.sh: h2n-results.tsv, <sys>-<mix>-n<N>/slo, cxlbw/,
+                hostcpu/). Several dirs of one N (a resumed N: the stopped block's dir, then the resumed one): a later
+                dir wins per (mix, system). The sampler dirs are <block>/cxlbw and <block>/hostcpu unless --cxlbw /
+                --hostcpu is given.
   --source 2vm  EVIDENCE = a 2-VM vdb run set dir (<E>/vdb/r<n>/run/{hw,pop}-<mix>-slo-r<n>/slo, mg-<mix>-r<n>/slo; e.g.
                 recovery/two-workload-eval-run1-vdb-v1): self tests and the 16-vCPU comparison only (it is NOT the
                 N = 2 point of new H2, which is measured at 4 vCPU / 24 GB).
@@ -19,16 +21,25 @@ Outputs (in --out):
   steps-vm.csv                 one row per (nodes, mix, system, step, vm): that VM's counters (per s)
   summary.csv                  one row per (nodes, mix, system): result + counters at the result (mean of the
                                at_result steps = the confirm repeats at the result rate, canon.confirm_stats)
-summary.csv columns (first ten = the figure contract): nodes, mix, system, max_under_slo_search_s (loadgen confirm
-  x_mean = achieved searches/s over the confirm repeats, aggregate over the N VMs; empty if not confirmed),
-  faults_read, faults_write (Popcorn coherence page faults per s, sys.swmc.page_coherence.fault_{read,write}_count
-  summed over the N VMs), mg_fetch (Megalon object refetches per s: megalon.read_retry_incoherent = a reader found its
-  copy stale, flushed it and re-read the object from CXL memory), mg_inval (Megalon object flushes per s:
-  megalon.flushes = stale-copy invalidations by readers + write-end flushes by writers), cxl_rd_MBs, cxl_wr_MBs
-  (Host CXL.mem MB/s, cxl-bw-sampler.sh, Intel PCM rule; perf intervals fully inside the step's guest wall window);
-  then *_per_op variants (per achieved op = search + update), raw Megalon counters per s, confirm stats, validity.
+Units: counters are events per second of the step window (summed over the N VMs), *_per_op per achieved op (search +
+update), *_ns_per_op in ns per achieved op, CPU columns in cores (CPU-seconds per second), busy columns 0..1.
+summary.csv columns (first eleven = the figure contract): nodes, mix, system, max_under_slo_search_s (loadgen confirm
+  x_mean = ACHIEVED searches/s, mean over the confirm repeats at the result rate, aggregate over the N VMs; empty if not
+  confirmed), faults_read, faults_write (Popcorn managed page faults per s, sys.swmc.page_coherence.fault_{read,write}_
+  count summed over the N VMs; supersets: they include managed faults without a state transition), coherence_events
+  (Popcorn MSI state transitions per s = is_faults (sys.swmc.instr.fault_full_is.count, exact I->S) + inv_commits
+  (sys.swmc.instr.tx_invalidate.ack, committed invalidation rounds = I->M and S->M incl. write-protect upgrades)),
+  mg_fetch (Megalon read-side stale-copy flush + refetch per s: megalon.read_retry_incoherent; each one is exactly one
+  object flush, lib/object_store.cc ReadStart/ReadEnd), mg_flush_writeend (Megalon write-end object flushes per s =
+  megalon.flushes - megalon.read_retry_incoherent), cxl_rd_MBs, cxl_wr_MBs (Host CXL.mem MB/s, cxl-bw-sampler.sh,
+  Intel PCM rule; perf intervals fully inside the step's guest wall window); then *_per_op variants, Popcorn request
+  wait (tx_wait_ns_per_op: sys.swmc.instr.tx_{fetch,invalidate}.wait_sum_ns summed over VMs per op, filled only when
+  the instr detail histograms count (wait_count > 0; empty with instr detail=0); msg_wait_ns_per_op /
+  msg_wait_ns_per_round: per-thread thr.*.swmc.{read,write}_msg_wait_ns, always on, request round send -> last
+  response incl. ring-full send retries), Host CPU of the QEMU emulator / vhost threads and of the loadgen
+  (host-cpu-sampler.py), raw Megalon counters per s, confirm stats, validity.
   A coherence column of a system without that mechanism is 0 when its counter is absent (hw: all, pop: mg_*,
-  mg: faults_*); counter_source names what was read.
+  mg: faults_* / coherence_events); counter_source names what was read.
 """
 import argparse
 import csv
@@ -47,25 +58,39 @@ _spec = importlib.util.spec_from_file_location("cxl_bw", os.path.join(HERE, "cxl
 CXB = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(CXB)
 
-MG = {"mg_fetch": "megalon.read_retry_incoherent", "mg_inval": "megalon.flushes",
+MG = {"mg_fetch": "megalon.read_retry_incoherent", "mg_flushes": "megalon.flushes",
       "mg_read_sections": "megalon.read_sections", "mg_write_sections": "megalon.write_sections",
       "mg_retry_notify": "megalon.read_retry_notify", "mg_replay_flushes": "megalon.replay_flushes",
       "mg_flush_bytes": "megalon.flush_bytes"}
 POPC = {"faults_read": "read_faults", "faults_write": "write_faults", "is_faults": "is_faults",
         "inv_commits": "inv_commits", "fetch_commits": "fetch_commits", "coh_ipis": "coh_ipis"}
-RATE = list(POPC) + list(MG)
-SUMMARY_HEAD = ["nodes", "mix", "system", "max_under_slo_search_s", "faults_read", "faults_write", "mg_fetch",
-                "mg_inval", "cxl_rd_MBs", "cxl_wr_MBs"]
-SUMMARY = SUMMARY_HEAD + ["faults_read_per_op", "faults_write_per_op", "mg_fetch_per_op", "mg_inval_per_op",
-                          "cxl_rd_B_per_op", "cxl_wr_B_per_op", "is_faults", "inv_commits", "fetch_commits",
-                          "coh_ipis", "mg_read_sections", "mg_write_sections", "mg_retry_notify", "mg_replay_flushes",
-                          "mg_flush_bytes", "result_offered_x", "result_offered_search_s", "confirm_x_sd",
-                          "confirmed", "note", "n_at_result", "valid_at_result", "at_result_search_s",
-                          "at_result_update_s", "at_result_p99_ms", "cxl_n_intervals", "counter_source",
-                          "vcpus_per_vm", "threads", "u", "run", "config_sha256", "lifetime", "source_dir"]
+# Popcorn request wait (verifier review v1 M5): node-wide tx histograms (instr detail only) and per-thread accounting
+TXW = {"tx_wait_ns": ("sys.swmc.instr.tx_fetch.wait_sum_ns", "sys.swmc.instr.tx_invalidate.wait_sum_ns"),
+       "tx_wait_count": ("sys.swmc.instr.tx_fetch.wait_count", "sys.swmc.instr.tx_invalidate.wait_count")}
+THR = {"msg_wait_ns": (".swmc.read_msg_wait_ns", ".swmc.write_msg_wait_ns"),
+       "msg_rounds": (".swmc.read_transactions", ".swmc.write_transactions"),
+       "nack_retries": (".swmc.nack_retries",)}
+DERIVED = ["coherence_events", "mg_flush_writeend"]
+RATE = ["faults_read", "faults_write", "coherence_events", "is_faults", "inv_commits", "fetch_commits", "coh_ipis",
+        "mg_fetch", "mg_flush_writeend", "mg_flushes", "mg_read_sections", "mg_write_sections", "mg_retry_notify",
+        "mg_replay_flushes", "mg_flush_bytes"]
+WAIT = ["tx_wait_ns_per_op", "tx_wait_count_per_s", "msg_wait_ns_per_op", "msg_wait_ns_per_round", "nack_retries"]
+HCPU = ["qemu_emu_cpu", "qemu_vhost_cpu", "qemu_vcpu_cpu", "emu_pcpu_busy_max", "loadgen_cpu", "lg_pcpu_busy_mean",
+        "hostcpu_n_samples"]
+CXL = ["cxl_rd_MBs", "cxl_wr_MBs", "cxl_n_intervals"]
+SUMMARY_HEAD = ["nodes", "mix", "system", "max_under_slo_search_s", "faults_read", "faults_write", "coherence_events",
+                "mg_fetch", "mg_flush_writeend", "cxl_rd_MBs", "cxl_wr_MBs"]
+PER_OP = ["faults_read", "faults_write", "coherence_events", "mg_fetch", "mg_flush_writeend"]
+SUMMARY = SUMMARY_HEAD + [k + "_per_op" for k in PER_OP] + [
+    "cxl_rd_B_per_op", "cxl_wr_B_per_op"] + WAIT + HCPU + [
+    "is_faults", "inv_commits", "fetch_commits", "coh_ipis", "mg_flushes", "mg_read_sections", "mg_write_sections",
+    "mg_retry_notify", "mg_replay_flushes", "mg_flush_bytes", "result_offered_x", "result_offered_search_s",
+    "confirm_x_sd", "confirmed", "note", "n_at_result", "valid_at_result", "at_result_search_s", "at_result_update_s",
+    "at_result_p99_ms", "cxl_n_intervals", "counter_source", "vcpus_per_vm", "threads", "u", "run", "config_sha256",
+    "lifetime", "source_dir"]
 STEP = ["nodes", "mix", "system", "u", "step", "phase", "offered_x", "search_s", "update_s", "p50_ms", "p95_ms",
-        "p99_ms", "pass", "at_result", "valid", "window_s"] + RATE + ["cxl_rd_MBs", "cxl_wr_MBs", "cxl_n_intervals",
-                                                                      "run", "config_sha256", "lifetime"]
+        "p99_ms", "pass", "at_result", "valid", "window_s"] + RATE + WAIT + CXL + HCPU + ["run", "config_sha256",
+                                                                                         "lifetime"]
 STEP_VM = ["nodes", "mix", "system", "step", "phase", "offered_x", "vm", "window_s"] + RATE + ["run", "lifetime"]
 SYS = {"hw", "pop", "mg", "mgoff"}
 
@@ -107,6 +132,22 @@ def sum_key(rows, key):
     return sum(v) if v else None
 
 
+def sum_keys(rows, keys):
+    v = [sum_key(rows, k) for k in keys]
+    v = [x for x in v if x is not None]
+    return sum(v) if v else None
+
+
+def sum_thr(rows, suffixes):
+    """sum over every per-thread key thr.<comm><suffix> of every target row (None when no such key)"""
+    tot = None
+    for r in rows:
+        for k, v in r.items():
+            if k.startswith("thr.") and k.endswith(suffixes) and v not in (None, ""):
+                tot = (tot or 0) + float(v)
+    return tot
+
+
 def cxl_steps(sampler, part):
     """{step: (read MB/s, write MB/s, n intervals, seconds)} from the sampler dir over the part's step windows"""
     if not sampler or not os.path.isfile(os.path.join(sampler, "perf.csv")):
@@ -126,18 +167,98 @@ def cxl_steps(sampler, part):
     return out
 
 
-def lifetime_rows(part, nodes, sampler):
+def hostcpu_load(hdir):
+    """(samples, clk_tck, domains, emulator CPUs, loadgen CPUs) of a host-cpu-sampler.py dir, or None"""
+    if not hdir or not os.path.isfile(os.path.join(hdir, "samples.csv")):
+        return None
+    clk, doms, emu, lg = 100, [], set(), set()
+    for ln in open(os.path.join(hdir, "manifest.txt")):
+        f = dict(x.split("=", 1) for x in ln.split() if "=" in x)
+        if ln.startswith("clk_tck="):
+            clk = int(f["clk_tck"])
+            if f.get("extra_cpus"):
+                lg = cpus_of(f["extra_cpus"])
+        elif ln.startswith("domain="):
+            doms.append(f["domain"])
+        elif ln.startswith("thread ") and f.get("class") in ("emu", "vhost") and f.get("affinity"):
+            comm = ln.split(" comm=", 1)[1].strip() if " comm=" in ln else ""
+            if f["class"] == "vhost" or comm.startswith("qemu-system"):
+                emu |= cpus_of(f["affinity"])
+    with open(os.path.join(hdir, "samples.csv")) as fh:
+        smp = list(csv.DictReader(fh))
+    return smp, clk, doms, emu - lg, lg
+
+
+def cpus_of(s):
+    out = set()
+    for part in s.split(","):
+        if part:
+            a, _, b = part.partition("-")
+            out.update(range(int(a), int(b or a) + 1))
+    return out
+
+
+def hostcpu_steps(hc, part):
+    """{step: {HCPU column: value}}: counter deltas between the first and the last sample inside the step window"""
+    if not hc:
+        return {}
+    smp, clk, doms, emu, lg = hc
+    ts = [int(s["epoch_ns"]) for s in smp]
+    out, seen = {}, set()
+    for r in csv.DictReader(open(os.path.join(part, "stats-steps.csv"))):
+        n = int(r["step"])
+        if n in seen or not r.get("begin_wall_ns") or not r.get("end_wall_ns"):
+            continue
+        seen.add(n)
+        b, e = int(r["begin_wall_ns"]), int(r["end_wall_ns"])
+        idx = [i for i, t in enumerate(ts) if b <= t <= e]
+        o = {"hostcpu_n_samples": len(idx)}
+        if len(idx) >= 2:
+            s0, s1 = smp[idx[0]], smp[idx[-1]]
+            dt = (ts[idx[-1]] - ts[idx[0]]) / 1e9
+
+            def d(col):
+                a, z = fl(s0.get(col)), fl(s1.get(col))
+                return z - a if a is not None and z is not None else None
+
+            for cls, col in (("emu", "qemu_emu_cpu"), ("vhost", "qemu_vhost_cpu"), ("vcpu", "qemu_vcpu_cpu")):
+                v = [d(f"{dm}.{cls}") for dm in doms]
+                o[col] = sum(v) / clk / dt if v and all(x is not None for x in v) else None
+
+            def busy(c):
+                tb, tt = d(f"cpu{c}.busy"), d(f"cpu{c}.total")
+                return tb / tt if tb is not None and tt else None
+
+            eb = [x for x in (busy(c) for c in sorted(emu)) if x is not None]
+            o["emu_pcpu_busy_max"] = max(eb) if eb else None
+            lb = [x for x in (busy(c) for c in sorted(lg)) if x is not None]
+            o["lg_pcpu_busy_mean"] = sum(lb) / len(lb) if lb else None
+            same = s0.get("loadgen_pids") and s0.get("loadgen_pids") == s1.get("loadgen_pids")
+            lt = d("loadgen")
+            o["loadgen_cpu"] = lt / clk / dt if same and lt is not None else None
+        out[n] = o
+    return out
+
+
+def derive(o, rs, win):
+    """coherence_events, mg_flush_writeend (per s) of one row from its rates and the target rows"""
+    i, v = fl(o.get("is_faults")), fl(o.get("inv_commits"))
+    o["coherence_events"] = i + v if i is not None and v is not None else None
+    fx, ff = sum_key(rs, MG["mg_flushes"]), sum_key(rs, MG["mg_fetch"])
+    o["mg_flush_writeend"] = (fx - ff) / win if fx is not None and ff is not None and win else None
+
+
+def lifetime_rows(part, nodes, sampler, hc=None):
     rows3, sm = X3.part_rows(part, "vdb", nodes)
     cs = X3.step_counters(part)
     cx = cxl_steps(sampler, part)
-    steps = {d["step"]: d for d in canon.measured_steps(part)}
+    hx = hostcpu_steps(hc, part)
     agg, per_vm = [], []
     for r in rows3:
         n = r["step"]
         rs = cs.get(n, [])
         win = fl(r.get("window_s"))
         if r["vm"] == "all":
-            d = steps[n]["streams"]
             o = dict(step=n, phase=r["phase"], offered_x=r["offered_x"], search_s=fl(r.get("achieved_x")),
                      update_s=fl(r.get("wop_per_s")), p50_ms=r.get("p50_ms"), p95_ms=r.get("p95_ms"),
                      p99_ms=r.get("p99_ms"), at_result=r["at_result"], valid=r.get("valid"), window_s=win)
@@ -147,11 +268,21 @@ def lifetime_rows(part, nodes, sampler):
             for k, key in MG.items():
                 t = sum_key(rs, key)
                 o[k] = t / win if t is not None and win else None
+            derive(o, rs, win)
+            ops = ((o["search_s"] or 0) + (o["update_s"] or 0)) * (win or 0)
+            tw, tc = sum_keys(rs, TXW["tx_wait_ns"]), sum_keys(rs, TXW["tx_wait_count"])
+            o["tx_wait_count_per_s"] = tc / win if tc is not None and win else None
+            o["tx_wait_ns_per_op"] = tw / ops if tw is not None and tc and ops else None
+            mw, mr = sum_thr(rs, THR["msg_wait_ns"]), sum_thr(rs, THR["msg_rounds"])
+            o["msg_wait_ns_per_op"] = mw / ops if mw is not None and ops else None
+            o["msg_wait_ns_per_round"] = mw / mr if mw is not None and mr else None
+            nr = sum_thr(rs, THR["nack_retries"])
+            o["nack_retries"] = nr / win if nr is not None and win else None
             c = cx.get(n)
             o.update(cxl_rd_MBs=c[0] if c else None, cxl_wr_MBs=c[1] if c else None, cxl_n_intervals=c[2] if c else None)
+            o.update(hx.get(n, {}))
             o["_has"] = {k: (any(rr.get(key) not in (None, "") for rr in rs)) for k, key in MG.items()}
             o["_has_pop"] = any(rr.get("sys.swmc.page_coherence.fault_read_count") not in (None, "") for rr in rs)
-            del d
             agg.append(o)
         else:
             k = int(r["vm"])
@@ -162,6 +293,7 @@ def lifetime_rows(part, nodes, sampler):
             for kk, key in MG.items():
                 t = fl(rr.get(key))
                 o[kk] = t / win if t is not None and win else None
+            derive(o, [rr] if rr else [], win)
             per_vm.append(o)
     return agg, per_vm, sm
 
@@ -183,7 +315,7 @@ def summary_row(system, agg, sm, u):
     o["valid_at_result"] = all(vs) if vs and all(x is not None for x in vs) else None
     o["at_result_search_s"], o["at_result_update_s"] = mean(at, "search_s"), mean(at, "update_s")
     o["at_result_p99_ms"] = mean(at, "p99_ms")
-    for k in RATE + ["cxl_rd_MBs", "cxl_wr_MBs", "cxl_n_intervals"]:
+    for k in RATE + WAIT + CXL + HCPU:
         o[k] = mean(at, k)
     has_mg = any(any(r["_has"].values()) for r in at)
     has_pop = any(r["_has_pop"] for r in at)
@@ -193,12 +325,14 @@ def summary_row(system, agg, sm, u):
     if has_mg:
         src.append("megalon")
     o["counter_source"] = "+".join(src) or "none"
-    zero = {"hw": list(POPC) + list(MG), "pop": list(MG), "mg": list(POPC), "mgoff": list(POPC)}[system]
+    popz = list(POPC) + ["coherence_events"]
+    mgz = list(MG) + ["mg_flush_writeend"]
+    zero = {"hw": popz + mgz, "pop": mgz, "mg": popz, "mgoff": popz}[system]
     for k in zero:
         if o.get(k) is None and at:
             o[k] = 0.0
     ops = (o["at_result_search_s"] or 0) + (o["at_result_update_s"] or 0)
-    for k in ("faults_read", "faults_write", "mg_fetch", "mg_inval"):
+    for k in PER_OP:
         o[k + "_per_op"] = o[k] / ops if o.get(k) is not None and ops else None
     for k, b in (("cxl_rd_B_per_op", "cxl_rd_MBs"), ("cxl_wr_B_per_op", "cxl_wr_MBs")):
         o[k] = o[b] * 1e6 / ops if o.get(b) is not None and ops else None
@@ -233,7 +367,7 @@ def combine(out, dirs):
             w.writeheader()
             w.writerows(rows)
         n[name] = len(rows)
-    print(f"COMBINE H2N: " + " ".join(f"{k}={v}" for k, v in n.items()) + f" -> {out}")
+    print("COMBINE H2N: " + " ".join(f"{k}={v}" for k, v in n.items()) + f" -> {out}")
 
 
 def main(argv=None):
@@ -244,6 +378,7 @@ def main(argv=None):
     ap.add_argument("--out", required=True)
     ap.add_argument("--source", choices=["h2n", "2vm"], default="h2n")
     ap.add_argument("--cxlbw", help="sampler dir (default <block>/cxlbw of each lifetime's block dir)")
+    ap.add_argument("--hostcpu", help="host-cpu-sampler.py dir (default <block>/hostcpu of each lifetime's block dir)")
     ap.add_argument("--combine", action="store_true")
     ap.add_argument("evidence", nargs="+")
     a = ap.parse_args(argv)
@@ -258,6 +393,7 @@ def main(argv=None):
     vcpu = 16 if a.source == "2vm" else 4
     key = dict(nodes=a.nodes, run=a.run, config_sha256=a.config_sha256)
     steps, steps_vm, summ, warn = [], [], [], []
+    hcache = {}
     for (mix, s), (life, part, E) in sorted(lts.items(), key=lambda x: (int(x[0][0][1:]), x[0][1])):
         if s not in SYS:
             raise SystemExit(f"unknown system {s} ({life})")
@@ -265,7 +401,12 @@ def main(argv=None):
         sampler = a.cxlbw or (os.path.join(E, "cxlbw") if a.source == "h2n" else None)
         if a.source == "h2n" and not os.path.isfile(os.path.join(sampler, "perf.csv")):
             warn.append(f"{life}: no CXL.mem sampler data ({sampler}/perf.csv): cxl columns empty")
-        agg, per_vm, sm = lifetime_rows(part, a.nodes, sampler)
+        hdir = a.hostcpu or (os.path.join(E, "hostcpu") if a.source == "h2n" else None)
+        if hdir not in hcache:
+            hcache[hdir] = hostcpu_load(hdir)
+        if a.source == "h2n" and hcache[hdir] is None:
+            warn.append(f"{life}: no Host CPU sampler data ({hdir}/samples.csv): host CPU columns empty")
+        agg, per_vm, sm = lifetime_rows(part, a.nodes, sampler, hcache[hdir])
         idd = dict(key, mix=mix, system=s, u=u, lifetime=life)
         rows = [dict(r, **idd) for r in agg]
         steps += rows
@@ -275,6 +416,9 @@ def main(argv=None):
         summ.append(dict(sr, **idd, vcpus_per_vm=vcpu, threads=f"{vcpu - 1}+1", source_dir=part))
         if sm.get("confirmed") is not True:
             warn.append(f"{life}: no confirmed result (note: {sm.get('note', '')})")
+        if s == "pop" and sr.get("tx_wait_ns_per_op") is None:
+            warn.append(f"{life}: tx_*.wait histograms empty (instr detail=0): tx_wait_ns_per_op empty, "
+                        "msg_wait_ns_per_round is the always-on request wait")
     write(os.path.join(a.out, "steps.csv"), STEP, steps)
     write(os.path.join(a.out, "steps-vm.csv"), STEP_VM, steps_vm)
     write(os.path.join(a.out, "summary.csv"), SUMMARY, summ)
