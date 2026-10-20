@@ -45,7 +45,7 @@ c++ "${FLAGS[@]}" "$HERE/../tools/build_index.cc" -o "$OUT/bin/vdb-build-index"
   echo "shim_info=$INFO"; echo "shim_kind=$SHIM_KIND"
   [ "$SHIM_KIND" = shared ] || echo "fallback_rackobj_h=$MC:include/rackobj.h sha256=$(sha256sum "$OUT/fallback-include/rackobj.h" | cut -d' ' -f1)"
   echo "megalon_build=$MB"
-  grep -E '^(source_commit|source_dirty_diff_sha256|build_id|flavor|wmeta_layout|cmake_effective)=' "$MB/manifest.txt" | sed 's/^/megalon./'
+  grep -E '^(source_commit|source_dirty_diff_sha256|build_id|flavor|wmeta_layout|cmake_effective|megalon_nodes)=' "$MB/manifest.txt" | sed 's/^/megalon./'
   echo "megalon.manifest_sha256=$(sha256sum "$MB/manifest.txt" | cut -d' ' -f1)"
   echo "cxx=$(c++ --version | head -1)"
   (cd "$OUT" && find bin lib -type f | sort | while read -r f; do echo "sha256[$f]=$(sha256sum "$f" | cut -d' ' -f1)"; done)
