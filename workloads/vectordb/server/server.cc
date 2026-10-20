@@ -214,6 +214,10 @@ class Server {
 
   void start() {
     std::string err;
+    if (p_.g.is_sq8()) {  // private quantizer copy, filled from HWcc after the start barrier (before any graph access)
+      sq8_.assign(2 * size_t(p_.g.dim), 0.f);
+      p_.g.sq8 = sq8_.data();
+    }
     if (!cxl::region_load(o_.region.empty() ? nullptr : o_.region.c_str(), &r_, &err)) die("region: " + err);
     if (p_.nr_nodes == 0 || o_.node >= p_.nr_nodes || p_.segments == 0) die("bad node/nodes/segments");
     HwccLayout lay(p_, Be::kLayoutTag);
@@ -280,6 +284,16 @@ class Server {
             },
             o_.start_timeout_ms))
       die("not every node became ready in time");
+    if (p_.g.is_sq8()) {
+      const Sq8Line &l = *h_->sq8;
+      if (load_acquire(&l.ready) != kSq8Magic || l.dim != p_.g.dim) die("sq8: quantizer not published by node 0 in HWcc");
+      std::memcpy(sq8_.data(), h_->sq8_params(), sq8_.size() * sizeof(float));
+      if (sq8_fnv(sq8_.data(), p_.g.dim) != l.fnv) die("sq8: quantizer checksum mismatch");
+      std::fprintf(stderr, "vdb-server: vector format sq8 (quantizer fnv %016lx, record %lu B)\n", (unsigned long)l.fnv,
+                   (unsigned long)p_.g.vrec_bytes());
+    } else {
+      std::fprintf(stderr, "vdb-server: vector format fp32 (record %lu B)\n", (unsigned long)p_.g.vrec_bytes());
+    }
     warm_up();
     opc_setup();
     if (o_.writer_threads > 1) std::fprintf(stderr, "vdb-server: writer threads %u\n", o_.writer_threads);
@@ -340,19 +354,43 @@ class Server {
   // init_dir: segments.txt ("<s> <count> <ep_level> <upper_cur>"), per group g < ceil(count / per_chunk):
   // seg-<s>-v<g>.bin (vector chunk, used bytes) and seg-<s>-l<g>.bin (whole link chunk); manifest.txt with the graph
   // parameters. Images are copied into the chunk objects as is (offsets are chunk-relative).
+  // init dir parameter check (load_initial, preload): the "graph ..." line must match; an sq8 dir has the line
+  // "vec_format sq8" (fp32 dirs, i.e. every dir before SQ8, have none) and it must match --vec-format
+  void check_manifest() const {
+    std::ifstream man(o_.init_dir + "/manifest.txt");
+    std::string line, want = "graph " + std::to_string(p_.segments) + " " + std::to_string(p_.g.dim) + " " +
+                             std::to_string(p_.g.M) + " " + std::to_string(p_.g.ef_construction) + " " +
+                             std::to_string(init_capacity()) + " " + std::to_string(p_.g.chunk_bytes);
+    bool ok = false, sq8 = false;
+    while (std::getline(man, line)) ok = ok || line == want, sq8 = sq8 || line == "vec_format sq8";
+    if (!ok) die("init_dir manifest does not contain '" + want + "' (built for other parameters)");
+    if (sq8 != p_.g.is_sq8())
+      die(std::string("init_dir vector format ") + (sq8 ? "sq8" : "fp32") + " != --vec-format " + (p_.g.is_sq8() ? "sq8" : "fp32"));
+  }
+
+  // sq8: node 0 publishes the init dir's quantizer (sq8.bin = min[dim], scale[dim] as float32) in HWcc
+  void publish_sq8() {
+    if (o_.init_dir.empty()) die("--vec-format sq8 needs --init-dir on node 0 (quantizer sq8.bin)");
+    float *dst = h_->sq8_params();
+    read_file(o_.init_dir + "/sq8.bin", reinterpret_cast<uint8_t *>(dst), uint64_t(p_.g.dim) * 8);
+    for (uint32_t i = 0; i < p_.g.dim; i++)
+      if (!(dst[p_.g.dim + i] >= 0) || !std::isfinite(dst[i]) || !std::isfinite(dst[p_.g.dim + i])) die("sq8.bin: bad parameters");
+    h_->sq8->dim = p_.g.dim;
+    h_->sq8->fnv = sq8_fnv(dst, p_.g.dim);
+    store_release(&h_->sq8->ready, kSq8Magic);
+  }
+
   void load_initial() {
     for (uint32_t s = 0; s < p_.segments; s++) Graph::init_empty(&h_->segs[s].meta);
     const uint64_t t0 = now_ns();
     std::string err;
     if (!be_->create_objects(&err)) die(err);
+    if (p_.g.is_sq8()) {
+      if (!o_.init_dir.empty()) check_manifest();
+      publish_sq8();
+    }
     if (o_.init_dir.empty()) return;
-    std::ifstream man(o_.init_dir + "/manifest.txt");
-    std::string line, want = "graph " + std::to_string(p_.segments) + " " + std::to_string(p_.g.dim) + " " +
-                             std::to_string(p_.g.M) + " " + std::to_string(p_.g.ef_construction) + " " +
-                             std::to_string(init_capacity()) + " " + std::to_string(p_.g.chunk_bytes);
-    bool ok = false;
-    while (std::getline(man, line)) ok = ok || line == want;
-    if (!ok) die("init_dir manifest does not contain '" + want + "' (built for other parameters)");
+    check_manifest();
     std::ifstream f(o_.init_dir + "/segments.txt");
     uint64_t s, count, epl, ucur, total = 0;
     uint32_t seen = 0;
@@ -385,15 +423,7 @@ class Server {
     if (!cxl::region_load(o_.region.empty() ? nullptr : o_.region.c_str(), &r_, &err)) die("region: " + err);
     if (o_.init_dir.empty()) die("--preload-only needs --init-dir");
     if (o_.node != 0) die("--preload-only runs on node 0 only");
-    {  // same parameter check as load_initial: refuse an init dir built for other parameters before writing anything
-      std::ifstream man(o_.init_dir + "/manifest.txt");
-      std::string line, want = "graph " + std::to_string(p_.segments) + " " + std::to_string(p_.g.dim) + " " +
-                               std::to_string(p_.g.M) + " " + std::to_string(p_.g.ef_construction) + " " +
-                               std::to_string(init_capacity()) + " " + std::to_string(p_.g.chunk_bytes);
-      bool ok = false;
-      while (std::getline(man, line)) ok = ok || line == want;
-      if (!ok) die("init_dir manifest does not contain '" + want + "' (built for other parameters)");
-    }
+    check_manifest();  // same check as load_initial: refuse an init dir built for other parameters before writing
     int fd = int(syscall(SYS_openat, AT_FDCWD, r_.device.c_str(), O_RDWR | O_CLOEXEC));
     if (fd < 0) die("open " + r_.device);
     void *m = mmap(reinterpret_cast<void *>(r_.map_va), r_.device_size, PROT_READ | PROT_WRITE,
@@ -899,6 +929,7 @@ class Server {
   const MegalonApi *api_ = nullptr;
   std::unique_ptr<Be> be_;
   std::vector<std::unique_ptr<Graph>> g_;
+  std::vector<float> sq8_;  // sq8: private copy of the HWcc quantizer (p_.g.sq8 points here; read-only after start)
   Stats st_;
   cxl::proc::Opts pst_{{"cxl_recv"},
                        {"TLB", "CAL", "RES", "LOC"},
@@ -952,6 +983,8 @@ void usage() {
                "  [--op-coh on|off] per-operation time split block in every search/update response (default on; DESIGN.md §15)\n"
                "  [--writer-threads N] writer threads of this node (default 1; plain backend only for N > 1; DESIGN.md §17)\n"
                "  [--init-capacity C] init dir built for C elements per segment (<= capacity; default the capacity; §17)\n"
+               "  [--vec-format fp32|sq8] stored vectors (default fp32; sq8 = 8-bit scalar quantization, init dir built\n"
+               "     with vdb-build-index ... sq8; node 0 publishes its sq8.bin in HWcc; part of the layout hash)\n"
                "--backend megalon: Megalon (RACKOBJ_CONFIG, object_arena_size > 0) maps the device; MEGALON_NODE_ID and\n"
                "  MEGALON_RUN_ID default to --node and --run-id, CXL_REGION_CONFIG to --region (DESIGN.md §12).\n"
                "All nodes need identical parameters (checked through the HWcc app layout hash).\n"
@@ -999,6 +1032,11 @@ int main(int argc, char **argv) {
     else if (a == "--trace-max-mb") o.trace_max_mb = std::stoull(v());
     else if (a == "--writer-threads") o.writer_threads = std::stoul(v());
     else if (a == "--init-capacity") o.init_capacity = std::stoull(v());
+    else if (a == "--vec-format") {
+      const std::string x = v();
+      if (x != "fp32" && x != "sq8") usage();
+      o.p.g.vec_format = x == "sq8" ? kVecSQ8 : kVecF32;
+    }
     else if (a == "--op-coh" || a == "--query-coh") {
       const std::string x = v();
       if (x != "on" && x != "off") usage();

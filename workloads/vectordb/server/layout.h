@@ -32,9 +32,28 @@ struct Params {
            " dim=" + std::to_string(g.dim) + " M=" + std::to_string(g.M) + " efc=" + std::to_string(g.ef_construction) +
            " capacity=" + std::to_string(g.capacity) + " chunk_bytes=" + std::to_string(g.chunk_bytes) + " max_writes=" + std::to_string(max_writes) +
            " max_ids=" + std::to_string(max_ids) + " dlog_chunk=" + std::to_string(dlog_chunk) +
-           " max_deletes=" + std::to_string(max_deletes);
+           " max_deletes=" + std::to_string(max_deletes) + (g.is_sq8() ? " vec=sq8" : "");  // fp32: text unchanged
   }
 };
+
+// sq8 quantizer in HWcc (only with --vec-format sq8; the fp32 layout has no such field): node 0 writes the
+// parameters of the init dir's sq8.bin at prepare, then releases `ready`; read-only afterwards. Every node copies them
+// into private memory after the start barrier (GraphParams::sq8) and checks dim and the FNV-1a sum.
+struct alignas(64) Sq8Line {
+  uint64_t ready;  // kSq8Magic once the parameters below are complete (release)
+  uint32_t dim;
+  uint32_t pad0;
+  uint64_t fnv;    // FNV-1a 64 over the 2 dim floats
+  uint8_t pad[40];
+};
+static_assert(sizeof(Sq8Line) == 64, "sq8 line");
+constexpr uint64_t kSq8Magic = 0x5344423853513852ull;
+inline uint64_t sq8_fnv(const float *p, uint32_t dim) {
+  uint64_t h = 1469598103934665603ull;
+  const uint8_t *b = reinterpret_cast<const uint8_t *>(p);
+  for (uint64_t i = 0; i < uint64_t(dim) * 8; i++) h = (h ^ b[i]) * 1099511628211ull;
+  return h;
+}
 
 struct alignas(64) DlogEntry {  // whole line (Megalon D3 write-section contract, same in every system)
   uint64_t id;
@@ -60,7 +79,7 @@ struct alignas(64) SegLines {  // HWcc per segment: lock and graph meta on separ
 
 struct HwccLayout {
   cxl::hwcc::layout L;
-  uint64_t off_p, off_nodes, off_applied, off_segs, off_wsec, off_objseq;
+  uint64_t off_p, off_nodes, off_applied, off_segs, off_wsec, off_objseq, off_sq8 = 0;  // off_sq8: sq8 only
   // backend_tag: "" for plain (hash unchanged), " backend=megalon" for Megalon; the size never depends on it
   explicit HwccLayout(const Params &p, const char *backend_tag = "") {
     L.add(("vdb-seg " + p.describe() + backend_tag).c_str(), 0, 8);  // parameters go into the layout hash
@@ -72,6 +91,7 @@ struct HwccLayout {
     // wsec = write sections completed by all nodes; objseq[o] = wsec value of the last write section on object o
     off_wsec = L.add("wsec", 64);
     off_objseq = L.add("objseq", (p.trace_objects() * 8 + 63) / 64 * 64);
+    if (p.g.is_sq8()) off_sq8 = L.add("sq8", sizeof(Sq8Line) + (uint64_t(p.g.dim) * 8 + 63) / 64 * 64);
   }
 };
 
@@ -82,13 +102,16 @@ struct Hwcc {
   SegLines *segs;
   uint64_t *wsec;
   uint64_t *objseq;
+  Sq8Line *sq8 = nullptr;  // sq8 only: line, then 2 dim floats
   Hwcc(uint8_t *app, const HwccLayout &h)
       : P(reinterpret_cast<uint64_t *>(app + h.off_p)),
         nodes(reinterpret_cast<NodeLine *>(app + h.off_nodes)),
         applied(reinterpret_cast<uint64_t *>(app + h.off_applied)),
         segs(reinterpret_cast<SegLines *>(app + h.off_segs)),
         wsec(reinterpret_cast<uint64_t *>(app + h.off_wsec)),
-        objseq(reinterpret_cast<uint64_t *>(app + h.off_objseq)) {}
+        objseq(reinterpret_cast<uint64_t *>(app + h.off_objseq)),
+        sq8(h.off_sq8 ? reinterpret_cast<Sq8Line *>(app + h.off_sq8) : nullptr) {}
+  float *sq8_params() const { return reinterpret_cast<float *>(sq8 + 1); }
 };
 
 }  // namespace vdb

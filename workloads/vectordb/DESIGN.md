@@ -543,6 +543,22 @@ experiments/vectordb/urate-block.sh (m4-run.sh KIND=urate). H1 (YCSB-style mixes
   knee-ramp SLO part; E1 per invocation; final consistency: P = writes, elements = NA + updates, delete-log entries =
   updates, bad_records 0, backlog 0).
 
+## 18. SQ8 vector storage (branch vdb-sq8; user decision 2026-10-21, vdb-vm-scaling)
+- Why: the fp32 vector DB is CXL-bandwidth-bound already at 2 VMs x 4 vCPU (~86 MB CXL read per search). SQ8 stores
+  one uint8 per dimension: vector record 64 + 768 = 832 B (13 lines) instead of 3136 B; links unchanged.
+- `--vec-format fp32|sq8` (default fp32: layout, layout hash, init images byte-identical to earlier builds). sq8 adds
+  " vec=sq8" to Params::describe (layout hash) and one HWcc field `sq8` (Sq8Line + min[dim], scale[dim] float32).
+- Quantizer: per-dimension min / max over every indexed pool A row (tools/build_index.cc, arg 11 `sq8`; sq8.bin and
+  manifest lines `vec_format sq8`, `sq8 ...`); code = clamp(round((x - min) / scale), 0, 255), scale = (max - min) / 255.
+  Node 0 publishes sq8.bin in HWcc at prepare (also with --preloaded); every node copies it to private memory after the
+  start barrier and checks dim and FNV-1a. Pool B inserts are quantized with it (out-of-range values clamp).
+- Distance: the same inner product against the decoded vector (min + scale x code), computed in registers; no fp32
+  rescoring, no fp32 vectors in shared memory. insert() quantizes the new vector and uses its decoded form for every
+  distance, so the offline build and run-time inserts build the same kind of graph. Megalon reads the 768 B in its read
+  section; its validation copy for dist_ids decodes into the scratch vector.
+- Host checks: tools/search_index.cc (static searches over an init dir: recall@k vs tools/static_gt.py exact GT,
+  distances, link blocks and bytes per query), tests/host_smoke.sh VEC_FORMAT=sq8.
+
 ## 10. Future reference: E2 (not implemented)
 
 - No-wait: s_used = min(P, ref_w); no staleness bound.

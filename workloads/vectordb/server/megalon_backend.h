@@ -584,9 +584,13 @@ class MegalonAcc {
     vrec_ = p.vrec_bytes();
     l0_ = p.links0_bytes();
     upper_base_ = N_ * l0_;
+    sq8_ = p.is_sq8();
   }
   GraphMeta *meta() const { return m_.meta; }
-  float dot(const float *q, uint32_t i) const {
+  float dot(const float *q, uint32_t i) const {  // in place on the object (sq8: decoded in registers)
+    if (sq8_)
+      return m_.be->read(vid(i), voff(i) + sizeof(ElemHeader), p_.vec_bytes(),
+                         [&](const uint8_t *v) { return vdb::dot_sq8(q, v, p_.sq8, p_.dim); }, velem(i));
     return m_.be->read(vid(i), voff(i) + sizeof(ElemHeader), uint64_t(p_.dim) * 4,
                        [&](const uint8_t *v) { return vdb::dot(q, reinterpret_cast<const float *>(v), p_.dim); },
                        velem(i));
@@ -597,6 +601,12 @@ class MegalonAcc {
     return tmp;
   }
   const float *vec(uint32_t i, float *tmp) const {
+    if (sq8_) {  // the validation copy decodes into tmp
+      m_.be->read(vid(i), voff(i) + sizeof(ElemHeader), p_.vec_bytes(),
+                  [&](const uint8_t *src) { validation_copy([&] { vdb::sq8_decode(src, tmp, p_.sq8, p_.dim); }); },
+                  velem(i));
+      return tmp;
+    }
     m_.be->read(vid(i), voff(i) + sizeof(ElemHeader), uint64_t(p_.dim) * 4,
                 [&](const uint8_t *src) { validation_copy([&] { std::memcpy(tmp, src, size_t(p_.dim) * 4); }); },
                 velem(i));
@@ -614,10 +624,12 @@ class MegalonAcc {
     m_.be->write(lid(i), loff(i, level, uo), n, [&](uint8_t *dst) { std::memcpy(dst, p, n); }, link_elem(i % N_, level));
     t_mod_bytes += n;
   }
-  void write_elem(uint32_t i, const ElemHeader &h, const float *v, uint64_t upper_bytes) const {
-    m_.be->write(vid(i), voff(i), vrec_, [&](uint8_t *dst) {
+  void write_elem(uint32_t i, const ElemHeader &h, const uint8_t *v, uint64_t upper_bytes) const {
+    m_.be->write(vid(i), voff(i), vrec_, [&](uint8_t *dst) {  // every byte of the record's lines (D3)
       std::memcpy(dst, &h, sizeof(h));
-      std::memcpy(dst + sizeof(ElemHeader), v, size_t(p_.dim) * 4);
+      std::memcpy(dst + sizeof(ElemHeader), v, p_.vec_bytes());
+      if (vrec_ > sizeof(ElemHeader) + p_.vec_bytes())
+        std::memset(dst + sizeof(ElemHeader) + p_.vec_bytes(), 0, vrec_ - sizeof(ElemHeader) - p_.vec_bytes());
     }, velem(i));
     const uint64_t l0off = (i % N_) * l0_, uoff = upper_base_ + h.upper_off;
     m_.be->write_obj(
@@ -647,6 +659,7 @@ class MegalonAcc {
   GraphParams p_;
   Mem m_;
   uint64_t N_, vrec_, l0_, upper_base_;
+  bool sq8_ = false;
 };
 
 }  // namespace vdb

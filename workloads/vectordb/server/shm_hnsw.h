@@ -15,13 +15,15 @@
 // Memory access goes through an accessor policy (HnswT<Acc>): PlainAcc (all-HWcc, Popcorn) hands out direct pointers
 // into the chunks, exactly as before; MegalonAcc (megalon_backend.h) wraps every chunk access in one Megalon object
 // read or write section (DESIGN.md §12). Accessor interface:
-//   float dot(q, i)                        q . vector(i)
+//   float dot(q, i)                        q . vector(i) (sq8: q . decoded vector(i))
 //   const ElemHeader &header(i, tmp)       header of element i (plain: in place; megalon: copy in tmp)
-//   const float *vec(i, tmp)               vector of element i (plain: in place; megalon: copy in tmp[dim])
+//   const float *vec(i, tmp)               vector of element i (plain fp32: in place; megalon fp32: copy in tmp[dim];
+//                                          sq8: decoded into tmp[dim])
 //   const uint32_t *links(i, lv, uo, tmp)  link block of i at level lv (uo = header.upper_off, used if lv > 0)
 //   uint32_t *links_mut(i, lv, uo, tmp)    the same block for an update; commit_links writes it back (whole block)
 //   void commit_links(i, lv, uo, p)
-//   void write_elem(i, h, v, uo_bytes)     header + vector, zeroed level-0 block and upper blocks [uo, uo + uo_bytes)
+//   void write_elem(i, h, v, uo_bytes)     header + vector bytes v (vec_bytes: floats or sq8 codes), zeroed level-0
+//                                          block and upper blocks [uo, uo + uo_bytes)
 //   void prefetch(i)
 #pragma once
 
@@ -91,14 +93,30 @@ struct alignas(64) ElemHeader {  // first line of a vector record (vector chunk)
 static_assert(sizeof(ElemHeader) == 64, "element header is one line");
 constexpr uint32_t kElemMagic = 0x484e5357u;
 
+// Vector storage format (--vec-format; user decision 2026-10-21, vdb-vm-scaling): fp32 = dim floats (every build
+// before SQ8; images and layout unchanged); sq8 = 8-bit scalar quantization, one uint8 per dimension with per-dimension
+// min / scale trained on pool A (tools/build_index.cc writes sq8.bin into the init dir; the server publishes it in HWcc
+// at prepare and every node keeps a private read-only copy). code = clamp(round((x - min) / scale), 0, 255),
+// scale = (max - min) / 255; decoded value = min + scale * code. Distances are the same inner product, computed
+// against the decoded vector (no fp32 rescoring; no fp32 vectors in shared memory). Inserts quantize the inserted
+// vector first and use its decoded form for every distance (offline build and run-time inserts are identical).
+constexpr uint32_t kVecF32 = 0, kVecSQ8 = 1;
+
 struct GraphParams {
   uint32_t dim = 768, M = 16, ef_construction = 128;
   uint64_t capacity = 62500;          // elements per segment
   uint64_t chunk_bytes = 32ull << 20; // target vector chunk size (user: 32 MiB)
+  uint32_t vec_format = kVecF32;
+  const float *sq8 = nullptr;         // sq8: process-local [min[dim], scale[dim]] (not part of any layout)
+  bool is_sq8() const { return vec_format == kVecSQ8; }
   uint32_t M0() const { return 2 * M; }
   uint64_t links0_bytes() const { return (4ull * (1 + M0()) + 63) / 64 * 64; }
   uint64_t links_bytes() const { return (4ull * (1 + M) + 63) / 64 * 64; }  // per upper level
-  uint64_t vrec_bytes() const { return sizeof(ElemHeader) + uint64_t(dim) * 4; }
+  uint64_t vec_bytes() const { return is_sq8() ? uint64_t(dim) : uint64_t(dim) * 4; }  // stored vector bytes
+  // vector record: header line + vector; sq8 records are rounded up to whole lines (fp32 unchanged: 64 + 4 dim)
+  uint64_t vrec_bytes() const {
+    return is_sq8() ? (sizeof(ElemHeader) + vec_bytes() + 63) / 64 * 64 : sizeof(ElemHeader) + uint64_t(dim) * 4;
+  }
   uint64_t per_chunk() const { return chunk_bytes / vrec_bytes(); }  // N elements per group
   uint64_t groups() const { return (capacity + per_chunk() - 1) / per_chunk(); }
   uint64_t vchunk_bytes() const { return per_chunk() * vrec_bytes(); }
@@ -113,6 +131,30 @@ inline float dot(const float *a, const float *b, uint32_t dim) {
 #pragma omp simd reduction(+ : s)
   for (uint32_t i = 0; i < dim; i++) s += a[i] * b[i];
   return s;
+}
+
+// sq8: q . decode(c) with decode(c)[i] = mn[i] + sc[i] * c[i] (mn = sq[0..dim), sc = sq[dim..2 dim))
+inline float dot_sq8(const float *q, const uint8_t *c, const float *sq, uint32_t dim) {
+  const float *mn = sq, *sc = sq + dim;
+  float s = 0;
+#pragma omp simd reduction(+ : s)
+  for (uint32_t i = 0; i < dim; i++) s += q[i] * (mn[i] + sc[i] * float(c[i]));
+  return s;
+}
+inline void sq8_decode(const uint8_t *c, float *out, const float *sq, uint32_t dim) {
+  const float *mn = sq, *sc = sq + dim;
+  for (uint32_t i = 0; i < dim; i++) out[i] = mn[i] + sc[i] * float(c[i]);
+}
+inline void sq8_encode(const float *x, uint8_t *c, const float *sq, uint32_t dim) {
+  const float *mn = sq, *sc = sq + dim;
+  for (uint32_t i = 0; i < dim; i++) {
+    float v = sc[i] > 0 ? std::floor((x[i] - mn[i]) / sc[i] + 0.5f) : 0.f;
+    c[i] = uint8_t(v < 0 ? 0 : v > 255 ? 255 : v);  // out-of-range values (pool B) clamp
+  }
+}
+// quantizer from per-dimension min / max: out = [min[dim], scale[dim]], scale = (max - min) / 255
+inline void sq8_params(const float *mn, const float *mx, float *out, uint32_t dim) {
+  for (uint32_t i = 0; i < dim; i++) out[i] = mn[i], out[dim + i] = (mx[i] - mn[i]) / 255.f;
 }
 
 constexpr uint32_t kMaxLinkWords = 64;  // link block scratch (M0 <= 63: 4 * (1 + 63) bytes)
@@ -131,23 +173,35 @@ class PlainAcc {
     vrec_ = p.vrec_bytes();
     l0_ = p.links0_bytes();
     upper_base_ = N_ * l0_;
+    sq8_ = p.is_sq8();
+    if (sq8_ && !p.sq8) throw std::invalid_argument("sq8 vector format without quantizer parameters");
   }
   GraphMeta *meta() const { return m_.meta; }
-  float dot(const float *q, uint32_t i) const { return vdb::dot(q, vecp(i), p_.dim); }
+  float dot(const float *q, uint32_t i) const {
+    return sq8_ ? dot_sq8(q, vrec(i) + sizeof(ElemHeader), p_.sq8, p_.dim) : vdb::dot(q, vecp(i), p_.dim);
+  }
   const ElemHeader &header(uint32_t i, ElemHeader &) const { return *reinterpret_cast<const ElemHeader *>(vrec(i)); }
-  const float *vec(uint32_t i, float *) const { return vecp(i); }
+  // fp32: in place; sq8: decoded into tmp[dim]
+  const float *vec(uint32_t i, float *tmp) const {
+    if (!sq8_) return vecp(i);
+    sq8_decode(vrec(i) + sizeof(ElemHeader), tmp, p_.sq8, p_.dim);
+    return tmp;
+  }
   const uint32_t *links(uint32_t i, int level, uint64_t uo, uint32_t *) const { return linkp(i, level, uo); }
   uint32_t *links_mut(uint32_t i, int level, uint64_t uo, uint32_t *) const { return linkp(i, level, uo); }
   void commit_links(uint32_t, int level, uint64_t, const uint32_t *) const {
     t_mod_bytes += level ? p_.links_bytes() : l0_;  // in place already; the block is what an update stores
   }
-  void write_elem(uint32_t i, const ElemHeader &h, const float *v, uint64_t upper_bytes) const {
+  // v = the stored vector bytes (vec_bytes: fp32 floats or sq8 codes); sq8 pads the record's last line with zeros
+  void write_elem(uint32_t i, const ElemHeader &h, const uint8_t *v, uint64_t upper_bytes) const {
     t_mod_bytes += vrec_ + l0_ + upper_bytes;
     uint8_t *lc = m_.link[i / N_];
     if (upper_bytes) std::memset(lc + upper_base_ + h.upper_off, 0, upper_bytes);
     uint8_t *vr = vrec(i);  // vector chunk: header + vector, whole lines, written once
     std::memcpy(vr, &h, sizeof(h));
-    std::memcpy(vr + sizeof(ElemHeader), v, size_t(p_.dim) * 4);
+    std::memcpy(vr + sizeof(ElemHeader), v, p_.vec_bytes());
+    if (sq8_ && vrec_ > sizeof(ElemHeader) + p_.vec_bytes())
+      std::memset(vr + sizeof(ElemHeader) + p_.vec_bytes(), 0, vrec_ - sizeof(ElemHeader) - p_.vec_bytes());
     std::memset(lc + (i % N_) * l0_, 0, l0_);
   }
   void prefetch(uint32_t i) const { _mm_prefetch(reinterpret_cast<const char *>(vecp(i)), _MM_HINT_T0); }
@@ -163,6 +217,7 @@ class PlainAcc {
   GraphParams p_;
   Mem m_;
   uint64_t N_, vrec_, l0_, upper_base_;
+  bool sq8_ = false;
 };
 
 template <class Acc>
@@ -176,6 +231,11 @@ class HnswT {
     N_ = p.per_chunk();
     meta_ = a_.meta();
     vtmp_.resize(p.dim);
+    if (p.is_sq8()) {
+      if (!p.sq8) throw std::invalid_argument("sq8 vector format without quantizer parameters");
+      ins_code_.resize(p.dim);
+      ins_dec_.resize(p.dim);
+    }
   }
 
   static void init_empty(GraphMeta *meta) {
@@ -191,8 +251,16 @@ class HnswT {
   const Acc &acc() const { return a_; }
 
   // ---------------------------------------------------------------- insert (hnswlib addPoint); write lock held
-  uint32_t insert(uint64_t ext_id, uint32_t ins_seq, const float *v, std::mt19937_64 &rng) {
+  uint32_t insert(uint64_t ext_id, uint32_t ins_seq, const float *vin, std::mt19937_64 &rng) {
     const uint64_t n = meta_->count;
+    const float *v = vin;  // vector used for every distance of this insert
+    const uint8_t *vbytes = reinterpret_cast<const uint8_t *>(vin);
+    if (p_.is_sq8()) {  // quantize, then insert the decoded vector (the one searches will see)
+      sq8_encode(vin, ins_code_.data(), p_.sq8, p_.dim);
+      sq8_decode(ins_code_.data(), ins_dec_.data(), p_.sq8, p_.dim);
+      v = ins_dec_.data();
+      vbytes = ins_code_.data();
+    }
     if (n >= p_.capacity) throw std::runtime_error("segment full (capacity)");
     const uint32_t cur = uint32_t(n);
     const int curlevel = random_level(rng);
@@ -208,7 +276,7 @@ class HnswT {
       meta_->upper_cur = h.upper_off + uint64_t(curlevel) * p_.links_bytes();
     }
     h.check = uint32_t(ext_id) ^ uint32_t(ext_id >> 32) ^ ins_seq ^ uint32_t(curlevel) ^ kElemMagic;
-    a_.write_elem(cur, h, v, uint64_t(curlevel) * p_.links_bytes());
+    a_.write_elem(cur, h, vbytes, uint64_t(curlevel) * p_.links_bytes());
 
     const uint64_t epl = meta_->ep_level;
     if (epl == kNoEntry) {
@@ -421,7 +489,9 @@ class HnswT {
   double mult_;
   uint64_t N_;
   std::vector<uint8_t> marks_;      // construction visited marks (writer side; one graph object per writer thread)
-  mutable std::vector<float> vtmp_;  // dist_ids scratch (writer side only; unused by PlainAcc)
+  mutable std::vector<float> vtmp_;  // dist_ids scratch (writer side only; unused by PlainAcc fp32)
+  std::vector<uint8_t> ins_code_;    // sq8 insert: codes of the inserted vector (writer side, under the write lock)
+  std::vector<float> ins_dec_;       // sq8 insert: its decoded vector
 };
 
 using ShmHnsw = HnswT<PlainAcc>;

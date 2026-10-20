@@ -11,7 +11,7 @@ The delete log is per node (backend.h:34-35). Rule (h2n): total delete-log capac
   max_deletes(N) = floor(2 x X_MAXD(2) / N / dlog_chunk) x dlog_chunk, X_MAXD(2) = 1835008 (the 2-VM value), and it
   must cover the largest per-VM delete count of the N-target writes file (deletes are executed by the target VM's
   writer; the file's total deletes are unchanged: 3,400,000 for every N).
-usage: h2n_layout.py [--writes-n2 F] [--writes-n4 F] [--writes-n8 F] [--csv OUT] [--skip-writes]
+usage: h2n_layout.py [--vec-format fp32|sq8] [--writes-n2 F] [--writes-n4 F] [--writes-n8 F] [--csv OUT] [--skip-writes]
 Prints one row per N and "LAYOUT PASS" / "LAYOUT FAIL: ..."; exit 1 on FAIL.
 """
 import argparse
@@ -43,8 +43,11 @@ def maxd(n, base=MAXD2):
     return (2 * base // n) // DLOG_CHUNK * DLOG_CHUNK
 
 
+VEC_FORMAT = "fp32"  # --vec-format: fp32 vrec = 64 + 4 dim; sq8 vrec = whole lines of 64 + dim (shm_hnsw.h vrec_bytes)
+
+
 def layout(n, max_deletes, max_ids=MAX_IDS):
-    vrec = 64 + 4 * DIM
+    vrec = 64 + 4 * DIM if VEC_FORMAT == "fp32" else (64 + DIM + 63) // 64 * 64
     per_chunk = CHUNK // vrec
     cap = (max_ids + SEGMENTS - 1) // SEGMENTS
     groups = (cap + per_chunk - 1) // per_chunk
@@ -81,12 +84,15 @@ def main():
     ap.add_argument("--skip-writes", action="store_true", help="layout only (no writes-file read)")
     ap.add_argument("--check", nargs=2, type=int, metavar=("N", "MAX_DELETES"),
                     help="one line for this N and per-node max_deletes (h2n-block.sh); exit 1 if it does not fit")
+    ap.add_argument("--vec-format", choices=("fp32", "sq8"), default="fp32", help="stored vector format (server --vec-format)")
     a = ap.parse_args()
+    global VEC_FORMAT
+    VEC_FORMAT = a.vec_format
     if a.check:
         n, md = a.check
         r = layout(n, md)
         ok = r["fits"] and r["dlog_total_bytes"] <= layout(2, MAXD2)["dlog_total_bytes"]
-        print(f"LAYOUT {'PASS' if ok else 'FAIL'}: N={n} max_deletes={md} dlog_node={r['dlog_node_bytes']} "
+        print(f"LAYOUT {'PASS' if ok else 'FAIL'}: {'vec=sq8 ' if VEC_FORMAT == 'sq8' else ''}N={n} max_deletes={md} dlog_node={r['dlog_node_bytes']} "
               f"swcc_used_end={r['swcc_used_end']} device={DEVICE_SIZE} headroom={r['headroom_bytes']}")
         sys.exit(0 if ok else 1)
     fails, rows = [], []

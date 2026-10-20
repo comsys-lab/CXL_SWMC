@@ -19,6 +19,7 @@ while [ $# -gt 0 ]; do
 done
 set -- "$K_ARG" "${REST[@]}"
 RUNSET=h2n-n$N WL=vdb CONF_WL=h2n
+unset H2N_PINS H2N_VEC_FORMAT H2N_EF H2N_INIT H2N_HOST_IMAGE   # optional conf keys: never inherited from the environment
 . "$(dirname "$0")/lib.sh"
 H=$TREE/experiments/h1
 [ -n "${H2N_NODES:-}" ] || die "EVAL_CONF has no H2N_* keys (use EVAL_CONF=$EVD/h2n.conf)"
@@ -56,7 +57,12 @@ need_files "$VDB_PLAIN_BUILD/bin/vdb-server" "$VDB_LOADGEN_BUILD/loadgen" "$REGI
   "$VDB_X_DATA/pool_b.fbin" "$WRITES" "$EVD/h2n-block.sh" "$EVD/h2n_layout.py"
 [ "$(sha256sum < "$POP_C/packet.sha256" | cut -c1-64)" = "$POP_BUNDLE_SHA" ] || die "Popcorn bundle packet.sha256 != POP_BUNDLE_SHA"
 ring_check
-( cd "$H" && . "$EVD/pins-vdb.sh" && echo "$PIN_SHA256" | sha256sum --quiet -c - ) || die "eval pins (pins-vdb.sh: builds, data, region, N = 2 Megalon) do not verify"
+# SQ8 overlay keys (h2n-sq8.conf; absent in h2n.conf = the fp32 behaviour): H2N_PINS (pins file instead of
+# pins-vdb.sh), H2N_VEC_FORMAT, H2N_EF, H2N_INIT, H2N_HOST_IMAGE (passed to h2n-block.sh)
+PINS=$EVD/${H2N_PINS:-pins-vdb.sh}
+[[ ${H2N_PINS:-x} != */* ]] || die "H2N_PINS is a file name next to runset-h2n.sh"
+VF=${H2N_VEC_FORMAT:-fp32}
+( cd "$H" && . "$PINS" && echo "$PIN_SHA256" | sha256sum --quiet -c - ) || die "eval pins ($PINS: builds, data, region, Megalon) do not verify"
 if [ $HASMG = 1 ]; then
   MGPEND=
   for x in "$MGB" "$MGV" "$MGC" "$MGL"; do [[ $x == *PLACEHOLDER* ]] && MGPEND="$MGPEND $x"; done
@@ -66,6 +72,7 @@ if [ $HASMG = 1 ]; then
   fi
   [[ $MGD =~ ^[1-9][0-9]*$ ]] || die "H2N_MG_MAXD_N$N missing"
 fi
+plan "vec_format $VF ef ${H2N_EF:-32 (h2n-block default)} pins $PINS${H2N_HOST_IMAGE:+ image $H2N_HOST_IMAGE guest ${H2N_INIT:-}}"
 plan "N=$N vCPU/VM=$VCPUS_PER_VM RAM/VM=${H2N_RAM_GB} GB; threads $VDB_SEARCH_THREADS search + 1 writer; recv_mode $RECV_MODE"
 plan "lifetimes (${#LIVES[@]}): ${LIVES[*]}${FROM:+ (resume from $FROM)}${ONLY:+ (only)}"
 plan "writes $WRITES; max_deletes/node $MAXD$([ $HASMG = 1 ] && echo "; Megalon build $MGB lib $MGL cfg $MGC guest $MGV max_deletes/node $MGD")"
@@ -79,6 +86,7 @@ BENV=(H2N_N=$N H2N_VCPU=$VCPUS_PER_VM "H2N_LIFETIMES=${LIVES[*]}" EVAL_RUN=$K SE
   X_NB=$VDB_X_NB X_MAXIDS=$VDB_X_MAXIDS X_MAXW=$VDB_X_MAXW X_MAXD=$MAXD X_INIT_CAP=$VDB_X_INIT_CAP
   "H2N_SLO_PART=$H2N_SLO_PART" H2N_OPCOH_STRICT=$H2N_OPCOH_STRICT H2N_CXLBW=$H2N_CXLBW H2N_HOSTCPU=${H2N_HOSTCPU:-0})
 [ $HASMG = 0 ] || BENV+=(MEG_BUILD=$MGB VMEG=$MGV MEG_CFG=$MGC MEG_LIB=$MGL MG_MAXD=$MGD)
+for x in H2N_VEC_FORMAT H2N_EF H2N_INIT H2N_HOST_IMAGE; do [ -z "${!x:-}" ] || BENV+=("$x=${!x}"); done
 for x in PRETOUCH_DIR MEASURE_ENV_DIR MEASURE_PART_DIR; do [ -z "${!x:-}" ] || BENV+=("$x=${!x}"); done
 plan "block: env ${BENV[*]} bash $EVD/h2n-block.sh <E>/block"
 if [ $DRY = 1 ]; then
@@ -91,7 +99,7 @@ log() { echo "$(date -Is) [$RUNSET run $K] $*" | tee -a "$E/eval-state.txt"; }
 stop() { log "SEQUENCE STOP $*"; $REG add vdb $RUNSET $K "$E" $CSHA stopped "$*"; exit 1; }
 manifest "$VDB_PLAIN_BUILD" "$VDB_LOADGEN_BUILD" $([ $HASMG = 1 ] && echo "$MGB")
 { echo "writes $(sha256sum "$WRITES")"; echo "lifetimes=${LIVES[*]} from=${FROM:-} only=${ONLY:-}"
-  python3 -I -B "$EVD/h2n_layout.py" --check "$N" "$MAXD"; } >> "$E/eval-manifest.txt"
+  python3 -I -B "$EVD/h2n_layout.py" --vec-format "$VF" --check "$N" "$MAXD"; } >> "$E/eval-manifest.txt"
 $REG add vdb $RUNSET $K "$E" $CSHA started "commit $COMMIT N=$N lifetimes ${#LIVES[@]}${FROM:+ from $FROM}"
 log "block start (N=$N, ${#LIVES[@]} lifetimes)"
 env "${BENV[@]}" bash "$EVD/h2n-block.sh" "$E/block" > "$E/sequence.log" 2>&1

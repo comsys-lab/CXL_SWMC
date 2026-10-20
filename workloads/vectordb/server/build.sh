@@ -10,6 +10,7 @@ FLAGS=(-std=c++17 -O3 -g -mavx2 -mfma -fopenmp-simd -pthread -Wall -Wextra
        -I"$ROOT/systems/megalon/shim" -I"$ROOT/systems/popcorn_new/include")
 c++ "${FLAGS[@]}" "$HERE/server.cc" -o "$OUT/bin/vdb-server"
 c++ "${FLAGS[@]}" "$HERE/../tools/build_index.cc" -o "$OUT/bin/vdb-build-index"
+c++ "${FLAGS[@]}" "$HERE/../tools/search_index.cc" -o "$OUT/bin/vdb-search-index"   # Host check tool (not installed on guests)
 { echo "# vdb-server build (CXL_SWMC/workloads/vectordb/server/build.sh)"; echo "date=$(date -Is)"
   echo "source_commit=$(git -C "$HERE" rev-parse HEAD) dirty=$(git -C "$HERE" status --porcelain -- "$HERE/.." "$ROOT/systems/common" "$ROOT/experiments/loadgen" "$ROOT/systems/megalon/shim" "$ROOT/systems/popcorn_new/include" | wc -l)"
   echo "source_dirty_files=$(git -C "$HERE" status --porcelain -- "$HERE/.." "$ROOT/systems/common" "$ROOT/experiments/loadgen" "$ROOT/systems/megalon/shim" "$ROOT/systems/popcorn_new/include" | awk '{print $2}' | tr '\n' ' ')"

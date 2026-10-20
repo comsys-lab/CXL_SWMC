@@ -63,9 +63,18 @@ for k in $(seq 0 $((N - 1))); do IPS+=(192.168.122.$((100 + k))); DOMS+=(cxl_vm$
 export NODES="${IPS[*]}" VM_DOMAINS="${DOMS[*]}" POP_IPS="${IPS[*]}" EXPECT_RUNNING="${DOMS[*]}"
 export MEASURE_ENV_DIR MEASURE_PART_DIR H1_MEASURE_RUN=1
 SSH="ssh -o BatchMode=yes -o ConnectTimeout=8"
-INIT=/home/comsys/vdb/init/seg32c32m-a27m NA=26990000 HOST_IMAGE=$P/workspaces/vdb-data/seg32-c32m-a27m-m16-efc128-b1
+# SQ8 overlay (h2n-sq8.conf; user decision 2026-10-21): H2N_VEC_FORMAT (fp32 | sq8; sq8 adds --vec-format sq8 to every
+# system's server arguments), H2N_EF (query ef), H2N_INIT (guest init dir on vm0), H2N_HOST_IMAGE (Host copy of it,
+# SHA256SUMS checked against the guest's). Unset = the fp32 values every h2n run before SQ8 used.
+INIT=${H2N_INIT:-/home/comsys/vdb/init/seg32c32m-a27m} NA=26990000 HOST_IMAGE=${H2N_HOST_IMAGE:-$P/workspaces/vdb-data/seg32-c32m-a27m-m16-efc128-b1}
+VF=${H2N_VEC_FORMAT:-fp32} EF=${H2N_EF:-32}
+[[ $VF =~ ^(fp32|sq8)$ ]] && [[ $EF =~ ^[1-9][0-9]*$ ]] || die "bad H2N_VEC_FORMAT / H2N_EF ($VF, $EF)"
+[ -f "$HOST_IMAGE/SHA256SUMS" ] && [ -f "$HOST_IMAGE/manifest.txt" ] || die "Host init image $HOST_IMAGE has no SHA256SUMS / manifest.txt"
+if [ $VF = sq8 ]; then grep -qx "vec_format sq8" "$HOST_IMAGE/manifest.txt" && [ -f "$HOST_IMAGE/sq8.bin" ] || die "$HOST_IMAGE is not an sq8 image"
+else ! grep -qx "vec_format sq8" "$HOST_IMAGE/manifest.txt" || die "$HOST_IMAGE is an sq8 image (H2N_VEC_FORMAT=fp32)"; fi
+VFSA=; [ $VF = fp32 ] || VFSA=" --vec-format $VF"
 PAT='[/]bin/vdb-server( |$)'
-COMMON_SA="--nodes $N --segments 32 --M 16 --efc 128 --ef 32 --search-threads $((VCPU - 1)) --wait-timeout-ms 60000 --start-timeout-ms 5400000"
+COMMON_SA="--nodes $N --segments 32 --M 16 --efc 128 --ef $EF --search-threads $((VCPU - 1)) --wait-timeout-ms 60000 --start-timeout-ms 5400000$VFSA"
 # plain backend (all-HWcc, Popcorn): 28m-x capacity, delete log per node X_MAXD (h2n_layout.py: total constant over N)
 SA="$COMMON_SA --max-writes $X_MAXW --max-ids $X_MAXIDS --max-deletes $X_MAXD --init-capacity $X_INIT_CAP"
 HOSTSRV=$PLAIN_BUILD/bin/vdb-server
@@ -86,7 +95,7 @@ APP=$("$HOSTSRV" $SA --print-app-bytes) || die "print-app-bytes ($HOSTSRV, --nod
 RING=$(grep -E '^msg_ring:' "$REGION" | sed 's/.*,[[:space:]]*\([0-9]*\)\].*/\1/')
 [ $((APP + RING)) -lt 268435456 ] || die "app HWcc $APP B + ring $RING B exceed the 256 MiB HWcc budget at N = $N"
 # SWcc fit of the plain layout at this N and X_MAXD (backend.h formulas; the server's own fits() check runs at start)
-LAYOUT=$(python3 -I -B "$EV/h2n_layout.py" --check "$N" "$X_MAXD") || die "h2n_layout.py: $LAYOUT"
+LAYOUT=$(python3 -I -B "$EV/h2n_layout.py" --vec-format $VF --check "$N" "$X_MAXD") || die "h2n_layout.py: $LAYOUT"
 MGSA= MGINSTALL= MGAPP=-
 if [ $HASMG = 1 ]; then
   : "${MEG_BUILD:?}" "${VMEG:?}" "${MEG_CFG:?}" "${MEG_LIB:?}" "${MG_MAXD:?}"
@@ -126,6 +135,7 @@ HCS=$EV/host-cpu-sampler.py   # Host CPU of each VM's QEMU emulator / vhost thre
 [ $HOSTCPU = 0 ] || [ -f "$HCS" ] || die "H2N_HOSTCPU=1 needs $HCS"
 LG_CPUS_H=56-63               # run.sh default LG_CPUS (loadgen CPUs), sampled as Host CPU busy
 OWNER=eval-h2n-n$N-run$EVAL_RUN
+echo "BLOCK PLAN: vec_format=$VF ef=$EF init=$INIT host_image=$HOST_IMAGE"
 echo "BLOCK PLAN: h2n vdb N=$N vcpu/VM=$VCPU threads $((VCPU - 1))+1 nodes=[${IPS[*]}] lifetimes=[${LIVES[*]}] app=$APP mg_app=$MGAPP ring=$RING cxlbw=$CXLBW hostcpu=$HOSTCPU opcoh_strict=$STRICT"
 echo "BLOCK PLAN: server_args plain=[$SA]${MGSA:+ megalon=[$MGSA]}"
 echo "BLOCK PLAN: $LAYOUT"

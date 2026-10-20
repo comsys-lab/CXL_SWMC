@@ -6,7 +6,7 @@
 #   data dir: pool_a.fbin (initial records), pool_b.fbin, queries.fbin, writes.bin (gen_writes.py --mode update,
 #             --pool-a = rows of pool_a.fbin); index built with <build>/bin/vdb-build-index into the scratch dir.
 # env: CPUS (default 16-31: Host node1), SEGMENTS (4), CHUNK (1048576), RATES (100,300), MIX (update=1,search=19),
-#      INDEX_BUILDER (default <build>/bin/vdb-build-index), DEVICE_SIZE (bytes, default 2 GiB),
+#      INDEX_BUILDER (default <build>/bin/vdb-build-index), DEVICE_SIZE (bytes, default 2 GiB), VEC_FORMAT (fp32 | sq8),
 #      BACKEND (plain | megalon: <build> from build-megalon.sh; Megalon config from systems/megalon/vectordb-2vm.yaml
 #      with object_arena_size ARENA (default 512MB); node 0 MEGALON_REINIT=1), TRACE (1 = --trace-dir <scratch>,
 #      default 1; 0 = none), OPCOH (fake | megalon | none: run tests/opcoh_check.py in that mode; VDB_OPCOH_FAKE=1 in
@@ -26,8 +26,11 @@ mkdir -p "$S"
 NA=$(python3 -c "import numpy as np,sys; print(np.fromfile(sys.argv[1],dtype=np.int32,count=1)[0])" "$D/pool_a.fbin")
 NB=$(python3 -c "import numpy as np,sys; print(np.fromfile(sys.argv[1],dtype=np.int32,count=1)[0])" "$D/pool_b.fbin")
 MAXIDS=$((NA + NB))
+VF=${VEC_FORMAT:-fp32}   # fp32 | sq8 (--vec-format; the index is built in the same format)
 PARAMS="--backend $BACKEND --nodes 2 --segments $SEG --chunk-bytes $CHUNK --max-ids $MAXIDS --max-writes 200000 --max-deletes 200000 --dlog-chunk 256"
-taskset -c "$CPUS" "${INDEX_BUILDER:-$B/bin/vdb-build-index}" "$D/pool_a.fbin" "$S/init" "$SEG" "$MAXIDS" 16 128 0 8 20261015 "$CHUNK" > "$S/index.log" 2>&1
+[ "$VF" = fp32 ] || PARAMS="$PARAMS --vec-format $VF"
+VFARG=(); [ "$VF" = fp32 ] || VFARG=("$VF")
+taskset -c "$CPUS" "${INDEX_BUILDER:-$B/bin/vdb-build-index}" "$D/pool_a.fbin" "$S/init" "$SEG" "$MAXIDS" 16 128 0 8 20261015 "$CHUNK" ${VFARG[@]+"${VFARG[@]}"} > "$S/index.log" 2>&1
 truncate -s "$DEVSZ" "$S/device.img"
 sed -e "s|^device: .*|device: $S/device.img|" -e "s|^device_size: .*|device_size: $DEVSZ|" "$ROOT/config/cxl_region.yaml" > "$S/region.yaml"
 sed -e "s|^object_arena_size: .*|object_arena_size: ${ARENA:-512MB}|" "$ROOT/systems/megalon/vectordb-2vm.yaml" > "$S/megalon.yaml"
