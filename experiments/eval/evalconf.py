@@ -30,8 +30,9 @@ P = "/home/comsys/sungsu/destijl-control"
 HERE = os.path.dirname(os.path.abspath(__file__))
 DEFAULT = os.path.join(HERE, "eval.conf")
 # REGISTRY, RUNSETS (optional, absent in eval.conf): runs.tsv this config's run sets register in, run sets allowed to
-# use the config (lib.sh; e.g. recv-sleep.conf)
-RUN_KEYS = {"RUNS", "RESULTS_ROOT", "DERIVED_ROOT", "EVIDENCE_PREFIX", "REGISTRY", "RUNSETS"}
+# use the config (lib.sh; e.g. recv-sleep.conf); EVIDENCE_TAG (optional): evidence dir tag instead of the run set name
+# (lib.sh evidence_dir; e.g. h1-u10u95.conf: vdb-u10u95)
+RUN_KEYS = {"RUNS", "RESULTS_ROOT", "DERIVED_ROOT", "EVIDENCE_PREFIX", "EVIDENCE_TAG", "REGISTRY", "RUNSETS"}
 PREFIX = {"vdb": "VDB_", "recsys": "RS_"}
 LINE = re.compile(r'^([A-Z][A-Z0-9_]*)=(?:"([^"$`\\]*)"|([^\s"$`\\#]*))\s*(#.*)?$')
 PATHISH = re.compile(r"^(CXL_SWMC|builds|workspaces|recovery)(/|$)")

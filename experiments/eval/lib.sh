@@ -22,7 +22,9 @@ TREE=$(cd "$EVD/../.." && pwd)
 #   LEVELS_REGISTRY  runs.tsv read for LEVELS_SOURCE=registry
 #   RS_PROC_CXL_SHM  1 = RecSys servers also snapshot /sys/kernel/cxl_shm per step (sleep_wakeups, tick_kicks)
 #   RUNSETS          [run] the run sets this config may drive (others refuse it); empty = all
-unset REGISTRY LEVELS_SOURCE LEVELS_REGISTRY RS_PROC_CXL_SHM RUNSETS
+#   EVIDENCE_TAG     [run] evidence dir tag instead of the run set name (evidence_dir; e.g. h1-u10u95.conf vdb-u10u95);
+#                    a driver that sets its own EVIDENCE_TAG after sourcing this file (runset-h2n.sh) overrides it
+unset REGISTRY LEVELS_SOURCE LEVELS_REGISTRY RS_PROC_CXL_SHM RUNSETS EVIDENCE_TAG
 CONFSH=$(python3 -I -B "$EVD/evalconf.py" shell ${EVAL_CONF:+--conf "$EVAL_CONF"}) || { echo "RUNSET STOP: ${EVAL_CONF:-eval.conf} does not parse"; exit 2; }
 eval "$CONFSH"
 export EVAL_CONF   # absolute path of the config (evalconf.py shell); pins-vdb.sh (sourced by the hook) reads the same file
@@ -73,7 +75,7 @@ lock_free() {
     plan "MEASUREMENT.lock is held now ($(cat "$P/workspaces/MEASUREMENT.lock")): the real run would stop here"
   fi
 }
-# evidence dir: <RESULTS_ROOT>/<prefix>-run<k>-<tag>-v<N>, tag = EVIDENCE_TAG if the run set sets it, else <runset>
+# evidence dir: <RESULTS_ROOT>/<prefix>-run<k>-<tag>-v<N>, tag = EVIDENCE_TAG if the run set or the config sets it, else <runset>
 evidence_dir() {
   local n=${VER:-1} tag=${EVIDENCE_TAG:-$RUNSET}
   if [ -z "$VER" ]; then while [ -e "$RESULTS_ROOT/$EVIDENCE_PREFIX-run$K-$tag-v$n" ]; do n=$((n + 1)); done; fi

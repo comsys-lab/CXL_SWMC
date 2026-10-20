@@ -14,9 +14,14 @@
 #             lifetimes) or after READY (separate fixed lifetimes), before the L2 and L1 windows; same per workload
 #             (proposal, packet §3.3: KV/LMDB 30 s, vector DB 60 s, DLRM 60 s = one publication round at T = 60 s;
 #             since v0.6.9 DLRM runs at T = 1 s (RS_T_MS, pins-recsys.sh), so the 60 s settle holds 60 rounds)
+# vdb u10, u95 (new H1, user 2026-10-20 22:3x: mixes u5 u10 u50 u90 u95): rows added for experiments/eval runset-vdb.sh,
+#   which runs only the vdb rows listed in VDB_POINTS (its run plan; eval.conf keeps u5 u50 u90). h1-main.sh (old H1
+#   pipeline) would run every vdb row: it is superseded by experiments/eval for the vector DB.
 vdb	u5	U=5	1.0526315789	3	search:99:100	search 95 / update 5	60
+vdb	u10	U=10	1.1111111111	3	search:99:100	search 90 / update 10	60
 vdb	u50	U=50	2	3	search:99:100	search 50 / update 50	60
 vdb	u90	U=90	10	3	search:99:100	search 10 / update 90 (big-ann streaming 4:4:1)	60
+vdb	u95	U=95	20	3	search:99:100	search 5 / update 95	60
 kv	u5	PUT_RATIO=0.05	1	0	mixed:99:1	YCSB B get 95 / put 5	30
 kv	u50	PUT_RATIO=0.5	1	0	mixed:99:1	YCSB A get 50 / put 50	30
 kv	u80	PUT_RATIO=0.8	1	0	mixed:99:1	Twitter get 20 / put 80	30

@@ -44,6 +44,13 @@ for m in $VDB_POINTS; do
   MIXES="$MIXES$m=$(echo "$row" | cut -f3) " SETTLE=$(echo "$row" | cut -f8)
 done
 MIXES=${MIXES% }
+# run plan (2026-10-21, new H1 u10 u95): h1-plan.tsv now has more vdb rows than one run set runs (u5 u10 u50 u90 u95);
+# levels-cb.sh, h2_mix, collect.py and check.py take every vdb row of their plan as a mix of the round, so they get
+# RPLAN = h1-plan.tsv with the vdb rows restricted to VDB_POINTS (plan order; other workloads' rows kept), written to
+# E/vdb/run-plan.tsv at the real start. With eval.conf (u5 u50 u90) its rows equal the vdb rows the plan had before.
+RPLAN=   # set after evidence_dir
+run_plan() { awk -F'\t' -v pts=" $VDB_POINTS " '/^#/ || $1 != "vdb" || index(pts, " " $2 " ")' "$PLAN"; }
+[ "$(run_plan | awk -F'\t' '!/^#/ && $1 == "vdb"' | wc -l)" = "$(echo $VDB_POINTS | wc -w)" ] || die "run plan: vdb rows != VDB_POINTS"
 # mode, round label and levels
 LV= ROOTS=() MODE=r1 N=1 H2F=
 case $VDB_H2_LEVELS in 0|1) ;; *) die "bad VDB_H2_LEVELS";; esac
@@ -92,26 +99,27 @@ plan "threads: --search-threads $VDB_SEARCH_THREADS + 1 writer; dataset $VDB_DAT
 need_env
 lock_free
 evidence_dir
-S=$E/vdb/r$N
+S=$E/vdb/r$N RPLAN=$E/vdb/run-plan.tsv
+plan "run plan $RPLAN (written at the start): vdb rows $(run_plan | awk -F'\t' '!/^#/ && $1 == "vdb" { printf "%s ", $2 "(" $3 ",x" $4 ")" }')"
 HENV=(EVAL_RUN=$K EVAL_REGION=$REGION EVAL_DATASET=$VDB_DATASET VDB_SEARCH_THREADS=$VDB_SEARCH_THREADS
   X_DATA=$VDB_X_DATA X_WRITES=$VDB_X_WRITES X_NB=$VDB_X_NB X_MAXIDS=$VDB_X_MAXIDS X_MAXW=$VDB_X_MAXW X_MAXD=$VDB_X_MAXD
   X_INIT_CAP=$VDB_X_INIT_CAP X_MEGALON_H1CAP=$XMG H1_SEED_BASE=$SEEDB H1_SETTLE_S=$SETTLE H1_MEASURE_RUN=1
   PRETOUCH_DIR=${PRETOUCH_DIR:-} MEASURE_ENV_DIR=${MEASURE_ENV_DIR:-} MEASURE_PART_DIR=${MEASURE_PART_DIR:-}
   EVAL_RECV_MODE=$RECV_MODE)
 if [ $POPONLY = 1 ]; then HENV+=(EVAL_SYSTEMS=pop)   # r1 with the given levels LV (hook.sh EVAL_SYSTEMS)
-elif [ $MODE = r1 ]; then HENV+=(H1_LEVELS_CMD=$H/levels-cb.sh H1_PLAN=$PLAN H1_W=vdb H1_LEVELS_OUT=$E/vdb/levels.tsv); fi
+elif [ $MODE = r1 ]; then HENV+=(H1_LEVELS_CMD=$H/levels-cb.sh H1_PLAN=$RPLAN H1_W=vdb H1_LEVELS_OUT=$E/vdb/levels.tsv); fi
 [ "$VDB_H2_LEVELS" = 1 ] && HENV+=(EVAL_H2=1) && [ -n "$H2F" ] && HENV+=(EVAL_H2_FROM=$H2F)
 HOOK=(bash $H/hook.sh vdb $MODE $S/run $N "$MIXES" ${LV:+"$LV"})
 plan "block: env ${HENV[*]} ${HOOK[*]}"
 if [ $POPONLY = 1 ]; then plan "then: recv_check.py $S/run --mode $RECV_MODE (no collect.py / check.py: 3-system H1 figures)"
-else plan "then: collect.py --plan $PLAN --workload vdb --levels ${LV:-$E/vdb/levels.tsv} $S; check.py --round $N ${ROOTS[*]} $E"; fi
+else plan "then: collect.py --plan $RPLAN --workload vdb --levels ${LV:-$E/vdb/levels.tsv} $S; check.py --round $N ${ROOTS[*]} $E"; fi
 if [ $DRY = 1 ]; then
   [ $MODE = r1 ] || [ -n "$LV" ] || LV=/dev/null   # cont dry without run-1 levels: hook needs a levels arg
   block_dry "missing or not empty" env "${HENV[@]}" bash $H/hook.sh vdb $MODE @DIR@ $N "$MIXES" ${LV:+"$LV"}
   echo "DRY START OK ($RUNSET run $K): stops here, before the lock"; exit 0
 fi
 # ---- real run ----
-mkdir "$E" || die "mkdir $E"
+mkdir "$E" && mkdir "$E/vdb" && run_plan > "$RPLAN" || die "mkdir $E / run plan"
 log() { echo "$(date -Is) [$RUNSET run $K] $*" | tee -a "$E/eval-state.txt"; }
 stop() { log "SEQUENCE STOP $*"; $REG add vdb vdb $K "$E" $CSHA stopped "$*"; exit 1; }
 manifest "$VDB_PLAIN_BUILD" "$VDB_MEG_BUILD" "$VDB_LOADGEN_BUILD"
@@ -139,9 +147,9 @@ if [ $POPONLY = 1 ]; then  # Popcorn-only round: hook checked h1-runs.tsv and ev
   log "RUNSET DONE: review $S/run/recv-check.txt and $S/run/*/h1-runcheck.txt, then: ${REGISTRY:+EVAL_REGISTRY=$REGISTRY }python3 $EVD/registry.py accept vdb $K $E"
   exit 0
 fi
-nice -n 19 python3 -B $H/collect.py --plan "$PLAN" --workload vdb --levels "${LV:-$E/vdb/levels.tsv}" "$S" > "$S/collect.log" 2>&1 \
+nice -n 19 python3 -B $H/collect.py --plan "$RPLAN" --workload vdb --levels "${LV:-$E/vdb/levels.tsv}" "$S" > "$S/collect.log" 2>&1 \
   || stop "collect: $(tail -n 1 "$S/collect.log")"
-python3 -B $H/check.py --plan "$PLAN" --workload vdb --round $N "${ROOTS[@]}" "$E" > "$S/check.log" 2>&1
+python3 -B $H/check.py --plan "$RPLAN" --workload vdb --round $N "${ROOTS[@]}" "$E" > "$S/check.log" 2>&1
 CRC=$?
 log "check: $(tail -n 1 "$S/check.txt" 2>/dev/null || echo 'no check.txt')"
 [ $CRC = 0 ] || stop "check FAIL (see $S/check.txt)"

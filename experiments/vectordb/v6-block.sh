@@ -133,8 +133,8 @@ one() {  # <sys> <name> <run-specific env...>
              XENV=ENV:MEGALON_COH_TIMERS=0 "$@";;
   esac
 }
-# H1 hook helpers (H1-HOOK v2)
-h1_u() { case $1 in U=5|U=50|U=90) echo ${1#U=};; *) echo "SEQUENCE STOP: bad mix parameter $1" >&2; return 1;; esac; }
+# H1 hook helpers (H1-HOOK v2); new H1 (2026-10-20) adds the mixes u10, u95
+h1_u() { case $1 in U=5|U=10|U=50|U=90|U=95) echo ${1#U=};; *) echo "SEQUENCE STOP: bad mix parameter $1" >&2; return 1;; esac; }
 h1_mixu() {  # <mix> -> U from H1_MIXES
   local spec; for spec in $H1_MIXES; do [ "${spec%%=*}" = "$1" ] && { h1_u "${spec#*=}"; return; }; done
   echo "SEQUENCE STOP: mix $1 not in H1_MIXES" >&2; return 1

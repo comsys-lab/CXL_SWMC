@@ -41,7 +41,7 @@ import canon  # noqa: E402
 import urate_report as ur  # noqa: E402
 import stats_delta  # noqa: E402  (urate_report put experiments/loadgen on the path)
 
-SHARE = {"u5": 0.05, "u50": 0.5, "u90": 0.9}
+SHARE = {f"u{u}": u / 100 for u in (5, 10, 50, 90, 95)}  # new H1 (2026-10-20) adds u10, u95
 SYSNAME = {"hw": "hw", "pop": "pop", "mg": "mg", "mgoff": "mgoff"}
 
 
