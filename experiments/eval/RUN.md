@@ -12,8 +12,8 @@ Parameters: `eval.conf` only (`evalconf.py shell` shows the resolved values and 
    REGION=$R VPLAIN=/home/comsys/vdb17r2m PLAIN_BUILD=$P/builds/vdb/17 bash $C/experiments/vectordb/m4-install.sh <log> plain
    REGION=$R VMEG=/home/comsys/vdbm14r2m MEG_BUILD=$P/builds/vdb-megalon/14 MEG_CFG=$C/systems/megalon/vectordb-2vm.yaml \
      bash $C/experiments/vectordb/m4-install.sh <log> megalon
-   REGION=$R PLAIN_DIR=/home/comsys/rs13r2m PLAIN_BUILD=$P/builds/recsys/13 VM_MEG=/home/comsys/rsm14r2m \
-     MEG_BUILD=$P/builds/recsys-megalon/14 MEGALON_BASE=$P/builds/megalon/77 MEG_CFG=$C/systems/megalon/recsys-2vm.yaml \
+   REGION=$R PLAIN_DIR=/home/comsys/rs13r2m PLAIN_BUILD=$P/builds/recsys/13 VM_MEG=/home/comsys/rsm15r2m \
+     MEG_BUILD=$P/builds/recsys-megalon/15 MEGALON_BASE=$P/builds/megalon/77 MEG_CFG=$C/systems/megalon/recsys-2vm.yaml \
      bash $C/experiments/recsys/install.sh <log>
    ```
    and check that /home/comsys/popcorn-12n (2 MiB-ring guest tools of workspaces/popcorn-n/bundle-n-v2) exists on both
