@@ -16,7 +16,7 @@ case "$WHAT" in
   *) echo "plain|megalon"; exit 2;;
 esac
 [ -f $B/bin/vdb-server ] || { echo "no build $B"; exit 1; }
-for ip in 192.168.122.100 192.168.122.101; do
+for ip in ${IPS:-192.168.122.100 192.168.122.101}; do   # IPS: guests to install on (h2n: VMs started after the freeze)
   $SSH comsys@$ip "test ! -e $V && mkdir -p $V/bin $V/cfg $([ $WHAT = megalon ] && echo $V/lib)" < /dev/null
   scp -q $B/bin/vdb-server $C/scripts/guest/vdb-node.sh comsys@$ip:$V/bin/
   if [ -n "${REGION:-}" ]; then scp -q $REGION comsys@$ip:$V/cfg/cxl_region.yaml   # REGION: eval (e.g. config/cxl_region-ring2m.yaml)
