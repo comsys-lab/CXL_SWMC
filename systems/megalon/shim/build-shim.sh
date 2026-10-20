@@ -19,7 +19,7 @@ cp -p "$MB"/ship/lib/* "$OUT/lib/"
 INFO="$PREFIX megalon=$(sed -n 's/^build_id=//p' "$MB/manifest.txt")/$(sed -n 's/^flavor=//p' "$MB/manifest.txt")/$(sed -n 's/^wmeta_layout=//p' "$MB/manifest.txt")"
 # node count only for builds that record one other than 2 (2-node shim info strings stay as before)
 [ -n "$MNODES" ] && [ "$MNODES" != 2 ] && INFO="$INFO/nodes$MNODES"
-c++-std=c++17 -O2 -g -fPIC -shared -Wall -Wextra -I"$HERE" -I"$MSRC/include" -DMSHIM_INFO="\"$INFO\"" \
+c++ -std=c++17 -O2 -g -fPIC -shared -Wall -Wextra -I"$HERE" -I"$MSRC/include" -DMSHIM_INFO="\"$INFO\"" \
     "$HERE/megalon_objapi.cc" -o "$OUT/lib/libmegalon-objapi.so" -L"$OUT/lib" -lmegalon \
     -Wl,--enable-new-dtags,-rpath,'$ORIGIN',--no-undefined,--no-as-needed
 LD_LIBRARY_PATH= ldd "$OUT/lib/libmegalon-objapi.so" | grep -q "not found" && { ldd "$OUT/lib/libmegalon-objapi.so"; exit 1; }
