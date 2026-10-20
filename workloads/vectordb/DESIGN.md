@@ -241,8 +241,9 @@ VMs (no per-VM graphs); Qdrant-style segments, count = CPUs of the VM socket (ho
 - SWcc: per segment level-0 slots (header line + level-0 links + vector, whole lines) and upper-level links.
 - Insert (owner = receiving VM's writer): write lock of segment id % S, hnswlib addPoint, unlock, then applied/P.
 - Search: wait P >= s, replay delete logs, then each segment under its read lock: hnswlib searchKnn with a
-  result filter (ins_seq <= s < del_seq), merge top-k. Segments are searched one after another per query
-  (Qdrant parallelises segments inside a request; here queries run in parallel across worker threads).
+  result filter (ins_seq <= s < del_seq), merge top-k. One query fans out over its segments like Qdrant
+  (SegmentsSearcher::search, one task per segment): the starting worker does the P wait and the delete replay, then
+  publishes one task per segment (server.cc QueryCtx, since 68e8b22d9); idle workers claim them, running queries first.
 - Initial pool A: tools/build_index.cc builds the 32 segment images offline (one thread per segment, seed + s,
   deterministic); node 0 copies them into SWcc at prepare.
 - Why (Host pilot 2026-10-15): the growing/sealed design drifted (brute-force growing segments: search cost 9 ->
