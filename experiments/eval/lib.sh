@@ -24,6 +24,8 @@ done
 [[ $K =~ ^[1-9]$ ]] && [ "$K" -le "$RUNS" ] || die "run number k must be 1..RUNS=$RUNS (got '$K')"
 [ -z "$VER" ] || [[ $VER =~ ^[1-9][0-9]*$ ]] || die "bad --v"
 case $WL in vdb) CSHA=$CONFIG_SHA256_VDB;; recsys) CSHA=$CONFIG_SHA256_RECSYS;; *) die "bad WL";; esac
+# H3 drivers (runset-h3-*.sh) set CONF_WL=h3-vdb | h3-recsys: config_sha256 and the manifest dump over WL + H3_* keys
+case ${CONF_WL:-} in "") CONF_WL=$WL;; h3-vdb) CSHA=$CONFIG_SHA256_H3_VDB;; h3-recsys) CSHA=$CONFIG_SHA256_H3_RECSYS;; *) die "bad CONF_WL";; esac
 REG="python3 -I -B $EVD/registry.py"
 plan() { echo "PLAN ($RUNSET run $K): $*"; }
 # the code tree: real runs need the clean live tree; a dry start may run in a worktree and reports the difference
@@ -68,7 +70,7 @@ manifest() {  # written into E at the real start
     echo "runset=$RUNSET workload=$WL run=$K evidence=$E start=$(date -Is) pid=$$"
     echo "code_tree=$TREE commit=$COMMIT dirty_files=$DIRTY dirty_diff_sha256=$DIFFSHA"
     echo "eval_conf=$EVAL_CONF sha256=$EVAL_CONF_SHA256 config_sha256=$CSHA"
-    python3 -I -B "$EVD/evalconf.py" dump "$WL" | sed 's/^/conf: /'
+    python3 -I -B "$EVD/evalconf.py" dump "$CONF_WL" | sed 's/^/conf: /'
     python3 -I -B "$EVD/evalconf.py" later | sed 's/^/later: /'
     local b
     for b in "$@"; do

@@ -3,7 +3,8 @@
 // "query" (MLPerf DLRMv2 server queries: N consecutive samples of the query pool from a random start, N drawn from
 // tools/dist_quantile.txt, or fixed with pairs=N; all to the serving target).
 // Options: samples=FILE (update trace, samples.h format), queries=FILE (query pool; default samples), quantiles=FILE
-//          or pairs=N, update_target=0, query_target=1 (index into --target), seed=N, scores=0|1 (return scores),
+//          or pairs=N, update_target=0, query_target=1 (index into --target), query_spread=rr (H3: queries round robin
+//          over every target except update_target; exclusive with query_target), seed=N, scores=0|1 (return scores),
 //          max_queries=N (default 50M), seq_base=N (default 0: update seqs continue after N; the trace position of
 //          seq s is s-1, so measurements against one server lifetime replay the trace on from where the previous one
 //          stopped), wrap=0|1 (default 0; 1 = the update trace wraps to its start instead of ending the stream).
@@ -80,6 +81,17 @@ class Recsys : public loadgen::Workload {
     update_target_ = std::stoul(get("update_target", "0"));
     query_target_ = std::stoul(get("query_target", targets > 1 ? "1" : "0"));
     if (update_target_ >= targets || query_target_ >= targets) return *err = "update/query target out of range", false;
+    // query_spread=rr (H3, N serving nodes): query k goes to the k-th target (round robin) of the targets other than
+    // update_target, so the offered query rate is split evenly over the serving nodes; the (pairs, start) draws are
+    // unchanged (same query sequence as query_target). Default "" = every query to query_target (unchanged).
+    const std::string spread = get("query_spread", "");
+    if (!spread.empty()) {
+      if (spread != "rr") return *err = "query_spread must be rr", false;
+      if (o.count("query_target")) return *err = "query_spread and query_target are exclusive", false;
+      for (uint32_t t = 0; t < targets; t++)
+        if (t != update_target_) serve_targets_.push_back(t);
+      if (serve_targets_.empty()) return *err = "query_spread=rr needs a target other than update_target", false;
+    }
     seed_ = std::stoull(get("seed", "20261016"));
     scores_ = get("scores", "0") == "1";
     max_queries_ = std::stoull(get("max_queries", "50000000"));
@@ -125,7 +137,7 @@ class Recsys : public loadgen::Workload {
     if (next_q_ >= max_queries_) return false;
     const uint32_t pairs = quant_[std::uniform_int_distribution<size_t>(0, quant_.size() - 1)(rng_)];
     const uint64_t start = std::uniform_int_distribution<uint64_t>(0, qry_.n - pairs)(rng_);
-    r->target = query_target_;
+    r->target = serve_targets_.empty() ? query_target_ : serve_targets_[next_q_ % serve_targets_.size()];
     r->op = kOpQuery;
     r->seq = next_q_++;
     {
@@ -208,7 +220,13 @@ class Recsys : public loadgen::Workload {
     o << "recsys samples=" << samples_path_ << " (" << upd_.n << ", " << upd_.source << ") queries=" << queries_path_
       << " (" << qry_.n << ") quantiles=" << (quantiles_path_.empty() ? "fixed" : quantiles_path_) << " sizes=";
     for (size_t i = 0; i < quant_.size(); i++) o << (i ? "," : "") << quant_[i];
-    o << " update_target=" << update_target_ << " query_target=" << query_target_ << " seed=" << seed_
+    o << " update_target=" << update_target_;
+    if (serve_targets_.empty()) o << " query_target=" << query_target_;
+    else {
+      o << " query_spread=rr query_targets=";
+      for (size_t i = 0; i < serve_targets_.size(); i++) o << (i ? "," : "") << serve_targets_[i];
+    }
+    o << " seed=" << seed_
       << " seq_base=" << seq_base_ << " wrap=" << wrap_;
     return o.str();
   }
@@ -223,6 +241,7 @@ class Recsys : public loadgen::Workload {
   std::string samples_path_, queries_path_, quantiles_path_;
   std::vector<uint32_t> quant_;
   uint32_t update_target_ = 0, query_target_ = 1;
+  std::vector<uint32_t> serve_targets_;  // query_spread=rr: query k -> serve_targets_[k % size]
   uint64_t seed_ = 0, max_queries_ = 0, next_u_ = 0, next_q_ = 0, seq_base_ = 0;
   bool scores_ = false, wrap_ = false;
   std::mt19937_64 rng_;
