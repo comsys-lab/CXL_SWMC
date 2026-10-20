@@ -168,7 +168,8 @@ check((cs["mod_bytes"] == 0).all(), "search mod_bytes 0")
 check((cs["wait_ns"] <= cs["t_ns"]).all() and (cu["wait_ns"] == 0).all(), "E1 wait inside search T, 0 for updates")
 for op, x in (("search", acs), ("update", acu)):
     check(sum(s[f"opt.{op}.wait_ns"] for s in st) == int(x["wait_ns"].sum()), f"opt.{op}.wait_ns = records' sum")
-check((cu["mod_bytes"] >= 3136 + 192 + 64).all(), "update mod_bytes >= record + level-0 block + delete-log entry")
+REC = int(os.environ.get("OPCOH_RECORD_BYTES", "3136"))  # level-0 record: 3136 fp32 768-d, 832 sq8 (h2n-block sets it)
+check((cu["mod_bytes"] >= REC + 192 + 64).all(), "update mod_bytes >= record + level-0 block + delete-log entry")
 by = {int(q): i for i, q in enumerate(ok["seq"])}
 oi = np.array([by[int(q)] for q in srch["seq"]], dtype=np.int64)
 if mode == "fake":

@@ -328,7 +328,8 @@ vdb_life() {  # <sys> <mix>
     grep -qx "bad_coh_version=0" $RP/loadgen/vectordb.txt; } || stop "$name: responses without an op coherence block"
   python3 $XV/opsplit.py $RP > $RP/opsplit.log 2>&1 || stop "$name: opsplit.py (see $RP/opsplit.log)"
   # opcoh_check on all N nodes (generalised; OPCOH_NODES = N): a FAIL stops only with H2N_OPCOH_STRICT=1
-  OPCOH_NODES=$N OPCOH_PARTS=$RP MEGALON_LEAN=1 python3 $OPC $RP $mode > $RP/opcoh-check.txt 2>&1
+  OPCOH_NODES=$N OPCOH_PARTS=$RP MEGALON_LEAN=1 OPCOH_RECORD_BYTES=$([ $VF = sq8 ] && echo 832 || echo 3136) \
+    python3 $OPC $RP $mode > $RP/opcoh-check.txt 2>&1
   oc=$(grep -m1 -oE '^OPCOH_CHECK (PASS|FAIL)' $RP/opcoh-check.txt | cut -d' ' -f2); oc=${oc:-ERROR}
   if [ "$oc" != PASS ]; then
     [ $STRICT = 1 ] && stop "$name: opcoh_check $mode $oc (see $RP/opcoh-check.txt)"
