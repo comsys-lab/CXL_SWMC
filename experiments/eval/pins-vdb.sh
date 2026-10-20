@@ -4,7 +4,7 @@
 # Code integrity: runset-vdb.sh requires a clean live CXL_SWMC and records its commit; the hashes below pin the
 # non-code inputs (builds, data, region, Megalon config, Popcorn bundle). Re-pin mechanically when eval.conf changes one.
 EVD=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
-eval "$(python3 -I -B "$EVD/evalconf.py" shell)"
+eval "$(python3 -I -B "$EVD/evalconf.py" shell ${EVAL_CONF:+--conf "$EVAL_CONF"})"   # lib.sh exports EVAL_CONF
 HOOK_FILE=$P/CXL_SWMC/experiments/vectordb/v6-block.sh   # v6-block.sh calls the live tree's m4-run.sh itself
 BLOCK_CMD=(bash $HOOK_FILE)
 BLOCK_ENV=(KPOP=$POP_K GTPOP=$POP_GT CPOP=$POP_C MEG_LIB=$MEG_LIB MEGALON_LEAN=1 EXPECT_DAX_UUID=$EXPECT_DAX_UUID

@@ -58,7 +58,17 @@ if [ -n "${H1MODE:-}" ]; then
   # README item 8: H1 measurement runs use experiments/h1/h1-gate.sh and scripts/host/measure-run.sh (m4-run.sh, run.sh)
   [ "${H1_MEASURE_RUN:-0}" = 1 ] && [ -d "${MEASURE_PART_DIR:-}" ] || { echo "SEQUENCE STOP: H1MODE needs H1_MEASURE_RUN=1 and MEASURE_PART_DIR"; exit 2; }
   [[ "${EXPECT_DAX_UUID:-}" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]] || { echo "SEQUENCE STOP: H1MODE needs EXPECT_DAX_UUID (precheck)"; exit 2; }
-  case $H1MODE in r1) : "${H1_LEVELS_CMD:?}" "${H1_LEVELS_OUT:?}";;
+  # H1_SYSTEMS (hook.sh): "hw pop mg" (default, the H1 set) or, with EVAL_RUN (eval EVAL_SYSTEMS), a subset of "hw pop"
+  # without Megalon: r1 then takes its levels from H1_LEVELS (given, e.g. another experiment's run 1) instead of the
+  # mg-lifetime callback; per mix the systems' SLO-only lifetimes, their fix lifetimes at H1_LEVELS, and h2_mix
+  case "${H1_SYSTEMS:-hw pop mg}" in "hw pop mg") H1MG=1;;
+    "hw pop"|hw|pop) [ -n "${EVAL_RUN:-}" ] || { echo "SEQUENCE STOP: H1_SYSTEMS without mg needs EVAL_RUN"; exit 2; }; H1MG=0;;
+    *) echo "SEQUENCE STOP: bad H1_SYSTEMS '${H1_SYSTEMS:-}'"; exit 2;; esac
+  case $H1MODE:$H1MG in r1:1) : "${H1_LEVELS_CMD:?}" "${H1_LEVELS_OUT:?}";;
+    r1:0) [ -f "${H1_LEVELS:-}" ] || { echo "SEQUENCE STOP: r1 without mg needs H1_LEVELS"; exit 2; };;
+    cont:0) echo "SEQUENCE STOP: cont mode runs hw pop mg"; exit 2;;
+  esac
+  case $H1MODE in r1) ;;
     cont) [ -f "${H1_LEVELS:-}" ] || { echo "SEQUENCE STOP: no H1_LEVELS"; exit 2; };;
     *) echo "SEQUENCE STOP: bad H1MODE (H1-HOOK v2: r1 | cont)"; exit 2;; esac
   PARENT_LOCK=$H1_PARENT_LOCK OWNER="H1-vdb-$H1MODE-r$H1_N"
@@ -93,7 +103,14 @@ $VM/cfg/cxl_region.yaml $RF"
 RATE_LOW=10.526 RATE_L=$(rate 158.479 5) RATE_TRACE=20
 COMMON=(DATASET=$DS PLAIN_BUILD=$PLAIN_BUILD VPLAIN=$VPLAIN MEG_BUILD=$MEG_BUILD VMEG=$VMEG
         LOADGEN_BIN=$LOADGEN_BUILD/loadgen KIND=pfix)
-PE=(C8=$CPOP K8=$KPOP GT8=$GTPOP RECV_MODE=poll)  # m4-run.sh's Popcorn variables (named C8/K8/GT8), given the bundle
+# Popcorn receive mode: poll; with EVAL_RUN the eval config's RECV_MODE (EVAL_RECV_MODE; m4-run.sh writes it to
+# /sys/module/cxl_shm/parameters/recv_mode after enable and checks it; the teardown unloads cxl_shm, whose default is poll)
+PRM=poll
+if [ -n "${EVAL_RECV_MODE:-}" ]; then
+  [ -n "${EVAL_RUN:-}" ] && [[ $EVAL_RECV_MODE =~ ^(poll|idle|sleep)$ ]] || { echo "SEQUENCE STOP: EVAL_RECV_MODE needs EVAL_RUN and poll | idle | sleep"; exit 2; }
+  PRM=$EVAL_RECV_MODE
+fi
+PE=(C8=$CPOP K8=$KPOP GT8=$GTPOP RECV_MODE=$PRM)  # m4-run.sh's Popcorn variables (named C8/K8/GT8), given the bundle
 dax_root() {  # before a Popcorn run: back to root:root 600 (no server of ours runs between runs); fresh stat check
   [ $CHOWNED = 1 ] || return 0
   block_stop_servers
@@ -215,7 +232,7 @@ PY
   [ "$(echo "$row" | cut -f6)" = measured ] || { echo "H2 levels $m: same as H1 (no extra windows)"; return 0; }
   rates="$(echo "$row" | cut -f5),$(echo "$row" | cut -f4)"
   [[ $rates =~ ^[0-9]+(\.[0-9]+)?,[0-9]+(\.[0-9]+)?$ ]] || { echo "SEQUENCE STOP: bad H2 rates $rates"; exit 1; }
-  for s in $(SHUFFLE_SEED=H1-vdb-r$H1_N-$m-h2 shuffle hw pop); do
+  for s in $(SHUFFLE_SEED=H1-vdb-r$H1_N-$m-h2 shuffle $(h1_hp)); do
     L=$s-$m-fixh2-r$H1_N
     parent_lock_check
     one $s $L U=$(h1_mixu $m) KIND=h1 "H1_PARTS=fix" SETTLE_S=$H1_SETTLE_S SEED=$H1_SEED REP=h2-r$H1_N RATE=$rates < /dev/null
@@ -224,23 +241,29 @@ PY
     printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$s-$m-fixh2-r$H1_N" $s $m fix $H1_N "$L/fix" "$st" sep >> "$E/h2-runs.tsv"
   done
 }
+h1_hp() { local s; for s in hw pop; do [[ " ${H1_SYSTEMS:-hw pop mg} " == *" $s "* ]] && echo $s; done; }  # hw / pop systems of the round
 h1_main() {
-  local m s mixes base rot ord rates
+  local m s mixes base rot ord rates hp mgt
+  hp=$(echo $(h1_hp))
   printf '# name\tsystem\tmix\tphase\tround\trun_dir\tsteps\tlifetime\n' > "$E/h1-runs.tsv"
   mixes=""; for spec in $H1_MIXES; do mixes="$mixes ${spec%%=*}"; h1_u "${spec#*=}" > /dev/null || exit 1; done
   mixes=$(SHUFFLE_SEED=H1-vdb-r$H1_N shuffle $mixes)
   if [ $H1MODE = r1 ]; then
+    mgt=" mg(slo+levels+fix) mgoff(fix)"; [ $H1MG = 1 ] || mgt=" (no Megalon; levels $H1_LEVELS; Popcorn recv_mode $PRM)"
     { echo "# H1 vector DB r1 (H1-HOOK v2; mixes: shuffle seed H1-vdb-r1; loadgen seed $H1_SEED; settle ${H1_SETTLE_S}s)"
       echo "mixes: $mixes"
-      for m in $mixes; do echo "$m: slo $(SHUFFLE_SEED=H1-vdb-r1-$m shuffle hw pop) mg(slo+levels+fix) mgoff(fix) fix $(SHUFFLE_SEED=H1-vdb-r1-$m-fix shuffle hw pop)"; done
+      for m in $mixes; do echo "$m: slo $(SHUFFLE_SEED=H1-vdb-r1-$m shuffle $hp)$mgt fix $(SHUFFLE_SEED=H1-vdb-r1-$m-fix shuffle $hp)"; done
     } | tee "$E/order.txt"
     for m in $mixes; do
-      for s in $(SHUFFLE_SEED=H1-vdb-r1-$m shuffle hw pop); do h1_life $s $m $s-$m-slo-r1 slo sep -; done
-      h1_life mg $m mg-$m-r1 "slo fix" cont cb
-      rates=$(h1_levels "$H1_LEVELS_OUT" $m) || exit 1
-      h1_life mgoff $m mgoff-$m-fix-r1 fix sep $rates
-      for s in $(SHUFFLE_SEED=H1-vdb-r1-$m-fix shuffle hw pop); do h1_life $s $m $s-$m-fix-r1 fix sep $rates; done
-      [ "${EVAL_H2:-0}" = 1 ] && h2_mix $m "$H1_LEVELS_OUT"
+      for s in $(SHUFFLE_SEED=H1-vdb-r1-$m shuffle $hp); do h1_life $s $m $s-$m-slo-r1 slo sep -; done
+      if [ $H1MG = 1 ]; then
+        h1_life mg $m mg-$m-r1 "slo fix" cont cb
+        rates=$(h1_levels "$H1_LEVELS_OUT" $m) || exit 1
+        h1_life mgoff $m mgoff-$m-fix-r1 fix sep $rates
+      else rates=$(h1_levels "$H1_LEVELS" $m) || exit 1; fi
+      for s in $(SHUFFLE_SEED=H1-vdb-r1-$m-fix shuffle $hp); do h1_life $s $m $s-$m-fix-r1 fix sep $rates; done
+      if [ $H1MG = 1 ]; then rates=$H1_LEVELS_OUT; else rates=$H1_LEVELS; fi
+      [ "${EVAL_H2:-0}" = 1 ] && h2_mix $m "$rates"
     done
   else
     base=($(SHUFFLE_SEED=H1-vdb-latin shuffle hw pop mg)); rot=$(( H1_N % 3 ))

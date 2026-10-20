@@ -60,6 +60,19 @@ note) makes levels-cb.sh fail inside the Megalon lifetime ("LEVELS STOP"): the b
 (no automatic retry; Q4 rule), keep the evidence dir, and rerun only after the user's decision (same command, new
 v<N>; or a changed VDB_POINTS = a new config_sha256).
 
+## Other configs (env EVAL_CONF)
+`EVAL_CONF=<file>` makes lib.sh (and pins-vdb.sh) read another config with the same keys; unset = eval.conf, whose
+config_sha256 values do not change. Optional keys (absent in eval.conf): REGISTRY (own runs.tsv), RUNSETS (run sets
+allowed), LEVELS_SOURCE=registry + LEVELS_REGISTRY (fixed-load levels of every run from the accepted run
+LEVELS_FROM_RUN of another registry), RS_PROC_CXL_SHM=1 (RecSys per-step /sys/kernel/cxl_shm snapshots).
+recv-sleep (reports/experiments/recv-sleep.md): `EVAL_CONF=$C/experiments/eval/recv-sleep.conf bash
+$C/experiments/eval/runset-{vdb,rs-main}.sh 1` = Popcorn recv_mode=sleep only, vector DB u5 u50 (VDB_SYSTEMS=pop:
+per mix pop SLO-only, pop fix at run 1's H1 levels, pop fix at run 1's H2 levels), RecSys 50 samples/s (pop SLO, pop
+fix-only at run 1's L1, L2, 1 q/s); evidence recovery/recv-sleep-run1-<vdb|rs-main>-v<N>, registry
+workspaces/eval-derived/recv-sleep-runs.tsv, CSVs workspaces/eval-derived-recv-sleep/; E/.../recv-check.txt
+(recv_check.py: recv_mode on both VMs per lifetime, unload at teardown, per-step receive counters) replaces the
+3-system collect/check for the vector DB.
+
 ## Known limits (see PROGRESS / report)
 - Megalon vector DB uses the 28M capacity (VDB_MG_CAPACITY=h1): the 28m-x capacity (89 groups/segment, ~95.6 GiB of
   objects, inference) exceeds Megalon's object_arena_size 90GB. Pending user confirmation.

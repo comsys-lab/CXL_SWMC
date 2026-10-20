@@ -20,8 +20,19 @@ RUNSET=vdb WL=vdb
 . "$(dirname "$0")/lib.sh"
 H=$TREE/experiments/h1 X=$TREE/experiments/vectordb
 G=$X/host-gate.sh PG=$X/pretouch-gate.sh PLAN=$H/h1-plan.tsv
-[ "$VDB_SYSTEMS" = "hw pop mg" ] || die "VDB_SYSTEMS must be 'hw pop mg' (the H1 hook runs exactly these + mgoff)"
-[ "$VDB_MG_POINTS" = "$VDB_POINTS" ] || die "VDB_MG_POINTS must equal VDB_POINTS (the H1 hook runs Megalon at every mix)"
+# VDB_SYSTEMS "hw pop mg" = the H1 hook set (+ mgoff). Popcorn-only mode (VDB_SYSTEMS=pop, e.g. recv-sleep.conf): one
+# round r1 without Megalon (hook EVAL_SYSTEMS=pop): per mix pop SLO-only lifetime, pop fix-only lifetime at the H1
+# levels and (VDB_H2_LEVELS=1) at the H2 levels of the accepted run LEVELS_FROM_RUN of LEVELS_REGISTRY (LEVELS_SOURCE=
+# registry); no collect.py / check.py (3-system H1 figures), recv_check.py instead.
+POPONLY=0
+case $VDB_SYSTEMS in
+  "hw pop mg") [ "$VDB_MG_POINTS" = "$VDB_POINTS" ] || die "VDB_MG_POINTS must equal VDB_POINTS (the H1 hook runs Megalon at every mix)";;
+  pop) POPONLY=1
+       [ -z "$VDB_MG_POINTS" ] || die "VDB_SYSTEMS=pop needs an empty VDB_MG_POINTS"
+       [ "${LEVELS_SOURCE:-}" = registry ] || die "VDB_SYSTEMS=pop takes its levels from another registry (LEVELS_SOURCE=registry)"
+       [ "$K" = 1 ] || die "VDB_SYSTEMS=pop supports run 1 only (one r1 round)";;
+  *) die "VDB_SYSTEMS must be 'hw pop mg' (the H1 hook runs exactly these + mgoff) or 'pop' (Popcorn-only mode)";;
+esac
 [ "$VDB_SLO_PCT:$VDB_SLO_MS" = 99:100 ] || die "VDB SLO is fixed in the H1 hook (search:99:100)"
 [ "$VDB_DATASET" = 28m-x ] || [ "$VDB_DATASET" = 28m ] || die "bad VDB_DATASET"
 case $VDB_MG_CAPACITY in h1) XMG=1;; x) XMG=0;; *) die "bad VDB_MG_CAPACITY";; esac
@@ -49,6 +60,21 @@ if [ "$K" -gt 1 ] && [ "$VDB_LATER_RUNS" = cont ]; then
     plan "levels from run $LEVELS_FROM_RUN: $LV"
   else plan "levels: run $LEVELS_FROM_RUN of vdb not accepted yet (a real run would stop here)"; fi
 elif [ "$K" -gt 1 ]; then [ "$VDB_LATER_RUNS" = r1 ] || die "bad VDB_LATER_RUNS"; fi
+if [ $POPONLY = 1 ]; then  # levels of the Popcorn-only round: run LEVELS_FROM_RUN of LEVELS_REGISTRY (every mix of VDB_POINTS)
+  levels_dir_of vdb || die "no accepted vdb run $LEVELS_FROM_RUN in $LEVELS_REGISTRY"
+  E1=$LEVELS_SRC_DIR
+  LV=$(python3 -I -B $H/attempts.py levels "$E1" vdb) && [ -f "$LV" ] || die "no levels.tsv in $E1"
+  for m in $VDB_POINTS; do awk -F'\t' -v m="$m" 'NR > 1 && $1 == m { f = 1 } END { exit !f }' "$LV" || die "no H1 levels of $m in $LV"; done
+  if [ "$VDB_H2_LEVELS" = 1 ]; then
+    H2F=$(python3 -I -B $H/attempts.py dir "$E1" vdb 1)/run/levels-h2-used.tsv
+    [ -f "$H2F" ] || die "no H2 levels in $E1 ($H2F)"
+    for m in $VDB_POINTS; do awk -F'\t' -v m="$m" '$1 == m { f = 1 } END { exit !f }' "$H2F" || die "no H2 levels of $m in $H2F"; done
+  fi
+  plan "Popcorn-only round (recv_mode $RECV_MODE): levels from $LEVELS_REGISTRY vdb run $LEVELS_FROM_RUN = $E1 (config_sha256 $LEVELS_SRC_SHA): H1 $LV${H2F:+, H2 $H2F}"
+  for m in $VDB_POINTS; do
+    plan "  $m: H1 L2,L1 rates $(awk -F'\t' -v m="$m" 'NR > 1 && $1 == m { print $10 "," $9 }' "$LV")${H2F:+; H2 L2,L1 rates $(awk -F'\t' -v m="$m" '$1 == m { print $5 "," $4 " (" $6 ")" }' "$H2F")}"
+  done
+fi
 SEEDB=$((SEED_BASE + K - N))   # loadgen seed of the run = SEED_BASE + k in both modes (hook: H1_SEED_BASE + n)
 need_files "$VDB_PLAIN_BUILD/bin/vdb-server" "$VDB_MEG_BUILD/bin/vdb-server" "$VDB_LOADGEN_BUILD/loadgen" "$REGION" \
   "$VDB_MEG_CFG" "$POP_C/p-popcorn-shm.sh" "$VDB_X_DATA/pool_b.fbin" "$VDB_X_WRITES" "$EVD/pins-vdb.sh"
@@ -70,12 +96,15 @@ S=$E/vdb/r$N
 HENV=(EVAL_RUN=$K EVAL_REGION=$REGION EVAL_DATASET=$VDB_DATASET VDB_SEARCH_THREADS=$VDB_SEARCH_THREADS
   X_DATA=$VDB_X_DATA X_WRITES=$VDB_X_WRITES X_NB=$VDB_X_NB X_MAXIDS=$VDB_X_MAXIDS X_MAXW=$VDB_X_MAXW X_MAXD=$VDB_X_MAXD
   X_INIT_CAP=$VDB_X_INIT_CAP X_MEGALON_H1CAP=$XMG H1_SEED_BASE=$SEEDB H1_SETTLE_S=$SETTLE H1_MEASURE_RUN=1
-  PRETOUCH_DIR=${PRETOUCH_DIR:-} MEASURE_ENV_DIR=${MEASURE_ENV_DIR:-} MEASURE_PART_DIR=${MEASURE_PART_DIR:-})
-[ $MODE = r1 ] && HENV+=(H1_LEVELS_CMD=$H/levels-cb.sh H1_PLAN=$PLAN H1_W=vdb H1_LEVELS_OUT=$E/vdb/levels.tsv)
+  PRETOUCH_DIR=${PRETOUCH_DIR:-} MEASURE_ENV_DIR=${MEASURE_ENV_DIR:-} MEASURE_PART_DIR=${MEASURE_PART_DIR:-}
+  EVAL_RECV_MODE=$RECV_MODE)
+if [ $POPONLY = 1 ]; then HENV+=(EVAL_SYSTEMS=pop)   # r1 with the given levels LV (hook.sh EVAL_SYSTEMS)
+elif [ $MODE = r1 ]; then HENV+=(H1_LEVELS_CMD=$H/levels-cb.sh H1_PLAN=$PLAN H1_W=vdb H1_LEVELS_OUT=$E/vdb/levels.tsv); fi
 [ "$VDB_H2_LEVELS" = 1 ] && HENV+=(EVAL_H2=1) && [ -n "$H2F" ] && HENV+=(EVAL_H2_FROM=$H2F)
 HOOK=(bash $H/hook.sh vdb $MODE $S/run $N "$MIXES" ${LV:+"$LV"})
 plan "block: env ${HENV[*]} ${HOOK[*]}"
-plan "then: collect.py --plan $PLAN --workload vdb --levels ${LV:-$E/vdb/levels.tsv} $S; check.py --round $N ${ROOTS[*]} $E"
+if [ $POPONLY = 1 ]; then plan "then: recv_check.py $S/run --mode $RECV_MODE (no collect.py / check.py: 3-system H1 figures)"
+else plan "then: collect.py --plan $PLAN --workload vdb --levels ${LV:-$E/vdb/levels.tsv} $S; check.py --round $N ${ROOTS[*]} $E"; fi
 if [ $DRY = 1 ]; then
   [ $MODE = r1 ] || [ -n "$LV" ] || LV=/dev/null   # cont dry without run-1 levels: hook needs a levels arg
   block_dry "missing or not empty" env "${HENV[@]}" bash $H/hook.sh vdb $MODE @DIR@ $N "$MIXES" ${LV:+"$LV"}
@@ -100,6 +129,16 @@ gates start
 log "block start: mode $MODE round $N mixes [$MIXES]"
 env "${HENV[@]}" "${HOOK[@]}" || stop "hook (see $S/run/sequence.log)"
 gates end
+if [ $POPONLY = 1 ]; then  # Popcorn-only round: hook checked h1-runs.tsv and every lifetime's RUNCHECK; receive mode check
+  python3 -I -B $EVD/recv_check.py "$S/run" --mode "$RECV_MODE" > "$S/recv-check.log" 2>&1
+  CRC=$?
+  log "recv check: $(tail -n 1 "$S/run/recv-check.txt" 2>/dev/null || echo 'no recv-check.txt')"
+  [ $CRC = 0 ] || stop "recv check FAIL (see $S/run/recv-check.txt)"
+  $REG add vdb vdb $K "$E" $CSHA measured "$(tail -n 1 "$S/run/recv-check.txt" | cut -c1-200)"
+  export_run "$TREE/experiments/vectordb/export.py" "$E"
+  log "RUNSET DONE: review $S/run/recv-check.txt and $S/run/*/h1-runcheck.txt, then: ${REGISTRY:+EVAL_REGISTRY=$REGISTRY }python3 $EVD/registry.py accept vdb $K $E"
+  exit 0
+fi
 nice -n 19 python3 -B $H/collect.py --plan "$PLAN" --workload vdb --levels "${LV:-$E/vdb/levels.tsv}" "$S" > "$S/collect.log" 2>&1 \
   || stop "collect: $(tail -n 1 "$S/collect.log")"
 python3 -B $H/check.py --plan "$PLAN" --workload vdb --round $N "${ROOTS[@]}" "$E" > "$S/check.log" 2>&1

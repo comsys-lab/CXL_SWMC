@@ -238,6 +238,11 @@ if [ $BLOCK = stream ]; then
   SA=$(echo $SA) N0X="--update-threads 14 --serve-threads 1"
   if [ -n "${EVAL_RUN:-}" ]; then  # threads = vCPUs (user 2026-10-20): node 0 RS_THREADS update threads, node 1 RS_THREADS serving
     SA=${SA/--serve-threads 14/--serve-threads $RS_THREADS} N0X="--update-threads $RS_THREADS --serve-threads 1"
+    # STREAM_PROC_CXL_SHM=1 (experiments/eval recv-sleep.conf RS_PROC_CXL_SHM): per-step snapshots also of the
+    # cxl_shm receive counters (sleep_wakeups, tick_kicks, ...: /sys/kernel/cxl_shm, as the vector DB server always does)
+    case ${STREAM_PROC_CXL_SHM:-0} in 0) ;; 1) SA="$SA --proc-sysfs /sys/kernel/cxl_shm";;
+      *) echo "SEQUENCE STOP: bad STREAM_PROC_CXL_SHM"; exit 2;; esac
+  elif [ -n "${STREAM_PROC_CXL_SHM:-}" ]; then echo "SEQUENCE STOP: STREAM_PROC_CXL_SHM needs EVAL_RUN"; exit 2
   fi
 fi
 if [ $BLOCK != h1 ] && [ $BLOCK != stream ]; then ekko_set "$EKKO" || { echo "SEQUENCE STOP: EKKO must be avg, peak, f087, f149, f253, f330, f350, f370, f400, f385 or f392"; exit 2; }; fi

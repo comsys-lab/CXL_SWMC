@@ -33,10 +33,22 @@ if [ -n "$PIN_SHA256" ]; then echo "$PIN_SHA256" | sha256sum --quiet -c - || sto
 [ -d "$D" ] && [ -z "$(ls -A "$D")" ] || stop "$D missing or not empty"
 [[ "${H1_SETTLE_S:-}" =~ ^[1-9][0-9]*$ ]] || stop "bad H1_SETTLE_S"
 SYS=$(python3 -I -B $H/h1sys.py slo "$W") || stop "h1sys.py"
+# EVAL_SYSTEMS (evaluation run sets only, EVAL_RUN set; e.g. recv-sleep: "pop"): a subset of the hw / pop systems,
+# no Megalon; r1 mode then needs the levels file argument (levels known before the round) and passes it as H1_LEVELS
+if [ -n "${EVAL_SYSTEMS:-}" ]; then
+  [ -n "${EVAL_RUN:-}" ] || stop "EVAL_SYSTEMS needs EVAL_RUN"
+  case "$EVAL_SYSTEMS" in "hw pop"|hw|pop) ;; *) stop "EVAL_SYSTEMS must be 'hw pop', 'hw' or 'pop'";; esac
+  for s in $EVAL_SYSTEMS; do [[ " $SYS " == *" $s "* ]] || stop "EVAL_SYSTEMS $s not an H1 system of $W"; done
+  SYS=$EVAL_SYSTEMS
+fi
 XE=(H1_MIXES="$ARG" H1_SEED=$(( ${H1_SEED_BASE:-20261017} + N )) H1_SETTLE_S=$H1_SETTLE_S H1_SYSTEMS="$SYS")
 case $MODE in
-  r1) [ "$N" = 1 ] || stop "r1 mode is round 1"; : "${H1_LEVELS_CMD:?}" "${H1_PLAN:?}" "${H1_W:?}" "${H1_LEVELS_OUT:?}"
-      XE+=(H1_LEVELS_CMD="$H1_LEVELS_CMD" H1_PLAN="$H1_PLAN" H1_W="$H1_W" H1_LEVELS_OUT="$H1_LEVELS_OUT" H1_STAGE_DIR="$D");;
+  r1) [ "$N" = 1 ] || stop "r1 mode is round 1"
+      if [ -n "${EVAL_SYSTEMS:-}" ]; then [ -f "$LV" ] || stop "r1 with EVAL_SYSTEMS needs the levels file"; XE+=(H1_LEVELS="$LV")
+      else
+      : "${H1_LEVELS_CMD:?}" "${H1_PLAN:?}" "${H1_W:?}" "${H1_LEVELS_OUT:?}"
+      XE+=(H1_LEVELS_CMD="$H1_LEVELS_CMD" H1_PLAN="$H1_PLAN" H1_W="$H1_W" H1_LEVELS_OUT="$H1_LEVELS_OUT" H1_STAGE_DIR="$D")
+      fi;;
   cont) [[ $N =~ ^[23]$ ]] || stop "cont mode is round 2 or 3"; [ -f "$LV" ] || stop "no levels file"; XE+=(H1_LEVELS="$LV");;
   *) stop "bad mode";;
 esac
@@ -61,7 +73,8 @@ for m in mixes:
     for s in systems:
         want[(m, s, "slo")] = "sep" if r1 and s != "mg" else "cont"
     for s in ("hw", "pop"):
-        want[(m, s, "fix")] = "sep" if r1 else "cont"
+        if s in systems:  # always both, except evaluation run sets with EVAL_SYSTEMS
+            want[(m, s, "fix")] = "sep" if r1 else "cont"
     if "mg" in systems:
         want[(m, "mg", "fix")] = "cont"
         want[(m, "mgoff", "fix")] = "sep"

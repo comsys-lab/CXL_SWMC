@@ -22,9 +22,11 @@ for r in $RS_MG_POINTS; do
   [ -z "$RS_MG_COMPARE_Q" ] || MAP="$MAP $r=$(echo $RS_FIX_LEVELS | tr ' ' ','),$RS_MG_COMPARE_Q"
 done
 SEP=$RS_FIX_SEP LVF=
-if [ "$K" != "$LEVELS_FROM_RUN" ]; then
-  SEP=$RS_LATER_FIX_SEP
-  if E1=$(run_dir_of rs-main "$LEVELS_FROM_RUN"); then LVF=$E1/block/stream-levels.tsv; need_files "$LVF"
+if [ "$K" != "$LEVELS_FROM_RUN" ] || [ "${LEVELS_SOURCE:-}" = registry ]; then
+  [ "$K" = "$LEVELS_FROM_RUN" ] || SEP=$RS_LATER_FIX_SEP
+  if levels_dir_of rs-main; then
+    LVF=$LEVELS_SRC_DIR/block/stream-levels.tsv; need_files "$LVF"
+    [ -z "${LEVELS_SOURCE:-}" ] || plan "levels from $LEVELS_REGISTRY rs-main run $LEVELS_FROM_RUN: $LVF (config_sha256 $LEVELS_SRC_SHA)"
   elif [ $DRY = 1 ]; then plan "levels: run $LEVELS_FROM_RUN of rs-main not accepted yet (a real run would stop here)"
   else die "run $LEVELS_FROM_RUN of rs-main is not accepted (registry.py accept)"; fi
 fi
@@ -38,6 +40,7 @@ BLK=(bash $TREE/experiments/recsys/main-block.sh $E/block)
 plan "rates [$RS_POINTS] systems [$RS_SYSTEMS] fix levels [$RS_FIX_LEVELS] map [${MAP# }] fallback ${RS_FIX_FALLBACK_Q:-none} sep $SEP levels ${LVF:-computed in this run}"
 plan "block: env ${RSENV[*]} ${BLK[*]}"
 plan "then: rs_check.py $E/block --rates '$RS_POINTS' --slo-systems '$RS_SYSTEMS' --fix-systems '$RS_SYSTEMS'"
+[ "$RECV_MODE" = poll ] || plan "then: recv_check.py $E/block --mode $RECV_MODE (RS_PROC_CXL_SHM=${RS_PROC_CXL_SHM:-0})"
 if [ $DRY = 1 ]; then
   block_dry "missing or not empty" env "${RSENV[@]}" bash $TREE/experiments/recsys/main-block.sh @DIR@
   echo "DRY START OK ($RUNSET run $K): stops here, before the lock"; exit 0
@@ -53,6 +56,11 @@ log "block rc $?: $(tail -n 1 "$E/block/sequence.log")"
 python3 -I -B $EVD/rs_check.py "$E/block" --rates "$RS_POINTS" --slo-systems "$RS_SYSTEMS" --fix-systems "$RS_SYSTEMS" > /dev/null
 log "check: $(tail -n 1 "$E/block/rs-check.txt")"
 tail -n 1 "$E/block/rs-check.txt" | grep -q "^RSCHECK PASS" || stop "check FAIL (see $E/block/rs-check.txt)"
+if [ "$RECV_MODE" != poll ]; then  # receive mode of every Popcorn lifetime (e.g. recv-sleep.conf)
+  python3 -I -B $EVD/recv_check.py "$E/block" --mode "$RECV_MODE" > /dev/null
+  log "recv check: $(tail -n 1 "$E/block/recv-check.txt" 2>/dev/null || echo 'no recv-check.txt')"
+  tail -n 1 "$E/block/recv-check.txt" | grep -q "^RECVCHECK PASS" || stop "recv check FAIL (see $E/block/recv-check.txt)"
+fi
 $REG add recsys rs-main $K "$E" $CSHA measured "$(tail -n 1 "$E/block/rs-check.txt")"
 export_run "$TREE/experiments/recsys/export.py" "$E"
-log "RUNSET DONE: review $E/block/rs-check.txt, then: python3 $EVD/registry.py accept rs-main $K $E"
+log "RUNSET DONE: review $E/block/rs-check.txt, then: ${REGISTRY:+EVAL_REGISTRY=$REGISTRY }python3 $EVD/registry.py accept rs-main $K $E"

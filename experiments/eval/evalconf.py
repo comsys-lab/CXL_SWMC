@@ -12,7 +12,8 @@
 config_sha256(workload) = sha256 of the sorted "KEY=value" lines of the measurement keys of that workload (global keys
 without the [run] mark, plus VDB_* or RS_*) followed by "sha256(KEY)=<file sha256>" for every such key whose value
 is an existing file (region file, Megalon configs, loadgen binary), so a changed file changes the hash. [run] keys
-(RUNS, RESULTS_ROOT, DERIVED_ROOT, EVIDENCE_PREFIX) are bookkeeping and never part of it.
+(RUNS, RESULTS_ROOT, DERIVED_ROOT, EVIDENCE_PREFIX, REGISTRY, RUNSETS) are bookkeeping and never part of it.
+--conf F: another config file with the same keys (lib.sh passes env EVAL_CONF; e.g. recv-sleep.conf); default eval.conf.
 H3 run sets (RUN-H3.md): config_sha256(h3-vdb) / config_sha256(h3-recsys) = the same over the workload's keys plus the
 H3_* keys; H3_* keys are never part of the vdb / recsys hashes (so adding H3 left the 2-VM hashes unchanged).
 `shell` also prints CONFIG_SHA256_H3_VDB and CONFIG_SHA256_H3_RECSYS; `sha` / `dump` accept h3-vdb and h3-recsys.
@@ -26,7 +27,9 @@ import sys
 P = "/home/comsys/sungsu/destijl-control"
 HERE = os.path.dirname(os.path.abspath(__file__))
 DEFAULT = os.path.join(HERE, "eval.conf")
-RUN_KEYS = {"RUNS", "RESULTS_ROOT", "DERIVED_ROOT", "EVIDENCE_PREFIX"}
+# REGISTRY, RUNSETS (optional, absent in eval.conf): runs.tsv this config's run sets register in, run sets allowed to
+# use the config (lib.sh; e.g. recv-sleep.conf)
+RUN_KEYS = {"RUNS", "RESULTS_ROOT", "DERIVED_ROOT", "EVIDENCE_PREFIX", "REGISTRY", "RUNSETS"}
 PREFIX = {"vdb": "VDB_", "recsys": "RS_"}
 LINE = re.compile(r'^([A-Z][A-Z0-9_]*)=(?:"([^"$`\\]*)"|([^\s"$`\\#]*))\s*(#.*)?$')
 PATHISH = re.compile(r"^(CXL_SWMC|builds|workspaces|recovery)(/|$)")
