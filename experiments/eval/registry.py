@@ -19,6 +19,7 @@ dirties the tree the drivers require clean; verifier M1). Tests point it elsewhe
 """
 import datetime
 import os
+import re
 import shutil
 import sys
 
@@ -30,6 +31,11 @@ if not os.path.exists(REG):
 COLS = ["workload", "runset", "k", "evidence_dir", "config_sha256", "status", "date", "note"]
 STATUS = ("started", "measured", "stopped", "accepted", "invalid")
 WORKLOADS = {"vdb": ("vdb",), "recsys": ("rs-main", "rs-h1")}
+H3_RUNSET = {"vdb": re.compile(r"h3-vdb-n[2-8]"), "recsys": re.compile(r"h3-rs-n[2-8]")}  # H3 run set per N (RUN-H3.md)
+
+
+def valid_runset(w, rs):
+    return rs in WORKLOADS.get(w, ()) or bool(w in H3_RUNSET and H3_RUNSET[w].fullmatch(rs))
 
 
 def rows():
@@ -72,7 +78,7 @@ def main(a):
     now = datetime.datetime.now().astimezone().isoformat(timespec="seconds")
     if a[1] == "add" and len(a) in (8, 9):
         w, rs, k, d, sha, status = a[2:8]
-        if rs not in WORKLOADS.get(w, ()) or status not in STATUS or not k.isdigit():
+        if not valid_runset(w, rs) or status not in STATUS or not k.isdigit():
             sys.exit(f"registry.py: bad add {a[2:]}")
         append(dict(workload=w, runset=rs, k=k, evidence_dir=d, config_sha256=sha, status=status, date=now,
                     note=a[8] if len(a) == 9 else ""))

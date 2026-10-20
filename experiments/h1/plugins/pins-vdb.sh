@@ -15,6 +15,8 @@
 # (checked: identical SERVER_ARGS for h1/urate/fixed kinds; H1 selftest PASS workspaces/h1-main/selftest-eval-run1-*).
 # Re-pinned again 2026-10-20 (verifier corrections + user decisions): m4-run.sh urate_check per part and v6-block.sh
 # H2 level set, both behind EVAL_RUN only.
+# Re-pinned 2026-10-20 (branch eval-h3, no H1 behaviour change): run.sh gained optional part hooks PART_GATE_CMD /
+# PART_PRE_CMD / PART_POST_CMD (H3 N-VM gate and CDF hist clear/dump, experiments/eval/h3-block.sh); unset = unchanged.
 . "$(dirname "${BASH_SOURCE[0]}")/pins-common.inc"
 HR=$P/CXL_SWMC                      # live tree; v6-block.sh uses $P/CXL_SWMC/experiments/vectordb itself. Every file it
                                     # runs is hash-pinned below (hook: see the v6-block.sh pin; builds vdb/15, vdb-megalon/14 from 934fa9312)
@@ -41,7 +43,7 @@ eeb6b23f173d85a3c86ade0fb804b363e3c84a36bf9c0f56a7cbcab25e738b53  $HR/config/cxl
 27a11c2c75f748fa7b47111496e30170ab5a35c0b65bd56422c6b3b6fb4d7503  $HR/experiments/vectordb/m4-lib.sh
 13895841e62b2b9a8d601d2d37129e36f8e59ae46d18da8468d2cbec141f883f  $HR/experiments/vectordb/m4-run.sh
 4d917368a0946c0a5052dd0d1e31e5ab900914e74c75bd02d37dc164708b66fb  $HR/experiments/vectordb/m4-precheck.sh
-5a4cd27c57b9aebe82a3d9b1652690b0496ddd1e81da4e9479a02d33085f3ad6  $HR/experiments/vectordb/run.sh
+ddb3bfc565cb954046911e76ebf82913beed793efbc1b371bb9ef36672086738  $HR/experiments/vectordb/run.sh
 1edcdda88f30200fd55c1b5a18cb4b9d6db57aa02647f8ad549e4e7f6aabb31f  $HR/experiments/vectordb/host-gate.sh
 1baccf944c1ac66fce65b065c1043529cd72bc08b38f4b42fe43bd2640076031  $HR/experiments/vectordb/pretouch-gate.sh
 49ffaf143f484e4548e84105d20f584547fbd06c6cd38c1522ba4dccbd18e8fe  $HR/experiments/vectordb/opsplit.py

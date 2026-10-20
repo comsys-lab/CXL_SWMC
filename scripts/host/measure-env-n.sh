@@ -11,6 +11,7 @@
 #   - every non-vCPU QEMU thread (main loop, IO, workers, vhost-<pid> workers) has Cpus_allowed_list = that set
 #     (kvm-nx-lpage-recovery is a KVM kthread child, not checked);
 #   - vCPU thread "CPU j/KVM" pinned per topology: 4 vCPUs (VM8): host core 2i + j/2, thread (j%2)*32;
+#     8 vCPUs (N=4 topology, eval-h3): host core 4i + j/2, thread (j%2)*32;
 #     16 vCPUs (2-VM topology): host core 2(j/2) + i, thread (j%2)*32;
 #   - EXPECT_RUNNING="cxl_vm0 cxl_vm1 ..." (required) must equal the running cxl_vm0..7 set (the H3 N subset).
 set -uo pipefail
@@ -48,8 +49,9 @@ for vm in $running; do
   while read -r j a; do
     case $nv in
       4)  core=$((2 * i + j / 2)) ;;
+      8)  core=$((4 * i + j / 2)) ;;   # N=4 topology (workspaces/vmN/vmN-xml.py: vm i -> cores 4i..4i+3 + HT)
       16) core=$((2 * (j / 2) + i)) ;;
-      *)  echo "CHECK FAIL: $vm has $nv vCPU threads (4 or 16 expected)"; rc=1; break ;;
+      *)  echo "CHECK FAIL: $vm has $nv vCPU threads (4, 8 or 16 expected)"; rc=1; break ;;
     esac
     [ "$a" = "$((core + (j % 2) * 32))" ] || { echo "CHECK FAIL: $vm vCPU $j on $a (want $((core + (j % 2) * 32)))"; rc=1; }
   done < "/tmp/measure-env-n.$$.$vm"

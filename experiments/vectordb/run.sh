@@ -28,6 +28,10 @@
 #   SLO search's "confirm failed at three rates" (then the next part runs; the caller decides). PART_SEED_<p> (optional):
 #   that part's query seed (--opt seed= --seed), recorded in the manifest part line. Per part rc in the
 #   manifest (part_<p>_loadgen_rc=); exit 1 if any part rc != 0.
+#   Part hooks (H3, experiments/eval/h3-block.sh; all optional, unset = unchanged): PART_GATE_CMD (word-split command,
+#   called with the gate log file instead of h1-gate.sh check before every later part when H1_MEASURE_RUN=1),
+#   PART_PRE_CMD / PART_POST_CMD (word-split commands called with the part name right before the part's loadgen /
+#   right after it, servers up; output in <run>/part-hooks.txt; a failure stops the lifetime, rc 97 / 98).
 # Stops (and stops the servers) on the first error. Measurement hygiene: no Host build before/after (pgrep).
 set -euo pipefail
 NAME=$1 OUT=$2; shift 2; [ "${1:-}" = "--" ] && shift
@@ -134,6 +138,8 @@ CONFIRM_NOTE="confirm failed at three rates; the knee is noisy (longer --confirm
 # Without H1_MEASURE_RUN (validation packets) loadgen starts directly, as before.
 LGL=(); [ "${H1_MEASURE_RUN:-0}" = 1 ] && LGL=(bash "$ROOT/scripts/host/measure-run.sh" --)
 echo "loadgen_launcher=${LGL[*]:-direct}" >> "$RUN/manifest.txt"
+[ -z "${PART_GATE_CMD:-}${PART_PRE_CMD:-}${PART_POST_CMD:-}" ] || \
+  echo "part_hooks gate=[${PART_GATE_CMD:-}] pre=[${PART_PRE_CMD:-}] post=[${PART_POST_CMD:-}]" >> "$RUN/manifest.txt"
 if [ -z "${PARTS:-}" ]; then
 cpu_snap before
 set +e
@@ -168,7 +174,14 @@ else  # H1-HOOK v2: several loadgen parts in this server lifetime
     v=PART_SEED_$p; PS=()  # per-part query seed (m4-run.sh KIND=h1: slo SEED, fix SEED+1)
     [ -z "${!v:-}" ] || { [[ ${!v} =~ ^[0-9]+$ ]] || { echo "bad $v"; false; }; PS=(--opt seed=${!v} --seed ${!v}); }
     if [ -n "$PREV" ] && [ "${H1_MEASURE_RUN:-0}" = 1 ]; then  # H1 gate before every later part (servers stay up)
-      bash "$ROOT/experiments/h1/h1-gate.sh" check "$OUT/gate-$NAME-$p.txt" || { echo "part $p: H1 gate failed (see $OUT/gate-$NAME-$p.txt)"; false; }
+      if [ -n "${PART_GATE_CMD:-}" ]; then  # H3 (experiments/eval/h3-block.sh): the N-VM gate scripts/host/h3-gate.sh
+        $PART_GATE_CMD "$OUT/gate-$NAME-$p.txt" || { echo "part $p: gate failed (see $OUT/gate-$NAME-$p.txt)"; false; }
+      else
+        bash "$ROOT/experiments/h1/h1-gate.sh" check "$OUT/gate-$NAME-$p.txt" || { echo "part $p: H1 gate failed (see $OUT/gate-$NAME-$p.txt)"; false; }
+      fi
+    fi
+    if [ -n "${PART_PRE_CMD:-}" ]; then  # H3 CDF: e.g. clear the kprobe hist right before the part (servers up)
+      $PART_PRE_CMD "$p" >> "$RUN/part-hooks.txt" 2>&1 || { echo "part $p: PART_PRE_CMD failed (see $RUN/part-hooks.txt)"; LG=97; break; }
     fi
     echo "part_$p=start $(date -Is) w_start=$WS seed=${!v:-common} args=${PA[*]}" >> "$RUN/manifest.txt"
     cpu_snap before; mv "$RUN/guest-cpu.txt" "$PR/guest-cpu.txt" 2>/dev/null || true
@@ -183,6 +196,9 @@ else  # H1-HOOK v2: several loadgen parts in this server lifetime
       LG=$rc
       note=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("note", ""))' "$PR/loadgen/summary.json" 2>/dev/null || true)
       [ "$note" = "$CONFIRM_NOTE" ] || { echo "part $p: loadgen rc=$rc ($note): lifetime stopped"; break; }
+    fi
+    if [ -n "${PART_POST_CMD:-}" ]; then  # H3 CDF: e.g. dump the kprobe hist before the servers stop
+      $PART_POST_CMD "$p" >> "$RUN/part-hooks.txt" 2>&1 || { echo "part $p: PART_POST_CMD failed (see $RUN/part-hooks.txt)"; LG=98; break; }
     fi
     PREV=$p
   done
