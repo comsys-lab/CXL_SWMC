@@ -51,7 +51,11 @@ Fig 8 columns (appended to steps.csv and summary.csv; de-stijl-motivation-isca27
   per-op accounting opt.search.c_ns within a few % (sections vs stats window). steps.csv also gets "aborted" (loadgen queue-cap abort; such steps are
   kept: drawn clipped). fig8.csv (per-N export and --combine): one row per (nodes, mix) at the Fig 8 load point
   (user 2026-10-22 Q1: the highest ramp step offered rate that both hw and pop pass), hw and pop W, the Popcorn
-  stack, all normalized to hw's W (fig8_norm_*).
+  stack, all normalized to hw's W (fig8_norm_*); variant common_n (verifier L1): one load per mix, the highest ramp
+  rate passed by hw and pop at every N of the export (n_set), rows per N at that load.
+summary.csv lowest_ramp_{step,offered_x,search_s,p99_ms,mg_fetch_per_op} (verifier L3): the lowest measured ramp step
+  of every search (aggregate achieved searches/s, its p99, Megalon read_retry_incoherent per achieved op; 0 for hw,
+  pop): the hatched value of Figs 5 and 7 when confirmed is not True.
 """
 import argparse
 import csv
@@ -116,7 +120,9 @@ SUMMARY = SUMMARY_HEAD + [k + "_per_op" for k in PER_OP] + [
     "mg_retry_notify", "mg_replay_flushes", "mg_flush_bytes", "result_offered_x", "result_offered_search_s",
     "confirm_x_sd", "confirmed", "note", "n_at_result", "valid_at_result", "at_result_search_s", "at_result_update_s",
     "at_result_p99_ms", "cxl_n_intervals", "counter_source", "vcpus_per_vm", "threads", "u", "run", "config_sha256",
-    "lifetime", "source_dir"] + FIG8   # Fig 8 columns appended (mean over the at_result steps)
+    "lifetime", "source_dir"] + FIG8 + [   # Fig 8 columns appended (mean over the at_result steps)
+    "lowest_ramp_step", "lowest_ramp_offered_x", "lowest_ramp_search_s", "lowest_ramp_p99_ms",
+    "lowest_ramp_mg_fetch_per_op"]     # verifier L3: hatched bars of Figs 5 / 7 (searches without a confirmed max)
 STEP = ["nodes", "mix", "system", "u", "step", "phase", "offered_x", "search_s", "update_s", "p50_ms", "p95_ms",
         "p99_ms", "pass", "at_result", "valid", "window_s"] + RATE + WAIT + CXL + HCPU + ["run", "config_sha256",
                                                                                          "lifetime"] + FIG8 + ["aborted"]
@@ -389,6 +395,14 @@ def summary_row(system, agg, sm, u):
     for k in zero:
         if o.get(k) is None and at:
             o[k] = 0.0
+    # lowest measured ramp step (verifier L3): the hatched bars of Figs 5 and 7 for a search without a confirmed max
+    ramp = [r for r in agg if r["phase"] == "ramp" and fl(r.get("offered_x")) is not None]
+    lo = min(ramp, key=lambda r: (fl(r["offered_x"]), r["step"])) if ramp else {}
+    lops = (lo.get("search_s") or 0) + (lo.get("update_s") or 0)
+    mf = 0.0 if system in ("hw", "pop") and lo else lo.get("mg_fetch")
+    o.update(lowest_ramp_step=lo.get("step"), lowest_ramp_offered_x=fl(lo.get("offered_x")),
+             lowest_ramp_search_s=lo.get("search_s"), lowest_ramp_p99_ms=fl(lo.get("p99_ms")),
+             lowest_ramp_mg_fetch_per_op=mf / lops if mf is not None and lops else None)
     ops = (o["at_result_search_s"] or 0) + (o["at_result_update_s"] or 0)
     for k in PER_OP:
         o[k + "_per_op"] = o[k] / ops if o.get(k) is not None and ops else None
@@ -397,7 +411,7 @@ def summary_row(system, agg, sm, u):
     return o
 
 
-FIG8_CSV = ["nodes", "mix", "u", "offered_x", "hw_step", "pop_step", "hw_search_s", "pop_search_s", "hw_p99_ms",
+FIG8_CSV = ["variant", "nodes", "mix", "u", "offered_x", "n_set", "hw_step", "pop_step", "hw_search_s", "pop_search_s", "hw_p99_ms",
             "pop_p99_ms", "hw_W_ns", "pop_W_ns", "pop_inval_ipi_ns", "pop_owner_wait_ns", "pop_other_fault_ns",
             "pop_query_ns", "fig8_norm_hw", "fig8_norm_pop", "fig8_norm_inval_ipi", "fig8_norm_owner_wait",
             "fig8_norm_other_fault", "fig8_norm_query", "pop_W_minus_sections_rel", "n_common_pass_steps", "run",
@@ -405,34 +419,53 @@ FIG8_CSV = ["nodes", "mix", "u", "offered_x", "hw_step", "pop_step", "hw_search_
 
 
 def fig8_rows(steps):
-    """Fig 8 load point per (nodes, mix): the highest ramp offered rate that both hw and pop pass (both ramps start
-    at 10 ops/s with x1.5, so they share offered rates); values of those two steps, normalized to hw's W"""
+    """Fig 8 load points; two variants (verifier L1, 2026-10-22):
+      per_n     per (nodes, mix): the highest ramp offered rate that both hw and pop pass at that N (user Q1)
+      common_n  per mix: the highest ramp offered rate that both hw and pop pass at EVERY N present (one load for the
+                whole N group of the mix: the adaptive ramp step makes per-N rates differ); n_set = the N group
+    values of those two steps, normalized to hw's W (fig8_norm_*); offered_x = the load of the row's group"""
     yes = lambda v: str(v) == "True"  # noqa: E731  (bool in an export, text after --combine)
-    out = []
+    key = lambda r: round(fl(r["offered_x"]), 6)  # noqa: E731
+    ps = {}
+    for r in steps:
+        if r["system"] in ("hw", "pop") and r["phase"] == "ramp" and yes(r["pass"]) and str(r.get("valid")) != "False" \
+                and fl(r.get("srch_wall_ns_per_search")) is not None:
+            ps.setdefault((int(r["nodes"]), r["mix"], r["system"]), {}).setdefault(key(r), r)
     keys = sorted({(int(r["nodes"]), r["mix"]) for r in steps}, key=lambda k: (k[0], int(k[1][1:])))
+    common = {k: set(ps.get(k + ("hw",), {})) & set(ps.get(k + ("pop",), {})) for k in keys}
+    out = []
     for nodes, mix in keys:
-        ps = {s: [r for r in steps if int(r["nodes"]) == nodes and r["mix"] == mix and r["system"] == s
-                  and r["phase"] == "ramp" and yes(r["pass"]) and str(r.get("valid")) != "False"
-                  and fl(r.get("srch_wall_ns_per_search")) is not None] for s in ("hw", "pop")}
-        common = [(h, p) for h in ps["hw"] for p in ps["pop"]
-                  if abs(fl(h["offered_x"]) - fl(p["offered_x"])) <= 1e-6 * max(1.0, fl(h["offered_x"]))]
-        if not common:
+        if common[(nodes, mix)]:
+            x = max(common[(nodes, mix)])
+            out.append(_fig8_row("per_n", str(nodes), nodes, mix, ps[(nodes, mix, "hw")][x], ps[(nodes, mix, "pop")][x],
+                                 len(common[(nodes, mix)])))
+    for mix in sorted({m for _, m in keys}, key=lambda m: int(m[1:])):
+        ns = sorted(n for n, m in keys if m == mix)
+        allc = set.intersection(*(common[(n, mix)] for n in ns))
+        if not allc:
             continue
-        h, p = max(common, key=lambda t: fl(t[0]["offered_x"]))
-        hw_w, pw = fl(h["srch_wall_ns_per_search"]), fl(p["srch_wall_ns_per_search"])
-        seg = {k: fl(p.get(f"fig8_{k}_ns_per_search")) for k in ("inval_ipi", "owner_wait", "other_fault", "query")}
-        o = dict(nodes=nodes, mix=mix, u=int(mix[1:]), offered_x=fl(h["offered_x"]), hw_step=h["step"], pop_step=p["step"],
-                 hw_search_s=h.get("search_s"), pop_search_s=p.get("search_s"), hw_p99_ms=h.get("p99_ms"),
-                 pop_p99_ms=p.get("p99_ms"), hw_W_ns=hw_w, pop_W_ns=pw, n_common_pass_steps=len(common),
-                 run=h.get("run"), config_sha256=h.get("config_sha256"), fig8_norm_hw=1.0 if hw_w else None,
-                 fig8_norm_pop=pw / hw_w if pw is not None and hw_w else None)
-        for k, v in seg.items():
-            o[f"pop_{k}_ns"] = v
-            o[f"fig8_norm_{k}"] = v / hw_w if v is not None and hw_w else None
-        t = fl(p.get("srch_sections_t_ns_per_search"))
-        o["pop_W_minus_sections_rel"] = (pw - t) / pw if pw and t is not None else None
-        out.append(o)
+        x = max(allc)
+        for n in ns:
+            out.append(_fig8_row("common_n", "/".join(map(str, ns)), n, mix, ps[(n, mix, "hw")][x],
+                                 ps[(n, mix, "pop")][x], len(allc)))
     return out
+
+
+def _fig8_row(variant, nset, nodes, mix, h, p, ncommon):
+    """one fig8.csv row from the hw step h and the pop step p at the same offered rate"""
+    hw_w, pw = fl(h["srch_wall_ns_per_search"]), fl(p["srch_wall_ns_per_search"])
+    seg = {k: fl(p.get(f"fig8_{k}_ns_per_search")) for k in ("inval_ipi", "owner_wait", "other_fault", "query")}
+    o = dict(variant=variant, n_set=nset, nodes=nodes, mix=mix, u=int(mix[1:]), offered_x=fl(h["offered_x"]),
+             hw_step=h["step"], pop_step=p["step"], hw_search_s=h.get("search_s"), pop_search_s=p.get("search_s"),
+             hw_p99_ms=h.get("p99_ms"), pop_p99_ms=p.get("p99_ms"), hw_W_ns=hw_w, pop_W_ns=pw,
+             n_common_pass_steps=ncommon, run=h.get("run"), config_sha256=h.get("config_sha256"),
+             fig8_norm_hw=1.0 if hw_w else None, fig8_norm_pop=pw / hw_w if pw is not None and hw_w else None)
+    for k, v in seg.items():
+        o[f"pop_{k}_ns"] = v
+        o[f"fig8_norm_{k}"] = v / hw_w if v is not None and hw_w else None
+    t = fl(p.get("srch_sections_t_ns_per_search"))
+    o["pop_W_minus_sections_rel"] = (pw - t) / pw if pw and t is not None else None
+    return o
 
 
 def write(path, cols, rows):

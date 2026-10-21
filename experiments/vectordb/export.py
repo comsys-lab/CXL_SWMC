@@ -187,7 +187,8 @@ def coh_steps(part, system):
         o = {"srv_searches": ns, "srv_updates": t["nu"], "mg_fetch_per_s": ps(t["fetch"]),
              "mg_flushes_per_s": ps(t["flushes"]), "mg_flush_bytes_per_s": ps(t["fbytes"]),
              "mg_wflush_bytes_per_s": ps(t["wbytes"]), "mg_wflushes_per_s": ps(t["wcnt"]),
-             "mg_search_events_per_rop": pr(t["sev"]), "pop_search_is_per_rop": pr(t["is"])}
+             "mg_search_events_per_rop": pr(t["sev"]), "pop_search_is_per_rop": pr(t["is"]),
+             "mg_fetch_per_op": t["fetch"] / (ns + (t["nu"] or 0)) if t["fetch"] is not None and ns else None}
         o["mg_flush_writeend_per_s"] = ps(t["flushes"] - t["fetch"]) if t["flushes"] is not None and t["fetch"] is not None else None
         rb = t["fbytes"] - (t["wbytes"] or 0.0) if t["fbytes"] is not None else None
         rf = t["flushes"] - (t["wcnt"] or 0.0) if t["flushes"] is not None else None
@@ -202,6 +203,18 @@ def coh_steps(part, system):
             o["fig3_lines_per_rop"] = 0.0
         out[n] = o
     return out
+
+
+def lowest_ramp(rows, cs, rd, system):
+    """canon.LOWEST of one SLO part (verifier L3): its lowest measured ramp step; mg_fetch per server op (0 hw/pop)"""
+    ramp = [r for r in rows if r["phase"] == "ramp" and canon.fl(r["offered_x"]) is not None]
+    if not ramp:
+        return {}
+    r = min(ramp, key=lambda r: (canon.fl(r["offered_x"]), r["step"]))
+    mf = cs.get(r["step"], {}).get("mg_fetch_per_op")
+    return dict(lowest_ramp_step=r["step"], lowest_ramp_offered_x=rd(r["offered_x"]),
+                lowest_ramp_achieved_x=r["search_per_s"], lowest_ramp_p99_ms=r["search_p99_ms"],
+                lowest_ramp_mg_fetch_per_op=0.0 if system in ("hw", "pop") else mf)
 
 
 def common(p, vcpus):
@@ -283,7 +296,8 @@ def export(E, out, rnd, vcpus):
                     at_result_wop_per_s=mean("updates_per_s"), at_result_T_ms_rop=mean("T_ms_per_search"),
                     at_result_C_ms_rop=mean("C_ms_per_search"),
                     at_result_pop_read_faults_per_rop=mean("pop_read_faults_per_search"),
-                    at_result_cxl_recv_cpu_s_per_s=mean("cxl_recv_cpu_s_per_s"), lifetime=p["lifetime"], source_dir=part)
+                    at_result_cxl_recv_cpu_s_per_s=mean("cxl_recv_cpu_s_per_s"), lifetime=p["lifetime"], source_dir=part,
+                    **lowest_ramp(rows, cs, rd, p["system"]))
         else:
             mf = mg_flush(part) if p["system"] in ("mg", "mgoff") else {}
             for r in rows:

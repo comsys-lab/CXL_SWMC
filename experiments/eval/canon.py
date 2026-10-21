@@ -32,7 +32,10 @@ KEY = ["workload", "run", "config_sha256"]
 VDB_COH = ["srv_searches", "srv_updates", "mg_fetch_per_s", "mg_flush_writeend_per_s", "mg_flushes_per_s",
            "mg_flush_bytes_per_s", "mg_wflush_bytes_per_s", "mg_wflushes_per_s", "mg_rflush_bytes_per_rop",
            "mg_rflushes_per_rop", "mg_rflush_bytes_per_flush", "mg_search_events_per_rop", "pop_search_is_per_rop",
-           "fig3_lines_per_rop"]
+           "fig3_lines_per_rop", "mg_fetch_per_op"]
+# lowest measured ramp step of an SLO search (verifier L3): hatched bars for searches without a confirmed max
+LOWEST = ["lowest_ramp_step", "lowest_ramp_offered_x", "lowest_ramp_achieved_x", "lowest_ramp_p99_ms",
+          "lowest_ramp_mg_fetch_per_op"]
 POINT = ["system", "point", "upd_share", "rate_unit", "vcpus_per_vm", "threads", "writers"]
 SCHEMA = {
     "slo_summary.csv": KEY + POINT + [
@@ -40,7 +43,7 @@ SCHEMA = {
         "confirmed", "valid", "n_judged", "n_invalid_judged", "low_rate_violations", "ramp_end", "knee_x", "note",
         "recall10", "recall10_tie", "at_result_achieved_x", "at_result_p95_ms", "at_result_p99_ms",
         "at_result_wop_per_s", "at_result_T_ms_rop", "at_result_C_ms_rop", "at_result_pop_read_faults_per_rop",
-        "at_result_cxl_recv_cpu_s_per_s", "lifetime", "source_dir"],
+        "at_result_cxl_recv_cpu_s_per_s", "lifetime", "source_dir"] + LOWEST,
     "slo_steps.csv": KEY + POINT + [
         "step", "phase", "offered_x", "achieved_x", "n_rop", "p50_ms", "p95_ms", "p99_ms", "pass", "valid",
         "at_result", "aborted", "wop_per_s", "wop_offered_per_s", "wop_done_ratio", "T_ms_rop", "C_ms_rop", "T_ms_wop", "C_ms_wop",

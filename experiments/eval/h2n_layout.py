@@ -85,6 +85,13 @@ def main():
     ap.add_argument("--check", nargs=2, type=int, metavar=("N", "MAX_DELETES"),
                     help="one line for this N and per-node max_deletes (h2n-block.sh); exit 1 if it does not fit")
     ap.add_argument("--vec-format", choices=("fp32", "sq8"), default="fp32", help="stored vector format (server --vec-format)")
+    # verifier L4 (2026-10-22): deletes one lifetime can reach per VM = aggregate update rate x lifetime / N (printed
+    # next to the delete-log size; informational, never a FAIL). Defaults above every pilot rate: plain backend 3600
+    # updates/s (2 x the SQ8 pilot hw u90 N=8 max 195 search/s x 9), Megalon 100 updates/s (pilot <= ~12), lifetime
+    # 2400 s (an SLO lifetime incl. warmup and overload steps <= ~25 min)
+    ap.add_argument("--update-rate", type=float, default=3600.0, help="aggregate updates/s bound, plain backend")
+    ap.add_argument("--mg-update-rate", type=float, default=100.0, help="aggregate updates/s bound, Megalon")
+    ap.add_argument("--lifetime-s", type=float, default=2400.0, help="lifetime length bound (s)")
     a = ap.parse_args()
     global VEC_FORMAT
     VEC_FORMAT = a.vec_format
@@ -112,6 +119,12 @@ def main():
                 fails.append(f"N={n}: largest per-VM delete count {max(per)} > max_deletes {r['max_deletes_per_node']}")
             if tot != 3400000:
                 fails.append(f"N={n}: total deletes {tot} != 3400000")
+        b = int(a.update_rate * a.lifetime_s / n)
+        mb = int(a.mg_update_rate * a.lifetime_s / n)
+        if r.get("deletes_max_per_vm") is not None:  # the writes file caps it as well
+            b, mb = min(b, r["deletes_max_per_vm"]), min(mb, r["deletes_max_per_vm"])
+        r.update(delete_bound_per_vm=b, delete_bound_fits=b <= r["max_deletes_per_node"],
+                 mg_delete_bound_per_vm=mb, mg_delete_bound_fits=mb <= r["mg_max_deletes_per_node"])
         if not r["fits"]:
             fails.append(f"N={n}: swcc_used_end {r['swcc_used_end']} > device {DEVICE_SIZE}")
         if r["dlog_total_bytes"] > base["dlog_total_bytes"]:
@@ -126,6 +139,11 @@ def main():
             w = csv.DictWriter(f, fieldnames=cols)
             w.writeheader()
             w.writerows(rows)
+    print(f"DELETE BOUND (update rate x lifetime / N, capped by the writes file; plain {a.update_rate:g}/s, Megalon "
+          f"{a.mg_update_rate:g}/s, lifetime {a.lifetime_s:g} s): " + "; ".join(
+              f"N={r['nodes']} plain {r['delete_bound_per_vm']} <= {r['max_deletes_per_node']} {r['delete_bound_fits']}, "
+              f"Megalon {r['mg_delete_bound_per_vm']} <= {r['mg_max_deletes_per_node']} {r['mg_delete_bound_fits']}"
+              for r in rows))
     print("LAYOUT " + ("PASS" if not fails else "FAIL: " + "; ".join(fails)))
     sys.exit(1 if fails else 0)
 

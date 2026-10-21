@@ -204,7 +204,8 @@ h2_mix() {  # <mix> <H1 levels.tsv>
 import csv, json, os, sys
 m, lv, runs, E, plan, frm, h1dir = sys.argv[1:8]
 sys.path.insert(0, h1dir)
-from levels import system_x  # decision E (2026-10-22): no confirmed max -> lowest ramp step x, as the H1 level set
+from levels import plan_confirm_fail, system_x  # decision E (2026-10-22): no confirmed max -> lowest ramp step x
+# (pop; hw must be confirmed, verifier M1), confirm-failed policy from the plan directive (verifier M2), as levels.py
 h1 = next((r for r in csv.DictReader(open(lv), delimiter="\t") if r["mix"] == m), None)
 assert h1, f"no H1 levels for {m} in {lv}"
 if frm:
@@ -218,7 +219,7 @@ else:
     xs, how = {}, {}
     for f in csv.reader(open(runs), delimiter="\t"):
         if f and not f[0].startswith("#") and f[2] == m and f[3] == "slo" and f[1] in ("hw", "pop"):
-            xs[f[1]], _, _, how[f[1]] = system_x(os.path.join(E, f[5]), p[5])  # LevelsError = real error: stop
+            xs[f[1]], _, _, how[f[1]] = system_x(os.path.join(E, f[5]), p[5], plan_confirm_fail(plan), f[1])  # LevelsError: stop
     assert set(xs) == {"hw", "pop"}, f"hw/pop SLO results missing for {m}: {sorted(xs)}"
     l1x = min(xs.values())
     l1, l2 = repr(l1x), repr(l1x / 2)

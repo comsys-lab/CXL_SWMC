@@ -29,7 +29,9 @@ FAIL checks (every workload):
   F7 collect notes.txt has no "no overload step", "fig1", "fig2" or "export_csv" note
   F8 (n = 1) levels.tsv weakest system = argmin of this round's confirm x_mean per mix (decision E: a noted search's x
      = its lowest ramp step, as levels.py)
-  W9 (decision E) an SLO search without a confirmed max: names the note and the lowest-ramp-step x used for L1
+  W9 (decision E) an SLO search without a confirmed max: names the note and the x used for L1 (lowest_step, or
+     highest_pass with the plan directive levels_confirm_fail=highest_pass); for All-HWcc it is an F2 FAIL instead
+     (verifier M1: never an L1 source)
 WARN checks:
   W1 all-HWcc below max(Popcorn, Megalon) x 0.98 at a mix
   W2 confirm x_sd / x_mean > 5 % or confirm fails >= 1
@@ -62,7 +64,7 @@ import argparse, csv, json, os, sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from h1sys import slo_systems, fix_systems, has_megalon, NO_MEGALON_NOTE  # noqa: E402
 import attempts  # noqa: E402  (v0.6.8: current attempt of a round, levels.tsv of the current r1 attempt)
-from levels import NOTED, START_NOTE, LevelsError, system_x  # noqa: E402  (decision E, 2026-10-22)
+from levels import NOTED, START_NOTE, LevelsError, plan_confirm_fail, system_x  # noqa: E402  (decision E, 2026-10-22)
 
 
 ROUND_ROOTS = {}  # --round-root n=<root> (experiments/eval: run k of a run set lives in its own evidence root)
@@ -279,6 +281,7 @@ def main():
                      "not applicable (C_diff absent by design)")
     S = rdir(E, W, n)
     mixes = plan_mixes(a.plan, W)
+    cfail = plan_confirm_fail(a.plan)  # verifier M2 switch (default lowest_step), as levels.py
     rs = {}
     allr = runs(os.path.join(S, "run"))  # H1-HOOK v2: one block dir per workload and round
     for ph in ("slo", "fix"):
@@ -335,9 +338,9 @@ def main():
         res("F", f"F2 {r['name']}", not errs, "; ".join(errs))
         if noted:
             try:
-                xe = system_x(r["dir"], mixes[r["mix"]])
+                xe = system_x(r["dir"], mixes[r["mix"]], cfail, r["sys"])  # hw: LevelsError (verifier M1) -> F2 FAIL
                 res("W", f"W9 {r['name']} no confirmed max", False,
-                    f"note '{s['note']}': x = lowest ramp step {xe[0]:g} (decision E; flagged in levels.tsv x_{r['sys']}_src)")
+                    f"note '{s['note']}': x = {xe[3]} {xe[0]:g} (decision E; flagged in levels.tsv x_{r['sys']}_src)")
             except LevelsError as e:
                 res("F", f"F2 {r['name']} lowest ramp step", False, str(e))
         uv = upd_valid(r["dir"])
@@ -347,7 +350,7 @@ def main():
                 "update stream not sustained (urate-check.csv) on passing confirm steps " + ", ".join(bad))
         if noted:  # decision E: the x levels.py used (lowest ramp step), so F8/W1/W4 compare like with like
             try:
-                xs[(r["mix"], r["sys"])] = system_x(r["dir"], mixes[r["mix"]])[0]
+                xs[(r["mix"], r["sys"])] = system_x(r["dir"], mixes[r["mix"]], cfail, r["sys"])[0]
             except LevelsError:
                 pass
         elif c.get("x_mean"):

@@ -249,8 +249,13 @@ class H2nExport(unittest.TestCase):
 
     def test_fig8_csv(self):
         """fig8.csv: per mix the highest ramp offered rate passed by both hw and pop; no higher common pass exists"""
-        f8 = {r["mix"]: r for r in rows(os.path.join(self.o, "fig8.csv"))}
+        allf = rows(os.path.join(self.o, "fig8.csv"))
+        f8 = {r["mix"]: r for r in allf if r["variant"] == "per_n"}
         self.assertEqual(set(f8), {"u5", "u50", "u90"})
+        # one N in this export: the common_n variant (verifier L1) equals per_n, n_set "2"
+        cn = {r["mix"]: r for r in allf if r["variant"] == "common_n"}
+        self.assertEqual({m: (r["offered_x"], r["n_set"]) for m, r in cn.items()},
+                         {m: (r["offered_x"], "2") for m, r in f8.items()})
         sv = rows(os.path.join(self.o, "steps.csv"))
         for mix, r in f8.items():
             ok = {s: {round(float(x["offered_x"]), 6) for x in sv if x["mix"] == mix and x["system"] == s
@@ -261,7 +266,39 @@ class H2nExport(unittest.TestCase):
             self.assertTrue(close(parts, r["fig8_norm_pop"]) and float(r["fig8_norm_hw"]) == 1.0, mix)
         o = os.path.join(OUT, "combined-f8")
         run(f"{EV}/export_h2n.py", "--combine", "--out", o, self.o)
-        self.assertEqual(len(rows(os.path.join(o, "fig8.csv"))), 3)
+        self.assertEqual(len(rows(os.path.join(o, "fig8.csv"))), 6)
+
+    def test_fig8_common_n(self):
+        """verifier L1: common_n = per mix the highest ramp rate passed by hw and pop at EVERY N; synthetic steps of
+        N = 2, 4 (pass sets {10, 22.5, 50} / {10, 22.5}) -> per_n 50 / 22.5, common_n 22.5 at both N"""
+        sys.path.insert(0, EV)
+        import export_h2n as X
+        st = []
+        for n, offs in ((2, (10, 22.5, 50)), (4, (10, 22.5))):
+            for s in ("hw", "pop"):
+                for i, off in enumerate(offs + (100,)):
+                    st.append(dict(nodes=n, mix="u50", system=s, phase="ramp", step=i + 1, offered_x=off,
+                                   **{"pass": off != 100}, valid=None, srch_wall_ns_per_search=1e6 * (2 if s == "pop" else 1),
+                                   search_s=off / 2, p99_ms=10, run=1, config_sha256="t"))
+        f = X.fig8_rows(st)
+        got = sorted((r["variant"], r["nodes"], r["offered_x"], r["n_set"]) for r in f)
+        self.assertEqual(got, [("common_n", 2, 22.5, "2/4"), ("common_n", 4, 22.5, "2/4"), ("per_n", 2, 50.0, "2"),
+                               ("per_n", 4, 22.5, "4")])
+        self.assertTrue(all(r["fig8_norm_pop"] == 2.0 for r in f))
+
+    def test_lowest_ramp_columns(self):
+        """verifier L3: summary lowest_ramp_* = the lowest measured ramp step of every search (steps.csv)"""
+        sv = rows(os.path.join(self.o, "steps.csv"))
+        for k, r in self.s.items():
+            ramp = [x for x in sv if (x["mix"], x["system"]) == k and x["phase"] == "ramp"]
+            lo = min(ramp, key=lambda x: (float(x["offered_x"]), int(x["step"])))
+            self.assertEqual(r["lowest_ramp_step"], lo["step"], k)
+            self.assertTrue(close(r["lowest_ramp_search_s"], lo["search_s"]) and close(r["lowest_ramp_p99_ms"], lo["p99_ms"]))
+            if k[1] == "mg":
+                ops = float(lo["search_s"]) + float(lo["update_s"])
+                self.assertTrue(close(r["lowest_ramp_mg_fetch_per_op"], float(lo["mg_fetch"]) / ops), k)
+            else:
+                self.assertEqual(float(r["lowest_ramp_mg_fetch_per_op"]), 0.0)
 
     @unittest.skipUnless(os.path.isdir(f"{P}/recovery/confirm-rule-test-run1-n2-v1/block"), "evidence absent")
     def test_fig8_instr_detail0(self):

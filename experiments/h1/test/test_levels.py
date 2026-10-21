@@ -11,6 +11,9 @@ Synthetic SLO runs (h1-runs.tsv + <run>/loadgen/{summary.json,steps.jsonl}) of t
   4. no confirm result without a note: lowest ramp step;
   5. real errors stop (exit 1, LEVELS STOP): another note, workload_finish != ok, SLO != plan, unreadable summary,
      a missing system run, a fallback run without a measured ramp step;
+  7. verifier M1: All-HWcc without a confirmed max always stops (both policies);
+  8. verifier M2 / user 2026-10-22: plan directive levels_confirm_fail=highest_pass -> a confirm-failed search uses
+     its highest passing ramp/bisect step (src highest_pass), a failed start rate still the lowest ramp step;
   6. real data: recovery/vdb-vm-scaling-sq8-run1-n4-v1 mg-u90-n4 (start rate failed): system_x = (1.01415,
      lowest_step), the hatched value of Fig 5; a confirmed hw run there: its confirm x_mean.
 """
@@ -28,6 +31,8 @@ import levels  # noqa: E402
 
 OUT = sys.argv.pop(1) if len(sys.argv) > 1 and not sys.argv[1].startswith("-") else sys.exit("usage: test_levels.py <dir>")
 PLAN = os.path.join(OUT, "plan.tsv")  # the vdb u5 and u90 rows of h1-plan.tsv (written in main)
+PLAN_HP = os.path.join(OUT, "plan-hp.tsv")  # the same with "#! levels_confirm_fail=highest_pass" (verifier M2)
+PLAN_BAD = os.path.join(OUT, "plan-bad.tsv")  # ... with a bad directive value
 REAL = "/home/comsys/sungsu/destijl-control/recovery/vdb-vm-scaling-sq8-run1-n4-v1/block"
 SLO = {"stream": "search", "pct": 99, "ms": 100}
 
@@ -134,9 +139,35 @@ class Levels(unittest.TestCase):
 
     def test_4_no_confirm_result(self):
         r = base()
-        r[("hw", "u90")] = dict()
+        r[("pop", "u90")] = dict()
         t, _ = self.ok(self.stage(r))
-        self.assertEqual((t["u90"]["x_hw_src"], float(t["u90"]["x_hw"])), ("lowest_step", 0.6))
+        self.assertEqual((t["u90"]["x_pop_src"], float(t["u90"]["x_pop"])), ("lowest_step", 0.6))
+
+    def test_7_hw_never_fallback(self):
+        """verifier M1: All-HWcc without a confirmed max (start fail, confirm fail, no result) is a LEVELS STOP,
+        under both confirm-failed policies"""
+        for kw in (dict(note=levels.START_NOTE, start_fail=True), dict(note=levels.CONFIRM_NOTE, confirm=60.0), dict()):
+            for plan in (PLAN, PLAN_HP):
+                r = base()
+                r[("hw", "u90")] = kw
+                self.stops(r, "All-HWcc has no confirmed max", "--plan", plan)
+        with self.assertRaises(levels.LevelsError):
+            d = self.stage({("hw", "u5"): dict(note=levels.CONFIRM_NOTE, confirm=60.0)})
+            levels.system_x(os.path.join(d, "hw-u5"), "search:99:100", "highest_pass", "hw")
+
+    def test_8_highest_pass_switch(self):
+        """verifier M2 / user 2026-10-22: plan directive levels_confirm_fail=highest_pass: a confirm-failed search uses
+        the highest passing ramp/bisect step (x 1.3 at offered 22.5, src highest_pass); a failed start rate still the
+        lowest ramp step; without the directive (PLAN) lowest_step (test 3); a bad value stops"""
+        r = base()
+        r[("pop", "u5")] = dict(note=levels.CONFIRM_NOTE, confirm=150.0)
+        r[("mg", "u90")] = dict(note=levels.START_NOTE, start_fail=True)
+        t, _ = self.ok(self.stage(r), "--plan", PLAN_HP)
+        self.assertEqual((t["u5"]["x_pop_src"], float(t["u5"]["x_pop"])), ("highest_pass", 1.3))
+        self.assertEqual((t["u90"]["x_mg_src"], float(t["u90"]["x_mg"])), ("lowest_step", 0.6))
+        self.assertEqual(levels.plan_confirm_fail(PLAN), "lowest_step")
+        self.assertEqual(levels.plan_confirm_fail(PLAN_HP), "highest_pass")
+        self.stops(base(), "levels_confirm_fail=bogus", "--plan", PLAN_BAD)
 
     def test_5_real_errors_stop(self):
         for kw, want in ((dict(note="streams exhausted during ramp", confirm=3.0), "not a decision-E outcome"),
@@ -169,7 +200,10 @@ if __name__ == "__main__":
     if os.listdir(OUT):
         sys.exit(f"{OUT} is not empty")
     with open(os.path.join(H1, "h1-plan.tsv")) as f, open(PLAN, "w") as g:
-        g.write("".join(l for l in f if l.split("\t")[:2] in (["vdb", "u5"], ["vdb", "u90"])))
+        rows_ = "".join(l for l in f if l.split("\t")[:2] in (["vdb", "u5"], ["vdb", "u90"]))
+        g.write(rows_)
+    open(PLAN_HP, "w").write("#! levels_confirm_fail=highest_pass\n" + rows_)
+    open(PLAN_BAD, "w").write("#! levels_confirm_fail=bogus\n" + rows_)
     r = unittest.main(exit=False, verbosity=2 if "-v" in sys.argv else 1).result
     print("TEST LEVELS PASS" if r.wasSuccessful() else "TEST LEVELS FAIL")
     sys.exit(0 if r.wasSuccessful() else 1)

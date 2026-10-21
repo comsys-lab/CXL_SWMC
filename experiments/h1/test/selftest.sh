@@ -17,7 +17,8 @@
 #      on recovery/RECSYS-V1-v1.4 hw/pop val windows, read-only) -> OK; the same CSV with a Megalon row -> F5 FAIL
 #   B  STUB_FAIL=badnote:mg:u50 in r1-kv: SEQUENCE STOP at levels ("not a decision-E outcome"); B2 (decision E,
 #      2026-10-22) STUB_FAIL=note:mg:u50 (confirm failed): no stop; levels.tsv u50 x_mg = the lowest ramp step's x (10),
-#      x_mg_src lowest_step, weakest mg; the stage ends with check.txt W9 for mg-u50 and H1CHECK PASS
+#      x_mg_src lowest_step, weakest mg; the stage ends with check.txt W9 for mg-u50 and H1CHECK PASS; B3 (verifier M1)
+#      STUB_FAIL=note:hw:u50: LEVELS STOP "All-HWcc has no confirmed max"
 #   C  STUB_FAIL=rc in r1-kv: SEQUENCE STOP at the SLO hook
 #   D  real plugin pins-vdb.sh with FILL_ tokens (not dry): HOOK STOP "unpinned" (skipped once fully pinned)
 #   E  levels.py + collect.py on the real KV-main H1 v2 SLO runs (read-only; mix u5 only): weakest pop
@@ -167,6 +168,10 @@ ck = open(f"{o}/kv/r1/check.txt").read()
 assert "W9 mg-u50-r1-slo no confirmed max" in ck and ck.strip().splitlines()[-1].startswith("H1CHECK PASS"), ck[-600:]
 print("B2 content OK")
 EOF
+# B3 verifier M1: a confirm-failed All-HWcc search is never an L1 source: LEVELS STOP, no fixed windows of the mix
+mkdir "$O/B3"; STUB_FAIL=note:hw:u50 stage B3 r1-kv && fail "B3 rc 0"
+grep -q "LEVELS STOP .*All-HWcc has no confirmed max" "$O/B3/kv/levels-u50.log" || fail "B3 stop reason"
+[ ! -e "$O/B3/kv/r1/run/mg-u50-r1/fix" ] || fail "B3 fixed windows ran after LEVELS STOP"
 # C
 mkdir "$O/C"; STUB_FAIL=rc stage C r1-kv && fail "C rc 0"
 grep -q "SEQUENCE STOP kv r1" "$O/C/h1-state.txt" || fail "C stop reason"

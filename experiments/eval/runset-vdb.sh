@@ -22,7 +22,7 @@
 #   VDB_SLO_EXTRA  loadgen arguments appended to every SLO part (m4-run.sh KIND=h1 H1_SLO_EXTRA; fixed-load parts
 #                  unchanged), e.g. the 2026-10-21 22:4x confirm rule; check.py expects its last --confirm-reps
 RUNSET=vdb WL=vdb
-unset VDB_PINS VDB_SLO_EXTRA
+unset VDB_PINS VDB_SLO_EXTRA VDB_LEVELS_CONFIRM_FAIL
 . "$(dirname "$0")/lib.sh"
 VPINS=$EVD/${VDB_PINS:-pins-vdb.sh}
 [[ ${VDB_PINS:-x} != */* ]] || die "VDB_PINS is a file name next to runset-vdb.sh"
@@ -61,7 +61,11 @@ MIXES=${MIXES% }
 # RPLAN = h1-plan.tsv with the vdb rows restricted to VDB_POINTS (plan order; other workloads' rows kept), written to
 # E/vdb/run-plan.tsv at the real start. With eval.conf (u5 u50 u90) its rows equal the vdb rows the plan had before.
 RPLAN=   # set after evidence_dir
-run_plan() { awk -F'\t' -v pts=" $VDB_POINTS " '/^#/ || $1 != "vdb" || index(pts, " " $2 " ")' "$PLAN"; }
+# VDB_LEVELS_CONFIRM_FAIL (optional; verifier M2, user 2026-10-22: highest_pass in eval2-h1.conf): written as the plan
+# directive "#! levels_confirm_fail=<v>" that levels.py, check.py and v6-block.sh h2_mix read (absent = lowest_step)
+case ${VDB_LEVELS_CONFIRM_FAIL:-lowest_step} in lowest_step|highest_pass) ;; *) die "bad VDB_LEVELS_CONFIRM_FAIL (lowest_step | highest_pass)";; esac
+run_plan() { [ -z "${VDB_LEVELS_CONFIRM_FAIL:-}" ] || echo "#! levels_confirm_fail=$VDB_LEVELS_CONFIRM_FAIL"
+  awk -F'\t' -v pts=" $VDB_POINTS " '/^#/ || $1 != "vdb" || index(pts, " " $2 " ")' "$PLAN"; }
 [ "$(run_plan | awk -F'\t' '!/^#/ && $1 == "vdb"' | wc -l)" = "$(echo $VDB_POINTS | wc -w)" ] || die "run plan: vdb rows != VDB_POINTS"
 # mode, round label and levels
 LV= ROOTS=() MODE=r1 N=1 H2F=
@@ -113,6 +117,7 @@ need_env
 lock_free
 evidence_dir
 S=$E/vdb/r$N RPLAN=$E/vdb/run-plan.tsv
+plan "levels on a failed confirm: ${VDB_LEVELS_CONFIRM_FAIL:-lowest_step} (failed start rate: lowest_step; All-HWcc must be confirmed)"
 plan "run plan $RPLAN (written at the start): vdb rows $(run_plan | awk -F'\t' '!/^#/ && $1 == "vdb" { printf "%s ", $2 "(" $3 ",x" $4 ")" }')"
 HENV=(EVAL_RUN=$K EVAL_REGION=$REGION EVAL_DATASET=$VDB_DATASET VDB_SEARCH_THREADS=$VDB_SEARCH_THREADS
   X_DATA=$VDB_X_DATA X_WRITES=$VDB_X_WRITES X_NB=$VDB_X_NB X_MAXIDS=$VDB_X_MAXIDS X_MAXW=$VDB_X_MAXW X_MAXD=$VDB_X_MAXD

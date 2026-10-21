@@ -75,6 +75,20 @@ class VdbCoh(unittest.TestCase):
             elif r["system"] == "hw":
                 self.assertEqual(float(r["fig3_lines_per_rop"]), 0.0)
 
+    def test_lowest_ramp(self):
+        """verifier L3: slo_summary lowest_ramp_* = the lowest measured ramp step of slo_steps.csv"""
+        st = rows(os.path.join(self.o, "slo_steps.csv"))
+        for r in rows(os.path.join(self.o, "slo_summary.csv")):
+            ramp = [x for x in st if (x["point"], x["system"]) == (r["point"], r["system"]) and x["phase"] == "ramp"]
+            lo = min(ramp, key=lambda x: (float(x["offered_x"]), int(x["step"])))
+            self.assertEqual(r["lowest_ramp_step"], lo["step"])
+            self.assertTrue(close(r["lowest_ramp_achieved_x"], lo["achieved_x"]) and close(r["lowest_ramp_p99_ms"], lo["p99_ms"]))
+            if r["system"] == "mg":
+                self.assertGreaterEqual(float(r["lowest_ramp_mg_fetch_per_op"]), 0)
+                self.assertTrue(close(r["lowest_ramp_mg_fetch_per_op"], lo["mg_fetch_per_op"]))
+            else:
+                self.assertEqual(float(r["lowest_ramp_mg_fetch_per_op"]), 0.0)
+
     def test_slo_steps(self):
         st = rows(os.path.join(self.o, "slo_steps.csv"))
         self.assertIn("fig3_lines_per_rop", st[0])
