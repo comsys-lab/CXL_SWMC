@@ -16,8 +16,20 @@
 # Layout: E/eval-manifest.txt, E/eval-state.txt, E/gate-*.txt, E/vdb/r<n>/{run,collect,check.txt}, E/vdb/levels.tsv
 # (round n = 1 in r1 mode, = k in cont mode). Acceptance: registry.py accept vdb <k> <E> after reviewing check.txt.
 # usage: runset-vdb.sh <k> [--dry] [--v N]   (lib.sh)
+# Optional conf keys (eval2-h1.conf; absent in eval.conf = the behaviour above; never inherited from the environment):
+#   VDB_PINS       pins file name next to pins-vdb.sh (e.g. pins-vdb-confirm11.sh for builds/vdb-loadgen/11); used by
+#                  this driver's pin check and by hook.sh (EVAL_PINS)
+#   VDB_SLO_EXTRA  loadgen arguments appended to every SLO part (m4-run.sh KIND=h1 H1_SLO_EXTRA; fixed-load parts
+#                  unchanged), e.g. the 2026-10-21 22:4x confirm rule; check.py expects its last --confirm-reps
 RUNSET=vdb WL=vdb
+unset VDB_PINS VDB_SLO_EXTRA
 . "$(dirname "$0")/lib.sh"
+VPINS=$EVD/${VDB_PINS:-pins-vdb.sh}
+[[ ${VDB_PINS:-x} != */* ]] || die "VDB_PINS is a file name next to runset-vdb.sh"
+[[ ${VDB_SLO_EXTRA:-} =~ ^[-a-z0-9.\ ]*$ ]] || die "bad VDB_SLO_EXTRA"
+CREPS=3; set -- ${VDB_SLO_EXTRA:-}
+while [ $# -gt 0 ]; do [ "$1" = --confirm-reps ] && CREPS=${2:-x}; shift; done
+[[ $CREPS =~ ^[1-9]$ ]] || die "bad --confirm-reps in VDB_SLO_EXTRA"
 H=$TREE/experiments/h1 X=$TREE/experiments/vectordb
 G=$X/host-gate.sh PG=$X/pretouch-gate.sh PLAN=$H/h1-plan.tsv
 # VDB_SYSTEMS "hw pop mg" = the H1 hook set (+ mgoff). Popcorn-only mode (VDB_SYSTEMS=pop, e.g. recv-sleep.conf): one
@@ -84,7 +96,7 @@ if [ $POPONLY = 1 ]; then  # levels of the Popcorn-only round: run LEVELS_FROM_R
 fi
 SEEDB=$((SEED_BASE + K - N))   # loadgen seed of the run = SEED_BASE + k in both modes (hook: H1_SEED_BASE + n)
 need_files "$VDB_PLAIN_BUILD/bin/vdb-server" "$VDB_MEG_BUILD/bin/vdb-server" "$VDB_LOADGEN_BUILD/loadgen" "$REGION" \
-  "$VDB_MEG_CFG" "$POP_C/p-popcorn-shm.sh" "$VDB_X_DATA/pool_b.fbin" "$VDB_X_WRITES" "$EVD/pins-vdb.sh"
+  "$VDB_MEG_CFG" "$POP_C/p-popcorn-shm.sh" "$VDB_X_DATA/pool_b.fbin" "$VDB_X_WRITES" "$VPINS"
 [ "$(sha256sum < "$POP_C/packet.sha256" | cut -c1-64)" = "$POP_BUNDLE_SHA" ] || die "Popcorn bundle packet.sha256 != POP_BUNDLE_SHA"
 ring_check
 APP=$("$VDB_PLAIN_BUILD/bin/vdb-server" --nodes 2 --segments 32 --M 16 --efc 128 --ef 32 --max-writes $VDB_X_MAXW \
@@ -93,8 +105,9 @@ APP=$("$VDB_PLAIN_BUILD/bin/vdb-server" --nodes 2 --segments 32 --M 16 --efc 128
 RING=$(grep -E '^msg_ring:' "$REGION" | sed 's/.*,[[:space:]]*\([0-9]*\)\].*/\1/')
 plan "app HWcc $APP B + ring $RING B of 268435456 B (hwcc_alloc for the system $((268435456 - APP - RING)) B)"
 [ $((APP + RING)) -lt 268435456 ] || die "app + ring exceed the HWcc budget"
-( cd "$H" && . "$EVD/pins-vdb.sh" && echo "$PIN_SHA256" | sha256sum --quiet -c - ) || die "eval pins (pins-vdb.sh) do not verify"
-plan "pins verify ($EVD/pins-vdb.sh); mode $MODE round $N mixes [$MIXES] settle ${SETTLE}s seed $((SEEDB + N))"
+( cd "$H" && . "$VPINS" && echo "$PIN_SHA256" | sha256sum --quiet -c - ) || die "eval pins ($VPINS) do not verify"
+plan "pins verify ($VPINS); mode $MODE round $N mixes [$MIXES] settle ${SETTLE}s seed $((SEEDB + N))"
+plan "slo part extra loadgen args: [${VDB_SLO_EXTRA:-}] (check.py confirm reps $CREPS); loadgen $VDB_LOADGEN_BUILD"
 plan "threads: --search-threads $VDB_SEARCH_THREADS + 1 writer; dataset $VDB_DATASET; Megalon capacity $VDB_MG_CAPACITY; region $REGION"
 need_env
 lock_free
@@ -106,6 +119,8 @@ HENV=(EVAL_RUN=$K EVAL_REGION=$REGION EVAL_DATASET=$VDB_DATASET VDB_SEARCH_THREA
   X_INIT_CAP=$VDB_X_INIT_CAP X_MEGALON_H1CAP=$XMG H1_SEED_BASE=$SEEDB H1_SETTLE_S=$SETTLE H1_MEASURE_RUN=1
   PRETOUCH_DIR=${PRETOUCH_DIR:-} MEASURE_ENV_DIR=${MEASURE_ENV_DIR:-} MEASURE_PART_DIR=${MEASURE_PART_DIR:-}
   EVAL_RECV_MODE=$RECV_MODE)
+[ -z "${VDB_PINS:-}" ] || HENV+=(EVAL_PINS=$VDB_PINS)
+[ -z "${VDB_SLO_EXTRA:-}" ] || HENV+=("H1_SLO_EXTRA=$VDB_SLO_EXTRA")
 if [ $POPONLY = 1 ]; then HENV+=(EVAL_SYSTEMS=pop)   # r1 with the given levels LV (hook.sh EVAL_SYSTEMS)
 elif [ $MODE = r1 ]; then HENV+=(H1_LEVELS_CMD=$H/levels-cb.sh H1_PLAN=$RPLAN H1_W=vdb H1_LEVELS_OUT=$E/vdb/levels.tsv); fi
 [ "$VDB_H2_LEVELS" = 1 ] && HENV+=(EVAL_H2=1) && [ -n "$H2F" ] && HENV+=(EVAL_H2_FROM=$H2F)
@@ -149,7 +164,7 @@ if [ $POPONLY = 1 ]; then  # Popcorn-only round: hook checked h1-runs.tsv and ev
 fi
 nice -n 19 python3 -B $H/collect.py --plan "$RPLAN" --workload vdb --levels "${LV:-$E/vdb/levels.tsv}" "$S" > "$S/collect.log" 2>&1 \
   || stop "collect: $(tail -n 1 "$S/collect.log")"
-python3 -B $H/check.py --plan "$RPLAN" --workload vdb --round $N "${ROOTS[@]}" "$E" > "$S/check.log" 2>&1
+H1_CONFIRM_REPS=$CREPS python3 -B $H/check.py --plan "$RPLAN" --workload vdb --round $N "${ROOTS[@]}" "$E" > "$S/check.log" 2>&1
 CRC=$?
 log "check: $(tail -n 1 "$S/check.txt" 2>/dev/null || echo 'no check.txt')"
 [ $CRC = 0 ] || stop "check FAIL (see $S/check.txt)"

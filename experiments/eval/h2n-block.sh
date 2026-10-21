@@ -11,7 +11,7 @@
 # Called by experiments/eval/runset-h2n.sh (never by hand in a real run).
 # usage: h2n-block.sh <evidence dir (exists; empty except sequence*)>
 # env: H2N_N (2..8), H2N_VCPU (4; 16 on the 2-VM topology, runset-h2n.sh H2N_TOPO=2), H2N_LIFETIMES ("<sys>:<mix>
-#   ..." or "<sys>:<mix>:r<j> ..." in execution order; sys hw | pop | mg | mgoff, mix u5 | u50 | u90), EVAL_RUN (k), SEED, REGION, C8 K8 GT8 RECV_MODE POP_BUNDLE_SHA, PRETOUCH_DIR (VM8-v* evidence
+#   ..." or "<sys>:<mix>:r<j> ..." in execution order; sys hw | pop | mg | mgoff, mix u5 | u10 | u50 | u90 | u95), EVAL_RUN (k), SEED, REGION, C8 K8 GT8 RECV_MODE POP_BUNDLE_SHA, PRETOUCH_DIR (VM8-v* evidence
 #   of the current QEMU lifetimes), MEASURE_ENV_DIR MEASURE_PART_DIR (h3-gate.sh), EXPECT_DAX_UUID,
 #   VPLAIN PLAIN_BUILD LOADGEN X_DATA X_WRITES X_NB X_MAXIDS X_MAXW X_MAXD X_INIT_CAP,
 #   Megalon (only when a lifetime is mg / mgoff): MEG_BUILD VMEG MEG_CFG MEG_LIB MG_MAXD,
@@ -52,7 +52,7 @@ for l in $H2N_LIFETIMES; do
   s=${l%%:*} m=${l#*:} m=${m%%:*}
   [[ $l =~ ^[a-z]+:u[0-9]+(:r[1-9])?$ ]] || die "bad lifetime id $l (<sys>:<mix>[:r<j>])"
   case $s in hw|pop) ;; mg|mgoff) HASMG=1;; *) die "bad system in $l";; esac
-  case $m in u5|u50|u90) ;; *) die "bad mix in $l (u5 | u50 | u90)";; esac
+  case $m in u5|u10|u50|u90|u95) ;; *) die "bad mix in $l (u5 | u10 | u50 | u90 | u95)";; esac   # u10 u95: new H1 on H2N_TOPO=2
   [ $s = pop ] && HASPOP=1
   [[ $seen == *" $l "* ]] && die "lifetime $l listed twice"; seen+="$l "
   LIVES+=("$l")

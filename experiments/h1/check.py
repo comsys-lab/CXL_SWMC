@@ -310,7 +310,9 @@ def main():
             errs.append(f"workload_finish {s.get('workload_finish')}")
         if not slo_ok:
             errs.append(f"SLO {so} != plan {mixes[r['mix']]}")
-        if c.get("reps") != 3 or not (c.get("x_mean") or 0) > 0:
+        # confirm repeats: 3 (H1 rule) unless the eval run set sets H1_CONFIRM_REPS (runset-vdb.sh: the last
+        # --confirm-reps of VDB_SLO_EXTRA, e.g. eval2-h1.conf 1 = one continuous 90 s confirm window)
+        if c.get("reps") != int(os.environ.get("H1_CONFIRM_REPS") or 3) or not (c.get("x_mean") or 0) > 0:
             errs.append(f"confirm {c}")
         if "fill" not in ph or "overload" not in ph:
             errs.append("no fill/overload steps")

@@ -21,8 +21,11 @@ W=${1:?} MODE=${2:?} D=${3:?} N=${4:?} ARG=${5:?} LV=${6:-}
 H=$(cd "$(dirname "$0")" && pwd)
 F=$H/plugins/pins-$W.sh; [ "${H1_DRY:-0}" = 1 ] && F=$H/plugins/pins-stub.sh
 # evaluation run sets (experiments/eval; EVAL_RUN=k): the eval's own pin file (its builds, region, Popcorn bundle)
-if [ -n "${EVAL_RUN:-}" ]; then [ "${H1_DRY:-0}" = 1 ] || F=$H/../eval/pins-$W.sh; fi
+#   EVAL_PINS (optional, runset-vdb.sh from the conf key VDB_PINS): another pins file name next to pins-$W.sh (e.g.
+#   eval2-h1.conf: pins-vdb-confirm11.sh = loadgen/11); absent = pins-$W.sh
+if [ -n "${EVAL_RUN:-}" ]; then [ "${H1_DRY:-0}" = 1 ] || F=$H/../eval/${EVAL_PINS:-pins-$W.sh}; fi
 stop() { echo "HOOK STOP $W $MODE $N: $*"; exit 1; }
+[[ ${EVAL_PINS:-x} != */* ]] || stop "EVAL_PINS is a file name next to the eval pins (got $EVAL_PINS)"
 [ -f "$F" ] || stop "no plugin $F"
 grep -q "FILL_" "$F" && stop "unpinned ($F has FILL_ tokens; fill after the validation packets pass)"
 BLOCK_CMD=() BLOCK_ENV=() HOOK_FILE= PIN_SHA256=

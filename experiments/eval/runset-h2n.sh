@@ -16,6 +16,7 @@
 #                       repeats); lifetime ids <sys>:<mix>:r<j> (run dirs <sys>-<mix>-n<N>-r<j>), same loadgen seed in
 #                       every repeat; r > 1 skips export_h2n.py (one row per (mix, system))
 #   H2N_LOADGEN_EXTRA   loadgen arguments appended to H2N_SLO_PART (e.g. "--confirm-rule pooled --confirm-full")
+#   EVIDENCE_TAG        (lib.sh key) evidence dir tag prefix: <prefix>-run<k>-<tag>-n<N>-v<V> (eval2-h1-slo / eval2-h2)
 N=${1:-}; shift || true
 [[ $N =~ ^[2-8]$ ]] || { echo "RUNSET STOP: usage runset-h2n.sh <N> <k> [--dry] [--v V] [--from sys:mix] [--only 'sys:mix ...']"; exit 2; }
 K_ARG=${1:-}; shift || true
@@ -92,7 +93,9 @@ plan "lifetimes (${#LIVES[@]}): ${LIVES[*]}${FROM:+ (resume from $FROM)}${ONLY:+
 plan "writes $WRITES; max_deletes/node $MAXD$([ $HASMG = 1 ] && echo "; Megalon build $MGB lib $MGL cfg $MGC guest $MGV max_deletes/node $MGD")"
 need_env
 lock_free
-EVIDENCE_TAG=n$N   # approved scope: <RESULTS_ROOT>/vdb-vm-scaling-run<k>-n<N>-v<V> (EVIDENCE_PREFIX in h2n.conf)
+# approved scope: <RESULTS_ROOT>/vdb-vm-scaling-run<k>-n<N>-v<V> (EVIDENCE_PREFIX in h2n.conf); a conf EVIDENCE_TAG
+# (eval2-h1-slo.conf h1, eval2-h2.conf h2; absent in h2n*.conf) prefixes it: <prefix>-run<k>-<tag>-n<N>-v<V>
+EVIDENCE_TAG=${EVIDENCE_TAG:+$EVIDENCE_TAG-}n$N
 evidence_dir
 BENV=(H2N_N=$N H2N_VCPU=$VCPUS_PER_VM "H2N_LIFETIMES=${LIVES[*]}" EVAL_RUN=$K SEED=$((SEED_BASE + K)) REGION=$REGION
   C8=$POP_C K8=$POP_K GT8=$POP_GT RECV_MODE=$RECV_MODE POP_BUNDLE_SHA=$POP_BUNDLE_SHA EXPECT_DAX_UUID=$EXPECT_DAX_UUID

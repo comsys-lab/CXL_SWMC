@@ -153,7 +153,12 @@ case "$KIND" in
       LG=("${NL[@]}" --raw)
       export PART_SEED_slo=$SEED PART_SEED_fix=$((SEED + 1))
       export PARTS=$H1_PARTS PART_RATES=${RATE:-} PART_RATES_CMD=${RATES_CMD:-}
-      export PART_ARGS_slo="--mode slo --start 10 --factor 1.5 --precision 0.02 --confirm-precision 0.01 --max-confirm-probes 6 --confirm-step-down 0.05 --max-steps 25 --warmup-s 10 --step-warmup-s 3 --step-measure-s 15 --confirm-s 30 --confirm-reps 3"
+      # H1_SLO_EXTRA (eval run sets only, runset-vdb.sh conf key VDB_SLO_EXTRA; e.g. eval2-h1.conf the confirm rule
+      # "--confirm-rule pooled --confirm-full --confirm-reps 1 --confirm-s 90 --confirm-warmup-s 15"): loadgen arguments
+      # appended to the slo part (loadgen keeps the last value of a repeated option); the fix part is unchanged
+      [ -z "${H1_SLO_EXTRA:-}" ] || [ -n "${EVAL_RUN:-}" ] || stop "H1_SLO_EXTRA needs EVAL_RUN"
+      [[ ${H1_SLO_EXTRA:-} =~ ^[-a-z0-9.\ ]*$ ]] || stop "bad H1_SLO_EXTRA"
+      export PART_ARGS_slo="--mode slo --start 10 --factor 1.5 --precision 0.02 --confirm-precision 0.01 --max-confirm-probes 6 --confirm-step-down 0.05 --max-steps 25 --warmup-s 10 --step-warmup-s 3 --step-measure-s 15 --confirm-s 30 --confirm-reps 3${H1_SLO_EXTRA:+ $H1_SLO_EXTRA}"
       export PART_ARGS_fix="--mode fixed --rates @RATES@ --warmup-s $SETTLE_S --step-warmup-s 10 --step-measure-s 60 --drain-s 10";;
   urate) [[ "${URATE:-}" =~ ^[1-9][0-9]*$ ]] || stop "bad URATE"
          [ "$U" = 0 ] || stop "KIND=urate needs U=0 (updates come from --fixed update=URATE)"
