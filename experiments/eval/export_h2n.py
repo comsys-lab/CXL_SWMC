@@ -40,6 +40,18 @@ summary.csv columns (first eleven = the figure contract): nodes, mix, system, ma
   (host-cpu-sampler.py), raw Megalon counters per s, confirm stats, validity.
   A coherence column of a system without that mechanism is 0 when its counter is absent (hw: all, pop: mg_*,
   mg: faults_* / coherence_events); counter_source names what was read.
+Fig 8 columns (appended to steps.csv and summary.csv; de-stijl-motivation-isca27 §2.1, 2026-10-22): per server search
+  (srv_searches = server counter "searches" summed over the VMs) of the vector DB server's search threads (comm
+  vdb-search): srch_wall_ns_per_search W (search_busy_ns), srch_{is,sm,wpu,nontrans}_fault_ns_per_search,
+  srch_coh_ipi_ns_per_search, srch_ipi_coh_infault_ns_per_search, srch_{read,write}_msg_wait_ns_per_search, srch_F
+  (is + sm + wpu), srch_C (F + coh IPI outside faults), srch_sections_t_ns_per_search (opt.search.t_ns, cross-check of
+  W), and the stack fig8_inval_ipi (C - F), fig8_owner_wait (MW = read + write msg wait), fig8_other_fault (F + NT -
+  MW), fig8_query (W - C - NT), which add up to W. Popcorn columns are 0 (kernel keys present, no coherence) or empty
+  for hw / mg; W is filled for every system (the All-HWcc base of the normalization). C agrees with the server's
+  per-op accounting opt.search.c_ns within a few % (sections vs stats window). steps.csv also gets "aborted" (loadgen queue-cap abort; such steps are
+  kept: drawn clipped). fig8.csv (per-N export and --combine): one row per (nodes, mix) at the Fig 8 load point
+  (user 2026-10-22 Q1: the highest ramp step offered rate that both hw and pop pass), hw and pop W, the Popcorn
+  stack, all normalized to hw's W (fig8_norm_*).
 """
 import argparse
 import csv
@@ -70,6 +82,23 @@ TXW = {"tx_wait_ns": ("sys.swmc.instr.tx_fetch.wait_sum_ns", "sys.swmc.instr.tx_
 THR = {"msg_wait_ns": (".swmc.read_msg_wait_ns", ".swmc.write_msg_wait_ns"),
        "msg_rounds": (".swmc.read_transactions", ".swmc.write_transactions"),
        "nack_retries": (".swmc.nack_retries",)}
+# Fig 8 (de-stijl-motivation-isca27 §2.1): Popcorn coherence time of the vector DB server's SEARCH threads (comm
+# "vdb-search": every search segment task runs on them; the writer, connection and listener threads are not in it),
+# per server search, summed over the N VMs; same definitions as the RecSys streaming breakdown (figs-h1h2 h2s.py):
+SRCH = "thr.vdb-search.swmc."
+FIG8_THR = {"srch_is_fault_ns": "is_fault_ns", "srch_sm_fault_ns": "sm_fault_ns", "srch_wpu_fault_ns": "wpu_fault_ns",
+            "srch_nontrans_fault_ns": "nontrans_fault_ns", "srch_coh_ipi_ns": "ipi_coh_ns",
+            "srch_ipi_coh_infault_ns": "ipi_coh_infault_ns", "srch_read_msg_wait_ns": "read_msg_wait_ns",
+            "srch_write_msg_wait_ns": "write_msg_wait_ns"}
+#   W  = srch_wall_ns: server counter search_busy_ns (wall time of every search task run by the search threads)
+#   F  = is + sm + wpu fault ns (transition faults), NT = nontrans fault ns, MW = read + write msg wait ns,
+#   C  = F + coherence IPI ns outside faults (ipi_coh_ns - ipi_coh_infault_ns) = swmc_acct C
+#   fig8_inval_ipi = C - F, fig8_owner_wait = MW, fig8_other_fault = F + NT - MW, fig8_query = W - C - NT
+#   (they add up to W). srch_sections_t_ns = opt.search.t_ns (sum of the search sections, a cross-check of W).
+FIG8_SEG = ["fig8_inval_ipi_ns_per_search", "fig8_owner_wait_ns_per_search", "fig8_other_fault_ns_per_search",
+            "fig8_query_ns_per_search"]
+FIG8 = (["srv_searches", "srch_wall_ns_per_search"] + [k + "_per_search" for k in FIG8_THR]
+        + ["srch_C_ns_per_search", "srch_F_ns_per_search", "srch_sections_t_ns_per_search"] + FIG8_SEG)
 DERIVED = ["coherence_events", "mg_flush_writeend"]
 RATE = ["faults_read", "faults_write", "coherence_events", "is_faults", "inv_commits", "fetch_commits", "coh_ipis",
         "mg_fetch", "mg_flush_writeend", "mg_flushes", "mg_read_sections", "mg_write_sections", "mg_retry_notify",
@@ -87,10 +116,10 @@ SUMMARY = SUMMARY_HEAD + [k + "_per_op" for k in PER_OP] + [
     "mg_retry_notify", "mg_replay_flushes", "mg_flush_bytes", "result_offered_x", "result_offered_search_s",
     "confirm_x_sd", "confirmed", "note", "n_at_result", "valid_at_result", "at_result_search_s", "at_result_update_s",
     "at_result_p99_ms", "cxl_n_intervals", "counter_source", "vcpus_per_vm", "threads", "u", "run", "config_sha256",
-    "lifetime", "source_dir"]
+    "lifetime", "source_dir"] + FIG8   # Fig 8 columns appended (mean over the at_result steps)
 STEP = ["nodes", "mix", "system", "u", "step", "phase", "offered_x", "search_s", "update_s", "p50_ms", "p95_ms",
         "p99_ms", "pass", "at_result", "valid", "window_s"] + RATE + WAIT + CXL + HCPU + ["run", "config_sha256",
-                                                                                         "lifetime"]
+                                                                                         "lifetime"] + FIG8 + ["aborted"]
 STEP_VM = ["nodes", "mix", "system", "step", "phase", "offered_x", "vm", "window_s"] + RATE + ["run", "lifetime"]
 SYS = {"hw", "pop", "mg", "mgoff"}
 
@@ -248,11 +277,39 @@ def derive(o, rs, win):
     o["mg_flush_writeend"] = (fx - ff) / win if fx is not None and ff is not None and win else None
 
 
+def fig8_cols(rs):
+    """Fig 8 columns of one step from the target rows (stats deltas): per server search, summed over the VMs; the
+    Popcorn columns stay empty for a system without the search threads' swmc keys (hw, mg)"""
+    ns = sum_key(rs, "searches")
+    o = {k: None for k in FIG8}
+    o["srv_searches"] = ns
+    if not ns:
+        return o
+    per = lambda v: v / ns if v is not None else None  # noqa: E731
+    o["srch_wall_ns_per_search"] = per(sum_key(rs, "search_busy_ns"))
+    o["srch_sections_t_ns_per_search"] = per(sum_key(rs, "opt.search.t_ns"))
+    for col, key in FIG8_THR.items():
+        o[col + "_per_search"] = per(sum_key(rs, SRCH + key))
+    g = {k: o[k + "_per_search"] for k in FIG8_THR}
+    if g["srch_is_fault_ns"] is None:
+        return o
+    z = lambda k: g[k] or 0.0  # noqa: E731  (a key absent on one build: 0)
+    F = z("srch_is_fault_ns") + z("srch_sm_fault_ns") + z("srch_wpu_fault_ns")
+    C = F + z("srch_coh_ipi_ns") - z("srch_ipi_coh_infault_ns")
+    NT, MW, W = z("srch_nontrans_fault_ns"), z("srch_read_msg_wait_ns") + z("srch_write_msg_wait_ns"), \
+        o["srch_wall_ns_per_search"]
+    o.update(srch_F_ns_per_search=F, srch_C_ns_per_search=C, fig8_inval_ipi_ns_per_search=C - F,
+             fig8_owner_wait_ns_per_search=MW, fig8_other_fault_ns_per_search=F + NT - MW,
+             fig8_query_ns_per_search=W - C - NT if W is not None else None)
+    return o
+
+
 def lifetime_rows(part, nodes, sampler, hc=None):
     rows3, sm = X3.part_rows(part, "vdb", nodes)
     cs = X3.step_counters(part)
     cx = cxl_steps(sampler, part)
     hx = hostcpu_steps(hc, part)
+    ab = {d["step"]: d.get("aborted") for d in canon.measured_steps(part)}  # queue-cap aborted steps stay (clipped)
     agg, per_vm = [], []
     for r in rows3:
         n = r["step"]
@@ -262,7 +319,7 @@ def lifetime_rows(part, nodes, sampler, hc=None):
             o = dict(step=n, phase=r["phase"], offered_x=r["offered_x"], search_s=fl(r.get("achieved_x")),
                      update_s=fl(r.get("wop_per_s")), p50_ms=r.get("p50_ms"), p95_ms=r.get("p95_ms"),
                      p99_ms=r.get("p99_ms"), at_result=r["at_result"], valid=r.get("valid"), window_s=win)
-            o["pass"] = r.get("pass")
+            o["pass"], o["aborted"] = r.get("pass"), ab.get(n)
             for k, src in POPC.items():
                 o[k] = r.get(src + "_per_s")
             for k, key in MG.items():
@@ -281,6 +338,7 @@ def lifetime_rows(part, nodes, sampler, hc=None):
             c = cx.get(n)
             o.update(cxl_rd_MBs=c[0] if c else None, cxl_wr_MBs=c[1] if c else None, cxl_n_intervals=c[2] if c else None)
             o.update(hx.get(n, {}))
+            o.update(fig8_cols(rs))
             o["_has"] = {k: (any(rr.get(key) not in (None, "") for rr in rs)) for k, key in MG.items()}
             o["_has_pop"] = any(rr.get("sys.swmc.page_coherence.fault_read_count") not in (None, "") for rr in rs)
             agg.append(o)
@@ -315,7 +373,7 @@ def summary_row(system, agg, sm, u):
     o["valid_at_result"] = all(vs) if vs and all(x is not None for x in vs) else None
     o["at_result_search_s"], o["at_result_update_s"] = mean(at, "search_s"), mean(at, "update_s")
     o["at_result_p99_ms"] = mean(at, "p99_ms")
-    for k in RATE + WAIT + CXL + HCPU:
+    for k in RATE + WAIT + CXL + HCPU + FIG8:
         o[k] = mean(at, k)
     has_mg = any(any(r["_has"].values()) for r in at)
     has_pop = any(r["_has_pop"] for r in at)
@@ -337,6 +395,44 @@ def summary_row(system, agg, sm, u):
     for k, b in (("cxl_rd_B_per_op", "cxl_rd_MBs"), ("cxl_wr_B_per_op", "cxl_wr_MBs")):
         o[k] = o[b] * 1e6 / ops if o.get(b) is not None and ops else None
     return o
+
+
+FIG8_CSV = ["nodes", "mix", "u", "offered_x", "hw_step", "pop_step", "hw_search_s", "pop_search_s", "hw_p99_ms",
+            "pop_p99_ms", "hw_W_ns", "pop_W_ns", "pop_inval_ipi_ns", "pop_owner_wait_ns", "pop_other_fault_ns",
+            "pop_query_ns", "fig8_norm_hw", "fig8_norm_pop", "fig8_norm_inval_ipi", "fig8_norm_owner_wait",
+            "fig8_norm_other_fault", "fig8_norm_query", "pop_W_minus_sections_rel", "n_common_pass_steps", "run",
+            "config_sha256"]
+
+
+def fig8_rows(steps):
+    """Fig 8 load point per (nodes, mix): the highest ramp offered rate that both hw and pop pass (both ramps start
+    at 10 ops/s with x1.5, so they share offered rates); values of those two steps, normalized to hw's W"""
+    yes = lambda v: str(v) == "True"  # noqa: E731  (bool in an export, text after --combine)
+    out = []
+    keys = sorted({(int(r["nodes"]), r["mix"]) for r in steps}, key=lambda k: (k[0], int(k[1][1:])))
+    for nodes, mix in keys:
+        ps = {s: [r for r in steps if int(r["nodes"]) == nodes and r["mix"] == mix and r["system"] == s
+                  and r["phase"] == "ramp" and yes(r["pass"]) and str(r.get("valid")) != "False"
+                  and fl(r.get("srch_wall_ns_per_search")) is not None] for s in ("hw", "pop")}
+        common = [(h, p) for h in ps["hw"] for p in ps["pop"]
+                  if abs(fl(h["offered_x"]) - fl(p["offered_x"])) <= 1e-6 * max(1.0, fl(h["offered_x"]))]
+        if not common:
+            continue
+        h, p = max(common, key=lambda t: fl(t[0]["offered_x"]))
+        hw_w, pw = fl(h["srch_wall_ns_per_search"]), fl(p["srch_wall_ns_per_search"])
+        seg = {k: fl(p.get(f"fig8_{k}_ns_per_search")) for k in ("inval_ipi", "owner_wait", "other_fault", "query")}
+        o = dict(nodes=nodes, mix=mix, u=int(mix[1:]), offered_x=fl(h["offered_x"]), hw_step=h["step"], pop_step=p["step"],
+                 hw_search_s=h.get("search_s"), pop_search_s=p.get("search_s"), hw_p99_ms=h.get("p99_ms"),
+                 pop_p99_ms=p.get("p99_ms"), hw_W_ns=hw_w, pop_W_ns=pw, n_common_pass_steps=len(common),
+                 run=h.get("run"), config_sha256=h.get("config_sha256"), fig8_norm_hw=1.0 if hw_w else None,
+                 fig8_norm_pop=pw / hw_w if pw is not None and hw_w else None)
+        for k, v in seg.items():
+            o[f"pop_{k}_ns"] = v
+            o[f"fig8_norm_{k}"] = v / hw_w if v is not None and hw_w else None
+        t = fl(p.get("srch_sections_t_ns_per_search"))
+        o["pop_W_minus_sections_rel"] = (pw - t) / pw if pw and t is not None else None
+        out.append(o)
+    return out
 
 
 def write(path, cols, rows):
@@ -367,6 +463,10 @@ def combine(out, dirs):
             w.writeheader()
             w.writerows(rows)
         n[name] = len(rows)
+        if name == "steps.csv" and "srch_wall_ns_per_search" in cols:
+            f8 = fig8_rows(rows)
+            write(os.path.join(out, "fig8.csv"), FIG8_CSV, f8)
+            n["fig8.csv"] = len(f8)
     print("COMBINE H2N: " + " ".join(f"{k}={v}" for k, v in n.items()) + f" -> {out}")
 
 
@@ -422,6 +522,7 @@ def main(argv=None):
     write(os.path.join(a.out, "steps.csv"), STEP, steps)
     write(os.path.join(a.out, "steps-vm.csv"), STEP_VM, steps_vm)
     write(os.path.join(a.out, "summary.csv"), SUMMARY, summ)
+    write(os.path.join(a.out, "fig8.csv"), FIG8_CSV, fig8_rows(steps))
     for x in warn:
         print("WARN " + x)
     print(f"EXPORT H2N N={a.nodes} run {a.run}: lifetimes={len(summ)} steps={len(steps)} steps_vm={len(steps_vm)} -> {a.out}")

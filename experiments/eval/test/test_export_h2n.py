@@ -14,6 +14,9 @@ usage: EVAL_TEST_OUT=<scratch dir (new or empty)> python3 -B test_export_h2n.py 
      lifetime gives 64.0 MB/s read and 32.0 MB/s write at the result; the other lifetimes have no interval.
   3. --combine concatenates two exports (row counts add up, columns equal).
   4. h2n_layout.py: PASS for the configured per-N delete logs, FAIL for N = 8 with the 2-VM per-node value.
+  5. Fig 8 (2026-10-22): per-search vdb-search thread columns match the raw keys, the stack adds up to W, C agrees
+     with opt.search.c_ns (5 %), hw C = 0; fig8.csv load point = highest ramp rate both hw and pop pass (also after
+     --combine); instr detail=0 evidence (confirm-rule-test-run1-n2-v1) has every counter filled.
 """
 import csv
 import json
@@ -207,6 +210,75 @@ class H2nExport(unittest.TestCase):
         o = os.path.join(OUT, "combined")
         run(f"{EV}/export_h2n.py", "--combine", "--out", o, self.o, self.o)
         self.assertEqual(len(rows(os.path.join(o, "summary.csv"))), 18)
+
+    def test_fig8_columns(self):
+        """Fig 8 (2026-10-22): per-search Popcorn time of the vdb-search threads; the stack adds up to W, W and the
+        raw per-thread keys of one step match the formulas, C = the server's own swmc_acct C of search ops
+        (opt.search.c_ns), hw has C = 0 and query = W"""
+        sv = rows(os.path.join(self.o, "steps.csv"))
+        f = lambda r, k: float(r[k]) if r[k] != "" else None  # noqa: E731
+        segs = ("fig8_inval_ipi_ns_per_search", "fig8_owner_wait_ns_per_search", "fig8_other_fault_ns_per_search",
+                "fig8_query_ns_per_search")
+        npop = 0
+        for r in sv:
+            if r["system"] == "pop" and f(r, "srv_searches"):
+                npop += 1
+                self.assertTrue(close(sum(f(r, k) for k in segs), f(r, "srch_wall_ns_per_search")), r["step"])
+                self.assertGreaterEqual(f(r, "fig8_owner_wait_ns_per_search"), 0)
+            if r["system"] == "hw" and f(r, "srv_searches"):
+                self.assertEqual(f(r, "srch_C_ns_per_search") or 0.0, 0.0)
+                self.assertTrue(close(f(r, "fig8_query_ns_per_search") or f(r, "srch_wall_ns_per_search"),
+                                      f(r, "srch_wall_ns_per_search")))
+        self.assertGreater(npop, 20)
+        d = f"{RUN}/{LIVES[('u90', 'pop')]}/slo"
+        st = rows(f"{d}/stats-steps.csv")
+        for r0 in [r for r in sv if r["mix"] == "u90" and r["system"] == "pop" and r["srv_searches"] not in ("", "0")]:
+            rs = [r for r in st if int(r["step"]) == int(r0["step"])]
+            ns = sum(float(r["searches"]) for r in rs)
+            g = lambda k: sum(float(r[k] or 0) for r in rs) / ns  # noqa: E731
+            self.assertTrue(close(r0["srch_wall_ns_per_search"], g("search_busy_ns")))
+            F = g("thr.vdb-search.swmc.is_fault_ns") + g("thr.vdb-search.swmc.sm_fault_ns") + \
+                g("thr.vdb-search.swmc.wpu_fault_ns")
+            C = F + g("thr.vdb-search.swmc.ipi_coh_ns") - g("thr.vdb-search.swmc.ipi_coh_infault_ns")
+            self.assertTrue(close(r0["srch_C_ns_per_search"], C) and close(r0["srch_F_ns_per_search"], F))
+            # cross-check with the per-op accounting (opsplit sections; the thread counters cover the stats window):
+            # equal within a few % (2-VM data: <= 1.8 %)
+            self.assertTrue(close(C, g("opt.search.c_ns"), 0.05), (r0["step"], C, g("opt.search.c_ns")))
+            self.assertTrue(close(r0["fig8_owner_wait_ns_per_search"], g("thr.vdb-search.swmc.read_msg_wait_ns")
+                                  + g("thr.vdb-search.swmc.write_msg_wait_ns")))
+
+    def test_fig8_csv(self):
+        """fig8.csv: per mix the highest ramp offered rate passed by both hw and pop; no higher common pass exists"""
+        f8 = {r["mix"]: r for r in rows(os.path.join(self.o, "fig8.csv"))}
+        self.assertEqual(set(f8), {"u5", "u50", "u90"})
+        sv = rows(os.path.join(self.o, "steps.csv"))
+        for mix, r in f8.items():
+            ok = {s: {round(float(x["offered_x"]), 6) for x in sv if x["mix"] == mix and x["system"] == s
+                      and x["phase"] == "ramp" and x["pass"] == "True"} for s in ("hw", "pop")}
+            self.assertEqual(round(float(r["offered_x"]), 6), max(ok["hw"] & ok["pop"]), mix)
+            parts = sum(float(r[k]) for k in ("fig8_norm_query", "fig8_norm_other_fault", "fig8_norm_owner_wait",
+                                               "fig8_norm_inval_ipi"))
+            self.assertTrue(close(parts, r["fig8_norm_pop"]) and float(r["fig8_norm_hw"]) == 1.0, mix)
+        o = os.path.join(OUT, "combined-f8")
+        run(f"{EV}/export_h2n.py", "--combine", "--out", o, self.o)
+        self.assertEqual(len(rows(os.path.join(o, "fig8.csv"))), 3)
+
+    @unittest.skipUnless(os.path.isdir(f"{P}/recovery/confirm-rule-test-run1-n2-v1/block"), "evidence absent")
+    def test_fig8_instr_detail0(self):
+        """instr detail=0 (recovery/confirm-rule-test-run1-n2-v1, pop-u50-n2-r3): every Fig 8 counter is filled and
+        C = opt.search.c_ns on every step with searches"""
+        o = os.path.join(OUT, "export-crt")
+        run(f"{EV}/export_h2n.py", "--run", "1", "--nodes", "2", "--out", o,
+            f"{P}/recovery/confirm-rule-test-run1-n2-v1/block")
+        st = rows(f"{P}/recovery/confirm-rule-test-run1-n2-v1/block/pop-u50-n2-r3/slo/stats-steps.csv")
+        sv = [r for r in rows(os.path.join(o, "steps.csv")) if r["system"] == "pop" and r["srv_searches"] not in ("", "0")]
+        self.assertGreater(len(sv), 10)
+        for r0 in sv:
+            rs = [r for r in st if int(r["step"]) == int(r0["step"])]
+            c = sum(float(r["opt.search.c_ns"] or 0) for r in rs) / sum(float(r["searches"]) for r in rs)
+            self.assertTrue(close(r0["srch_C_ns_per_search"], c, 0.05), (r0["step"], r0["srch_C_ns_per_search"], c))
+            self.assertGreater(float(r0["srch_is_fault_ns_per_search"]), 0)
+            self.assertGreater(float(r0["srch_read_msg_wait_ns_per_search"]), 0)
 
     def test_layout(self):
         out = run(f"{EV}/h2n_layout.py", "--skip-writes")
