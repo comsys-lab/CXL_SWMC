@@ -88,6 +88,9 @@ struct Config {
   uint64_t confirm_min_samples = 0;       // merged SLO-stream count below this -> "insufficient samples" (0 = off)
   std::vector<double> overload = {1.05, 1.1, 1.2};  // SLO mode: extra points at first-fail x f (past the knee)
   std::vector<double> fill = {0.7, 0.8, 0.9};       // SLO mode: extra points at the result x f (bend before the knee)
+  // past-the-knee rule (de-stijl-motivation-isca27 §3, user 2026-10-21 23:5x), opt-in; defaults = the old behaviour
+  std::string overload_base = "first-fail";  // overload points at first-fail x f (default) or at the result x f
+  std::vector<double> start_fail;            // start rate fails: extra overload points at start x f (default none)
   // RecSys methodology (2026-10-19), opt-in; 0 = the old behaviour (every existing caller)
   uint32_t min_step_queries = 0;  // every measured step lasts at least N / (SLO stream rate) s
   uint32_t ramp_knee = 0;         // KneeRamp K (slo_search.h): low-rate failures do not end the ramp
@@ -136,6 +139,10 @@ void usage() {
                "                                        samples\" (not a pass) under both rules (default 0 = off)\n"
                "  --overload f1,f2,...|none             SLO mode: points at first-fail rate x f, measured in full\n"
                "                                        (no early SLO abort) for the curve past the knee (1.05,1.1,1.2)\n"
+               "  --overload-base first-fail|result     SLO mode: base rate of the --overload points (first-fail)\n"
+               "  --start-fail-steps f1,f2,...|none     SLO mode: when the start rate already violates the SLO, overload\n"
+               "                                        points at start x f, measured in full, before the search ends\n"
+               "                                        (same note; default none; not with --ramp-knee)\n"
                "  --fill f1,f2,...|none                 SLO mode: points at the result x f for the bend (0.7,0.8,0.9)\n"
                "  --min-step-queries N                  every measured step lasts >= N / SLO-stream rate s (default 0 = off)\n"
                "  --ramp-knee K                         SLO mode: a failed ramp step does not end the ramp; it ends at K\n"
@@ -219,6 +226,13 @@ Config parse(int argc, char **argv) {
       c.overload.clear();
       if (v != "none")
         for (auto &f : split(v, ',')) c.overload.push_back(std::atof(f.c_str()));
+    } else if (a == "--overload-base") {
+      c.overload_base = need(i);
+    } else if (a == "--start-fail-steps") {
+      std::string v = need(i);
+      c.start_fail.clear();
+      if (v != "none")
+        for (auto &f : split(v, ',')) c.start_fail.push_back(std::atof(f.c_str()));
     }
     else if (a == "--min-step-queries") c.min_step_queries = std::stoul(need(i));
     else if (a == "--ramp-knee") c.ramp_knee = std::stoul(need(i));
@@ -251,6 +265,12 @@ Config parse(int argc, char **argv) {
   if (!(c.confirm_step_down >= 0.02 && c.confirm_step_down <= 0.05)) die("bad --confirm-step-down (0.02 .. 0.05)");
   if (c.arrival != "poisson" && c.arrival != "uniform") die("--arrival poisson|uniform");
   if (c.confirm_rule != "majority" && c.confirm_rule != "pooled") die("--confirm-rule majority|pooled");
+  if (c.overload_base != "first-fail" && c.overload_base != "result") die("--overload-base first-fail|result");
+  for (double f : c.overload)
+    if (!(f > 0)) die("bad --overload factor (> 0)");
+  for (double f : c.start_fail)
+    if (!(f > 1)) die("bad --start-fail-steps factor (> 1)");
+  if (!c.start_fail.empty() && c.ramp_knee) die("--start-fail-steps is not used with --ramp-knee");
   return c;
 }
 
@@ -394,8 +414,17 @@ class Engine {
       r *= next_factor(s.s[idx_[c_.slo_stream]].pslo, prev_pslo);
       prev_pslo = s.s[idx_[c_.slo_stream]].pslo;
     }
-    if (good == 0)
-      return finish(c_.ramp_knee ? "no passing ramp step below the knee" : "the start rate already violates the SLO; lower --start");
+    if (good == 0 && !c_.ramp_knee) {
+      // --start-fail-steps (past-the-knee rule): the curve of a system that fails at the start rate gets points above
+      // it, measured in full like the overload points (phase "overload"; saturation abort stays); same note
+      for (double f : c_.start_fail) {
+        const double x = c_.start * f;
+        if (step("overload", x, c_.step_warmup_s, measure_for(x, c_.step_measure_s), false).exhausted)
+          return finish("streams exhausted during the start-fail steps");
+      }
+      return finish("the start rate already violates the SLO; lower --start");
+    }
+    if (good == 0) return finish("no passing ramp step below the knee");
     if (bad == 0) return finish("max steps reached without an SLO violation; raise --start or --max-steps");
     for (; n < bisect_cap && bad / good > 1 + c_.precision; n++) {
       double m = std::sqrt(good * bad);
@@ -536,13 +565,16 @@ class Engine {
 
   // Points past the knee for the throughput/latency curve: measured in full (the early "SLO already exceeded"
   // abort is off; the saturation abort stays). They never change the SLO result.
+  // --overload-base result: the points are at the result (the confirmed offered rate; with no confirmed rate the
+  // lowest probed rate, as max_offered_x_pass) x f instead of the first failed rate above it x f.
   void overload(double first_fail) {
     for (double f : c_.fill) {  // bend before the knee (result = best_)
       StepResult s = step("fill", best_ * f, c_.step_warmup_s, measure_for(best_ * f, c_.step_measure_s), false);
       if (s.exhausted) return;
     }
+    const double base = c_.overload_base == "result" ? best_ : first_fail;
     for (double f : c_.overload) {
-      StepResult s = step("overload", first_fail * f, c_.step_warmup_s, measure_for(first_fail * f, c_.step_measure_s), false);
+      StepResult s = step("overload", base * f, c_.step_warmup_s, measure_for(base * f, c_.step_measure_s), false);
       if (s.exhausted) return;
     }
   }
@@ -868,6 +900,11 @@ class Engine {
     if (c_.confirm_rule != "majority" || c_.confirm_full || c_.confirm_min_samples)  // opt-in keys only
       m << "confirm_rule=" << c_.confirm_rule << " confirm_full=" << (c_.confirm_full ? 1 : 0)
         << " confirm_min_samples=" << c_.confirm_min_samples << "\n";
+    if (c_.overload_base != "first-fail" || !c_.start_fail.empty()) {  // opt-in keys only (past-the-knee rule)
+      std::string sf;
+      for (double f : c_.start_fail) sf += (sf.empty() ? "" : ",") + fmt(f);
+      m << "overload_base=" << c_.overload_base << " start_fail_steps=" << (sf.empty() ? "none" : sf) << "\n";
+    }
     for (auto &kv : c_.mix) m << "mix." << kv.first << "=" << kv.second << "\n";
     for (auto &kv : c_.fixed) m << "fixed." << kv.first << "=" << kv.second << "\n";
   }

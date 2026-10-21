@@ -67,6 +67,15 @@ summary/manifest key unchanged (new keys are appended, one new file); code `slo_
   confirm_search replayed on the recorded verdicts, complete=false when it would have needed a probe that was not run
   (needs_offered/needs_role; its other fields are then its state at that point). New file `confirm_probes.csv`: one
   row per confirm repeat. Manifest key `confirm_rule= confirm_full= confirm_min_samples=` only when set.
+Past-the-knee rule (de-stijl-motivation-isca27 §3, user 2026-10-21 23:5x; opt-in, defaults keep the old behaviour,
+manifest key `overload_base= start_fail_steps=` only when set; builds/vdb-loadgen/12):
+- `--overload-base first-fail|result` (first-fail): the `--overload` points are at the first failed rate above the
+  result x f (default) or at the result (max_offered_x_pass: the confirmed offered rate) x f. The eval2 runs use
+  `--overload-base result --overload 1.1,1.25,1.5,2.0`.
+- `--start-fail-steps f1,f2,...|none` (none): when the start rate already violates the SLO, steps at start x f are
+  measured in full (phase "overload", like the overload points: no SLO early abort, the queue-cap abort stays; an
+  aborted step is kept in steps.jsonl with aborted=true) before the search ends with the unchanged note "the start
+  rate already violates the SLO; lower --start". eval2: `--start-fail-steps 1.5,2.25`. Not with `--ramp-knee`.
 Opt-in for workloads whose tail latency can be worst at LOW load (RecSys: updates at an absolute rate, so a query
 at a low rate absorbs every invalidation since the previous one; user decisions 2026-10-19; defaults 0 = off, every
 other caller unchanged, manifest key `min_step_queries= ramp_knee=` only when set):
