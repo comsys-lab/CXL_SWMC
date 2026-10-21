@@ -75,6 +75,7 @@ struct Config {
   double warmup_s = 10, warmup_rate = 0;  // run-start warmup (rate 0 = first step's rate)
   double step_warmup_s = 3, step_measure_s = 15, drain_s = 5;
   double confirm_s = 30;
+  double confirm_warmup_s = -1;  // warmup before each confirm repeat; < 0 = step_warmup_s (main 2026-10-21)
   uint32_t confirm_reps = 3;
   double confirm_precision = 0.01;  // after a failed confirm: confirm-length bisection to hi/lo <= 1 + this (2026-10-18)
   uint32_t max_confirm_probes = 6;  // confirms after the first one (>= 2: the legacy "three rates" note stays true)
@@ -129,6 +130,8 @@ void usage() {
                "                                        <= SLO and no repeat failed for a non-latency reason (pooled);\n"
                "                                        both verdicts are recorded either way (summary.json, confirm_probes.csv)\n"
                "  --confirm-full                        confirm repeats run the full --confirm-s (no SLO early abort)\n"
+               "  --confirm-warmup-s S                  SLO mode: unmeasured warmup before each confirm repeat\n"
+               "                                        (default: --step-warmup-s)\n"
                "  --confirm-min-samples K               a confirm with < K merged SLO-stream requests is \"insufficient\n"
                "                                        samples\" (not a pass) under both rules (default 0 = off)\n"
                "  --overload f1,f2,...|none             SLO mode: points at first-fail rate x f, measured in full\n"
@@ -198,6 +201,7 @@ Config parse(int argc, char **argv) {
     else if (a == "--step-measure-s") c.step_measure_s = std::atof(need(i).c_str());
     else if (a == "--drain-s") c.drain_s = std::atof(need(i).c_str());
     else if (a == "--confirm-s") c.confirm_s = std::atof(need(i).c_str());
+    else if (a == "--confirm-warmup-s") c.confirm_warmup_s = std::atof(need(i).c_str());
     else if (a == "--confirm-reps") c.confirm_reps = std::stoul(need(i));
     else if (a == "--confirm-precision") c.confirm_precision = std::atof(need(i).c_str());
     else if (a == "--max-confirm-probes") c.max_confirm_probes = std::stoul(need(i));
@@ -414,7 +418,8 @@ class Engine {
       std::vector<RepeatInput> in;
       keep_slo_lat_ = true;
       for (uint32_t k = 0; k < c_.confirm_reps; k++) {
-        StepResult s = step("confirm", x, c_.step_warmup_s, measure_for(x, c_.confirm_s), !c_.confirm_full);
+        StepResult s = step("confirm", x, c_.confirm_warmup_s < 0 ? c_.step_warmup_s : c_.confirm_warmup_s,
+                            measure_for(x, c_.confirm_s), !c_.confirm_full);
         if (s.exhausted) return keep_slo_lat_ = false, -1;
         p.fails += !s.pass;
         in.push_back({s.pass, s.nonlatency_fail, std::move(s.slo_lat)});
@@ -852,6 +857,7 @@ class Engine {
       << " max_steps=" << c_.max_steps << "\nwarmup_s=" << c_.warmup_s << " warmup_rate=" << c_.warmup_rate
       << " step_warmup_s=" << c_.step_warmup_s << " step_measure_s=" << c_.step_measure_s
       << " drain_s=" << c_.drain_s << " confirm_s=" << c_.confirm_s << " confirm_reps=" << c_.confirm_reps
+      << (c_.confirm_warmup_s >= 0 ? " confirm_warmup_s=" + std::to_string(c_.confirm_warmup_s) : std::string())
       << " confirm_precision=" << c_.confirm_precision << " max_confirm_probes=" << c_.max_confirm_probes
       << " confirm_step_down=" << c_.confirm_step_down << " overload=" << [&] { std::string o; for (double f : c_.overload) o += (o.empty() ? "" : ",") + fmt(f); return o.empty() ? std::string("none") : o; }()
       << "\ntol=" << c_.tol << " max_err=" << c_.max_err << " abort_queue_s=" << c_.abort_queue_s
