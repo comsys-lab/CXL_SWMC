@@ -81,6 +81,10 @@ struct Config {
   // while no rate is confirmed: next candidate = max(nearest ramp/bisect pass below the last failed confirm f,
   // f / (1 + this)) (H1 v0.6.5, 2026-10-18; v0.6.3 jumped to the next lower ramp pass however far below)
   double confirm_step_down = 0.05;
+  // confirm rule (slo_search.h judge_probe, 2026-10-21); defaults = the rule since 2026-10-18
+  std::string confirm_rule = "majority";  // majority | pooled
+  bool confirm_full = false;              // confirm repeats never stop early (no SLO early abort)
+  uint64_t confirm_min_samples = 0;       // merged SLO-stream count below this -> "insufficient samples" (0 = off)
   std::vector<double> overload = {1.05, 1.1, 1.2};  // SLO mode: extra points at first-fail x f (past the knee)
   std::vector<double> fill = {0.7, 0.8, 0.9};       // SLO mode: extra points at the result x f (bend before the knee)
   // RecSys methodology (2026-10-19), opt-in; 0 = the old behaviour (every existing caller)
@@ -120,6 +124,13 @@ void usage() {
                "  --confirm-step-down S                 SLO mode: until a confirm passes, the next candidate below a\n"
                "                                        failed confirm f is max(nearest ramp/bisect pass below f,\n"
                "                                        f / (1 + S)); S in [0.02, 0.05] (0.05)\n"
+               "  --confirm-rule majority|pooled        SLO mode: a confirm passes if fails x 2 <= reps (majority, default)\n"
+               "                                        or if the SLO percentile of the merged latencies of its repeats\n"
+               "                                        <= SLO and no repeat failed for a non-latency reason (pooled);\n"
+               "                                        both verdicts are recorded either way (summary.json, confirm_probes.csv)\n"
+               "  --confirm-full                        confirm repeats run the full --confirm-s (no SLO early abort)\n"
+               "  --confirm-min-samples K               a confirm with < K merged SLO-stream requests is \"insufficient\n"
+               "                                        samples\" (not a pass) under both rules (default 0 = off)\n"
                "  --overload f1,f2,...|none             SLO mode: points at first-fail rate x f, measured in full\n"
                "                                        (no early SLO abort) for the curve past the knee (1.05,1.1,1.2)\n"
                "  --fill f1,f2,...|none                 SLO mode: points at the result x f for the bend (0.7,0.8,0.9)\n"
@@ -191,6 +202,9 @@ Config parse(int argc, char **argv) {
     else if (a == "--confirm-precision") c.confirm_precision = std::atof(need(i).c_str());
     else if (a == "--max-confirm-probes") c.max_confirm_probes = std::stoul(need(i));
     else if (a == "--confirm-step-down") c.confirm_step_down = std::atof(need(i).c_str());
+    else if (a == "--confirm-rule") c.confirm_rule = need(i);
+    else if (a == "--confirm-full") c.confirm_full = true;
+    else if (a == "--confirm-min-samples") c.confirm_min_samples = std::stoull(need(i));
     else if (a == "--fill") {
       std::string v = need(i);
       c.fill.clear();
@@ -232,6 +246,7 @@ Config parse(int argc, char **argv) {
     die("bad --confirm-precision (> 0) / --max-confirm-probes (>= 2) / --confirm-reps (>= 1)");
   if (!(c.confirm_step_down >= 0.02 && c.confirm_step_down <= 0.05)) die("bad --confirm-step-down (0.02 .. 0.05)");
   if (c.arrival != "poisson" && c.arrival != "uniform") die("--arrival poisson|uniform");
+  if (c.confirm_rule != "majority" && c.confirm_rule != "pooled") die("--confirm-rule majority|pooled");
   return c;
 }
 
@@ -285,6 +300,10 @@ struct StepResult {
   bool aborted = false, exhausted = false, pass = false, lag_flag = false;
   bool saturated = false, behind = false;  // the queue cap aborted the step / the SLO stream fell behind
   std::string reason;
+  // confirm steps only (judge_probe): failed for a reason other than the SLO percentile; SLO-stream latencies (ms)
+  bool nonlatency_fail = false;
+  uint32_t step_no = 0;
+  std::vector<double> slo_lat;
 };
 
 class Engine {
@@ -392,18 +411,42 @@ class Engine {
                                             [&](double x, const char *) -> int {
       Probe p;
       p.offered = x;
+      std::vector<RepeatInput> in;
+      keep_slo_lat_ = true;
       for (uint32_t k = 0; k < c_.confirm_reps; k++) {
-        StepResult s = step("confirm", x, c_.step_warmup_s, measure_for(x, c_.confirm_s));
-        if (s.exhausted) return -1;
+        StepResult s = step("confirm", x, c_.step_warmup_s, measure_for(x, c_.confirm_s), !c_.confirm_full);
+        if (s.exhausted) return keep_slo_lat_ = false, -1;
         p.fails += !s.pass;
+        in.push_back({s.pass, s.nonlatency_fail, std::move(s.slo_lat)});
+        s.slo_lat.clear();
         p.reps.push_back(s);
       }
-      p.pass = 2 * p.fails <= c_.confirm_reps;
+      keep_slo_lat_ = false;
+      p.j = judge_probe(in, c_.slo_pct, c_.slo_ms, c_.confirm_min_samples);
+      // majority with --confirm-min-samples 0: p.j.majority == pass iff 2 * fails <= reps (the rule since 2026-10-18)
+      p.pass = (c_.confirm_rule == "pooled" ? p.j.pooled : p.j.majority) == kVerdictPass;
       probes_.push_back(p);
+      if (c_.confirm_rule != "majority" || c_.confirm_full || c_.confirm_min_samples)
+        std::fprintf(stderr, "[confirm] x=%.1f majority %s, pooled %s (p%s %.3f ms over %llu), rule %s -> %s\n", x,
+                     verdict_name(p.j.majority), verdict_name(p.j.pooled), fmt(c_.slo_pct).c_str(), p.j.pooled_pslo,
+                     (unsigned long long)p.j.n, c_.confirm_rule.c_str(), p.pass ? "PASS" : "FAIL");
       return p.pass ? 1 : 0;
     });
     for (size_t k = 0; k < probes_.size() && k < o.probes.size(); k++) probes_[k].role = o.probes[k].role;
     if (o.exhausted) return finish("streams exhausted during confirm");
+    // both rules: the followed one = o; the other one replayed on the probes that were run (flag: unrun probe needed)
+    {
+      const int fol = c_.confirm_rule == "pooled" ? 1 : 0;
+      for (int r = 0; r < 2; r++) {
+        std::vector<std::pair<double, int>> rec;
+        for (auto &p : probes_) rec.push_back({p.offered, r ? p.j.pooled : p.j.majority});
+        rule_res_[r].valid = true, rule_res_[r].followed = r == fol;
+        if (r == fol) rule_res_[r].rr.o = o;
+        else
+          rule_res_[r].rr = replay_rule(good, passes, c_.confirm_step_down, c_.confirm_precision,
+                                        c_.max_confirm_probes, rec);
+      }
+    }
     confirm_search_finish_ = o.finish;
     confirmed_ = o.confirmed;
     // result: the highest confirmed pass; no confirmed pass -> the lowest probed rate (its repeats failed; legacy
@@ -672,9 +715,10 @@ class Engine {
         // keeping up = completions in the window vs requests actually sent in it (not the nominal rate: a Poisson
         // count over a short window is itself noisy); tiny counts are not judged
         if (st.sent >= 100 && st.achieved * win < (1 - c_.tol) * double(st.sent) && pass)
-          pass = false, why = specs_[s].name + " completions < sent (falling behind)", res.behind |= s == slo_idx_;
+          pass = false, why = specs_[s].name + " completions < sent (falling behind)", res.behind |= s == slo_idx_,
+          res.nonlatency_fail = true;
         if (st.sent && double(st.errors + st.timeouts) / st.sent > c_.max_err && pass)
-          pass = false, why = specs_[s].name + " errors/timeouts";
+          pass = false, why = specs_[s].name + " errors/timeouts", res.nonlatency_fail = true;
       }
       if (st.lag_p99_us > c_.lag_limit_us) res.lag_flag = true;
     }
@@ -682,6 +726,9 @@ class Engine {
       pass = false, why = "p" + fmt(c_.slo_pct) + " " + fmt(res.s[slo_idx_].pslo) + " ms > SLO";
     res.pass = pass && measure_s > 0;
     res.reason = why;
+    res.nonlatency_fail |= res.saturated || res.exhausted;
+    res.step_no = step_no_;
+    if (keep_slo_lat_ && slo_idx_ != 0xff) res.slo_lat = lat[slo_idx_];  // same multiset (nth_element only reorders)
     log_step(phase, x, measure_s, res);
     if (c_.raw && measure_s > 0) dump_raw(first_id, last_id);
     step_no_++;
@@ -812,8 +859,42 @@ class Engine {
     if (c_.min_step_queries || c_.ramp_knee)  // opt-in keys only (manifests of earlier callers stay unchanged)
       m << "min_step_queries=" << c_.min_step_queries << " ramp_knee=" << c_.ramp_knee << " ramp_knee_rise="
         << c_.ramp_knee_rise << " ramp_knee_floor=" << c_.ramp_knee_floor << " knee_bisect_steps=" << c_.knee_bisect_steps << "\n";
+    if (c_.confirm_rule != "majority" || c_.confirm_full || c_.confirm_min_samples)  // opt-in keys only
+      m << "confirm_rule=" << c_.confirm_rule << " confirm_full=" << (c_.confirm_full ? 1 : 0)
+        << " confirm_min_samples=" << c_.confirm_min_samples << "\n";
     for (auto &kv : c_.mix) m << "mix." << kv.first << "=" << kv.second << "\n";
     for (auto &kv : c_.fixed) m << "fixed." << kv.first << "=" << kv.second << "\n";
+  }
+
+  // <out>/confirm_probes.csv: one row per confirm repeat, probe-level columns repeated on each row of the probe
+  void write_confirm_csv() {
+    FILE *f = std::fopen((c_.out + "/confirm_probes.csv").c_str(), "w");
+    if (!f) return;
+    auto num = [](double v) {
+      if (std::isinf(v)) return std::string("inf");
+      char b[64];
+      std::snprintf(b, sizeof(b), "%.6g", v);
+      return std::string(b);
+    };
+    std::fprintf(f, "probe,offered_x,role,rep,step,rep_pass,rep_aborted,rep_reason,rep_x,rep_pslo_ms,rep_p99_ms,rep_n,"
+                    "fails,nonlatency_fails,pooled_n,pooled_pslo_ms,pooled_p99_ms,verdict_majority,verdict_pooled,"
+                    "rule,probe_pass\n");
+    for (size_t k = 0; k < probes_.size(); k++) {
+      const Probe &p = probes_[k];
+      for (size_t q = 0; q < p.reps.size(); q++) {
+        const StepResult &r = p.reps[q];
+        const auto &st = r.s[slo_idx_];
+        std::string why = r.reason;
+        for (char &ch : why) if (ch == ',' || ch == '"') ch = ';';
+        std::fprintf(f, "%zu,%s,%s,%zu,%u,%d,%d,%s,%s,%s,%s,%llu,%u,%u,%llu,%s,%s,%s,%s,%s,%d\n", k,
+                     num(p.offered).c_str(), p.role.c_str(), q, r.step_no, int(r.pass), int(r.aborted), why.c_str(),
+                     num(xval(r)).c_str(), num(st.pslo).c_str(), num(st.p99).c_str(), (unsigned long long)st.sent,
+                     p.fails, p.j.nonlatency_fails, (unsigned long long)p.j.n, num(p.j.pooled_pslo).c_str(),
+                     num(p.j.pooled_p99).c_str(), verdict_name(p.j.majority), verdict_name(p.j.pooled),
+                     c_.confirm_rule.c_str(), int(p.pass));
+      }
+    }
+    std::fclose(f);
   }
 
   int finish(const std::string &note) {
@@ -852,9 +933,44 @@ class Engine {
         auto &p = probes_[k];
         s << (k ? "," : "") << "{\"offered_x\":" << fmt(p.offered) << ",\"role\":\"" << p.role << "\",\"reps\":"
           << p.reps.size() << ",\"fails\":" << p.fails << ",\"pass\":" << (p.pass ? "true" : "false")
-          << ",\"x_mean\":" << fmt(mean_x(p.reps)) << ",\"pslo_mean_ms\":" << fmt(mean_pslo(p.reps)) << "}";
+          << ",\"x_mean\":" << fmt(mean_x(p.reps)) << ",\"pslo_mean_ms\":" << fmt(mean_pslo(p.reps));
+        // both confirm rules (2026-10-21; keys appended after the older ones): per-repeat SLO percentile, p99 and
+        // SLO-stream count, the pooled percentile over the merged latencies, and both verdicts
+        auto arr = [&](auto f) {
+          std::string a = "[";
+          for (size_t q = 0; q < p.reps.size(); q++) a += (q ? "," : "") + f(p.reps[q]);
+          return a + "]";
+        };
+        s << ",\"rep_pslo_ms\":" << arr([&](const StepResult &r) { return fmt(r.s[slo_idx_].pslo); })
+          << ",\"rep_p99_ms\":" << arr([&](const StepResult &r) { return fmt(r.s[slo_idx_].p99); })
+          << ",\"rep_n\":" << arr([&](const StepResult &r) { return std::to_string(r.s[slo_idx_].sent); })
+          << ",\"rep_pass\":" << arr([&](const StepResult &r) { return std::string(r.pass ? "true" : "false"); })
+          << ",\"rep_aborted\":" << arr([&](const StepResult &r) { return std::string(r.aborted ? "true" : "false"); })
+          << ",\"nonlatency_fails\":" << p.j.nonlatency_fails << ",\"pooled_n\":" << p.j.n
+          << ",\"pooled_pslo_ms\":" << fmt(p.j.pooled_pslo) << ",\"pooled_p99_ms\":" << fmt(p.j.pooled_p99)
+          << ",\"verdict_majority\":\"" << verdict_name(p.j.majority) << "\",\"verdict_pooled\":\""
+          << verdict_name(p.j.pooled) << "\"}";
       }
       s << "]";
+      s << ",\"confirm_rule\":{\"rule\":\"" << c_.confirm_rule << "\",\"full\":" << (c_.confirm_full ? "true" : "false")
+        << ",\"min_samples\":" << c_.confirm_min_samples << "}";
+      for (int r = 0; r < 2; r++) {
+        // result_<rule>: what that rule concludes; the followed rule = the search itself; the other rule = replay on
+        // the probes that were run; complete=false: it would have needed the unrun probe needs_offered (needs_role),
+        // and confirmed/max_offered_x_pass are then its state when that probe was needed (not a final result)
+        const RuleResult &rr = rule_res_[r];
+        if (!rr.valid) continue;
+        const ConfirmOutcome &q = rr.rr.o;
+        s << ",\"result_" << (r ? "pooled" : "majority") << "\":{\"followed\":" << (rr.followed ? "true" : "false")
+          << ",\"complete\":" << (rr.rr.complete ? "true" : "false") << ",\"confirmed\":"
+          << (q.confirmed ? "true" : "false") << ",\"max_offered_x_pass\":"
+          << (q.confirmed ? fmt(q.best) : std::string("null")) << ",\"lo_fail_offered\":"
+          << (q.lo_fail > 0 ? fmt(q.lo_fail) : std::string("null")) << ",\"finish\":\"" << q.finish
+          << "\",\"probes_used\":" << q.probes.size() << ",\"needs_offered\":"
+          << (rr.rr.complete ? std::string("null") : fmt(rr.rr.unrun_offered)) << ",\"needs_role\":\""
+          << rr.rr.unrun_role << "\"}";
+      }
+      write_confirm_csv();
       if (c_.ramp_knee) {  // knee ramp: low-rate violations = failed ramp/bisect steps below the result
         s << ",\"ramp_policy\":{\"knee_k\":" << c_.ramp_knee << ",\"knee_rise\":" << fmt(c_.ramp_knee_rise)
           << ",\"knee_floor_x_slo\":" << fmt(c_.ramp_knee_floor)
@@ -928,8 +1044,16 @@ class Engine {
     uint32_t fails = 0;
     bool pass = false;
     std::vector<StepResult> reps;
+    ProbeJudgement j;  // both rules' verdicts (slo_search.h judge_probe)
   };
   std::vector<Probe> probes_;  // every confirm (confirm_reps repeats each), in order
+  bool keep_slo_lat_ = false;  // step() keeps the SLO-stream latencies (confirm repeats, judge_probe)
+  // both rules' conclusions (--confirm-rule followed by the search; the other one replayed on the recorded probes)
+  struct RuleResult {
+    bool valid = false, followed = false;
+    RuleReplay rr;
+  };
+  RuleResult rule_res_[2];  // [0] majority, [1] pooled
   bool confirmed_ = false;
   std::string confirm_search_finish_, bracket_phase_;
   double bracket_hi_x_ = 0;

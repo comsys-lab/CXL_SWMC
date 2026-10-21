@@ -52,6 +52,21 @@ asyncio peer (e.g. for a LangChain VectorStore client).
    scripts match it), result = the lowest probed rate, `confirmed` false. Cost of a failed first confirm: one confirm
    (`--confirm-reps` × (`--step-warmup-s` + `--confirm-s` + `--drain-s`), ≈ 2 min at 3 × (3 + 30 + 5) s) per probe,
    typically 2-6 probes (H1 r1 shapes replayed offline: mean 4.5, worst case 6 = ≈ 12 min).
+Confirm rule (2026-10-21, exploratory; defaults keep the rule above, its decisions, steps.jsonl and every older
+summary/manifest key unchanged (new keys are appended, one new file); code `slo_search.h` judge_probe/replay_rule, unit test `test/confirm_rule_test.cc`):
+- `--confirm-rule majority|pooled` (majority): pooled = a confirm passes iff the nearest-rank SLO percentile of the
+  merged SLO-stream latencies of all its repeats (exact: every measured request, timeouts = inf) <= SLO and no repeat
+  failed for a non-latency reason (queue-cap saturation, falling behind, errors/timeouts).
+- `--confirm-full`: confirm repeats never stop early (no "SLO percentile already exceeded" abort; queue cap stays).
+- `--confirm-min-samples K` (0 = off): a confirm whose merged SLO-stream count (measured requests) is < K gets the
+  verdict "insufficient samples" under both rules; the search treats it as not passing.
+- Always recorded: `confirm_probes[]` appends rep_pslo_ms, rep_p99_ms, rep_n, rep_pass, rep_aborted, nonlatency_fails,
+  pooled_n, pooled_pslo_ms, pooled_p99_ms, verdict_majority, verdict_pooled; summary.json appends `confirm_rule`
+  {rule, full, min_samples}, `result_majority` and `result_pooled` {followed, complete, confirmed, max_offered_x_pass,
+  lo_fail_offered, finish, probes_used, needs_offered, needs_role}: the followed rule = the search; the other rule =
+  confirm_search replayed on the recorded verdicts, complete=false when it would have needed a probe that was not run
+  (needs_offered/needs_role; its other fields are then its state at that point). New file `confirm_probes.csv`: one
+  row per confirm repeat. Manifest key `confirm_rule= confirm_full= confirm_min_samples=` only when set.
 Opt-in for workloads whose tail latency can be worst at LOW load (RecSys: updates at an absolute rate, so a query
 at a low rate absorbs every invalidation since the previous one; user decisions 2026-10-19; defaults 0 = off, every
 other caller unchanged, manifest key `min_step_queries= ramp_knee=` only when set):

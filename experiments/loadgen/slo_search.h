@@ -2,7 +2,8 @@
 // Kept apart from the engine so test/slo_search_test.cc drives it with a synthetic confirm oracle (no server).
 //
 // Input: `good` = the best ramp/bisect pass (one short step), `passes` = every ramp/bisect pass (unconfirmed), and a
-// confirm callback (one confirm = confirm_reps x confirm_s, majority rule; 1 pass, 0 fail, -1 streams exhausted).
+// confirm callback (one confirm = confirm_reps x confirm_s, --confirm-rule majority (default) or pooled, see
+// judge_probe below; 1 pass, 0 fail or insufficient samples, -1 streams exhausted).
 // 1. Confirm `good`; a pass ends the search (bracket above it = the bisect/ramp first fail).
 // 2. Otherwise hi = good (the lowest failed confirm), and
 //    a) while no rate is confirmed yet (H1 v0.6.5, decision 2026-10-18 "탐색 fallback 수정"; v0.6.3 jumped to the
@@ -95,6 +96,83 @@ inline ConfirmOutcome confirm_search(double good, std::vector<double> passes, do
     o.finish = b;
   }
   return o;
+}
+
+// ---------------------------------------------------------------- confirm rules (--confirm-rule, 2026-10-21)
+// One confirm probe = confirm_reps repeats at one rate. Both rules are judged on every probe; the search follows
+// --confirm-rule, the other rule is replayed on the recorded probes (replay_rule).
+//   majority (default, the rule since 2026-10-18): each repeat is judged alone (the engine's step pass: SLO percentile
+//     of the repeat <= SLO, keeping up, errors); the probe passes iff fails * 2 <= reps.
+//   pooled: the SLO-stream latencies of all repeats are merged exactly (per-request latencies, timeouts = inf) and the
+//     probe passes iff the nearest-rank SLO percentile of the merged set <= SLO AND no repeat failed for a reason
+//     other than latency (saturated queue cap, SLO stream falling behind, errors/timeouts, streams exhausted): pooling
+//     only replaces the per-repeat latency judgement, never the throughput/error checks.
+//   --confirm-min-samples K (> 0): a probe whose merged SLO-stream count (measured requests, sent) is < K gets the
+//     verdict "insufficient samples" under BOTH rules; the search treats it as not passing (like a fail).
+enum ProbeVerdict { kVerdictFail = 0, kVerdictPass = 1, kVerdictInsufficient = 2 };
+inline const char *verdict_name(int v) {
+  return v == kVerdictPass ? "pass" : v == kVerdictInsufficient ? "insufficient samples" : "fail";
+}
+
+// nearest-rank percentile (same definition as the engine's per-step percentiles); 0 for an empty set
+inline double nearest_rank(std::vector<double> v, double p) {
+  if (v.empty()) return 0.0;
+  double rank = std::ceil(p / 100 * double(v.size()));
+  size_t k = rank < 1 ? 0 : std::min(v.size() - 1, size_t(rank) - 1);
+  std::nth_element(v.begin(), v.begin() + k, v.end());
+  return v[k];
+}
+
+struct RepeatInput {
+  bool pass = false;           // the engine's verdict of the repeat alone
+  bool nonlatency_fail = false;  // failed for a reason other than the SLO percentile
+  std::vector<double> lat;     // SLO-stream latencies (ms) of the measured requests, inf = timeout
+};
+
+struct ProbeJudgement {
+  uint32_t reps = 0, fails = 0, nonlatency_fails = 0;
+  uint64_t n = 0;                          // merged SLO-stream count
+  double pooled_pslo = 0, pooled_p99 = 0;  // ms, over the merged latencies
+  int majority = kVerdictFail, pooled = kVerdictFail;
+};
+
+inline ProbeJudgement judge_probe(const std::vector<RepeatInput> &reps, double slo_pct, double slo_ms,
+                                  uint64_t min_samples) {
+  ProbeJudgement j;
+  std::vector<double> all;
+  for (auto &r : reps) {
+    j.reps++, j.fails += !r.pass, j.nonlatency_fails += r.nonlatency_fail;
+    all.insert(all.end(), r.lat.begin(), r.lat.end());
+  }
+  j.n = all.size();
+  j.pooled_pslo = nearest_rank(all, slo_pct);
+  j.pooled_p99 = nearest_rank(all, 99);
+  j.majority = 2 * j.fails <= j.reps ? kVerdictPass : kVerdictFail;
+  j.pooled = (!all.empty() && j.pooled_pslo <= slo_ms && j.nonlatency_fails == 0) ? kVerdictPass : kVerdictFail;
+  if (min_samples > 0 && j.n < min_samples) j.majority = j.pooled = kVerdictInsufficient;
+  return j;
+}
+
+// What a rule would have concluded from the probes that were run: confirm_search driven by the recorded verdicts
+// (offered rate -> verdict). The first candidate with no recorded probe stops the replay: complete = false and
+// unrun_offered/unrun_role name the probe that would have been needed.
+struct RuleReplay {
+  ConfirmOutcome o;
+  bool complete = true;
+  double unrun_offered = 0;
+  std::string unrun_role;
+};
+inline RuleReplay replay_rule(double good, const std::vector<double> &passes, double step_down,
+                              double confirm_precision, uint32_t max_probes,
+                              const std::vector<std::pair<double, int>> &recorded) {
+  RuleReplay rr;
+  rr.o = confirm_search(good, passes, step_down, confirm_precision, max_probes, [&](double x, const char *role) {
+    for (auto &p : recorded)
+      if (std::fabs(p.first - x) <= 1e-9 * std::max(1.0, std::fabs(x))) return p.second == kVerdictPass ? 1 : 0;
+    rr.complete = false, rr.unrun_offered = x, rr.unrun_role = role;
+    return -1;
+  });
+  return rr;
 }
 
 // Knee ramp (--ramp-knee K, opt-in; RecSys methodology, user decisions 2026-10-19, state/PROJECT.md): a failed ramp

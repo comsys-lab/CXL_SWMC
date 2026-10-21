@@ -9,6 +9,8 @@ Columns (stable; new columns are only ever appended):
   p50/p90/p99/p999/pslo/max (ms), lag_p99_us, max_under_slo (the run's confirm mean, same on every row of the run)
   ... (appended last, 2026-10-18 "A+C") bracket_lo_offered, bracket_hi_offered: the run's knee bracket (knee_bracket():
   confirmed max offered rate under the SLO, lowest failed offered rate above it; same on every row of the run)
+  ... (appended last, 2026-10-21) confirm_rule, result_majority_offered, result_majority_complete,
+  result_pooled_offered, result_pooled_complete (loadgen --confirm-rule; empty for older runs; see RULES)
 Step-level (same value on every stream row of a step):
   search_per_s, update_per_s     achieved rate of stream "search" / "update" (empty if the run has no such stream)
   total_ops_per_s                sum of the achieved rates of all streams (an update counts as one operation)
@@ -81,6 +83,11 @@ STEP = ["search_per_s", "update_per_s", "total_ops_per_s", "search_p50_ms", "sea
         "update_p99_ms", "traffic_bytes", "traffic_per_update"]
 RUNSLO = ["slo_stream", "slo_pct", "slo_ms", "p95_ms"]
 BRACKET = ["bracket_lo_offered", "bracket_hi_offered"]
+# appended last (2026-10-21, loadgen --confirm-rule): both confirm rules' results (summary.json result_<rule>; empty for
+# older runs). *_offered = confirmed max offered rate (empty if none); *_complete = false when the rule the search did
+# not follow would have needed a probe that was never run (its offered value is then its state at that point)
+RULES = ["confirm_rule", "result_majority_offered", "result_majority_complete", "result_pooled_offered",
+         "result_pooled_complete"]
 SEARCH_PHASES = ("ramp", "bisect", "confirm")
 
 
@@ -267,7 +274,7 @@ def main():
             if os.path.exists(os.path.join(run, "manifest.txt")) else 0
         runs.append((run, label or os.path.basename(run.rstrip("/")), per_step, ntgt))
     nodes = max([2] + [r[3] for r in runs] + [max(t) + 1 for r in runs for t in r[2].values()])
-    cols = BASE + STEP + [f"n{k}_{c}" for k in range(nodes) for c in NODE] + RUNSLO + BRACKET
+    cols = BASE + STEP + [f"n{k}_{c}" for k in range(nodes) for c in NODE] + RUNSLO + BRACKET + RULES
     with open(a.out, "w", newline="") as f:
         w = csv.writer(f)
         w.writerow(cols)
@@ -277,6 +284,11 @@ def main():
             slo = list(run_slo(run))
             kb = knee_bracket(summ, [json.loads(line) for line in open(os.path.join(run, "steps.jsonl")) if line.strip()])
             brk = [blank(kb.get("lo")), blank(kb.get("hi"))]
+            rules = [summ.get("confirm_rule", {}).get("rule", "")]
+            for r in ("result_majority", "result_pooled"):
+                rr = summ.get(r)
+                rules += ["", ""] if rr is None else [blank(rr.get("max_offered_x_pass")), rr.get("complete")]
+            brk += rules
             for line in open(os.path.join(run, "steps.jsonl")):
                 s = json.loads(line)
                 if s["phase"] == "warmup":
