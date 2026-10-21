@@ -200,9 +200,11 @@ h2_mix() {  # <mix> <H1 levels.tsv>
   local m=$1 lv=$2 row s rates L st
   [ -f "$E/levels-h2-used.tsv" ] || printf '# mix\tL1_x\tL2_x\tL1_rate\tL2_rate\tset\tsource\n' > "$E/levels-h2-used.tsv"
   [ -f "$E/h2-runs.tsv" ] || printf '# name\tsystem\tmix\tphase\tround\trun_dir\tsteps\tlifetime\n' > "$E/h2-runs.tsv"
-  row=$(python3 -I - "$m" "$lv" "$E/h1-runs.tsv" "$E" "${H1_PLAN:-$P/CXL_SWMC/experiments/h1/h1-plan.tsv}" "${EVAL_H2_FROM:-}" <<'PY'
+  row=$(python3 -I - "$m" "$lv" "$E/h1-runs.tsv" "$E" "${H1_PLAN:-$P/CXL_SWMC/experiments/h1/h1-plan.tsv}" "${EVAL_H2_FROM:-}" "$X/../h1" <<'PY'
 import csv, json, os, sys
-m, lv, runs, E, plan, frm = sys.argv[1:7]
+m, lv, runs, E, plan, frm, h1dir = sys.argv[1:8]
+sys.path.insert(0, h1dir)
+from levels import system_x  # decision E (2026-10-22): no confirmed max -> lowest ramp step x, as the H1 level set
 h1 = next((r for r in csv.DictReader(open(lv), delimiter="\t") if r["mix"] == m), None)
 assert h1, f"no H1 levels for {m} in {lv}"
 if frm:
@@ -213,17 +215,15 @@ if frm:
 else:
     p = next(x for x in csv.reader(open(plan), delimiter="\t") if x and x[0] == "vdb" and x[1] == m)
     fac, dec = float(p[3]), int(p[4])
-    xs = {}
+    xs, how = {}, {}
     for f in csv.reader(open(runs), delimiter="\t"):
         if f and not f[0].startswith("#") and f[2] == m and f[3] == "slo" and f[1] in ("hw", "pop"):
-            s = json.load(open(os.path.join(E, f[5], "loadgen", "summary.json")))
-            assert not s.get("note") and s.get("confirm", {}).get("x_mean"), f"{f[0]}: no confirmed max"
-            xs[f[1]] = float(s["confirm"]["x_mean"])
+            xs[f[1]], _, _, how[f[1]] = system_x(os.path.join(E, f[5]), p[5])  # LevelsError = real error: stop
     assert set(xs) == {"hw", "pop"}, f"hw/pop SLO results missing for {m}: {sorted(xs)}"
     l1x = min(xs.values())
     l1, l2 = repr(l1x), repr(l1x / 2)
     r1, r2 = repr(round(l1x * fac, dec)), repr(round(l1x / 2 * fac, dec))
-    src = f"min(hw {xs['hw']}, pop {xs['pop']}) factor {fac:g} round {dec}"
+    src = f"min(hw {xs['hw']} {how['hw']}, pop {xs['pop']} {how['pop']}) factor {fac:g} round {dec}"
 same = abs(float(l1) - float(h1["L1_x"])) <= 1e-9 * max(1.0, float(l1))
 print("\t".join([m, l1, l2, r1, r2, "same-as-h1" if same else "measured", src]))
 PY

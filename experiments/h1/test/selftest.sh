@@ -15,7 +15,9 @@
 #   M  v0.6.7 recsys without Megalon: (1) a block that writes an mg SLO entry for recsys anyway -> LEVELS STOP
 #      ("not measured") and HOOK STOP; (2) check.py F5 on a real hw/pop Fig 2 CSV (v6_fig2_split.py --megalon-c none
 #      on recovery/RECSYS-V1-v1.4 hw/pop val windows, read-only) -> OK; the same CSV with a Megalon row -> F5 FAIL
-#   B  STUB_FAIL=note:mg:u50 in r1-kv: SEQUENCE STOP at levels ("note")
+#   B  STUB_FAIL=badnote:mg:u50 in r1-kv: SEQUENCE STOP at levels ("not a decision-E outcome"); B2 (decision E,
+#      2026-10-22) STUB_FAIL=note:mg:u50 (confirm failed): no stop; levels.tsv u50 x_mg = the lowest ramp step's x (10),
+#      x_mg_src lowest_step, weakest mg; the stage ends with check.txt W9 for mg-u50 and H1CHECK PASS
 #   C  STUB_FAIL=rc in r1-kv: SEQUENCE STOP at the SLO hook
 #   D  real plugin pins-vdb.sh with FILL_ tokens (not dry): HOOK STOP "unpinned" (skipped once fully pinned)
 #   E  levels.py + collect.py on the real KV-main H1 v2 SLO runs (read-only; mix u5 only): weakest pop
@@ -128,7 +130,7 @@ for n in (1, 2):  # v0.6.7: no Megalon in H1 recsys
 for w in ("kv", "lmdb", "vdb"):
     assert "INFO" not in open(f"{o}/{w}/r1/check.txt").read(), w
     assert not os.path.exists(f"{o}/{w}/r1/collect/systems.txt"), w
-for w, ncell in (("kv", 3), ("lmdb", 3), ("vdb", 3), ("recsys", 2)):
+for w, ncell in (("kv", 3), ("lmdb", 3), ("vdb", 5), ("recsys", 2)):  # vdb: u5 u10 u50 u90 u95 (plan rows since 2026-10-20)
     nsys = 2 if w == "recsys" else 4
     for n in done[w]:
         fx = list(csv.DictReader(open(f"{o}/{w}/r{n}/collect/fix-steps.csv")))
@@ -149,9 +151,22 @@ for w, ncell in (("kv", 3), ("lmdb", 3), ("vdb", 3), ("recsys", 2)):
 print("A content OK")
 EOF
 # B
-mkdir "$O/B"; STUB_FAIL=note:mg:u50 stage B r1-kv && fail "B rc 0"
-grep -q "SEQUENCE STOP kv r1" "$O/B/h1-state.txt" && grep -q "LEVELS STOP .*note" "$O/B/kv/levels-u50.log" || fail "B stop reason"
+mkdir "$O/B"; STUB_FAIL=badnote:mg:u50 stage B r1-kv && fail "B rc 0"
+grep -q "SEQUENCE STOP kv r1" "$O/B/h1-state.txt" && grep -q "LEVELS STOP .*not a decision-E outcome" "$O/B/kv/levels-u50.log" || fail "B stop reason"
 [ ! -e "$O/B/kv/r1/run/mg-u50-r1/fix" ] || fail "B fixed windows ran after LEVELS STOP"
+mkdir "$O/B2"; STUB_FAIL=note:mg:u50 stage B2 r1-kv || fail "B2 noted mg search stopped the stage (see $O/B2.out)"
+python3 -I -B - "$O/B2" <<'EOF' || fail "B2 content"
+import csv, sys
+o = sys.argv[1]
+lv = {r["mix"]: r for r in csv.DictReader(open(f"{o}/kv/levels.tsv"), delimiter="\t")}
+u = lv["u50"]
+assert u["x_mg_src"] == "lowest_step" and float(u["x_mg"]) == 10 and u["weakest"] == "mg" and float(u["L1_x"]) == 10, u
+assert u["x_hw_src"] == u["x_pop_src"] == "confirm", u
+assert all(r["x_mg_src"] == "confirm" for m, r in lv.items() if m != "u50"), lv
+ck = open(f"{o}/kv/r1/check.txt").read()
+assert "W9 mg-u50-r1-slo no confirmed max" in ck and ck.strip().splitlines()[-1].startswith("H1CHECK PASS"), ck[-600:]
+print("B2 content OK")
+EOF
 # C
 mkdir "$O/C"; STUB_FAIL=rc stage C r1-kv && fail "C rc 0"
 grep -q "SEQUENCE STOP kv r1" "$O/C/h1-state.txt" || fail "C stop reason"
@@ -400,7 +415,7 @@ for f in $H/../kv/*.sh $H/../lmdb/*.sh $H/../vectordb/*.sh; do [ -f "$f" ] || co
 mkdir "$O/N"
 na() { bash $H/h1-accept.sh "$O/N" "$1" "$2" selftest >> "$O/N.out" 2>&1; }
 for w in kv lmdb vdb; do stage N r1-$w || fail "N r1-$w"; na 1 $w || fail "N accept $w"; done
-STUB_FAIL=note:hw:peak stage N r1-recsys && fail "N r1-recsys rc 0"
+STUB_FAIL=badnote:hw:peak stage N r1-recsys && fail "N r1-recsys rc 0"   # decision E: the confirm note no longer stops
 grep -q "\[r1-recsys\] SEQUENCE STOP" "$O/N/h1-state.txt" && grep -q "^avg	" "$O/N/recsys/levels.tsv" || fail "N stop setup"
 L1SHA=$(cd "$O/N/recsys/r1" && find . -type f -printf '%P %s\n' | LC_ALL=C sort | sha256sum | cut -c1-64)
 na 1 recsys && fail "N accepted a stopped stage"

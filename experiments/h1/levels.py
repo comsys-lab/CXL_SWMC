@@ -9,9 +9,15 @@ SAME offered rate, L1 = the weakest system's max throughput under the SLO, L2 = 
 x-stream rate of the confirm repeats, as every earlier L rule: m4-lib.sh confirm_x, kv pilot-block confirm_l). With
 several SLO dirs the per-system value is the mean over them; H1 main calls it only with round 1 (dec Q3: levels from
 r1, reused in r2/r3), in r1 per mix through levels-cb.sh --mix.
-Refused (exit 1, "LEVELS STOP <reason>"; the sequence stops, a methodology judgment waits for the user):
-  - a run with a non-empty summary note (e.g. "confirm failed at three rates"), no confirm result, or
-    workload_finish != ok;
+No confirmed max (decision E, user 2026-10-22 00:1x, reports/experiments/de-stijl-motivation-isca27.md §6 E): an SLO
+search that ended with one of the NOTED notes ("the start rate already violates the SLO; lower --start", "confirm
+failed at three rates; ...") or without a confirm result is NOT a stop: that system's x for the mix = the achieved x
+(loadgen steps.jsonl "x" = achieved searches/s) of its LOWEST ramp step (the measured "ramp" step with the lowest
+offered_x; the same step Figs 5 and 7 draw as the hatched point), and the row records x_<sys>_src = lowest_step (else
+confirm) so the CSV and the caption can flag the mix. L1 = min over systems as before, L2 = L1 / 2.
+Refused (exit 1, "LEVELS STOP <reason>"; real errors only; the sequence stops):
+  - a run whose summary.json is unreadable, whose workload_finish != ok, or whose note is not one of NOTED (e.g.
+    "streams exhausted", "max steps reached ..."); a fallback run without a measured ramp step with x > 0;
   - a run whose summary SLO differs from the plan row's slo;
   - a mix without exactly one SLO run per system and round (the workload's systems, h1sys.py: hw, pop, mg; recsys
     hw, pop since v0.6.7, user decision 2026-10-18).
@@ -21,9 +27,12 @@ lifetimes of the mix (main-block.sh BLOCK=h1), and x_mg is "-".
 usage: levels.py --plan h1-plan.tsv --workload W --out levels.tsv SLO_DIR [SLO_DIR ...]
   SLO_DIR  one SLO-phase evidence dir per round (holds the hook's h1-runs.tsv)
 levels.tsv (tab separated, one row per mix, header line first):
-  mix weakest x_hw x_pop x_mg L1_x L2_x factor L1_rate L2_rate rounds sources
+  mix weakest x_hw x_pop x_mg L1_x L2_x factor L1_rate L2_rate rounds sources x_hw_src x_pop_src x_mg_src
   x_*: per-system x (mean over rounds); L*_rate: the fixed-load rate argument for the workload's block
-  (L*_x x factor, rounded to the plan's decimals); sources: run dirs used.
+  (L*_x x factor, rounded to the plan's decimals); sources: run dirs used; x_*_src: confirm | lowest_step (decision E;
+  several rounds: the per-round sources joined by "+"), "-" for a system not measured. The three src columns are
+  appended after the older ones (positional readers, v6-block.sh h1_levels $9/$10, are unchanged).
+  Python use: system_x(run_dir, slo) -> (x, sd, path, src) (also v6-block.sh h2_mix, the H2 level set).
 """
 import argparse, json, os, sys
 
@@ -72,26 +81,67 @@ def read_runs(d):
     return out
 
 
-def confirm_x(run, slo):
-    p = os.path.join(run["dir"], "loadgen", "summary.json")
+START_NOTE = "the start rate already violates the SLO; lower --start"
+CONFIRM_NOTE = "confirm failed at three rates; the knee is noisy (longer --confirm-s?)"
+NOTED = (START_NOTE, CONFIRM_NOTE)  # SLO-search outcomes without a confirmed max (decision E); any other note = error
+
+
+class LevelsError(Exception):
+    pass
+
+
+def lowest_step_x(run_dir):
+    """(achieved x, offered_x, step no) of the measured ramp step with the lowest offered_x (steps.jsonl)"""
+    p = os.path.join(run_dir, "loadgen", "steps.jsonl")
     try:
-        s = json.load(open(p))
+        with open(p) as f:
+            st = [json.loads(l) for l in f if l.strip()]
     except (OSError, ValueError) as e:
-        stop(f"{run['name']}: cannot read {p}: {e}")
-    if s.get("note"):
-        stop(f"{run['name']}: SLO search ended with a note ({s['note']}); never used for L1 (packet Q4)")
+        raise LevelsError(f"cannot read {p}: {e}")
+    ramp = [s for s in st if s.get("phase") == "ramp" and (s.get("measure_s") or 0) > 0]
+    if not ramp:
+        raise LevelsError(f"no measured ramp step in {p}")
+    s = min(ramp, key=lambda s: (float(s["offered_x"]), s["step"]))
+    if not (s.get("x") or 0) > 0:
+        raise LevelsError(f"lowest ramp step {s['step']} of {p} has achieved x {s.get('x')}")
+    return float(s["x"]), float(s["offered_x"]), s["step"]
+
+
+def system_x(run_dir, slo):
+    """(x, x_sd, summary path, src) of one SLO run; src = confirm | lowest_step (decision E). LevelsError = real error."""
+    p = os.path.join(run_dir, "loadgen", "summary.json")
+    try:
+        with open(p) as f:
+            s = json.load(f)
+    except (OSError, ValueError) as e:
+        raise LevelsError(f"cannot read {p}: {e}")
     if s.get("workload_finish") != "ok":
-        stop(f"{run['name']}: workload_finish {s.get('workload_finish')}")
+        raise LevelsError(f"workload_finish {s.get('workload_finish')}")
     so = s.get("slo", {})
-    got = f"{so.get('stream')}:{so.get('pct'):g}:{so.get('ms'):g}" if so else "none"
+    try:
+        got = f"{so.get('stream')}:{float(so.get('pct')):g}:{float(so.get('ms')):g}" if so else "none"
+    except (TypeError, ValueError):
+        got = f"unreadable {so}"
     want = slo.split(":")
     want = f"{want[0]}:{float(want[1]):g}:{float(want[2]):g}"
     if got != want:
-        stop(f"{run['name']}: SLO {got} != plan {want}")
-    x = s.get("confirm", {}).get("x_mean", 0)
-    if not x or x <= 0:
-        stop(f"{run['name']}: no confirm result")
-    return float(x), float(s["confirm"].get("x_sd", 0.0)), p
+        raise LevelsError(f"SLO {got} != plan {want}")
+    note = s.get("note") or ""
+    if note and note not in NOTED:
+        raise LevelsError(f"SLO search ended with the note '{note}' (not a decision-E outcome)")
+    x = (s.get("confirm") or {}).get("x_mean") or 0
+    if not note and x > 0:
+        return float(x), float(s["confirm"].get("x_sd", 0.0)), p, "confirm"
+    lx, off, n = lowest_step_x(run_dir)
+    return lx, 0.0, f"{p} (no confirmed max: {note or 'no confirm result'}; lowest ramp step {n} offered {off:g})", \
+        "lowest_step"
+
+
+def confirm_x(run, slo):
+    try:
+        return system_x(run["dir"], slo)
+    except LevelsError as e:
+        stop(f"{run['name']}: {e}")
 
 
 def main():
@@ -115,21 +165,23 @@ def main():
         stop(f"SLO runs of systems {extra} not measured for {a.workload} (h1sys.py: {' '.join(systems)})")
     nround = len(a.slo_dirs)
     lines = ["\t".join(["mix", "weakest", "x_hw", "x_pop", "x_mg", "L1_x", "L2_x", "factor", "L1_rate", "L2_rate",
-                        "rounds", "sources"])]
+                        "rounds", "sources"] + [f"x_{k}_src" for k in SYSTEMS])]
     for row in plan:
-        xs, src, per_round = {}, [], []
+        xs, src, per_round, xsrc = {}, [], [], {}
         for k in systems:
             sel = [r for r in runs if r["mix"] == row["mix"] and r["sys"] == k]
             rounds = sorted(r["round"] for r in sel)
             if len(sel) != nround or len(set(rounds)) != nround:
                 stop(f"mix {row['mix']} system {k}: {len(sel)} SLO runs for {nround} rounds ({rounds})")
-            vals = []
+            vals, srcs = [], []
             for r in sorted(sel, key=lambda r: r["round"]):
-                x, sd, p = confirm_x(r, row["slo"])
+                x, sd, p, how = confirm_x(r, row["slo"])
                 vals.append(x)
+                srcs.append(how)
                 src.append(r["dir"])
-                per_round.append(f"{row['mix']} {k} r{r['round']} x_mean={x:g} x_sd={sd:g} ({p})")
+                per_round.append(f"{row['mix']} {k} r{r['round']} x={x:g} x_sd={sd:g} src={how} ({p})")
             xs[k] = sum(vals) / len(vals)
+            xsrc[k] = "+".join(srcs)
         weakest = min(systems, key=lambda k: xs[k])
         l1 = xs[weakest]
         l2 = 0.5 * l1
@@ -140,11 +192,13 @@ def main():
             stop(f"mix {row['mix']}: L2 rate {r2} <= 0")
         for v in per_round:
             print(v)
+        fb = [k for k in systems if xsrc[k] != "confirm"]
         print(f"{a.workload} {row['mix']}: weakest {weakest} x={l1:g}; L1_x={l1:g} L2_x={l2:g}; "
-              f"rates L1={r1} L2={r2} (factor {row['factor']:g})")
+              f"rates L1={r1} L2={r2} (factor {row['factor']:g})"
+              + (f"; decision E: no confirmed max for {' '.join(fb)} (x = lowest ramp step)" if fb else ""))
         lines.append("\t".join([row["mix"], weakest] + [f"{xs[k]:.6g}" if k in xs else "-" for k in SYSTEMS] +
                                [f"{l1:.6g}", f"{l2:.6g}", f"{row['factor']:g}", str(r1), str(r2), str(nround),
-                                ",".join(src)]))
+                                ",".join(src)] + [xsrc.get(k, "-") for k in SYSTEMS]))
     if a.mix and os.path.isfile(a.out):  # append one row; refuse an existing row for this mix
         old = open(a.out).read().rstrip("\n").split("\n")
         if old[0] != lines[0]:

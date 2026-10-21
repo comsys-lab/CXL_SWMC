@@ -12,8 +12,10 @@ FAIL = integrity: the round cannot enter Fig 1 / Fig 2. WARN = plausibility: rec
 FAIL checks (every workload):
   F1 completeness: run/h1-runs.tsv: per mix one slo entry for hw, pop, mg and one fix entry for hw, pop, mg, mgoff
      (Megalon timers off), round n, lifetime labels as expected (r1 hw/pop sep, mg cont; r2/r3 cont; mgoff sep)
-  F2 per SLO run: empty note (Q4: a noted run stops the workload), workload_finish ok, SLO = plan, confirm reps 3 and
-     x_mean > 0, >= 1 fill and >= 1 overload step (points past the knee), >= 3 passing ramp/bisect/fill steps
+  F2 per SLO run: no note other than the decision-E ones (levels.NOTED, user 2026-10-22: a search without a
+     confirmed max is a result, W9), workload_finish ok, SLO = plan, confirm reps 3 and x_mean > 0 (not after a failed
+     start rate), >= 1 fill and >= 1 overload step (points past the knee; after a failed start rate: >= 1 overload
+     step), >= 3 passing ramp/bisect/fill steps (not for a noted search)
   F3 per run: h1-runcheck.txt ending in "RUNCHECK PASS" (the hook's per-run validation checks), the workload split
      file (vdb opsplit-steps.csv, kv/lmdb opsplit.csv, recsys breakdown.csv), node0 kernel = Popcorn build 12
      (runs-index.csv kernel_node0 ends with -ds-popcorn-new-12)
@@ -25,7 +27,9 @@ FAIL checks (every workload):
   F9 the Fig 2 CSV has a "Megalon (timers off)" row for every load (L1, L2) x op with C_diff_ns present, C_ns =
      C_diff_ns and C_method "diff ..." (the Fig 2 Megalon C, upper bound, user decision 2026-10-17 "(a)")
   F7 collect notes.txt has no "no overload step", "fig1", "fig2" or "export_csv" note
-  F8 (n = 1) levels.tsv weakest system = argmin of this round's confirm x_mean per mix
+  F8 (n = 1) levels.tsv weakest system = argmin of this round's confirm x_mean per mix (decision E: a noted search's x
+     = its lowest ramp step, as levels.py)
+  W9 (decision E) an SLO search without a confirmed max: names the note and the lowest-ramp-step x used for L1
 WARN checks:
   W1 all-HWcc below max(Popcorn, Megalon) x 0.98 at a mix
   W2 confirm x_sd / x_mean > 5 % or confirm fails >= 1
@@ -58,6 +62,7 @@ import argparse, csv, json, os, sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from h1sys import slo_systems, fix_systems, has_megalon, NO_MEGALON_NOTE  # noqa: E402
 import attempts  # noqa: E402  (v0.6.8: current attempt of a round, levels.tsv of the current r1 attempt)
+from levels import NOTED, START_NOTE, LevelsError, system_x  # noqa: E402  (decision E, 2026-10-22)
 
 
 ROUND_ROOTS = {}  # --round-root n=<root> (experiments/eval: run k of a run set lives in its own evidence root)
@@ -304,29 +309,48 @@ def main():
         ph = [x.get("phase") for x in st]
         npass = sum(1 for x in st if x.get("phase") in ("ramp", "bisect", "fill") and x.get("pass"))
         errs = []
-        if s.get("note"):
-            errs.append(f"note '{s['note']}' (Q4: stop this workload and ask)")
+        # decision E (user 2026-10-22, de-stijl-motivation-isca27 §6 E): a search without a confirmed max (levels.NOTED
+        # notes) is a result: its x = the lowest ramp step (levels.system_x), reported as W9; any other note is a FAIL
+        noted = s.get("note") in NOTED
+        if s.get("note") and not noted:
+            errs.append(f"note '{s['note']}' (not a decision-E outcome)")
         if s.get("workload_finish") != "ok":
             errs.append(f"workload_finish {s.get('workload_finish')}")
         if not slo_ok:
             errs.append(f"SLO {so} != plan {mixes[r['mix']]}")
         # confirm repeats: 3 (H1 rule) unless the eval run set sets H1_CONFIRM_REPS (runset-vdb.sh: the last
         # --confirm-reps of VDB_SLO_EXTRA, e.g. eval2-h1.conf 1 = one continuous 90 s confirm window)
-        if c.get("reps") != int(os.environ.get("H1_CONFIRM_REPS") or 3) or not (c.get("x_mean") or 0) > 0:
+        if s.get("note") != START_NOTE and (c.get("reps") != int(os.environ.get("H1_CONFIRM_REPS") or 3)
+                                            or not (c.get("x_mean") or 0) > 0):
             errs.append(f"confirm {c}")
-        if "fill" not in ph or "overload" not in ph:
+        if s.get("note") == START_NOTE:  # no fill (no result); the start-fail overload steps are the curve
+            if "overload" not in ph:
+                errs.append("no overload step after the failed start rate (loadgen --start-fail-steps)")
+        elif "fill" not in ph or "overload" not in ph:
             errs.append("no fill/overload steps")
         if "fixed" in ph:
             errs.append("fixed steps inside the SLO part (contract: one loadgen part per phase)")
-        if npass < 3:
+        if npass < 3 and not noted:
             errs.append(f"{npass} passing curve steps")
         res("F", f"F2 {r['name']}", not errs, "; ".join(errs))
+        if noted:
+            try:
+                xe = system_x(r["dir"], mixes[r["mix"]])
+                res("W", f"W9 {r['name']} no confirmed max", False,
+                    f"note '{s['note']}': x = lowest ramp step {xe[0]:g} (decision E; flagged in levels.tsv x_{r['sys']}_src)")
+            except LevelsError as e:
+                res("F", f"F2 {r['name']} lowest ramp step", False, str(e))
         uv = upd_valid(r["dir"])
         if uv is not None:  # W8 (eval-run1, verifier M3): update stream sustained on the passing confirm steps
             bad = [str(x["step"]) for x in st if x.get("phase") == "confirm" and x.get("pass") and uv.get(x["step"]) is False]
             res("W", f"W8 {r['name']} update stream at the result", not bad,
                 "update stream not sustained (urate-check.csv) on passing confirm steps " + ", ".join(bad))
-        if c.get("x_mean"):
+        if noted:  # decision E: the x levels.py used (lowest ramp step), so F8/W1/W4 compare like with like
+            try:
+                xs[(r["mix"], r["sys"])] = system_x(r["dir"], mixes[r["mix"]])[0]
+            except LevelsError:
+                pass
+        elif c.get("x_mean"):
             xs[(r["mix"], r["sys"])] = float(c["x_mean"])
             sd = float(c.get("x_sd") or 0)
             res("W", f"W2 {r['name']} confirm spread", sd / float(c["x_mean"]) <= 0.05 and not c.get("fails"),

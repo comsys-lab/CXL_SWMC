@@ -132,6 +132,7 @@ post_outputs() {  # <dir holding loadgen/>: spreadsheet/plot outputs, always (on
   python3 "$ROOT/experiments/loadgen/plot_slo.py" --out "$R/slo.png" "$R/loadgen=$SYSTEM" > "$R/slo-points.txt" 2>&1 || true
 }
 CONFIRM_NOTE="confirm failed at three rates; the knee is noisy (longer --confirm-s?)"
+START_NOTE="the start rate already violates the SLO; lower --start"
 # H1 measurement runs (H1_MEASURE_RUN=1, experiments/h1/README.md item 8): loadgen starts inside measure.slice through
 # scripts/host/measure-run.sh (clean environment; loadgen needs no variable: everything is on its command line; fail
 # closed, exit 125), and every part after the first is preceded by experiments/h1/h1-gate.sh check (MEASURE_PART_DIR).
@@ -195,7 +196,10 @@ else  # H1-HOOK v2: several loadgen parts in this server lifetime
     if [ $rc != 0 ]; then
       LG=$rc
       note=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("note", ""))' "$PR/loadgen/summary.json" 2>/dev/null || true)
-      [ "$note" = "$CONFIRM_NOTE" ] || { echo "part $p: loadgen rc=$rc ($note): lifetime stopped"; break; }
+      # decision E (2026-10-22): a failed start rate in an slo part is a result as well (the next part, e.g. the H1
+      # fix part at the levels from the lowest ramp step, still runs); m4-run.sh judges which notes a caller accepts
+      [ "$note" = "$CONFIRM_NOTE" ] || { [ "$p" = slo ] && [ "$note" = "$START_NOTE" ]; } \
+        || { echo "part $p: loadgen rc=$rc ($note): lifetime stopped"; break; }
     fi
     if [ -n "${PART_POST_CMD:-}" ]; then  # H3 CDF: e.g. dump the kprobe hist before the servers stop
       $PART_POST_CMD "$p" >> "$RUN/part-hooks.txt" 2>&1 || { echo "part $p: PART_POST_CMD failed (see $RUN/part-hooks.txt)"; LG=98; break; }

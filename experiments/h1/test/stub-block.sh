@@ -9,7 +9,8 @@
 # H1_SYSTEMS (hook.sh, h1sys.py; v0.6.7): "hw pop mg" as above; "hw pop" (recsys): r1 per mix hw, pop SLO-only
 #   lifetimes -> $H1_LEVELS_CMD <mix> -> hw, pop separate fixed lifetimes; cont hw, pop each SLO -> fix; no mg / mgoff.
 # env: H1MODE r1|cont, H1_N, H1_MIXES, H1_SYSTEMS, H1_LEVELS (cont) / H1_LEVELS_CMD (r1), H1_SETTLE_S, H1_SEED, H1_PARENT_LOCK,
-#   LOCK (test lock), STUB_WORKLOAD, STUB_FAIL (optional): "note:<sys>:<mix>" = that SLO run ends with a note;
+#   LOCK (test lock), STUB_WORKLOAD, STUB_FAIL (optional): "note:<sys>:<mix>" = that SLO run ends with the confirm-
+#   failed note (decision E: a result); "badnote:<sys>:<mix>" = it ends with "streams exhausted during ramp" (an error);
 #   "rc" = the block fails at once; "mgextra" = with H1_SYSTEMS "hw pop", an mg SLO entry is written anyway.
 set -uo pipefail
 D=${1:?}
@@ -88,7 +89,8 @@ def slo_part(life, sysk, mix):
         st.append(step(i, "fill", m * f_, m * f_, True, 0.6)); i += 1
     for f_ in (1.05, 1.1, 1.2):
         st.append(step(i, "overload", m * 1.1 * f_, m * 1.05, False, 3)); i += 1
-    note = "confirm failed at three rates; the knee is noisy (longer --confirm-s?)" if fail == f"note:{sysk}:{mix}" else ""
+    note = "confirm failed at three rates; the knee is noisy (longer --confirm-s?)" if fail == f"note:{sysk}:{mix}" else \
+        "streams exhausted during ramp" if fail == f"badnote:{sysk}:{mix}" else ""
     summ = {"mode": "slo", "note": note, "steps": i, "slo": {"stream": stream, "pct": slo[0], "ms": slo[1]},
             "max_offered_x_pass": m, "min_offered_x_fail": m * 1.1,
             "confirm": {"reps": 3, "fails": 0, "x_mean": m, "x_sd": 0.5, "pslo_mean_ms": 0.9, "pslo_sd_ms": 0.01},

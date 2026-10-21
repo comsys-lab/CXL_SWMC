@@ -26,7 +26,7 @@ unset VDB_PINS VDB_SLO_EXTRA
 . "$(dirname "$0")/lib.sh"
 VPINS=$EVD/${VDB_PINS:-pins-vdb.sh}
 [[ ${VDB_PINS:-x} != */* ]] || die "VDB_PINS is a file name next to runset-vdb.sh"
-[[ ${VDB_SLO_EXTRA:-} =~ ^[-a-z0-9.\ ]*$ ]] || die "bad VDB_SLO_EXTRA"
+[[ ${VDB_SLO_EXTRA:-} =~ ^[-a-z0-9.,\ ]*$ ]] || die "bad VDB_SLO_EXTRA"   # commas: --overload f1,f2 lists
 CREPS=3; set -- ${VDB_SLO_EXTRA:-}
 while [ $# -gt 0 ]; do [ "$1" = --confirm-reps ] && CREPS=${2:-x}; shift; done
 [[ $CREPS =~ ^[1-9]$ ]] || die "bad --confirm-reps in VDB_SLO_EXTRA"

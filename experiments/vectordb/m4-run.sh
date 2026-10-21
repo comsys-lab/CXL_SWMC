@@ -157,7 +157,7 @@ case "$KIND" in
       # "--confirm-rule pooled --confirm-full --confirm-reps 1 --confirm-s 90 --confirm-warmup-s 15"): loadgen arguments
       # appended to the slo part (loadgen keeps the last value of a repeated option); the fix part is unchanged
       [ -z "${H1_SLO_EXTRA:-}" ] || [ -n "${EVAL_RUN:-}" ] || stop "H1_SLO_EXTRA needs EVAL_RUN"
-      [[ ${H1_SLO_EXTRA:-} =~ ^[-a-z0-9.\ ]*$ ]] || stop "bad H1_SLO_EXTRA"
+      [[ ${H1_SLO_EXTRA:-} =~ ^[-a-z0-9.,\ ]*$ ]] || stop "bad H1_SLO_EXTRA"   # commas: --overload f1,f2 lists
       export PART_ARGS_slo="--mode slo --start 10 --factor 1.5 --precision 0.02 --confirm-precision 0.01 --max-confirm-probes 6 --confirm-step-down 0.05 --max-steps 25 --warmup-s 10 --step-warmup-s 3 --step-measure-s 15 --confirm-s 30 --confirm-reps 3${H1_SLO_EXTRA:+ $H1_SLO_EXTRA}"
       export PART_ARGS_fix="--mode fixed --rates @RATES@ --warmup-s $SETTLE_S --step-warmup-s 10 --step-measure-s 60 --drain-s 10";;
   urate) [[ "${URATE:-}" =~ ^[1-9][0-9]*$ ]] || stop "bad URATE"
@@ -316,8 +316,12 @@ for RP in $PDIRS; do
   if [ -n "$note" ] && [ "$KIND" = urate ] && [ "${RP##*/}" = slo ]; then  # knee ramp: every note is a result
     NOTES="$NOTES ${RP##*/}: $note"
   elif [ -n "$note" ]; then
+    # decision E (user 2026-10-22, de-stijl-motivation-isca27 §6 E): in an H1 slo part a failed start rate is a result
+    # too (levels.py then takes the lowest ramp step); everywhere else only the confirm note, as before
     { [[ $KIND =~ ^p?slo$ ]] || { [ "$KIND" = h1 ] && [ "${RP##*/}" = slo ]; }; } \
-      && [ "$note" = "confirm failed at three rates; the knee is noisy (longer --confirm-s?)" ] || stop "loadgen note ($RP): $note"
+      && { [ "$note" = "confirm failed at three rates; the knee is noisy (longer --confirm-s?)" ] \
+           || { [ "$KIND" = h1 ] && [ "$note" = "the start rate already violates the SLO; lower --start" ]; }; } \
+      || stop "loadgen note ($RP): $note"
     NOTES="$NOTES ${RP##*/}: $note"
   fi
   if [[ $KIND =~ ^(h1|urate)$ ]] && [ "${RP##*/}" = fix ]; then  # the two measured fixed steps: L2 then L1
