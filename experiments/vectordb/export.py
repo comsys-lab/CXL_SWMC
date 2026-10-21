@@ -26,6 +26,12 @@ Formulas (per step; opsplit-steps.csv per operation, loadgen stats deltas over t
   m4-run.sh EVAL_RUN); empty for evidence without the server write counters (H1 r1, vdb builds < 17). slo_summary
   valid = urate-check.txt verdict (PASS 1 / NOTE 0), n_judged / n_invalid_judged from it. fixed.csv slo_pass = loadgen
   pass of the window (SLO met), not validity.
+  Per-step coherence columns (canon.VDB_COH, appended to slo_steps.csv and fixed.csv, 2026-10-22; definitions at
+  coh_steps below): Megalon mg_fetch_per_s (read_retry_incoherent), mg_flush_writeend_per_s, read-side flush bytes and
+  flushes per search, bytes per read-side flush, search stale/concurrent events per search, Popcorn search I->S per
+  search (search threads), and fig3_lines_per_rop = the de-stijl-motivation-isca27 Fig 3 formula (Megalon events x
+  bytes per read-side flush / 64; Popcorn I->S x 64 lines; All-HWcc 0). flushed_lines_per_rop (older formula: all
+  read-side bytes / searches / 64) is kept unchanged.
 """
 import argparse
 import csv
@@ -132,6 +138,72 @@ def mg_flush(part):
     return out
 
 
+# Per-step coherence columns (2026-10-22, de-stijl-motivation-isca27 §1.1 Fig 3; same Megalon names as
+# experiments/eval/export_h2n.py), summed over the targets (stats deltas), rates per second of the longest target
+# window, per-op columns per SERVER search / update of the same window:
+#   mg_fetch_per_s          megalon.read_retry_incoherent (read-side stale-copy flush + refetch; one object flush each)
+#   mg_flush_writeend_per_s megalon.flushes - megalon.read_retry_incoherent (write-end object flushes)
+#   mg_flushes_per_s, mg_flush_bytes_per_s       megalon.flushes, megalon.flush_bytes
+#   mg_wflush_bytes / mg_wflushes                write-end flush bytes / count of the server's write sections
+#                                                (opt.{search,update}.meg.wflush_bytes / wflush_cnt)
+#   mg_rflush_bytes_per_rop, mg_rflushes_per_rop read side = megalon.flush_bytes - write-end bytes, megalon.flushes -
+#                                                write-end count (flushes outside write sections), per server search
+#   mg_rflush_bytes_per_flush                    read-side bytes / read-side flushes (bytes of one flushed object)
+#   mg_search_events_per_rop                     search stale + concurrent read events (opt.search.meg.stale_cnt +
+#                                                concur_cnt) per server search
+#   fig3_lines_per_rop      Fig 3: Megalon = mg_search_events_per_rop x mg_rflush_bytes_per_flush / 64; Popcorn =
+#                           pop_search_is_per_rop x 4096 / 64; All-HWcc 0
+#   pop_search_is_per_rop   Popcorn search I->S faults (thr.vdb-search.swmc.is_faults: the server's search threads)
+#                           per server search
+COH = canon.VDB_COH
+
+
+def coh_steps(part, system):
+    """{step: {COH column: value}} of one part (empty dict when the part has no stats snapshots)"""
+    acc = {}
+    try:
+        dl = stats_delta.deltas(os.path.join(part, "loadgen"))
+    except Exception as e:  # noqa: BLE001 (analysis only)
+        print(f"export.py WARNING: {part}: stats unreadable ({e!r})", file=sys.stderr)
+        return {}
+    keys = {"fetch": ("megalon.read_retry_incoherent",), "flushes": ("megalon.flushes",),
+            "fbytes": ("megalon.flush_bytes",), "wbytes": ("opt.search.meg.wflush_bytes", "opt.update.meg.wflush_bytes"),
+            "wcnt": ("opt.search.meg.wflush_cnt", "opt.update.meg.wflush_cnt"),
+            "sev": ("opt.search.meg.stale_cnt", "opt.search.meg.concur_cnt"),
+            "is": ("thr.vdb-search.swmc.is_faults",), "ns": ("searches",), "nu": ("inserts",)}
+    for fx, d in dl:
+        t = acc.setdefault(fx["step"], {"win": 0.0, **{k: None for k in keys}})
+        w = canon.fl(fx.get("window_s"))
+        t["win"] = max(t["win"], w or 0.0)
+        for k, ks in keys.items():
+            v = [d[x] for x in ks if d.get(x) is not None]
+            if v:
+                t[k] = (t[k] or 0.0) + sum(v)
+    out = {}
+    for n, t in acc.items():
+        win, ns = t["win"], t["ns"]
+        ps = lambda v: v / win if v is not None and win else None  # noqa: E731
+        pr = lambda v: v / ns if v is not None and ns else None  # noqa: E731
+        o = {"srv_searches": ns, "srv_updates": t["nu"], "mg_fetch_per_s": ps(t["fetch"]),
+             "mg_flushes_per_s": ps(t["flushes"]), "mg_flush_bytes_per_s": ps(t["fbytes"]),
+             "mg_wflush_bytes_per_s": ps(t["wbytes"]), "mg_wflushes_per_s": ps(t["wcnt"]),
+             "mg_search_events_per_rop": pr(t["sev"]), "pop_search_is_per_rop": pr(t["is"])}
+        o["mg_flush_writeend_per_s"] = ps(t["flushes"] - t["fetch"]) if t["flushes"] is not None and t["fetch"] is not None else None
+        rb = t["fbytes"] - (t["wbytes"] or 0.0) if t["fbytes"] is not None else None
+        rf = t["flushes"] - (t["wcnt"] or 0.0) if t["flushes"] is not None else None
+        o["mg_rflush_bytes_per_rop"], o["mg_rflushes_per_rop"] = pr(rb), pr(rf)
+        o["mg_rflush_bytes_per_flush"] = rb / rf if rb is not None and rf else None
+        if system in ("mg", "mgoff"):
+            ev, bpf = o["mg_search_events_per_rop"], o["mg_rflush_bytes_per_flush"]
+            o["fig3_lines_per_rop"] = ev * bpf / 64 if ev is not None and bpf is not None else (0.0 if ev == 0 else None)
+        elif system == "pop":
+            o["fig3_lines_per_rop"] = o["pop_search_is_per_rop"] * 4096 / 64 if o["pop_search_is_per_rop"] is not None else None
+        else:
+            o["fig3_lines_per_rop"] = 0.0
+        out[n] = o
+    return out
+
+
 def common(p, vcpus):
     st, wr = server_threads(p["life"])
     return dict(system=p["system"], point=p["point"], upd_share=p["upd_share"], rate_unit=p["rate_unit"],
@@ -168,6 +240,7 @@ def export(E, out, rnd, vcpus):
             txt = open(os.path.join(part, "urate-check.txt")).read()
             ucv = "1" if "URATECHECK PASS" in txt else "0" if "URATECHECK NOTE" in txt else None
             ucj = ur.check_counts(txt)[:2]
+        cs = coh_steps(part, p["system"])
         if p["phase"] == "slo":
             best, at, cmin, cmax = canon.confirm_stats(part, "search")
             for r in rows:
@@ -185,7 +258,8 @@ def export(E, out, rnd, vcpus):
                         pop_read_faults_per_wop=r["pop_read_faults_per_update"],
                         pop_write_faults_per_wop=r["pop_write_faults_per_update"],
                         owner_wait_ms_rop=r.get("search_owner_wait_ms"), cxl_recv_cpu_s_per_s=r["cxl_recv_cpu_s_per_s"],
-                        slo_pct=slo.get("pct"), slo_ms=slo.get("ms"), lifetime=p["lifetime"])
+                        slo_pct=slo.get("pct"), slo_ms=slo.get("ms"), lifetime=p["lifetime"],
+                        **{k: cs.get(r["step"], {}).get(k) for k in COH})
             for step, bins in sorted(canon.latency_hist(part, "search").items()):
                 d = js.get(step)
                 if not d:
@@ -248,7 +322,8 @@ def export(E, out, rnd, vcpus):
                                   seg_inval_ipis_per_rop=r.get("search_pop_ipi_cnt"),
                                   seg_processing_ms_rop=(T - C) if T is not None and C is not None else None,
                                   mg_flush_bytes_per_rop=fb, mg_wflush_bytes_per_wop=wb, flushed_lines_per_rop=lines,
-                                  cxl_recv_cpu_s_per_s=r["cxl_recv_cpu_s_per_s"], lifetime=p["lifetime"], source_dir=part))
+                                  cxl_recv_cpu_s_per_s=r["cxl_recv_cpu_s_per_s"], lifetime=p["lifetime"], source_dir=part,
+                                  **{k: cs.get(r["step"], {}).get(k) for k in COH}))
     off = {(x["point"], x["level"]): x for x in fixed if x["system"] == "mgoff"}
     for x in fixed:
         if x["system"] == "mg" and (x["point"], x["level"]) in off:

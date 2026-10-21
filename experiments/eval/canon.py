@@ -26,6 +26,13 @@ import os
 import numpy as np
 
 KEY = ["workload", "run", "config_sha256"]
+# per-step coherence columns of the vector DB export (experiments/vectordb/export.py coh_steps, 2026-10-22: Megalon
+# columns as experiments/eval/export_h2n.py + what de-stijl-motivation-isca27 Fig 3 needs); appended to slo_steps.csv
+# and fixed.csv (empty for RecSys rows)
+VDB_COH = ["srv_searches", "srv_updates", "mg_fetch_per_s", "mg_flush_writeend_per_s", "mg_flushes_per_s",
+           "mg_flush_bytes_per_s", "mg_wflush_bytes_per_s", "mg_wflushes_per_s", "mg_rflush_bytes_per_rop",
+           "mg_rflushes_per_rop", "mg_rflush_bytes_per_flush", "mg_search_events_per_rop", "pop_search_is_per_rop",
+           "fig3_lines_per_rop"]
 POINT = ["system", "point", "upd_share", "rate_unit", "vcpus_per_vm", "threads", "writers"]
 SCHEMA = {
     "slo_summary.csv": KEY + POINT + [
@@ -38,7 +45,7 @@ SCHEMA = {
         "step", "phase", "offered_x", "achieved_x", "n_rop", "p50_ms", "p95_ms", "p99_ms", "pass", "valid",
         "at_result", "aborted", "wop_per_s", "wop_offered_per_s", "wop_done_ratio", "T_ms_rop", "C_ms_rop", "T_ms_wop", "C_ms_wop",
         "pop_read_faults_per_rop", "pop_write_faults_per_rop", "pop_read_faults_per_wop", "pop_write_faults_per_wop",
-        "owner_wait_ms_rop", "cxl_recv_cpu_s_per_s", "slo_pct", "slo_ms", "lifetime"],
+        "owner_wait_ms_rop", "cxl_recv_cpu_s_per_s", "slo_pct", "slo_ms", "lifetime"] + VDB_COH,
     "latency_hist.csv": KEY + ["system", "point", "step", "phase", "offered_x", "bin_hi_us", "count"],
     "fixed.csv": KEY + POINT + [
         "level", "level_set", "step", "offered_x", "achieved_x", "valid", "slo_pass", "n_rop", "p95_ms", "p99_ms", "wop_per_s",
@@ -48,7 +55,7 @@ SCHEMA = {
         "seg_is_ms_rop", "seg_sm_ms_rop", "seg_wp_ms_rop", "seg_ipi_ms_rop", "seg_nontrans_ms_rop",
         "seg_owner_wait_ms_rop", "seg_inval_ipis_per_rop", "seg_processing_ms_rop",
         "mg_flush_bytes_per_rop", "mg_wflush_bytes_per_wop", "flushed_lines_per_rop", "cxl_recv_cpu_s_per_s",
-        "mgoff_T_ms_rop", "mgoff_T_ms_wop", "lifetime", "source_dir"],
+        "mgoff_T_ms_rop", "mgoff_T_ms_wop", "lifetime", "source_dir"] + VDB_COH,
     "mg_probe.csv": KEY + ["point", "offered_x", "T_ms_rop", "p95_ms", "achieved_wop_per_s", "backlog_end",
                            "lag_ms_max", "valid", "decision", "source_dir"],
 }
