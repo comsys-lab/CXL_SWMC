@@ -10,6 +10,12 @@
 #   --from  resume: start the lifetime list at this lifetime (a stopped block's finished lifetimes stay in its own,
 #           immutable evidence dir; export_h2n.py takes several evidence dirs per N, later dirs win per lifetime)
 #   --only  run exactly these lifetimes (in the given order), e.g. a single re-run; exclusive with --from
+# Optional conf keys of the confirm-rule test (confirm-test.conf; absent in h2n.conf = the behaviour above):
+#   H2N_TOPO=2          the 2-VM topology (cxl_vm0/cxl_vm1, 16 vCPU / 96 GB each; N = 2 only) instead of VM8 (H2N_TOPO=8)
+#   H2N_REPEATS=<r>     every (system, mix) lifetime r times, each a fresh server lifetime (systems outer, mixes, then
+#                       repeats); lifetime ids <sys>:<mix>:r<j> (run dirs <sys>-<mix>-n<N>-r<j>), same loadgen seed in
+#                       every repeat; r > 1 skips export_h2n.py (one row per (mix, system))
+#   H2N_LOADGEN_EXTRA   loadgen arguments appended to H2N_SLO_PART (e.g. "--confirm-rule pooled --confirm-full")
 N=${1:-}; shift || true
 [[ $N =~ ^[2-8]$ ]] || { echo "RUNSET STOP: usage runset-h2n.sh <N> <k> [--dry] [--v V] [--from sys:mix] [--only 'sys:mix ...']"; exit 2; }
 K_ARG=${1:-}; shift || true
@@ -19,12 +25,19 @@ while [ $# -gt 0 ]; do
 done
 set -- "$K_ARG" "${REST[@]}"
 RUNSET=h2n-n$N WL=vdb CONF_WL=h2n
-unset H2N_PINS H2N_VEC_FORMAT H2N_EF H2N_INIT H2N_HOST_IMAGE   # optional conf keys: never inherited from the environment
+unset H2N_PINS H2N_VEC_FORMAT H2N_EF H2N_INIT H2N_HOST_IMAGE H2N_REPEATS H2N_LOADGEN_EXTRA   # optional conf keys: never inherited from the environment
 . "$(dirname "$0")/lib.sh"
 H=$TREE/experiments/h1
 [ -n "${H2N_NODES:-}" ] || die "EVAL_CONF has no H2N_* keys (use EVAL_CONF=$EVD/h2n.conf)"
 [[ " $H2N_NODES " == *" $N "* ]] || die "N=$N not in H2N_NODES ($H2N_NODES)"
-[ "$H2N_TOPO" = 8 ] && [ "$VCPUS_PER_VM" = 4 ] && [ "$H2N_RAM_GB" = 24 ] || die "h2n needs the VM8 topology with 4 vCPU / 24 GB per VM"
+case $H2N_TOPO in
+  8) [ "$VCPUS_PER_VM" = 4 ] && [ "$H2N_RAM_GB" = 24 ] || die "h2n needs the VM8 topology with 4 vCPU / 24 GB per VM";;
+  2) [ "$N" = 2 ] && [ "$VCPUS_PER_VM" = 16 ] && [ "$H2N_RAM_GB" = 96 ] || die "H2N_TOPO=2 = cxl_vm0/cxl_vm1 with 16 vCPU / 96 GB, N = 2 only";;
+  *) die "bad H2N_TOPO ($H2N_TOPO: 8 | 2)";;
+esac
+REPS=${H2N_REPEATS:-1}
+[[ $REPS =~ ^[1-9]$ ]] || die "bad H2N_REPEATS ($REPS: 1..9)"
+SLOPART=$H2N_SLO_PART${H2N_LOADGEN_EXTRA:+ $H2N_LOADGEN_EXTRA}
 [ "$VDB_DATASET" = 28m-x ] || die "h2n uses the 28m-x dataset (VDB_DATASET)"
 [ "$VDB_SLO_PCT:$VDB_SLO_MS" = 99:100 ] || die "VDB SLO is search p99 <= 100 ms (the SLO part arguments are fixed)"
 [ "$VDB_MG_CAPACITY" = h1 ] || die "h2n Megalon capacity is VDB_MG_CAPACITY=h1"
@@ -36,7 +49,7 @@ for s in $H2N_SYSTEMS; do
   for m in $H2N_POINTS; do
     row=$(awk -F'\t' -v m="$m" '!/^#/ && $1 == "vdb" && $2 == m' "$H/h1-plan.tsv")
     [ "$(echo "$row" | cut -f3)" = "U=${m#u}" ] || die "mix $m: h1-plan.tsv has no vdb row with U=${m#u}"
-    ALL+=("$s:$m")
+    if [ "$REPS" = 1 ]; then ALL+=("$s:$m"); else for r in $(seq 1 "$REPS"); do ALL+=("$s:$m:r$r"); done; fi
   done
 done
 LIVES=("${ALL[@]}")
@@ -73,7 +86,8 @@ if [ $HASMG = 1 ]; then
   [[ $MGD =~ ^[1-9][0-9]*$ ]] || die "H2N_MG_MAXD_N$N missing"
 fi
 plan "vec_format $VF ef ${H2N_EF:-32 (h2n-block default)} pins $PINS${H2N_HOST_IMAGE:+ image $H2N_HOST_IMAGE guest ${H2N_INIT:-}}"
-plan "N=$N vCPU/VM=$VCPUS_PER_VM RAM/VM=${H2N_RAM_GB} GB; threads $VDB_SEARCH_THREADS search + 1 writer; recv_mode $RECV_MODE"
+plan "N=$N topology $H2N_TOPO vCPU/VM=$VCPUS_PER_VM RAM/VM=${H2N_RAM_GB} GB; threads $VDB_SEARCH_THREADS search + 1 writer; recv_mode $RECV_MODE; repeats $REPS (seed $((SEED_BASE + K)) in every repeat)"
+plan "slo part: $SLOPART"
 plan "lifetimes (${#LIVES[@]}): ${LIVES[*]}${FROM:+ (resume from $FROM)}${ONLY:+ (only)}"
 plan "writes $WRITES; max_deletes/node $MAXD$([ $HASMG = 1 ] && echo "; Megalon build $MGB lib $MGL cfg $MGC guest $MGV max_deletes/node $MGD")"
 need_env
@@ -84,7 +98,7 @@ BENV=(H2N_N=$N H2N_VCPU=$VCPUS_PER_VM "H2N_LIFETIMES=${LIVES[*]}" EVAL_RUN=$K SE
   C8=$POP_C K8=$POP_K GT8=$POP_GT RECV_MODE=$RECV_MODE POP_BUNDLE_SHA=$POP_BUNDLE_SHA EXPECT_DAX_UUID=$EXPECT_DAX_UUID
   VPLAIN=$VDB_VPLAIN PLAIN_BUILD=$VDB_PLAIN_BUILD LOADGEN=$VDB_LOADGEN_BUILD/loadgen X_DATA=$VDB_X_DATA X_WRITES=$WRITES
   X_NB=$VDB_X_NB X_MAXIDS=$VDB_X_MAXIDS X_MAXW=$VDB_X_MAXW X_MAXD=$MAXD X_INIT_CAP=$VDB_X_INIT_CAP
-  "H2N_SLO_PART=$H2N_SLO_PART" H2N_OPCOH_STRICT=$H2N_OPCOH_STRICT H2N_CXLBW=$H2N_CXLBW H2N_HOSTCPU=${H2N_HOSTCPU:-0})
+  "H2N_SLO_PART=$SLOPART" H2N_OPCOH_STRICT=$H2N_OPCOH_STRICT H2N_CXLBW=$H2N_CXLBW H2N_HOSTCPU=${H2N_HOSTCPU:-0})
 [ $HASMG = 0 ] || BENV+=(MEG_BUILD=$MGB VMEG=$MGV MEG_CFG=$MGC MEG_LIB=$MGL MG_MAXD=$MGD)
 for x in H2N_VEC_FORMAT H2N_EF H2N_INIT H2N_HOST_IMAGE; do [ -z "${!x:-}" ] || BENV+=("$x=${!x}"); done
 for x in PRETOUCH_DIR MEASURE_ENV_DIR MEASURE_PART_DIR; do [ -z "${!x:-}" ] || BENV+=("$x=${!x}"); done
@@ -109,6 +123,7 @@ grep -q "BLOCK DONE" "$E/block/block.log" 2>/dev/null || stop "block did not fin
 [ "$(grep -vc '^#' "$E/block/h2n-results.tsv")" = "${#LIVES[@]}" ] || stop "h2n-results.tsv rows != lifetimes"
 $REG add vdb $RUNSET $K "$E" $CSHA measured "$(grep -v '^#' "$E/block/h2n-results.tsv" | cut -f1,7,9 | tr '\t\n' ' ;' | cut -c1-200)"
 out=$DERIVED_ROOT/vdb/$RUNSET/run$K
-mkdir -p "$out" && python3 -I -B "$EVD/export_h2n.py" --run "$K" --nodes "$N" --config-sha256 "$CSHA" --out "$out" "$E/block" > "$out/export.log" 2>&1 \
-  && log "export: $out" || log "RUNSET NOTE: export failed (see $out/export.log; the run itself is unaffected)"
+if [ "$REPS" != 1 ]; then log "RUNSET NOTE: export_h2n.py skipped (H2N_REPEATS=$REPS: it keeps one lifetime per (mix, system))"
+else mkdir -p "$out" && python3 -I -B "$EVD/export_h2n.py" --run "$K" --nodes "$N" --config-sha256 "$CSHA" --out "$out" "$E/block" > "$out/export.log" 2>&1 \
+  && log "export: $out" || log "RUNSET NOTE: export failed (see $out/export.log; the run itself is unaffected)"; fi
 log "RUNSET DONE: review $E/block/h2n-results.tsv and block.log, then: EVAL_REGISTRY=${REGISTRY:-} python3 $EVD/registry.py accept $RUNSET $K $E"

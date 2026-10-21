@@ -10,8 +10,8 @@
 # opcoh_check on N nodes, the CXL.mem bandwidth sampler between lock and unlock.
 # Called by experiments/eval/runset-h2n.sh (never by hand in a real run).
 # usage: h2n-block.sh <evidence dir (exists; empty except sequence*)>
-# env: H2N_N (2..8), H2N_VCPU (4), H2N_LIFETIMES ("<sys>:<mix> ..." in execution order; sys hw | pop | mg | mgoff,
-#   mix u5 | u50 | u90), EVAL_RUN (k), SEED, REGION, C8 K8 GT8 RECV_MODE POP_BUNDLE_SHA, PRETOUCH_DIR (VM8-v* evidence
+# env: H2N_N (2..8), H2N_VCPU (4; 16 on the 2-VM topology, runset-h2n.sh H2N_TOPO=2), H2N_LIFETIMES ("<sys>:<mix>
+#   ..." or "<sys>:<mix>:r<j> ..." in execution order; sys hw | pop | mg | mgoff, mix u5 | u50 | u90), EVAL_RUN (k), SEED, REGION, C8 K8 GT8 RECV_MODE POP_BUNDLE_SHA, PRETOUCH_DIR (VM8-v* evidence
 #   of the current QEMU lifetimes), MEASURE_ENV_DIR MEASURE_PART_DIR (h3-gate.sh), EXPECT_DAX_UUID,
 #   VPLAIN PLAIN_BUILD LOADGEN X_DATA X_WRITES X_NB X_MAXIDS X_MAXW X_MAXD X_INIT_CAP,
 #   Megalon (only when a lifetime is mg / mgoff): MEG_BUILD VMEG MEG_CFG MEG_LIB MG_MAXD,
@@ -45,10 +45,12 @@ N=$H2N_N VCPU=$H2N_VCPU STRICT=${H2N_OPCOH_STRICT:-0} CXLBW=${H2N_CXLBW:-0} HOST
 [[ $RECV_MODE =~ ^(poll|idle|sleep)$ ]] || die "bad RECV_MODE"
 [[ $STRICT =~ ^[01]$ ]] && [[ $CXLBW =~ ^[01]$ ]] && [[ $HOSTCPU =~ ^[01]$ ]] || die "bad H2N_OPCOH_STRICT / H2N_CXLBW / H2N_HOSTCPU"
 [[ $X_MAXD =~ ^[1-9][0-9]*$ ]] || die "bad X_MAXD"
-# lifetimes: <sys>:<mix>, no repeats
+# lifetimes: <sys>:<mix> or <sys>:<mix>:r<j> (repeat j, runset-h2n.sh H2N_REPEATS; run dir <sys>-<mix>-n<N>-r<j>), no
+# id twice
 LIVES=() HASMG=0 HASPOP=0 seen=" "
 for l in $H2N_LIFETIMES; do
-  s=${l%%:*} m=${l#*:}
+  s=${l%%:*} m=${l#*:} m=${m%%:*}
+  [[ $l =~ ^[a-z]+:u[0-9]+(:r[1-9])?$ ]] || die "bad lifetime id $l (<sys>:<mix>[:r<j>])"
   case $s in hw|pop) ;; mg|mgoff) HASMG=1;; *) die "bad system in $l";; esac
   case $m in u5|u50|u90) ;; *) die "bad mix in $l (u5 | u50 | u90)";; esac
   [ $s = pop ] && HASPOP=1
@@ -288,8 +290,8 @@ sys_up() {  # <sys> <name>: dax owner (hw, mg, mgoff: comsys) + Popcorn cycle
   esac
 }
 # ---- one lifetime: run.sh (N nodes, PARTS=slo) with the H1 SLO part arguments ---------------------------------------
-vdb_life() {  # <sys> <mix>
-  local s=$1 mix=$2 U=${2#u} name=$1-$2-n$N R k L RP note rc mode oc=- OPS
+vdb_life() {  # <sys> <mix> [r<j>]
+  local s=$1 mix=$2 U=${2#u} name=$1-$2-n$N${3:+-$3} R k L RP note rc mode oc=- OPS
   R=$E/$name
   local LG=(--opt data=$X_DATA --opt writes=$X_WRITES --opt k=10 --mix "update=$U,search=$((100 - U))" --slo search:99:100 --x-stream search --raw)
   local RE=(V=$VPLAIN HOST_SERVER=$HOSTSRV LOADGEN=$LOADGEN INIT=$INIT READY_TIMEOUT=5400 RUN_KIND=measurement TRACE=0 STATS_OP=10
@@ -358,8 +360,9 @@ print("\t".join(sys.argv[2:8] + [f(s.get("max_offered_x_pass")), f(c.get("x_mean
 }
 # ---- sequence ----------------------------------------------------------------------------------------------------
 for l in "${LIVES[@]}"; do
-  log "== HSLO ${l%%:*} ${l#*:} n$N"
-  vdb_life "${l%%:*}" "${l#*:}"
+  IFS=: read -r ls lm lr <<< "$l"
+  log "== HSLO $ls $lm n$N${lr:+ $lr}"
+  vdb_life "$ls" "$lm" ${lr:+"$lr"}
 done
 [ $OWNED = root ] || { dax_owner root || stop "dax0.0 back to root"; OWNED=root; }
 log "== PT pretouch check (end)"
