@@ -341,7 +341,13 @@ vdb_life() {  # <sys> <mix>
   grep -q 'workload_finish":"ok' $RP/loadgen/summary.json || stop "$name: loadgen workload finish"
   note=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["note"])' $RP/loadgen/summary.json 2>/dev/null)
   if [ -n "$note" ]; then
-    [ "$note" = "confirm failed at three rates; the knee is noisy (longer --confirm-s?)" ] || stop "$name: loadgen note: $note"
+    # main 2026-10-21 13:3x: "the start rate already violates the SLO" is a result (no rate under the SLO at or above
+    # the ramp start: the row keeps empty max/confirm values) and the block goes on; before, it stopped the block and
+    # skipped every later lifetime (SQ8 run 1 N=2: mg-u90 stop -> pop u5/u50/u90 not run)
+    case "$note" in
+      "confirm failed at three rates; the knee is noisy (longer --confirm-s?)"|"the start rate already violates the SLO; lower --start") ;;
+      *) stop "$name: loadgen note: $note";;
+    esac
     log "$name NOTE: $note"
   elif [ $rc != 0 ]; then stop "$name: run.sh rc $rc"; fi
   python3 -I -c 'import json,sys
