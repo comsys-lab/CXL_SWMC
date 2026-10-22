@@ -33,7 +33,9 @@ Coherence CPU per window (CLAUDE.md: CPU spent on coherence next to throughput a
                kv, lmdb  opsplit.csv lib_bg_cpu_s[measured] (thread groups not named kv-* / lmdb-*)
                recsys breakdown.csv bg_cpu_ms_node<k>[measured] (thr.nr-log-sync + thr.mg-bg) / 1000
   coh_cpu_vcpus = (recv_cpu_s for Popcorn | meg_bg_cpu_s for Megalon | 0 for all-HWcc) / window_s
-usage: collect.py --plan h1-plan.tsv --workload W [--levels levels.tsv] [--out-name collect] [--no-figs] WDIR
+usage: collect.py --plan h1-plan.tsv --workload W [--levels levels.tsv] [--out-name collect | --out DIR] [--no-figs] WDIR
+  --out DIR (2026-10-22): write the new dir DIR instead of WDIR/<out-name> (frozen evidence, e.g. eval2 run 1 H1 v1;
+  check.py --collect DIR reads it)
   WDIR = one round of a workload (<E>/<W>/r<n>: run/ with h1-runs.tsv v2) or the workload root (<E>/<W>, every round; --out-name
   collect-all); runs = every h1-runs.tsv below WDIR outside collect* dirs and outside superseded stage attempts (v0.6.8,
   attempts.py: after `h1-main.sh --retry` only the current attempt r<n>-a<k> of a round counts). Figures use the lowest
@@ -240,12 +242,13 @@ def main():
     ap.add_argument("--no-figs", action="store_true")
     ap.add_argument("--levels", help="levels.tsv (default <WDIR>/levels.tsv)")
     ap.add_argument("--out-name", default="collect", help="output dir name below WDIR (default collect)")
+    ap.add_argument("--out", help="output dir (default <WDIR>/<out-name>); e.g. outside a frozen evidence dir")
     ap.add_argument("wdir")
     a = ap.parse_args()
     W, wdir = a.workload, a.wdir
     SYSTEMS, FIXSYS, MG = slo_systems(W), fix_systems(W), has_megalon(W)  # per workload (v0.6.7)
     mgnote = NO_MEGALON_NOTE.get(W, f"no Megalon for {W}")
-    out = os.path.join(wdir, a.out_name)
+    out = a.out or os.path.join(wdir, a.out_name)
     if os.path.exists(out):
         fail(f"{out} exists (result dirs are immutable; collect into a fresh copy)")
     os.makedirs(os.path.join(out, "fig"))

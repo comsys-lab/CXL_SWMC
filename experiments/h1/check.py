@@ -57,7 +57,10 @@ Systems per workload (h1sys.py, v0.6.7; user decision 2026-10-18 "그냥 recsys�
   FAIL); F6 Popcorn only; F9, W5, W6 and C2 do not apply (C_diff absent by design: an INFO line names the RECSYS-V1
   v1.4 source); F8 / W1 / W4 / W7 over hw, pop; C1 has no Megalon run-to-run spread: r2 threshold 5 %, r3 max(5 %,
   2 x the system's own r2 -> r3 change).
-usage: check.py --plan h1-plan.tsv --workload W --round n [--skip-fig2] E
+usage: check.py --plan h1-plan.tsv --workload W --round n [--skip-fig2] [--collect DIR] [--out FILE] E
+  --collect / --out (2026-10-22): read collect.py's output from DIR and write check.txt to FILE instead of the round
+  dir, for evidence that is frozen (eval2 run 1 H1 v1: its sequence stopped before collect / check; check with a plan
+  restricted to the mixes the dir holds).
 """
 import argparse, csv, json, os, sys
 
@@ -267,6 +270,9 @@ def main():
     ap.add_argument("--round-root", action="append", default=[],
                     help="n=<root>: round n of W lives in <root>/<W>/r<n> (experiments/eval run sets; default E); the "
                          "levels.tsv is then the one of round 1's root")
+    ap.add_argument("--collect", help="collect dir of round n (default <round dir>/collect); e.g. collect.py --out of "
+                                      "a frozen evidence dir")
+    ap.add_argument("--out", help="check.txt path (default <round dir>/check.txt)")
     ap.add_argument("E")
     a = ap.parse_args()
     W, n, E = a.workload, a.round, a.E
@@ -280,6 +286,7 @@ def main():
         lines.append(f"INFO systems {' '.join(SYSTEMS)}: {NO_MEGALON_NOTE.get(W, 'no Megalon for ' + W)}; F9/W5/W6/C2 "
                      "not applicable (C_diff absent by design)")
     S = rdir(E, W, n)
+    COL = a.collect or os.path.join(S, "collect")
     mixes = plan_mixes(a.plan, W)
     cfail = plan_confirm_fail(a.plan)  # verifier M2 switch (default lowest_step), as levels.py
     rs = {}
@@ -368,7 +375,7 @@ def main():
             f"{r['sys']} {m}: rel_width {rw}, finish '{fin}', "
             + ("WEAKEST of the mix (defines L1/L2)" if weakest == r["sys"] else
                f"not the weakest ({weakest})" if weakest else "weakest unknown"))
-    idx = {x["name"]: x for x in (rows(os.path.join(S, "collect", "runs-index.csv")) or [])}
+    idx = {x["name"]: x for x in (rows(os.path.join(COL,"runs-index.csv")) or [])}
     for r in rs["slo"] + rs["fix"]:
         rc_ok = False
         for rc in (os.path.join(r["dir"], "h1-runcheck.txt"), os.path.join(os.path.dirname(r["dir"]), "h1-runcheck.txt")):
@@ -384,11 +391,11 @@ def main():
         if not k.endswith("-ds-popcorn-new-12"):
             errs.append(f"kernel_node0 '{k}'")
         res("F", f"F3 {r['name']}", not errs, "; ".join(errs))
-    fx = rows(os.path.join(S, "collect", "fix-steps.csv")) or []
+    fx = rows(os.path.join(COL,"fix-steps.csv")) or []
     for m in mixes:
         got = sorted((x["level"], x["system"]) for x in fx if x["mix"] == m)
         res("F", f"F4 {m} fixed windows", got == sorted((l, s) for l in ("L1", "L2") for s in FIXSYS), f"{got}")
-        f2 = fig2_rows(os.path.join(S, "collect", "fig", f"{W}-{m}-fig2.csv"))
+        f2 = fig2_rows(os.path.join(COL,"fig", f"{W}-{m}-fig2.csv"))
         if a.skip_fig2:
             res("W", f"F5 {m} Fig 2", False, "skipped (--skip-fig2, self-test only)")
         elif f2 is None:
@@ -461,7 +468,7 @@ def main():
             res("W", f"W1 {m} all-HWcc highest", xs[(m, "hw")] >= 0.98 * max(xs[(m, k)] for k in SYSTEMS if k != "hw"),
                 "x " + " ".join(f"{k} {xs[(m, k)]:g}" for k in SYSTEMS))
     try:
-        bad = [l for l in open(os.path.join(S, "collect", "notes.txt"))
+        bad = [l for l in open(os.path.join(COL,"notes.txt"))
                if any(t in l for t in ("no overload step", "fig1", "fig2", "export_csv"))
                and not (a.skip_fig2 and ("fig1" in l or "fig2" in l))]
     except OSError:
@@ -493,7 +500,7 @@ def main():
     if n > 1:
         compare(W, n, E, mixes, a.skip_fig2)
     verdict = f"H1CHECK {'FAIL' if nfail else 'PASS'} {W} r{n}: {nfail} FAIL, {nwarn} WARN, {nrep} REPORT"
-    with open(os.path.join(S, "check.txt"), "w") as f:
+    with open(a.out or os.path.join(S, "check.txt"), "w") as f:
         f.write("\n".join(lines + [verdict]) + "\n")
     print("\n".join(l for l in lines if not l.startswith("OK")))
     print(verdict)

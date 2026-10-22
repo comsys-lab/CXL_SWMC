@@ -24,7 +24,7 @@ TREE=$(cd "$EVD/../.." && pwd)
 #   RUNSETS          [run] the run sets this config may drive (others refuse it); empty = all
 #   EVIDENCE_TAG     [run] evidence dir tag instead of the run set name (evidence_dir; e.g. h1-u10u95.conf vdb-u10u95);
 #                    a driver that sets its own EVIDENCE_TAG after sourcing this file (runset-h2n.sh) overrides it
-unset REGISTRY LEVELS_SOURCE LEVELS_REGISTRY RS_PROC_CXL_SHM RUNSETS EVIDENCE_TAG
+unset REGISTRY LEVELS_SOURCE LEVELS_REGISTRY RS_PROC_CXL_SHM RUNSETS EVIDENCE_TAG EXPORT_SUFFIX
 CONFSH=$(python3 -I -B "$EVD/evalconf.py" shell ${EVAL_CONF:+--conf "$EVAL_CONF"}) || { echo "RUNSET STOP: ${EVAL_CONF:-eval.conf} does not parse"; exit 2; }
 eval "$CONFSH"
 export EVAL_CONF   # absolute path of the config (evalconf.py shell); pins-vdb.sh (sourced by the hook) reads the same file
@@ -107,6 +107,7 @@ manifest() {  # written into E at the real start
     python3 -I -B "$EVD/evalconf.py" dump "$CONF_WL" --conf "$EVAL_CONF" | sed 's/^/conf: /'
     python3 -I -B "$EVD/evalconf.py" later --conf "$EVAL_CONF" | sed 's/^/later: /'
     [ -z "${REGISTRY:-}" ] || echo "registry=$REGISTRY"
+    [ -z "${ONLY_POINTS:-}" ] || echo "only_points=$VDB_POINTS (env EVAL_ONLY_POINTS; conf points ${CONF_POINTS:-})"
     [ -z "${LEVELS_SOURCE:-}" ] || echo "levels_source=$LEVELS_SOURCE registry=$LEVELS_REGISTRY run=$LEVELS_FROM_RUN dir=${LEVELS_SRC_DIR:-} config_sha256=${LEVELS_SRC_SHA:-}"
     local b
     for b in "$@"; do
@@ -165,7 +166,8 @@ block_dry() {
   else die "block dry start did not reach the evidence-dir check: $out"; fi
 }
 export_run() {  # <export script> <evidence dir>: canonical CSVs into DERIVED_ROOT/<WL>/<RUNSET>/run<K>
-  local out=$DERIVED_ROOT/$WL/$RUNSET/run$K
+  # (runset-vdb.sh EVAL_ONLY_POINTS: run<K>-only-<mixes>, so a partial rerun never replaces a whole run's export)
+  local out=$DERIVED_ROOT/$WL/$RUNSET/run$K${EXPORT_SUFFIX:-}
   mkdir -p "$out" && python3 -I -B "$1" --run "$K" --runset "$RUNSET" --config-sha256 "$CSHA" --out "$out" "$2" > "$out/export.log" 2>&1 \
     && echo "export: $out" || echo "RUNSET NOTE: export failed (see $out/export.log; the run itself is unaffected)"
 }

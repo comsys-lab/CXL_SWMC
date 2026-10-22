@@ -2,7 +2,10 @@
 """Vector DB export: canonical CSVs (evaluation-pipeline rev 3 §4.2; experiments/eval/canon.py) from one evidence dir.
 Host only, offline; the evidence is only read. Metric formulas live here (and in urate_report.py, reused).
 
-usage: export.py --run K --runset R --config-sha256 S --out DIR [--vcpus 16] [--round N] <evidence dir>
+usage: export.py --run K --runset R --config-sha256 S --out DIR [--vcpus 16] [--round N] <evidence dir> [<evidence dir> ...]
+  Several evidence dirs (2026-10-22): one run k whose H1 mixes are split over evidence versions (eval2 run 1: v1 u50
+  u90, v2 u10 via runset-vdb.sh EVAL_ONLY_POINTS); each must be an H1 hook layout whose eval-manifest.txt has run=K
+  and config_sha256=S, and each mix must come from exactly one dir; rows keep their source_dir.
 Layouts:
   H1 hook layout (experiments/eval runset-vdb.sh roots, recovery/H1-main-v*): <E>/vdb/r<n>/run/h1-runs.tsv lists every
     part (<lifetime>/slo, <lifetime>/fix with "<L2 step>,<L1 step>"); point = mix u5/u50/u90 (upd_share 0.05/0.5/0.9).
@@ -231,8 +234,43 @@ def recall(part):
     return canon.fl(kv.get("recall_measured_ok")), canon.fl(kv.get("recall_tie_aware_measured_ok"))
 
 
-def export(E, out, rnd, vcpus):
-    parts = parts_urate(E) if os.path.isfile(os.path.join(E, "urate-results.tsv")) else parts_h1(E, rnd)
+def eval_manifest(E):
+    """run=, config_sha256= of an evaluation evidence dir (lib.sh eval-manifest.txt); {} without the file"""
+    p, d = os.path.join(E, "eval-manifest.txt"), {}
+    if os.path.isfile(p):
+        for line in open(p):
+            for k in ("run", "config_sha256"):
+                m = re.search(rf"(?:^|\s){k}=(\S+)", line)
+                if m and k not in d:
+                    d[k] = m.group(1)
+    return d
+
+
+def parts_split(Es, rnd, run, sha):
+    """H1 parts of one run split over several evidence versions (2026-10-22: eval2 run 1 H1 = v1 u50 u90 + v2 u10,
+    runset-vdb.sh EVAL_ONLY_POINTS): every dir an H1 hook layout of the same run and config_sha256 (eval-manifest.txt)
+    as --run / --config-sha256; each mix from exactly one dir"""
+    parts, owner = [], {}
+    for E in Es:
+        if os.path.isfile(os.path.join(E, "urate-results.tsv")):
+            sys.exit(f"export.py: {E}: several evidence dirs only for the H1 hook layout")
+        m = eval_manifest(E)
+        if m.get("run") != str(run) or m.get("config_sha256") != sha:
+            sys.exit(f"export.py: {E}: eval-manifest run {m.get('run')} config_sha256 {m.get('config_sha256')} != "
+                     f"--run {run} --config-sha256 {sha}")
+        for p in parts_h1(E, rnd):
+            if owner.setdefault(p["point"], E) != E:
+                sys.exit(f"export.py: mix {p['point']} in {owner[p['point']]} and {E}")
+            parts.append(p)
+    return parts
+
+
+def export(E, out, rnd, vcpus, run=None, sha=None):
+    if isinstance(E, (list, tuple)) and len(E) > 1:
+        parts = parts_split(E, rnd, run, sha)
+    else:
+        E = E[0] if isinstance(E, (list, tuple)) else E
+        parts = parts_urate(E) if os.path.isfile(os.path.join(E, "urate-results.tsv")) else parts_h1(E, rnd)
     fixed = []
     for p in parts:
         part, c = p["part"], common(p, vcpus)
@@ -355,10 +393,10 @@ def main():
     ap.add_argument("--out", required=True)
     ap.add_argument("--vcpus", type=int, default=16)
     ap.add_argument("--round", type=int)
-    ap.add_argument("E")
+    ap.add_argument("E", nargs="+", help="evidence dir; several = one run split over evidence versions (H1 layout)")
     a = ap.parse_args()
     out = canon.Out("vdb", a.run, a.config_sha256)
-    export(os.path.abspath(a.E), out, a.round, a.vcpus)
+    export([os.path.abspath(e) for e in a.E], out, a.round, a.vcpus, a.run, a.config_sha256)
     n = out.write(a.out)
     print("export.py vdb: " + " ".join(f"{k}={v}" for k, v in n.items()) + f" -> {a.out}")
 

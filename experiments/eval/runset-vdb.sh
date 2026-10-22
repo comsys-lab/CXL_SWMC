@@ -21,9 +21,23 @@
 #                  this driver's pin check and by hook.sh (EVAL_PINS)
 #   VDB_SLO_EXTRA  loadgen arguments appended to every SLO part (m4-run.sh KIND=h1 H1_SLO_EXTRA; fixed-load parts
 #                  unchanged), e.g. the 2026-10-21 22:4x confirm rule; check.py expects its last --confirm-reps
+# env EVAL_ONLY_POINTS (optional, 2026-10-22 split H1 of eval2 run 1): a subset of VDB_POINTS, e.g. "u10", to rerun only
+#   these mixes of run k as a new evidence version (same conf, config_sha256, seeds and per-mix lifetime order: the
+#   order seeds are per mix, the mix shuffle of one mix is that mix). The run plan, levels, collect and check then
+#   cover these mixes only; the other mixes come from an earlier version of run k (export.py takes several evidence
+#   dirs). Recorded in the plan output and in eval-manifest.txt (only_points=). Unset = every mix of VDB_POINTS.
 RUNSET=vdb WL=vdb
+ONLY_POINTS=${EVAL_ONLY_POINTS:-}
 unset VDB_PINS VDB_SLO_EXTRA VDB_LEVELS_CONFIRM_FAIL
 . "$(dirname "$0")/lib.sh"
+if [ -n "$ONLY_POINTS" ]; then
+  for m in $ONLY_POINTS; do [[ " $VDB_POINTS " == *" $m "* ]] || die "EVAL_ONLY_POINTS: $m is not in VDB_POINTS ($VDB_POINTS)"; done
+  [ "$VDB_MG_POINTS" = "$VDB_POINTS" ] || die "EVAL_ONLY_POINTS needs VDB_MG_POINTS = VDB_POINTS in the conf"
+  CONF_POINTS=$VDB_POINTS VDB_POINTS=
+  for m in $CONF_POINTS; do [[ " $ONLY_POINTS " == *" $m "* ]] && VDB_POINTS="$VDB_POINTS $m"; done
+  VDB_POINTS=${VDB_POINTS# } VDB_MG_POINTS=$VDB_POINTS EXPORT_SUFFIX=-only-${VDB_POINTS// /-}
+  plan "EVAL_ONLY_POINTS: mixes [$VDB_POINTS] of the conf's [$CONF_POINTS] (config_sha256 unchanged: $CSHA; run-set export -> run$K$EXPORT_SUFFIX)"
+fi
 VPINS=$EVD/${VDB_PINS:-pins-vdb.sh}
 [[ ${VDB_PINS:-x} != */* ]] || die "VDB_PINS is a file name next to runset-vdb.sh"
 [[ ${VDB_SLO_EXTRA:-} =~ ^[-a-z0-9.,\ ]*$ ]] || die "bad VDB_SLO_EXTRA"   # commas: --overload f1,f2 lists
