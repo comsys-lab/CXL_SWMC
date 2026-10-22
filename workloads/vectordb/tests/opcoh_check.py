@@ -13,7 +13,10 @@ usage: opcoh_check.py <run or scratch dir> fake|megalon|none|hwcc|popcorn|megalo
   every mode: one v2 record per OK search response (op-coh.bin vs searches.bin, joined by seq) and per OK update
               (vectordb.txt updates_ok_without_coh=0, records = server updates); search sections = segments + 1,
               update sections = 1; t_ns > 0; c_ns = Popcorn parts + Megalon parts (proto.h RD / EV / WR: Megalon >= 76
-              lean sampling, src bit 4, scales the timed-section sums per side); the server's opt.<op>.* totals at
+              lean sampling, src bit 4, scales the timed-section sums per side); late responses (2026-10-22,
+              experiments/vectordb/late_resp.py): a search record without an OK response, and a measured record
+              without an OK raw row (opsplit unmatched), only for a request the loadgen counted as a timeout in an
+              aborted / overload step (NOTE with the count; anything else FAIL); the server's opt.<op>.* totals at
               stop (nodes summed) equal the records' sums (ops, t_ns, c_ns, mod_bytes, pop.*, meg.wflush_bytes);
               opcoh.read_errors = register_errors = 0; search mod_bytes = 0; update mod_bytes >= vector record +
               level-0 block + delete-log entry; opsplit.py writes rows for both operation types and the column table.
@@ -50,6 +53,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.dirname(HERE)))
 sys.path.insert(0, os.path.join(ROOT, "experiments", "vectordb"))
 import opsplit  # noqa: E402
 import qcoh  # noqa: E402  (searches.bin layout)
+import late_resp  # noqa: E402  (late responses of saturated overload steps)
 
 S, mode = sys.argv[1], sys.argv[2]
 fails = []
@@ -110,12 +114,72 @@ parts = os.environ.get("OPCOH_PARTS", "").split() or [S]
 assert os.path.abspath(S) in [os.path.abspath(x) for x in parts], "OPCOH_PARTS must include the checked part"
 alll = np.concatenate([np.fromfile(os.path.join(x, "loadgen", "op-coh.bin"), dtype=opsplit.OPLOG) for x in parts])
 acs, acu = alll[alll["op"] == 3]["c"], alll[alll["op"] == 4]["c"]  # closure: every part of the lifetime
+# lost responses (late_resp.lost): operations the server finished and counted in opt.* whose response the loadgen
+# never recorded (saturated-step timeouts minus the late records it did record), summed over the parts. 0 = exact
+# closure as before; > 0: opt.<op>.ops = records + lost exactly, every opt.<op>.* sum >= the records' sum.
+LOST = {"search": 0, "update": 0}
+for x in parts:
+    pl = np.fromfile(os.path.join(x, "loadgen", "op-coh.bin"), dtype=opsplit.OPLOG)
+    for op, code in (("search", 3), ("update", 4)):
+        LOST[op] += late_resp.lost(os.path.join(x, "loadgen"), pl[pl["op"] == code], op) or 0
+check(LOST["search"] >= 0 and LOST["update"] >= 0, f"late records <= saturated-step timeouts ({LOST})")
+if any(LOST.values()):
+    print(f"OPCOH_CHECK NOTE: lost responses (server finished, loadgen timed out and never recorded) {LOST}: "
+          "closure opt.<op>.ops = records + lost, other opt.<op>.* sums >= records' sums")
+
+
+def closes(op, server, records):
+    return server == records if LOST[op] == 0 else server >= records
+
+
 print(f"op records {len(logs)} (search {len(srch)}, update {len(upd)}), OK searches {len(ok)}, "
       f"server updates {sum(s['updates'] for s in st)}")
 check(len(logs) and (c["version"] == 2).all(), "version 2")
-check(np.array_equal(np.sort(srch["seq"]), np.sort(ok["seq"])), "one search record per OK search response")
+# search records vs ALL loadgen search responses (late_resp.py): every OK response has exactly one record; a record
+# without an OK response is allowed only as a late response of a request the loadgen counted as a timeout in an
+# aborted / overload step (searches.bin status kStatusTimeout, or no searches.bin record: response after finish() wrote
+# searches.bin); without rawid sidecars (step not derivable) only a timeout status, or no record at most as many as
+# the loadgen's search timeouts. Counted and printed as NOTE.
+oks = ok["seq"]
+okset = set(oks.tolist())
+sseq = srch["seq"]
+has_ok = np.isin(sseq, oks)
+check(len(np.unique(sseq)) == len(sseq) and np.array_equal(np.sort(sseq[has_ok]), np.sort(oks)),
+      "one search record per OK search response")
+st_of = {int(q): int(s) for q, s in zip(sr["seq"], sr["status"]) if s != 0}
+extra = srch[~has_ok]
+lr_extra = late_resp.late(lg, extra)
+bad_x, late_x, nosr_unknown = [], {}, 0
+for x, (cl, stp) in zip(extra, lr_extra):
+    q = int(x["seq"])
+    s = st_of.get(q)  # None: no searches.bin record
+    if cl == "late" and s in (None, late_resp.TIMEOUT):
+        late_x[stp] = late_x.get(stp, 0) + 1
+    elif cl == "unknown" and s == late_resp.TIMEOUT:
+        late_x[-1] = late_x.get(-1, 0) + 1
+    elif cl == "unknown" and s is None:
+        nosr_unknown += 1
+        late_x[-1] = late_x.get(-1, 0) + 1
+    else:
+        bad_x.append(f"seq {q} status {s} raw {cl} step {stp}")
+check(nosr_unknown <= late_resp.search_timeouts(lg), "records without a searches.bin record <= loadgen search timeouts")
+check(not bad_x, "search records without an OK response are late timeouts of aborted/overload steps: " + ", ".join(bad_x[:5]))
+if late_x:
+    print(f"OPCOH_CHECK NOTE: {sum(late_x.values())} search records without an OK loadgen response (late responses to "
+          f"requests counted as timeouts; per step {dict(sorted(late_x.items()))}, -1 = step not derivable)")
+srch_ok = srch[has_ok]  # records with an OK response: the per-response joins below
+# measured op records without an OK raw row (opsplit "unmatched"): only such late timeouts (both operation types)
+meas_all = logs[logs["measured"] == 1]
+lr_meas = late_resp.late(lg, meas_all)
+n_late_meas = sum(1 for cl, _ in lr_meas if cl == "late")
+bad_meas = [f"seq {int(x['seq'])} op {int(x['op'])} step {stp}" for x, (cl, stp) in zip(meas_all, lr_meas) if cl == "bad"]
+check(not bad_meas, "measured op records without an OK raw row are late timeouts of aborted/overload steps: "
+      + ", ".join(bad_meas[:5]))
+if n_late_meas:
+    print(f"OPCOH_CHECK NOTE: {n_late_meas} measured op records are late responses (raw row a timeout in an "
+          "aborted/overload step): opsplit unmatched must equal this count")
 check(vt.get("updates_ok_without_coh") == "0" and vt.get("bad_coh_version") == "0", "no response without a v2 block")
-check(len(acu) == sum(s["updates"] for s in st) and len(upd) > 0, "one update record per update")
+check(len(acu) + LOST["update"] == sum(s["updates"] for s in st) and len(upd) > 0, "one update record per update")
 seg = int(ok["segs"][0]) if len(ok) else 0
 check((cs["sections"] == seg + 1).all() and (cu["sections"] == 1).all(), "sections")
 check((c["t_ns"] > 0).all(), "t_ns > 0")
@@ -157,30 +221,31 @@ if lean_r.any():
           "lean: no read-side event time without timed read sections")
 for op, x in (("search", acs), ("update", acu)):
     tot = lambda k: sum(s[f"opt.{op}.{k}"] for s in st)  # noqa: E731
-    check(tot("ops") == len(x), f"opt.{op}.ops = records")
+    check(tot("ops") == len(x) + LOST[op], f"opt.{op}.ops = records + lost ({tot('ops')} vs {len(x)} + {LOST[op]})")
     for k, v in (("t_ns", x["t_ns"]), ("c_ns", x["c_ns"]), ("mod_bytes", x["mod_bytes"]), ("pop.is_ns", x["pf_ns"][:, 0]),
                  ("pop.sm_ns", x["pf_ns"][:, 1]), ("pop.ipi_ns", x["ipi_ns"]), ("meg.wflush_bytes", x["mg_wflush_bytes"])):
-        check(tot(k) == int(v.astype(np.uint64).sum()), f"opt.{op}.{k} = records' sum ({tot(k)} vs {int(v.sum())})")
+        check(closes(op, tot(k), int(v.astype(np.uint64).sum())), f"opt.{op}.{k} = records' sum ({tot(k)} vs {int(v.sum())})")
 for op, x in (("search", acs), ("update", acu)):
-    check(sum(s[f"opt.{op}.meg.vcopy_cnt"] for s in st) == int(x["vcopy_cnt"].astype(np.uint64).sum()), f"opt.{op}.meg.vcopy_cnt")
+    check(closes(op, sum(s[f"opt.{op}.meg.vcopy_cnt"] for s in st), int(x["vcopy_cnt"].astype(np.uint64).sum())),
+          f"opt.{op}.meg.vcopy_cnt")
 check(all(s["opcoh.read_errors"] == 0 and s["opcoh.register_errors"] == 0 for s in st), "no counter read/register errors")
 check((cs["mod_bytes"] == 0).all(), "search mod_bytes 0")
 check((cs["wait_ns"] <= cs["t_ns"]).all() and (cu["wait_ns"] == 0).all(), "E1 wait inside search T, 0 for updates")
 for op, x in (("search", acs), ("update", acu)):
-    check(sum(s[f"opt.{op}.wait_ns"] for s in st) == int(x["wait_ns"].sum()), f"opt.{op}.wait_ns = records' sum")
+    check(closes(op, sum(s[f"opt.{op}.wait_ns"] for s in st), int(x["wait_ns"].sum())), f"opt.{op}.wait_ns = records' sum")
 REC = int(os.environ.get("OPCOH_RECORD_BYTES", "3136"))  # level-0 record: 3136 fp32 768-d, 832 sq8 (h2n-block sets it)
 check((cu["mod_bytes"] >= REC + 192 + 64).all(), "update mod_bytes >= record + level-0 block + delete-log entry")
 by = {int(q): i for i, q in enumerate(ok["seq"])}
-oi = np.array([by[int(q)] for q in srch["seq"]], dtype=np.int64)
+oi = np.array([by[int(q)] for q in srch_ok["seq"]], dtype=np.int64)  # records with an OK response only
 if mode == "fake":
     check(all(s["opcoh.pop_source"] == "fake" for s in st), "source fake")
-    check(np.array_equal(cs["pf_ns"][:, 0], ok["dists"][oi].astype(np.uint64)), "search pf_ns[0] = dists")
+    check(np.array_equal(srch_ok["c"]["pf_ns"][:, 0], ok["dists"][oi].astype(np.uint64)), "search pf_ns[0] = dists")
     check((cs["pf_cnt"][:, 0] == seg).all() and (cs["ipi_ns"] <= cs["pf_ns"][:, 0] // 8).all(), "search fake counts")
     check((cu["pf_ns"][:, 1] == 1000).all() and (cu["pf_cnt"][:, 1] == 1).all(), "update fake S->M 1000 ns")
     check((cu["nontrans_ns"] == 500).all() and (cu["nontrans_cnt"] == 1).all() and (cs["nontrans_ns"] == 0).all(),
           "update fake no-transition 500 ns")
     check((cu["c_ns"] == 1000).all(), "no-transition faults are not part of C")
-    check(sum(s["opt.update.pop.nontrans_ns"] for s in st) == 500 * len(acu), "opt.update.pop.nontrans_ns")
+    check(sum(s["opt.update.pop.nontrans_ns"] for s in st) == 500 * (len(acu) + LOST["update"]), "opt.update.pop.nontrans_ns")
 pop_zero = ((c["pf_ns"] == 0).all() and (c["pf_cnt"] == 0).all() and (c["ipi_ns"] == 0).all()
             and (c["nontrans_ns"] == 0).all())
 mg_fields = [f for f in opsplit.OPCOH.names if f.startswith("mg_") or f.startswith("an_") or f.startswith("vcopy")]
@@ -221,7 +286,7 @@ elif mode == "megalon":
                     rec = "mg_write_sampled" if f == "write_sampled" else "an_" + f
                     if f == "write_sampled" and not all(f"opt.{op}.meg.anchor.{f}" in s for s in st):
                         continue  # vdb builds <= 14 have no write_sampled key (their records carry 0)
-                    check(sum(s[f"opt.{op}.meg.anchor.{f}"] for s in st) == int(x[rec].astype(np.uint64).sum()),
+                    check(closes(op, sum(s[f"opt.{op}.meg.anchor.{f}"] for s in st), int(x[rec].astype(np.uint64).sum())),
                           f"opt.{op}.meg.anchor.{f}")
     else:
         mgf = [f for f in opsplit.OPCOH.names if f.startswith("mg_")]
@@ -242,7 +307,10 @@ if r.returncode == 0:
     rows = list(csv.DictReader(open(os.path.join(S, "opsplit-steps.csv"))))
     tags = {x["column"]: x["tag"] for x in csv.DictReader(open(os.path.join(S, "opsplit-steps.columns.csv")))}
     check({x["op"] for x in rows} == {"search", "update"}, "rows for search and update")
-    check(all(x["unmatched"] == "0" for x in rows), "every measured record matched")
+    # every measured record matched, except the late responses counted above (raw row a timeout in an aborted /
+    # overload step); without rawid sidecars (time matching) still 0
+    check(all(x["unmatched"] == str(n_late_meas) for x in rows),
+          f"every measured record matched (unmatched = {n_late_meas} late responses)")
     if glob.glob(os.path.join(lg, "rawid-step*.bin")):
         check(all(x["match"] == "req_id" for x in rows), "id-based matching (rawid sidecars present)")
     check(tags.get("T_ms") == "measured" and tags.get("C_ms") == "derived" and tags.get("mg_check_ms", "").startswith("sampled×"),
