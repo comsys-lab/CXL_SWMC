@@ -116,7 +116,8 @@ alll = np.concatenate([np.fromfile(os.path.join(x, "loadgen", "op-coh.bin"), dty
 acs, acu = alll[alll["op"] == 3]["c"], alll[alll["op"] == 4]["c"]  # closure: every part of the lifetime
 # lost responses (late_resp.lost): operations the server finished and counted in opt.* whose response the loadgen
 # never recorded (saturated-step timeouts minus the late records it did record), summed over the parts. 0 = exact
-# closure as before; > 0: opt.<op>.ops = records + lost exactly, every opt.<op>.* sum >= the records' sum.
+# closure as before; > 0: records <= opt.<op>.ops <= records + lost (lost is an upper bound: a timed-out request may
+# never have reached the server), every opt.<op>.* sum >= the records' sum.
 LOST = {"search": 0, "update": 0}
 for x in parts:
     pl = np.fromfile(os.path.join(x, "loadgen", "op-coh.bin"), dtype=opsplit.OPLOG)
@@ -125,7 +126,7 @@ for x in parts:
 check(LOST["search"] >= 0 and LOST["update"] >= 0, f"late records <= saturated-step timeouts ({LOST})")
 if any(LOST.values()):
     print(f"OPCOH_CHECK NOTE: lost responses (server finished, loadgen timed out and never recorded) {LOST}: "
-          "closure opt.<op>.ops = records + lost, other opt.<op>.* sums >= records' sums")
+          "closure records <= opt.<op>.ops <= records + lost, other opt.<op>.* sums >= records' sums")
 
 
 def closes(op, server, records):
@@ -221,7 +222,10 @@ if lean_r.any():
           "lean: no read-side event time without timed read sections")
 for op, x in (("search", acs), ("update", acu)):
     tot = lambda k: sum(s[f"opt.{op}.{k}"] for s in st)  # noqa: E731
-    check(tot("ops") == len(x) + LOST[op], f"opt.{op}.ops = records + lost ({tot('ops')} vs {len(x)} + {LOST[op]})")
+    # LOST is an upper bound: a timed-out request may also never have reached the server (eval2 run 3 mg-u50: 2
+    # saturated-step timeouts, 1 served), so records <= opt.ops <= records + lost; exact when lost = 0
+    check(len(x) <= tot("ops") <= len(x) + LOST[op],
+          f"records <= opt.{op}.ops <= records + lost ({len(x)} <= {tot('ops')} <= {len(x)} + {LOST[op]})")
     for k, v in (("t_ns", x["t_ns"]), ("c_ns", x["c_ns"]), ("mod_bytes", x["mod_bytes"]), ("pop.is_ns", x["pf_ns"][:, 0]),
                  ("pop.sm_ns", x["pf_ns"][:, 1]), ("pop.ipi_ns", x["ipi_ns"]), ("meg.wflush_bytes", x["mg_wflush_bytes"])):
         check(closes(op, tot(k), int(v.astype(np.uint64).sum())), f"opt.{op}.{k} = records' sum ({tot(k)} vs {int(v.sum())})")
