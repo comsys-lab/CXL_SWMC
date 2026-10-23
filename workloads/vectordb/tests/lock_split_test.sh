@@ -14,9 +14,14 @@ FAKE=${FAKE:-1000} SEG=${SEGMENTS:-4}
 [ -e "$S" ] && { echo "refusing: $S exists"; exit 2; }
 mkdir -p "$S"
 rc=0
+# "on" runs both servers (writer, 4 searchers, readers each) on CPUS_ON (default 18-19: 2 Host node-1 CPUs inside
+# the session cpuset), so the writer
+# waits on the run queue and hold_rq > 0 is exercised
 env VDB_LOCK_SPLIT=1 VDB_OPCOH_FAKE=1 VDB_LOCK_SPLIT_FAKE_NS=$FAKE TRACE=0 SEGMENTS=$SEG VEC_FORMAT=${VEC_FORMAT:-sq8} \
-  bash "$HERE/host_smoke.sh" "$B" "$LG" "$D" "$S/on" > "$S/on.log" 2>&1 || { echo "host_smoke (on) rc != 0 (see $S/on.log)"; rc=1; }
-env -u VDB_LOCK_SPLIT -u VDB_LOCK_SPLIT_FAKE_NS VDB_OPCOH_FAKE=1 OPCOH=fake TRACE=0 SEGMENTS=$SEG VEC_FORMAT=${VEC_FORMAT:-sq8} \
+  CPUS=${CPUS_ON:-18-19} bash "$HERE/host_smoke.sh" "$B" "$LG" "$D" "$S/on" > "$S/on.log" 2>&1 \
+  || { echo "host_smoke (on) rc != 0 (see $S/on.log)"; rc=1; }
+REC=$([ "${VEC_FORMAT:-sq8}" = sq8 ] && echo 832 || echo 3136)   # opcoh_check level-0 record size (as h2n-block.sh)
+env -u VDB_LOCK_SPLIT -u VDB_LOCK_SPLIT_FAKE_NS VDB_OPCOH_FAKE=1 OPCOH=fake OPCOH_RECORD_BYTES=$REC TRACE=0 SEGMENTS=$SEG VEC_FORMAT=${VEC_FORMAT:-sq8} \
   bash "$HERE/host_smoke.sh" "$B" "$LG" "$D" "$S/off" > "$S/off.log" 2>&1 || { echo "host_smoke (off) rc != 0 (see $S/off.log)"; rc=1; }
 python3 -I - "$S" "$FAKE" "$SEG" <<'PY' || rc=1
 import csv, sys
@@ -59,10 +64,13 @@ def check(tag, d, final_row):
     for name, ok in c:
         if not ok: bad.append(f"{tag}: {name}")
     return n, g("hold_ns"), g("hold_coh_ns"), g("hold_rq_ns"), g("hold_cpu_ns"), g("sample_ns"), g("hold_overlap_cnt")
+rq_all = 0
 for k in (0, 1):
     d = final(f"{S}/on/node{k}.log")
     n, h, co, rq, cpu, smp, ov = check(f"on node{k} final", d, True)
+    rq_all += rq
     print(f"on node{k}: inserts={n} hold_mean_us={h / max(n, 1) / 1e3:.1f} coh={co} rq={rq} cpu={cpu} sample_ns_mean={smp / max(n, 1):.0f} overlap={ov}")
+if rq_all <= 0: bad.append("on: hold_rq = 0 on both nodes (contended CPUs: the run-queue path is not exercised)")
 rows = list(csv.DictReader(open(f"{S}/on/stats-steps.csv")))
 for r in rows:
     d = {k: int(float(v)) for k, v in r.items() if k.startswith("lock_split.") and v not in ("", None)}

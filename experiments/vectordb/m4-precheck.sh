@@ -18,10 +18,12 @@ if [ -n "${EXPECT_DAX_UUID:-}" ]; then
   echo "dax uuid=$u"
   [ "$u" = "$EXPECT_DAX_UUID" ] || fail "namespace0.0 uuid $u != $EXPECT_DAX_UUID"
 fi
-# Popcorn build >= 11: instr/detail must be 0 (default; detail-only timings are not part of any measurement)
+# Popcorn build >= 11: instr/detail must be 0 (default; detail-only timings are not part of any measurement).
+# PRECHECK_ALLOW_DETAIL=1: recorded, not checked (experiment popcorn-writer-lock-split only: h2n-block.sh H2N_FIXED
+# sets detail per part itself and restores 0)
 if [ -r /sys/kernel/swmc/instr/detail ]; then
-  echo "instr enabled=$(cat /sys/kernel/swmc/instr/enabled 2>/dev/null) detail=$(cat /sys/kernel/swmc/instr/detail)"
-  [ "$(cat /sys/kernel/swmc/instr/detail)" = 0 ] || fail "instr/detail != 0"
+  echo "instr enabled=$(cat /sys/kernel/swmc/instr/enabled 2>/dev/null) detail=$(cat /sys/kernel/swmc/instr/detail) allow_detail=${PRECHECK_ALLOW_DETAIL:-0}"
+  [ "${PRECHECK_ALLOW_DETAIL:-0}" = 1 ] || [ "$(cat /sys/kernel/swmc/instr/detail)" = 0 ] || fail "instr/detail != 0"
 fi
 f=$(sudo -n fuser -v /dev/dax0.0 2>&1); echo "fuser: [$f]"
 echo "$f" | grep -q "sudo:" && fail "sudo denied"

@@ -58,6 +58,36 @@ for l in $H2N_LIFETIMES; do
   LIVES+=("$l")
 done
 [ ${#LIVES[@]} -ge 1 ] || die "no lifetimes"
+# Fixed-window lifetimes (optional; unset = every lifetime is one SLO search, as before): H2N_FIXED = tokens
+#   <sys>/<part>/<detail>/<recv>/<rates>/<warmup s>/<measure s>/<drain s>
+# A lifetime of system <sys> runs the parts of its tokens in the given order (run.sh PARTS, one server lifetime;
+# loadgen --mode fixed --rates <rates> --warmup-s 0 --step-warmup-s .. --step-measure-s .. --drain-s .., WITHOUT --slo:
+# no SLO early abort, the queue cap stays; --raw kept). <detail> 0|1 = /sys/kernel/swmc/instr/detail on every VM for
+# that part (fixed-part-hook.sh, set before and back to 0 after the part; Popcorn only), - = untouched (stays 0);
+# <recv> poll|idle|sleep = cxl_shm recv_mode for that part (back to RECV_MODE after it; Popcorn only), - = RECV_MODE.
+# Used by experiments knee-sweep-pilot and popcorn-writer-lock-split (lock-split.conf, knee-sweep-pilot.conf).
+#   H2N_NODE_ENV_EXTRA  ENV:K=V tokens added to every node's environment (e.g. ENV:VDB_LOCK_SPLIT=1)
+#   H2N_ALLOW_DETAIL    1 = m4-precheck.sh does not require instr/detail = 0 (PRECHECK_ALLOW_DETAIL; this block sets
+#                       detail itself per part and restores 0); only with a detail=1 part
+FIXED=${H2N_FIXED:-} NENV_X=${H2N_NODE_ENV_EXTRA:-} ALLOWDET=${H2N_ALLOW_DETAIL:-0}
+declare -A FPARTS=()   # sys -> "part ..."
+FDET=0
+for t in $FIXED; do
+  IFS=/ read -r fs fp fd fr frt fw fm fdr <<< "$t"
+  [[ $fs =~ ^(hw|pop|mg|mgoff)$ ]] && [[ $fp =~ ^[a-z0-9]+$ ]] && [[ $fd =~ ^(0|1|-)$ ]] && [[ $fr =~ ^(poll|idle|sleep|-)$ ]] \
+    && [[ $frt =~ ^[0-9.]+(,[0-9.]+)*$ ]] && [[ $fw =~ ^[0-9]+$ ]] && [[ $fm =~ ^[1-9][0-9]*$ ]] && [[ $fdr =~ ^[0-9]+$ ]] \
+    || die "bad H2N_FIXED token $t (<sys>/<part>/<0|1|->/<poll|idle|sleep|->/<rates>/<warmup>/<measure>/<drain>)"
+  [ $fs = pop ] || [ "$fd:$fr" = "-:-" ] || die "H2N_FIXED $t: detail / recv_mode only for pop"
+  [[ " ${FPARTS[$fs]:-} " == *" $fp "* ]] && die "H2N_FIXED: part $fp twice for $fs"
+  [ "$fd" = 1 ] && FDET=1
+  FPARTS[$fs]="${FPARTS[$fs]:-}${FPARTS[$fs]:+ }$fp"
+done
+if [ -n "$FIXED" ]; then
+  for l in "${LIVES[@]}"; do [ -n "${FPARTS[${l%%:*}]:-}" ] || die "H2N_FIXED has no part for lifetime $l"; done
+  [ $FDET = 0 ] || [ "$ALLOWDET" = 1 ] || die "H2N_FIXED has a detail=1 part: H2N_ALLOW_DETAIL=1 needed (approved scope)"
+fi
+[[ $ALLOWDET =~ ^[01]$ ]] || die "bad H2N_ALLOW_DETAIL"
+[ -z "$NENV_X" ] || [[ $NENV_X =~ ^(ENV:[A-Z_][A-Z0-9_]*=[^[:space:]]*( |$))+$ ]] || die "bad H2N_NODE_ENV_EXTRA ($NENV_X)"
 [ -f "$REGION" ] && [ "$(sha256sum < "$C8/packet.sha256" | cut -c1-64)" = "$POP_BUNDLE_SHA" ] \
   && (cd "$C8" && sha256sum -c --quiet packet.sha256) || die "REGION or the Popcorn bundle ($C8) does not verify"
 IPS=() DOMS=()
@@ -141,6 +171,7 @@ echo "BLOCK PLAN: vec_format=$VF ef=$EF init=$INIT host_image=$HOST_IMAGE"
 echo "BLOCK PLAN: h2n vdb N=$N vcpu/VM=$VCPU threads $((VCPU - 1))+1 nodes=[${IPS[*]}] lifetimes=[${LIVES[*]}] app=$APP mg_app=$MGAPP ring=$RING cxlbw=$CXLBW hostcpu=$HOSTCPU opcoh_strict=$STRICT"
 echo "BLOCK PLAN: server_args plain=[$SA]${MGSA:+ megalon=[$MGSA]}"
 echo "BLOCK PLAN: $LAYOUT"
+[ -z "$FIXED" ] || echo "BLOCK PLAN: fixed windows (no SLO search) [$FIXED] node_env_extra=[$NENV_X] allow_detail=$ALLOWDET"
 if [ "$DRYB" = 1 ]; then echo "BLOCK DRY STOP: evidence-dir check reached ($E; dry: no lock, no VM contact)"; exit 0; fi
 [ -d "$E" ] && [ -z "$(ls -A "$E" | grep -v '^sequence')" ] || die "$E missing or not empty"
 # ---------------------------------------------------------------------------------------------------- real block
@@ -212,6 +243,13 @@ finish() {
     echo "$out" | sed "s/^/$(date -Is) $ip /" >> "$E/rollback.out"
     echo "$out" | grep -qx "procs=0" || echo "ROLLBACK FAIL: $ip server process left (see rollback.out)" | tee -a "$E/rollback.out"
   done
+  if [ $FDET = 1 ]; then  # H2N_FIXED detail=1 parts: instr/detail back to 0 on every VM (whatever state a stop left)
+    for ip in "${IPS[@]}"; do
+      out=$($SSH comsys@$ip "[ ! -e /sys/kernel/swmc/instr/detail ] || sudo -n sh -c 'echo 0 > /sys/kernel/swmc/instr/detail'; cat /sys/kernel/swmc/instr/detail 2>/dev/null || echo absent" < /dev/null 2>&1)
+      echo "$(date -Is) $ip instr_detail=$out" >> "$E/rollback.out"
+      [ "$out" = 0 ] || [ "$out" = absent ] || echo "ROLLBACK FAIL: $ip instr/detail not 0 ($out)" | tee -a "$E/rollback.out"
+    done
+  fi
   shm_teardown_left
   dax_unused rollback || echo "ROLLBACK FAIL: /dev/dax0.0 in use on a VM (see dax-users.txt)" | tee -a "$E/rollback.out"
   dax_owner root || echo "ROLLBACK FAIL: dax0.0 not root:root 600 on every VM (see dax-owner.txt)" | tee -a "$E/rollback.out"
@@ -227,6 +265,7 @@ gate() { bash "$HG" check "$E/gate-$1.txt" > /dev/null || stop "h3 gate ($1; see
   [ $HASMG = 1 ] && echo "megalon_build=$MEG_BUILD lib=$MEG_LIB cfg=$MEG_CFG sha256=$(sha256sum < "$MEG_CFG" | cut -c1-64) vmeg=$VMEG mg_max_deletes=$MG_MAXD"
   echo "writes=$X_WRITES sha256=$(sha256sum < "$X_WRITES" | cut -c1-64) max_deletes=$X_MAXD"
   echo "slo_part=[$H2N_SLO_PART]"
+  [ -z "$FIXED" ] || echo "fixed=[$FIXED] node_env_extra=[$NENV_X] allow_detail=$ALLOWDET (H2N_FIXED: the slo part is not run)"
   for d in "${DOMS[@]}"; do x=$(virsh -c qemu:///system dumpxml --inactive "$d" 2>/dev/null); echo "vm_xml_sha256.$d=$(printf '%s' "$x" | sha256sum | cut -c1-64) bytes=${#x}"; done
 } > "$E/h2n-params.txt"
 log "== PT pretouch check (start, $N VMs)"
@@ -237,7 +276,7 @@ SUMS=$(sha256sum < "$HOST_IMAGE/SHA256SUMS" | cut -c1-64)
 ALLINST=$INSTALL${MGINSTALL:+
 $MGINSTALL}
 for i in "${!IPS[@]}"; do
-  $SSH comsys@${IPS[$i]} "EXPECT_K=$K8 EXPECT_DAX_UUID=$EXPECT_DAX_UUID INIT_DIR=$INIT INIT_SUMS=$SUMS INIT_CHECK=$([ $i = 0 ] && echo 1 || echo 0) INSTALL_DIRS='$(echo "$ALLINST" | awk '{print $1}' | tr '\n' ' ')' bash -s" \
+  $SSH comsys@${IPS[$i]} "PRECHECK_ALLOW_DETAIL=$ALLOWDET EXPECT_K=$K8 EXPECT_DAX_UUID=$EXPECT_DAX_UUID INIT_DIR=$INIT INIT_SUMS=$SUMS INIT_CHECK=$([ $i = 0 ] && echo 1 || echo 0) INSTALL_DIRS='$(echo "$ALLINST" | awk '{print $1}' | tr '\n' ' ')' bash -s" \
     < $XV/m4-precheck.sh > "$E/precheck-vm$i.txt" 2>&1
   grep -q "^PRECHECK PASS" "$E/precheck-vm$i.txt" || stop "precheck vm$i: $(grep -m1 'PRECHECK FAIL' "$E/precheck-vm$i.txt")"
   while read -r g h; do
@@ -358,12 +397,86 @@ print("\t".join(sys.argv[2:8] + [f(s.get("max_offered_x_pass")), f(c.get("x_mean
     $RP/loadgen/summary.json "$name" $s $mix $U $N $VCPU "$name/slo" "$oc" >> "$E/h2n-results.tsv"
   dmesg_check $name || stop "$name: dmesg check"
 }
+# ---- one fixed-window lifetime (H2N_FIXED): run.sh PARTS = the system's parts, no --slo -----------------------------
+# Same server arguments, node environment (+ H2N_NODE_ENV_EXTRA), Popcorn cycle and checks as vdb_life; per part
+# <run>/<part>/ (loadgen, stats-steps.csv, steps.csv, opsplit, e1); detail / recv_mode per part by fixed-part-hook.sh
+# (PART_PRE_CMD / PART_POST_CMD; part-hooks.txt). Result row: empty max / confirm columns, note "fixed parts ...".
+vdb_fixed_life() {  # <sys> <mix>
+  local s=$1 mix=$2 U=${2#u} name=$1-$2-n$N R k L p t note rc mode oc=- OPS parts=${FPARTS[$1]} fs fp fd fr frt fw fm fdr
+  R=$E/$name
+  local LG=(--opt data=$X_DATA --opt writes=$X_WRITES --opt k=10 --mix "update=$U,search=$((100 - U))" --x-stream search --raw)
+  local RE=(V=$VPLAIN HOST_SERVER=$HOSTSRV LOADGEN=$LOADGEN INIT=$INIT READY_TIMEOUT=5400 RUN_KIND=measurement TRACE=0 STATS_OP=10
+    "PARTS=$parts" H1_MEASURE_RUN=1 MEASURE_PART_DIR=$MEASURE_PART_DIR "PART_GATE_CMD=bash $HG check"
+    "PART_PRE_CMD=bash $EV/fixed-part-hook.sh pre $s" "PART_POST_CMD=bash $EV/fixed-part-hook.sh post $s")
+  for t in $FIXED; do
+    IFS=/ read -r fs fp fd fr frt fw fm fdr <<< "$t"
+    [ "$fs" = "$s" ] || continue
+    RE+=("PART_ARGS_$fp=--mode fixed --rates $frt --warmup-s 0 --step-warmup-s $fw --step-measure-s $fm --drain-s $fdr" "PART_SEED_$fp=$SEED")
+  done
+  case $s in
+    hw)  RE+=(SYSTEM=all-HWcc "NODE_ENV=$NENV_X" NODE0_ENV= "SERVER_ARGS=$SA"); mode=hwcc OPS=none;;
+    pop) RE+=(SYSTEM=Popcorn-$RECV_MODE "NODE_ENV=$NENV_X" NODE0_ENV= "SERVER_ARGS=$SA --preloaded"); mode=popcorn OPS=swmc_acct;;
+    mg)  RE+=(SYSTEM=Megalon V=$VMEG HOST_SERVER=$MEG_BUILD/bin/vdb-server "SERVER_ARGS=$MGSA" "NODE_ENV=ENV:RACKOBJ_CONFIG=$VMEG/cfg/megalon.yaml${NENV_X:+ $NENV_X}"
+              NODE0_ENV=ENV:MEGALON_REINIT=1); mode=megalon-vm OPS=cohsnap;;
+    mgoff) RE+=(SYSTEM=Megalon V=$VMEG HOST_SERVER=$MEG_BUILD/bin/vdb-server "SERVER_ARGS=$MGSA"
+              "NODE_ENV=ENV:RACKOBJ_CONFIG=$VMEG/cfg/megalon.yaml ENV:MEGALON_COH_TIMERS=0${NENV_X:+ $NENV_X}" NODE0_ENV=ENV:MEGALON_REINIT=1); mode=megalon-t0 OPS=cohsnap;;
+  esac
+  gate $name; sys_up $s $name
+  servers_gone || stop "a vdb-server runs before $name"
+  log "$name: run.sh fixed parts [$parts] ($s, $mix, N=$N)"
+  env "${RE[@]}" FIXED_SPEC="$FIXED" RECV_MODE=$RECV_MODE bash $XV/run.sh "$name" "$E" -- "${LG[@]}" > "$E/$name.out" 2>&1; rc=$?
+  log "$name: run.sh rc $rc: $(tail -n 1 "$E/$name.out")"
+  env FIXED_SPEC="$FIXED" RECV_MODE=$RECV_MODE bash $EV/fixed-part-hook.sh check $s end >>"$E/$name-hook-end.txt" 2>&1 || log "$name NOTE: detail / recv_mode not at the defaults after the lifetime (see $name-hook-end.txt; the EXIT trap restores detail)"
+  [ $s = pop ] && pop_down
+  servers_gone || stop "servers left after $name"
+  [ -d "$R" ] || stop "$name: no run dir"
+  [ $rc = 0 ] || stop "$name: run.sh rc $rc (a part failed; see $E/$name.out, $R/part-hooks.txt)"
+  for k in "${!IPS[@]}"; do
+    L=$R/node$k.log
+    { grep -q "vdb-server: stopping" $L && [ "$(grep -c '^bad_records=0$' $L)" = 1 ]; } || stop "$name node$k: no clean stop / bad_records"
+    grep -q "^vdb-server: op coherence on," $L || stop "$name node$k: op coherence not on"
+    case $OPS in
+      swmc_acct) grep -qE "^vdb-server: op coherence on, popcorn source swmc_acct[ ,]" $L || stop "$name node$k: popcorn source != swmc_acct";;
+      cohsnap) grep -qE "^vdb-server: op coherence on, .*megalon cohsnap on," $L || stop "$name node$k: megalon cohsnap not on";;
+    esac
+    { grep -qx "opcoh.read_errors=0" $L && grep -qx "opcoh.register_errors=0" $L; } || stop "$name node$k: opcoh errors"
+    [[ $NENV_X != *VDB_LOCK_SPLIT=1* ]] || grep -q "^vdb-server: lock split on" $L || stop "$name node$k: lock split not on"
+  done
+  local OPP=; for p in $parts; do OPP+="$R/$p "; done
+  for p in $parts; do
+    local RP=$R/$p
+    [ -s $RP/loadgen/summary.json ] || stop "$name/$p: no loadgen output"
+    grep -q '"reason":"stream [a-z]* exhausted' $RP/loadgen/steps.jsonl && stop "$name/$p: writes file exhausted"
+    { grep -qx "ok_without_coh=0" $RP/loadgen/vectordb.txt && grep -qx "updates_ok_without_coh=0" $RP/loadgen/vectordb.txt &&
+      grep -qx "bad_coh_version=0" $RP/loadgen/vectordb.txt; } || stop "$name/$p: responses without an op coherence block"
+    grep -q 'workload_finish":"ok' $RP/loadgen/summary.json || stop "$name/$p: loadgen workload finish"
+    python3 $XV/opsplit.py $RP > $RP/opsplit.log 2>&1 || log "$name/$p NOTE: opsplit.py failed (see $RP/opsplit.log)"
+    OPCOH_NODES=$N OPCOH_PARTS="${OPP% }" MEGALON_LEAN=1 OPCOH_RECORD_BYTES=$([ $VF = sq8 ] && echo 832 || echo 3136) \
+      python3 $OPC $RP $mode > $RP/opcoh-check.txt 2>&1
+    t=$(grep -m1 -oE '^OPCOH_CHECK (PASS|FAIL)' $RP/opcoh-check.txt | cut -d' ' -f2); t=${t:-ERROR}
+    [ "$t" = PASS ] || { [ $STRICT = 1 ] && stop "$name/$p: opcoh_check $mode $t"; log "$name/$p NOTE: opcoh_check $mode $t (recorded)"; }
+    oc="${oc#-}${oc:+ }$p:$t"
+    python3 $XV/urate_check.py $RP --writers 1 > $RP/urate-check.txt 2>&1 || true
+    python3 $XV/e1_check.py --writes $X_WRITES --na $NA --nb $X_NB --searches $RP/loadgen/searches.bin --out $RP/e1 --sample 500 > /dev/null \
+      || stop "$name/$p: E1 violation (see $RP/e1.e1.txt)"
+  done
+  note="fixed parts: $parts"
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t\t\t\t%s\t%s\t%s\n' "$name" $s $mix $U $N $VCPU "$note" "$name" "${oc# }" >> "$E/h2n-results.tsv"
+  dmesg_check $name || stop "$name: dmesg check"
+}
 # ---- sequence ----------------------------------------------------------------------------------------------------
 for l in "${LIVES[@]}"; do
   IFS=: read -r ls lm lr <<< "$l"
-  log "== HSLO $ls $lm n$N${lr:+ $lr}"
-  vdb_life "$ls" "$lm" ${lr:+"$lr"}
+  if [ -n "$FIXED" ]; then
+    log "== FIXED $ls $lm n$N parts [${FPARTS[$ls]}]"
+    vdb_fixed_life "$ls" "$lm"
+  else
+    log "== HSLO $ls $lm n$N${lr:+ $lr}"
+    vdb_life "$ls" "$lm" ${lr:+"$lr"}
+  fi
 done
+# hook point (popcorn-writer-lock-split chain): a later knee sweep reuses this block with another H2N_FIXED in the same
+# VM8 lifetime (a separate runset-h2n.sh call with its own conf and evidence dir); nothing to do here
 [ $OWNED = root ] || { dax_owner root || stop "dax0.0 back to root"; OWNED=root; }
 log "== PT pretouch check (end)"
 bash $XK/pretouch-check-n.sh "$PRETOUCH_DIR" "$E/pretouch-check-end.txt" >> "$E/block.log" 2>&1 || stop "pretouch check (end)"

@@ -26,7 +26,12 @@ while [ $# -gt 0 ]; do
 done
 set -- "$K_ARG" "${REST[@]}"
 RUNSET=h2n-n$N WL=vdb CONF_WL=h2n
-unset H2N_PINS H2N_VEC_FORMAT H2N_EF H2N_INIT H2N_HOST_IMAGE H2N_REPEATS H2N_LOADGEN_EXTRA   # optional conf keys: never inherited from the environment
+unset H2N_PINS H2N_VEC_FORMAT H2N_EF H2N_INIT H2N_HOST_IMAGE H2N_REPEATS H2N_LOADGEN_EXTRA \
+  H2N_FIXED H2N_NODE_ENV_EXTRA H2N_ALLOW_DETAIL H2N_EVIDENCE_NAME   # optional conf keys: never inherited from the environment
+# Fixed-window keys (knee-sweep-pilot.conf, lock-split.conf; absent = SLO searches as above): H2N_FIXED,
+# H2N_NODE_ENV_EXTRA, H2N_ALLOW_DETAIL (passed to h2n-block.sh; its header documents them), H2N_EVIDENCE_NAME =
+# evidence dir <RESULTS_ROOT>/<name>-v<V> instead of <prefix>-run<k>-<tag>-n<N>-v<V>; with H2N_FIXED export_h2n.py
+# is skipped (no SLO result; the experiment's own export reads the evidence dir)
 . "$(dirname "$0")/lib.sh"
 H=$TREE/experiments/h1
 [ -n "${H2N_NODES:-}" ] || die "EVAL_CONF has no H2N_* keys (use EVAL_CONF=$EVD/h2n.conf)"
@@ -96,14 +101,21 @@ lock_free
 # approved scope: <RESULTS_ROOT>/vdb-vm-scaling-run<k>-n<N>-v<V> (EVIDENCE_PREFIX in h2n.conf); a conf EVIDENCE_TAG
 # (eval2-h1-slo.conf h1, eval2-h2.conf h2; absent in h2n*.conf) prefixes it: <prefix>-run<k>-<tag>-n<N>-v<V>
 EVIDENCE_TAG=${EVIDENCE_TAG:+$EVIDENCE_TAG-}n$N
-evidence_dir
+if [ -n "${H2N_EVIDENCE_NAME:-}" ]; then
+  [[ $H2N_EVIDENCE_NAME =~ ^[a-z0-9-]+$ ]] || die "bad H2N_EVIDENCE_NAME"
+  n=${VER:-1}; if [ -z "$VER" ]; then while [ -e "$RESULTS_ROOT/$H2N_EVIDENCE_NAME-v$n" ]; do n=$((n + 1)); done; fi
+  E=$RESULTS_ROOT/$H2N_EVIDENCE_NAME-v$n
+  [ ! -e "$E" ] || die "$E exists (evidence dirs are immutable; a failed attempt bumps v<N>)"
+  plan "evidence dir $E (absent: OK; H2N_EVIDENCE_NAME)"
+else evidence_dir; fi
+[ -z "${H2N_FIXED:-}" ] || plan "fixed windows (no SLO search): $H2N_FIXED; node env extra [${H2N_NODE_ENV_EXTRA:-}] allow_detail ${H2N_ALLOW_DETAIL:-0}"
 BENV=(H2N_N=$N H2N_VCPU=$VCPUS_PER_VM "H2N_LIFETIMES=${LIVES[*]}" EVAL_RUN=$K SEED=$((SEED_BASE + K)) REGION=$REGION
   C8=$POP_C K8=$POP_K GT8=$POP_GT RECV_MODE=$RECV_MODE POP_BUNDLE_SHA=$POP_BUNDLE_SHA EXPECT_DAX_UUID=$EXPECT_DAX_UUID
   VPLAIN=$VDB_VPLAIN PLAIN_BUILD=$VDB_PLAIN_BUILD LOADGEN=$VDB_LOADGEN_BUILD/loadgen X_DATA=$VDB_X_DATA X_WRITES=$WRITES
   X_NB=$VDB_X_NB X_MAXIDS=$VDB_X_MAXIDS X_MAXW=$VDB_X_MAXW X_MAXD=$MAXD X_INIT_CAP=$VDB_X_INIT_CAP
   "H2N_SLO_PART=$SLOPART" H2N_OPCOH_STRICT=$H2N_OPCOH_STRICT H2N_CXLBW=$H2N_CXLBW H2N_HOSTCPU=${H2N_HOSTCPU:-0})
 [ $HASMG = 0 ] || BENV+=(MEG_BUILD=$MGB VMEG=$MGV MEG_CFG=$MGC MEG_LIB=$MGL MG_MAXD=$MGD)
-for x in H2N_VEC_FORMAT H2N_EF H2N_INIT H2N_HOST_IMAGE; do [ -z "${!x:-}" ] || BENV+=("$x=${!x}"); done
+for x in H2N_VEC_FORMAT H2N_EF H2N_INIT H2N_HOST_IMAGE H2N_FIXED H2N_NODE_ENV_EXTRA H2N_ALLOW_DETAIL; do [ -z "${!x:-}" ] || BENV+=("$x=${!x}"); done
 for x in PRETOUCH_DIR MEASURE_ENV_DIR MEASURE_PART_DIR; do [ -z "${!x:-}" ] || BENV+=("$x=${!x}"); done
 plan "block: env ${BENV[*]} bash $EVD/h2n-block.sh <E>/block"
 if [ $DRY = 1 ]; then
@@ -126,7 +138,8 @@ grep -q "BLOCK DONE" "$E/block/block.log" 2>/dev/null || stop "block did not fin
 [ "$(grep -vc '^#' "$E/block/h2n-results.tsv")" = "${#LIVES[@]}" ] || stop "h2n-results.tsv rows != lifetimes"
 $REG add vdb $RUNSET $K "$E" $CSHA measured "$(grep -v '^#' "$E/block/h2n-results.tsv" | cut -f1,7,9 | tr '\t\n' ' ;' | cut -c1-200)"
 out=$DERIVED_ROOT/vdb/$RUNSET/run$K
-if [ "$REPS" != 1 ]; then log "RUNSET NOTE: export_h2n.py skipped (H2N_REPEATS=$REPS: it keeps one lifetime per (mix, system))"
+if [ -n "${H2N_FIXED:-}" ]; then log "RUNSET NOTE: export_h2n.py skipped (H2N_FIXED: fixed windows, no SLO result)"
+elif [ "$REPS" != 1 ]; then log "RUNSET NOTE: export_h2n.py skipped (H2N_REPEATS=$REPS: it keeps one lifetime per (mix, system))"
 else mkdir -p "$out" && python3 -I -B "$EVD/export_h2n.py" --run "$K" --nodes "$N" --config-sha256 "$CSHA" --out "$out" "$E/block" > "$out/export.log" 2>&1 \
   && log "export: $out" || log "RUNSET NOTE: export failed (see $out/export.log; the run itself is unaffected)"; fi
 log "RUNSET DONE: review $E/block/h2n-results.tsv and block.log, then: EVAL_REGISTRY=${REGISTRY:-} python3 $EVD/registry.py accept $RUNSET $K $E"
