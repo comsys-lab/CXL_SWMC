@@ -50,10 +50,15 @@ def raw_split(path, sent):
 
 
 def r(x, d=3):
-    if x is None:
+    if x is None or x == "":
         return ""
-    if isinstance(x, float) and math.isinf(x):
-        return "inf"
+    if isinstance(x, str):  # loadgen writes e.g. "inf" / "nan" as strings for steps without a finite percentile
+        try:
+            x = float(x)
+        except ValueError:
+            return x
+    if math.isinf(x) or math.isnan(x):
+        return str(x)
     return round(x, d)
 
 
@@ -93,6 +98,11 @@ def main():
             th, f30 = raw_split(os.path.join(d, f"raw-step{s['step']}.bin"), q.get("sent", 0))
             ratio = th[2] / th[0] if th[0] and th[2] is not None and not math.isinf(th[0]) else None
             p = q.get("p99_ms")
+            if isinstance(p, str):  # "inf" etc. from the loadgen json
+                try:
+                    p = float(p)
+                except ValueError:
+                    p = None
             rows.append([life, sysname, part, s["step"], s["offered_x"], q.get("offered"), q.get("achieved"), u.get("achieved"),
                          q.get("sent"), q.get("done"), q.get("timeouts"), q.get("errors"), r(q.get("p50_ms")), r(p),
                          r(q.get("p999_ms")), r(q.get("max_ms")), r(p / SLO_MS if p is not None else None),
