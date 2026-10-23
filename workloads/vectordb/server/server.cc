@@ -144,6 +144,67 @@ struct Stats {
   std::atomic<uint64_t> write_jobs_accepted{0}, write_jobs_done{0}, write_lag_ns_sum{0}, write_lag_n{0}, write_lag_max_ns{0};
 };
 
+// Writer segment write-lock split (experiment popcorn-writer-lock-split, reports/experiments/; DESIGN.md §19). Off by
+// default; VDB_LOCK_SPLIT=1 in the server environment turns it on (nothing is sampled or printed when off). Per insert,
+// right after the segment write lock is acquired and right before it is released, the writer thread reads its own
+// swmc_acct coherence counters (opcoh.h pop_now), its run-queue delay (/proc/thread-self/schedstat field 2, run_delay
+// ns) and its CPU time (CLOCK_THREAD_CPUTIME_ID). hold = release - acquire (CLOCK_MONOTONIC, incl. the samples);
+// hold_coh = coherence time C inside the hold (I->S + S->M + write-protect upgrade faults + coherence IPIs, as
+// opt.<op>.c_ns; no-transition faults separately in hold_nt), hold_rq = run-queue delay inside the hold, hold_cpu =
+// on-CPU time inside the hold. A fault that sleeps for its ACKs and then waits on the run queue counts in both coh and
+// rq: hold_overlap_n counts inserts with hold_coh + hold_rq > hold. Histograms: log2 buckets of ns, b<k> = values in
+// [2^k, 2^(k+1)) (b00 also 0; b39 also larger): hold per insert; per search: segment write-lock wait (sum over its
+// segments, = the response's lock_us), per segment task the read-lock wait, E1 wait (= wait_us). Keys "lock_split.*".
+struct LockSplit {
+  static constexpr int kB = 40;
+  std::atomic<uint64_t> inserts{0}, hold_ns{0}, hold_coh_ns{0}, hold_rq_ns{0}, hold_cpu_ns{0}, hold_nt_ns{0}, hold_nt_cnt{0},
+      hold_ipi_ns{0}, hold_ipi_cnt{0}, hold_pf_ns[3]{}, hold_pf_cnt[3]{}, hold_overlap_n{0}, hold_max_ns{0}, sample_ns{0},
+      coh_unavailable{0}, rq_errors{0}, searches{0}, search_lock_ns{0}, search_e1_ns{0}, seg_tasks{0};
+  std::atomic<uint64_t> hold_hist[kB]{}, search_lock_hist[kB]{}, seg_lock_hist[kB]{}, e1_hist[kB]{};
+  static int bucket(uint64_t ns) { return ns ? std::min(kB - 1, 63 - __builtin_clzll(ns)) : 0; }
+  static void hist(std::atomic<uint64_t> *h, uint64_t ns) { h[bucket(ns)].fetch_add(1, std::memory_order_relaxed); }
+  void print(std::ostream &o) {
+    static const char *const pf[3] = {"is", "sm", "wp"};
+    o << "\nlock_split.enabled=1\nlock_split.inserts=" << inserts << "\nlock_split.hold_ns=" << hold_ns
+      << "\nlock_split.hold_coh_ns=" << hold_coh_ns << "\nlock_split.hold_rq_ns=" << hold_rq_ns
+      << "\nlock_split.hold_cpu_ns=" << hold_cpu_ns << "\nlock_split.hold_nt_ns=" << hold_nt_ns
+      << "\nlock_split.hold_nt_cnt=" << hold_nt_cnt << "\nlock_split.hold_ipi_ns=" << hold_ipi_ns
+      << "\nlock_split.hold_ipi_cnt=" << hold_ipi_cnt;
+    for (int i = 0; i < 3; i++)
+      o << "\nlock_split.hold_" << pf[i] << "_ns=" << hold_pf_ns[i] << "\nlock_split.hold_" << pf[i] << "_cnt=" << hold_pf_cnt[i];
+    o << "\nlock_split.hold_overlap_cnt=" << hold_overlap_n << "\nlock_split.hold_max_ns=" << hold_max_ns.exchange(0)
+      << "\nlock_split.sample_ns=" << sample_ns << "\nlock_split.coh_unavailable=" << coh_unavailable
+      << "\nlock_split.rq_errors=" << rq_errors << "\nlock_split.searches=" << searches
+      << "\nlock_split.search_lock_ns=" << search_lock_ns << "\nlock_split.search_e1_ns=" << search_e1_ns
+      << "\nlock_split.seg_tasks=" << seg_tasks;
+    auto h = [&](const char *n, const std::atomic<uint64_t> *x) {
+      for (int b = 0; b < kB; b++) o << "\nlock_split." << n << ".b" << (b < 10 ? "0" : "") << b << "=" << x[b];
+    };
+    h("hold_hist", hold_hist), h("search_lock_hist", search_lock_hist), h("seg_lock_hist", seg_lock_hist), h("e1_hist", e1_hist);
+  }
+};
+
+// Run-queue delay of the calling thread (ns; schedstat field 2). One fd per thread, re-read with pread at offset 0
+// (seq_file restarts at offset 0). false: open/read failed.
+inline bool thread_run_delay(uint64_t *rq) {
+  thread_local int fd = -1;
+  if (fd < 0) fd = open("/proc/thread-self/schedstat", O_RDONLY | O_CLOEXEC);
+  if (fd < 0) return false;
+  char b[128];
+  const ssize_t n = pread(fd, b, sizeof(b) - 1, 0);
+  if (n <= 0) return false;
+  b[n] = 0;
+  unsigned long long run = 0, delay = 0;
+  if (std::sscanf(b, "%llu %llu", &run, &delay) != 2) return false;
+  *rq = delay;
+  return true;
+}
+inline uint64_t thread_cpu_ns() {
+  timespec ts;
+  clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts);
+  return uint64_t(ts.tv_sec) * 1000000000ull + uint64_t(ts.tv_nsec);
+}
+
 // Window counters of one operation type (opcoh.h), keys in the KV convention (workloads/kv/server/opsplit.h,
 // experiments/analysis/v6_common.py): opt.<op>.{ops,t_ns,c_ns,mod_bytes}, opt.<op>.pop.<f>, opt.<op>.meg.<f>; sums over
 // the operations answered (the same values as the response blocks; the server's completion time decides the window).
@@ -341,6 +402,7 @@ class Server {
       << "\nopt.meg_check_sample=" << oc_.mg_check_sample() << "\nopt.meg_anchor=" << int(oc_.an_snap());
     win_search_.print(o, "search");
     win_update_.print(o, "update");
+    if (lock_split_) ls_.print(o);  // VDB_LOCK_SPLIT=1 only (default: no lock_split.* keys)
     for (uint32_t v = 0; v < p_.nr_nodes; v++) o << "\ndlog_count." << v << "=" << load_acquire(&h_->nodes[v].dlog_count);
     o << "\nbackend=" << be_->usage() << "\n" << be_->stats();
     o << "\n" << cxl::proc::text(pst_);
@@ -500,6 +562,20 @@ class Server {
                  "clock_ns %u\n", oc_.on() ? "on" : "off", pop_src_name(oc_.src()), why.empty() ? "" : " (",
                  why.empty() ? "" : (why + ")").c_str(), meg ? (oc_.mg_snap() ? "on" : "absent") : "n/a",
                  meg ? (oc_.an_snap() ? "on" : "absent") : "n/a", tsc_khz_, clock_ns_);
+    const char *ls = getenv("VDB_LOCK_SPLIT");
+    lock_split_ = ls && std::string(ls) == "1";
+    if (lock_split_) {
+      const char *fn = getenv("VDB_LOCK_SPLIT_FAKE_NS");
+      if (fn && *fn) {
+        if (oc_.src() != kPopFake) die("VDB_LOCK_SPLIT_FAKE_NS needs VDB_OPCOH_FAKE=1 (Host test only)");
+        ls_fake_ns_ = std::stoull(fn);
+      }
+      uint64_t rq;
+      std::fprintf(stderr, "vdb-server: lock split on (writer hold: coherence %s, run queue %s%s)\n",
+                   oc_.src() == kPopAcct || oc_.src() == kPopFake ? pop_src_name(oc_.src()) : "unavailable",
+                   thread_run_delay(&rq) ? "schedstat" : "unavailable",
+                   ls_fake_ns_ ? (", fake " + std::to_string(ls_fake_ns_) + " ns wp per insert").c_str() : "");
+    }
   }
   // Worker thread start (after thread_init).
   void opc_thread_start() {
@@ -593,15 +669,66 @@ class Server {
     SegLines &sl = h_->segs[p_.seg_of(id)];
     cxl::hwcc::write_lock(&sl.lock);
     const uint64_t t1 = now_ns();
+    LsSample s0;
+    uint64_t t1s = t1;  // end of the acquire-side sample
+    if (lock_split_) ls_sample(&s0), t1s = now_ns();
     try {
       g_[p_.seg_of(id)]->insert(id, w, vec, rng);
     } catch (const std::exception &e) {  // never leave the cross-VM write lock held (peers would spin)
       cxl::hwcc::write_unlock(&sl.lock);
       die(std::string("insert: ") + e.what());
     }
+    if (lock_split_) ls_hold(s0, t1, t1s);
     cxl::hwcc::write_unlock(&sl.lock);
     st_.insert_lock_ns += t1 - t0;
     st_.insert_ns += now_ns() - t0;
+  }
+
+  // ---------------------------------------------------------------- writer lock split (VDB_LOCK_SPLIT=1, LockSplit)
+  struct LsSample {
+    OpCohSrc::PopNow coh;
+    uint64_t rq = 0, cpu = 0;
+    bool coh_ok = false, rq_ok = false;
+  };
+  void ls_sample(LsSample *s) {
+    s->coh_ok = oc_.pop_now(&s->coh);
+    s->rq_ok = thread_run_delay(&s->rq);
+    s->cpu = thread_cpu_ns();
+  }
+  // Called holding the segment write lock acquired at t1 (CLOCK_MONOTONIC), right before the release.
+  void ls_hold(const LsSample &s0, uint64_t t1, uint64_t t1s) {
+    // Host test only (fake coherence source): VDB_LOCK_SPLIT_FAKE_NS ns of write-protect upgrade fault inside the hold
+    if (ls_fake_ns_) oc_.fake_add(2, ls_fake_ns_, 0);
+    const uint64_t a = now_ns();
+    LsSample s1;
+    ls_sample(&s1);
+    const uint64_t t2 = now_ns(), hold = t2 - t1;
+    LockSplit &L = ls_;
+    L.inserts++;
+    L.hold_ns += hold;
+    LockSplit::hist(L.hold_hist, hold);
+    uint64_t m = L.hold_max_ns.load();
+    while (hold > m && !L.hold_max_ns.compare_exchange_weak(m, hold)) {}
+    const uint64_t cpu = s1.cpu - s0.cpu;
+    L.hold_cpu_ns += cpu;
+    uint64_t coh = 0, rq = 0;
+    if (s0.coh_ok && s1.coh_ok) {
+      coh = s1.coh.coh_ns() - s0.coh.coh_ns();
+      L.hold_coh_ns += coh;
+      for (int i = 0; i < 3; i++) L.hold_pf_ns[i] += s1.coh.pf_ns[i] - s0.coh.pf_ns[i], L.hold_pf_cnt[i] += s1.coh.pf_cnt[i] - s0.coh.pf_cnt[i];
+      L.hold_ipi_ns += s1.coh.ipi_ns - s0.coh.ipi_ns, L.hold_ipi_cnt += s1.coh.ipi_cnt - s0.coh.ipi_cnt;
+      L.hold_nt_ns += s1.coh.nt_ns - s0.coh.nt_ns, L.hold_nt_cnt += s1.coh.nt_cnt - s0.coh.nt_cnt;
+    } else {
+      L.coh_unavailable++;
+    }
+    if (s0.rq_ok && s1.rq_ok) {
+      rq = s1.rq - s0.rq;
+      L.hold_rq_ns += rq;
+    } else {
+      L.rq_errors++;
+    }
+    if (coh + rq > hold) L.hold_overlap_n++;
+    L.sample_ns += (t1s - t1) + (t2 - a);  // cost of the two samples (inside the hold)
   }
 
   void bad(Job &j) { j.c->reply(frame::kStatusBadRequest, j.h.req_id, nullptr, 0); }
@@ -784,7 +911,9 @@ class Server {
     oc_.begin(&os);
     const uint64_t l0 = now_ns();
     cxl::hwcc::read_lock(&sl.lock);
-    c->lock_ns += now_ns() - l0;
+    const uint64_t lw = now_ns() - l0;
+    c->lock_ns += lw;
+    if (lock_split_) LockSplit::hist(ls_.seg_lock_hist, lw), ls_.seg_tasks++;
     const Graph &g = *g_[sg];
     const uint32_t s = c->s;
     auto allowed = [&](uint32_t i) {
@@ -857,6 +986,11 @@ class Server {
     st_.replay_ns += c->t2 - c->t1;
     st_.search_ns += t3 - c->t2;
     st_.lock_ns += c->lock_ns.load();
+    if (lock_split_) {  // per search: segment write-lock wait (sum over its segments) and E1 wait
+      const uint64_t lw = c->lock_ns.load(), e1 = c->t1 - c->t0;
+      ls_.searches++, ls_.search_lock_ns += lw, ls_.search_e1_ns += e1;
+      LockSplit::hist(ls_.search_lock_hist, lw), LockSplit::hist(ls_.e1_hist, e1);
+    }
   }
 
   size_t search_queue_len() {
@@ -948,6 +1082,9 @@ class Server {
   std::unique_ptr<std::mutex[]> dmu_;
   OpCohSrc oc_;
   OpWin win_search_, win_update_;
+  bool lock_split_ = false;  // VDB_LOCK_SPLIT=1 (set in opc_setup, before the worker threads start)
+  uint64_t ls_fake_ns_ = 0;  // VDB_LOCK_SPLIT_FAKE_NS (Host test with VDB_OPCOH_FAKE=1 only)
+  LockSplit ls_;
   uint32_t clock_ns_ = 0, tsc_khz_ = 0;
 };
 

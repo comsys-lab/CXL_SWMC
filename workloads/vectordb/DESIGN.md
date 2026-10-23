@@ -559,6 +559,22 @@ experiments/vectordb/urate-block.sh (m4-run.sh KIND=urate). H1 (YCSB-style mixes
 - Host checks: tools/search_index.cc (static searches over an init dir: recall@k vs tools/static_gt.py exact GT,
   distances, link blocks and bytes per query), tests/host_smoke.sh VEC_FORMAT=sq8.
 
+## 19. Writer lock split (branch popcorn-lock-split; experiment popcorn-writer-lock-split, approved 2026-10-23)
+- `VDB_LOCK_SPLIT=1` in the server environment (default off: nothing sampled, no `lock_split.*` key printed). Per
+  insert, after the segment write lock is acquired and before it is released, the writer reads its swmc_acct
+  coherence counters (OpCohSrc::pop_now: the same snapshot as a section boundary), its run-queue delay
+  (/proc/thread-self/schedstat field 2, one fd per thread, pread at 0) and CLOCK_THREAD_CPUTIME_ID.
+- Stats keys (cumulative; server.cc LockSplit): lock_split.inserts, hold_ns, hold_coh_ns (I->S + S->M + wp faults +
+  coherence IPIs inside the hold = C), hold_rq_ns, hold_cpu_ns, hold_{is,sm,wp}_{ns,cnt}, hold_ipi_{ns,cnt},
+  hold_nt_{ns,cnt} (no-transition faults, not in C), hold_overlap_cnt (coh + rq > hold: a fault that slept for its ACKs
+  then waited on the run queue), hold_max_ns (since the previous stats read), sample_ns (cost of the samples, inside
+  the hold), coh_unavailable, rq_errors; per search: searches, search_lock_ns, search_e1_ns, seg_tasks; log2
+  histograms hold_hist / search_lock_hist (per search) / seg_lock_hist (per segment task) / e1_hist, keys .b00-.b39
+  (b<k> = [2^k, 2^(k+1)) ns).
+- Host test: tests/lock_split_test.sh (host_smoke.sh with VDB_OPCOH_FAKE=1 VDB_LOCK_SPLIT_FAKE_NS=N: every insert
+  adds an N ns wp fault inside its hold, so hold_wp_ns = N x inserts exactly; checks hold_coh + hold_rq <= hold, the
+  histogram sums, and that a run without VDB_LOCK_SPLIT prints no lock_split key).
+
 ## 10. Future reference: E2 (not implemented)
 
 - No-wait: s_used = min(P, ref_w); no staleness bound.

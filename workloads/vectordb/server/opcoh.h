@@ -279,6 +279,22 @@ class OpCohSrc {
     if (nontrans_ns) a.reserved[0] += nontrans_ns, a.reserved[1] += 1;
     if (ipi_ns) a.ipi_ns += ipi_ns, a.ipi_cnt += 1;
   }
+  // Cumulative Popcorn coherence counters of the calling thread (writer lock split, VDB_LOCK_SPLIT=1): the same
+  // swmc_acct snapshot as a section boundary, without a section. false: no per-thread area (op coherence off, the
+  // /proc file source, or none); *v is then untouched.
+  struct PopNow {
+    uint64_t pf_ns[3] = {}, pf_cnt[3] = {}, ipi_ns = 0, ipi_cnt = 0, nt_ns = 0, nt_cnt = 0;
+    uint64_t coh_ns() const { return pf_ns[0] + pf_ns[1] + pf_ns[2] + ipi_ns; }  // = pop_coh_ns (C), nt excluded
+  };
+  bool pop_now(PopNow *v) const {
+    if (!on_ || (src_ != kPopAcct && src_ != kPopFake)) return false;
+    swmc_acct a;
+    swmc_acct_snapshot(&thr().acct, &a);
+    for (int i = 0; i < 3; i++) v->pf_ns[i] = a.fault_ns[i], v->pf_cnt[i] = a.fault_cnt[i];
+    v->ipi_ns = a.ipi_ns, v->ipi_cnt = a.ipi_cnt;
+    v->nt_ns = a.reserved[SWMC_ACCT_NONTRANS_NS], v->nt_cnt = a.reserved[SWMC_ACCT_NONTRANS_CNT];
+    return true;
+  }
   bool on() const { return on_; }
   int src() const { return src_; }
   bool mg_snap() const { return mg_ != nullptr; }
