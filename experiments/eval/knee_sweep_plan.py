@@ -21,7 +21,13 @@ SETS = {
     "POP": ([0.90, 0.92, 0.94, 0.96, 0.98, 1.00, 1.02, 1.05], 15, 45, 5),
     "MK": ([0.90, 1.00, 1.15, 1.30, 1.45, 1.60, 1.80, 2.00, 2.30], 15, 45, 5),
     "MF": ([1.00, 1.50, 2.25, 3.40, 5.10], 15, 120, 5),
+    "POPX": ([0.90, 0.92, 0.94, 0.96, 0.98, 1.00, 1.02, 1.05, 1.10, 1.15], 15, 45, 5),
 }
+# user decisions 2026-10-24 (after the verifier review): H2 N=2 u50 Megalon takes the knee set (confirmed in every
+# run; the floor rule above put it in MF); Popcorn cells with capacity > 1.05 x base (mean over runs 1-3 of
+# cross_runs.csv xmax_over_base) get the extra factors 1.10 and 1.15 (set POPX)
+MK_OVERRIDE = {("H2", 2, "u50")}
+POP_EXTRA_CAP = 1.05
 OVH = {("H1", "pop"): 5.0, ("H1", "hw"): 3.5, ("H1", "mg"): 3.5, ("H2", "pop"): 4.0, ("H2", "hw"): 2.0, ("H2", "mg"): 2.0}
 SHORT = {"All-HWcc": "hw", "Popcorn": "pop", "Megalon": "mg"}
 FRAC = {"u10": 0.9, "u50": 0.5, "u90": 0.1}
@@ -39,8 +45,13 @@ def main():
             conf = all(r["confirmed"] == "1" for r in rs)
             low = S.median(float(r["lowest_rate_p99_over_slo"]) for r in rs)
             fs = "MF" if (not conf or low > 0.5) else "MK"
+            if (hyp, n, mix) in MK_OVERRIDE:
+                fs = "MK"
         else:
             fs = "HW" if s == "hw" else "POP"
+        cap = S.mean(float(r["xmax_over_base"]) for r in rs)
+        if fs == "POP" and cap > POP_EXTRA_CAP:
+            fs = "POPX"
         base_search = S.mean(float(r["base_search"]) for r in rs)
         base_x = base_search / FRAC[mix]
         f, wu, me, dr = SETS[fs]
