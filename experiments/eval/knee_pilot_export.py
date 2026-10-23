@@ -8,8 +8,12 @@ Output knee-pilot.csv, columns: lifetime, system, part, step, offered_x (loadgen
   offered_search_s, achieved_search_s (= x), achieved_update_s, search_sent, search_done, timeouts, errors, p50_ms,
   p99_ms, p999_ms, max_ms (search, whole window, from steps.jsonl), p99_over_slo (p99 / 100 ms), p99_third1..3_ms (search
   p99 of the measured requests in consecutive thirds of the window by scheduled time, raw rows; not completed = inf),
-  thirds_ratio (third 3 / third 1), stationary (thirds_ratio <= 1.5), p99_first30s_ms (first 30 s of the window: the
-  30 s vs 45 s question), update_p99_ms, aborted, reason. Raw-row method = knee-sweep-design/raw_windows.py.
+  thirds_ratio (third 3 / third 1), stationary (thirds_ratio <= 1.5; always 0 for an aborted step), p99_first30s_ms
+  (first 30 s of the window: the 30 s vs 45 s question), update_p99_ms, aborted, reason, evidence (dir name),
+  lifetime_ok (1 = the lifetime has a row in <evidence>/block/h2n-results.tsv, i.e. every block check incl. dmesg passed;
+  0 = it stopped; empty for a bare loadgen dir; figures use lifetime_ok = 1 only), after_abort (1 for every step after
+  the first aborted step of any reason in that lifetime: it starts behind the earlier step's backlog; the figures stop
+  at the first aborted step). Every row is kept. Raw-row method = knee-sweep-design/raw_windows.py.
 """
 import csv
 import glob
@@ -85,14 +89,26 @@ def main():
     cols = ["lifetime", "system", "part", "step", "offered_x", "offered_search_s", "achieved_search_s", "achieved_update_s",
             "search_sent", "search_done", "timeouts", "errors", "p50_ms", "p99_ms", "p999_ms", "max_ms", "p99_over_slo",
             "p99_third1_ms", "p99_third2_ms", "p99_third3_ms", "thirds_ratio", "stationary", "p99_first30s_ms",
-            "update_p99_ms", "aborted", "reason", "evidence"]  # evidence (knee-sweep, appended): dir name of the row
+            "update_p99_ms", "aborted", "reason", "evidence",  # evidence (knee-sweep, appended): dir name of the row
+            "lifetime_ok", "after_abort"]  # knee-sweep review M3 / M4 (appended), see the docstring
     rows = []
+    okcache = {}
     for life, part, d, ev in lgs:
         sysname = life.split("-")[0]
+        ok = ""
+        if ev != "-":  # lifetime_ok: the lifetime has a result row in <evidence>/block/h2n-results.tsv
+            evd = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(d))))
+            if evd not in okcache:
+                tsv = os.path.join(evd, "block", "h2n-results.tsv")
+                okcache[evd] = {l.split("\t")[0] for l in open(tsv) if not l.startswith("#")} if os.path.exists(tsv) else set()
+            ok = int(life in okcache[evd])
+        seen_abort = False
         for line in open(os.path.join(d, "steps.jsonl")):
             s = json.loads(line)
             if s.get("phase") != "fixed":
                 continue
+            after = int(seen_abort)  # after_abort: an earlier step of this lifetime was aborted (any reason)
+            seen_abort = seen_abort or bool(s.get("aborted"))
             q = s["streams"].get("search", {})
             u = s["streams"].get("update", {})
             th, f30 = raw_split(os.path.join(d, f"raw-step{s['step']}.bin"), q.get("sent", 0))
@@ -106,8 +122,9 @@ def main():
             rows.append([life, sysname, part, s["step"], s["offered_x"], q.get("offered"), q.get("achieved"), u.get("achieved"),
                          q.get("sent"), q.get("done"), q.get("timeouts"), q.get("errors"), r(q.get("p50_ms")), r(p),
                          r(q.get("p999_ms")), r(q.get("max_ms")), r(p / SLO_MS if p is not None else None),
-                         r(th[0]), r(th[1]), r(th[2]), r(ratio), "" if ratio is None else int(ratio <= 1.5) if not math.isinf(ratio) else 0,
-                         r(f30), r(u.get("p99_ms")), int(bool(s.get("aborted"))), s.get("reason", ""), ev])
+                         r(th[0]), r(th[1]), r(th[2]), r(ratio),
+                         0 if s.get("aborted") else "" if ratio is None else int(ratio <= 1.5) if not math.isinf(ratio) else 0,
+                         r(f30), r(u.get("p99_ms")), int(bool(s.get("aborted"))), s.get("reason", ""), ev, ok, after])
     with open(os.path.join(out, "knee-pilot.csv"), "w", newline="") as fh:
         w = csv.writer(fh)
         w.writerow(cols)

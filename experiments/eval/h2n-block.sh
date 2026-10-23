@@ -467,8 +467,10 @@ vdb_fixed_life() {  # <sys> <mix>
       || stop "$name/$p: E1 violation (see $RP/e1.e1.txt)"
   done
   note="fixed parts: $parts"
-  printf '%s\t%s\t%s\t%s\t%s\t%s\t\t\t\t%s\t%s\t%s\n' "$name" $s $mix $U $N $VCPU "$note" "$name" "${oc# }" >> "$E/h2n-results.tsv"
+  # dmesg first (review M1): a result row means every check of this lifetime passed, so a resume never skips the next
+  # cell for a failure of this one
   dmesg_check $name || stop "$name: dmesg check"
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t\t\t\t%s\t%s\t%s\n' "$name" $s $mix $U $N $VCPU "$note" "$name" "${oc# }" >> "$E/h2n-results.tsv"
 }
 # ---- sequence ----------------------------------------------------------------------------------------------------
 for l in "${LIVES[@]}"; do
