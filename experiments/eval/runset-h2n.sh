@@ -27,7 +27,9 @@ done
 set -- "$K_ARG" "${REST[@]}"
 RUNSET=h2n-n$N WL=vdb CONF_WL=h2n
 unset H2N_PINS H2N_VEC_FORMAT H2N_EF H2N_INIT H2N_HOST_IMAGE H2N_REPEATS H2N_LOADGEN_EXTRA \
-  H2N_FIXED H2N_NODE_ENV_EXTRA H2N_ALLOW_DETAIL H2N_EVIDENCE_NAME   # optional conf keys: never inherited from the environment
+  H2N_FIXED H2N_FIXED_N2 H2N_FIXED_N4 H2N_FIXED_N8 H2N_NODE_ENV_EXTRA H2N_ALLOW_DETAIL H2N_EVIDENCE_NAME   # optional conf keys: never inherited from the environment
+# knee-sweep-h2.conf: H2N_FIXED_N<N> (per-N rates) replaces H2N_FIXED for N; H2N_EVIDENCE_NAME may contain {N}
+# (replaced by N, e.g. knee-sweep-h2-n{N} -> recovery/knee-sweep-h2-n4-v<V>)
 # Fixed-window keys (knee-sweep-pilot.conf, lock-split.conf; absent = SLO searches as above): H2N_FIXED,
 # H2N_NODE_ENV_EXTRA, H2N_ALLOW_DETAIL (passed to h2n-block.sh; its header documents them), H2N_EVIDENCE_NAME =
 # evidence dir <RESULTS_ROOT>/<name>-v<V> instead of <prefix>-run<k>-<tag>-n<N>-v<V>; with H2N_FIXED export_h2n.py
@@ -101,7 +103,9 @@ lock_free
 # approved scope: <RESULTS_ROOT>/vdb-vm-scaling-run<k>-n<N>-v<V> (EVIDENCE_PREFIX in h2n.conf); a conf EVIDENCE_TAG
 # (eval2-h1-slo.conf h1, eval2-h2.conf h2; absent in h2n*.conf) prefixes it: <prefix>-run<k>-<tag>-n<N>-v<V>
 EVIDENCE_TAG=${EVIDENCE_TAG:+$EVIDENCE_TAG-}n$N
+x=H2N_FIXED_N$N; [ -z "${!x:-}" ] || H2N_FIXED=${!x}
 if [ -n "${H2N_EVIDENCE_NAME:-}" ]; then
+  H2N_EVIDENCE_NAME=${H2N_EVIDENCE_NAME//\{N\}/$N}
   [[ $H2N_EVIDENCE_NAME =~ ^[a-z0-9-]+$ ]] || die "bad H2N_EVIDENCE_NAME"
   n=${VER:-1}; if [ -z "$VER" ]; then while [ -e "$RESULTS_ROOT/$H2N_EVIDENCE_NAME-v$n" ]; do n=$((n + 1)); done; fi
   E=$RESULTS_ROOT/$H2N_EVIDENCE_NAME-v$n

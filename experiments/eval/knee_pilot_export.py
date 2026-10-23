@@ -74,10 +74,10 @@ def main():
     lgs = []
     for x in a:
         if os.path.isfile(os.path.join(x, "steps.jsonl")):
-            lgs.append(("-", os.path.basename(os.path.dirname(os.path.normpath(x))), x))
+            lgs.append(("-", os.path.basename(os.path.dirname(os.path.normpath(x))), x, "-"))
         for d in sorted(glob.glob(os.path.join(x, "block", "*-n[0-9]*", "*", "loadgen"))):
             life = os.path.basename(os.path.dirname(os.path.dirname(d)))
-            lgs.append((life, os.path.basename(os.path.dirname(d)), d))
+            lgs.append((life, os.path.basename(os.path.dirname(d)), d, os.path.basename(os.path.normpath(x))))
     if not lgs:
         sys.exit("no loadgen dirs found")
     out = out or os.path.join(P, "workspaces/popcorn-lock-split/derived", os.path.basename(os.path.normpath(a[0])))
@@ -85,9 +85,9 @@ def main():
     cols = ["lifetime", "system", "part", "step", "offered_x", "offered_search_s", "achieved_search_s", "achieved_update_s",
             "search_sent", "search_done", "timeouts", "errors", "p50_ms", "p99_ms", "p999_ms", "max_ms", "p99_over_slo",
             "p99_third1_ms", "p99_third2_ms", "p99_third3_ms", "thirds_ratio", "stationary", "p99_first30s_ms",
-            "update_p99_ms", "aborted", "reason"]
+            "update_p99_ms", "aborted", "reason", "evidence"]  # evidence (knee-sweep, appended): dir name of the row
     rows = []
-    for life, part, d in lgs:
+    for life, part, d, ev in lgs:
         sysname = life.split("-")[0]
         for line in open(os.path.join(d, "steps.jsonl")):
             s = json.loads(line)
@@ -107,7 +107,7 @@ def main():
                          q.get("sent"), q.get("done"), q.get("timeouts"), q.get("errors"), r(q.get("p50_ms")), r(p),
                          r(q.get("p999_ms")), r(q.get("max_ms")), r(p / SLO_MS if p is not None else None),
                          r(th[0]), r(th[1]), r(th[2]), r(ratio), "" if ratio is None else int(ratio <= 1.5) if not math.isinf(ratio) else 0,
-                         r(f30), r(u.get("p99_ms")), int(bool(s.get("aborted"))), s.get("reason", "")])
+                         r(f30), r(u.get("p99_ms")), int(bool(s.get("aborted"))), s.get("reason", ""), ev])
     with open(os.path.join(out, "knee-pilot.csv"), "w", newline="") as fh:
         w = csv.writer(fh)
         w.writerow(cols)

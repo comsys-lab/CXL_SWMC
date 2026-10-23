@@ -24,7 +24,7 @@ fi
 case $PH in
   pre) WD=$DET WR=$RECV;;
   post) WD=-; [ "$DET" = - ] || WD=0; WR=-; [ "$RECV" = - ] || WR=$RECV_MODE;;
-  check) [ "$SYS" = pop ] || { echo "$(date -Is) check $SYS: nothing to check"; exit 0; }; WD=0 WR=$RECV_MODE;;
+  check) [ "${SYS%%@*}" = pop ] || { echo "$(date -Is) check $SYS: nothing to check"; exit 0; }; WD=0 WR=$RECV_MODE;;
   *) echo "HOOK FAIL: phase $PH"; exit 2;;
 esac
 rc=0
@@ -41,6 +41,6 @@ for ip in $NODES; do
   ed=$WD; [ "$ed" = - ] && ed=0
   er=$WR; [ "$er" = - ] && er=$RECV_MODE
   [[ $out == *"detail=$ed "* ]] || { [ "$ed" = 0 ] && [[ $out == *"detail=absent "* ]]; } || { echo "HOOK FAIL: $ip detail != $ed"; rc=1; }
-  if [ "$SYS" = pop ]; then [[ $out == *"recv_mode=$er" ]] || { echo "HOOK FAIL: $ip recv_mode != $er"; rc=1; }; fi
+  if [ "${SYS%%@*}" = pop ]; then [[ $out == *"recv_mode=$er" ]] || { echo "HOOK FAIL: $ip recv_mode != $er"; rc=1; }; fi
 done
 exit $rc

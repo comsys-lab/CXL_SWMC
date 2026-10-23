@@ -66,6 +66,8 @@ done
 # that part (fixed-part-hook.sh, set before and back to 0 after the part; Popcorn only), - = untouched (stays 0);
 # <recv> poll|idle|sleep = cxl_shm recv_mode for that part (back to RECV_MODE after it; Popcorn only), - = RECV_MODE.
 # Used by experiments knee-sweep-pilot and popcorn-writer-lock-split (lock-split.conf, knee-sweep-pilot.conf).
+# <sys> may be <sys>@<mix> (knee-sweep: one rate list per (system, mix) lifetime); a lifetime <sys>:<mix> takes the
+# tokens of <sys>@<mix> if any, else those of <sys>.
 #   H2N_NODE_ENV_EXTRA  ENV:K=V tokens added to every node's environment (e.g. ENV:VDB_LOCK_SPLIT=1)
 #   H2N_ALLOW_DETAIL    1 = m4-precheck.sh does not require instr/detail = 0 (PRECHECK_ALLOW_DETAIL; this block sets
 #                       detail itself per part and restores 0); only with a detail=1 part
@@ -74,16 +76,19 @@ declare -A FPARTS=()   # sys -> "part ..."
 FDET=0
 for t in $FIXED; do
   IFS=/ read -r fs fp fd fr frt fw fm fdr <<< "$t"
-  [[ $fs =~ ^(hw|pop|mg|mgoff)$ ]] && [[ $fp =~ ^[a-z0-9]+$ ]] && [[ $fd =~ ^(0|1|-)$ ]] && [[ $fr =~ ^(poll|idle|sleep|-)$ ]] \
+  [[ $fs =~ ^(hw|pop|mg|mgoff)(@u[0-9]+)?$ ]] && [[ $fp =~ ^[a-z0-9]+$ ]] && [[ $fd =~ ^(0|1|-)$ ]] && [[ $fr =~ ^(poll|idle|sleep|-)$ ]] \
     && [[ $frt =~ ^[0-9.]+(,[0-9.]+)*$ ]] && [[ $fw =~ ^[0-9]+$ ]] && [[ $fm =~ ^[1-9][0-9]*$ ]] && [[ $fdr =~ ^[0-9]+$ ]] \
     || die "bad H2N_FIXED token $t (<sys>/<part>/<0|1|->/<poll|idle|sleep|->/<rates>/<warmup>/<measure>/<drain>)"
-  [ $fs = pop ] || [ "$fd:$fr" = "-:-" ] || die "H2N_FIXED $t: detail / recv_mode only for pop"
+  [ ${fs%%@*} = pop ] || [ "$fd:$fr" = "-:-" ] || die "H2N_FIXED $t: detail / recv_mode only for pop"
   [[ " ${FPARTS[$fs]:-} " == *" $fp "* ]] && die "H2N_FIXED: part $fp twice for $fs"
   [ "$fd" = 1 ] && FDET=1
   FPARTS[$fs]="${FPARTS[$fs]:-}${FPARTS[$fs]:+ }$fp"
 done
+fkey() {  # <sys> <mix>: the H2N_FIXED key of a lifetime (<sys>@<mix> if it has tokens, else <sys>)
+  if [ -n "${FPARTS[$1@$2]:-}" ]; then echo "$1@$2"; else echo "$1"; fi
+}
 if [ -n "$FIXED" ]; then
-  for l in "${LIVES[@]}"; do [ -n "${FPARTS[${l%%:*}]:-}" ] || die "H2N_FIXED has no part for lifetime $l"; done
+  for l in "${LIVES[@]}"; do lm=${l#*:}; lm=${lm%%:*}; [ -n "${FPARTS[$(fkey ${l%%:*} $lm)]:-}" ] || die "H2N_FIXED has no part for lifetime $l"; done
   [ $FDET = 0 ] || [ "$ALLOWDET" = 1 ] || die "H2N_FIXED has a detail=1 part: H2N_ALLOW_DETAIL=1 needed (approved scope)"
 fi
 [[ $ALLOWDET =~ ^[01]$ ]] || die "bad H2N_ALLOW_DETAIL"
@@ -402,15 +407,16 @@ print("\t".join(sys.argv[2:8] + [f(s.get("max_offered_x_pass")), f(c.get("x_mean
 # <run>/<part>/ (loadgen, stats-steps.csv, steps.csv, opsplit, e1); detail / recv_mode per part by fixed-part-hook.sh
 # (PART_PRE_CMD / PART_POST_CMD; part-hooks.txt). Result row: empty max / confirm columns, note "fixed parts ...".
 vdb_fixed_life() {  # <sys> <mix>
-  local s=$1 mix=$2 U=${2#u} name=$1-$2-n$N R k L p t note rc mode oc=- OPS parts=${FPARTS[$1]} fs fp fd fr frt fw fm fdr
+  local s=$1 mix=$2 U=${2#u} name=$1-$2-n$N R k L p t note rc mode oc=- OPS fk parts fs fp fd fr frt fw fm fdr
+  fk=$(fkey $s $mix) parts=${FPARTS[$(fkey $s $mix)]}
   R=$E/$name
   local LG=(--opt data=$X_DATA --opt writes=$X_WRITES --opt k=10 --mix "update=$U,search=$((100 - U))" --x-stream search --raw)
   local RE=(V=$VPLAIN HOST_SERVER=$HOSTSRV LOADGEN=$LOADGEN INIT=$INIT READY_TIMEOUT=5400 RUN_KIND=measurement TRACE=0 STATS_OP=10
     "PARTS=$parts" H1_MEASURE_RUN=1 MEASURE_PART_DIR=$MEASURE_PART_DIR "PART_GATE_CMD=bash $HG check"
-    "PART_PRE_CMD=bash $EV/fixed-part-hook.sh pre $s" "PART_POST_CMD=bash $EV/fixed-part-hook.sh post $s")
+    "PART_PRE_CMD=bash $EV/fixed-part-hook.sh pre $fk" "PART_POST_CMD=bash $EV/fixed-part-hook.sh post $fk")
   for t in $FIXED; do
     IFS=/ read -r fs fp fd fr frt fw fm fdr <<< "$t"
-    [ "$fs" = "$s" ] || continue
+    [ "$fs" = "$fk" ] || continue
     RE+=("PART_ARGS_$fp=--mode fixed --rates $frt --warmup-s 0 --step-warmup-s $fw --step-measure-s $fm --drain-s $fdr" "PART_SEED_$fp=$SEED")
   done
   case $s in
@@ -468,7 +474,7 @@ vdb_fixed_life() {  # <sys> <mix>
 for l in "${LIVES[@]}"; do
   IFS=: read -r ls lm lr <<< "$l"
   if [ -n "$FIXED" ]; then
-    log "== FIXED $ls $lm n$N parts [${FPARTS[$ls]}]"
+    log "== FIXED $ls $lm n$N parts [${FPARTS[$(fkey $ls $lm)]}]"
     vdb_fixed_life "$ls" "$lm"
   else
     log "== HSLO $ls $lm n$N${lr:+ $lr}"
