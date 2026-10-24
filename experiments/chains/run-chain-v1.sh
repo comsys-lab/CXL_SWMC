@@ -42,14 +42,14 @@
 #   DESTIJL_ROOT   [/home/comsys/sungsu/destijl-control] control root P (recovery/, workspaces/, the live tree CXL_SWMC)
 #   EVAL2_RUN_DIR  [$P/workspaces/runs123] logs and state of this chain and of h2n-chain-v4.sh (run<k>.log,
 #                  live-head.txt, run<k>-h1-v<V>.log, run<k>-h2.log, run<k>-exports.txt, h2n-chain-v4-*)
-#   EVAL2_ENV      [<this dir>/eval2.env] the EVAL2_H1_FIXED switch file
+#   EVAL2_ENV      [<this dir>/eval2-settings.conf] the EVAL2_H1_FIXED switch file
 # h2n-chain-v4.sh is the copy next to this script.
 set -uo pipefail
 P=${DESTIJL_ROOT:-/home/comsys/sungsu/destijl-control}
 CH=$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")
 R=${EVAL2_RUN_DIR:-$P/workspaces/runs123}
 export EVAL2_RUN_DIR=$R
-EV2ENV=${EVAL2_ENV:-$CH/eval2.env}
+EV2ENV=${EVAL2_ENV:-$CH/eval2-settings.conf}  # repo copy of workspaces/runs123/eval2.env (renamed: *.env is git-ignored)
 LIVE=$P/CXL_SWMC
 MED=$P/recovery/HOST-measure-env-reapply-1 MPD=$P/recovery/HOST-measure-part-apply-2
 K= DRY=0 START=h1 TREE=$LIVE H2ARGS= PT= FIXED= H1ONLY=0 H1MIXES= H1WITH=()

@@ -9,7 +9,7 @@ workspaces/ originals stay as the record of what ran. The artifact (`artifact/fi
 | --- | --- | --- |
 | run-chain-v1.sh | workspaces/runs123/run-chain-v1.sh | eval2 run k: H1 (2-VM), H2 (h2n-chain-v4.sh), export |
 | h2n-chain-v4.sh | workspaces/runs123/h2n-chain-v4.sh | eval2 H2: install, VM8 switch, N = 2/4/8 blocks, restore, export |
-| eval2.env | workspaces/runs123/eval2.env | EVAL2_H1_FIXED switch read by run-chain-v1.sh |
+| eval2-settings.conf | workspaces/runs123/eval2.env | EVAL2_H1_FIXED switch read by run-chain-v1.sh (renamed: the repo git-ignores *.env) |
 | knee-sweep-chain-v1.sh | workspaces/knee-sweep-chain-v1.sh | knee sweep: H1 2-VM + H2 N = 2/4/8 |
 | knee-sweep-chain-v2.sh | workspaces/knee-sweep-chain-v2.sh | knee-sweep addendum: Popcorn H2 u90 N = 4/8 |
 | popcorn-writer-lock-split-chain-v1.sh | workspaces/popcorn-writer-lock-split-chain-v1.sh | lock-split exploratory run + knee pilot |
@@ -23,7 +23,7 @@ workspaces/ originals stay as the record of what ran. The artifact (`artifact/fi
 | --- | --- | --- |
 | `DESTIJL_ROOT` | /home/comsys/sungsu/destijl-control | all: P (recovery/, workspaces/MEASUREMENT.lock, the live tree P/CXL_SWMC) |
 | `EVAL2_RUN_DIR` | $P/workspaces/runs123 | run-chain-v1.sh, h2n-chain-v4.sh, the isca27 wrapper: run<k>.log, live-head.txt, run<k>-*.log, run<k>-exports.txt, h2n-chain-v4-* |
-| `EVAL2_ENV` | <this dir>/eval2.env | run-chain-v1.sh |
+| `EVAL2_ENV` | <this dir>/eval2-settings.conf | run-chain-v1.sh |
 | `KNEE_SWEEP_RUN_DIR` | $P/workspaces/knee-sweep | knee-sweep-chain-v{1,2}.sh: chain-v<N>.state, install logs, derived/ (the artifact's KNEE_DERIVED) |
 | `LOCK_SPLIT_RUN_DIR` | $P/workspaces/popcorn-lock-split | lock-split chain: chain-v1.state, install logs |
 | `MOTIVATION_LAUNCH_LOG` | $P/workspaces/de-stijl-motivation-isca27-chain.log | the isca27 wrapper |

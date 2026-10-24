@@ -111,7 +111,7 @@ live tree's copy. Stage dry-runs (`--measure --dry-run`) only print; the chains'
 
 ## Limits
 
-- The run chains are in this repo (experiments/chains/: run-chain-v1.sh, h2n-chain-v4.sh, eval2.env,
+- The run chains are in this repo (experiments/chains/: run-chain-v1.sh, h2n-chain-v4.sh, eval2-settings.conf,
   knee-sweep-chain-v{1,2}.sh, vmN/vmN-chain-v2.sh + vmN-xml.py; copies of the workspaces/ scripts that ran, paths
   parameterised only). What still lives outside the repo: the control root itself (recovery/ evidence and approval
   dirs such as HOST-measure-*, VM8-v2.2/topo8/ids.txt, ENV-pretouch-v2.1, P-popcorn-build10-eqF-v1.3), builds/, the
