@@ -37,9 +37,14 @@
 # node0 free >= N x RAM + 10 GiB before the first start of a switch; live phases only in an evidence dir whose
 # steps.log has this chain's "PRE PASS (topo N)" or "R-DOWN PASS (topo N" (never frozen evidence such as VM8-v2.2);
 # N=8 gen with VMN_IDS_FROM and the same overlay dir: XMLs cmp-identical to the earlier run's; phase nochain-check.
+# Repo copy (experiments/chains/vmN/, ../README.md) of workspaces/vmN/vmN-chain-v2.sh as it ran; only the paths are
+# parameterised (same defaults): DESTIJL_ROOT [/home/comsys/sungsu/destijl-control] = P; VMN_STATE_DIR
+# [$P/workspaces/vmN] = W (dry-n<N>/, dry-restore-n<N>/ with DRY-PASS, lg-root/); the generator is vmN-xml.py next to
+# this script (byte-identical to workspaces/vmN/vmN-xml.py). DRY-PASS binds the sha256 of the chain file that ran
+# the dry: a live phase of this copy needs a dry / dry-restore of this copy (every chain runs one first).
 set -uo pipefail
-P=/home/comsys/sungsu/destijl-control
-W=$P/workspaces/vmN
+P=${DESTIJL_ROOT:-/home/comsys/sungsu/destijl-control}
+W=${VMN_STATE_DIR:-$P/workspaces/vmN}
 ab() { [ -n "$1" ] && realpath -m "$1"; }
 E=$(ab "${VMN_E:-}") S=$(ab "${VMN_SRC:-}") IDS=$(ab "${VMN_IDS_FROM:-}") BEF=$(ab "${VMN_BEFORE:-}")
 OFF=${VMN_OFFLINE:-0}
@@ -59,7 +64,7 @@ BASE=$I/cxl_vm0.qcow2
 D=$I/$OVL
 OVL_ANY="$I/vm4-overlays-v1 $I/vm8-overlays-v2"   # no switch while any N-VM overlay dir exists
 K12=6.14.0-famfs-de-stijl+-ds-popcorn-new-12
-GEN=$W/vmN-xml.py
+GEN=$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/vmN-xml.py
 TOOL=$P/recovery/ENV-pretouch-v2.1/dax-pretouch.py TOOL_SHA=30d068d606e6d0bc9bbc99a5ecc9ed4d2bc64605a7ddfd430ff6bf43f09410ff
 GD=/home/comsys/vm8-pretouch
 HR=$P/recovery/P-popcorn-build10-eqF-v1.3/harness/CXL_SWMC

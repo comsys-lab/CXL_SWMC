@@ -38,10 +38,14 @@
 # env: LS_TREE [$P/CXL_SWMC], KS_H1_PRETOUCH_DIR (h1), VMN_E [recovery/VM8-v4-knee-sweep-v1], VMN_E_RESTORE
 #   [recovery/VM8-v4-knee-sweep-v1-restore], MEASURE_ENV_DIR [recovery/HOST-measure-env-reapply-1], MEASURE_PART_DIR
 #   [recovery/HOST-measure-part-apply-2]
+# Repo copy (experiments/chains/, README.md there) of workspaces/knee-sweep-chain-v2.sh as it ran; only the paths are
+# parameterised (same defaults): DESTIJL_ROOT [/home/comsys/sungsu/destijl-control] = P; KNEE_SWEEP_RUN_DIR
+# [$P/workspaces/knee-sweep] state file, install logs, derived/<dir>/ exports; vmN-chain-v2.sh = the copy in vmN/ here.
 set -uo pipefail
-P=/home/comsys/sungsu/destijl-control
-VMN=$P/workspaces/vmN/vmN-chain-v2.sh
-W=$P/workspaces/knee-sweep
+P=${DESTIJL_ROOT:-/home/comsys/sungsu/destijl-control}
+CH=$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")
+VMN=$CH/vmN/vmN-chain-v2.sh
+W=${KNEE_SWEEP_RUN_DIR:-$P/workspaces/knee-sweep}
 DRY=0 START=install RESTORE=1
 while [ $# -gt 0 ]; do
   case $1 in

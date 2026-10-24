@@ -12,10 +12,14 @@
 #   EVIDENCE_ROOT   raw evidence root [$DESTIJL_ROOT/recovery] (knee-sweep re-export only; the eval2 exports carry
 #                   absolute source_dir paths, rewritten with --evidence-map OLD=NEW when the evidence moved)
 #   MEASURE_TREE    code tree the measurement chains run [$DESTIJL_ROOT/CXL_SWMC] (the live tree; chains refuse others)
-#   RUNS123_CHAIN   [$DESTIJL_ROOT/workspaces/runs123/run-chain-v1.sh]  eval2 run chain (H1 part)
-#   H2N_CHAIN       [$DESTIJL_ROOT/workspaces/runs123/h2n-chain-v4.sh]  eval2 H2 chain (VM8 topology)
-#   KNEE_CHAIN_V1   [$DESTIJL_ROOT/workspaces/knee-sweep-chain-v1.sh]   knee sweep (H1 + H2 N = 2/4/8)
-#   KNEE_CHAIN_V2   [$DESTIJL_ROOT/workspaces/knee-sweep-chain-v2.sh]   knee-sweep addendum (Popcorn H2 u90 N = 4/8)
+#   Run chains (experiments/chains/ of this repo, README.md there; the copies of the workspaces/ chains that ran):
+#   RUNS123_CHAIN   [<repo>/experiments/chains/run-chain-v1.sh]        eval2 run chain (H1 part)
+#   H2N_CHAIN       [<repo>/experiments/chains/h2n-chain-v4.sh]        eval2 H2 chain (VM8 topology)
+#   KNEE_CHAIN_V1   [<repo>/experiments/chains/knee-sweep-chain-v1.sh] knee sweep (H1 + H2 N = 2/4/8)
+#   KNEE_CHAIN_V2   [<repo>/experiments/chains/knee-sweep-chain-v2.sh] knee-sweep addendum (Popcorn H2 u90 N = 4/8)
+#                   A real --measure runs from the live tree's artifact/figures (<repo> = MEASURE_TREE), e.g. through
+#                   the launcher $DESTIJL_ROOT/workspaces/artifact-figures-chain-v1.sh; the chains keep their state and
+#                   logs in their run dirs (EVAL2_RUN_DIR, KNEE_SWEEP_RUN_DIR, VMN_STATE_DIR; defaults in workspaces/).
 #   ARTIFACT_PY     python command [nice -n 19 numactl --cpunodebind=1 --membind=1 python3 -I -B, without numactl
 #                   when it is missing]
 # Options of every fig<N>.sh (af_main):
@@ -56,10 +60,10 @@ af_resolve() {
   KNEE_PLAN=${KNEE_PLAN:-$AF_REPO/experiments/eval/knee-sweep-plan.csv}
   EVIDENCE_ROOT=${EVIDENCE_ROOT:-$R/recovery}
   MEASURE_TREE=${MEASURE_TREE:-$R/CXL_SWMC}
-  RUNS123_CHAIN=${RUNS123_CHAIN:-$R/workspaces/runs123/run-chain-v1.sh}
-  H2N_CHAIN=${H2N_CHAIN:-$R/workspaces/runs123/h2n-chain-v4.sh}
-  KNEE_CHAIN_V1=${KNEE_CHAIN_V1:-$R/workspaces/knee-sweep-chain-v1.sh}
-  KNEE_CHAIN_V2=${KNEE_CHAIN_V2:-$R/workspaces/knee-sweep-chain-v2.sh}
+  RUNS123_CHAIN=${RUNS123_CHAIN:-$AF_REPO/experiments/chains/run-chain-v1.sh}
+  H2N_CHAIN=${H2N_CHAIN:-$AF_REPO/experiments/chains/h2n-chain-v4.sh}
+  KNEE_CHAIN_V1=${KNEE_CHAIN_V1:-$AF_REPO/experiments/chains/knee-sweep-chain-v1.sh}
+  KNEE_CHAIN_V2=${KNEE_CHAIN_V2:-$AF_REPO/experiments/chains/knee-sweep-chain-v2.sh}
   if [ -z "${ARTIFACT_PY:-}" ]; then
     if command -v numactl > /dev/null 2>&1; then ARTIFACT_PY="nice -n 19 numactl --cpunodebind=1 --membind=1 python3 -I -B"
     else ARTIFACT_PY="nice -n 19 python3 -I -B"; fi
@@ -189,11 +193,16 @@ af_stage_parse() {  # --runs N --dry-run --redo
   done
   [[ $AF_NRUNS =~ ^[1-9][0-9]*$ ]] || af_die "--runs needs a positive integer"
   af_resolve
+  [ -z "$DESTIJL_ROOT" ] || export DESTIJL_ROOT   # the chains resolve P from it (same root as the artifact)
   AF_LOGDIR=${ARTIFACT_LOG_DIR:-${DESTIJL_ROOT:-.}/workspaces/artifact-measure}
 }
 af_stage_pre() {  # <chain>...: checks before a real measurement
   local c
   for c in "$@"; do [ -f "$c" ] || af_die "missing chain $c (set the *_CHAIN variables, common.sh)"; done
+  for c in "$@"; do
+    case $(readlink -f "$c") in "$(readlink -f "$MEASURE_TREE")"/*) ;;
+      *) af_say "NOTE: chain $c is not in MEASURE_TREE $MEASURE_TREE (a real run should use the live tree's copy)";; esac
+  done
   [ "$AF_DRY" = 1 ] && return 0
   [ -d "$MEASURE_TREE" ] || af_die "MEASURE_TREE $MEASURE_TREE missing"
   [ ! -e "$DESTIJL_ROOT/workspaces/MEASUREMENT.lock" ] || af_die "MEASUREMENT.lock exists: another measurement runs"

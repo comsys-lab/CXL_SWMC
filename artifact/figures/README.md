@@ -49,8 +49,10 @@ Path defaults (environment overrides, common.sh): `DESTIJL_ROOT` = the first par
 workspaces/eval2-derived; `EVAL2_DERIVED` = $DESTIJL_ROOT/workspaces/eval2-derived; `KNEE_DERIVED` =
 $DESTIJL_ROOT/workspaces/knee-sweep/derived; `KNEE_PLAN` = experiments/eval/knee-sweep-plan.csv; `EVIDENCE_ROOT` =
 $DESTIJL_ROOT/recovery; `MEASURE_TREE` = $DESTIJL_ROOT/CXL_SWMC; chains `RUNS123_CHAIN`, `H2N_CHAIN`,
-`KNEE_CHAIN_V1`, `KNEE_CHAIN_V2` (workspaces/runs123/, workspaces/knee-sweep-chain-v{1,2}.sh);
-`ARTIFACT_LOG_DIR` = $DESTIJL_ROOT/workspaces/artifact-measure (stage logs).
+`KNEE_CHAIN_V1`, `KNEE_CHAIN_V2` = experiments/chains/{run-chain-v1,h2n-chain-v4,knee-sweep-chain-v1,knee-sweep-chain-v2}.sh
+of this repo (experiments/chains/README.md); `ARTIFACT_LOG_DIR` = $DESTIJL_ROOT/workspaces/artifact-measure (stage logs).
+The stages export `DESTIJL_ROOT` to the chains; the chains' state/log dirs keep their defaults (`EVAL2_RUN_DIR` =
+workspaces/runs123, `KNEE_SWEEP_RUN_DIR` = workspaces/knee-sweep, `VMN_STATE_DIR` = workspaces/vmN).
 
 ## Figures
 
@@ -93,8 +95,10 @@ state) -> h2-slo (switches to VM8 and restores) -> regenerate the knee-sweep pla
 Measurement is main-session work inside the approved experiment (VMs, guest sudo, CXL device via
 config/cxl_region*.yaml): the chains refuse while workspaces/MEASUREMENT.lock exists, when the live tree is dirty, and
 (run-chain-v1.sh) when the live HEAD differs from runs 1-3's (EVAL2_ALLOW_HEAD_CHANGE=1). Launch long stages detached
-(`setsid nohup .../figN.sh --measure ... > log 2>&1 &`). Stage dry-runs (`--measure --dry-run`) only print; the chains'
-own deeper dry-runs (`run-chain-v1.sh --dry-run`, `h2n-chain-v4.sh --dry-run`) are run by hand when wanted.
+(`setsid nohup .../figN.sh --measure ... > log 2>&1 &`); from the main session use the pre-allowed launcher
+`bash $DESTIJL_ROOT/workspaces/artifact-figures-chain-v1.sh <figN|all|stages/<stage>> --measure ...`, which runs the
+live tree's copy. Stage dry-runs (`--measure --dry-run`) only print; the chains' own deeper dry-runs
+(`run-chain-v1.sh --dry-run`, `h2n-chain-v4.sh --dry-run`) are run by hand when wanted.
 
 ## Validation (2026-10-24, workspaces/artifact-figs/test-out)
 
@@ -107,8 +111,15 @@ own deeper dry-runs (`run-chain-v1.sh --dry-run`, `h2n-chain-v4.sh --dry-run`) a
 
 ## Limits
 
-- The run chains (workspaces/runs123/run-chain-v1.sh, h2n-chain-v4.sh, workspaces/knee-sweep-chain-v{1,2}.sh,
-  workspaces/vmN/vmN-chain-v2.sh) live in the control workspace, not in this repo; the stages call them by path.
+- The run chains are in this repo (experiments/chains/: run-chain-v1.sh, h2n-chain-v4.sh, eval2.env,
+  knee-sweep-chain-v{1,2}.sh, vmN/vmN-chain-v2.sh + vmN-xml.py; copies of the workspaces/ scripts that ran, paths
+  parameterised only). What still lives outside the repo: the control root itself (recovery/ evidence and approval
+  dirs such as HOST-measure-*, VM8-v2.2/topo8/ids.txt, ENV-pretouch-v2.1, P-popcorn-build10-eqF-v1.3), builds/, the
+  derived/state dirs the chains and confs write (workspaces/eval2-derived, workspaces/knee-sweep, workspaces/runs123,
+  workspaces/vmN state), data the confs name (workspaces/popcorn-n/bundle-n-v2, workspaces/vdb-data,
+  workspaces/megalon-n), and workspaces/MEASUREMENT.lock. Main launches the chains through the thin launchers
+  workspaces/{eval2-chain-v2,h2n-chain-v5,knee-sweep-chain-v3,knee-sweep-chain-v4,vmN-chain-v3,artifact-figures-chain-v1}.sh
+  (pre-allowed path pattern), which exec the live tree's copies.
 - The eval2 chains accept `--run 1..3`; `--runs N > 3` is printed in a dry-run but refused for a real run until their
   run check (and the confs' RUNS) is widened.
 - Re-measuring an existing run k (`--redo`) needs fresh switch / restore evidence dirs (VMN_E, VMN_E_RESTORE; the

@@ -5,7 +5,8 @@
 #   Megalon (+ Megalon without section timers in the fixed windows). ~3.9-4.6 h per run.
 #   Per run k: <RUNS123_CHAIN> --run k --h1-only = experiments/eval/runset-vdb.sh k with eval2-h1.conf (loadgen seed
 #   SEED_BASE + k), evidence recovery/eval2-run<k>-h1-n2-v<V>, export experiments/vectordb/export.py ->
-#   $EVAL2_DERIVED/h1/vdb/vdb/run<k>-chain (slo_summary.csv, fixed.csv). Log: <RUNS123 dir>/run<k>.log.
+#   $EVAL2_DERIVED/h1/vdb/vdb/run<k>-chain (slo_summary.csv, fixed.csv). Log: <EVAL2_RUN_DIR>/run<k>.log
+#   (EVAL2_RUN_DIR [$DESTIJL_ROOT/workspaces/runs123], experiments/chains/README.md).
 #   A run whose export exists is skipped (--redo: measured again as a new evidence version).
 # usage: h1-slo-fixed.sh [--runs N] [--dry-run] [--redo]
 # Main session only (VMs, sudo, CXL device inside the approved experiment); the chain refuses with MEASUREMENT.lock,
@@ -22,7 +23,7 @@ for k in $(af_runs); do
   fi
   af_chain_run_ok "$k"
   af_say "run $k: H1 SLO + fixed windows (2-VM topology, ~3.9-4.6 h; seed SEED_BASE + $k)"
-  af_run bash "$RUNS123_CHAIN" --run "$k" --h1-only || af_die "run $k: H1 chain failed (see its run$k.log)"
+  af_run bash "$RUNS123_CHAIN" --run "$k" --h1-only || af_die "run $k: H1 chain failed (see ${EVAL2_RUN_DIR:-$DESTIJL_ROOT/workspaces/runs123}/run$k.log)"
   [ "$AF_DRY" = 1 ] || af_have_h1 "$k" || af_die "run $k: chain ended but $EVAL2_DERIVED/h1/vdb/vdb/run$k-chain is incomplete"
 done
 af_say "stage h1-slo-fixed $([ "$AF_DRY" = 1 ] && echo 'planned (dry run)' || echo done)"

@@ -30,10 +30,14 @@
 # env: LS_TREE [$P/CXL_SWMC] code tree (a real run needs the live tree), VMN_E [recovery/VM8-v4-lock-split-v1],
 #   VMN_E_RESTORE [recovery/VM8-v4-lock-split-v1-restore], MEASURE_ENV_DIR [recovery/HOST-measure-env-reapply-1],
 #   MEASURE_PART_DIR [recovery/HOST-measure-part-apply-2]
+# Repo copy (experiments/chains/, README.md there) of workspaces/popcorn-writer-lock-split-chain-v1.sh as it ran; only
+# the paths are parameterised (same defaults): DESTIJL_ROOT [/home/comsys/sungsu/destijl-control] = P;
+# LOCK_SPLIT_RUN_DIR [$P/workspaces/popcorn-lock-split] state file and install logs; vmN-chain-v2.sh = vmN/ here.
 set -uo pipefail
-P=/home/comsys/sungsu/destijl-control
-VMN=$P/workspaces/vmN/vmN-chain-v2.sh
-W=$P/workspaces/popcorn-lock-split
+P=${DESTIJL_ROOT:-/home/comsys/sungsu/destijl-control}
+CH=$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")
+VMN=$CH/vmN/vmN-chain-v2.sh
+W=${LOCK_SPLIT_RUN_DIR:-$P/workspaces/popcorn-lock-split}
 DRY=0 START=install RESTORE=1 KNEE=1
 while [ $# -gt 0 ]; do
   case $1 in

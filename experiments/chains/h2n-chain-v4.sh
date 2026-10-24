@@ -4,6 +4,10 @@
 #   EVIDENCE_TAG, e.g. h2 -> recovery/eval2-run<k>-h2-n<N>-v<V>); switch / restore dirs recovery/VM8-v4-eval2-run<k>
 #   (-restore); state, install logs and resume lines under workspaces/runs123 (h2n-chain-v4-*). Called by
 #   workspaces/runs123/run-chain-v1.sh (part h2); can run alone with the same arguments as v3.
+# Repo copy (experiments/chains/, README.md there) of workspaces/runs123/h2n-chain-v4.sh as it ran; only the paths are
+# parameterised (same defaults): DESTIJL_ROOT [/home/comsys/sungsu/destijl-control] = P; EVAL2_RUN_DIR
+# [$P/workspaces/runs123] state + install logs (h2n-chain-v4-*); vmN-chain-v2.sh is the copy in vmN/ here; RESUME lines name
+# the launcher workspaces/eval2-chain-v2.sh (= run-chain-v1.sh here).
 # h2n chain v3 = v2 + guest installs for builds made after the topology freeze (SQ8, user 2026-10-21):
 #   install  on the running guests 0 1 (2-VM or VM8 state): plain server dir (VDB_VPLAIN <- VDB_PLAIN_BUILD), Megalon
 #            dirs of N = 2, 4, 8, and the H2N_INIT copy of H2N_HOST_IMAGE on vm0; each skipped when it exists
@@ -53,8 +57,9 @@
 #   PRETOUCH_DIR of every block), VMN_E_RESTORE [recovery/VM8-v4-h2n-run<k>-restore], MEASURE_ENV_DIR
 #   [recovery/HOST-measure-env-reapply-1], MEASURE_PART_DIR [recovery/HOST-measure-part-apply-2]
 set -uo pipefail
-P=/home/comsys/sungsu/destijl-control
-VMN=$P/workspaces/vmN/vmN-chain-v2.sh
+P=${DESTIJL_ROOT:-/home/comsys/sungsu/destijl-control}
+CH=$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")
+VMN=$CH/vmN/vmN-chain-v2.sh
 K= DRY=0 START=install RESTORE=1 ONLYN= SKIPSW=0 LTONLY=
 declare -A FROM=()
 while [ $# -gt 0 ]; do
@@ -72,7 +77,7 @@ T=${H2N_TREE:-$P/CXL_SWMC}
 EVD=$T/experiments/eval
 CONF=${EVAL_CONF:-$EVD/eval2-h2.conf}
 SW=${VMN_E:-$P/recovery/VM8-v4-eval2-run$K} RS=${VMN_E_RESTORE:-$P/recovery/VM8-v4-eval2-run$K-restore}
-R123=$P/workspaces/runs123
+R123=${EVAL2_RUN_DIR:-$P/workspaces/runs123}
 MED=${MEASURE_ENV_DIR:-$P/recovery/HOST-measure-env-reapply-1} MPD=${MEASURE_PART_DIR:-$P/recovery/HOST-measure-part-apply-2}
 IDS=$P/recovery/VM8-v2.2/topo8/ids.txt
 NS="2 4 8"
@@ -175,7 +180,7 @@ lt_list() {  # <N>: the lifetime list of this attempt (from FROM[N]; without mg 
   echo "${out[*]}"
 }
 resume_line() {  # <N> <first failed lifetime>
-  log "RESUME N=$1 from $2: after this chain's restore: bash $R123/run-chain-v1.sh --run $K --start h2 --h2-args '--only-n $1 --from $1:$2' (install skips present guest dirs; a new evidence dir v<V+1>; the resume needs new VMN_E / VMN_E_RESTORE dirs, e.g. VMN_E=$SW-r2 VMN_E_RESTORE=$SW-r2-restore)"
+  log "RESUME N=$1 from $2: after this chain's restore: bash $P/workspaces/eval2-chain-v2.sh --run $K --start h2 --h2-args '--only-n $1 --from $1:$2' (install skips present guest dirs; a new evidence dir v<V+1>; the resume needs new VMN_E / VMN_E_RESTORE dirs, e.g. VMN_E=$SW-r2 VMN_E_RESTORE=$SW-r2-restore)"
 }
 block() {  # <N>
   local n=$1 lts e done_lt l first= rc

@@ -10,11 +10,11 @@
 #             EVAL2_H1_FIXED=0: runset-h2n.sh 2 <k> with eval2-h1-slo.conf = SLO searches only
 #           evidence recovery/eval2-run<k>-h1-n2-v<V>; a failed H1 is logged (with the evidence dir) and the chain goes on
 #           to h2 unless the measurement lock is still held (then it stops before any topology change)
-#   h2      new H2 (SQ8, ef 24, N = 2/4/8 x u10 u50 u90 x hw mg pop): workspaces/runs123/h2n-chain-v4.sh --run <k> with
+#   h2      new H2 (SQ8, ef 24, N = 2/4/8 x u10 u50 u90 x hw mg pop): h2n-chain-v4.sh (next to this script) --run <k> with
 #           eval2-h2.conf (install -> switch to VM8 -> N=2, 4, 8 blocks -> restore to 2 x 16 vCPU -> per-N export +
 #           combine); evidence recovery/eval2-run<k>-h2-n<N>-v<V>, switch / restore dirs recovery/VM8-v4-eval2-run<k>(-restore)
 #   export  H1 export of the newest H1 evidence of run k (again, into <DERIVED_ROOT>/vdb/<runset>/run<k>-chain) and the
-#           list of registries / derived dirs in workspaces/runs123/run<k>-exports.txt
+#           list of registries / derived dirs in <EVAL2_RUN_DIR>/run<k>-exports.txt
 # usage: run-chain-v1.sh --run K [--dry-run] [--start h1|h2|h2:<v4 start>|restore|export] [--h1-fixed 0|1]
 #                        [--pretouch DIR] [--h2-args "<extra h2n-chain-v4.sh args>"] [--tree DIR (dry only)]
 #                        [--h1-only] [--h1-mixes "<mixes>"] [--h1-with DIR ...]
@@ -33,13 +33,23 @@
 #   --h2-args  appended to the h2n-chain-v4.sh call (e.g. "--only-n 4 --from 4:mg:u50" after a failed N)
 #   --dry-run  every step printed; the run-set dry starts run (H1: runset --dry; H2: h2n-chain-v4.sh --dry-run with
 #           H2N_DRY_CHECK=1 = runset-h2n.sh <N> <k> --dry per N); no lock, no VM contact, nothing written
-# Launch (real): setsid nohup bash /home/comsys/sungsu/destijl-control/workspaces/runs123/run-chain-v1.sh --run <k> \
-#   > /dev/null 2>&1 < /dev/null &        (log: workspaces/runs123/run<k>.log)
+# Launch (real): setsid nohup bash /home/comsys/sungsu/destijl-control/workspaces/eval2-chain-v2.sh --run <k> \
+#   > /dev/null 2>&1 < /dev/null &        (log: <EVAL2_RUN_DIR>/run<k>.log)
 # Refuses (real run) unless the live tree P/CXL_SWMC contains branch runs123 (merge it first) and is clean, and
 # workspaces/MEASUREMENT.lock is absent.
+# Repo copy (experiments/chains/, README.md there) of workspaces/runs123/run-chain-v1.sh as it ran for eval2 runs 1-3;
+# only the paths are parameterised (same defaults):
+#   DESTIJL_ROOT   [/home/comsys/sungsu/destijl-control] control root P (recovery/, workspaces/, the live tree CXL_SWMC)
+#   EVAL2_RUN_DIR  [$P/workspaces/runs123] logs and state of this chain and of h2n-chain-v4.sh (run<k>.log,
+#                  live-head.txt, run<k>-h1-v<V>.log, run<k>-h2.log, run<k>-exports.txt, h2n-chain-v4-*)
+#   EVAL2_ENV      [<this dir>/eval2.env] the EVAL2_H1_FIXED switch file
+# h2n-chain-v4.sh is the copy next to this script.
 set -uo pipefail
-P=/home/comsys/sungsu/destijl-control
-R=$P/workspaces/runs123
+P=${DESTIJL_ROOT:-/home/comsys/sungsu/destijl-control}
+CH=$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")
+R=${EVAL2_RUN_DIR:-$P/workspaces/runs123}
+export EVAL2_RUN_DIR=$R
+EV2ENV=${EVAL2_ENV:-$CH/eval2.env}
 LIVE=$P/CXL_SWMC
 MED=$P/recovery/HOST-measure-env-reapply-1 MPD=$P/recovery/HOST-measure-part-apply-2
 K= DRY=0 START=h1 TREE=$LIVE H2ARGS= PT= FIXED= H1ONLY=0 H1MIXES= H1WITH=()
@@ -63,7 +73,7 @@ while [ $# -gt 0 ]; do
 done
 [[ $K =~ ^[1-3]$ ]] || { echo "CHAIN STOP: --run 1..3 required"; exit 2; }
 case $START in h1|h2|h2:*|restore|export) ;; *) echo "CHAIN STOP: bad --start $START"; exit 2;; esac
-[ -n "$FIXED" ] || FIXED=$(grep -m1 '^EVAL2_H1_FIXED=' "$R/eval2.env" 2>/dev/null | cut -d= -f2)
+[ -n "$FIXED" ] || FIXED=$(grep -m1 '^EVAL2_H1_FIXED=' "$EV2ENV" 2>/dev/null | cut -d= -f2)
 [[ $FIXED =~ ^[01]$ ]] || { echo "CHAIN STOP: EVAL2_H1_FIXED must be 0 or 1 (eval2.env or --h1-fixed; got '$FIXED')"; exit 2; }
 [ $DRY = 1 ] || [ "$TREE" = "$LIVE" ] || { echo "CHAIN STOP: --tree is for --dry-run only (a real run uses $LIVE)"; exit 2; }
 # real run: everything into run<k>.log (re-exec with a plain redirect: no process substitution child that carries this
@@ -80,7 +90,7 @@ say "start pid $$ tree $TREE start $START EVAL2_H1_FIXED=$FIXED args [${ARGS[*]}
 EVD=$TREE/experiments/eval
 if [ $FIXED = 1 ]; then H1CONF=$EVD/eval2-h1.conf H1RS=(bash "$EVD/runset-vdb.sh" "$K") H1SET=vdb
 else H1CONF=$EVD/eval2-h1-slo.conf H1RS=(bash "$EVD/runset-h2n.sh" 2 "$K") H1SET=h2n-n2; fi
-H2CONF=$EVD/eval2-h2.conf V4=$R/h2n-chain-v4.sh
+H2CONF=$EVD/eval2-h2.conf V4=$CH/h2n-chain-v4.sh
 for f in "$H1CONF" "$H2CONF" "$EVD/runset-vdb.sh" "$EVD/runset-h2n.sh" "$V4"; do [ -f "$f" ] || die "missing $f"; done
 # ---- refusals ----
 BR=$(git -C "$LIVE" rev-parse -q --verify refs/heads/runs123 2>/dev/null)
