@@ -31,7 +31,15 @@ def rows(path):
 
 kind = args[0] if args else ""
 if kind == "h1":
-    out = {ev(r["source_dir"].split("/vdb/r1/")[0]) for r in rows(f"{args[1]}/slo_summary.csv")}
+    # in the order of first appearance: export.py keeps the order of its evidence arguments (a split run, e.g. eval2
+    # run 1 = v2 (u10) then v1 (u50, u90), is re-exported with the same argument order and so the same row order)
+    seen = []
+    for r in rows(f"{args[1]}/slo_summary.csv"):
+        e = ev(r["source_dir"].split("/vdb/r1/")[0])
+        if e not in seen:
+            seen.append(e)
+    print("\n".join(seen))
+    raise SystemExit(0)
 elif kind == "h2":
     out = {ev(r["source_dir"].split("/block/")[0]) for r in rows(f"{args[1]}/summary.csv") if r["nodes"] == args[2]}
 elif kind == "knee":

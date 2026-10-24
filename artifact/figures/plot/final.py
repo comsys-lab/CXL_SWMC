@@ -179,9 +179,11 @@ for k in RUNS:
 
 if want("fig1", "fig4"):
     KPLAN = K.load_plan(A.plan)  # knee-sweep bases
-    SWEEP = K.load_sweep_by(K.sweep_paths(A.knee))
-    ADDEND = K.load_sweep_by(K.sweep_paths(A.knee, K.ADDENDUM_GROUPS))  # addendum lifetimes: collapse evidence only
-    NUM["sources"]["knee_sweep"] = {"plan": A.plan, "exports": K.sweep_paths(A.knee)}
+    # only the groups the selected figures read: Fig 1 = knee-sweep-h1, Fig 4 = the H2 groups + the addendum
+    groups = [g for g in K.MAIN_GROUPS if (want("fig1") and "-h1" in g) or (want("fig4") and "-h2" in g)]
+    SWEEP = K.load_sweep_by(K.sweep_paths(A.knee, groups))
+    ADDEND = K.load_sweep_by(K.sweep_paths(A.knee, K.ADDENDUM_GROUPS)) if want("fig4") else {}  # collapse evidence
+    NUM["sources"]["knee_sweep"] = {"plan": A.plan, "exports": K.sweep_paths(A.knee, groups)}
 PT_HDR = ("figure", "panel", "system", "offered_total_ops_s", "x_search_per_s", "p99_ms", "n_search", "steps",
           "phases", "aborted_step", "drawn", "p99_norm", "base_ms", "clipped_at_top")
 
