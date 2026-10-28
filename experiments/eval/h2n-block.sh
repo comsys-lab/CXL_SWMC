@@ -106,12 +106,16 @@ SSH="ssh -o BatchMode=yes -o ConnectTimeout=8"
 INIT=${H2N_INIT:-/home/comsys/vdb/init/seg32c32m-a27m} NA=26990000 HOST_IMAGE=${H2N_HOST_IMAGE:-$P/workspaces/vdb-data/seg32-c32m-a27m-m16-efc128-b1}
 VF=${H2N_VEC_FORMAT:-fp32} EF=${H2N_EF:-32}
 [[ $VF =~ ^(fp32|sq8)$ ]] && [[ $EF =~ ^[1-9][0-9]*$ ]] || die "bad H2N_VEC_FORMAT / H2N_EF ($VF, $EF)"
+# H2N_SEARCH_THREADS (ef-bandwidth, 2026-10-28): search threads per VM instead of vCPU - 1 (core scaling at the
+# application level, the VM keeps its vCPUs); 1 .. vCPU - 1. Unset = vCPU - 1 as every run before.
+ST=${H2N_SEARCH_THREADS:-$((VCPU - 1))}
+[[ $ST =~ ^[1-9][0-9]*$ ]] && [ "$ST" -le $((VCPU - 1)) ] || die "bad H2N_SEARCH_THREADS ($ST: 1 .. vCPU - 1 = $((VCPU - 1)))"
 [ -f "$HOST_IMAGE/SHA256SUMS" ] && [ -f "$HOST_IMAGE/manifest.txt" ] || die "Host init image $HOST_IMAGE has no SHA256SUMS / manifest.txt"
 if [ $VF = sq8 ]; then grep -qx "vec_format sq8" "$HOST_IMAGE/manifest.txt" && [ -f "$HOST_IMAGE/sq8.bin" ] || die "$HOST_IMAGE is not an sq8 image"
 else ! grep -qx "vec_format sq8" "$HOST_IMAGE/manifest.txt" || die "$HOST_IMAGE is an sq8 image (H2N_VEC_FORMAT=fp32)"; fi
 VFSA=; [ $VF = fp32 ] || VFSA=" --vec-format $VF"
 PAT='[/]bin/vdb-server( |$)'
-COMMON_SA="--nodes $N --segments 32 --M 16 --efc 128 --ef $EF --search-threads $((VCPU - 1)) --wait-timeout-ms 60000 --start-timeout-ms 5400000$VFSA"
+COMMON_SA="--nodes $N --segments 32 --M 16 --efc 128 --ef $EF --search-threads $ST --wait-timeout-ms 60000 --start-timeout-ms 5400000$VFSA"
 # plain backend (all-HWcc, Popcorn): 28m-x capacity, delete log per node X_MAXD (h2n_layout.py: total constant over N)
 SA="$COMMON_SA --max-writes $X_MAXW --max-ids $X_MAXIDS --max-deletes $X_MAXD --init-capacity $X_INIT_CAP"
 HOSTSRV=$PLAIN_BUILD/bin/vdb-server
@@ -173,7 +177,7 @@ HCS=$EV/host-cpu-sampler.py   # Host CPU of each VM's QEMU emulator / vhost thre
 LG_CPUS_H=56-63               # run.sh default LG_CPUS (loadgen CPUs), sampled as Host CPU busy
 OWNER=eval-h2n-n$N-run$EVAL_RUN
 echo "BLOCK PLAN: vec_format=$VF ef=$EF init=$INIT host_image=$HOST_IMAGE"
-echo "BLOCK PLAN: h2n vdb N=$N vcpu/VM=$VCPU threads $((VCPU - 1))+1 nodes=[${IPS[*]}] lifetimes=[${LIVES[*]}] app=$APP mg_app=$MGAPP ring=$RING cxlbw=$CXLBW hostcpu=$HOSTCPU opcoh_strict=$STRICT"
+echo "BLOCK PLAN: h2n vdb N=$N vcpu/VM=$VCPU threads $ST+1 nodes=[${IPS[*]}] lifetimes=[${LIVES[*]}] app=$APP mg_app=$MGAPP ring=$RING cxlbw=$CXLBW hostcpu=$HOSTCPU opcoh_strict=$STRICT"
 echo "BLOCK PLAN: server_args plain=[$SA]${MGSA:+ megalon=[$MGSA]}"
 echo "BLOCK PLAN: $LAYOUT"
 [ -z "$FIXED" ] || echo "BLOCK PLAN: fixed windows (no SLO search) [$FIXED] node_env_extra=[$NENV_X] allow_detail=$ALLOWDET"

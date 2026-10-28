@@ -26,8 +26,10 @@ while [ $# -gt 0 ]; do
 done
 set -- "$K_ARG" "${REST[@]}"
 RUNSET=h2n-n$N WL=vdb CONF_WL=h2n
-unset H2N_PINS H2N_VEC_FORMAT H2N_EF H2N_INIT H2N_HOST_IMAGE H2N_REPEATS H2N_LOADGEN_EXTRA \
+unset H2N_PINS H2N_VEC_FORMAT H2N_EF H2N_INIT H2N_HOST_IMAGE H2N_REPEATS H2N_LOADGEN_EXTRA H2N_SEARCH_THREADS \
   H2N_FIXED H2N_FIXED_N2 H2N_FIXED_N4 H2N_FIXED_N8 H2N_NODE_ENV_EXTRA H2N_ALLOW_DETAIL H2N_EVIDENCE_NAME   # optional conf keys: never inherited from the environment
+# H2N_SEARCH_THREADS (ef-bandwidth.conf, 2026-10-28): search threads per VM instead of VCPUS_PER_VM - 1 (passed to
+# h2n-block.sh; the VMs keep their vCPUs)
 # knee-sweep-h2.conf: H2N_FIXED_N<N> (per-N rates) replaces H2N_FIXED for N; H2N_EVIDENCE_NAME may contain {N}
 # (replaced by N, e.g. knee-sweep-h2-n{N} -> recovery/knee-sweep-h2-n4-v<V>)
 # Fixed-window keys (knee-sweep-pilot.conf, lock-split.conf; absent = SLO searches as above): H2N_FIXED,
@@ -94,7 +96,7 @@ if [ $HASMG = 1 ]; then
   [[ $MGD =~ ^[1-9][0-9]*$ ]] || die "H2N_MG_MAXD_N$N missing"
 fi
 plan "vec_format $VF ef ${H2N_EF:-32 (h2n-block default)} pins $PINS${H2N_HOST_IMAGE:+ image $H2N_HOST_IMAGE guest ${H2N_INIT:-}}"
-plan "N=$N topology $H2N_TOPO vCPU/VM=$VCPUS_PER_VM RAM/VM=${H2N_RAM_GB} GB; threads $VDB_SEARCH_THREADS search + 1 writer; recv_mode $RECV_MODE; repeats $REPS (seed $((SEED_BASE + K)) in every repeat)"
+plan "N=$N topology $H2N_TOPO vCPU/VM=$VCPUS_PER_VM RAM/VM=${H2N_RAM_GB} GB; threads ${H2N_SEARCH_THREADS:-$VDB_SEARCH_THREADS} search + 1 writer; recv_mode $RECV_MODE; repeats $REPS (seed $((SEED_BASE + K)) in every repeat)"
 plan "slo part: $SLOPART"
 plan "lifetimes (${#LIVES[@]}): ${LIVES[*]}${FROM:+ (resume from $FROM)}${ONLY:+ (only)}"
 plan "writes $WRITES; max_deletes/node $MAXD$([ $HASMG = 1 ] && echo "; Megalon build $MGB lib $MGL cfg $MGC guest $MGV max_deletes/node $MGD")"
@@ -119,7 +121,7 @@ BENV=(H2N_N=$N H2N_VCPU=$VCPUS_PER_VM "H2N_LIFETIMES=${LIVES[*]}" EVAL_RUN=$K SE
   X_NB=$VDB_X_NB X_MAXIDS=$VDB_X_MAXIDS X_MAXW=$VDB_X_MAXW X_MAXD=$MAXD X_INIT_CAP=$VDB_X_INIT_CAP
   "H2N_SLO_PART=$SLOPART" H2N_OPCOH_STRICT=$H2N_OPCOH_STRICT H2N_CXLBW=$H2N_CXLBW H2N_HOSTCPU=${H2N_HOSTCPU:-0})
 [ $HASMG = 0 ] || BENV+=(MEG_BUILD=$MGB VMEG=$MGV MEG_CFG=$MGC MEG_LIB=$MGL MG_MAXD=$MGD)
-for x in H2N_VEC_FORMAT H2N_EF H2N_INIT H2N_HOST_IMAGE H2N_FIXED H2N_NODE_ENV_EXTRA H2N_ALLOW_DETAIL; do [ -z "${!x:-}" ] || BENV+=("$x=${!x}"); done
+for x in H2N_VEC_FORMAT H2N_EF H2N_INIT H2N_HOST_IMAGE H2N_SEARCH_THREADS H2N_FIXED H2N_NODE_ENV_EXTRA H2N_ALLOW_DETAIL; do [ -z "${!x:-}" ] || BENV+=("$x=${!x}"); done
 for x in PRETOUCH_DIR MEASURE_ENV_DIR MEASURE_PART_DIR; do [ -z "${!x:-}" ] || BENV+=("$x=${!x}"); done
 plan "block: env ${BENV[*]} bash $EVD/h2n-block.sh <E>/block"
 if [ $DRY = 1 ]; then
