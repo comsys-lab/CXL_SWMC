@@ -27,7 +27,10 @@ done
 set -- "$K_ARG" "${REST[@]}"
 RUNSET=h2n-n$N WL=vdb CONF_WL=h2n
 unset H2N_PINS H2N_VEC_FORMAT H2N_EF H2N_INIT H2N_HOST_IMAGE H2N_REPEATS H2N_LOADGEN_EXTRA H2N_SEARCH_THREADS \
-  H2N_FIXED H2N_FIXED_N2 H2N_FIXED_N4 H2N_FIXED_N8 H2N_NODE_ENV_EXTRA H2N_ALLOW_DETAIL H2N_EVIDENCE_NAME   # optional conf keys: never inherited from the environment
+  H2N_FIXED H2N_FIXED_N2 H2N_FIXED_N4 H2N_FIXED_N8 H2N_NODE_ENV_EXTRA H2N_ALLOW_DETAIL H2N_EVIDENCE_NAME VDB_X_NA   # optional conf keys: never inherited from the environment
+# VDB_X_NA (2026-10-30, 54M pool A): pool A record count of the init image (h2n-block.sh X_NA, e1_check --na); absent =
+# 26990000 (the 28M image) so every earlier conf behaves as before. VDB_MG_CAPACITY: h1 (Megalon --max-ids 28000000, no
+# --init-capacity, the fp32 28M cap) | x (the plain layout values --max-ids VDB_X_MAXIDS --init-capacity VDB_X_INIT_CAP)
 # H2N_SEARCH_THREADS (ef-bandwidth.conf, 2026-10-28): search threads per VM instead of VCPUS_PER_VM - 1 (passed to
 # h2n-block.sh; the VMs keep their vCPUs)
 # knee-sweep-h2.conf: H2N_FIXED_N<N> (per-N rates) replaces H2N_FIXED for N; H2N_EVIDENCE_NAME may contain {N}
@@ -50,7 +53,9 @@ REPS=${H2N_REPEATS:-1}
 SLOPART=$H2N_SLO_PART${H2N_LOADGEN_EXTRA:+ $H2N_LOADGEN_EXTRA}
 [ "$VDB_DATASET" = 28m-x ] || die "h2n uses the 28m-x dataset (VDB_DATASET)"
 [ "$VDB_SLO_PCT:$VDB_SLO_MS" = 99:100 ] || die "VDB SLO is search p99 <= 100 ms (the SLO part arguments are fixed)"
-[ "$VDB_MG_CAPACITY" = h1 ] || die "h2n Megalon capacity is VDB_MG_CAPACITY=h1"
+[[ $VDB_MG_CAPACITY =~ ^(h1|x)$ ]] || die "bad VDB_MG_CAPACITY ($VDB_MG_CAPACITY: h1 | x)"
+X_NA=${VDB_X_NA:-26990000}
+[[ $X_NA =~ ^[1-9][0-9]*$ ]] || die "bad VDB_X_NA ($X_NA)"
 [ -n "$FROM" ] && [ -n "$ONLY" ] && die "--from and --only are exclusive"
 # lifetime list: systems outer, mixes inner
 ALL=()
@@ -99,7 +104,7 @@ plan "vec_format $VF ef ${H2N_EF:-32 (h2n-block default)} pins $PINS${H2N_HOST_I
 plan "N=$N topology $H2N_TOPO vCPU/VM=$VCPUS_PER_VM RAM/VM=${H2N_RAM_GB} GB; threads ${H2N_SEARCH_THREADS:-$VDB_SEARCH_THREADS} search + 1 writer; recv_mode $RECV_MODE; repeats $REPS (seed $((SEED_BASE + K)) in every repeat)"
 plan "slo part: $SLOPART"
 plan "lifetimes (${#LIVES[@]}): ${LIVES[*]}${FROM:+ (resume from $FROM)}${ONLY:+ (only)}"
-plan "writes $WRITES; max_deletes/node $MAXD$([ $HASMG = 1 ] && echo "; Megalon build $MGB lib $MGL cfg $MGC guest $MGV max_deletes/node $MGD")"
+plan "writes $WRITES; max_deletes/node $MAXD; pool A $X_NA ($([ -n "${VDB_X_NA:-}" ] && echo "conf VDB_X_NA" || echo "default: no VDB_X_NA")) max_ids $VDB_X_MAXIDS init_capacity $VDB_X_INIT_CAP$([ $HASMG = 1 ] && echo "; Megalon build $MGB lib $MGL cfg $MGC guest $MGV max_deletes/node $MGD capacity $VDB_MG_CAPACITY")"
 need_env
 lock_free
 # approved scope: <RESULTS_ROOT>/vdb-vm-scaling-run<k>-n<N>-v<V> (EVIDENCE_PREFIX in h2n.conf); a conf EVIDENCE_TAG
@@ -118,9 +123,9 @@ else evidence_dir; fi
 BENV=(H2N_N=$N H2N_VCPU=$VCPUS_PER_VM "H2N_LIFETIMES=${LIVES[*]}" EVAL_RUN=$K SEED=$((SEED_BASE + K)) REGION=$REGION
   C8=$POP_C K8=$POP_K GT8=$POP_GT RECV_MODE=$RECV_MODE POP_BUNDLE_SHA=$POP_BUNDLE_SHA EXPECT_DAX_UUID=$EXPECT_DAX_UUID
   VPLAIN=$VDB_VPLAIN PLAIN_BUILD=$VDB_PLAIN_BUILD LOADGEN=$VDB_LOADGEN_BUILD/loadgen X_DATA=$VDB_X_DATA X_WRITES=$WRITES
-  X_NB=$VDB_X_NB X_MAXIDS=$VDB_X_MAXIDS X_MAXW=$VDB_X_MAXW X_MAXD=$MAXD X_INIT_CAP=$VDB_X_INIT_CAP
+  X_NB=$VDB_X_NB X_MAXIDS=$VDB_X_MAXIDS X_MAXW=$VDB_X_MAXW X_MAXD=$MAXD X_INIT_CAP=$VDB_X_INIT_CAP X_NA=$X_NA
   "H2N_SLO_PART=$SLOPART" H2N_OPCOH_STRICT=$H2N_OPCOH_STRICT H2N_CXLBW=$H2N_CXLBW H2N_HOSTCPU=${H2N_HOSTCPU:-0})
-[ $HASMG = 0 ] || BENV+=(MEG_BUILD=$MGB VMEG=$MGV MEG_CFG=$MGC MEG_LIB=$MGL MG_MAXD=$MGD)
+[ $HASMG = 0 ] || BENV+=(MEG_BUILD=$MGB VMEG=$MGV MEG_CFG=$MGC MEG_LIB=$MGL MG_MAXD=$MGD MG_CAPACITY=$VDB_MG_CAPACITY)
 for x in H2N_VEC_FORMAT H2N_EF H2N_INIT H2N_HOST_IMAGE H2N_SEARCH_THREADS H2N_FIXED H2N_NODE_ENV_EXTRA H2N_ALLOW_DETAIL; do [ -z "${!x:-}" ] || BENV+=("$x=${!x}"); done
 for x in PRETOUCH_DIR MEASURE_ENV_DIR MEASURE_PART_DIR; do [ -z "${!x:-}" ] || BENV+=("$x=${!x}"); done
 plan "block: env ${BENV[*]} bash $EVD/h2n-block.sh <E>/block"
@@ -134,7 +139,7 @@ log() { echo "$(date -Is) [$RUNSET run $K] $*" | tee -a "$E/eval-state.txt"; }
 stop() { log "SEQUENCE STOP $*"; $REG add vdb $RUNSET $K "$E" $CSHA stopped "$*"; exit 1; }
 manifest "$VDB_PLAIN_BUILD" "$VDB_LOADGEN_BUILD" $([ $HASMG = 1 ] && echo "$MGB")
 { echo "writes $(sha256sum "$WRITES")"; echo "lifetimes=${LIVES[*]} from=${FROM:-} only=${ONLY:-}"
-  python3 -I -B "$EVD/h2n_layout.py" --vec-format "$VF" --check "$N" "$MAXD"; } >> "$E/eval-manifest.txt"
+  python3 -I -B "$EVD/h2n_layout.py" --vec-format "$VF" --max-ids "$VDB_X_MAXIDS" --check "$N" "$MAXD"; } >> "$E/eval-manifest.txt"
 $REG add vdb $RUNSET $K "$E" $CSHA started "commit $COMMIT N=$N lifetimes ${#LIVES[@]}${FROM:+ from $FROM}"
 log "block start (N=$N, ${#LIVES[@]} lifetimes)"
 env "${BENV[@]}" bash "$EVD/h2n-block.sh" "$E/block" > "$E/sequence.log" 2>&1

@@ -13,13 +13,25 @@ Streaming (2026-10-16, for the 28M set): pass 1 reads only chunk_id, row counts 
 set's rows shard by shard. Memory is O(rows * 13 B) plus one shard, never the whole vector matrix. Selection,
 on-disk order (global row order) and norm statistics are identical to the earlier in-memory version.
 
-usage: prepare_data.py --out DIR --seed 20261015 --pool-a 1000000 --pool-b 1000000 --queries 10000 SHARD...
+Exact-duplicate filter (2026-10-30, for the 54M set; default off = the behaviour above, byte for byte): --dedupe doc,vec
+drops every row whose document text (doc) or whose float32 embedding bytes (vec) exactly repeat a row kept before it
+(first occurrence kept; order = shard order, sorted, then row order), the same 64-bit blake2b hashes and the same
+sequential rule as extend_pool_b.py (a row is checked against the kept rows only, doc first, then vec). The split then
+draws from the unique rows only (need <= unique rows). Memory stays O(rows): two uint64 hash arrays; the per-row loop and
+the seen sets cover only rows whose hash repeats somewhere. chunk_id uniqueness is checked as before. The manifest gets
+dedupe=<rule> rows_scanned=.. dropped_doc=.. dropped_vec=.. unique_kept=..
+
+usage: prepare_data.py --out DIR --seed 20261015 --pool-a 1000000 --pool-b 1000000 --queries 10000 [--dedupe doc,vec] SHARD...
+Run with python3 -E (pyarrow lives in the user site; -I hides it: --help works, a run stops with a message).
 """
 import argparse, hashlib, os, sys
 from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
-import pyarrow as pa
+try:
+    import pyarrow as pa
+except ImportError:  # python3 -I: --help still works; main() stops before reading a shard
+    pa = None
 
 
 def read_table(f):
@@ -51,6 +63,54 @@ def sha256(path):
     return h.hexdigest()
 
 
+def h8(b):  # as extend_pool_b.py: 64-bit blake2b
+    return int.from_bytes(hashlib.blake2b(b, digest_size=8).digest(), "little")
+
+
+def doc_hashes(t):
+    docs = t.column("document").to_pylist()
+    return np.fromiter((h8((x or "").encode()) for x in docs), dtype=np.uint64, count=len(docs))
+
+
+def vec_hashes(v):
+    v = np.ascontiguousarray(v, dtype=np.float32)
+    return np.fromiter((h8(v[i].tobytes()) for i in range(len(v))), dtype=np.uint64, count=len(v))
+
+
+def repeated(h):
+    """mask: the hash of this row occurs more than once over all rows (vectorised; the rest never need the loop)"""
+    _, inv, cnt = np.unique(h, return_inverse=True, return_counts=True)
+    return cnt[inv] > 1
+
+
+def dedupe(rule, dh, vh, n):
+    """keep mask over the n rows (global order) + drop counts; sequential rule of extend_pool_b.py :124-143 over the
+    kept rows: drop if the doc hash was kept before, else if the vec hash was kept before, else keep."""
+    cand = np.zeros(n, dtype=bool)
+    if "doc" in rule:
+        cand |= repeated(dh)
+    if "vec" in rule:
+        cand |= repeated(vh)
+    keep = np.ones(n, dtype=bool)
+    seen_doc, seen_vec = set(), set()
+    dropped = {"doc": 0, "vec": 0}
+    for i in np.flatnonzero(cand):
+        x = int(dh[i]) if "doc" in rule else None
+        y = int(vh[i]) if "vec" in rule else None
+        if x is not None and x in seen_doc:
+            keep[i] = False
+            dropped["doc"] += 1
+        elif y is not None and y in seen_vec:
+            keep[i] = False
+            dropped["vec"] += 1
+        else:
+            if x is not None:
+                seen_doc.add(x)
+            if y is not None:
+                seen_vec.add(y)
+    return keep, dropped
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--out", required=True)
@@ -59,13 +119,25 @@ def main():
     ap.add_argument("--pool-b", type=int, required=True)
     ap.add_argument("--queries", type=int, required=True)
     ap.add_argument("--hash-threads", type=int, default=8)
+    ap.add_argument("--dedupe", default=None, metavar="RULE",
+                    help="drop exact duplicates before the split: doc | vec | doc,vec (document text / embedding bytes "
+                         "equal to a row kept earlier; default off = no filter)")
     ap.add_argument("shards", nargs="+")
     a = ap.parse_args()
+    rule = ()
+    if a.dedupe is not None:
+        rule = tuple(sorted(set(a.dedupe.split(","))))
+        if not rule or any(r not in ("doc", "vec") for r in rule):
+            sys.exit(f"--dedupe {a.dedupe}: expected doc, vec or doc,vec")
+    if pa is None:
+        sys.exit("pyarrow is not importable (it lives in the user site: run with python3 -E, not -I)")
     shards = sorted(a.shards)
     os.makedirs(a.out, exist_ok=True)
 
-    # pass 1: ids, row counts, per-row norms (float32, same per-row reduction as before)
+    # pass 1: ids, row counts, per-row norms (float32, same per-row reduction as before); with --dedupe also the
+    # 64-bit doc / vec hashes of every row
     ids, norms, d = [], [], None
+    dh, vh = [], []
     for s in shards:
         with pa.memory_map(s) as f:
             t = read_table(f)
@@ -76,6 +148,10 @@ def main():
                 sys.exit(f"{s}: dim {v.shape[1]} != {d}")
             ids.append(t.column("chunk_id").to_numpy())
             norms.append(np.linalg.norm(v, axis=1))
+            if "doc" in rule:
+                dh.append(doc_hashes(t))
+            if "vec" in rule:
+                vh.append(vec_hashes(v))
             del v, t
         print(f"pass1 {os.path.basename(s)}: {len(ids[-1])} rows", flush=True)
     counts = [len(i) for i in ids]
@@ -84,11 +160,24 @@ def main():
     del norms
     if len(np.unique(ids)) != len(ids):
         sys.exit("duplicate chunk_id across shards")
+    dropped = None
+    if rule:
+        dh = np.concatenate(dh) if dh else None
+        vh = np.concatenate(vh) if vh else None
+        keep, dropped = dedupe(rule, dh, vh, len(ids))
+        del dh, vh
+        uniq = np.flatnonzero(keep)
+        print(f"dedupe {','.join(rule)}: rows_scanned={len(ids)} dropped_doc={dropped['doc']} dropped_vec={dropped['vec']} "
+              f"unique_kept={len(uniq)}", flush=True)
+    else:
+        uniq = np.arange(len(ids))
     need = a.pool_a + a.pool_b + a.queries
-    if need > len(ids):
-        sys.exit(f"need {need} rows, have {len(ids)}")
+    if need > len(uniq):
+        sys.exit(f"need {need} rows, have {len(uniq)}" + (" unique" if rule else ""))
 
-    perm = np.random.default_rng(a.seed).permutation(len(ids))[:need]
+    # the permutation is over the unique rows (= all rows without --dedupe: identical to the earlier versions)
+    perm = uniq[np.random.default_rng(a.seed).permutation(len(uniq))[:need]]
+    del uniq
     parts = {"pool_a": perm[:a.pool_a], "pool_b": perm[a.pool_a:a.pool_a + a.pool_b],
              "queries": perm[a.pool_a + a.pool_b:]}
     norms = norms_all[perm]
@@ -132,6 +221,9 @@ def main():
     with open(os.path.join(a.out, "manifest.txt"), "w") as m:
         m.write("# vectordb dataset (CXL_SWMC/workloads/vectordb/tools/prepare_data.py)\n")
         m.write(f"seed={a.seed}\ndim={d}\nsource_rows={len(ids)}\n")
+        if rule:
+            m.write(f"dedupe={','.join(rule)} rows_scanned={len(ids)} dropped_doc={dropped['doc']} "
+                    f"dropped_vec={dropped['vec']} unique_kept={len(ids) - dropped['doc'] - dropped['vec']}\n")
         for name, sel in parts.items():
             m.write(f"{name}={len(sel)}\n")
         m.write(f"norm_min={norms.min():.6f} norm_max={norms.max():.6f} norm_mean={norms.mean():.6f}\n")

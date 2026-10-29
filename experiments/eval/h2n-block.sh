@@ -13,8 +13,11 @@
 # env: H2N_N (2..8), H2N_VCPU (4; 16 on the 2-VM topology, runset-h2n.sh H2N_TOPO=2), H2N_LIFETIMES ("<sys>:<mix>
 #   ..." or "<sys>:<mix>:r<j> ..." in execution order; sys hw | pop | mg | mgoff, mix u5 | u10 | u50 | u90 | u95), EVAL_RUN (k), SEED, REGION, C8 K8 GT8 RECV_MODE POP_BUNDLE_SHA, PRETOUCH_DIR (VM8-v* evidence
 #   of the current QEMU lifetimes), MEASURE_ENV_DIR MEASURE_PART_DIR (h3-gate.sh), EXPECT_DAX_UUID,
-#   VPLAIN PLAIN_BUILD LOADGEN X_DATA X_WRITES X_NB X_MAXIDS X_MAXW X_MAXD X_INIT_CAP,
-#   Megalon (only when a lifetime is mg / mgoff): MEG_BUILD VMEG MEG_CFG MEG_LIB MG_MAXD,
+#   VPLAIN PLAIN_BUILD LOADGEN X_DATA X_WRITES X_NB X_MAXIDS X_MAXW X_MAXD X_INIT_CAP, X_NA (optional: pool A size =
+#   the init image's record count, conf VDB_X_NA; unset = 26990000, the 28M image, as every run before 2026-10-30),
+#   Megalon (only when a lifetime is mg / mgoff): MEG_BUILD VMEG MEG_CFG MEG_LIB MG_MAXD, MG_CAPACITY (optional,
+#   conf VDB_MG_CAPACITY: h1 = --max-ids 28000000 without --init-capacity, the fp32 28M cap, unset = h1 as before;
+#   x = the plain layout values --max-ids X_MAXIDS --init-capacity X_INIT_CAP, for the 54M SQ8 set),
 #   H2N_SLO_PART (loadgen SLO part arguments), H2N_OPCOH_STRICT (0 | 1), H2N_CXLBW (0 | 1), H2N_HOSTCPU (0 | 1)
 # Order: lock -> [CXL.mem sampler] -> pretouch check (N VMs) -> h3 gate -> guest prechecks + install sha256 vs the Host
 # builds -> dmesg baseline -> lifetimes (each: h3 gate, dax owner, [Popcorn: shm load / preload / enable / recv_mode /
@@ -103,9 +106,11 @@ SSH="ssh -o BatchMode=yes -o ConnectTimeout=8"
 # SQ8 overlay (h2n-sq8.conf; user decision 2026-10-21): H2N_VEC_FORMAT (fp32 | sq8; sq8 adds --vec-format sq8 to every
 # system's server arguments), H2N_EF (query ef), H2N_INIT (guest init dir on vm0), H2N_HOST_IMAGE (Host copy of it,
 # SHA256SUMS checked against the guest's). Unset = the fp32 values every h2n run before SQ8 used.
-INIT=${H2N_INIT:-/home/comsys/vdb/init/seg32c32m-a27m} NA=26990000 HOST_IMAGE=${H2N_HOST_IMAGE:-$P/workspaces/vdb-data/seg32-c32m-a27m-m16-efc128-b1}
-VF=${H2N_VEC_FORMAT:-fp32} EF=${H2N_EF:-32}
+INIT=${H2N_INIT:-/home/comsys/vdb/init/seg32c32m-a27m} NA=${X_NA:-26990000} HOST_IMAGE=${H2N_HOST_IMAGE:-$P/workspaces/vdb-data/seg32-c32m-a27m-m16-efc128-b1}
+VF=${H2N_VEC_FORMAT:-fp32} EF=${H2N_EF:-32} MGCAP=${MG_CAPACITY:-h1}
 [[ $VF =~ ^(fp32|sq8)$ ]] && [[ $EF =~ ^[1-9][0-9]*$ ]] || die "bad H2N_VEC_FORMAT / H2N_EF ($VF, $EF)"
+[[ $NA =~ ^[1-9][0-9]*$ ]] || die "bad X_NA ($NA)"
+[[ $MGCAP =~ ^(h1|x)$ ]] || die "bad MG_CAPACITY ($MGCAP: h1 | x)"
 # H2N_SEARCH_THREADS (ef-bandwidth, 2026-10-28): search threads per VM instead of vCPU - 1 (core scaling at the
 # application level, the VM keeps its vCPUs); 1 .. vCPU - 1. Unset = vCPU - 1 as every run before.
 ST=${H2N_SEARCH_THREADS:-$((VCPU - 1))}
@@ -136,12 +141,17 @@ APP=$("$HOSTSRV" $SA --print-app-bytes) || die "print-app-bytes ($HOSTSRV, --nod
 RING=$(grep -E '^msg_ring:' "$REGION" | sed 's/.*,[[:space:]]*\([0-9]*\)\].*/\1/')
 [ $((APP + RING)) -lt 268435456 ] || die "app HWcc $APP B + ring $RING B exceed the 256 MiB HWcc budget at N = $N"
 # SWcc fit of the plain layout at this N and X_MAXD (backend.h formulas; the server's own fits() check runs at start)
-LAYOUT=$(python3 -I -B "$EV/h2n_layout.py" --vec-format $VF --check "$N" "$X_MAXD") || die "h2n_layout.py: $LAYOUT"
+LAYOUT=$(python3 -I -B "$EV/h2n_layout.py" --vec-format $VF --max-ids "$X_MAXIDS" --check "$N" "$X_MAXD") || die "h2n_layout.py: $LAYOUT"
 MGSA= MGINSTALL= MGAPP=-
 if [ $HASMG = 1 ]; then
   : "${MEG_BUILD:?}" "${VMEG:?}" "${MEG_CFG:?}" "${MEG_LIB:?}" "${MG_MAXD:?}"
-  # VDB_MG_CAPACITY=h1 (m4-run.sh X_MEGALON_H1CAP=1): 28M capacity, no --init-capacity; delete log per node MG_MAXD
-  MGSA="--backend megalon $COMMON_SA --max-writes 2097152 --max-ids 28000000 --max-deletes $MG_MAXD"
+  # MG_CAPACITY (conf VDB_MG_CAPACITY): h1 (m4-run.sh X_MEGALON_H1CAP=1) = 28M capacity, no --init-capacity (the
+  # fp32 28M image's own capacity: 28m-x did not fit Megalon's arena in fp32); x = the plain layout values (SQ8 54M
+  # set: --max-ids X_MAXIDS --init-capacity X_INIT_CAP, the image's init capacity). Delete log per node MG_MAXD.
+  case $MGCAP in
+    h1) MGSA="--backend megalon $COMMON_SA --max-writes 2097152 --max-ids 28000000 --max-deletes $MG_MAXD";;
+    x)  MGSA="--backend megalon $COMMON_SA --max-writes 2097152 --max-ids $X_MAXIDS --max-deletes $MG_MAXD --init-capacity $X_INIT_CAP";;
+  esac
   MGOK=1
   for f in "$MEG_BUILD/bin/vdb-server" "$MEG_BUILD/manifest.txt" "$MEG_CFG" "$MEG_LIB/manifest.txt"; do
     [ -f "$f" ] || { MGOK=0; pending "Megalon input missing for N = $N: $f (megalon-n agent)"; }

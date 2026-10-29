@@ -11,8 +11,12 @@ The delete log is per node (backend.h:34-35). Rule (h2n): total delete-log capac
   max_deletes(N) = floor(2 x X_MAXD(2) / N / dlog_chunk) x dlog_chunk, X_MAXD(2) = 1835008 (the 2-VM value), and it
   must cover the largest per-VM delete count of the N-target writes file (deletes are executed by the target VM's
   writer; the file's total deletes are unchanged: 3,400,000 for every N).
-usage: h2n_layout.py [--vec-format fp32|sq8] [--writes-n2 F] [--writes-n4 F] [--writes-n8 F] [--csv OUT] [--skip-writes]
+usage: h2n_layout.py [--vec-format fp32|sq8] [--max-ids N] [--mg-max-ids N] [--writes-n2 F] [--writes-n4 F] [--writes-n8 F]
+                     [--csv OUT] [--skip-writes]
 Prints one row per N and "LAYOUT PASS" / "LAYOUT FAIL: ..."; exit 1 on FAIL.
+--max-ids (2026-10-30, 54M pool A): the plain backend --max-ids (conf VDB_X_MAXIDS; default the 28m-x value 30470752);
+h2n-block.sh / runset-h2n.sh pass the conf's value with --check. --mg-max-ids: Megalon's (table rows; default 28000000 =
+VDB_MG_CAPACITY=h1; VDB_MG_CAPACITY=x uses the plain value, pass the same number).
 """
 import argparse
 import csv
@@ -85,6 +89,8 @@ def main():
     ap.add_argument("--check", nargs=2, type=int, metavar=("N", "MAX_DELETES"),
                     help="one line for this N and per-node max_deletes (h2n-block.sh); exit 1 if it does not fit")
     ap.add_argument("--vec-format", choices=("fp32", "sq8"), default="fp32", help="stored vector format (server --vec-format)")
+    ap.add_argument("--max-ids", type=int, default=MAX_IDS, help=f"plain backend --max-ids (VDB_X_MAXIDS; default {MAX_IDS})")
+    ap.add_argument("--mg-max-ids", type=int, default=MG_MAX_IDS, help=f"Megalon --max-ids, table rows only (default {MG_MAX_IDS})")
     # verifier L4 (2026-10-22): deletes one lifetime can reach per VM = aggregate update rate x lifetime / N (printed
     # next to the delete-log size; informational, never a FAIL). Defaults above every pilot rate: plain backend 3600
     # updates/s (2 x the SQ8 pilot hw u90 N=8 max 195 search/s x 9), Megalon 100 updates/s (pilot <= ~12), lifetime
@@ -97,16 +103,16 @@ def main():
     VEC_FORMAT = a.vec_format
     if a.check:
         n, md = a.check
-        r = layout(n, md)
-        ok = r["fits"] and r["dlog_total_bytes"] <= layout(2, MAXD2)["dlog_total_bytes"]
+        r = layout(n, md, a.max_ids)
+        ok = r["fits"] and r["dlog_total_bytes"] <= layout(2, MAXD2, a.max_ids)["dlog_total_bytes"]
         print(f"LAYOUT {'PASS' if ok else 'FAIL'}: {'vec=sq8 ' if VEC_FORMAT == 'sq8' else ''}N={n} max_deletes={md} dlog_node={r['dlog_node_bytes']} "
               f"swcc_used_end={r['swcc_used_end']} device={DEVICE_SIZE} headroom={r['headroom_bytes']}")
         sys.exit(0 if ok else 1)
     fails, rows = [], []
-    base = layout(2, MAXD2)
+    base = layout(2, MAXD2, a.max_ids)
     for n in (2, 4, 8):
-        r = layout(n, maxd(n))
-        mg = layout(n, maxd(n, MG_MAXD2), MG_MAX_IDS)
+        r = layout(n, maxd(n), a.max_ids)
+        mg = layout(n, maxd(n, MG_MAXD2), a.mg_max_ids)
         r.update(mg_max_deletes_per_node=maxd(n, MG_MAXD2), mg_dlog_total_bytes=mg["dlog_total_bytes"])
         if not args_skip(a):
             f = getattr(a, f"writes_n{n}")
