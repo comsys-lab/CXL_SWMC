@@ -15,7 +15,7 @@
 set -uo pipefail
 D=${1:?ENV-pretouch evidence dir} OUT=${2:?out file}
 P=/home/comsys/sungsu/destijl-control
-UUID=${PT_UUID:-f61e87a2-aaa7-41a7-94d9-5e74fe078049}
+UUID=${PT_UUID:-3d40b5e0-dcaf-427f-bb9b-04fd6c8be26f}   # devdax restore v3 (2026-10-28); before: f61e87a2-aaa7-41a7-94d9-5e74fe078049 (2026-10-17)
 SSH="ssh -o BatchMode=yes -o ConnectTimeout=8"
 IPS=(192.168.122.100 192.168.122.101)
 fails=() lines=()
