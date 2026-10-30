@@ -74,7 +74,7 @@ ME_BASE=$P/recovery/HOST-measure-env-reapply-1 ME_PART=$P/recovery/HOST-measure-
 DAX_SIZE=103060340736 NPAGES=25161216
 MEM96_MIN=98000000 MEM96_MAX=99500000   # 96 GiB VM MemTotal (observed 98,875,388 kB, recovery/R6-20261014-v1 P3c VM0)
 BASE_ID="CXL_vm0 21a1a314c19942ebbdc85617855ef95d"   # /etc/hostname and /etc/machine-id of the base root fs
-NSUUID=9c7db57f-9f44-4462-b367-95e32b0deef9   # live namespace0.0 label (P3c create-namespace) in the shared label area
+NSUUID=${VMN_NSUUID:-3ef8e7e7-813c-45e5-a326-7a0db22ffc08}   # live namespace0.0 sysfs uuid (shared label area); devdax restore v3 of 2026-10-28 (vm0 = vm1 = 3ef8e7e7-...); before: 9c7db57f-9f44-4462-b367-95e32b0deef9 (P3c of 2026-10-17); VMN_NSUUID overrides after a later restore
 FREEZE_REC_OFFLINE=$P/recovery/VM8-v2.2/freeze/stat-before.txt   # offline dry-restore only: placeholder owner/mode
 V="virsh -c qemu:///system"
 LG=$W/lg-root     # libguestfs cache/tmp for the root-run guestfish (inside this workspace; workspaces/vm8 is not touched)
