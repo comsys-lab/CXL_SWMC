@@ -2,7 +2,10 @@
 # Package a built De Stijl v2 kernel (builds/destijl/<n>, LOCALVERSION -ds-destijl-<n>) for the same direct-boot
 # deployment as Popcorn build 12 (p-popcorn-package.sh / p-popcorn-deploy.sh, P3c pattern). Host-local only (no guest,
 # no VM change, no sudo, no virsh: the rollback XMLs come from a frozen bundle, checked again by the deploy precheck).
-#   [XML_SRC=<dir>] [KTREE=<kernel worktree>] [EQUIV_COMMIT=<commit>] p-destijl-package.sh <n> <bundle-version>
+#   [XML_SRC=<dir>] [KTREE=<kernel worktree>] [EQUIV_COMMIT=<commit>] [FAULTLAT_BUILD=<builds/faultlat/<m>>] \
+#     p-destijl-package.sh <n> <bundle-version>
+# FAULTLAT_BUILD: take faultlat from that frozen build (its build-record.json faultlat_sha256 must match) instead of
+#   building it here with workloads/faultlat/setup.sh.
 # Inputs (builds/destijl/<n>):  MANIFEST.txt (release, source_commit, dirty_sha256, config_sha256, artifact sha256s),
 #   .config, arch/x86/boot/bzImage, System.map, certs/, cxl_shm/cxl_shm.ko (cxl_shm v13, M=<KTREE>/msg_layer_module).
 # Source identity: a build from a dirty tree (MANIFEST dirty_sha256) is accepted only if EQUIV_COMMIT reproduces the
@@ -159,7 +162,14 @@ cp "$DEP/l-vanilla-verify-initrd.py" "$OUT/verify-initrd.py"
 (cd "$OUT" && python3 -I verify-module-payload.py)
 
 # 3. guest tools: faultlat (faultlat-6, built from this tree), libdestijl test, region config, guest script, destijl.env
-bash "$SW/workloads/faultlat/setup.sh" "$SCR/fl" > /dev/null
+if [ -n "${FAULTLAT_BUILD:-}" ]; then
+  want=$(python3 -I -c 'import json,sys; print(json.load(open(sys.argv[1]))["faultlat_sha256"])' "$FAULTLAT_BUILD/build-record.json")
+  [ "$(sha256sum "$FAULTLAT_BUILD/faultlat" | cut -d' ' -f1)" = "$want" ] ||
+    { echo "STOP: $FAULTLAT_BUILD/faultlat != its build-record.json faultlat_sha256"; exit 1; }
+  mkdir -p "$SCR/fl"; cp "$FAULTLAT_BUILD/faultlat" "$SCR/fl/faultlat"
+else
+  bash "$SW/workloads/faultlat/setup.sh" "$SCR/fl" > /dev/null
+fi
 mkdir -p "$SCR/t/systems/destijl" "$SCR/t/systems/common"
 cp -r "$SW/systems/destijl/lib" "$SCR/t/systems/destijl/lib"
 cp "$SW/systems/common/"*.h "$SCR/t/systems/common/"
@@ -214,6 +224,7 @@ cat > "$OUT/package-record.json" <<JSON
   "cxl_swmc_dirty_files": $(git -C "$SW" status --porcelain -- scripts/deploy workloads/faultlat systems/destijl systems/common config | wc -l),
   "faultlat_sha256": "$(sh_ "$FL")",
   "faultlat_version": "$(grep -aoE 'faultlat-[0-9]+' "$FL" | sort -u | tail -1)",
+  "faultlat_source": "${FAULTLAT_BUILD:-built here by workloads/faultlat/setup.sh}",
   "de_stijl_test_sha256": "$(sh_ "$OUT/tools/de_stijl_test")",
   "region_config": "$REG", "region_sha256": "$(sh_ "$REG")", "ring_offset": $ROFF, "ring_size": $RSIZE,
   "cxl_shm_params": "$PARAMS",
