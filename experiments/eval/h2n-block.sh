@@ -28,7 +28,10 @@
 #   ENV:CXL_SYSTEM=ds ENV:CXL_DESTIJL_T_US=<T>). ds cycle = p-destijl-shm.sh precheck / load (protocol=destijl,
 #   init_state=shared, recv_mode=RECV_MODE: poll | sleep) / chown / preload (as pop) / enable / recv_mode / status, and
 #   teardown after the lifetime. ds lifetimes are checked with opcoh_check.py destijl (popcorn rules + De Stijl
-#   counters present, tx_timeout / protocol_error deltas 0; same H2N_OPCOH_STRICT rule as pop).
+#   counters present, tx_timeout / protocol_error deltas 0; same H2N_OPCOH_STRICT rule as pop) and, after the
+#   teardown, recv_check.py --name <lifetime> (E/recv-check-<name>.txt: recv_mode, cxl_shm v13 state, protocol, De
+#   Stijl counters, receive thread, tx_timeout / protocol_error status deltas 0, per-step ds columns); a recv check FAIL
+#   always stops the block (as runset-vdb.sh / runset-rs-main.sh).
 # Order: lock -> [CXL.mem sampler] -> pretouch check (N VMs) -> h3 gate -> guest prechecks + install sha256 vs the Host
 # builds -> dmesg baseline -> lifetimes (each: h3 gate, dax owner, [Popcorn: shm load / preload / enable / recv_mode /
 # instr], run.sh part slo, checks, [teardown], dmesg check) -> pretouch check (end) -> BLOCK DONE.
@@ -424,6 +427,12 @@ sys_up() {  # <sys> <name>: dax owner (hw, mg, mgoff: comsys) + Popcorn / De Sti
 sys_down() {  # <sys>: Popcorn / De Stijl teardown after the lifetime (nothing for the others)
   case $1 in pop) pop_down;; ds) ds_down;; esac
 }
+ds_recv() {  # <name>: recv_check.py on this ds lifetime (needs its teardown files and stats-steps.csv); FAIL stops
+  python3 -I -B $EV/recv_check.py "$E" --mode "$RECV_MODE" --name "$1" --out "$E/recv-check-$1.txt" > /dev/null 2>&1
+  local r; r=$(tail -n 1 "$E/recv-check-$1.txt" 2>/dev/null)
+  log "$1: recv check: ${r:-no recv-check-$1.txt}"
+  [[ $r == "RECVCHECK PASS"* ]] || stop "$1: recv check FAIL (see recv-check-$1.txt)"
+}
 # ---- one lifetime: run.sh (N nodes, PARTS=slo) with the H1 SLO part arguments ---------------------------------------
 vdb_life() {  # <sys> <mix> [r<j>]
   local s=$1 mix=$2 U=${2#u} name=$1-$2-n$N${3:+-$3} R k L RP note rc mode oc=- OPS
@@ -474,6 +483,7 @@ vdb_life() {  # <sys> <mix> [r<j>]
     [ $STRICT = 1 ] && stop "$name: opcoh_check $mode $oc (see $RP/opcoh-check.txt)"
     log "$name NOTE: opcoh_check $mode $oc on $N nodes (H2N_OPCOH_STRICT=0: recorded; see $RP/opcoh-check.txt)"
   fi
+  [ $s != ds ] || ds_recv $name
   python3 $XV/urate_check.py $RP --writers 1 > $RP/urate-check.txt 2>&1 || true
   python3 $XV/e1_check.py --writes $X_WRITES --na $NA --nb $X_NB --searches $RP/loadgen/searches.bin --out $RP/e1 --sample 500 > /dev/null \
     || stop "$name: E1 violation (see $RP/e1.e1.txt)"
@@ -561,6 +571,7 @@ vdb_fixed_life() {  # <sys> <mix>
     python3 $XV/e1_check.py --writes $X_WRITES --na $NA --nb $X_NB --searches $RP/loadgen/searches.bin --out $RP/e1 --sample 500 > /dev/null \
       || stop "$name/$p: E1 violation (see $RP/e1.e1.txt)"
   done
+  [ $s != ds ] || ds_recv $name
   note="fixed parts: $parts"
   # dmesg first (review M1): a result row means every check of this lifetime passed, so a resume never skips the next
   # cell for a failure of this one

@@ -18,7 +18,8 @@
 #   builds/destijl/<n>/deploy-v<v>/
 #     modules.tar, modules-manifest.json, kernel.config, prepare-guest.sh, sanitize-initrd.py, verify-module-payload.py,
 #     verify-initrd.py, preparation.sha256                        guest install set (generic l-vanilla scripts, copied)
-#     tools/{faultlat,run.sh,cxl_region.yaml,p-destijl-guest.sh,destijl.env,de_stijl_test,tools.sha256}   guest tools (GT)
+#     tools/{faultlat,run.sh,cxl_region.yaml,p-destijl-guest.sh,ds-replica-check.sh,destijl.env,de_stijl_test,tools.sha256}
+#                                                                 guest tools (GT; ds-replica-check.sh from phase 5d on)
 #     vm0/, vm1/ {rollback-inactive.xml,candidate-normal.xml,candidate-restricted.xml,xml.sha256}
 #     p-destijl-deploy.sh, p-destijl-shm.sh, smoke.sh, smoke-n.sh, scenarios.sh, parse.py, vm-console.py, p-popcorn-xml.py
 #     params-layout.txt, signatures.txt, package-record.json, packet.sha256
@@ -166,7 +167,7 @@ make -s -C "$SCR/t/systems/destijl/lib" clean > /dev/null
 make -s -C "$SCR/t/systems/destijl/lib" de_stijl_test > /dev/null
 cp "$SCR/fl/faultlat" "$SW/workloads/faultlat/run.sh" "$SCR/t/systems/destijl/lib/de_stijl_test" "$OUT/tools/"
 cp "$REG" "$OUT/tools/cxl_region.yaml"
-cp "$DEP/p-destijl-guest.sh" "$OUT/tools/"
+cp "$DEP/p-destijl-guest.sh" "$DEP/ds-replica-check.sh" "$OUT/tools/"   # replica check: p-destijl-guest.sh replica-check
 FL=$OUT/tools/faultlat
 grep -aq 'faultlat-6' "$FL" || { echo "STOP: faultlat is not faultlat-6 (no --protocol destijl)"; exit 1; }
 par() { "$FL" params --protocol destijl --config "$OUT/tools/cxl_region.yaml" --device-size $DEV_SIZE --nodes "$1" \
@@ -186,7 +187,7 @@ KO_SHA=$(sha256sum "$MD/updates/cxl_shm.ko" | cut -d' ' -f1)
   echo "MANAGED_BYTES=$MBYTES"
 } > "$OUT/tools/destijl.env"
 for m in 2 3 4 5 6 7 8; do echo "N=$m $(par $m)"; done > "$OUT/params-layout.txt"
-(cd "$OUT/tools" && sha256sum faultlat run.sh cxl_region.yaml p-destijl-guest.sh destijl.env de_stijl_test > tools.sha256)
+(cd "$OUT/tools" && sha256sum faultlat run.sh cxl_region.yaml p-destijl-guest.sh ds-replica-check.sh destijl.env de_stijl_test > tools.sha256)
 
 # 4. per-VM candidate XMLs (direct boot from /var/lib/libvirt/images/destijl-<n>-vm<k>-v<v>)
 for k in 0 1; do

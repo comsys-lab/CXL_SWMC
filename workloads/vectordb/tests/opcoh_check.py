@@ -39,7 +39,10 @@ usage: opcoh_check.py <run or scratch dir> fake|megalon|none|hwcc|popcorn|destij
               protocol_error deltas = 0 on every target between the first begin and the last end loadgen stats
               snapshot (<part>/loadgen/stats/, ordered by mono_ns) of the parts in OPCOH_PARTS (no snapshots or a
               missing key: FAIL); prints ds_async_share = async_issued / (async_issued + async_fallback_mean +
-              async_fallback_p95) over the same window and nodes (experiments/eval/canon.py DS_COH).
+              async_fallback_p95) over the same window and nodes (experiments/eval/canon.py DS_COH); prints
+              replica_pages / replica_pool_full of every node's final stats, FAIL if replica_pool_full != 0 (a full
+              pool maps CXL directly: replicated and unreplicated pages mixed); OPCOH_DS_REPLICA_MODE=all also
+              FAILs when either key is missing.
   megalon-vm: Megalon with CohSnap + AnchorSnap (shim v3): both present on every record, sum of c_ns > 0 per op type,
               validation copies counted; every Popcorn part 0 (cxl_shm unloaded); MEGALON_LEAN=1 in the environment
               (Megalon >= 76 runs, reports/VDB-V1-packet.md v1.3): lean bit on and events_always off on every record,
@@ -313,6 +316,17 @@ if mode == "destijl":
             if k in ("tx_timeout", "protocol_error"):
                 check(e[DSP + k] == b[DSP + k], f"target {t}: De Stijl {k} delta {e[DSP + k] - b[DSP + k]} (must be 0)")
     den = tot["async_issued"] + tot["async_fallback_mean"] + tot["async_fallback_p95"]
+    # replica pool (replication review 2026-11-01): a full pool silently maps CXL directly, so a lifetime with
+    # replica_pool_full != 0 mixes replicated and unreplicated pages: FAIL. End values of every node's final stats;
+    # OPCOH_DS_REPLICA_MODE=all (replica_mode=all lifetimes) also requires the keys (absent = kernel without them).
+    rmode = os.environ.get("OPCOH_DS_REPLICA_MODE", "off")
+    rp = [s.get(DSP + "replica_pages") for s in st]
+    rf = [s.get(DSP + "replica_pool_full") for s in st]
+    if rmode == "all":
+        check(all(isinstance(x, int) for x in rp + rf), "replica_mode=all: replica_pages and replica_pool_full in every "
+              f"node's final stats (pages {rp}, pool_full {rf})")
+    check(all(not isinstance(x, int) or x == 0 for x in rf), f"De Stijl replica_pool_full 0 on every node ({rf})")
+    print(f"destijl: replica_mode {rmode} replica_pages {rp} replica_pool_full {rf} (final stats per node)")
     print(f"destijl: ds_async_share {tot['async_issued'] / den:.4f}" if den else "destijl: ds_async_share n/a (no admission decision)",
           f"(async_issued {tot['async_issued']}, async_fallback_mean {tot['async_fallback_mean']}, async_fallback_p95 "
           f"{tot['async_fallback_p95']}; ccd_filtered {tot['ccd_filtered']} fetch_sent {tot['fetch_sent']} inv_sent "

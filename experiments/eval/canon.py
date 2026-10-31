@@ -41,10 +41,13 @@ VDB_COH = ["srv_searches", "srv_updates", "mg_fetch_per_s", "mg_flush_writeend_p
 #                             (both empty when no read fault on a T > 0 range needed a FETCH in the step)
 #   ds_p95_us               = max over nodes of the end value of p95_us (SS residence p95, gauge)
 #   ds_bpd_evict_per_s      = bpd_evict / step window (s)
+#   ds_replica_refresh_per_rop = replica_refresh / server read ops (replica_mode=all: every completed async page costs
+#                             one extra minor fault after the ACK refresh; a reader may subtract it; 0 without replicas)
 DS_COH = ["ds_filtered_per_rop", "ds_merged_per_rop", "ds_fetch_per_rop", "ds_inv_per_rop", "ds_async_share",
-          "ds_async_fallback_share", "ds_p95_us", "ds_bpd_evict_per_s"]
+          "ds_async_fallback_share", "ds_p95_us", "ds_bpd_evict_per_s", "ds_replica_refresh_per_rop"]
 DS_KEYS = {k: "sys.swmc.destijl." + k for k in ("ccd_filtered", "ccd_merged", "fetch_sent", "inv_sent", "async_issued",
-                                                "async_fallback_mean", "async_fallback_p95", "p95_us", "bpd_evict")}
+                                                "async_fallback_mean", "async_fallback_p95", "p95_us", "bpd_evict",
+                                                "replica_refresh")}
 
 
 def ds_coh(sums, rops, window_s):
@@ -59,7 +62,8 @@ def ds_coh(sums, rops, window_s):
             "ds_fetch_per_rop": pr(g("fetch_sent")), "ds_inv_per_rop": pr(g("inv_sent")),
             "ds_async_share": g("async_issued") / den if den else None,
             "ds_async_fallback_share": (g("async_fallback_mean") + g("async_fallback_p95")) / den if den else None,
-            "ds_p95_us": sums.get("p95_us"), "ds_bpd_evict_per_s": g("bpd_evict") / window_s if window_s else None}
+            "ds_p95_us": sums.get("p95_us"), "ds_bpd_evict_per_s": g("bpd_evict") / window_s if window_s else None,
+            "ds_replica_refresh_per_rop": pr(g("replica_refresh"))}
 
 
 # lowest measured ramp step of an SLO search (verifier L3): hatched bars for searches without a confirmed max

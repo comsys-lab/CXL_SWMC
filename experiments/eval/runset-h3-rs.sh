@@ -39,6 +39,8 @@ plan "N=$N vCPU/VM=$VCPU RAM/VM=$((H3_TOTAL_RAM_GB / N)) GB; rate $H3_RS_RATE sa
 plan "N = 2 point: rs-main run $K ($(run_dir_of rs-main "$K" || echo 'not accepted yet'))"
 need_env
 lock_free
+# a conf EVIDENCE_TAG (h3-ds.conf) prefixes the run set name: <prefix>-run<k>-<tag>-h3-rs-n<N>-v<V>
+[ -z "${EVIDENCE_TAG:-}" ] || EVIDENCE_TAG=$EVIDENCE_TAG-$RUNSET
 evidence_dir
 BENV=(H3_WL=recsys H3_N=$N H3_TOTAL_VCPU=$H3_TOTAL_VCPU "SYSTEMS=$H3_SYSTEMS" EVAL_RUN=$K SEED=$((SEED_BASE + K)) REGION=$REGION
   C8=$POP_C K8=$POP_K GT8=$POP_GT RECV_MODE=$RECV_MODE POP_BUNDLE_SHA=$POP_BUNDLE_SHA EXPECT_DAX_UUID=$EXPECT_DAX_UUID

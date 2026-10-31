@@ -3,7 +3,8 @@
 # and sudo surface as p-popcorn-guest.sh (insmod/rmmod cxl_shm, syscalls 470/471, instr/enabled), for cxl_shm v13
 # protocol=destijl (reports/design/DS2-protocol-spec.md §9; module README top block).
 #   p-destijl-guest.sh load <node_id> <invalid|shared> [nodes=N] [name=value ...] | wait-state <sec> | enable <sec>
-#                      | status | disable | unload | instr <0|1> | instr-dump
+#                      | status | disable | unload | instr <0|1> | instr-dump | replica-mode <off|all>
+#                      | replica-check <ds-replica-check.sh args> (replica_mode file / page_digest replica check)
 # Expected values come from destijl.env next to this script (frozen in the bundle): K (kernel release, -ds-destijl-<n>),
 # KO_SHA (sha256 of the installed cxl_shm.ko v13; optional KO_PATH: load that file instead of
 # /lib/modules/$K/updates/cxl_shm.ko), PARAMS (cxl_shm parameters except node_id = `faultlat params --protocol destijl
@@ -196,5 +197,17 @@ instr-dump)
       sed "s|^|$(basename "$(dirname "$d")").$(basename "$f").|" "$f"
     done
   done ;;
-*) sed -n '2,28p' "$0"; exit 2 ;;
+replica-mode)
+  # off | all (damon: not used by the harness); the kernel accepts it only while no managed VMA exists (EBUSY): the
+  # bring-up chain writes it after load / wait-state and before enable. Same sudo surface (this script as root).
+  m=${2:?off|all}; [[ "$m" =~ ^(off|all)$ ]] || { echo "STOP: replica-mode off|all"; exit 1; }
+  test -w $DS/replica_mode || { echo "STOP: no $DS/replica_mode (kernel without replication)"; exit 1; }
+  echo "$m" > $DS/replica_mode || { echo "STOP: write replica_mode=$m refused (EBUSY: managed mapping; EOPNOTSUPP: build without CONFIG_SWMC_DE_STIJL_REPL)"; exit 1; }
+  [ "$(cat $DS/replica_mode)" = "$m" ] || { echo "STOP: replica_mode reads $(cat $DS/replica_mode)"; exit 1; }
+  echo "replica_mode OK ($m; replica_pages $(cat $DS/replica_pages 2>/dev/null || echo absent))" ;;
+replica-check)
+  # ds-replica-check.sh next to this script (bundle tools from De Stijl build 4 on); arguments passed through
+  shift; test -f "$H/ds-replica-check.sh" || { echo "STOP: no $H/ds-replica-check.sh in the guest tools"; exit 1; }
+  exec bash "$H/ds-replica-check.sh" "$@" ;;
+*) sed -n '2,30p' "$0"; exit 2 ;;
 esac

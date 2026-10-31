@@ -2,7 +2,9 @@
 """Receive-mode check of the Popcorn and De Stijl lifetimes of one evaluation block dir (Host only, read-only;
 recv-sleep experiment, reports/experiments/recv-sleep.md; De Stijl v2 lifetimes, systems/destijl/system.yaml).
 
-usage: recv_check.py <dir> --mode poll|idle|sleep [--out FILE]
+usage: recv_check.py <dir> --mode poll|idle|sleep [--out FILE] [--name <lifetime> ...]
+  --name: check only these lifetimes (h2n-block.sh / h3-block.sh run it after every ds lifetime with
+  --out <dir>/recv-check-<name>.txt; a missing recv-mode-<name>.txt is a FAIL)
 <dir> = a dir holding the per-lifetime files the blocks write side by side (vector DB: <E>/vdb/r1/run or an h2n / h3
 block dir, RecSys: <E>/block): recv-mode-<name>.txt (m4-run.sh / main-block.sh / h2n-block.sh / h3-block.sh:
 "<ip> recv_mode=<m> ..." per VM after the sysfs write) and the cxl_shm status dir of the lifetime: shm-<name>/
@@ -19,7 +21,9 @@ FAIL, De Stijl lifetimes (dsshm-<name>) additionally: a status-pre/post file who
   line "running registered 1", whose swmc.protocol is not destijl, or without the De Stijl counters ds.tx_timeout,
   ds.protocol_error, ds.async_issued, ds.async_fallback_mean, ds.async_fallback_p95 (/sys/kernel/swmc/destijl);
   no receive thread (recv_thread.*) in status-post (receiver not on a CPU); a tx_timeout or protocol_error delta
-  (post - pre) != 0 on any VM; a stats-steps.csv of the lifetime without per-step sys.swmc.destijl.* columns.
+  (post - pre) != 0 on any VM; a stats-steps.csv of the lifetime without per-step sys.swmc.destijl.* columns;
+  ds.replica_pool_full != 0 in status-post (a full replica pool maps CXL directly: replicated and unreplicated pages
+  mixed); with --replica-mode all also a status-post without ds.replica_pages / ds.replica_pool_full.
 Prints per lifetime and VM the post - pre deltas of sleep_wakeups, tick_kicks and the cxl_recv thread CPU ticks; per De
 Stijl lifetime ds_async_share = async_issued / (async_issued + async_fallback_mean + async_fallback_p95) over the
 status post - pre deltas of all VMs (experiments/eval/canon.py DS_COH; "n/a" when the denominator is 0).
@@ -68,6 +72,10 @@ def main():
     ap.add_argument("dir")
     ap.add_argument("--mode", required=True, choices=("poll", "idle", "sleep"))
     ap.add_argument("--out")
+    ap.add_argument("--replica-mode", choices=("off", "all"), default="off",
+                    help="all: De Stijl lifetimes loaded with replica_mode=all must report ds.replica_pages / pool_full")
+    ap.add_argument("--name", action="append", default=[],
+                    help="check only this lifetime (repeatable; h2n-block.sh / h3-block.sh after each ds lifetime)")
     a = ap.parse_args()
     D, out, bad = a.dir, [], 0
     kinds = {"pop": 0, "ds": 0}
@@ -78,6 +86,11 @@ def main():
         out.append("FAIL " + msg)
 
     names = sorted(os.path.basename(p)[len("recv-mode-"):-len(".txt")] for p in glob.glob(os.path.join(D, "recv-mode-*.txt")))
+    if a.name:
+        miss = [n for n in a.name if n not in names]
+        if miss:
+            fail(f"--name {', '.join(miss)}: no recv-mode-<name>.txt in {D}")
+        names = [n for n in names if n in a.name]
     if not names:
         fail(f"no recv-mode-*.txt in {D} (no Popcorn or De Stijl lifetime)")
     for n in names:
@@ -123,6 +136,13 @@ def main():
                     dsum[c] += e - b
                     if c in DS_ZERO and e != b:
                         fail(f"{n} vm{k}: ds.{c} delta {e - b} (post {e} - pre {b}; must be 0)")
+                # replica pool (replication review 2026-11-01): a full pool maps CXL directly -> mixed run: FAIL
+                rpg, rpf = integer(post.get("ds.replica_pages")), integer(post.get("ds.replica_pool_full"))
+                if a.replica_mode == "all" and (rpg is None or rpf is None):
+                    fail(f"{n} vm{k}: --replica-mode all but status-post has no ds.replica_pages / ds.replica_pool_full")
+                if rpf:
+                    fail(f"{n} vm{k}: ds.replica_pool_full {rpf} (must be 0: pool full = pages mapped to CXL directly)")
+                out.append(f"{n} vm{k}: replica_pages {rpg} replica_pool_full {rpf} (status post)")
         if ds:
             den = dsum["async_issued"] + dsum["async_fallback_mean"] + dsum["async_fallback_p95"]
             share = f"{dsum['async_issued'] / den:.4f}" if den else "n/a"

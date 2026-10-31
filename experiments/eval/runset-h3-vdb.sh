@@ -15,7 +15,9 @@
 N=${1:-}; shift || true
 [[ $N =~ ^[2-8]$ ]] || { echo "RUNSET STOP: usage runset-h3-vdb.sh <N> <k> [--dry] [--v V]"; exit 2; }
 RUNSET=h3-vdb-n$N WL=vdb CONF_WL=h3-vdb
-unset H3_DS_C H3_DS_K H3_DS_GT H3_DS_BUNDLE_SHA H3_DS_REGION H3_DS_T_US   # optional conf keys: never inherited from the environment
+unset H3_DS_C H3_DS_K H3_DS_GT H3_DS_BUNDLE_SHA H3_DS_REGION H3_DS_T_US H3_PINS   # optional conf keys: never inherited from the environment
+# H3_PINS (optional, h3-ds.conf): pins file name next to this script instead of pins-vdb.sh (e.g. pins-vdb-ds-h3.sh for
+# the libdestijl vdb build)
 . "$(dirname "$0")/lib.sh"
 H=$TREE/experiments/h1
 [[ " $H3_NODES " == *" $N "* ]] || die "N=$N not in H3_NODES ($H3_NODES)"
@@ -35,7 +37,10 @@ need_files "$VDB_PLAIN_BUILD/bin/vdb-server" "$VDB_LOADGEN_BUILD/loadgen" "$REGI
   "$VDB_X_DATA/pool_b.fbin" "$EVD/h3-block.sh" "$EVD/h3-cdf.sh"
 [ "$(sha256sum < "$POP_C/packet.sha256" | cut -c1-64)" = "$POP_BUNDLE_SHA" ] || die "Popcorn bundle packet.sha256 != POP_BUNDLE_SHA"
 ring_check
-( cd "$H" && . "$EVD/pins-vdb.sh" && echo "$PIN_SHA256" | sha256sum --quiet -c - ) || die "eval pins (pins-vdb.sh: builds, data, region) do not verify"
+[[ ${H3_PINS:-x} != */* ]] || die "H3_PINS is a file name next to runset-h3-vdb.sh"
+PINS=$EVD/${H3_PINS:-pins-vdb.sh}
+( cd "$H" && . "$PINS" && echo "$PIN_SHA256" | sha256sum --quiet -c - ) || die "eval pins ($PINS: builds, data, region) do not verify"
+plan "pins $PINS"
 WOK=1
 if [ ! -f "$WRITES" ]; then
   WOK=0; [ $DRY = 1 ] || die "missing $WRITES (generate it: RUN-H3.md 'Pending')"
@@ -45,6 +50,9 @@ plan "N=$N vCPU/VM=$VCPU RAM/VM=$((H3_TOTAL_RAM_GB / N)) GB; mix $H3_VDB_POINT (
 plan "N = 2 point: vdb run $K ($(run_dir_of vdb "$K" || echo 'not accepted yet'))"
 need_env
 lock_free
+# a conf EVIDENCE_TAG (h3-ds.conf) prefixes the run set name: <prefix>-run<k>-<tag>-h3-vdb-n<N>-v<V> (no collision
+# between N values or with the RecSys run sets of the same conf)
+[ -z "${EVIDENCE_TAG:-}" ] || EVIDENCE_TAG=$EVIDENCE_TAG-$RUNSET
 evidence_dir
 BENV=(H3_WL=vdb H3_N=$N H3_TOTAL_VCPU=$H3_TOTAL_VCPU "SYSTEMS=$H3_SYSTEMS" EVAL_RUN=$K SEED=$((SEED_BASE + K)) REGION=$REGION
   C8=$POP_C K8=$POP_K GT8=$POP_GT RECV_MODE=$RECV_MODE POP_BUNDLE_SHA=$POP_BUNDLE_SHA EXPECT_DAX_UUID=$EXPECT_DAX_UUID

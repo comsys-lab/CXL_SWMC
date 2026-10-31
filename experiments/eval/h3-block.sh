@@ -17,7 +17,10 @@
 #   De Stijl v2 (SYSTEMS with ds; same keys and rules as h2n-block.sh): DS_C DS_BUNDLE_SHA DS_K DS_GT [DS_REGION]
 #   [H3_DS_T_US]; pop and ds never share a block (different guest kernels); ds cycle = p-destijl-shm.sh precheck / load
 #   (protocol=destijl, init_state=shared, recv_mode RECV_MODE: poll | sleep) / chown / preload / enable / status /
-#   teardown; servers get ENV:CXL_SYSTEM=ds ENV:CXL_DESTIJL_T_US=<T> (default 0 = synchronous).
+#   teardown; servers get ENV:CXL_SYSTEM=ds ENV:CXL_DESTIJL_T_US=<T> (default 0 = synchronous). Checks per ds lifetime:
+#   vector DB opcoh_check.py destijl on all N nodes (OPCOH_NODES = N; FAIL = NOTE unless H3_OPCOH_STRICT=1), both
+#   workloads recv_check.py --name <lifetime> after the teardown (E/recv-check-<name>.txt; FAIL stops the block);
+#   RecSys ds with recv_mode=sleep adds --proc-sysfs /sys/kernel/cxl_shm (per-step receive counters for recv_check).
 # vdb: VPLAIN, PLAIN_BUILD, LOADGEN, X_DATA, X_WRITES (writes file whose targets cover the N VMs), X_NB, X_MAXIDS,
 #   X_MAXW, X_MAXD, X_INIT_CAP, U (update share %, mix update=U,search=100-U)
 # recsys: VM_PLAIN, PLAIN_BUILD, LOADGEN (with query_spread), D (inputs dir), RATE (samples/s), XT (lifetime bound, s)
@@ -38,7 +41,7 @@ E=${1:?evidence dir}
 P=/home/comsys/sungsu/destijl-control
 EV=$(cd "$(dirname "$0")" && pwd); TREE=$(cd "$EV/../.." && pwd)
 XV=$TREE/experiments/vectordb XR=$TREE/experiments/recsys XK=$TREE/experiments/rocksdb
-HG=$TREE/scripts/host/h3-gate.sh CDFS=$EV/h3-cdf.sh
+HG=$TREE/scripts/host/h3-gate.sh CDFS=$EV/h3-cdf.sh OPC=$TREE/workloads/vectordb/tests/opcoh_check.py
 die() { echo "BLOCK STOP: $*"; exit 2; }
 # H3_BLOCK_DRY=1 (runset-h3-*.sh --dry only): every check up to the evidence-dir check, then exit 0 before the lock;
 # a missing pending artifact (N-target writes file, query_spread loadgen) is reported, not fatal, in a dry start only
@@ -229,10 +232,10 @@ log "== guest prechecks (install sha256 = Host builds; guests 2..N-1 inherit vm0
 SUMS=; [ $H3_WL = vdb ] && SUMS=$(sha256sum < "$HOST_IMAGE/SHA256SUMS" | cut -c1-64)
 for i in "${!IPS[@]}"; do
   if [ $H3_WL = vdb ]; then
-    $SSH comsys@${IPS[$i]} "EXPECT_K=$KEXPEXPECT_DAX_UUID=$EXPECT_DAX_UUID INIT_DIR=$INIT INIT_SUMS=$SUMS INIT_CHECK=$([ $i = 0 ] && echo 1 || echo 0) INSTALL_DIRS='$(echo "$INSTALL" | awk '{print $1}' | tr '\n' ' ')' bash -s" \
+    $SSH comsys@${IPS[$i]} "EXPECT_K=$KEXP EXPECT_DAX_UUID=$EXPECT_DAX_UUID INIT_DIR=$INIT INIT_SUMS=$SUMS INIT_CHECK=$([ $i = 0 ] && echo 1 || echo 0) INSTALL_DIRS='$(echo "$INSTALL" | awk '{print $1}' | tr '\n' ' ')' bash -s" \
       < $XV/m4-precheck.sh > "$E/precheck-vm$i.txt" 2>&1
   else
-    $SSH comsys@${IPS[$i]} "EXPECT_K=$KEXPMEM_MIN=8 EXPECT_DAX_UUID='$EXPECT_DAX_UUID' INSTALL_FILES='$(echo "$INSTALL" | awk '{print $1}' | tr '\n' ' ')' bash -s" \
+    $SSH comsys@${IPS[$i]} "EXPECT_K=$KEXP MEM_MIN=8EXPECT_DAX_UUID='$EXPECT_DAX_UUID' INSTALL_FILES='$(echo "$INSTALL" | awk '{print $1}' | tr '\n' ' ')' bash -s" \
       < $XR/precheck.sh > "$E/precheck-vm$i.txt" 2>&1
   fi
   grep -q "^PRECHECK PASS" "$E/precheck-vm$i.txt" || stop "precheck vm$i: $(grep -m1 'PRECHECK FAIL' "$E/precheck-vm$i.txt")"
@@ -329,6 +332,12 @@ sys_up() {  # <sys> <name>: dax owner + Popcorn / De Stijl cycle
 sys_down() {  # <sys>: Popcorn / De Stijl teardown after the lifetime (nothing for hw)
   case $1 in pop) pop_down;; ds) ds_down;; esac
 }
+ds_recv() {  # <name>: recv_check.py on this ds lifetime after its teardown (as h2n-block.sh); FAIL stops the block
+  python3 -I -B $EV/recv_check.py "$E" --mode "$RECV_MODE" --name "$1" --out "$E/recv-check-$1.txt" > /dev/null 2>&1
+  local r; r=$(tail -n 1 "$E/recv-check-$1.txt" 2>/dev/null)
+  log "$1: recv check: ${r:-no recv-check-$1.txt}"
+  [[ $r == "RECVCHECK PASS"* ]] || stop "$1: recv check FAIL (see recv-check-$1.txt)"
+}
 # SYSTEM label and the extra server arguments / node env per system (pop and ds start from the preloaded data)
 sys_label() { case $1 in pop) echo Popcorn-$RECV_MODE;; ds) echo DeStijl-$RECV_MODE-T$DST;; *) echo all-HWcc;; esac; }
 sys_pre() { case $1 in pop|ds) echo "$2";; esac; }
@@ -374,7 +383,18 @@ vdb_life() {  # <sys> <name> <kind: slo | cdf> [<cdf offered rate>]
   { grep -qx "ok_without_coh=0" $RP/loadgen/vectordb.txt && grep -qx "updates_ok_without_coh=0" $RP/loadgen/vectordb.txt &&
     grep -qx "bad_coh_version=0" $RP/loadgen/vectordb.txt; } || stop "$name: responses without an op coherence block"
   python3 $XV/opsplit.py $RP > $RP/opsplit.log 2>&1 || stop "$name: opsplit.py (see $RP/opsplit.log)"
-  echo "opcoh_check.py not run: its closure reads node0/node1 only (2-node checker); per-node opcoh errors checked above" > $RP/opcoh-check.txt
+  if [ $s = ds ]; then  # opcoh_check.py destijl on all N nodes (OPCOH_NODES, as h2n-block.sh); FAIL stops only with H3_OPCOH_STRICT=1
+    OPCOH_NODES=$N OPCOH_PARTS=$RP python3 $OPC $RP destijl > $RP/opcoh-check.txt 2>&1
+    oc=$(grep -m1 -oE '^OPCOH_CHECK (PASS|FAIL)' $RP/opcoh-check.txt | cut -d' ' -f2); oc=${oc:-ERROR}
+    if [ "$oc" != PASS ]; then
+      [ "${H3_OPCOH_STRICT:-0}" = 1 ] && stop "$name: opcoh_check destijl $oc (see $RP/opcoh-check.txt)"
+      log "$name NOTE: opcoh_check destijl $oc on $N nodes (H3_OPCOH_STRICT=0: recorded; see $RP/opcoh-check.txt)"
+    fi
+  else
+    # hw / pop keep the earlier H3 behaviour (their per-node opcoh errors are checked above); opcoh_check.py now takes
+    # OPCOH_NODES = N (h2n-block.sh), switching hw / pop here is a separate change of the H3 checks
+    echo "opcoh_check.py not run for $s in H3 (ds lifetimes only); per-node opcoh errors checked above" > $RP/opcoh-check.txt
+  fi
   python3 $XV/urate_check.py $RP --writers 1 > $RP/urate-check.txt 2>&1 || true
   python3 $XV/e1_check.py --writes $X_WRITES --na $NA --nb $X_NB --searches $RP/loadgen/searches.bin --out $RP/e1 --sample 500 > /dev/null \
     || stop "$name: E1 violation (see $RP/e1.e1.txt)"
@@ -389,6 +409,7 @@ vdb_life() {  # <sys> <name> <kind: slo | cdf> [<cdf offered rate>]
 s=json.load(open(sys.argv[1])); c=s.get("confirm",{}); f=lambda v: "" if v is None else str(v)
 print("\t".join(sys.argv[2:6] + [f(s.get("max_offered_x_pass")), f(c.get("x_mean")), f(s.get("confirmed")), s.get("note",""), sys.argv[6]]))' \
     $RP/loadgen/summary.json "$name" $s $N $VCPU "$name/slo" >> "$E/h3-results.tsv"
+  [ $s != ds ] || ds_recv $name
   dmesg_check $name || stop "$name: dmesg check"
 }
 # ---- RecSys lifetime: session.sh (N nodes) ---------------------------------------------------------------------------
@@ -405,7 +426,10 @@ rs_life() {  # <sys> <name> <slo | cdf> [<cdf query rate>]
   local s=$1 name=$2 kind=$3 S=$E/$2 rc note sc SE
   gate $name; sys_up $s $name
   servers_gone || stop "a recsys-server runs before $name"
-  SE=(SYSTEM=$(sys_label $s) V=$V HOST_SERVER=$HOSTSRV "SERVER_ARGS=$SA" T_MS=0
+  # ds with recv_mode=sleep: recv_check.py needs the per-step sleep_wakeups / tick_kicks (/sys/kernel/cxl_shm; the
+  # vector DB server snapshots it always, RecSys only with this --proc-sysfs, as main-block.sh STREAM_PROC_CXL_SHM=1)
+  local SAX=$SA; [ $s != ds ] || [ "$RECV_MODE" != sleep ] || SAX="$SA --proc-sysfs /sys/kernel/cxl_shm"
+  SE=(SYSTEM=$(sys_label $s) V=$V HOST_SERVER=$HOSTSRV "SERVER_ARGS=$SAX" T_MS=0
       "NODE_ENV=ENV:XTIMEOUT=$XT$([ $s != ds ] || echo " $(sys_env ds)")" "NODE0_ARGS=$(sys_pre $s '--preloaded ')$N0X" READY_TIMEOUT=$((XT / 2)))
   env "${SE[@]}" bash $XR/session.sh start "$S" > "$S.start.out" 2>&1 || stop "$name session start: $(tail -n 2 "$S.start.out" | tr '\n' ' ')"
   log "$name: $(tail -n 1 "$S.start.out")"
@@ -447,6 +471,7 @@ print("\t".join(sys.argv[2:6] + [f(s.get("max_offered_x_pass")), f(c.get("x_mean
   fi
   sys_down $s
   servers_gone || stop "servers left after $name"
+  [ $s != ds ] || ds_recv $name
   dmesg_check $name || stop "$name: dmesg check"
 }
 # ---- sequence ----------------------------------------------------------------------------------------------------
