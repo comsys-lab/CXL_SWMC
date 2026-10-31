@@ -3,10 +3,13 @@
 # run.sh (PROFILE=pilot), post checks. Synthetic ids (workspaces/recsys-data/pilot), 10.0 GiB of slots (--row-div 9),
 # random weights. Every system runs on the page MSI kernel (build 8); all-HWcc and Megalon with cxl_shm unloaded.
 # usage: pilot-run.sh <name> <evidence dir>
-# env (required): SYS (all-HWcc | Megalon | Popcorn), T_MS (publication interval: 60000 | 1000 | 0),
+# env (required): SYS (all-HWcc | Megalon | Popcorn | DeStijl), T_MS (publication interval: 60000 | 1000 | 0),
 #   KIND (functional | slo | fixed); KIND=fixed: RATE (query/s = L)
 #   SYS=Popcorn: C8 (build-8 deploy bundle dir), K8 (release), GT8 (guest tools dir), RECV_MODE (poll | idle | sleep);
 #     /dev/dax0.0 must be root:root 600 (p-popcorn-shm.sh precheck; its teardown restores it)
+#   SYS=DeStijl (De Stijl v2, as experiments/eval/h2n-block.sh ds): DS_C (bundle dir with p-destijl-shm.sh), DS_K
+#     (release -ds-destijl-<n>), DS_GT (guest tools dir), RECV_MODE (poll | sleep); T = 0 only (builds/recsys/3 has no
+#     libdestijl); same cycle as Popcorn with p-destijl-shm.sh (protocol destijl checked instead of instr)
 #   SYS=all-HWcc / Megalon: /dev/dax0.0 owned by comsys (the block chowns it)
 #   SYS=Megalon: VM_MEG (guest install dir, default /home/comsys/rsm4), HOST_MEG (default builds/recsys-megalon/4)
 # optional: SEED (default 20261016), GATE=0 (skip the Host gate; refused unless KIND=functional), UPD_RATE (default 2100).
@@ -27,7 +30,7 @@ SHM=0  # page MSI: 1 from the load attempt until a successful teardown; any exit
 shm_down() {
   [ $SHM = 1 ] || return 0
   servers_gone || { echo "PILOTRUN $NAME: servers still running, teardown skipped (block_finish retries)"; return 1; }
-  env "${PS[@]}" bash $C8/p-popcorn-shm.sh teardown && SHM=0
+  env "${PS[@]}" bash $SHMS teardown && SHM=0
 }
 stop() { echo "PILOTRUN $NAME STOP $*"; exit 1; }
 trap 'shm_down' EXIT
@@ -51,7 +54,15 @@ case "$SYS" in
   Popcorn) : "${C8:?}" "${K8:?}" "${GT8:?}" "${RECV_MODE:?}"
            [[ $RECV_MODE =~ ^(poll|idle|sleep)$ ]] || stop "bad RECV_MODE"
            export SYSTEM=Popcorn-$RECV_MODE V=/home/comsys/rs3 HOST_SERVER=$P/builds/recsys/3/bin/recsys-server \
-             SERVER_ARGS="$SA" NODE0_ARGS="--preloaded";;
+             SERVER_ARGS="$SA" NODE0_ARGS="--preloaded"
+           SHMS=$C8/p-popcorn-shm.sh GTX=$GT8 PS=(K=$K8 GT=$GT8 C=$C8 R=$E/shm-$NAME INIT_STATE=shared);;
+  DeStijl) : "${DS_C:?}" "${DS_K:?}" "${DS_GT:?}" "${RECV_MODE:?}"
+           [[ $RECV_MODE =~ ^(poll|sleep)$ ]] || stop "bad RECV_MODE for De Stijl (poll | sleep)"
+           [ "${DS_T_US:-0}" = 0 ] || stop "DS_T_US must be 0 in the pilot (builds/recsys/3 has no libdestijl)"
+           export SYSTEM=DeStijl-$RECV_MODE-T0 V=/home/comsys/rs3 HOST_SERVER=$P/builds/recsys/3/bin/recsys-server \
+             SERVER_ARGS="$SA" NODE0_ARGS="--preloaded"
+           SHMS=$DS_C/p-destijl-shm.sh GTX=$DS_GT
+           PS=(K=$DS_K GT=$DS_GT C=$DS_C R=$E/dsshm-$NAME INIT_STATE=shared "LOAD_EXTRA=recv_mode=$RECV_MODE");;
   *) stop "bad SYS";;
 esac
 LG=(--opt samples=$D/updates-zipf105-s1-2M.smp --opt queries=$D/queries-zipf105-s2-1M.smp
@@ -68,13 +79,13 @@ echo "$(date -Is) $NAME: SYS=$SYS T_MS=$T_MS KIND=$KIND RATE=${RATE:-} RECV_MODE
 servers_gone || stop "a recsys-server is running before the run"
 if [ "${GATE:-1}" = 1 ]; then bash $P/CXL_SWMC/experiments/vectordb/host-gate.sh check "$E/gate-$NAME.txt" || stop "host gate"; fi
 T0=$(date +%s)
-if [ "$SYS" = Popcorn ]; then  # P-popcorn-deploy §6a cycle with build 8 (init_state=shared), as vectordb m4-run.sh
-  PS=(K=$K8 GT=$GT8 C=$C8 R=$E/shm-$NAME INIT_STATE=shared)
-  env "${PS[@]}" bash $C8/p-popcorn-shm.sh precheck || stop "shm precheck"
+COH=0; case "$SYS" in Popcorn|DeStijl) COH=1;; esac   # a cxl_shm cycle per run (PS / SHMS / GTX from the case above)
+if [ $COH = 1 ]; then  # P-popcorn-deploy §6a cycle (init_state=shared), as vectordb m4-run.sh; De Stijl: same, p-destijl-shm.sh
+  env "${PS[@]}" bash $SHMS precheck || stop "shm precheck"
   SHM=1
-  for ph in load chown; do env "${PS[@]}" bash $C8/p-popcorn-shm.sh $ph || stop "shm $ph"; done
+  for ph in load chown; do env "${PS[@]}" bash $SHMS $ph || stop "shm $ph"; done
   for ip in "${IPS[@]}"; do  # the server's region config must equal the module parameters' one (both must exist)
-    [ "$($SSH comsys@$ip "test -f $V/cfg/cxl_region.yaml && test -f $GT8/cxl_region.yaml && sha256sum $V/cfg/cxl_region.yaml $GT8/cxl_region.yaml | cut -d' ' -f1 | sort -u | wc -l" < /dev/null)" = 1 ] \
+    [ "$($SSH comsys@$ip "test -f $V/cfg/cxl_region.yaml && test -f $GTX/cxl_region.yaml && sha256sum $V/cfg/cxl_region.yaml $GTX/cxl_region.yaml | cut -d' ' -f1 | sort -u | wc -l" < /dev/null)" = 1 ] \
       || stop "region config missing or different on $ip"
   done
   t=$(date +%s)  # node 0 writes the initial tables through a plain mapping before coherence is enabled (no HWcc access)
@@ -84,20 +95,22 @@ if [ "$SYS" = Popcorn ]; then  # P-popcorn-deploy §6a cycle with build 8 (init_
     < /dev/null > "$E/preload-$NAME.log" 2>&1
   echo "preload_wall_s=$(( $(date +%s) - t ))" >> "$E/preload-$NAME.log"
   { grep -q "PRELOAD DONE" "$E/preload-$NAME.log" && servers_gone; } || stop "preload"
-  env "${PS[@]}" bash $C8/p-popcorn-shm.sh enable || stop "enable gate"
-  for ip in "${IPS[@]}"; do  # recv_mode (runtime-writable) and the instrumentation switch must be as required
+  env "${PS[@]}" bash $SHMS enable || stop "enable gate"
+  for ip in "${IPS[@]}"; do  # recv_mode (runtime-writable) and the instrumentation switch (Popcorn) / protocol (De Stijl)
     m=$($SSH comsys@$ip "sudo -n sh -c 'echo $RECV_MODE > /sys/module/cxl_shm/parameters/recv_mode' && cat /sys/module/cxl_shm/parameters/recv_mode" < /dev/null)
-    i=$($SSH comsys@$ip "cat /sys/kernel/swmc/instr/enabled" < /dev/null)
-    echo "$ip recv_mode=$m instr_enabled=$i" >> "$E/recv-mode-$NAME.txt"
+    i=$($SSH comsys@$ip "cat /sys/kernel/swmc/instr/enabled 2>/dev/null || echo absent" < /dev/null)
+    pr=$($SSH comsys@$ip "cat /sys/kernel/swmc/page_coherence/protocol" < /dev/null)
+    echo "$ip recv_mode=$m instr_enabled=$i protocol=$pr" >> "$E/recv-mode-$NAME.txt"
     [ "$m" = "$RECV_MODE" ] || stop "recv_mode on $ip = $m"
-    [ "$i" = 1 ] || stop "instr enabled on $ip = $i"
+    if [ "$SYS" = Popcorn ]; then [ "$i" = 1 ] || stop "instr enabled on $ip = $i"
+    else [ "$pr" = destijl ] || stop "protocol on $ip = $pr"; fi
   done
-  env "${PS[@]}" STATUS_TAG=pre bash $C8/p-popcorn-shm.sh status || stop "status pre"
+  env "${PS[@]}" STATUS_TAG=pre bash $SHMS status || stop "status pre"
 fi
 bash $X/run.sh "$NAME" "$E" -- "${LG[@]}"
 RC=$?
-if [ "$SYS" = Popcorn ]; then
-  env "${PS[@]}" STATUS_TAG=post bash $C8/p-popcorn-shm.sh status
+if [ $COH = 1 ]; then
+  env "${PS[@]}" STATUS_TAG=post bash $SHMS status
   servers_gone || stop "servers left (page MSI teardown not attempted)"
   shm_down || stop "shm teardown"
 fi

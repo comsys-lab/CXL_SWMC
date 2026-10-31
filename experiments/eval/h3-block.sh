@@ -14,6 +14,10 @@
 #   RECV_MODE POP_BUNDLE_SHA (Popcorn N-node bundle, POP_IPS = the N guests), PRETOUCH_DIR (VM8-v* / ENV-pretouch-v*
 #   evidence of the current QEMU lifetimes, pretouch-check-n.sh), MEASURE_ENV_DIR MEASURE_PART_DIR (h3-gate.sh),
 #   EXPECT_DAX_UUID, CDF (0 | 1), CDF_S (window, s)
+#   De Stijl v2 (SYSTEMS with ds; same keys and rules as h2n-block.sh): DS_C DS_BUNDLE_SHA DS_K DS_GT [DS_REGION]
+#   [H3_DS_T_US]; pop and ds never share a block (different guest kernels); ds cycle = p-destijl-shm.sh precheck / load
+#   (protocol=destijl, init_state=shared, recv_mode RECV_MODE: poll | sleep) / chown / preload / enable / status /
+#   teardown; servers get ENV:CXL_SYSTEM=ds ENV:CXL_DESTIJL_T_US=<T> (default 0 = synchronous).
 # vdb: VPLAIN, PLAIN_BUILD, LOADGEN, X_DATA, X_WRITES (writes file whose targets cover the N VMs), X_NB, X_MAXIDS,
 #   X_MAXW, X_MAXD, X_INIT_CAP, U (update share %, mix update=U,search=100-U)
 # recsys: VM_PLAIN, PLAIN_BUILD, LOADGEN (with query_spread), D (inputs dir), RATE (samples/s), XT (lifetime bound, s)
@@ -40,7 +44,7 @@ die() { echo "BLOCK STOP: $*"; exit 2; }
 # a missing pending artifact (N-target writes file, query_spread loadgen) is reported, not fatal, in a dry start only
 DRYB=${H3_BLOCK_DRY:-0}
 pending() { if [ "$DRYB" = 1 ]; then echo "BLOCK DRY NOTE: $* (a real run stops here)"; else die "$*"; fi; }
-: "${H3_WL:?}" "${H3_N:?}" "${SYSTEMS:?}" "${EVAL_RUN:?}" "${SEED:?}" "${REGION:?}" "${C8:?}" "${K8:?}" "${GT8:?}"
+: "${H3_WL:?}" "${H3_N:?}" "${SYSTEMS:?}" "${EVAL_RUN:?}" "${SEED:?}" "${C8:?}" "${K8:?}" "${GT8:?}"
 : "${RECV_MODE:?}" "${POP_BUNDLE_SHA:?}" "${PRETOUCH_DIR:?}" "${MEASURE_ENV_DIR:?}" "${MEASURE_PART_DIR:?}"
 : "${EXPECT_DAX_UUID:?}" "${CDF:?}" "${CDF_S:?}"
 TV=${H3_TOTAL_VCPU:-32} N=$H3_N
@@ -51,10 +55,27 @@ VCPU=$((TV / N))
 [[ $RECV_MODE =~ ^(poll|idle|sleep)$ ]] || die "bad RECV_MODE"
 export H3_CDF_PFN_MOD=${H3_CDF_PFN_MOD:-1}   # kprobe hist page sampling (h3-cdf.sh; 1 = off; runset-h3-rs.sh passes 16)
 bash "$CDFS" filter > /dev/null || die "bad H3_CDF_PFN_MOD (power of two, 1 = off)"
-for s in $SYSTEMS; do case $s in hw|pop) ;; mg) die "Megalon in H3 needs Megalon builds with LOGICAL_NODE_NUM = $N (RUN-H3.md, 'Megalon')";; *) die "bad system $s";; esac; done
+HASDS=0
+for s in $SYSTEMS; do case $s in hw|pop) ;; ds) HASDS=1;; mg) die "Megalon in H3 needs Megalon builds with LOGICAL_NODE_NUM = $N (RUN-H3.md, 'Megalon')";; *) die "bad system $s";; esac; done
 [ "$CDF" = 0 ] || [[ " $SYSTEMS " == *" pop "* ]] || die "CDF=1 needs pop in SYSTEMS (the rate is Popcorn's max under the SLO)"
+# De Stijl v2 (ds): its own guest kernel, bundle, region and T (as h2n-block.sh)
+KEXP=$K8 DST=0
+if [ $HASDS = 1 ]; then
+  [[ " $SYSTEMS " != *" pop "* ]] || die "pop and ds need different guest kernels: run them in separate blocks"
+  : "${DS_C:?}" "${DS_BUNDLE_SHA:?}" "${DS_K:?}" "${DS_GT:?}"
+  [[ $DS_K == *-ds-destijl-* ]] || die "DS_K=$DS_K is not a De Stijl release (-ds-destijl-<n>)"
+  [[ $RECV_MODE =~ ^(poll|sleep)$ ]] || die "RECV_MODE=$RECV_MODE: De Stijl (cxl_shm v13 protocol=destijl) refuses idle"
+  DST=${H3_DS_T_US:-0}
+  [[ $DST =~ ^(0|[1-9][0-9]*)$ ]] || die "bad H3_DS_T_US ($DST: integer us, 0 = synchronous)"
+  REGION=${DS_REGION:-$TREE/config/cxl_region-destijl.yaml}   # replaces REGION for the whole block (app offset)
+  KEXP=$DS_K
+  [ -f "$REGION" ] && [ -f "$DS_C/p-destijl-shm.sh" ] && [ "$(sha256sum < "$DS_C/packet.sha256" | cut -c1-64)" = "$DS_BUNDLE_SHA" ] \
+    && (cd "$DS_C" && sha256sum -c --quiet packet.sha256) || die "REGION ($REGION) or the De Stijl bundle ($DS_C) does not verify"
+else
+: "${REGION:?}"
 [ -f "$REGION" ] && [ "$(sha256sum < "$C8/packet.sha256" | cut -c1-64)" = "$POP_BUNDLE_SHA" ] \
   && (cd "$C8" && sha256sum -c --quiet packet.sha256) || die "REGION or the Popcorn bundle ($C8) does not verify"
+fi
 IPS=() DOMS=()
 for k in $(seq 0 $((N - 1))); do IPS+=(192.168.122.$((100 + k))); DOMS+=(cxl_vm$k); done
 export NODES="${IPS[*]}" VM_DOMAINS="${DOMS[*]}" POP_IPS="${IPS[*]}" EXPECT_RUNNING="${DOMS[*]}"
@@ -109,6 +130,7 @@ RING=$(grep -E '^msg_ring:' "$REGION" | sed 's/.*,[[:space:]]*\([0-9]*\)\].*/\1/
 OWNER=eval-h3-$H3_WL-n$N-run$EVAL_RUN
 ORDER=$(python3 -I -c 'import random,sys; v=sys.argv[2:]; random.Random(sys.argv[1]).shuffle(v); print(" ".join(v))' "h3-$H3_WL-n$N" $SYSTEMS)
 echo "BLOCK PLAN: $H3_WL N=$N vcpu/VM=$VCPU nodes=[${IPS[*]}] order=[$ORDER] cdf=$CDF app=$APP ring=$RING server_args=[$SA]"
+[ $HASDS = 0 ] || echo "BLOCK PLAN: destijl release=$DS_K bundle=$DS_C guest_tools=$DS_GT region=$REGION T=$DST us recv_mode=$RECV_MODE (node env CXL_SYSTEM=ds CXL_DESTIJL_T_US=$DST)"
 if [ "$DRYB" = 1 ]; then echo "BLOCK DRY STOP: evidence-dir check reached ($E; dry: no lock, no VM contact)"; exit 0; fi
 [ -d "$E" ] && [ -z "$(ls -A "$E" | grep -v '^sequence')" ] || die "$E missing or not empty"
 # ---------------------------------------------------------------------------------------------------- real block
@@ -159,6 +181,13 @@ shm_teardown_left() {  # every cxl_shm load of this block without "teardown PASS
            && env K=$K8 GT=$GT8 C=$C8 R=$r bash $C8/p-popcorn-shm.sh teardown >> "$E/cleanup.out" 2>&1; }
     grep -q "teardown PASS" "$r/steps.log" 2>/dev/null || echo "CLEANUP FAILED: $r (manual: P-popcorn packet §6)" | tee -a "$E/cleanup.out"
   done
+  for r in "$E"/dsshm-*/; do  # De Stijl loads (ds lifetimes): same rule, p-destijl-shm.sh teardown
+    r=${r%/}; [ -d "$r" ] && [ -f "$r/load-vm0.txt" ] || continue
+    grep -q "teardown PASS" "$r/steps.log" 2>/dev/null && continue
+    dax_unused cleanup || { echo "CLEANUP FAILED: $r: /dev/dax0.0 in use, teardown not attempted (manual: p-destijl-shm.sh teardown)" | tee -a "$E/cleanup.out"; continue; }
+    env K=$DS_K GT=$DS_GT C=$DS_C R=$r DS_IPS="${IPS[*]}" bash $DS_C/p-destijl-shm.sh teardown >> "$E/cleanup.out" 2>&1
+    grep -q "teardown PASS" "$r/steps.log" 2>/dev/null || echo "CLEANUP FAILED: $r (manual: p-destijl-shm.sh teardown)" | tee -a "$E/cleanup.out"
+  done
 }
 finish() {
   trap '' INT TERM HUP
@@ -190,6 +219,7 @@ gate() { bash "$HG" check "$E/gate-$1.txt" > /dev/null || stop "h3 gate ($1; see
   echo "host_server=$HOSTSRV sha256=$(sha256sum < "$HOSTSRV" | cut -c1-64) loadgen=$LOADGEN sha256=$(sha256sum < "$LOADGEN" | cut -c1-64)"
   [ $H3_WL = vdb ] && echo "writes=$X_WRITES sha256=$(sha256sum < "$X_WRITES" | cut -c1-64) U=$U"
   [ $H3_WL = recsys ] && echo "rate=$RATE samples/s n0x=[$N0X] lgc=[${LGC[*]}]"
+  [ $HASDS = 0 ] || echo "destijl: bundle=$DS_C bundle_sha=$DS_BUNDLE_SHA release=$DS_K guest_tools=$DS_GT region=$REGION t_us=$DST recv_mode=$RECV_MODE"
   for d in "${DOMS[@]}"; do x=$(virsh -c qemu:///system dumpxml --inactive "$d" 2>/dev/null); echo "vm_xml_sha256.$d=$(printf '%s' "$x" | sha256sum | cut -c1-64) bytes=${#x}"; done
 } > "$E/h3-params.txt"
 log "== PT pretouch check (start, $N VMs)"
@@ -199,10 +229,10 @@ log "== guest prechecks (install sha256 = Host builds; guests 2..N-1 inherit vm0
 SUMS=; [ $H3_WL = vdb ] && SUMS=$(sha256sum < "$HOST_IMAGE/SHA256SUMS" | cut -c1-64)
 for i in "${!IPS[@]}"; do
   if [ $H3_WL = vdb ]; then
-    $SSH comsys@${IPS[$i]} "EXPECT_K=$K8 EXPECT_DAX_UUID=$EXPECT_DAX_UUID INIT_DIR=$INIT INIT_SUMS=$SUMS INIT_CHECK=$([ $i = 0 ] && echo 1 || echo 0) INSTALL_DIRS='$(echo "$INSTALL" | awk '{print $1}' | tr '\n' ' ')' bash -s" \
+    $SSH comsys@${IPS[$i]} "EXPECT_K=$KEXPEXPECT_DAX_UUID=$EXPECT_DAX_UUID INIT_DIR=$INIT INIT_SUMS=$SUMS INIT_CHECK=$([ $i = 0 ] && echo 1 || echo 0) INSTALL_DIRS='$(echo "$INSTALL" | awk '{print $1}' | tr '\n' ' ')' bash -s" \
       < $XV/m4-precheck.sh > "$E/precheck-vm$i.txt" 2>&1
   else
-    $SSH comsys@${IPS[$i]} "EXPECT_K=$K8 MEM_MIN=8 EXPECT_DAX_UUID='$EXPECT_DAX_UUID' INSTALL_FILES='$(echo "$INSTALL" | awk '{print $1}' | tr '\n' ' ')' bash -s" \
+    $SSH comsys@${IPS[$i]} "EXPECT_K=$KEXPMEM_MIN=8 EXPECT_DAX_UUID='$EXPECT_DAX_UUID' INSTALL_FILES='$(echo "$INSTALL" | awk '{print $1}' | tr '\n' ' ')' bash -s" \
       < $XR/precheck.sh > "$E/precheck-vm$i.txt" 2>&1
   fi
   grep -q "^PRECHECK PASS" "$E/precheck-vm$i.txt" || stop "precheck vm$i: $(grep -m1 'PRECHECK FAIL' "$E/precheck-vm$i.txt")"
@@ -217,6 +247,19 @@ if [ $H3_WL = vdb ]; then printf '# name\tsystem\tnodes\tvcpus_per_vm\tmax_offer
 else printf '# name\tsystem\tnodes\tvcpus_per_vm\tmax_offered_x_pass\tconfirm_x_mean\tconfirmed\tnote\trun_dir\tstreamcheck\n' > "$E/h3-results.tsv"; fi
 echo "$ORDER" > "$E/order.txt"
 OWNED=root
+preload0() {  # <name>: node 0 preloads the initial data through a plain mapping (cxl_shm loaded, coherence not enabled)
+  local t
+  t=$(date +%s)
+  if [ $H3_WL = vdb ]; then
+    $SSH comsys@${IPS[0]} "mkdir -p $V/runs && echo \$\$ > $V/runs/preload-$1.pid && exec timeout -k 30 1200 env CXL_REGION_CONFIG=$V/cfg/cxl_region.yaml $V/bin/vdb-server --node 0 --preload-only --init-dir $INIT $SA" \
+      < /dev/null > "$E/preload-$1.log" 2>&1
+  else
+    $SSH comsys@${IPS[0]} "mkdir -p $V/runs/preload-$1 && CXL_REGION_CONFIG=$V/cfg/cxl_region.yaml setsid -w sh -c 'echo \$\$ > $V/runs/preload-$1/node0.pid; exec timeout $XT $V/bin/recsys-server --node 0 --preload-only $SA --publish-ms 0'" \
+      < /dev/null > "$E/preload-$1.log" 2>&1
+  fi
+  echo "preload_wall_s=$(( $(date +%s) - t ))" >> "$E/preload-$1.log"
+  { grep -q "PRELOAD DONE" "$E/preload-$1.log" && servers_gone; } || stop "preload ($1)"
+}
 # ---- Popcorn cxl_shm cycle (P-popcorn-deploy §6a, init_state=shared) on the N guests -------------------------------
 pop_up() {  # <name>
   PS=(K=$K8 GT=$GT8 C=$C8 R=$E/shm-$1 INIT_STATE=shared)
@@ -230,16 +273,7 @@ pop_up() {  # <name>
     [ "$($SSH comsys@$ip "test -f $V/cfg/cxl_region.yaml && test -f $GT8/cxl_region.yaml && sha256sum $V/cfg/cxl_region.yaml $GT8/cxl_region.yaml | cut -d' ' -f1 | sort -u | wc -l" < /dev/null)" = 1 ] \
       || stop "region config missing or different on $ip"
   done
-  t=$(date +%s)
-  if [ $H3_WL = vdb ]; then
-    $SSH comsys@${IPS[0]} "mkdir -p $V/runs && echo \$\$ > $V/runs/preload-$1.pid && exec timeout -k 30 1200 env CXL_REGION_CONFIG=$V/cfg/cxl_region.yaml $V/bin/vdb-server --node 0 --preload-only --init-dir $INIT $SA" \
-      < /dev/null > "$E/preload-$1.log" 2>&1
-  else
-    $SSH comsys@${IPS[0]} "mkdir -p $V/runs/preload-$1 && CXL_REGION_CONFIG=$V/cfg/cxl_region.yaml setsid -w sh -c 'echo \$\$ > $V/runs/preload-$1/node0.pid; exec timeout $XT $V/bin/recsys-server --node 0 --preload-only $SA --publish-ms 0'" \
-      < /dev/null > "$E/preload-$1.log" 2>&1
-  fi
-  echo "preload_wall_s=$(( $(date +%s) - t ))" >> "$E/preload-$1.log"
-  { grep -q "PRELOAD DONE" "$E/preload-$1.log" && servers_gone; } || stop "preload ($1)"
+  preload0 "$1"
   env "${PS[@]}" bash $C8/p-popcorn-shm.sh enable >> "$E/block.log" 2>&1 || stop "enable gate"
   for ip in "${IPS[@]}"; do
     m=$($SSH comsys@$ip "sudo -n sh -c 'echo $RECV_MODE > /sys/module/cxl_shm/parameters/recv_mode' && cat /sys/module/cxl_shm/parameters/recv_mode" < /dev/null)
@@ -255,12 +289,50 @@ pop_down() {
   dax_unused pre-teardown || stop "/dev/dax0.0 in use before the cxl_shm teardown"
   env "${PS[@]}" bash $C8/p-popcorn-shm.sh teardown >> "$E/block.log" 2>&1 || stop "shm teardown"
 }
-sys_up() {  # <sys> <name>: dax owner + Popcorn cycle
+# ---- De Stijl v2 cxl_shm cycle (protocol=destijl, init_state=shared; as h2n-block.sh ds_up / ds_down) ---------------
+ds_up() {  # <name>
+  DSP=(K=$DS_K GT=$DS_GT C=$DS_C R=$E/dsshm-$1 INIT_STATE=shared "LOAD_EXTRA=recv_mode=$RECV_MODE")
+  [ $OWNED = root ] || { dax_owner root || stop "dax0.0 back to root before De Stijl"; OWNED=root; }
+  servers_gone || stop "a server runs before the De Stijl load"
+  env "${DSP[@]}" bash $DS_C/p-destijl-shm.sh precheck >> "$E/block.log" 2>&1 || stop "ds shm precheck"
+  dax_unused pre-load-$1 || stop "/dev/dax0.0 in use before the cxl_shm (destijl) load"
+  local ph ip m p i
+  for ph in load chown; do env "${DSP[@]}" bash $DS_C/p-destijl-shm.sh $ph >> "$E/block.log" 2>&1 || stop "ds shm $ph"; done
+  for ip in "${IPS[@]}"; do
+    [ "$($SSH comsys@$ip "test -f $V/cfg/cxl_region.yaml && test -f $DS_GT/cxl_region.yaml && sha256sum $V/cfg/cxl_region.yaml $DS_GT/cxl_region.yaml | cut -d' ' -f1 | sort -u | wc -l" < /dev/null)" = 1 ] \
+      || stop "region config missing or different on $ip (De Stijl tools)"
+  done
+  preload0 "$1"
+  env "${DSP[@]}" bash $DS_C/p-destijl-shm.sh enable >> "$E/block.log" 2>&1 || stop "ds enable gate"
+  for ip in "${IPS[@]}"; do
+    m=$($SSH comsys@$ip "sudo -n sh -c 'echo $RECV_MODE > /sys/module/cxl_shm/parameters/recv_mode' && cat /sys/module/cxl_shm/parameters/recv_mode" < /dev/null)
+    p=$($SSH comsys@$ip "cat /sys/kernel/swmc/page_coherence/protocol" < /dev/null)
+    i=$($SSH comsys@$ip "cat /sys/kernel/swmc/instr/enabled 2>/dev/null || echo absent" < /dev/null)
+    echo "$ip recv_mode=$m protocol=$p instr_enabled=$i" >> "$E/recv-mode-$1.txt"
+    [ "$m" = "$RECV_MODE" ] && [ "$p" = destijl ] || stop "recv_mode / protocol on $ip ($m, $p)"
+  done
+  env "${DSP[@]}" STATUS_TAG=pre bash $DS_C/p-destijl-shm.sh status >> "$E/block.log" 2>&1 || stop "ds status pre"
+}
+ds_down() {
+  env "${DSP[@]}" STATUS_TAG=post bash $DS_C/p-destijl-shm.sh status >> "$E/block.log" 2>&1
+  servers_gone || stop "servers left (De Stijl teardown not attempted)"
+  dax_unused pre-teardown || stop "/dev/dax0.0 in use before the cxl_shm (destijl) teardown"
+  env "${DSP[@]}" bash $DS_C/p-destijl-shm.sh teardown >> "$E/block.log" 2>&1 || stop "ds shm teardown"
+}
+sys_up() {  # <sys> <name>: dax owner + Popcorn / De Stijl cycle
   case $1 in
     hw) [ $OWNED = comsys ] || { dax_owner comsys || stop "dax0.0 -> comsys"; OWNED=comsys; };;
     pop) pop_up "$2";;
+    ds) ds_up "$2";;
   esac
 }
+sys_down() {  # <sys>: Popcorn / De Stijl teardown after the lifetime (nothing for hw)
+  case $1 in pop) pop_down;; ds) ds_down;; esac
+}
+# SYSTEM label and the extra server arguments / node env per system (pop and ds start from the preloaded data)
+sys_label() { case $1 in pop) echo Popcorn-$RECV_MODE;; ds) echo DeStijl-$RECV_MODE-T$DST;; *) echo all-HWcc;; esac; }
+sys_pre() { case $1 in pop|ds) echo "$2";; esac; }
+sys_env() { [ $1 != ds ] || echo "ENV:CXL_SYSTEM=ds ENV:CXL_DESTIJL_T_US=$DST"; }
 # loadgen arguments of the CDF settle and cdf parts (both workloads): one CDF_S window at the CDF rate
 cdf_args() { echo "--mode fixed --rates $1 --warmup-s 10 --step-warmup-s 0 --step-measure-s $CDF_S --drain-s 10"; }
 # ---- vector DB lifetime: run.sh (N nodes, PARTS) with the H1 SLO part arguments --------------------------------------
@@ -268,9 +340,9 @@ vdb_life() {  # <sys> <name> <kind: slo | cdf> [<cdf offered rate>]
   local s=$1 name=$2 kind=$3 R=$E/$2 k L RP note parts=slo
   [ $kind = slo ] || parts="settle cdf"
   local LG=(--opt data=$X_DATA --opt writes=$X_WRITES --opt k=10 --mix "update=$U,search=$((100 - U))" --slo search:99:100 --x-stream search --raw)
-  local RE=(SYSTEM=$([ $s = pop ] && echo Popcorn-$RECV_MODE || echo all-HWcc) V=$V HOST_SERVER=$HOSTSRV LOADGEN=$LOADGEN INIT=$INIT
-    READY_TIMEOUT=5400 RUN_KIND=measurement TRACE=0 STATS_OP=10 NODE_ENV= "PARTS=$parts" H1_MEASURE_RUN=1 MEASURE_PART_DIR=$MEASURE_PART_DIR
-    "SERVER_ARGS=$SA$([ $s = pop ] && echo ' --preloaded')"
+  local RE=(SYSTEM=$(sys_label $s) V=$V HOST_SERVER=$HOSTSRV LOADGEN=$LOADGEN INIT=$INIT
+    READY_TIMEOUT=5400 RUN_KIND=measurement TRACE=0 STATS_OP=10 "NODE_ENV=$(sys_env $s)" "PARTS=$parts" H1_MEASURE_RUN=1 MEASURE_PART_DIR=$MEASURE_PART_DIR
+    "SERVER_ARGS=$SA$(sys_pre $s ' --preloaded')"
     "PART_ARGS_slo=--mode slo --start 10 --factor 1.5 --precision 0.02 --confirm-precision 0.01 --max-confirm-probes 6 --confirm-step-down 0.05 --max-steps 25 --warmup-s 10 --step-warmup-s 3 --step-measure-s 15 --confirm-s 30 --confirm-reps 3"
     PART_SEED_slo=$SEED
     "PART_GATE_CMD=bash $HG check")   # between parts: the N-VM gate (run.sh part hook), never the 2-VM h1-gate.sh
@@ -284,7 +356,7 @@ vdb_life() {  # <sys> <name> <kind: slo | cdf> [<cdf offered rate>]
   env "${RE[@]}" bash $XV/run.sh "$name" "$E" -- "${LG[@]}" > "$E/$name.out" 2>&1; local rc=$?
   log "$name: run.sh rc $rc: $(tail -n 1 "$E/$name.out")"
   [ $kind = slo ] || { grep -q "CDF DUMP PASS" "$R/part-hooks.txt" 2>/dev/null || stop "$name: no CDF DUMP PASS (see $R/part-hooks.txt)"; }
-  [ $s = pop ] && pop_down
+  sys_down $s
   servers_gone || stop "servers left after $name"
   [ -d "$R" ] || stop "$name: no run dir"
   for k in "${!IPS[@]}"; do  # clean stop, no bad record, op coherence on and error-free (m4-run.sh rules, N nodes)
@@ -292,6 +364,7 @@ vdb_life() {  # <sys> <name> <kind: slo | cdf> [<cdf offered rate>]
     { grep -q "vdb-server: stopping" $L && [ "$(grep -c '^bad_records=0$' $L)" = 1 ]; } || stop "$name node$k: no clean stop / bad_records"
     grep -q "^vdb-server: op coherence on," $L || stop "$name node$k: op coherence not on"
     [ $s != pop ] || grep -qE "^vdb-server: op coherence on, popcorn source swmc_acct[ ,]" $L || stop "$name node$k: popcorn source != swmc_acct"
+    [ $s != ds ] || [ "$DST" = 0 ] || grep -q "^vdb-server: de stijl staleness T=$DST us on " $L || stop "$name node$k: staleness T=$DST not applied"
     { grep -qx "opcoh.read_errors=0" $L && grep -qx "opcoh.register_errors=0" $L; } || stop "$name node$k: opcoh errors"
   done
   for RP in $(for p in $parts; do echo $R/$p; done); do
@@ -332,8 +405,8 @@ rs_life() {  # <sys> <name> <slo | cdf> [<cdf query rate>]
   local s=$1 name=$2 kind=$3 S=$E/$2 rc note sc SE
   gate $name; sys_up $s $name
   servers_gone || stop "a recsys-server runs before $name"
-  SE=(SYSTEM=$([ $s = pop ] && echo Popcorn-$RECV_MODE || echo all-HWcc) V=$V HOST_SERVER=$HOSTSRV "SERVER_ARGS=$SA" T_MS=0
-      "NODE_ENV=ENV:XTIMEOUT=$XT" "NODE0_ARGS=$([ $s = pop ] && echo '--preloaded ')$N0X" READY_TIMEOUT=$((XT / 2)))
+  SE=(SYSTEM=$(sys_label $s) V=$V HOST_SERVER=$HOSTSRV "SERVER_ARGS=$SA" T_MS=0
+      "NODE_ENV=ENV:XTIMEOUT=$XT$([ $s != ds ] || echo " $(sys_env ds)")" "NODE0_ARGS=$(sys_pre $s '--preloaded ')$N0X" READY_TIMEOUT=$((XT / 2)))
   env "${SE[@]}" bash $XR/session.sh start "$S" > "$S.start.out" 2>&1 || stop "$name session start: $(tail -n 2 "$S.start.out" | tr '\n' ' ')"
   log "$name: $(tail -n 1 "$S.start.out")"
   rs_measure "$S" warmup "${LGC[@]}" --opt seed=$((SEED + 100)) --seed $((SEED + 100)) --mode fixed --rates 1 \
@@ -369,7 +442,10 @@ print("\t".join(sys.argv[2:6] + [f(s.get("max_offered_x_pass")), f(c.get("x_mean
     python3 $XR/stream_check.py "$S/cdf" > "$S/cdf/stream-check.txt" 2>&1
   fi
   bash $XR/session.sh stop "$S" > "$S.stop.out" 2>&1 || stop "$name session stop / final checks: $(tail -n 2 "$S.stop.out" | tr '\n' ' ')"
-  [ $s = pop ] && pop_down
+  if [ $s = ds ] && [ "$DST" != 0 ]; then local k
+    for k in "${!IPS[@]}"; do grep -q "^recsys-server: de stijl staleness T=$DST us on " "$S/node$k.log" || stop "$name node$k: staleness T=$DST not applied"; done
+  fi
+  sys_down $s
   servers_gone || stop "servers left after $name"
   dmesg_check $name || stop "$name: dmesg check"
 }

@@ -4,7 +4,7 @@
 # YCSB keys (24 B), value 1,000 B (+ 8 B stamp stored), ScrambledZipfian 0.99; request = one get or one update
 # (mixed stream: update with probability UPDATE_RATIO); SLO per request mixed p99 < 1 ms (as kv/lmdb).
 # usage: pilot-run.sh <name> <evidence dir>
-# env (required): SYS (all-HWcc | Popcorn), UPDATE_RATIO (0.05 | 0.5 | 0.8), KIND:
+# env (required): SYS (all-HWcc | Popcorn | DeStijl), UPDATE_RATIO (0.05 | 0.5 | 0.8), KIND:
 #   functional  fixed RATES (total, default 200,1000), 30 s windows, LOG=1 recommended (check_log)
 #   slo         SLO search with the KV/LMDB H1 loadgen arguments (precision 0.02, confirm 0.01, max 6 confirm probes,
 #               step-down 0.05; fill 0.7,0.8,0.9; overload 1.05,1.1,1.2)
@@ -13,6 +13,10 @@
 #   SYS=Popcorn: C8 (deploy bundle dir with p-popcorn-shm.sh), K8 (release), GT8 (guest tools dir), RECV_MODE
 #   (poll | idle | sleep); cxl_shm loaded and coherence ENABLED (init_state=shared) before the servers start, so the
 #   image build runs under coherence. LOCK_OWNER: the calling block's measurement lock.
+#   SYS=DeStijl (De Stijl v2, as experiments/eval/h2n-block.sh ds): DS_C (bundle dir with p-destijl-shm.sh), DS_K
+#   (release -ds-destijl-<n>), DS_GT (guest tools dir), RECV_MODE (poll | sleep); same cycle as Popcorn with
+#   p-destijl-shm.sh (protocol destijl checked); T = 0 only (the RocksDB server has no De Stijl staleness hook); error
+#   counters over the run: swmc.transaction_error_count, ds.protocol_error, ds.tx_timeout deltas = 0.
 # optional: NODES ("192.168.122.100 192.168.122.101"; N = count; p-popcorn-shm.sh must cover the same VMs), KEYS
 #   (54000000), THREADS (server request workers per node, 4), PREPARE_THREADS (4), FILE_EXTENTS (0 = rest of share),
 #   SEED (20261018), LOG (0), GATE (1), V (/home/comsys/rocksdb3), BUILD (builds/rocksdb/3), LOADGEN_BUILD
@@ -47,9 +51,17 @@ case "$SYS" in
   all-HWcc) export SYSTEM=all-HWcc;;
   Popcorn)  : "${C8:?}" "${K8:?}" "${GT8:?}" "${RECV_MODE:?}"
             [[ $RECV_MODE =~ ^(poll|idle|sleep)$ ]] || stop "bad RECV_MODE"
-            export SYSTEM=Popcorn-$RECV_MODE;;
+            export SYSTEM=Popcorn-$RECV_MODE
+            SHMS=$C8/p-popcorn-shm.sh GTX=$GT8 SHMR=$E/shm-$NAME
+            PS=(POP_IPS="${IPS[*]}" K=$K8 GT=$GT8 C=$C8 R=$SHMR INIT_STATE=shared);;  # POP_IPS: N-node bundle (popcorn-n)
+  DeStijl)  : "${DS_C:?}" "${DS_K:?}" "${DS_GT:?}" "${RECV_MODE:?}"
+            [[ $RECV_MODE =~ ^(poll|sleep)$ ]] || stop "bad RECV_MODE for De Stijl (poll | sleep)"
+            export SYSTEM=DeStijl-$RECV_MODE-T0
+            SHMS=$DS_C/p-destijl-shm.sh GTX=$DS_GT SHMR=$E/dsshm-$NAME
+            PS=(DS_IPS="${IPS[*]}" K=$DS_K GT=$DS_GT C=$DS_C R=$SHMR INIT_STATE=shared "LOAD_EXTRA=recv_mode=$RECV_MODE");;
   *) stop "bad SYS";;
 esac
+COH=0; case "$SYS" in Popcorn|DeStijl) COH=1;; esac   # a cxl_shm cycle around the run (PS / SHMS / GTX above)
 LG=(--opt keys=$KEYS --opt update_ratio=$UPDATE_RATIO --opt seed=$SEED --seed "$SEED" --opt log=$LOG --mix mixed=1
     --x-stream mixed)
 case "$KIND" in
@@ -88,30 +100,34 @@ if [ "${GATE:-1}" = 1 ]; then
   fi
 fi
 T0=$(date +%s)
-if [ "$SYS" = Popcorn ]; then  # as experiments/lmdb/pilot-run.sh: enable BEFORE the servers
-  PS=(POP_IPS="${IPS[*]}" K=$K8 GT=$GT8 C=$C8 R=$E/shm-$NAME INIT_STATE=shared)  # POP_IPS: N-node bundle (popcorn-n)
+if [ $COH = 1 ]; then  # as experiments/lmdb/pilot-run.sh: enable BEFORE the servers (De Stijl: same, p-destijl-shm.sh)
   servers_gone || stop "rocksdb process or /dev/dax0.0 user before the cxl_shm load"
-  for ph in precheck load chown; do env "${PS[@]}" bash $C8/p-popcorn-shm.sh $ph || stop "shm $ph"; done
+  for ph in precheck load chown; do env "${PS[@]}" bash $SHMS $ph || stop "shm $ph"; done
   for ip in "${IPS[@]}"; do
-    [ "$($SSH comsys@$ip "sha256sum $V/cfg/cxl_region.yaml $GT8/cxl_region.yaml | cut -d' ' -f1 | sort -u | wc -l" < /dev/null)" = 1 ] \
-      || { env "${PS[@]}" bash $C8/p-popcorn-shm.sh teardown; stop "region config differs on $ip"; }
+    [ "$($SSH comsys@$ip "sha256sum $V/cfg/cxl_region.yaml $GTX/cxl_region.yaml | cut -d' ' -f1 | sort -u | wc -l" < /dev/null)" = 1 ] \
+      || { env "${PS[@]}" bash $SHMS teardown; stop "region config differs on $ip"; }
   done
-  env "${PS[@]}" bash $C8/p-popcorn-shm.sh enable || { env "${PS[@]}" bash $C8/p-popcorn-shm.sh teardown; stop "enable gate"; }
+  env "${PS[@]}" bash $SHMS enable || { env "${PS[@]}" bash $SHMS teardown; stop "enable gate"; }
   for ip in "${IPS[@]}"; do
     m=$($SSH comsys@$ip "sudo -n sh -c 'echo $RECV_MODE > /sys/module/cxl_shm/parameters/recv_mode' && cat /sys/module/cxl_shm/parameters/recv_mode" < /dev/null)
-    echo "$ip recv_mode=$m" >> "$E/recv-mode-$NAME.txt"
-    [ "$m" = "$RECV_MODE" ] || { env "${PS[@]}" bash $C8/p-popcorn-shm.sh teardown; stop "recv_mode on $ip = $m"; }
+    pr=$($SSH comsys@$ip "cat /sys/kernel/swmc/page_coherence/protocol" < /dev/null)
+    echo "$ip recv_mode=$m protocol=$pr" >> "$E/recv-mode-$NAME.txt"
+    [ "$m" = "$RECV_MODE" ] || { env "${PS[@]}" bash $SHMS teardown; stop "recv_mode on $ip = $m"; }
+    [ "$SYS" != DeStijl ] || [ "$pr" = destijl ] || { env "${PS[@]}" bash $SHMS teardown; stop "protocol on $ip = $pr"; }
   done
-  env "${PS[@]}" STATUS_TAG=runpre bash $C8/p-popcorn-shm.sh status || { env "${PS[@]}" bash $C8/p-popcorn-shm.sh teardown; stop "status pre"; }
+  env "${PS[@]}" STATUS_TAG=runpre bash $SHMS status || { env "${PS[@]}" bash $SHMS teardown; stop "status pre"; }
 fi
 bash $X/run.sh "$NAME" "$E" -- "${LG[@]}"
 RC=$?
-if [ "$SYS" = Popcorn ]; then
-  env "${PS[@]}" STATUS_TAG=runpost bash $C8/p-popcorn-shm.sh status
-  # Popcorn error counters over the run (verifier HIGH-1): transaction_error / send_drop / late_response deltas = 0
-  python3 -I -B - "$E/shm-$NAME" "$N" > "$E/$NAME.popcorn-errors.txt" 2>&1 <<'EOP'
+if [ $COH = 1 ]; then
+  env "${PS[@]}" STATUS_TAG=runpost bash $SHMS status
+  # error counters over the run (verifier HIGH-1): Popcorn transaction_error / send_drop / late_response deltas = 0;
+  # De Stijl transaction_error, ds.protocol_error, ds.tx_timeout deltas = 0
+  python3 -I -B - "$SHMR" "$N" "$SYS" > "$E/$NAME.popcorn-errors.txt" 2>&1 <<'EOP'
 import os, sys
 d, n = sys.argv[1], int(sys.argv[2]); bad = []
+cs = ['swmc.transaction_error_count', 'ds.protocol_error', 'ds.tx_timeout'] if sys.argv[3] == 'DeStijl' else \
+     ['swmc.' + c for c in ('transaction_error_count', 'send_drop_count', 'late_response_count')]
 def kv(p):
     out = {}
     for l in open(p):
@@ -122,20 +138,20 @@ for k in range(n):
     b, a = os.path.join(d, f'status-runpre-vm{k}.txt'), os.path.join(d, f'status-runpost-vm{k}.txt')
     if not (os.path.exists(b) and os.path.exists(a)): bad.append(f'vm{k}: status files missing'); continue
     b, a = kv(b), kv(a)
-    for c in ('transaction_error_count', 'send_drop_count', 'late_response_count'):
-        try: dv = int(a['swmc.' + c]) - int(b['swmc.' + c])
+    for c in cs:
+        try: dv = int(a[c]) - int(b[c])
         except (KeyError, ValueError): bad.append(f'vm{k}: {c} unreadable'); continue
-        print(f'vm{k} {c} delta={dv}')
-        if dv: bad.append(f'vm{k}: {c} delta {dv}')
-print('POPCORN ERRORS ' + ('OK' if not bad else 'FAIL ' + '; '.join(bad)))
+        print(f'vm{k} {c.split(".", 1)[1]} delta={dv}')
+        if dv: bad.append(f'vm{k}: {c.split(".", 1)[1]} delta {dv}')
+print(('DESTIJL' if sys.argv[3] == 'DeStijl' else 'POPCORN') + ' ERRORS ' + ('OK' if not bad else 'FAIL ' + '; '.join(bad)))
 sys.exit(1 if bad else 0)
 EOP
   PERR=$?
-  servers_gone || stop "servers left (Popcorn teardown not attempted)"
-  env "${PS[@]}" bash $C8/p-popcorn-shm.sh teardown || stop "shm teardown"
+  servers_gone || stop "servers left ($SYS teardown not attempted)"
+  env "${PS[@]}" bash $SHMS teardown || stop "shm teardown"
 fi
 servers_gone || stop "servers left"
-[ "$SYS" != Popcorn ] || [ "$PERR" = 0 ] || stop "Popcorn error counters ($(tail -n 1 "$E/$NAME.popcorn-errors.txt"))"
+[ $COH = 0 ] || [ "$PERR" = 0 ] || stop "$SYS error counters ($(tail -n 1 "$E/$NAME.popcorn-errors.txt"))"
 R=$E/$NAME
 [ -d "$R" ] || stop "no run dir"
 { echo "# load times $NAME (s)"; echo "run_wall_s=$(( $(date +%s) - T0 ))"; grep -h "^node[0-9]* .*IMAGE" $R/manifest.txt
