@@ -27,7 +27,12 @@ done
 set -- "$K_ARG" "${REST[@]}"
 RUNSET=h2n-n$N WL=vdb CONF_WL=h2n
 unset H2N_PINS H2N_VEC_FORMAT H2N_EF H2N_INIT H2N_HOST_IMAGE H2N_REPEATS H2N_LOADGEN_EXTRA H2N_SEARCH_THREADS \
-  H2N_FIXED H2N_FIXED_N2 H2N_FIXED_N4 H2N_FIXED_N8 H2N_NODE_ENV_EXTRA H2N_ALLOW_DETAIL H2N_EVIDENCE_NAME VDB_X_NA   # optional conf keys: never inherited from the environment
+  H2N_FIXED H2N_FIXED_N2 H2N_FIXED_N4 H2N_FIXED_N8 H2N_NODE_ENV_EXTRA H2N_ALLOW_DETAIL H2N_EVIDENCE_NAME VDB_X_NA \
+  H2N_DS_C H2N_DS_K H2N_DS_GT H2N_DS_BUNDLE_SHA H2N_DS_REGION H2N_DS_T_US   # optional conf keys: never inherited from the environment
+# De Stijl v2 (H2N_SYSTEMS entry ds; systems/destijl/system.yaml): H2N_DS_C (bundle dir: p-destijl-shm.sh, packet.sha256),
+# H2N_DS_BUNDLE_SHA, H2N_DS_K (guest release -ds-destijl-<n>), H2N_DS_GT (guest tools dir), optional H2N_DS_REGION
+# (default config/cxl_region-destijl.yaml) and H2N_DS_T_US (staleness bound T, default 0); passed to h2n-block.sh as
+# DS_C DS_BUNDLE_SHA DS_K DS_GT DS_REGION H2N_DS_T_US. pop and ds never share a block (different guest kernels).
 # VDB_X_NA (2026-10-30, 54M pool A): pool A record count of the init image (h2n-block.sh X_NA, e1_check --na); absent =
 # 26990000 (the 28M image) so every earlier conf behaves as before. VDB_MG_CAPACITY: h1 (Megalon --max-ids 28000000, no
 # --init-capacity, the fp32 28M cap) | x (the plain layout values --max-ids VDB_X_MAXIDS --init-capacity VDB_X_INIT_CAP)
@@ -60,7 +65,7 @@ X_NA=${VDB_X_NA:-26990000}
 # lifetime list: systems outer, mixes inner
 ALL=()
 for s in $H2N_SYSTEMS; do
-  case $s in hw|pop|mg|mgoff) ;; *) die "bad H2N_SYSTEMS entry $s";; esac
+  case $s in hw|pop|ds|mg|mgoff) ;; *) die "bad H2N_SYSTEMS entry $s";; esac
   for m in $H2N_POINTS; do
     row=$(awk -F'\t' -v m="$m" '!/^#/ && $1 == "vdb" && $2 == m' "$H/h1-plan.tsv")
     [ "$(echo "$row" | cut -f3)" = "U=${m#u}" ] || die "mix $m: h1-plan.tsv has no vdb row with U=${m#u}"
@@ -76,7 +81,16 @@ elif [ -n "$ONLY" ]; then
   LIVES=()
   for l in $ONLY; do [[ " ${ALL[*]} " == *" $l "* ]] || die "--only $l is not one of [${ALL[*]}]"; LIVES+=("$l"); done
 fi
-HASMG=0; for l in "${LIVES[@]}"; do case ${l%%:*} in mg|mgoff) HASMG=1;; esac; done
+HASMG=0 HASDS=0; for l in "${LIVES[@]}"; do case ${l%%:*} in mg|mgoff) HASMG=1;; ds) HASDS=1;; esac; done
+DSENV=()
+if [ $HASDS = 1 ]; then
+  ab() { case $1 in /*) echo "$1";; *) echo "$P/$1";; esac; }
+  for x in H2N_DS_C H2N_DS_K H2N_DS_GT H2N_DS_BUNDLE_SHA; do [ -n "${!x:-}" ] || die "ds lifetimes need $x in $EVAL_CONF"; done
+  DSC=$(ab "$H2N_DS_C") DSR=$(ab "${H2N_DS_REGION:-CXL_SWMC/config/cxl_region-destijl.yaml}")
+  need_files "$DSC/p-destijl-shm.sh" "$DSC/packet.sha256" "$DSR"
+  [ "$(sha256sum < "$DSC/packet.sha256" | cut -c1-64)" = "$H2N_DS_BUNDLE_SHA" ] || die "De Stijl bundle packet.sha256 != H2N_DS_BUNDLE_SHA"
+  DSENV=(DS_C=$DSC DS_K=$H2N_DS_K DS_GT=$H2N_DS_GT DS_BUNDLE_SHA=$H2N_DS_BUNDLE_SHA DS_REGION=$DSR H2N_DS_T_US=${H2N_DS_T_US:-0})
+fi
 v() { local x=H2N_$1_N$N; echo "${!x:-}"; }
 WRITES=$(v WRITES) MAXD=$(v MAXD)
 [ -n "$WRITES" ] && [[ $MAXD =~ ^[1-9][0-9]*$ ]] || die "H2N_WRITES_N$N / H2N_MAXD_N$N missing"
@@ -125,6 +139,7 @@ BENV=(H2N_N=$N H2N_VCPU=$VCPUS_PER_VM "H2N_LIFETIMES=${LIVES[*]}" EVAL_RUN=$K SE
   VPLAIN=$VDB_VPLAIN PLAIN_BUILD=$VDB_PLAIN_BUILD LOADGEN=$VDB_LOADGEN_BUILD/loadgen X_DATA=$VDB_X_DATA X_WRITES=$WRITES
   X_NB=$VDB_X_NB X_MAXIDS=$VDB_X_MAXIDS X_MAXW=$VDB_X_MAXW X_MAXD=$MAXD X_INIT_CAP=$VDB_X_INIT_CAP X_NA=$X_NA
   "H2N_SLO_PART=$SLOPART" H2N_OPCOH_STRICT=$H2N_OPCOH_STRICT H2N_CXLBW=$H2N_CXLBW H2N_HOSTCPU=${H2N_HOSTCPU:-0})
+[ $HASDS = 0 ] || BENV+=("${DSENV[@]}")
 [ $HASMG = 0 ] || BENV+=(MEG_BUILD=$MGB VMEG=$MGV MEG_CFG=$MGC MEG_LIB=$MGL MG_MAXD=$MGD MG_CAPACITY=$VDB_MG_CAPACITY)
 for x in H2N_VEC_FORMAT H2N_EF H2N_INIT H2N_HOST_IMAGE H2N_SEARCH_THREADS H2N_FIXED H2N_NODE_ENV_EXTRA H2N_ALLOW_DETAIL; do [ -z "${!x:-}" ] || BENV+=("$x=${!x}"); done
 for x in PRETOUCH_DIR MEASURE_ENV_DIR MEASURE_PART_DIR; do [ -z "${!x:-}" ] || BENV+=("$x=${!x}"); done

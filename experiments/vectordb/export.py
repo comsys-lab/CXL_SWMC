@@ -51,7 +51,7 @@ import urate_report as ur  # noqa: E402
 import stats_delta  # noqa: E402  (urate_report put experiments/loadgen on the path)
 
 SHARE = {f"u{u}": u / 100 for u in (5, 10, 50, 90, 95)}  # new H1 (2026-10-20) adds u10, u95
-SYSNAME = {"hw": "hw", "pop": "pop", "mg": "mg", "mgoff": "mgoff"}
+SYSNAME = {"hw": "hw", "pop": "pop", "mg": "mg", "mgoff": "mgoff", "ds": "ds"}
 
 
 def server_threads(life):
@@ -158,7 +158,7 @@ def mg_flush(part):
 #                           pop_search_is_per_rop x 4096 / 64; All-HWcc 0
 #   pop_search_is_per_rop   Popcorn search I->S faults (thr.vdb-search.swmc.is_faults: the server's search threads)
 #                           per server search
-COH = canon.VDB_COH
+COH = canon.VDB_COH + canon.DS_COH   # DS_COH: De Stijl v2 (empty unless the step has sys.swmc.destijl.* counters)
 
 
 def coh_steps(part, system):
@@ -175,13 +175,16 @@ def coh_steps(part, system):
             "sev": ("opt.search.meg.stale_cnt", "opt.search.meg.concur_cnt"),
             "is": ("thr.vdb-search.swmc.is_faults",), "ns": ("searches",), "nu": ("inserts",)}
     for fx, d in dl:
-        t = acc.setdefault(fx["step"], {"win": 0.0, **{k: None for k in keys}})
+        t = acc.setdefault(fx["step"], {"win": 0.0, **{k: None for k in keys}, "ds": {}})
         w = canon.fl(fx.get("window_s"))
         t["win"] = max(t["win"], w or 0.0)
         for k, ks in keys.items():
             v = [d[x] for x in ks if d.get(x) is not None]
             if v:
                 t[k] = (t[k] or 0.0) + sum(v)
+        for k, x in canon.DS_KEYS.items():  # De Stijl v2: sum over nodes (p95_us gauge: max)
+            if d.get(x) is not None:
+                t["ds"][k] = max(t["ds"].get(k) or 0.0, d[x]) if k == "p95_us" else (t["ds"].get(k) or 0.0) + d[x]
     out = {}
     for n, t in acc.items():
         win, ns = t["win"], t["ns"]
@@ -200,10 +203,11 @@ def coh_steps(part, system):
         if system in ("mg", "mgoff"):
             ev, bpf = o["mg_search_events_per_rop"], o["mg_rflush_bytes_per_flush"]
             o["fig3_lines_per_rop"] = ev * bpf / 64 if ev is not None and bpf is not None else (0.0 if ev == 0 else None)
-        elif system == "pop":
+        elif system in ("pop", "ds"):
             o["fig3_lines_per_rop"] = o["pop_search_is_per_rop"] * 4096 / 64 if o["pop_search_is_per_rop"] is not None else None
         else:
             o["fig3_lines_per_rop"] = 0.0
+        o.update(canon.ds_coh(t["ds"], ns, win))
         out[n] = o
     return out
 
@@ -217,7 +221,7 @@ def lowest_ramp(rows, cs, rd, system):
     mf = cs.get(r["step"], {}).get("mg_fetch_per_op")
     return dict(lowest_ramp_step=r["step"], lowest_ramp_offered_x=rd(r["offered_x"]),
                 lowest_ramp_achieved_x=r["search_per_s"], lowest_ramp_p99_ms=r["search_p99_ms"],
-                lowest_ramp_mg_fetch_per_op=0.0 if system in ("hw", "pop") else mf)
+                lowest_ramp_mg_fetch_per_op=0.0 if system in ("hw", "pop", "ds") else mf)
 
 
 def common(p, vcpus):
@@ -351,7 +355,7 @@ def export(E, out, rnd, vcpus, run=None, sha=None):
                     wb = wtot / nu if nu else None
                 if p["system"] in ("mg", "mgoff"):
                     lines = fb / 64 if fb is not None else None
-                elif p["system"] == "pop":
+                elif p["system"] in ("pop", "ds"):
                     rf = r["pop_read_faults_per_search"]
                     lines = rf * 4096 / 64 if rf is not None else None
                 else:

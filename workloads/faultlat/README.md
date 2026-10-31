@@ -139,6 +139,31 @@ every run needs a fresh `<base-page>` (the script prints the next one) or a
 reboot of both guests. Then collect the guest output dirs and run
 `parse.py <dir>... > summary.csv`.
 
+## De Stijl v2: async step (faultlat-6)
+
+`access --staleness-us T` (T > 0) calls `de_stijl_set_staleness(window, T)`
+(libdestijl, syscall 472; systems/destijl/lib) on the whole mapped window
+before the first access; without the option nothing changes (no syscall).
+On a kernel without De Stijl v2 the step stops with ENOSYS. The step JSON
+records `params.staleness_us`, and `kernel` also carries the
+`/sys/kernel/swmc/destijl/*` files as `ds_<name>` (counters as `_delta`;
+`ds_pending_now`, `ds_lambda`, `ds_p95_us`, `ds_replica_pages` as end values).
+
+`ASYNC_T_US="T1 T2 ..." scenarios.sh ...` adds, after s7, one window per T:
+
+| Step | Node | What is measured | Local transition | Peer work |
+| --- | --- | --- | --- | --- |
+| a<T>_prep_peerM | 1 | (setup) write, node 1 holds M | I->M | none |
+| a<T>_read_I_peerM_T | 0 | read-on-I under a VMA with bound T (the readM step of s2 with T) | I->SS if admitted (async FETCH, later SS->S), else I->S as s2 | M->S: write-protect, write back, FETCH_ACK |
+
+Admitted faults map without waiting for the FETCH (`ds_async_issued_delta`),
+refused ones fall back to the synchronous s2 path (`ds_async_fallback_mean_delta`
+/ `ds_async_fallback_p95_delta`). Without `ASYNC_T_US` the windows and every
+other step are as before. `faultlat params --protocol destijl [--bpd-sets S]
+[--ring-slots R]` prints the cxl_shm v13 parameters for the De Stijl block
+(msg_ring of config/cxl_region-destijl.yaml; refuses a block smaller than the
+module's layout total); the Popcorn output is unchanged.
+
 ## N-node scenarios (Popcorn broadcast MSI, popcorn-msi-n)
 
 With `NODES="<ssh0> <ssh1> ... <sshN-1>"` (N > 2) `scenarios.sh` also runs,

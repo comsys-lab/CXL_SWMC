@@ -13,7 +13,8 @@
 # first two), PPAGES (pages per N-node window, default 256),
 # GDIR (plugin dir on the guests), GOUT (guest output root), PAGES (pages per
 # window, default 4096), CPU (pinned CPU, default 2), ITERS (ping-pong, 10000),
-# CXL_REGION_CONFIG (path on the guests).
+# CXL_REGION_CONFIG (path on the guests), ASYNC_T_US (De Stijl v2 only: space-separated staleness bounds T in us;
+# for each T one async step pair after s7, see a<T>_* below; unset = no async step, every window as before).
 # <base-page> must point at swcc pages no earlier run touched (page states
 # persist across runs; use a new base per run or reboot both guests).
 set -euo pipefail
@@ -69,13 +70,24 @@ else
   step "$NODE0" s7_pingpong_r0 pingpong --role 0 --nonce "$nonce" --iters "$ITERS" --page-offset "$pp"
 fi
 next=7
+# async (De Stijl v2, T > 0): the readM pair of s2 with a staleness bound T on node 0's window. Node 1 writes the
+# pages (M at node 1), node 0 reads them under a VMA with T: an admitted read fault maps the page at once (SS) and
+# the FETCH completes asynchronously (counters ds_async_issued / ds_async_completed / ds_async_fallback_* in the
+# step JSON). One fresh window per T.
+read -r -a ASYNC_T <<< "${ASYNC_T_US:-}"
+for t in ${ASYNC_T[@]+"${ASYNC_T[@]}"}; do
+  [[ $t =~ ^[1-9][0-9]*$ ]] || { echo "ASYNC_T_US: bad T '$t' (integer us > 0)"; exit 2; }
+  step "$NODE1" "a${t}_prep_peerM"      access --op write --pages "$PAGES" --page-offset "$(win $next)"
+  step "$NODE0" "a${t}_read_I_peerM_T"  access --op read  --pages "$PAGES" --page-offset "$(win $next)" --staleness-us "$t"
+  next=$((next + 1))
+done
 
 # --- N-node scenarios (NODES with N > 2 entries) ---------------------------
 if [ "$N" -gt 2 ]; then
   bg() {  # run a step in the background when executing
     if [ "$exec_" = --execute ]; then step "$@" & else step "$@"; echo "  (background)"; fi
   }
-  nwin() { echo $((base + 7 * PAGES + $1 * PPAGES)); }
+  nwin() { echo $((base + next * PAGES + $1 * PPAGES)); }   # next = 7 without ASYNC_T_US (as before)
   # 8 one writer, N-1 readers: node 0 writes; nodes 1..N-1 read in turn.
   #   First reader: read-on-I, writer downgrades M->S (write-back);
   #   later readers: read-on-I with S sharers (FETCH to N-1 peers, no work).

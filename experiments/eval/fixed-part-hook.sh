@@ -4,7 +4,7 @@
 #   pre   the part's token <sys>/<part>/<detail>/<recv>/...: detail 0|1 -> /sys/kernel/swmc/instr/detail, recv
 #         poll|idle|sleep -> /sys/module/cxl_shm/parameters/recv_mode on every VM (- = untouched), read back and checked
 #   post  detail back to 0 (if the part set it), recv_mode back to RECV_MODE (if the part set it), checked
-#   check (Popcorn only) every VM at detail 0 and recv_mode RECV_MODE
+#   check (Popcorn and De Stijl: cxl_shm loaded) every VM at detail 0 and recv_mode RECV_MODE
 # Always prints one line per VM with the values read (run.sh appends it to <run>/part-hooks.txt). Guest sudo: the
 # recv_mode write of grant B and the instr/detail write approved for popcorn-writer-lock-split (both sudo -n sh -c).
 # env: FIXED_SPEC (= H2N_FIXED), NODES (VM IPs), RECV_MODE; FIXED_HOOK_DRY=1 prints the commands only.
@@ -24,7 +24,7 @@ fi
 case $PH in
   pre) WD=$DET WR=$RECV;;
   post) WD=-; [ "$DET" = - ] || WD=0; WR=-; [ "$RECV" = - ] || WR=$RECV_MODE;;
-  check) [ "${SYS%%@*}" = pop ] || { echo "$(date -Is) check $SYS: nothing to check"; exit 0; }; WD=0 WR=$RECV_MODE;;
+  check) [[ ${SYS%%@*} =~ ^(pop|ds)$ ]] || { echo "$(date -Is) check $SYS: nothing to check"; exit 0; }; WD=0 WR=$RECV_MODE;;
   *) echo "HOOK FAIL: phase $PH"; exit 2;;
 esac
 rc=0
@@ -41,6 +41,6 @@ for ip in $NODES; do
   ed=$WD; [ "$ed" = - ] && ed=0
   er=$WR; [ "$er" = - ] && er=$RECV_MODE
   [[ $out == *"detail=$ed "* ]] || { [ "$ed" = 0 ] && [[ $out == *"detail=absent "* ]]; } || { echo "HOOK FAIL: $ip detail != $ed"; rc=1; }
-  if [ "${SYS%%@*}" = pop ]; then [[ $out == *"recv_mode=$er" ]] || { echo "HOOK FAIL: $ip recv_mode != $er"; rc=1; }; fi
+  if [[ ${SYS%%@*} =~ ^(pop|ds)$ ]]; then [[ $out == *"recv_mode=$er" ]] || { echo "HOOK FAIL: $ip recv_mode != $er"; rc=1; }; fi
 done
 exit $rc
