@@ -86,7 +86,7 @@ DSENV=()
 if [ $HASDS = 1 ]; then
   ab() { case $1 in /*) echo "$1";; *) echo "$P/$1";; esac; }
   for x in H2N_DS_C H2N_DS_K H2N_DS_GT H2N_DS_BUNDLE_SHA; do [ -n "${!x:-}" ] || die "ds lifetimes need $x in $EVAL_CONF"; done
-  DSC=$(ab "$H2N_DS_C") DSR=$(ab "${H2N_DS_REGION:-CXL_SWMC/config/cxl_region-destijl.yaml}")
+  DSC=$(ab "$H2N_DS_C") DSR=$(ab "${H2N_DS_REGION:-$TREE/config/cxl_region-destijl.yaml}")   # default: this tree's
   need_files "$DSC/p-destijl-shm.sh" "$DSC/packet.sha256" "$DSR"
   [ "$(sha256sum < "$DSC/packet.sha256" | cut -c1-64)" = "$H2N_DS_BUNDLE_SHA" ] || die "De Stijl bundle packet.sha256 != H2N_DS_BUNDLE_SHA"
   DSENV=(DS_C=$DSC DS_K=$H2N_DS_K DS_GT=$H2N_DS_GT DS_BUNDLE_SHA=$H2N_DS_BUNDLE_SHA DS_REGION=$DSR H2N_DS_T_US=${H2N_DS_T_US:-0})

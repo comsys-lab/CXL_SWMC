@@ -15,8 +15,9 @@
 #   image build runs under coherence. LOCK_OWNER: the calling block's measurement lock.
 #   SYS=DeStijl (De Stijl v2, as experiments/eval/h2n-block.sh ds): DS_C (bundle dir with p-destijl-shm.sh), DS_K
 #   (release -ds-destijl-<n>), DS_GT (guest tools dir), RECV_MODE (poll | sleep); same cycle as Popcorn with
-#   p-destijl-shm.sh (protocol destijl checked); T = 0 only (the RocksDB server has no De Stijl staleness hook); error
-#   counters over the run: swmc.transaction_error_count, ds.protocol_error, ds.tx_timeout deltas = 0.
+#   p-destijl-shm.sh (protocol destijl checked); T = 0 only: rocksdb-server has no region_apply_staleness call (no
+#   CXL_DESTIJL_T_US hook), so a DS_T_US other than 0 is refused (unlike the vector DB / RecSys H2N_DS_T_US / RS_DS_T_US /
+#   DS_T_US keys); error counters over the run: swmc.transaction_error_count, ds.protocol_error, ds.tx_timeout deltas = 0.
 # optional: NODES ("192.168.122.100 192.168.122.101"; N = count; p-popcorn-shm.sh must cover the same VMs), KEYS
 #   (54000000), THREADS (server request workers per node, 4), PREPARE_THREADS (4), FILE_EXTENTS (0 = rest of share),
 #   SEED (20261018), LOG (0), GATE (1), V (/home/comsys/rocksdb3), BUILD (builds/rocksdb/3), LOADGEN_BUILD
@@ -56,6 +57,7 @@ case "$SYS" in
             PS=(POP_IPS="${IPS[*]}" K=$K8 GT=$GT8 C=$C8 R=$SHMR INIT_STATE=shared);;  # POP_IPS: N-node bundle (popcorn-n)
   DeStijl)  : "${DS_C:?}" "${DS_K:?}" "${DS_GT:?}" "${RECV_MODE:?}"
             [[ $RECV_MODE =~ ^(poll|sleep)$ ]] || stop "bad RECV_MODE for De Stijl (poll | sleep)"
+            [ "${DS_T_US:-0}" = 0 ] || stop "DS_T_US=${DS_T_US}: RocksDB runs De Stijl at T = 0 only (rocksdb-server has no staleness hook)"
             export SYSTEM=DeStijl-$RECV_MODE-T0
             SHMS=$DS_C/p-destijl-shm.sh GTX=$DS_GT SHMR=$E/dsshm-$NAME
             PS=(DS_IPS="${IPS[*]}" K=$DS_K GT=$DS_GT C=$DS_C R=$SHMR INIT_STATE=shared "LOAD_EXTRA=recv_mode=$RECV_MODE");;

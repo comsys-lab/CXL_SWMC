@@ -25,8 +25,9 @@ GAUGE_SUFFIX = (".n", "max_ns", ".in_flight_transaction_count", ".enabled",
                 # KV/LMDB opt.meg_flags, opt.meg_lean, opt.meg_events_always, opt.meg_probe_ps_{min,max}
                 ".meg.flags", ".mg.flags", "meg_flags", "meg_lean", "meg_events_always", "probe_ps_min", "probe_ps_max",
                 # De Stijl v2 (systems/common/proc_stats.h sys.swmc.destijl.*): current pending count, completion rate,
-                # residence p95, replica pool size
-                "swmc.destijl.pending_now", "swmc.destijl.lambda", "swmc.destijl.p95_us", "swmc.destijl.replica_pages")
+                # residence p95 and max, replica pool size ("lambda": the pre-kernel spec name, kept for old snapshots)
+                "swmc.destijl.pending_now", "swmc.destijl.lambda", "swmc.destijl.lambda_per_s", "swmc.destijl.p95_us",
+                "swmc.destijl.ss_residence_max_us", "swmc.destijl.replica_pages")
 # MOT1 v6 per-operation namespaces op.<op>.* / opt.<op>.*: the operation count "<prefix>.<op>.n" is a counter
 OP_COUNT = re.compile(r"^opt?\.[^.]+\.n$")
 

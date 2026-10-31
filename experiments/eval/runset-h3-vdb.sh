@@ -8,9 +8,14 @@
 # <sys>-n<N>/, cdf/, block.log). Acceptance: review E/block/h3-results.tsv + block.log (BLOCK DONE, no ROLLBACK FAIL),
 # then registry.py accept h3-vdb-n<N> <k> <E>.
 # usage: runset-h3-vdb.sh <N> <k> [--dry] [--v V]   (lib.sh; evidence <RESULTS_ROOT>/<prefix>-run<k>-h3-vdb-n<N>-v<V>)
+# De Stijl v2: H3_SYSTEMS entry ds with the conf keys H3_DS_C H3_DS_K H3_DS_GT H3_DS_BUNDLE_SHA [H3_DS_REGION]
+# [H3_DS_T_US] (lib.sh h3_ds_env; passed to h3-block.sh as DS_C DS_BUNDLE_SHA DS_K DS_GT DS_REGION H3_DS_T_US); pop and
+# ds never share a block. The CDF lifetime is Popcorn's: a block without pop has CDF=0. A ds conf should set its own
+# REGISTRY / EVIDENCE_TAG (lib.sh keys) so its runs do not collide with the pop block's run set entries.
 N=${1:-}; shift || true
 [[ $N =~ ^[2-8]$ ]] || { echo "RUNSET STOP: usage runset-h3-vdb.sh <N> <k> [--dry] [--v V]"; exit 2; }
 RUNSET=h3-vdb-n$N WL=vdb CONF_WL=h3-vdb
+unset H3_DS_C H3_DS_K H3_DS_GT H3_DS_BUNDLE_SHA H3_DS_REGION H3_DS_T_US   # optional conf keys: never inherited from the environment
 . "$(dirname "$0")/lib.sh"
 H=$TREE/experiments/h1
 [[ " $H3_NODES " == *" $N "* ]] || die "N=$N not in H3_NODES ($H3_NODES)"
@@ -21,8 +26,10 @@ VCPU=$((H3_TOTAL_VCPU / N))
 row=$(awk -F'\t' -v m="$H3_VDB_POINT" '!/^#/ && $1 == "vdb" && $2 == m' "$H/h1-plan.tsv")
 U=$(echo "$row" | cut -f3 | sed -n 's/^U=\([0-9]*\)$/\1/p'); [ -n "$U" ] || die "no U for $H3_VDB_POINT in h1-plan.tsv"
 [ "$VDB_DATASET" = 28m-x ] || die "H3 uses the 28m-x dataset (VDB_DATASET)"
-for s in $H3_SYSTEMS; do case $s in hw|pop) ;; mg) die "Megalon in H3 needs Megalon builds with LOGICAL_NODE_NUM = $N (RUN-H3.md)";; *) die "bad H3_SYSTEMS entry $s";; esac; done
+for s in $H3_SYSTEMS; do case $s in hw|pop|ds) ;; mg) die "Megalon in H3 needs Megalon builds with LOGICAL_NODE_NUM = $N (RUN-H3.md)";; *) die "bad H3_SYSTEMS entry $s";; esac; done
 CDF=0; [ "$N" = "$H3_CDF_N" ] && [[ " $H3_CDF_RUNS " == *" $K "* ]] && CDF=1
+if [ $CDF = 1 ] && [[ " $H3_SYSTEMS " != *" pop "* ]]; then CDF=0; plan "CDF lifetime skipped: no pop in H3_SYSTEMS (the CDF rate is Popcorn's; the pop block runs it)"; fi
+h3_ds_env "$VDB_PLAIN_BUILD/bin/vdb-server"
 WRITES=$H3_VDB_WRITES_DIR/writes-a27m-b3400k-u3400k-vms$N.bin
 need_files "$VDB_PLAIN_BUILD/bin/vdb-server" "$VDB_LOADGEN_BUILD/loadgen" "$REGION" "$POP_C/p-popcorn-shm.sh" \
   "$VDB_X_DATA/pool_b.fbin" "$EVD/h3-block.sh" "$EVD/h3-cdf.sh"
@@ -44,6 +51,7 @@ BENV=(H3_WL=vdb H3_N=$N H3_TOTAL_VCPU=$H3_TOTAL_VCPU "SYSTEMS=$H3_SYSTEMS" EVAL_
   CDF=$CDF CDF_S=$H3_CDF_S H3_CDF_PFN_MOD=$H3_CDF_PFN_MOD VPLAIN=$VDB_VPLAIN PLAIN_BUILD=$VDB_PLAIN_BUILD LOADGEN=$VDB_LOADGEN_BUILD/loadgen
   X_DATA=$VDB_X_DATA X_WRITES=$WRITES X_NB=$VDB_X_NB X_MAXIDS=$VDB_X_MAXIDS X_MAXW=$VDB_X_MAXW X_MAXD=$VDB_X_MAXD
   X_INIT_CAP=$VDB_X_INIT_CAP U=$U)
+[ $HASDS = 0 ] || BENV+=("${DSENV[@]}")
 for v in PRETOUCH_DIR MEASURE_ENV_DIR MEASURE_PART_DIR; do [ -z "${!v:-}" ] || BENV+=("$v=${!v}"); done
 plan "block: env ${BENV[*]} bash $EVD/h3-block.sh <E>/block"
 if [ $DRY = 1 ]; then
@@ -56,6 +64,7 @@ log() { echo "$(date -Is) [$RUNSET run $K] $*" | tee -a "$E/eval-state.txt"; }
 stop() { log "SEQUENCE STOP $*"; $REG add vdb $RUNSET $K "$E" $CSHA stopped "$*"; exit 1; }
 manifest "$VDB_PLAIN_BUILD" "$VDB_LOADGEN_BUILD"
 echo "writes $(sha256sum "$WRITES")" >> "$E/eval-manifest.txt"
+[ $HASDS = 0 ] || echo "destijl ${DSENV[*]} region_sha256=$(sha256sum < "${DSENV[4]#DS_REGION=}" | cut -c1-64)" >> "$E/eval-manifest.txt"
 $REG add vdb $RUNSET $K "$E" $CSHA started "commit $COMMIT N=$N"
 log "block start (N=$N, CDF=$CDF)"
 env "${BENV[@]}" bash "$EVD/h3-block.sh" "$E/block" > "$E/sequence.log" 2>&1

@@ -27,7 +27,8 @@
 #   Stijl block), H2N_DS_T_US (optional staleness bound T in us for the servers, default 0 = synchronous; passed as
 #   ENV:CXL_SYSTEM=ds ENV:CXL_DESTIJL_T_US=<T>). ds cycle = p-destijl-shm.sh precheck / load (protocol=destijl,
 #   init_state=shared, recv_mode=RECV_MODE: poll | sleep) / chown / preload (as pop) / enable / recv_mode / status, and
-#   teardown after the lifetime.
+#   teardown after the lifetime. ds lifetimes are checked with opcoh_check.py destijl (popcorn rules + De Stijl
+#   counters present, tx_timeout / protocol_error deltas 0; same H2N_OPCOH_STRICT rule as pop).
 # Order: lock -> [CXL.mem sampler] -> pretouch check (N VMs) -> h3 gate -> guest prechecks + install sha256 vs the Host
 # builds -> dmesg baseline -> lifetimes (each: h3 gate, dax owner, [Popcorn: shm load / preload / enable / recv_mode /
 # instr], run.sh part slo, checks, [teardown], dmesg check) -> pretouch check (end) -> BLOCK DONE.
@@ -434,7 +435,7 @@ vdb_life() {  # <sys> <mix> [r<j>]
   case $s in
     hw)  RE+=(SYSTEM=all-HWcc NODE_ENV= NODE0_ENV= "SERVER_ARGS=$SA"); mode=hwcc OPS=none;;
     pop) RE+=(SYSTEM=Popcorn-$RECV_MODE NODE_ENV= NODE0_ENV= "SERVER_ARGS=$SA --preloaded"); mode=popcorn OPS=swmc_acct;;
-    ds)  RE+=(SYSTEM=DeStijl-$RECV_MODE-T$DST "NODE_ENV=ENV:CXL_SYSTEM=ds ENV:CXL_DESTIJL_T_US=$DST" NODE0_ENV= "SERVER_ARGS=$SA --preloaded"); mode=popcorn OPS=ds;;
+    ds)  RE+=(SYSTEM=DeStijl-$RECV_MODE-T$DST "NODE_ENV=ENV:CXL_SYSTEM=ds ENV:CXL_DESTIJL_T_US=$DST" NODE0_ENV= "SERVER_ARGS=$SA --preloaded"); mode=destijl OPS=ds;;
     mg)  RE+=(SYSTEM=Megalon V=$VMEG HOST_SERVER=$MEG_BUILD/bin/vdb-server "SERVER_ARGS=$MGSA" "NODE_ENV=ENV:RACKOBJ_CONFIG=$VMEG/cfg/megalon.yaml"
               NODE0_ENV=ENV:MEGALON_REINIT=1); mode=megalon-vm OPS=cohsnap;;
     mgoff) RE+=(SYSTEM=Megalon V=$VMEG HOST_SERVER=$MEG_BUILD/bin/vdb-server "SERVER_ARGS=$MGSA"
@@ -514,7 +515,7 @@ vdb_fixed_life() {  # <sys> <mix>
   case $s in
     hw)  RE+=(SYSTEM=all-HWcc "NODE_ENV=$NENV_X" NODE0_ENV= "SERVER_ARGS=$SA"); mode=hwcc OPS=none;;
     pop) RE+=(SYSTEM=Popcorn-$RECV_MODE "NODE_ENV=$NENV_X" NODE0_ENV= "SERVER_ARGS=$SA --preloaded"); mode=popcorn OPS=swmc_acct;;
-    ds)  RE+=(SYSTEM=DeStijl-$RECV_MODE-T$DST "NODE_ENV=ENV:CXL_SYSTEM=ds ENV:CXL_DESTIJL_T_US=$DST${NENV_X:+ $NENV_X}" NODE0_ENV= "SERVER_ARGS=$SA --preloaded"); mode=popcorn OPS=ds;;
+    ds)  RE+=(SYSTEM=DeStijl-$RECV_MODE-T$DST "NODE_ENV=ENV:CXL_SYSTEM=ds ENV:CXL_DESTIJL_T_US=$DST${NENV_X:+ $NENV_X}" NODE0_ENV= "SERVER_ARGS=$SA --preloaded"); mode=destijl OPS=ds;;
     mg)  RE+=(SYSTEM=Megalon V=$VMEG HOST_SERVER=$MEG_BUILD/bin/vdb-server "SERVER_ARGS=$MGSA" "NODE_ENV=ENV:RACKOBJ_CONFIG=$VMEG/cfg/megalon.yaml${NENV_X:+ $NENV_X}"
               NODE0_ENV=ENV:MEGALON_REINIT=1); mode=megalon-vm OPS=cohsnap;;
     mgoff) RE+=(SYSTEM=Megalon V=$VMEG HOST_SERVER=$MEG_BUILD/bin/vdb-server "SERVER_ARGS=$MGSA"

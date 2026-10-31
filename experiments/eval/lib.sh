@@ -171,3 +171,27 @@ export_run() {  # <export script> <evidence dir>: canonical CSVs into DERIVED_RO
   mkdir -p "$out" && python3 -I -B "$1" --run "$K" --runset "$RUNSET" --config-sha256 "$CSHA" --out "$out" "$2" > "$out/export.log" 2>&1 \
     && echo "export: $out" || echo "RUNSET NOTE: export failed (see $out/export.log; the run itself is unaffected)"
 }
+# De Stijl v2 in the H3 run sets (H3_SYSTEMS entry ds; the H3 equivalent of runset-h2n.sh H2N_DS_*). Conf keys
+# H3_DS_C (bundle dir: p-destijl-shm.sh, packet.sha256), H3_DS_BUNDLE_SHA (sha256 of H3_DS_C/packet.sha256), H3_DS_K
+# (guest release -ds-destijl-<n>), H3_DS_GT (guest tools dir), optional H3_DS_REGION (default
+# config/cxl_region-destijl.yaml of this tree) and H3_DS_T_US (staleness bound T in us, default 0 = synchronous); the
+# drivers unset them before this file is sourced (never inherited from the environment). Passed to h3-block.sh as
+# DS_C DS_BUNDLE_SHA DS_K DS_GT DS_REGION H3_DS_T_US. pop and ds never share a block (different guest kernels); a
+# T > 0 needs a server build that links libdestijl (de_stijl_set_staleness), else the servers would ignore T.
+h3_ds_env() {  # <Host server binary of the block>: sets HASDS (0 | 1) and DSENV (env assignments for h3-block.sh)
+  HASDS=0 DSENV=()
+  [[ " $H3_SYSTEMS " == *" ds "* ]] || return 0
+  HASDS=1
+  [[ " $H3_SYSTEMS " != *" pop "* ]] || die "pop and ds need different guest kernels: run them in separate H3 blocks (confs)"
+  local x dsc dsr t=${H3_DS_T_US:-0}
+  for x in H3_DS_C H3_DS_K H3_DS_GT H3_DS_BUNDLE_SHA; do [ -n "${!x:-}" ] || die "ds needs $x in $EVAL_CONF"; done
+  [[ $H3_DS_K == *-ds-destijl-* ]] || die "H3_DS_K=$H3_DS_K is not a De Stijl release (-ds-destijl-<n>)"
+  [[ $t =~ ^(0|[1-9][0-9]*)$ ]] || die "bad H3_DS_T_US ($t: integer us, 0 = synchronous)"
+  [[ $RECV_MODE =~ ^(poll|sleep)$ ]] || die "RECV_MODE=$RECV_MODE: De Stijl (cxl_shm v13 protocol=destijl) refuses idle"
+  dsc=$H3_DS_C dsr=${H3_DS_REGION:-$TREE/config/cxl_region-destijl.yaml}
+  need_files "$dsc/p-destijl-shm.sh" "$dsc/packet.sha256" "$dsr"
+  [ "$(sha256sum < "$dsc/packet.sha256" | cut -c1-64)" = "$H3_DS_BUNDLE_SHA" ] || die "De Stijl bundle packet.sha256 != H3_DS_BUNDLE_SHA"
+  [ "$t" = 0 ] || grep -qa de_stijl_set_staleness "$1" || die "H3_DS_T_US=$t needs a server build with libdestijl ($1 has none)"
+  DSENV=(DS_C=$dsc DS_K=$H3_DS_K DS_GT=$H3_DS_GT DS_BUNDLE_SHA=$H3_DS_BUNDLE_SHA DS_REGION=$dsr H3_DS_T_US=$t)
+  plan "De Stijl: bundle $dsc release $H3_DS_K guest tools $H3_DS_GT region $dsr T=$t us recv_mode $RECV_MODE"
+}

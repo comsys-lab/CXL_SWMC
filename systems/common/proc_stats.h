@@ -18,9 +18,10 @@
 //                                            <dir> = path below /sys/kernel/ with '.' for '/', e.g. swmc.page_coherence)
 //   sys.<dir>.<file>.<name>                  files of "name value" lines in those dirs (e.g. Popcorn instr/ histograms)
 //   sys.swmc.destijl.<name>                  De Stijl v2 counters (/sys/kernel/swmc/destijl), only when that directory
-//                                            exists (De Stijl kernels): the fixed list kDestijlCounters (a missing file
-//                                            = 0) plus any other rx_* / replica_* file there; pending_now, lambda,
-//                                            p95_us, replica_pages are gauges (stats_delta.py keeps the end value)
+//                                            exists (De Stijl kernels): the fixed list destijl_counters() (a missing
+//                                            file = 0) plus any other rx_* / replica_* file there; pending_now,
+//                                            lambda_per_s, p95_us, ss_residence_max_us, replica_pages are gauges
+//                                            (stats_delta.py keeps the end value)
 // cpu_ticks are USER_HZ ticks (utime + stime); run_ns / wait_ns are ns from schedstat. Key names never contain '='
 // or spaces. *.max_ns style keys are maxima, not sums (stats_delta.py reports their end value).
 #pragma once
@@ -89,14 +90,21 @@ inline std::vector<std::string> dir_entries(const std::string &d) {
   return v;
 }
 
-// De Stijl v2 counters exported in every snapshot of a De Stijl kernel (DS2-protocol-spec.md §4-§8)
+// De Stijl v2 counters exported in every snapshot of a De Stijl kernel (DS2-protocol-spec.md §4-§8): every counter of
+// kernel/swmc/destijl.c DS_DS_COUNTERS (kernel commit 2424ff336; tx_timeout / protocol_error are the error counters
+// opcoh_check.py destijl requires to stay 0), the gauges pending_now, lambda_per_s, p95_us, ss_residence_max_us, and
+// the spec's replica_* names (a kernel without them reads 0; further replica_* / rx_* files come from the dir scan)
 inline const std::vector<std::string> &destijl_counters() {
   static const std::vector<std::string> v{
-      "ccd_filtered",   "ccd_merged",      "fetch_sent",          "inv_sent",           "ack_sent",
-      "rx_fetch",       "rx_inv",          "rx_ack",              "bpd_insert",         "bpd_evict",
-      "bpd_evict_m",    "async_issued",    "async_completed",     "async_dropped",      "async_fallback_mean",
-      "async_fallback_p95", "pending_now", "lambda",              "p95_us",             "replica_pages",
-      "replica_create", "replica_evict",   "replica_writeback",   "replica_refresh"};
+      "ccd_filtered",   "ccd_merged",      "ccd_write_wait",      "fetch_sent",         "inv_sent",
+      "ack_sent",       "rx_fetch",        "rx_inv",              "rx_ack",             "read_complete",
+      "bpd_insert",     "bpd_evict",       "bpd_evict_m",         "evict_self_fetch",   "tx_timeout",
+      "protocol_error", "async_issued",    "async_installed",     "async_completed",    "async_dropped",
+      "async_early_ack", "async_raced",    "async_fallback_mean", "async_fallback_p95", "async_fallback_write",
+      "async_fallback_nomem", "async_probe", "async_superseded_write", "async_superseded_inv", "ack_deferred",
+      "ack_retried",    "ack_overflow",    "pending_now",         "lambda_per_s",       "p95_us",
+      "ss_residence_max_us", "replica_pages", "replica_create",  "replica_evict",      "replica_writeback",
+      "replica_refresh"};
   return v;
 }
 
