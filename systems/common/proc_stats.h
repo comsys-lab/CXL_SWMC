@@ -41,6 +41,12 @@
 #include <string>
 #include <vector>
 
+// De Stijl v2 counter dir; servers use the default. Host tests compile with -DCXL_PROC_DESTIJL_DIR=<fake dir> to run
+// the same snapshot code against synthetic counter files (workspaces/destijl-v2/phase5d/t/ds_dump.cc).
+#ifndef CXL_PROC_DESTIJL_DIR
+#define CXL_PROC_DESTIJL_DIR "/sys/kernel/swmc/destijl"
+#endif
+
 namespace cxl::proc {
 
 inline void name_thread(const char *name) { pthread_setname_np(pthread_self(), name); }  // <= 15 chars
@@ -224,7 +230,7 @@ inline std::string text(const Opts &o) {
   }
   // De Stijl v2 counters (only on a De Stijl kernel: the directory exists); a listed file that is missing reads 0
   {
-    const std::string ds = "/sys/kernel/swmc/destijl";
+    const std::string ds = CXL_PROC_DESTIJL_DIR;
     if (DIR *dp = opendir(ds.c_str())) {
       closedir(dp);
       auto num = [](const std::string &v) {  // integer prefix ("12", "12 us"); anything else 0
