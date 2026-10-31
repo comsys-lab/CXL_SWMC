@@ -56,7 +56,8 @@ for p in os.listdir("/proc"):
         continue
     if hit: print(p, open(f"/proc/{p}/comm").read().strip())'
 }
-state() { cat $CS/state 2>/dev/null || echo absent; }
+# cxl_shm v13 state file: "<state> registered <0|1>" (state_show); the first word is the state
+state() { local s; s=$(cat $CS/state 2>/dev/null) || s=absent; echo "${s%% *}"; }
 dump_dir() {  # dump_dir <dir> <prefix>: one-line files as prefix.name=value, multi-line as "prefix.name: line"
   local f n
   for f in "$1"/*; do
