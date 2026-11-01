@@ -11,7 +11,9 @@
 #           immutable evidence dir; export_h2n.py takes several evidence dirs per N, later dirs win per lifetime)
 #   --only  run exactly these lifetimes (in the given order), e.g. a single re-run; exclusive with --from
 # Optional conf keys of the confirm-rule test (confirm-test.conf; absent in h2n.conf = the behaviour above):
-#   H2N_TOPO=2          the 2-VM topology (cxl_vm0/cxl_vm1, 16 vCPU / 96 GB each; N = 2 only) instead of VM8 (H2N_TOPO=8)
+#   H2N_TOPO=2          the 2-VM topology (cxl_vm0/cxl_vm1, 16 vCPU / 96 GB each; N = 2 only) instead of VM8 (H2N_TOPO=8);
+#                       VCPUS_PER_VM=4 there = guest CPUs 4-15 set offline by the operator (sysfs; the block's nproc check
+#                       then verifies 4 online CPUs; user 2026-11-01 ds-h1-4vcpu)
 #   H2N_REPEATS=<r>     every (system, mix) lifetime r times, each a fresh server lifetime (systems outer, mixes, then
 #                       repeats); lifetime ids <sys>:<mix>:r<j> (run dirs <sys>-<mix>-n<N>-r<j>), same loadgen seed in
 #                       every repeat; r > 1 skips export_h2n.py (one row per (mix, system))
@@ -50,7 +52,7 @@ H=$TREE/experiments/h1
 [[ " $H2N_NODES " == *" $N "* ]] || die "N=$N not in H2N_NODES ($H2N_NODES)"
 case $H2N_TOPO in
   8) [ "$VCPUS_PER_VM" = 4 ] && [ "$H2N_RAM_GB" = 24 ] || die "h2n needs the VM8 topology with 4 vCPU / 24 GB per VM";;
-  2) [ "$N" = 2 ] && [ "$VCPUS_PER_VM" = 16 ] && [ "$H2N_RAM_GB" = 96 ] || die "H2N_TOPO=2 = cxl_vm0/cxl_vm1 with 16 vCPU / 96 GB, N = 2 only";;
+  2) [ "$N" = 2 ] && [[ $VCPUS_PER_VM =~ ^(16|4)$ ]] && [ "$H2N_RAM_GB" = 96 ] || die "H2N_TOPO=2 = cxl_vm0/cxl_vm1 with 16 vCPU (or 4 online) / 96 GB, N = 2 only";;
   *) die "bad H2N_TOPO ($H2N_TOPO: 8 | 2)";;
 esac
 REPS=${H2N_REPEATS:-1}
