@@ -1,10 +1,17 @@
 #!/bin/bash
-# Make the next De Stijl build-7 deploy bundle (builds/destijl/7/deploy-v<next>) on demand, for a deploy whose rollback
-# target is a Popcorn bundle (default builds/popcorn_new/13/deploy-v2). Each De Stijl deploy needs its own bundle: the
-# candidate XMLs fix the Host images dir /var/lib/libvirt/images/destijl-7-vm<k>-v<v> and p-destijl-deploy.sh install
-# never overwrites an existing one (the guest rebuilds the initramfs on every prepare), and the bundle's rollback XML
-# must equal the VM's current `virsh dumpxml --inactive`. Host-local only: no virsh, no ssh, no sudo.
-#   p-destijl-bundle.sh [--dry-run] [--rollback <popcorn bundle dir>] [--topo 2|8] [--xml-src <dir>] [--version <v>]
+# Make the next De Stijl build-<n> deploy bundle (builds/destijl/<n>/deploy-v<next>, n = 7 or 8) on demand, for a deploy
+# whose rollback target is a Popcorn bundle (default builds/popcorn_new/13/deploy-v2). Each De Stijl deploy needs its own
+# bundle: the candidate XMLs fix the Host images dir /var/lib/libvirt/images/destijl-<n>-vm<k>-v<v> and p-destijl-deploy.sh
+# install never overwrites an existing one (the guest rebuilds the initramfs on every prepare), and the bundle's rollback
+# XML must equal the VM's current `virsh dumpxml --inactive`. Host-local only: no virsh, no ssh, no sudo.
+#   p-destijl-bundle.sh [--dry-run] [--build 7|8] [--rollback <popcorn bundle dir>] [--topo 2|8] [--xml-src <dir>] [--version <v>]
+# --build 7 (default, unchanged): see "Fixed inputs (build 7)" below.
+# --build 8 (fault-latency breakdown port, d529ac9d9, user decision 2026-11-02 for blocks D, B2+C, E): SOURCE_TAG =
+#   rel/destijl-8; MANIFEST.txt must say "status: COMPLETE" (workspaces/eval3/build8/finish-build8.sh) and System.map must
+#   hold swmc_instr_breakdown_key; TOOLS_FROM = builds/destijl/7/deploy-v1 (faultlat, run.sh, cxl_region.yaml, guest
+#   scripts, de_stijl_test byte-identical; destijl.env differs only in K and KO_SHA, so tools.sha256 differs too) ->
+#   new guest tools dir GT=/home/comsys/destijl-8 (p-destijl-deploy.sh tools refuses a GT with other content); every
+#   later build-8 bundle must have the tools.sha256 of the first build-8 bundle (same GT reused).
 # --topo 2 (default): cxl_vm0/1; rollback XML = <rollback bundle>/vm<k>/candidate-normal.xml (what the VMs run after a
 #   Popcorn deploy from that bundle). --xml-src overrides it (a dir with vm<k>/candidate-normal.xml or
 #   cxl_vm<k>.after-define.xml).
@@ -25,25 +32,36 @@ umask 022
 ROOT=/home/comsys/sungsu/destijl-control
 SW=$(cd "$(dirname "$(readlink -f "$0")")/../.." && pwd)
 n=7
-B=$ROOT/builds/destijl/$n
 KTREE=$ROOT/workspaces/destijl-v2/kernel
-SOURCE_TAG=rel/destijl-6
 FAULTLAT_BUILD=$ROOT/builds/faultlat/3
-TOOLS_FROM=$B/deploy-v1
-GT=/home/comsys/destijl-$n
 DRY=0 TOPO=2 RB=$ROOT/builds/popcorn_new/13/deploy-v2 XSRC= V=   # deploy-v2 = what the VMs run (deploy-v1 never installed)
 while [ $# -gt 0 ]; do
   case $1 in
     --dry-run) DRY=1;;
+    --build) n=${2:?}; shift;;
     --rollback) RB=${2:?}; shift;;
     --topo) TOPO=${2:?}; shift;;
     --xml-src) XSRC=${2:?}; shift;;
     --version) V=${2:?}; shift;;
-    *) sed -n '2,25p' "$0"; exit 2;;
+    *) sed -n '2,32p' "$0"; exit 2;;
   esac; shift
 done
 stop() { echo "BUNDLE STOP: $*"; exit 1; }
 sh_() { sha256sum "$1" | cut -d' ' -f1; }
+case $n in
+  7) B=$ROOT/builds/destijl/7 SOURCE_TAG=rel/destijl-6 TOOLS_FROM=$ROOT/builds/destijl/7/deploy-v1;;
+  8) B=$ROOT/builds/destijl/8 SOURCE_TAG=rel/destijl-8 TOOLS_FROM=$ROOT/builds/destijl/7/deploy-v1;;
+  *) stop "--build must be 7 or 8";;
+esac
+# test hook (dry runs only): a stand-in build dir / source tag, for the build-8 path before build 8 is finished
+if [ $DRY = 1 ] && [ -n "${BUNDLE_TEST_BUILD_DIR:-}" ]; then
+  B=$(readlink -f "$BUNDLE_TEST_BUILD_DIR"); SOURCE_TAG=${BUNDLE_TEST_SOURCE_TAG:-$SOURCE_TAG}
+  echo "NOTE: test hook: build dir $B, source tag $SOURCE_TAG"
+fi
+GT=/home/comsys/destijl-$n
+# tools of TOOLS_FROM that must be byte-identical (destijl.env: only for the same build; else equal except K / KO_SHA)
+SAME=(faultlat run.sh cxl_region.yaml p-destijl-guest.sh ds-replica-check.sh de_stijl_test)
+[ "$(dirname "$TOOLS_FROM")" = "$B" ] && SAME+=(destijl.env tools.sha256)
 case $TOPO in
   2) VMS="0 1";;
   8) VMS="0 1 2 3 4 5 6 7"; [ -n "$XSRC" ] || stop "--topo 8 needs --xml-src <vmN switch evidence>/topo8";;
@@ -84,12 +102,18 @@ for k in $VMS; do
   fi
 done
 
-# 3. build 7 inputs (the same checks p-destijl-package.sh repeats, here so the dry run sees them)
+# 3. build <n> inputs (the same checks p-destijl-package.sh repeats, here so the dry run sees them)
 M=$B/MANIFEST.txt
+test -f "$M" || stop "no $M"
 mf() { sed -n "s/^$1: \([^ ]*\).*/\1/p" "$M" | head -1; }
 art() { awk -v f="$1" '$1 == f {print $2; exit}' "$M"; }
 K=$(mf release); BZ=$B/arch/x86/boot/bzImage; BZ_SHA=$(art arch/x86/boot/bzImage)
 [ "$K" = "6.14.0-famfs-de-stijl+-ds-destijl-$n" ] || stop "MANIFEST release '$K'"
+if [ "$n" = 8 ]; then
+  [ "$(mf status)" = COMPLETE ] || stop "build 8 MANIFEST status '$(mf status)' (run workspaces/eval3/build8/finish-build8.sh)"
+  grep -q ' swmc_instr_breakdown_key$' "$B/System.map" || stop "build 8 System.map has no swmc_instr_breakdown_key"
+  [ "$(sh_ "$B/System.map")" = "$(art System.map)" ] || stop "System.map changed since the MANIFEST"
+fi
 [ "$(sh_ "$BZ")" = "$BZ_SHA" ] || stop "bzImage changed"
 [ "$(sh_ "$B/.config")" = "$(mf config_sha256)" ] || stop ".config changed"
 [ "$(sh_ "$B/cxl_shm/cxl_shm.ko")" = "$(art cxl_shm/cxl_shm.ko)" ] || stop "cxl_shm.ko changed"
@@ -109,6 +133,10 @@ TC=$(python3 -I -c 'import json,sys; print(json.load(open(sys.argv[1]))["cxl_swm
 git -C "$SW" diff --quiet "$TC" -- systems/destijl/lib systems/common || stop "systems/destijl/lib or systems/common changed since $TC"
 DIRTY=$(git -C "$SW" status --porcelain -- scripts/deploy workloads/faultlat systems/destijl systems/common config | wc -l)
 [ "$DIRTY" = 0 ] || echo "NOTE: $DIRTY dirty files in $SW (recorded as cxl_swmc_dirty_files; commit before a real bundle)"
+
+# earlier build-n bundles with tools: the new one must have the same tools.sha256 (one guest tools dir GT per build)
+FIRST_TOOLS=$(find "$B" -maxdepth 3 -path "$B/deploy-v*/tools/tools.sha256" 2>/dev/null | sort -V | head -1)
+[ "$n" = 7 ] || [ -z "$FIRST_TOOLS" ] || echo "earlier build-$n tools: $FIRST_TOOLS (the new bundle must match it)"
 
 PKG=(env XML_SRC="$XSRC" VMS="$VMS" KTREE="$KTREE" SOURCE_TAG="$SOURCE_TAG" FAULTLAT_BUILD="$FAULTLAT_BUILD"
      TOOLS_FROM="$TOOLS_FROM" bash "$SW/scripts/ctl/build-wrap.sh" bash "$SW/scripts/deploy/p-destijl-package.sh" "$n" "$V")
@@ -139,9 +167,16 @@ fi
 # 4. post-checks + MANIFEST.txt + deploy-env.sh
 (cd "$OUT" && sha256sum --quiet -c packet.sha256) || stop "$OUT fails its packet.sha256"
 (cd "$OUT/tools" && sha256sum --quiet -c tools.sha256) || stop "$OUT/tools fails tools.sha256"
-for f in faultlat run.sh cxl_region.yaml p-destijl-guest.sh ds-replica-check.sh destijl.env de_stijl_test tools.sha256; do
+for f in "${SAME[@]}"; do
   cmp -s "$OUT/tools/$f" "$TOOLS_FROM/tools/$f" || stop "tools/$f differs from $TOOLS_FROM (guest dir $GT could not be reused)"
 done
+if [ "$n" != 7 ]; then   # cross-build tools: destijl.env = TOOLS_FROM's except K and KO_SHA; K = this release
+  diff -q <(grep -vE '^(K|KO_SHA)=' "$OUT/tools/destijl.env") <(grep -vE '^(K|KO_SHA)=' "$TOOLS_FROM/tools/destijl.env") > /dev/null ||
+    stop "tools/destijl.env differs from $TOOLS_FROM beyond K / KO_SHA"
+  grep -qx "K=$K" "$OUT/tools/destijl.env" || stop "tools/destijl.env K is not $K"
+  [ -z "$FIRST_TOOLS" ] || cmp -s "$OUT/tools/tools.sha256" "$FIRST_TOOLS" ||
+    stop "tools/tools.sha256 differs from the first build-$n bundle ($FIRST_TOOLS): guest dir $GT could not be reused"
+fi
 for k in $VMS; do cmp -s "$OUT/vm$k/rollback-inactive.xml" "${XS[$k]}" || stop "vm$k rollback XML != source"; done
 PKT_SHA=$(sh_ "$OUT/packet.sha256")
 denv "$PKT_SHA" > "$OUT/deploy-env.sh"
@@ -153,7 +188,8 @@ denv "$PKT_SHA" > "$OUT/deploy-env.sh"
   echo "  $PKT_SHA  packet.sha256   (every file except modules.tar, MANIFEST.txt, deploy-env.sh)"
   echo "  $(sh_ "$OUT/modules.tar")  modules.tar"
   echo "  $(sh_ "$OUT/package-record.json")  package-record.json"
-  echo "  $(sh_ "$OUT/tools/tools.sha256")  tools/tools.sha256 (== $TOOLS_FROM/tools/tools.sha256)"
+  if [ "$n" = 7 ]; then echo "  $(sh_ "$OUT/tools/tools.sha256")  tools/tools.sha256 (== $TOOLS_FROM/tools/tools.sha256)"
+  else echo "  $(sh_ "$OUT/tools/tools.sha256")  tools/tools.sha256 (guest dir $GT; tools of $TOOLS_FROM, destijl.env K/KO_SHA of build $n)"; fi
   echo "  $(sh_ "$OUT/deploy-env.sh")  deploy-env.sh"
   for k in $VMS; do echo "  $(sh_ "$OUT/vm$k/xml.sha256")  vm$k/xml.sha256 (rollback = ${XS[$k]})"; done
   echo "bzImage: $BZ $BZ_SHA"
