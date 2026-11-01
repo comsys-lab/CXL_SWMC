@@ -146,10 +146,11 @@ enable)
   start=$(python3 -I -c 'import sys; print(hex(int(open("/sys/bus/dax/devices/dax0.0/resource").read(),0)+int(sys.argv[1])))' "$MANAGED_BASE_OFF")
   [ "$base" = "$start" ] && [ "$bytes" = "$MANAGED_BYTES" ] ||
     { echo "STOP: managed range $base +$bytes, expected $start +$MANAGED_BYTES"; exit 1; }
+  # page_coherence/init_state reads "<state> (initialized)" after enable (e.g. "invalid (initialized)"); first word = state
   is=$(cat $SYS/init_state 2>/dev/null || echo absent)
   case "$(cat /sys/module/cxl_shm/parameters/init_state)" in
     shared) [[ "$is" == shared* ]] || { echo "STOP: init_state '$is'"; exit 1; } ;;
-    *) [ "$is" = invalid ] || { echo "STOP: init_state '$is'"; exit 1; } ;;
+    *) [[ "$is" == invalid* ]] || { echo "STOP: init_state '$is'"; exit 1; } ;;
   esac
   echo "protocol=$pr managed_base=$base managed_bytes=$bytes init_state=$is"
   dmesg | grep -E 'swmc|destijl' | tail -n 3
