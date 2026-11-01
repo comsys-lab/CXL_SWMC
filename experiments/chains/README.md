@@ -16,6 +16,7 @@ workspaces/ originals stay as the record of what ran. The artifact (`artifact/fi
 | de-stijl-motivation-isca27-chain-v1.sh | workspaces/de-stijl-motivation-isca27-chain-v1.sh | detached launch of one run-chain-v1.sh run |
 | vmN/vmN-chain-v2.sh | workspaces/vmN/vmN-chain-v2.sh | VM topology phases (dry, switch, start, pretouch, restore) |
 | vmN/vmN-xml.py | workspaces/vmN/vmN-xml.py (byte-identical) | VM XML generator |
+| vmN/vmN-chain-v3.sh | (new, 2026-11-02) | vmN-chain-v2.sh + Popcorn 13 release / kernel dir params, namespace uuid from vm0, measure-env dir params, nochain on the script path only (header) |
 
 ## Paths (environment, defaults = the locations the originals used, so behaviour is identical)
 
@@ -52,6 +53,7 @@ copies in the live tree (`CHAINS_REPO` [$DESTIJL_ROOT/CXL_SWMC]; another checkou
 | workspaces/popcorn-writer-lock-split-chain-v2.sh | popcorn-writer-lock-split-chain-v1.sh |
 | workspaces/de-stijl-motivation-isca27-chain-v2.sh | de-stijl-motivation-isca27-chain-v1.sh |
 | workspaces/vmN-chain-v3.sh | vmN/vmN-chain-v2.sh |
+| workspaces/vmN-chain-v4.sh | vmN/vmN-chain-v3.sh (eval3 block E: workspaces/de-stijl-evaluation-run1-e-chain-v1.sh) |
 | workspaces/artifact-figures-chain-v1.sh | artifact/figures/<figN\|all\|stages/...>.sh |
 
 Example: `setsid nohup bash $P/workspaces/eval2-chain-v2.sh --run 1 > /dev/null 2>&1 < /dev/null &` (log
