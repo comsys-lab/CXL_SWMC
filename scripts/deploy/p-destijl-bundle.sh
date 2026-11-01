@@ -1,6 +1,6 @@
 #!/bin/bash
 # Make the next De Stijl build-7 deploy bundle (builds/destijl/7/deploy-v<next>) on demand, for a deploy whose rollback
-# target is a Popcorn bundle (default builds/popcorn_new/13/deploy-v1). Each De Stijl deploy needs its own bundle: the
+# target is a Popcorn bundle (default builds/popcorn_new/13/deploy-v2). Each De Stijl deploy needs its own bundle: the
 # candidate XMLs fix the Host images dir /var/lib/libvirt/images/destijl-7-vm<k>-v<v> and p-destijl-deploy.sh install
 # never overwrites an existing one (the guest rebuilds the initramfs on every prepare), and the bundle's rollback XML
 # must equal the VM's current `virsh dumpxml --inactive`. Host-local only: no virsh, no ssh, no sudo.
@@ -31,7 +31,7 @@ SOURCE_TAG=rel/destijl-6
 FAULTLAT_BUILD=$ROOT/builds/faultlat/3
 TOOLS_FROM=$B/deploy-v1
 GT=/home/comsys/destijl-$n
-DRY=0 TOPO=2 RB=$ROOT/builds/popcorn_new/13/deploy-v1 XSRC= V=
+DRY=0 TOPO=2 RB=$ROOT/builds/popcorn_new/13/deploy-v2 XSRC= V=   # deploy-v2 = what the VMs run (deploy-v1 never installed)
 while [ $# -gt 0 ]; do
   case $1 in
     --dry-run) DRY=1;;

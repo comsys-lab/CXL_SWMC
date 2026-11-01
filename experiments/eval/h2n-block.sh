@@ -45,10 +45,11 @@
 #   H2N_L1=1            hw / pop / ds lifetimes append ONE fixed step at L1 inside the same server lifetime (run.sh
 #                       PARTS "slo l1"; loadgen --mode fixed --rates L1, H2N_L1_WARMUP_S (15) s warm-up + H2N_L1_MEASURE_S
 #                       (90) s window + H2N_L1_DRAIN_S (5) s drain, no --slo: no early abort), so stats-steps.csv holds
-#                       the per-step counters of every system at the same load. L1 (offered ops/s) = Megalon's max
-#                       search/s under the SLO of that mix (confirm x_mean of row mg-<mix>-n<N>, confirmed True) x 100 /
-#                       (100 - U), as the 2026-10-30 fixed windows (h1-54m-fixed: 97.71 search/s -> 108.57 ops/s).
-#                       mg row without a confirmed max (start fail, confirm failed): L1 = the ramp start (--start of
+#                       the per-step counters of every system at the same load. L1 (offered ops/s) = the LOWEST max
+#                       search/s under the SLO of that mix over the mg / pop / hw rows found (confirm x_mean, confirmed
+#                       True; l1_decide.py, outline rule; B1 passed only mg rows in H2N_L1_FROM) x 100 / (100 - U), as
+#                       the 2026-10-30 fixed windows (h1-54m-fixed: 97.71 search/s -> 108.57 ops/s). A start-fail row,
+#                       or an mg row without a confirmed max (confirm failed): L1 = the ramp start (--start of
 #                       H2N_SLO_PART) and NOTHING is appended (the SLO search's first ramp step is that point). Lookup:
 #                       the files of H2N_L1_FROM (space-separated globs, {MIX} {N} replaced; newest version last) and
 #                       then this block's own h2n-results.tsv (an mg lifetime earlier in the same block wins). No mg row
