@@ -112,6 +112,33 @@ DS8_SERVE = [node(70, 40, 0, 0, 30, serve={"fetch": (100, 100, 0, 50), "invalida
 LIVES = (("pop-u50-n2", POP), ("ds-u50-n2", DS), ("ds-u10-n2", DS8_N2), ("ds-u10-n4", DS8_N4),
          ("ds-u90-n2", DS8_SERVE))
 
+# status-delta (block G fixed lifetimes): stats-steps without srv_* (serve_* only), guest status pre/post with the
+# DS8_N2 srv_* values as post - pre (pre = a large persistent baseline)
+STEPS_ONE = [(1, "fixed", 30.0, 50.0, True)]
+_SRV_KEYS = [k for k in DS8_N2[0] if k.startswith(D + "srv_")]
+DS8_STAT = [{k: v for k, v in DS8_N2[t].items() if not k.startswith(D + "srv_")} for t in range(2)]
+for _t in range(2):
+    DS8_STAT[_t].update({k: v for k, v in DS8_SERVE[_t].items() if k.startswith("sys.swmc.instr.serve_")})
+STATUS_LIVES = {  # lifetime: (steps, write pre files)
+    "ds-u30-n2": (STEPS_ONE, True),   # one step + pre/post -> status-delta
+    "ds-u60-n2": (STEPS, True),       # 5 steps -> flagged, serve-all-fetch fallback
+    "ds-u70-n2": (STEPS_ONE, False),  # no pre -> flagged, serve-all-fetch fallback
+}
+
+
+def write_status(B, life, pre):
+    S = os.path.join(B, f"dsshm-{life}")
+    os.makedirs(S, exist_ok=True)
+    for t in range(2):
+        base = {k: 1_000_000_000 + 7 * i for i, k in enumerate(_SRV_KEYS)}
+        hdr = "release=6.14.0-famfs-de-stijl+-ds-destijl-8 loaded=1\nparam.node_id=%d\nds.inspect: page 0 pfn 0x1\n" % t
+        body = lambda vals: "".join(f"ds.{k[len(D):]}={int(v)}\n" for k, v in vals.items())  # noqa: E731
+        if pre:
+            with open(os.path.join(S, f"status-pre-vm{t}.txt"), "w") as f:
+                f.write(hdr + body(base) + "ds.lambda_per_s=0 (cold)\n")
+        with open(os.path.join(S, f"status-post-vm{t}.txt"), "w") as f:
+            f.write(hdr + body({k: base[k] + DS8_N2[t][k] for k in _SRV_KEYS}))
+
 
 def write_fixture(root):
     run = os.path.join(root, "eval3-fixture-v1")
@@ -125,7 +152,11 @@ def write_fixture(root):
         f.write("ds-u10-n2\tds\tu10\t10\t2\t4\t40\t19.0\tTrue\t\tds-u10-n2/slo\tPASS\n")
         f.write("ds-u10-n4\tds\tu10\t10\t4\t4\t40\t19.0\tTrue\t\tds-u10-n4/slo\tPASS\n")
         f.write("ds-u90-n2\tds\tu90\t90\t2\t4\t40\t19.0\tTrue\t\tds-u90-n2/slo\tPASS\n")
-    for life, vals in LIVES:
+    lives = [(life, vals, STEPS) for life, vals in LIVES]
+    for life, (steps, pre) in STATUS_LIVES.items():
+        lives.append((life, DS8_STAT, steps))
+        write_status(B, life, pre)
+    for life, vals, steps in lives:
         P = os.path.join(B, life, "slo")
         os.makedirs(P, exist_ok=True)
         with open(os.path.join(P, "steps.csv"), "w", newline="") as f:
@@ -133,7 +164,7 @@ def write_fixture(root):
             w.writerow(["label", "step", "phase", "measure_s", "pass", "aborted", "stream", "offered", "achieved",
                         "p50_ms", "p95_ms", "p99_ms", "pslo_ms", "max_under_slo", "slo_stream", "slo_pct", "slo_ms",
                         "result_pooled_offered"])
-            for n, ph, x, p99, ok in STEPS:
+            for n, ph, x, p99, ok in steps:
                 for s in ("update", "search"):
                     w.writerow(["fixture", n, ph, WIN, ok, False, s, x / 2, x / 2, p99 / 3, p99 / 2, p99, p99,
                                 19.5, "search", 99.0, 100.0, 40])
@@ -143,7 +174,7 @@ def write_fixture(root):
             w = csv.writer(f)
             w.writerow(["step", "phase", "offered_x", "target", "addr", "begin_wall_ns", "end_wall_ns", "window_s",
                         "srv_window_s"] + keys)
-            for n, ph, x, _, _ in STEPS:
+            for n, ph, x, _, _ in steps:
                 for t, tv in enumerate(per_t):
                     row = {**tv}
                     if vals is DS:
@@ -275,6 +306,26 @@ class Eval3ExtractTest(unittest.TestCase):
         self.close(r, "cat4_metadata_us", (30 + 440) / 120)
         w = self.ds8("ds-u90-n2", "write")
         self.close(w, "cat2_unmap_tlb_us", 180 / 100)
+
+    def test_status_delta(self):
+        # one fixed step, srv_* from status post - pre: same numbers as the srv_* N = 2 cell
+        r = self.ds8("ds-u30-n2", "read_sync")
+        self.assertEqual(r["owner_src"], "status-delta")
+        self.close(r, "cat2_unmap_tlb_us", 190 / 120)
+        self.close(r, "cat1_comm_us", (2400 - 190 - 45 - 47.5) / 120)
+        w = self.ds8("ds-u30-n2", "write")
+        self.close(w, "cat2_unmap_tlb_us", 2.2)
+        self.close(w, "cat3_flush_us", 1.95)
+
+    def test_status_delta_flagged(self):
+        r = self.ds8("ds-u60-n2", "read_sync")  # 5 measurement steps
+        self.assertTrue(r["owner_src"].startswith("serve-all-fetch (status-delta not used: lifetime has 5"),
+                        r["owner_src"])
+        # serve_fetch mean revoke 1 us x sync FETCH rounds 25 + 45 over 120 sync faults
+        self.close(r, "cat2_unmap_tlb_us", 70 / 120)
+        r = self.ds8("ds-u70-n2", "read_sync")  # no pre file
+        self.assertIn("no status-pre", r["owner_src"])
+        self.close(r, "cat2_unmap_tlb_us", 70 / 120)
 
     def test_flushed_lines(self):
         r = self.one("fig-flushed-lines-l1.csv", system="pop")

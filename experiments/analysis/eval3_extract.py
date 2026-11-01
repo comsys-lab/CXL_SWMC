@@ -229,6 +229,7 @@ class Cell:
         self.h2n = self.h2n_row()
         self.l1, self.l1_src, self.l1_rate = [], "", None
         self.mx, self.mx_src = self.max_steps()
+        self.ds_status, self.ds_status_note = None, ""
 
     @property
     def group(self):
@@ -396,30 +397,90 @@ OWN_SERVE = {"fetch_sync": (I_ + "serve_fetch.", "reply_count"), "fetch_evict": 
              "inv": (I_ + "serve_invalidate.", "reply_count")}
 
 
-def ds8_owner_src(t):
+def ds8_owner_src(t, c=None):
+    """(owner_src, classes, per-node view used for the means): srv_* in stats-steps; else the lifetime's guest
+    status pre/post delta (c.ds_status, valid only for one measurement step); else instr serve_* aggregates"""
     keys = set().union(*t["tg"].values()) if t["tg"] else set()
     if D + "srv_fetch_sync_count" in keys:
-        return "srv", OWN_SRV
+        return "srv", OWN_SRV, t["tg"]
+    st = getattr(c, "ds_status", None)
+    if st and set(st) == set(t["tg"]):
+        return "status-delta", OWN_SRV, st
     if I_ + "serve_fetch.reply_count" in keys:
-        return "serve-all-fetch", OWN_SERVE
-    return "none", None
+        return "serve-all-fetch", OWN_SERVE, t["tg"]
+    return "none", None, t["tg"]
 
 
-def other_means(t, me, prefix, cnt):
-    """{revoke, wb, meta, h}: mean owner ns per request over the OTHER targets than `me` (sum ns / sum count)"""
-    n = sum(d.get(prefix + cnt, 0.0) for k, d in t["tg"].items() if k != me)
+def other_means(tgv, me, prefix, cnt):
+    """{revoke, wb, meta, h}: mean owner ns per request over the OTHER targets than `me` (sum ns / sum count);
+    tgv = {target: {key: value}} (stats-steps node counters or the status delta)"""
+    n = sum(d.get(prefix + cnt, 0.0) for k, d in tgv.items() if k != me)
     out = {}
     for x in ("revoke", "wb", "meta", "h"):
-        s = sum(d.get(f"{prefix}{x}_ns", 0.0) for k, d in t["tg"].items() if k != me)
-        if x == "meta" and not any(f"{prefix}meta_ns" in d for d in t["tg"].values()):
+        s = sum(d.get(f"{prefix}{x}_ns", 0.0) for k, d in tgv.items() if k != me)
+        if x == "meta" and not any(f"{prefix}meta_ns" in d for d in tgv.values()):
             # build-7 serve_* have no meta_ns: meta = pre_reply - revoke - wb (owner time to the completion CAS)
-            pre = sum(d.get(f"{prefix}pre_reply_ns", 0.0) for k, d in t["tg"].items() if k != me)
+            pre = sum(d.get(f"{prefix}pre_reply_ns", 0.0) for k, d in tgv.items() if k != me)
             s = max(0.0, pre - out["revoke"] * n - out["wb"] * n) if n else 0.0
         out[x] = s / n if n else 0.0
     return out
 
 
-def ds8_owner(t):
+STATUS_LINE = re.compile(r"^ds\.([a-z0-9_]+)=(-?\d+)\s*$")
+
+
+def read_status(path):
+    """{sys.swmc.destijl.<name>: int} from a p-destijl-guest.sh status dump ("ds.<name>=<int>" lines)"""
+    out = {}
+    with open(path) as f:
+        for line in f:
+            m = STATUS_LINE.match(line.strip())
+            if m:
+                out[D + m.group(1)] = float(m.group(2))
+    return out
+
+
+def ds_status_delta(c, n_measured):
+    """(per-target srv_* deltas or None, note). Files: <block>/dsshm-<lifetime>/status-{pre,post}-vm<k>.txt
+    (experiments/eval/h2n-block.sh ds_up / ds_down: pre after enable, before the server; post after the lifetime).
+    The srv_* counters live in the built-in kernel (kernel/swmc/destijl.o) and persist across cxl_shm loads (reset
+    only by a reset_counters write), so a post file alone is never used. Valid only when the lifetime has exactly one
+    non-warm-up measurement step; the delta then also holds that lifetime's server preload and loadgen warm-up
+    (owner means per request, not totals, are taken from it)."""
+    d = c.part
+    sdir = None
+    while len(d) >= len(c.root):
+        cand = os.path.join(d, f"dsshm-{c.life}")
+        if os.path.isdir(cand):
+            sdir = cand
+            break
+        d = os.path.dirname(d)
+    if sdir is None:
+        return None, ""
+    pre = sorted(glob.glob(os.path.join(sdir, "status-pre-vm*.txt")))
+    post = sorted(glob.glob(os.path.join(sdir, "status-post-vm*.txt")))
+    if not post:
+        return None, "status-delta: no status-post files"
+    if not pre:
+        return None, "status-delta: no status-pre (srv_* persist in the built-in kernel; post alone not usable)"
+    if n_measured != 1:
+        return None, f"status-delta not used: lifetime has {n_measured} measurement steps (needs exactly 1)"
+    out = {}
+    for p in post:
+        k = re.search(r"-vm(\d+)\.txt$", p).group(1)
+        q = os.path.join(sdir, f"status-pre-vm{k}.txt")
+        if not os.path.isfile(q):
+            return None, f"status-delta: status-pre-vm{k}.txt missing"
+        a, b = read_status(q), read_status(p)
+        if not any(x.startswith(D + "srv_") for x in b):
+            return None, "status-delta: no ds.srv_* in the status files (build < 8)"
+        out[k] = {x: b[x] - a.get(x, 0.0) for x in b if x.startswith(D + "srv_")}
+        if any(v < 0 for v in out[k].values()):
+            return None, f"status-delta: negative srv_* delta on vm{k} (counters reset during the lifetime)"
+    return out, "status-delta used"
+
+
+def ds8_owner(t, c=None):
     """owner phase totals (ns, summed over requester nodes) {"read": {revoke, wb, meta}, "write": {...}} plus the
     round counts. Per requester node i (target), from its node counters:
       sync FETCH rounds_i = fetch_sent - async_issued - eviction FETCHes  (FETCH-producing sync rounds only:
@@ -428,7 +489,7 @@ def ds8_owner(t):
       read owner_i  = mean_{j != i}(srv_fetch_sync_x) x sync FETCH rounds_i
       write owner_i = mean_{j != i}(srv_inv_x) x inv_sent_i + mean_{j != i}(srv_fetch_evict_x) x eviction FETCHes_i
     (write msg_wait holds the eviction waits; at N > 2 srv_inv is the mean holder, not the slowest: review M2)."""
-    src, cls = ds8_owner_src(t)
+    src, cls, tgv = ds8_owner_src(t, c)
     tot = {"read": {"revoke": 0.0, "wb": 0.0, "meta": 0.0}, "write": {"revoke": 0.0, "wb": 0.0, "meta": 0.0},
            "src": src, "sync_fetch_rounds": 0.0, "evict_fetches": 0.0, "inv_sent": 0.0}
     if cls is None:
@@ -440,7 +501,7 @@ def ds8_owner(t):
         tot["sync_fetch_rounds"] += sf
         tot["evict_fetches"] += ev
         tot["inv_sent"] += inv
-        ms, me_, mi = (other_means(t, me, *cls[k]) for k in ("fetch_sync", "fetch_evict", "inv"))
+        ms, me_, mi = (other_means(tgv, me, *cls[k]) for k in ("fetch_sync", "fetch_evict", "inv"))
         for x in ("revoke", "wb", "meta"):
             tot["read"][x] += ms[x] * sf
             tot["write"][x] += mi[x] * inv + me_[x] * ev
@@ -466,7 +527,7 @@ def breakdown_ds8(c, t):
     1 = W - owner(revoke + wb + meta); 2 = owner revoke; 3 = owner wb + acquire flush; 4 = owner meta + local
     meta; 5 = F - (1..4) = pte install + local wait + residual. Async reads carry no owner work."""
     T = t["T"]
-    own = ds8_owner(t)
+    own = ds8_owner(t, c)
     N = c.N or t["n"]
     rows = []
     for cls, v, side in ds8_classes(T):
@@ -476,6 +537,8 @@ def breakdown_ds8(c, t):
         else:
             rev, wb, meta = (own[side][x] for x in ("revoke", "wb", "meta"))
             src = own["src"]
+            if src not in ("srv", "status-delta") and c.ds_status_note:
+                src += f" ({c.ds_status_note})"
         R = {"read": own["sync_fetch_rounds"], "write": own["inv_sent"] + own["evict_fetches"]}.get(side, 0.0)
         W, F = v["msg_wait_ns"], v["F"]
         c1 = W - rev - wb - meta
@@ -704,6 +767,13 @@ def extract(roots, out_dir, systems, override):
     if not cells:
         sys.exit("eval3_extract: no parts found")
     choose_l1(cells, override)
+    nmeas = {}
+    for c in cells:
+        k = (c.root, c.life)
+        nmeas[k] = nmeas.get(k, 0) + sum(1 for s in c.steps.values() if s["phase"] not in ("warmup", "warm-up"))
+    for c in cells:
+        if c.system == "ds":
+            c.ds_status, c.ds_status_note = ds_status_delta(c, nmeas[(c.root, c.life)])
     os.makedirs(out_dir, exist_ok=True)
     R = {k: [] for k in COLS}
     for c in cells:

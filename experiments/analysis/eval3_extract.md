@@ -78,11 +78,20 @@ revoke / wb / meta. Totals summed over requester nodes:
 Categories: 1 = W - owner(revoke + wb + meta); 2 = owner revoke; 3 = owner wb + acquire_flush; 4 = owner meta +
 local_meta; 5 = F - (1..4) = pte_install + local_wait + residual. cat5 can be slightly negative (F counts transition
 reads only, W / local_* count all read faults; review L4): reported as is, not clamped. Columns `owner_src`
-(`srv`, or `serve-all-fetch`), `owner_rounds` (sync FETCH rounds; write: inv_sent + eviction FETCHes),
+(`srv`, `status-delta`, or `serve-all-fetch` [+ reason]), `owner_rounds` (sync FETCH rounds; write: inv_sent + eviction FETCHes),
 `owner_{revoke,wb,meta}_us` per fault, `instr_build`.
 **Snapshot gap (2026-11-02):** systems/common/proc_stats.h exports from /sys/kernel/swmc/destijl only its fixed list
 plus rx_* / replica_*, so `srv_*` and `ack_ph_*` are NOT in current stats-steps.csv. Until proc_stats exports them
-(one-line prefix change + server rebuild), the extractor falls back to the build-8 instr aggregates
+(one-line prefix change + server rebuild; coordinator 2026-11-02: not during this experiment), the extractor takes
+the owner means from the lifetime's guest status dumps, `owner_src = status-delta`: per node k, srv_* =
+`<block>/dsshm-<lifetime>/status-post-vm<k>.txt` - `status-pre-vm<k>.txt` ("ds.<name>=<int>" lines of
+p-destijl-guest.sh status; pre after enable before the server, post after the lifetime, h2n-block.sh ds_up / ds_down).
+Valid only when the lifetime has exactly one non-warm-up measurement step (block G fixed lifetimes); the delta also
+holds that lifetime's preload and loadgen warm-up, which is why only per-request means (not totals) are used; the
+multipliers (fetch_sent, async_issued, inv_sent, evictions) still come from the step's stats-steps.csv. srv_* live in
+the built-in kernel (kernel/swmc/destijl.o) and persist across cxl_shm loads (reset only by a reset_counters write),
+so a post file without its pre file is never used. Otherwise (several steps, no pre, no srv_* in the dump = build
+7, a negative delta) the reason is appended to owner_src and the extractor falls back to the build-8 instr aggregates
 `sys.swmc.instr.serve_fetch.*` (all FETCHes: sync + async + eviction mixed, used for sync reads and evictions) and
 `serve_invalidate.*` (INV), `owner_src = serve-all-fetch` (exact at T = 0 except the eviction mix).
 Build 7 and build 8 write W differ in meaning (build 7 includes the CCD acquire work): `ds7-2part` and `ds8*` rows
@@ -117,5 +126,6 @@ gauge sys.swmc.destijl.p95_us (max and mean over targets), ss_residence_max_us =
 ## Validation (2026-11-01)
 - Unit test: 13 tests on the synthetic fixture (build-13 keys, ds build-7 keys, pooled confirm steps; 2026-11-02:
   ds build 8 at N = 2 and N = 4 with per-node srv_* differing per node, and the serve_* fallback), all PASS.
+  15 tests since the status-delta source (one-step lifetime with pre/post; flagged fallbacks for 5 steps and no pre).
 - recovery/h1-54m-fixed-run1-v1 (fixed windows): lines_per_search at L1 equals fixed-run1.csv `fig3_lines_per_rop`
   for all 12 cells (hw / pop / mg / mgoff x u10 / u50 / u90) to 6 decimals.
