@@ -49,6 +49,10 @@ def main():
     ap.add_argument("--k", type=int, default=10)
     ap.add_argument("--kprime", type=int, default=200)
     ap.add_argument("--block-mb", type=int, default=256, help="score-matrix budget per matmul block (MiB)")
+    ap.add_argument("--topk", help="precomputed exact top-K' over pools A+B per query row (.npz: qrows, ids, scores, na;"
+                    " ids >= na = na + pool-B row; workspaces/eval3/recall/recall_gt.py static --pool-b): skips the scan;"
+                    " searches with < k visible candidates are brute-forced in ONE batched pass at the end")
+    ap.add_argument("--no-tie", action="store_true", help="skip the tie-aware recall (random pool reads per search)")
     a = ap.parse_args()
     t0 = time.time()
     A = read_fbin(os.path.join(a.data, "pool_a.fbin"))
@@ -80,7 +84,25 @@ def main():
     Qu = np.ascontiguousarray(Q[qrows])
     best_s = np.full((len(qrows), a.kprime), -np.inf, dtype=np.float32)
     best_i = np.zeros((len(qrows), a.kprime), dtype=np.int64)
-    for base, X, n_rows in ((0, A, NA), (NA, B, NB)):
+    if a.topk:  # precomputed A+B top-K': pool-B row -> inserted id of this writes file; rows never inserted -> sentinel
+        tk = np.load(a.topk)
+        if int(tk["na"]) != NA or int(tk["pool_b_rows"]) != B.shape[0]:
+            sys.exit("--topk file is for another pool A / pool B size")
+        tpos = np.full(int(tk["qrows"].max()) + 1, -1, dtype=np.int64)
+        tpos[tk["qrows"]] = np.arange(len(tk["qrows"]))
+        if qrows.max() >= len(tpos) or (tpos[qrows] < 0).any():
+            sys.exit("--topk file lacks query rows of this searches file")
+        SENT = NA + NB  # extra id, never visible
+        ins, dele = np.append(ins, INF), np.append(dele, INF)
+        id_of_row = np.full(B.shape[0], SENT, dtype=np.int64)
+        id_of_row[rowmap] = np.arange(NB) + NA
+        best_i = tk["ids"][tpos[qrows]].astype(np.int64)
+        best_s = tk["scores"][tpos[qrows]]
+        mb = best_i >= NA
+        best_i[mb] = id_of_row[best_i[mb] - NA]
+        a.kprime = best_i.shape[1]
+        print(f"loaded --topk {a.topk}: K'={a.kprime} ({time.time() - t0:.0f}s)", flush=True)
+    for base, X, n_rows in (() if a.topk else ((0, A, NA), (NA, B, NB))):
         block = max(1024, (a.block_mb << 20) // (4 * max(1, len(qrows))))  # rows per block: bounded score matrix
         for lo in range(0, n_rows, block):
             blk = np.asarray(X[lo:lo + block]) if base == 0 else np.asarray(B[rowmap[lo:lo + block]])  # id order
@@ -114,6 +136,7 @@ def main():
     hits = np.zeros(len(sr), dtype=np.float64)
     hits_tie = np.zeros(len(sr), dtype=np.float64)
     fallback = invisible = dup = 0
+    deferred = []
     for n, rec in enumerate(sr):
         if rec["status"] != 0:
             continue
@@ -122,17 +145,44 @@ def main():
         vis = cand[(ins[cand] <= s) & (s < dele[cand])]
         if len(vis) >= a.k:
             gt[n] = vis[:a.k]
+        elif a.topk:
+            deferred.append(n)
         else:
             fallback += 1
             ids = np.nonzero((ins <= s) & (s < dele))[0]
             sc = np.concatenate([np.asarray(A[ids[ids < NA]]) @ Q[q], vecs_b(ids[ids >= NA] - NA) @ Q[q]])
             gt[n] = ids[np.argsort(-sc, kind="stable")[:a.k]]
+    if deferred:  # --topk: exact brute force for all short searches in ONE pass over A and the inserted B rows
+        fallback = len(deferred)
+        print(f"brute-force fallback for {fallback} searches (one pass over pools A+B)", flush=True)
+        dn = np.array(deferred)
+        Qd = np.ascontiguousarray(Q[sr["qrow"][dn].astype(np.int64)])
+        sd = sr["ref_w"][dn].astype(np.int64)[:, None]
+        fs = np.full((len(dn), a.k), -np.inf, dtype=np.float32)
+        fi = np.zeros((len(dn), a.k), dtype=np.int64)
+        block = max(1024, (a.block_mb << 20) // (4 * len(dn)))
+        for base, n_rows in ((0, NA), (NA, NB)):
+            for lo in range(0, n_rows, block):
+                blk = np.asarray(A[lo:lo + block]) if base == 0 else np.asarray(B[rowmap[lo:lo + block]])
+                idb = np.arange(base + lo, base + lo + blk.shape[0])
+                sc = Qd @ blk.T
+                sc[(ins[idb][None, :] > sd) | (dele[idb][None, :] <= sd)] = -np.inf
+                cs = np.concatenate([fs, sc], axis=1)
+                ci = np.concatenate([fi, np.broadcast_to(idb, sc.shape)], axis=1)
+                sel = np.argpartition(-cs, a.k - 1, axis=1)[:, :a.k]
+                fs, fi = np.take_along_axis(cs, sel, axis=1), np.take_along_axis(ci, sel, axis=1)
+        o = np.argsort(-fs, axis=1, kind="stable")
+        gt[dn] = np.take_along_axis(fi, o, axis=1)
+    for n, rec in enumerate(sr):
+        if rec["status"] != 0:
+            continue
+        q, s = int(rec["qrow"]), int(rec["ref_w"])
         got = rec["ids"][:rec["n"]].astype(np.int64)
         hits[n] = len(np.intersect1d(got, gt[n])) / a.k
         bad = (got >= NA + NB)
         g = got[~bad]
         gvis = g[(ins[g] <= s) & (s < dele[g])]
-        if len(gvis) and len(gt[n]):
+        if len(gvis) and len(gt[n]) and not a.no_tie:
             kth = float(score(gt[n][-1:].astype(np.int64), q)[0])
             hits_tie[n] = min(a.k, len(np.intersect1d(gvis, gt[n])) + int((score(np.setdiff1d(gvis, gt[n].astype(np.int64)), q) >= kth - 1e-6).sum())) / a.k
         invisible += int(bad.sum()) + int(((ins[g] > s) | (dele[g] <= s)).sum())  # E1 violation
@@ -145,10 +195,16 @@ def main():
                 f"not_ok={int((~oka).sum())}\n")
         f.write(f"recall_measured_ok={hits[okm].mean() if okm.any() else float('nan'):.5f}\n")
         f.write(f"recall_all_ok={hits[oka].mean() if oka.any() else float('nan'):.5f}\n")
+        if okm.any():  # s.e. of the mean: binomial over the 10 * n result slots, and empirical over searches
+            p, nm = hits[okm].mean(), int(okm.sum())
+            f.write(f"recall_measured_ok_se_binom={np.sqrt(p * (1 - p) / (a.k * nm)):.6f}\n")
+            f.write(f"recall_measured_ok_se_emp={hits[okm].std(ddof=1) / np.sqrt(nm) if nm > 1 else float('nan'):.6f}\n")
         f.write(f"recall_tie_aware_measured_ok={hits_tie[okm].mean() if okm.any() else float('nan'):.5f}\n")
         f.write(f"recall_tie_aware_all_ok={hits_tie[oka].mean() if oka.any() else float('nan'):.5f}\n")
         f.write(f"inserted_ids={NB} vector_rows_used={len(np.unique(rowmap)) if NB else 0}\n")
         f.write(f"invisible_returned={invisible}\nduplicate_ids={dup}\n")
+        f.write(f"brute_force_fallbacks={fallback} candidates={'topk:' + a.topk if a.topk else 'scan'} "
+                f"kprime={a.kprime} tie_aware={'skipped' if a.no_tie else 'on'}\n")
         f.write("(searches never answered are not in searches.bin: take timeouts from the loadgen steps.jsonl)\n")
     with open(a.out + ".manifest.txt", "w") as m:
         m.write("# vectordb ground truth (CXL_SWMC/workloads/vectordb/tools/compute_gt.py)\n")
