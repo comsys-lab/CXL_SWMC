@@ -50,7 +50,9 @@ def main():
     m = sys.argv[1]
     man = dict(l.rstrip('\n').split('=', 1) for l in open(os.path.join(m, 'manifest.txt')) if '=' in l and not l.startswith('#'))
     system = man.get('system', '')
-    kind = 'hwcc' if system == 'all-HWcc' else 'msi' if system.startswith('Popcorn') else 'megalon' if system == 'Megalon' else None
+    # De Stijl v2 lifetimes (DeStijl-<recv>-T<us>) carry the Popcorn build-12 swmc_acct keys: checked as page MSI
+    kind = 'hwcc' if system == 'all-HWcc' else 'msi' if system.startswith(('Popcorn', 'DeStijl')) \
+        else 'megalon' if system == 'Megalon' else None
     if kind is None:
         fail(f'unknown system {system!r}')
     p = os.path.join(m, 'breakdown.csv')

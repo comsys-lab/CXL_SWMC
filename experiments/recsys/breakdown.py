@@ -14,6 +14,7 @@ zeros, even without cxl_shm, so key presence says nothing about the system):
              read_msg_wait_ns, transition-fault time is_/sm_/wpu_fault_ns, nontrans_fault_ns;
              node-wide on the serving node (receive context, not serving threads): INVALIDATE handling =
              sys.swmc.instr.serve.unmap_ns + mkclean_ns, TLB IPIs = irq.TLB, receive thread CPU = kthr.cxl_recv*.cpu_ticks
+  DeStijl-*  (De Stijl v2, eval3) as Popcorn-*: the kernel keeps build 12's swmc_acct and per-thread swmc keys
   Megalon    v6 default (legacy app timers off, megalon_time.sample=0): serving coherence = CohSnap op.query.c_ns
              (optime.h); with --megalon-time-sample N > 0 the legacy split (backend.h MegThr: section checks,
              flushes, re-executed work) is added as before
@@ -110,8 +111,8 @@ def main():
     system = man.get('system', '')
     if system == 'all-HWcc':
         kind = 'hwcc'
-    elif system.startswith('Popcorn'):
-        kind = 'msi'
+    elif system.startswith('Popcorn') or system.startswith('DeStijl'):
+        kind = 'msi'  # De Stijl v2 (branch of Popcorn build 12): same swmc_acct per-thread / per-op keys
     elif system == 'Megalon':
         kind = 'megalon'
     else:

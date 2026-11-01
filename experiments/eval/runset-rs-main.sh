@@ -21,6 +21,10 @@ for r in $RS_MG_POINTS; do
   [[ " $RS_POINTS " == *" $r "* ]] || die "RS_MG_POINTS rate $r not in RS_POINTS"
   [ -z "$RS_MG_COMPARE_Q" ] || MAP="$MAP $r=$(echo $RS_FIX_LEVELS | tr ' ' ','),$RS_MG_COMPARE_Q"
 done
+# eval3 (block C): RS_FIX_LEVELS, RS_MG_COMPARE_Q and RS_FIX_FALLBACK_Q all empty = SLO lifetimes only (the 1 q/s
+# start step of every SLO search is the L1 step); rs_check.py then expects no fixed windows
+FIXSYS=$RS_SYSTEMS
+[ -n "$RS_FIX_LEVELS${MAP# }$RS_FIX_FALLBACK_Q" ] || FIXSYS=
 SEP=$RS_FIX_SEP LVF=
 if [ "$K" != "$LEVELS_FROM_RUN" ] || [ "${LEVELS_SOURCE:-}" = registry ]; then
   [ "$K" = "$LEVELS_FROM_RUN" ] || SEP=$RS_LATER_FIX_SEP
@@ -39,7 +43,7 @@ RSENV+=(SYSTEMS="$RS_SYSTEMS" STREAM_RATES="$RS_POINTS" STREAM_FIX_LEVELS="$RS_F
 BLK=(bash $TREE/experiments/recsys/main-block.sh $E/block)
 plan "rates [$RS_POINTS] systems [$RS_SYSTEMS] fix levels [$RS_FIX_LEVELS] map [${MAP# }] fallback ${RS_FIX_FALLBACK_Q:-none} sep $SEP levels ${LVF:-computed in this run}"
 plan "block: env ${RSENV[*]} ${BLK[*]}"
-plan "then: rs_check.py $E/block --rates '$RS_POINTS' --slo-systems '$RS_SYSTEMS' --fix-systems '$RS_SYSTEMS'"
+plan "then: rs_check.py $E/block --rates '$RS_POINTS' --slo-systems '$RS_SYSTEMS' --fix-systems '$FIXSYS'"
 [ "$RECV_MODE" = poll ] || plan "then: recv_check.py $E/block --mode $RECV_MODE (RS_PROC_CXL_SHM=${RS_PROC_CXL_SHM:-0})"
 if [ $DRY = 1 ]; then
   block_dry "missing or not empty" env "${RSENV[@]}" bash $TREE/experiments/recsys/main-block.sh @DIR@
@@ -53,7 +57,7 @@ $REG add recsys rs-main $K "$E" $CSHA started "commit $COMMIT"
 log "block start"
 env "${RSENV[@]}" "${BLK[@]}" > "$E/block/sequence.log" 2>&1
 log "block rc $?: $(tail -n 1 "$E/block/sequence.log")"
-python3 -I -B $EVD/rs_check.py "$E/block" --rates "$RS_POINTS" --slo-systems "$RS_SYSTEMS" --fix-systems "$RS_SYSTEMS" > /dev/null
+python3 -I -B $EVD/rs_check.py "$E/block" --rates "$RS_POINTS" --slo-systems "$RS_SYSTEMS" --fix-systems "$FIXSYS" > /dev/null
 log "check: $(tail -n 1 "$E/block/rs-check.txt")"
 tail -n 1 "$E/block/rs-check.txt" | grep -q "^RSCHECK PASS" || stop "check FAIL (see $E/block/rs-check.txt)"
 if [ "$RECV_MODE" != poll ]; then  # receive mode of every Popcorn lifetime (e.g. recv-sleep.conf)
