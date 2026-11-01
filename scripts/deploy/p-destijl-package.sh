@@ -6,6 +6,9 @@
 #     p-destijl-package.sh <n> <bundle-version>
 # FAULTLAT_BUILD: take faultlat from that frozen build (its build-record.json faultlat_sha256 must match) instead of
 #   building it here with workloads/faultlat/setup.sh.
+# TOOLS_FROM=<builds/destijl/<n>/deploy-v<w>>: the guest tools must be byte-identical to that bundle's (de_stijl_test,
+#   whose binary embeds its build path, is copied from it if systems/destijl/lib + systems/common are unchanged since
+#   its cxl_swmc_commit), so an existing guest tools dir of that bundle is reused by p-destijl-deploy.sh.
 # Inputs (builds/destijl/<n>):  MANIFEST.txt (release, source_commit, dirty_sha256, config_sha256, artifact sha256s),
 #   .config, arch/x86/boot/bzImage, System.map, certs/, cxl_shm/cxl_shm.ko (cxl_shm v13, M=<KTREE>/msg_layer_module).
 # Source identity: a build from a dirty tree (MANIFEST dirty_sha256) is accepted only if EQUIV_COMMIT reproduces the
@@ -203,6 +206,21 @@ KO_SHA=$(sha256sum "$MD/updates/cxl_shm.ko" | cut -d' ' -f1)
   echo "MANAGED_BYTES=$MBYTES"
 } > "$OUT/tools/destijl.env"
 for m in 2 3 4 5 6 7 8; do echo "N=$m $(par $m)"; done > "$OUT/params-layout.txt"
+if [ -n "${TOOLS_FROM:-}" ]; then   # re-package with the guest tools of an earlier bundle of the same build (byte-identical)
+  TR=$TOOLS_FROM/package-record.json
+  (cd "$TOOLS_FROM/tools" && sha256sum --quiet -c tools.sha256) || { echo "STOP: $TOOLS_FROM/tools fails its tools.sha256"; exit 1; }
+  for f in faultlat run.sh cxl_region.yaml p-destijl-guest.sh ds-replica-check.sh destijl.env; do
+    cmp -s "$OUT/tools/$f" "$TOOLS_FROM/tools/$f" || { echo "STOP: tools/$f differs from $TOOLS_FROM"; exit 1; }
+  done
+  TC=$(python3 -I -c 'import json,sys; r=json.load(open(sys.argv[1])); assert r["cxl_swmc_dirty_files"]==0; print(r["cxl_swmc_commit"])' "$TR") ||
+    { echo "STOP: $TR has no clean cxl_swmc_commit"; exit 1; }
+  # de_stijl_test embeds its build path (not reproducible): reuse the earlier binary if its sources are unchanged
+  git -C "$SW" diff --quiet "$TC" -- systems/destijl/lib systems/common &&
+    [ -z "$(git -C "$SW" status --porcelain -- systems/destijl/lib systems/common)" ] ||
+    { echo "STOP: systems/destijl/lib or systems/common changed since $TC ($TOOLS_FROM)"; exit 1; }
+  cp "$TOOLS_FROM/tools/de_stijl_test" "$OUT/tools/de_stijl_test"
+  TOOLS_SRC="tools byte-identical to $TOOLS_FROM (de_stijl_test copied; sources unchanged since $TC)"
+fi
 (cd "$OUT/tools" && sha256sum faultlat run.sh cxl_region.yaml p-destijl-guest.sh ds-replica-check.sh destijl.env de_stijl_test > tools.sha256)
 
 # 4. per-VM candidate XMLs (direct boot from /var/lib/libvirt/images/destijl-<n>-vm<k>-v<v>)
@@ -232,6 +250,7 @@ cat > "$OUT/package-record.json" <<JSON
   "faultlat_version": "$(grep -aoE 'faultlat-[0-9]+' "$FL" | sort -u | tail -1)",
   "faultlat_source": "${FAULTLAT_BUILD:-built here by workloads/faultlat/setup.sh}",
   "de_stijl_test_sha256": "$(sh_ "$OUT/tools/de_stijl_test")",
+  "tools_source": "${TOOLS_SRC:-built here}",
   "region_config": "$REG", "region_sha256": "$(sh_ "$REG")", "ring_offset": $ROFF, "ring_size": $RSIZE,
   "cxl_shm_params": "$PARAMS",
   "xml_source": "${XS[0]} ${XS[1]}",
