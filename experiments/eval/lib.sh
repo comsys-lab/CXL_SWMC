@@ -160,8 +160,11 @@ block_dry() {
   t=$(mktemp -d /tmp/eval-dry-XXXXXX) && touch "$t/not-empty" || die "mktemp"
   # unset gate dirs: an existing placeholder dir (the block only tests -d before its evidence-dir check)
   out=$(env PRETOUCH_DIR=${PRETOUCH_DIR:-$RESULTS_ROOT} MEASURE_ENV_DIR=${MEASURE_ENV_DIR:-$RESULTS_ROOT} \
-        MEASURE_PART_DIR=${MEASURE_PART_DIR:-$RESULTS_ROOT} "${@//@DIR@/$t}" 2>&1 | tail -n 3)
+        MEASURE_PART_DIR=${MEASURE_PART_DIR:-$RESULTS_ROOT} "${@//@DIR@/$t}" 2>&1)
   rm -rf "$t"
+  # eval3: the block's L1 / pending lines are shown (h2n-block.sh H2N_L1, @MAIN_T@); the check uses the last 3 lines
+  echo "$out" | grep -E '^BLOCK (PLAN: L1 |DRY NOTE)' | while IFS= read -r l; do plan "block dry: $l"; done
+  out=$(echo "$out" | tail -n 3)
   if [[ "$out" == *"$want"* ]]; then plan "block dry start reached its evidence-dir check: $(echo "$out" | grep -m1 "$want")"
   else die "block dry start did not reach the evidence-dir check: $out"; fi
 }

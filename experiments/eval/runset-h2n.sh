@@ -30,7 +30,18 @@ set -- "$K_ARG" "${REST[@]}"
 RUNSET=h2n-n$N WL=vdb CONF_WL=h2n
 unset H2N_PINS H2N_VEC_FORMAT H2N_EF H2N_INIT H2N_HOST_IMAGE H2N_REPEATS H2N_LOADGEN_EXTRA H2N_SEARCH_THREADS \
   H2N_FIXED H2N_FIXED_N2 H2N_FIXED_N4 H2N_FIXED_N8 H2N_NODE_ENV_EXTRA H2N_ALLOW_DETAIL H2N_EVIDENCE_NAME VDB_X_NA \
-  H2N_DS_C H2N_DS_K H2N_DS_GT H2N_DS_BUNDLE_SHA H2N_DS_REGION H2N_DS_T_US   # optional conf keys: never inherited from the environment
+  H2N_DS_C H2N_DS_K H2N_DS_GT H2N_DS_BUNDLE_SHA H2N_DS_REGION H2N_DS_T_US \
+  H2N_ORDER H2N_DS_T_SWEEP H2N_DS_KERNEL H2N_DS_REPLICA_MODE H2N_DS_REPLICA_POOL_BYTES H2N_L1 H2N_L1_FROM \
+  H2N_ACCURACY_EXPORT   # optional conf keys: never inherited from the environment
+# eval3 keys (experiment de-stijl-evaluation-run1, 2026-11-02; absent = unchanged):
+#   H2N_ORDER=mix        lifetime list mixes outer, systems inner (B1: per mix mg -> pop -> hw); default systems outer
+#   H2N_DS_T_SWEEP="T1 T2 .."  the ds entry of H2N_SYSTEMS becomes one lifetime ds:<mix>:t<T> per value (us; block A)
+#   H2N_DS_KERNEL=1      the block runs on the De Stijl kernel without a ds lifetime (hw reference cell of block A)
+#   H2N_DS_REPLICA_MODE / H2N_DS_REPLICA_POOL_BYTES / H2N_L1 / H2N_L1_FROM / H2N_ACCURACY_EXPORT: passed to h2n-block.sh
+#                        (its header); H2N_L1_FROM tokens relative to the project root are made absolute
+#   H2N_DS_T_US=@MAIN_T@ placeholder (eval3-b2.conf before block A's recall decides T): dry start NOTE, real run STOP
+#   H2N_EVIDENCE_NAME may also hold {SYS} {MIX} {CELL} (one lifetime per call, --only; CELL = <sys>-<mix>[-t<T>]):
+#                        one evidence dir per cell, e.g. eval3-b1-{SYS}-{MIX}-n{N} -> recovery/eval3-b1-mg-u10-n2-v1
 # De Stijl v2 (H2N_SYSTEMS entry ds; systems/destijl/system.yaml): H2N_DS_C (bundle dir: p-destijl-shm.sh, packet.sha256),
 # H2N_DS_BUNDLE_SHA, H2N_DS_K (guest release -ds-destijl-<n>), H2N_DS_GT (guest tools dir), optional H2N_DS_REGION
 # (default config/cxl_region-destijl.yaml) and H2N_DS_T_US (staleness bound T, default 0); passed to h2n-block.sh as
@@ -64,16 +75,22 @@ SLOPART=$H2N_SLO_PART${H2N_LOADGEN_EXTRA:+ $H2N_LOADGEN_EXTRA}
 X_NA=${VDB_X_NA:-26990000}
 [[ $X_NA =~ ^[1-9][0-9]*$ ]] || die "bad VDB_X_NA ($X_NA)"
 [ -n "$FROM" ] && [ -n "$ONLY" ] && die "--from and --only are exclusive"
-# lifetime list: systems outer, mixes inner
-ALL=()
-for s in $H2N_SYSTEMS; do
-  case $s in hw|pop|ds|mg|mgoff) ;; *) die "bad H2N_SYSTEMS entry $s";; esac
-  for m in $H2N_POINTS; do
-    row=$(awk -F'\t' -v m="$m" '!/^#/ && $1 == "vdb" && $2 == m' "$H/h1-plan.tsv")
-    [ "$(echo "$row" | cut -f3)" = "U=${m#u}" ] || die "mix $m: h1-plan.tsv has no vdb row with U=${m#u}"
-    if [ "$REPS" = 1 ]; then ALL+=("$s:$m"); else for r in $(seq 1 "$REPS"); do ALL+=("$s:$m:r$r"); done; fi
-  done
+# lifetime list: systems outer, mixes inner (H2N_ORDER=mix: mixes outer, systems inner)
+ORDER=${H2N_ORDER:-sys} TSW=${H2N_DS_T_SWEEP:-}
+[[ $ORDER =~ ^(sys|mix)$ ]] || die "bad H2N_ORDER ($ORDER: sys | mix)"
+[ -z "$TSW" ] || { [[ $TSW =~ ^(0|[1-9][0-9]*)( (0|[1-9][0-9]*))*$ ]] && [ "$REPS" = 1 ]; } || die "bad H2N_DS_T_SWEEP ($TSW: integer us list; not with H2N_REPEATS)"
+for s in $H2N_SYSTEMS; do case $s in hw|pop|ds|mg|mgoff) ;; *) die "bad H2N_SYSTEMS entry $s";; esac; done
+for m in $H2N_POINTS; do
+  row=$(awk -F'\t' -v m="$m" '!/^#/ && $1 == "vdb" && $2 == m' "$H/h1-plan.tsv")
+  [ "$(echo "$row" | cut -f3)" = "U=${m#u}" ] || die "mix $m: h1-plan.tsv has no vdb row with U=${m#u}"
 done
+cell() {  # <sys> <mix>: the lifetime ids of one (system, mix)
+  if [ "$1" = ds ] && [ -n "$TSW" ]; then for t in $TSW; do ALL+=("$1:$2:t$t"); done
+  elif [ "$REPS" = 1 ]; then ALL+=("$1:$2"); else for r in $(seq 1 "$REPS"); do ALL+=("$1:$2:r$r"); done; fi
+}
+ALL=()
+if [ "$ORDER" = mix ]; then for m in $H2N_POINTS; do for s in $H2N_SYSTEMS; do cell $s $m; done; done
+else for s in $H2N_SYSTEMS; do for m in $H2N_POINTS; do cell $s $m; done; done; fi
 LIVES=("${ALL[@]}")
 if [ -n "$FROM" ]; then
   i=-1; for j in "${!ALL[@]}"; do [ "${ALL[$j]}" = "$FROM" ] && i=$j; done
@@ -85,14 +102,23 @@ elif [ -n "$ONLY" ]; then
 fi
 HASMG=0 HASDS=0; for l in "${LIVES[@]}"; do case ${l%%:*} in mg|mgoff) HASMG=1;; ds) HASDS=1;; esac; done
 DSENV=()
-if [ $HASDS = 1 ]; then
-  ab() { case $1 in /*) echo "$1";; *) echo "$P/$1";; esac; }
+ab() { case $1 in /*) echo "$1";; *) echo "$P/$1";; esac; }
+[[ ${H2N_DS_KERNEL:-0} =~ ^[01]$ ]] || die "bad H2N_DS_KERNEL"
+if [ $HASDS = 1 ] || [ "${H2N_DS_KERNEL:-0}" = 1 ]; then
   for x in H2N_DS_C H2N_DS_K H2N_DS_GT H2N_DS_BUNDLE_SHA; do [ -n "${!x:-}" ] || die "ds lifetimes need $x in $EVAL_CONF"; done
   DSC=$(ab "$H2N_DS_C") DSR=$(ab "${H2N_DS_REGION:-$TREE/config/cxl_region-destijl.yaml}")   # default: this tree's
   need_files "$DSC/p-destijl-shm.sh" "$DSC/packet.sha256" "$DSR"
   [ "$(sha256sum < "$DSC/packet.sha256" | cut -c1-64)" = "$H2N_DS_BUNDLE_SHA" ] || die "De Stijl bundle packet.sha256 != H2N_DS_BUNDLE_SHA"
-  DSENV=(DS_C=$DSC DS_K=$H2N_DS_K DS_GT=$H2N_DS_GT DS_BUNDLE_SHA=$H2N_DS_BUNDLE_SHA DS_REGION=$DSR H2N_DS_T_US=${H2N_DS_T_US:-0})
+  DST_C=${H2N_DS_T_US:-0}
+  if [ "$DST_C" = @MAIN_T@ ]; then  # eval3-b2.conf before the main T is known
+    NEEDT=0; for l in "${LIVES[@]}"; do [[ $l == ds:* ]] && [[ $l != *:t* ]] && NEEDT=1; done
+    if [ $NEEDT = 1 ]; then [ $DRY = 1 ] || die "H2N_DS_T_US=@MAIN_T@: the main T is not filled in yet (block A recall rule)"
+      plan "H2N_DS_T_US is the placeholder @MAIN_T@: fill it before a real run (a real run stops here)"; fi
+  fi
+  DSENV=(DS_C=$DSC DS_K=$H2N_DS_K DS_GT=$H2N_DS_GT DS_BUNDLE_SHA=$H2N_DS_BUNDLE_SHA DS_REGION=$DSR H2N_DS_T_US=$DST_C H2N_DS_KERNEL=1)
 fi
+L1FROM_A=; read -r -a L1G <<< "${H2N_L1_FROM:-}"   # read -a: no glob expansion here (the block expands them)
+for g in "${L1G[@]}"; do L1FROM_A+="${L1FROM_A:+ }$(ab "$g")"; done
 v() { local x=H2N_$1_N$N; echo "${!x:-}"; }
 WRITES=$(v WRITES) MAXD=$(v MAXD)
 [ -n "$WRITES" ] && [[ $MAXD =~ ^[1-9][0-9]*$ ]] || die "H2N_WRITES_N$N / H2N_MAXD_N$N missing"
@@ -129,6 +155,12 @@ EVIDENCE_TAG=${EVIDENCE_TAG:+$EVIDENCE_TAG-}n$N
 x=H2N_FIXED_N$N; [ -z "${!x:-}" ] || H2N_FIXED=${!x}
 if [ -n "${H2N_EVIDENCE_NAME:-}" ]; then
   H2N_EVIDENCE_NAME=${H2N_EVIDENCE_NAME//\{N\}/$N}
+  if [[ $H2N_EVIDENCE_NAME == *\{* ]]; then  # {SYS} {MIX} {CELL}: one evidence dir per cell (eval3)
+    [ ${#LIVES[@]} = 1 ] || die "H2N_EVIDENCE_NAME $H2N_EVIDENCE_NAME needs exactly one lifetime (--only <sys>:<mix>)"
+    IFS=: read -r cs cm cx <<< "${LIVES[0]}"
+    H2N_EVIDENCE_NAME=${H2N_EVIDENCE_NAME//\{SYS\}/$cs}; H2N_EVIDENCE_NAME=${H2N_EVIDENCE_NAME//\{MIX\}/$cm}
+    H2N_EVIDENCE_NAME=${H2N_EVIDENCE_NAME//\{CELL\}/$cs-$cm${cx:+-$cx}}
+  fi
   [[ $H2N_EVIDENCE_NAME =~ ^[a-z0-9-]+$ ]] || die "bad H2N_EVIDENCE_NAME"
   n=${VER:-1}; if [ -z "$VER" ]; then while [ -e "$RESULTS_ROOT/$H2N_EVIDENCE_NAME-v$n" ]; do n=$((n + 1)); done; fi
   E=$RESULTS_ROOT/$H2N_EVIDENCE_NAME-v$n
@@ -143,7 +175,11 @@ BENV=(H2N_N=$N H2N_VCPU=$VCPUS_PER_VM "H2N_LIFETIMES=${LIVES[*]}" EVAL_RUN=$K SE
   "H2N_SLO_PART=$SLOPART" H2N_OPCOH_STRICT=$H2N_OPCOH_STRICT H2N_CXLBW=$H2N_CXLBW H2N_HOSTCPU=${H2N_HOSTCPU:-0})
 [ $HASDS = 0 ] || BENV+=("${DSENV[@]}")
 [ $HASMG = 0 ] || BENV+=(MEG_BUILD=$MGB VMEG=$MGV MEG_CFG=$MGC MEG_LIB=$MGL MG_MAXD=$MGD MG_CAPACITY=$VDB_MG_CAPACITY)
-for x in H2N_VEC_FORMAT H2N_EF H2N_INIT H2N_HOST_IMAGE H2N_SEARCH_THREADS H2N_FIXED H2N_NODE_ENV_EXTRA H2N_ALLOW_DETAIL; do [ -z "${!x:-}" ] || BENV+=("$x=${!x}"); done
+for x in H2N_VEC_FORMAT H2N_EF H2N_INIT H2N_HOST_IMAGE H2N_SEARCH_THREADS H2N_FIXED H2N_NODE_ENV_EXTRA H2N_ALLOW_DETAIL \
+  H2N_DS_REPLICA_MODE H2N_DS_REPLICA_POOL_BYTES H2N_L1 H2N_ACCURACY_EXPORT; do [ -z "${!x:-}" ] || BENV+=("$x=${!x}"); done
+[ -z "$L1FROM_A" ] || BENV+=("H2N_L1_FROM=$L1FROM_A")
+[ "${H2N_L1:-0}" = 0 ] || plan "L1 step: hw/pop/ds lifetimes append loadgen --mode fixed --rates <L1> (L1 from mg rows of [${L1FROM_A:-} + the block's own results])"
+[ -z "${H2N_DS_REPLICA_MODE:-}" ] || plan "De Stijl replica_mode ${H2N_DS_REPLICA_MODE} pool ${H2N_DS_REPLICA_POOL_BYTES:--} bytes (back to off after every ds lifetime)"
 for x in PRETOUCH_DIR MEASURE_ENV_DIR MEASURE_PART_DIR; do [ -z "${!x:-}" ] || BENV+=("$x=${!x}"); done
 plan "block: env ${BENV[*]} bash $EVD/h2n-block.sh <E>/block"
 if [ $DRY = 1 ]; then
