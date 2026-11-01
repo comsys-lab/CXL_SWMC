@@ -16,9 +16,13 @@
 #   untracked, then `git show <EQUIV_COMMIT>:<file>` of those files) == dirty_sha256 (same recipe as MANIFEST.txt), and
 #   msg_layer_module is unchanged between both commits and clean in KTREE. Clean builds need the tag rel/destijl-<n>,
 #   or SOURCE_TAG=<tag> for a rebuild of a tagged commit under a new release (e.g. build 7 = SOURCE_TAG=rel/destijl-6).
-# XML_SRC: directory with vm<k>/candidate-normal.xml or cxl_vm<k>/candidate-normal.xml = the CURRENT inactive XML of
-#   cxl_vm<k> (default builds/popcorn_new/12/deploy-v1: the build-12 definitions the VMs run now). The rollback XML of
-#   this bundle is that file; p-destijl-deploy.sh precheck refuses unless `virsh dumpxml --inactive` equals it.
+# XML_SRC: directory with vm<k>/candidate-normal.xml, cxl_vm<k>/candidate-normal.xml or cxl_vm<k>.after-define.xml
+#   (vmN chain topo<N>/ output) = the CURRENT inactive XML of cxl_vm<k> (default builds/popcorn_new/12/deploy-v1). The
+#   rollback XML of this bundle is that file; p-destijl-deploy.sh precheck refuses unless `virsh dumpxml --inactive`
+#   equals it byte for byte (so never a generator-formatted topo<N>/cxl_vm<k>.xml).
+# VMS="0 1" (default) or e.g. "0 1 2 3 4 5 6 7": the VM ids that get a vm<k>/ deploy dir (VM8 topology: cxl_vm0..7).
+# MEASUREMENT.lock: tolerated when nothing is compiled (stage/ exists, FAULTLAT_BUILD and TOOLS_FROM set); the rest
+#   (make kernelrelease, tar, signature checks) runs under scripts/ctl/build-wrap.sh (node 1 / session CPUs).
 # Writes (all new; refuses if deploy-v<v> exists):
 #   builds/destijl/<n>/stage/ (reused if present)   modules_install (kernel + cxl_shm in updates/), signed by kbuild with
 #                                                   the build's own key, depmod -b
@@ -30,7 +34,7 @@
 #                                                   installed /lib/modules/<K> identical to this bundle)
 #     tools/{faultlat,run.sh,cxl_region.yaml,p-destijl-guest.sh,ds-replica-check.sh,destijl.env,de_stijl_test,tools.sha256}
 #                                                                 guest tools (GT; ds-replica-check.sh from phase 5d on)
-#     vm0/, vm1/ {rollback-inactive.xml,candidate-normal.xml,candidate-restricted.xml,xml.sha256}
+#     vm<k>/ (k in VMS) {rollback-inactive.xml,candidate-normal.xml,candidate-restricted.xml,xml.sha256}
 #     p-destijl-deploy.sh, p-destijl-shm.sh, smoke.sh, smoke-n.sh, scenarios.sh, parse.py, vm-console.py, p-popcorn-xml.py
 #     params-layout.txt, signatures.txt, package-record.json, packet.sha256
 #   destijl.env: K, KO_SHA (signed, installed cxl_shm.ko), PARAMS (= PARAMS_N2), PARAMS_N2..PARAMS_N8 (`faultlat params
@@ -51,10 +55,18 @@ DEP=$SW/scripts/deploy
 REG=$SW/config/cxl_region-destijl.yaml
 XML_SRC=${XML_SRC:-$ROOT/builds/popcorn_new/12/deploy-v1}
 DEV_SIZE=103060340736   # observed /sys/bus/dax/devices/dax0.0/size on the guests
-WRAP="nice -n 19 numactl --cpunodebind=1 --membind=1"
+WRAP="bash $SW/scripts/ctl/build-wrap.sh"   # node 1, or the session CPUs while MEASUREMENT.lock exists
 SCR=${TMPDIR:-/tmp}/p-destijl-package-$$
+VMS=${VMS:-0 1}
+read -r -a VML <<< "$VMS"
+[ ${#VML[@]} -ge 1 ] || { echo "VMS is empty"; exit 2; }
+for k in "${VML[@]}"; do [[ "$k" =~ ^[0-7]$ ]] || { echo "VMS: bad VM id '$k'"; exit 2; }; done
+[ "$(printf '%s\n' "${VML[@]}" | sort -u | wc -l)" = ${#VML[@]} ] || { echo "VMS has duplicates"; exit 2; }
 
-test ! -e "$ROOT/workspaces/MEASUREMENT.lock" || { echo "STOP: workspaces/MEASUREMENT.lock exists (no build-side work)"; exit 1; }
+if [ -e "$ROOT/workspaces/MEASUREMENT.lock" ]; then   # packaging only, nothing compiled
+  [ -e "$ST" ] && [ -n "${FAULTLAT_BUILD:-}" ] && [ -n "${TOOLS_FROM:-}" ] ||
+    { echo "STOP: workspaces/MEASUREMENT.lock exists and this run would compile (needs stage/, FAULTLAT_BUILD, TOOLS_FROM)"; exit 1; }
+fi
 test ! -e "$OUT" || { echo "STOP: $OUT exists"; exit 1; }
 M=$B/MANIFEST.txt
 mf() { sed -n "s/^$1: \([^ ]*\).*/\1/p" "$M" | head -1; }
@@ -90,10 +102,13 @@ git -C "$KTREE" diff --quiet "$COMMIT" "$EQ" -- msg_layer_module || { echo "STOP
 git -C "$KTREE" diff --quiet "$EQ" -- msg_layer_module && [ -z "$(git -C "$KTREE" status --porcelain -- msg_layer_module)" ] ||
   { echo "STOP: $KTREE/msg_layer_module is not clean at $EQ (modules_install M= reads it)"; exit 1; }
 [ "$($WRAP make -s -C "$KS" O="$B" LOCALVERSION="$LV" kernelrelease)" = "$K" ] || { echo "STOP: kernelrelease differs"; exit 1; }
-for k in 0 1; do
-  if [ -f "$XML_SRC/vm$k/candidate-normal.xml" ]; then XS[$k]=$XML_SRC/vm$k/candidate-normal.xml
-  else XS[$k]=$XML_SRC/cxl_vm$k/candidate-normal.xml; fi
-  test -f "${XS[$k]}" || { echo "STOP: no candidate-normal.xml for vm$k in $XML_SRC"; exit 1; }
+for k in "${VML[@]}"; do
+  XS[$k]=
+  for f in "$XML_SRC/vm$k/candidate-normal.xml" "$XML_SRC/cxl_vm$k/candidate-normal.xml" "$XML_SRC/cxl_vm$k.after-define.xml"; do
+    [ -f "$f" ] && { XS[$k]=$f; break; }
+  done
+  [ -n "${XS[$k]}" ] || { echo "STOP: no candidate-normal.xml / cxl_vm$k.after-define.xml for vm$k in $XML_SRC"; exit 1; }
+  grep -q "<name>cxl_vm$k</name>" "${XS[$k]}" || { echo "STOP: ${XS[$k]} is not cxl_vm$k"; exit 1; }
 done
 mkdir -p "$SCR"; trap 'rm -rf "$SCR"' EXIT
 
@@ -182,9 +197,12 @@ fi
 mkdir -p "$SCR/t/systems/destijl" "$SCR/t/systems/common"
 cp -r "$SW/systems/destijl/lib" "$SCR/t/systems/destijl/lib"
 cp "$SW/systems/common/"*.h "$SCR/t/systems/common/"
-make -s -C "$SCR/t/systems/destijl/lib" clean > /dev/null
-make -s -C "$SCR/t/systems/destijl/lib" de_stijl_test > /dev/null
-cp "$SCR/fl/faultlat" "$SW/workloads/faultlat/run.sh" "$SCR/t/systems/destijl/lib/de_stijl_test" "$OUT/tools/"
+if [ -z "${TOOLS_FROM:-}" ]; then   # with TOOLS_FROM the earlier de_stijl_test is copied below (nothing compiled)
+  make -s -C "$SCR/t/systems/destijl/lib" clean > /dev/null
+  make -s -C "$SCR/t/systems/destijl/lib" de_stijl_test > /dev/null
+  cp "$SCR/t/systems/destijl/lib/de_stijl_test" "$OUT/tools/"
+fi
+cp "$SCR/fl/faultlat" "$SW/workloads/faultlat/run.sh" "$OUT/tools/"
 cp "$REG" "$OUT/tools/cxl_region.yaml"
 cp "$DEP/p-destijl-guest.sh" "$DEP/ds-replica-check.sh" "$OUT/tools/"   # replica check: p-destijl-guest.sh replica-check
 FL=$OUT/tools/faultlat
@@ -224,7 +242,7 @@ fi
 (cd "$OUT/tools" && sha256sum faultlat run.sh cxl_region.yaml p-destijl-guest.sh ds-replica-check.sh destijl.env de_stijl_test > tools.sha256)
 
 # 4. per-VM candidate XMLs (direct boot from /var/lib/libvirt/images/destijl-<n>-vm<k>-v<v>)
-for k in 0 1; do
+for k in "${VML[@]}"; do
   python3 -I "$DEP/p-popcorn-xml.py" "${XS[$k]}" "/var/lib/libvirt/images/destijl-$n-vm$k-v$v" "$K" "$OUT/vm$k"
   (cd "$OUT/vm$k" && sha256sum rollback-inactive.xml candidate-normal.xml candidate-restricted.xml > xml.sha256)
 done
@@ -253,8 +271,10 @@ cat > "$OUT/package-record.json" <<JSON
   "tools_source": "${TOOLS_SRC:-built here}",
   "region_config": "$REG", "region_sha256": "$(sh_ "$REG")", "ring_offset": $ROFF, "ring_size": $RSIZE,
   "cxl_shm_params": "$PARAMS",
-  "xml_source": "${XS[0]} ${XS[1]}",
-  "images_dirs": "/var/lib/libvirt/images/destijl-$n-vm0-v$v /var/lib/libvirt/images/destijl-$n-vm1-v$v",
+  "vms": "${VML[*]}",
+  "xml_source": "$(for k in "${VML[@]}"; do printf '%s ' "${XS[$k]}"; done | sed 's/ $//')",
+  "xml_source_sha256": "$(for k in "${VML[@]}"; do printf '%s ' "$(sh_ "${XS[$k]}")"; done | sed 's/ $//')",
+  "images_dirs": "$(for k in "${VML[@]}"; do printf '/var/lib/libvirt/images/destijl-%s-vm%s-v%s ' "$n" "$k" "$v"; done | sed 's/ $//')",
   "created": "$(date -Is)"
 }
 JSON
