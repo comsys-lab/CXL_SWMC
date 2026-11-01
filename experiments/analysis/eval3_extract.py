@@ -122,6 +122,7 @@ def load_steps(part):
 
 
 THR = re.compile(r"^thr\.([^.]+)\.swmc\.(.+)$")
+NODE_PREFIXES = ("sys.swmc.destijl.", "sys.swmc.instr.serve_")
 
 
 def load_stats(part):
@@ -146,9 +147,16 @@ def load_stats(part):
     for r in rows:
         n = int(r["step"])
         t = acc.setdefault(n, {"n": 0, "win": 0.0, "offered_x": fl(r.get("offered_x")), "sum": {}, "gmax": {},
-                               "T": {}, "role": {}})
+                               "T": {}, "role": {}, "tg": {}})
         t["n"] += 1
         t["win"] = max(t["win"], fl(r.get("window_s")) or 0.0)
+        # per-target node counters (De Stijl owner phases are taken from the OTHER nodes of each requester)
+        tg = t["tg"].setdefault(str(r.get("target")), {})
+        for k, v in r.items():
+            if k.startswith(NODE_PREFIXES):
+                x = fl(v)
+                if x is not None:
+                    tg[k] = tg.get(k, 0.0) + x
         for k, v in r.items():
             if k in ("step", "phase", "offered_x", "target", "addr", "begin_wall_ns", "end_wall_ns", "window_s",
                      "srv_window_s"):
@@ -167,11 +175,15 @@ def load_stats(part):
 
 def pool(stats, steps_sel):
     """sum the counter dicts of several steps (windows add up); gauges keep the max"""
-    out = {"n": 0, "k": 0, "win": 0.0, "offered_x": None, "sum": {}, "gmax": {}, "T": {}, "role": {}}
+    out = {"n": 0, "k": 0, "win": 0.0, "offered_x": None, "sum": {}, "gmax": {}, "T": {}, "role": {}, "tg": {}}
     for n in steps_sel:
         t = stats.get(n)
         if not t:
             continue
+        for tgt, d in t.get("tg", {}).items():
+            o = out["tg"].setdefault(tgt, {})
+            for k, v in d.items():
+                o[k] = o.get(k, 0.0) + v
         out["k"] += 1
         out["n"] = max(out["n"], t["n"])
         out["win"] += t["win"]
@@ -356,19 +368,133 @@ CAT_KEYS = ("msg_wait_ns", "owner_h_ns", "xport_ns", "owner_h_rounds", "last_rev
 
 def fault_classes(T):
     """[(class, prefix, F ns, n faults)]: read = I->S (is_*), write = I/S->M (sm_*) + write-protect upgrade
-    (wpu_*); De Stijl build 8 sub-classes <read|write>_{sync,async} when their keys exist"""
+    (wpu_*). De Stijl build 8 sub-classes are built by ds8_classes()."""
     out = []
     if "is_faults" in T:
         out.append(("read", "read", T.get("is_fault_ns"), T.get("is_faults")))
     if "sm_faults" in T or "wpu_faults" in T:
         out.append(("write", "write", T.get("sm_fault_ns", 0.0) + T.get("wpu_fault_ns", 0.0),
                     T.get("sm_faults", 0.0) + T.get("wpu_faults", 0.0)))
-    for base in ("read", "write"):
-        for k in ("sync", "async"):
-            p = f"{base}_{k}"
-            if f"{p}_faults" in T:
-                out.append((p, p, T.get(f"{p}_fault_ns"), T.get(f"{p}_faults")))
     return out
+
+
+DS8_LOCAL = ("msg_wait_ns", "acquire_flush_ns", "local_meta_ns", "local_wait_ns", "pte_install_ns")
+
+
+def is_ds8(c, t):
+    """De Stijl build 8 (workspaces/eval3/ds-breakdown DESIGN.md; review ds-breakdown-review H1): per-thread
+    read_async_is_fault_ns or node srv_* keys present. Never falls into b13 (its *_last_* stay 0 on De Stijl)."""
+    return c.system == "ds" and ("read_async_is_fault_ns" in t["T"] or
+                                 any(k.startswith("sys.swmc.destijl.srv_") for k in t["sum"]))
+
+
+D, I_ = "sys.swmc.destijl.", "sys.swmc.instr."
+# owner request classes: (srv_* prefix, count key) preferred; fallback = instr serve_* (FETCH: sync + async + evict mixed)
+OWN_SRV = {"fetch_sync": (D + "srv_fetch_sync_", "count"), "fetch_evict": (D + "srv_fetch_evict_", "count"),
+           "inv": (D + "srv_inv_", "count")}
+OWN_SERVE = {"fetch_sync": (I_ + "serve_fetch.", "reply_count"), "fetch_evict": (I_ + "serve_fetch.", "reply_count"),
+             "inv": (I_ + "serve_invalidate.", "reply_count")}
+
+
+def ds8_owner_src(t):
+    keys = set().union(*t["tg"].values()) if t["tg"] else set()
+    if D + "srv_fetch_sync_count" in keys:
+        return "srv", OWN_SRV
+    if I_ + "serve_fetch.reply_count" in keys:
+        return "serve-all-fetch", OWN_SERVE
+    return "none", None
+
+
+def other_means(t, me, prefix, cnt):
+    """{revoke, wb, meta, h}: mean owner ns per request over the OTHER targets than `me` (sum ns / sum count)"""
+    n = sum(d.get(prefix + cnt, 0.0) for k, d in t["tg"].items() if k != me)
+    out = {}
+    for x in ("revoke", "wb", "meta", "h"):
+        s = sum(d.get(f"{prefix}{x}_ns", 0.0) for k, d in t["tg"].items() if k != me)
+        if x == "meta" and not any(f"{prefix}meta_ns" in d for d in t["tg"].values()):
+            # build-7 serve_* have no meta_ns: meta = pre_reply - revoke - wb (owner time to the completion CAS)
+            pre = sum(d.get(f"{prefix}pre_reply_ns", 0.0) for k, d in t["tg"].items() if k != me)
+            s = max(0.0, pre - out["revoke"] * n - out["wb"] * n) if n else 0.0
+        out[x] = s / n if n else 0.0
+    return out
+
+
+def ds8_owner(t):
+    """owner phase totals (ns, summed over requester nodes) {"read": {revoke, wb, meta}, "write": {...}} plus the
+    round counts. Per requester node i (target), from its node counters:
+      sync FETCH rounds_i = fetch_sent - async_issued - eviction FETCHes  (FETCH-producing sync rounds only:
+        MERGED_WAIT / WAIT_WRITE rounds send no FETCH; their wait stays in communication; review M1)
+      eviction FETCHes_i = bpd_evict_m - evict_self_fetch (M victims owned elsewhere)
+      read owner_i  = mean_{j != i}(srv_fetch_sync_x) x sync FETCH rounds_i
+      write owner_i = mean_{j != i}(srv_inv_x) x inv_sent_i + mean_{j != i}(srv_fetch_evict_x) x eviction FETCHes_i
+    (write msg_wait holds the eviction waits; at N > 2 srv_inv is the mean holder, not the slowest: review M2)."""
+    src, cls = ds8_owner_src(t)
+    tot = {"read": {"revoke": 0.0, "wb": 0.0, "meta": 0.0}, "write": {"revoke": 0.0, "wb": 0.0, "meta": 0.0},
+           "src": src, "sync_fetch_rounds": 0.0, "evict_fetches": 0.0, "inv_sent": 0.0}
+    if cls is None:
+        return tot
+    for me, d in t["tg"].items():
+        ev = max(0.0, d.get(D + "bpd_evict_m", 0.0) - d.get(D + "evict_self_fetch", 0.0))
+        sf = max(0.0, d.get(D + "fetch_sent", 0.0) - d.get(D + "async_issued", 0.0) - ev)
+        inv = d.get(D + "inv_sent", 0.0)
+        tot["sync_fetch_rounds"] += sf
+        tot["evict_fetches"] += ev
+        tot["inv_sent"] += inv
+        ms, me_, mi = (other_means(t, me, *cls[k]) for k in ("fetch_sync", "fetch_evict", "inv"))
+        for x in ("revoke", "wb", "meta"):
+            tot["read"][x] += ms[x] * sf
+            tot["write"][x] += mi[x] * inv + me_[x] * ev
+    return tot
+
+
+def ds8_classes(T):
+    """[(class, {F, n, rounds key, msg_wait_ns, acquire_flush_ns, local_meta_ns, local_wait_ns, pte_install_ns},
+    owner side)]: read_async = read_async_* (F = read_async_is_fault_ns); read_sync = class-less read - read_async
+    (F = is_fault_ns - read_async_is_fault_ns, faults = is_faults - read_async_faults); read = both; write = all
+    writes (always sync)."""
+    g = lambda k: T.get(k) or 0.0  # noqa: E731
+    asy = {"F": g("read_async_is_fault_ns"), "n": g("read_async_faults"), **{k: g(f"read_async_{k}") for k in DS8_LOCAL}}
+    tot = {"F": g("is_fault_ns"), "n": g("is_faults"), **{k: g(f"read_{k}") for k in DS8_LOCAL}}
+    syn = {k: tot[k] - asy[k] for k in tot}
+    wr = {"F": g("sm_fault_ns") + g("wpu_fault_ns"), "n": g("sm_faults") + g("wpu_faults"),
+          **{k: g(f"write_{k}") for k in DS8_LOCAL}}
+    return [("read", tot, "read"), ("read_sync", syn, "read"), ("read_async", asy, None), ("write", wr, "write")]
+
+
+def breakdown_ds8(c, t):
+    """De Stijl build 8: requester parts per thread, owner parts = per-node mean per request x requester rounds.
+    1 = W - owner(revoke + wb + meta); 2 = owner revoke; 3 = owner wb + acquire flush; 4 = owner meta + local
+    meta; 5 = F - (1..4) = pte install + local wait + residual. Async reads carry no owner work."""
+    T = t["T"]
+    own = ds8_owner(t)
+    N = c.N or t["n"]
+    rows = []
+    for cls, v, side in ds8_classes(T):
+        if side is None or own["src"] == "none":
+            rev = wb = meta = 0.0
+            src = "none (async: no owner work on the fault path)" if side is None else "none (no owner counters)"
+        else:
+            rev, wb, meta = (own[side][x] for x in ("revoke", "wb", "meta"))
+            src = own["src"]
+        R = {"read": own["sync_fetch_rounds"], "write": own["inv_sent"] + own["evict_fetches"]}.get(side, 0.0)
+        W, F = v["msg_wait_ns"], v["F"]
+        c1 = W - rev - wb - meta
+        c2, c3, c4 = rev, wb + v["acquire_flush_ns"], meta + v["local_meta_ns"]
+        c5 = F - c1 - c2 - c3 - c4  # may be slightly negative (review L4: F counts transition reads only)
+        mode = "ds8-meanholder" if side == "write" and N and N > 2 else "ds8"
+        r = {"class": cls, "faults": v["n"], "F_ns": F, "W_ns": W, "cat1_comm_ns": c1, "cat2_unmap_tlb_ns": c2,
+             "cat3_flush_ns": c3, "cat4_metadata_ns": c4, "cat5_others_ns": c5,
+             "owner_revoke_ns": rev, "owner_wb_ns": wb, "owner_meta_ns": meta, "owner_rounds": R, "owner_src": src,
+             "acquire_flush_ns": v["acquire_flush_ns"], "local_meta_ns": v["local_meta_ns"],
+             "pte_install_ns": v["pte_install_ns"], "local_wait_ns": v["local_wait_ns"],
+             "residual_ns": c5 - v["pte_install_ns"] - v["local_wait_ns"],
+             "breakdown_faults": T.get("read_async_breakdown_faults") if cls == "read_async" else T.get("breakdown_faults"),
+             "nontrans_faults": T.get("nontrans_faults"), "mode": mode}
+        if cls.startswith("read"):
+            r["async_served_faults"] = T.get("read_async_faults")
+            r["sync_faults"] = sub(T.get("is_faults"), T.get("read_async_faults"))
+        rows.append(r)
+    return rows
 
 
 def breakdown(c, t):
@@ -376,8 +502,10 @@ def breakdown(c, t):
     per fault in us. Category 1 = W - (revoke + wb + meta)_last (= xport + owner reply/rest), so 1..5 sum to F."""
     T = t["T"]
     S = t["sum"]
+    if is_ds8(c, t):
+        return breakdown_ds8(c, t)
     rows = []
-    b13 = any(k.endswith("last_revoke_ns") for k in T) and (T.get("breakdown_faults") or 0) > 0
+    b13 = c.system != "ds" and any(k.endswith("last_revoke_ns") for k in T) and (T.get("breakdown_faults") or 0) > 0
     for cls, p, F, n in fault_classes(T):
         g = {k: T.get(f"{p}_{k}") for k in CAT_KEYS}
         W, H = g["msg_wait_ns"], g["owner_h_ns"]
@@ -399,7 +527,7 @@ def breakdown(c, t):
                      pte_install_ns=pte, local_wait_ns=lw, residual_ns=sub(c5, pte, lw) if c5 is not None else None)
         elif c.system == "ds":
             # De Stijl build 7: no owner phases in the ring ACK -> two parts: fetch wait (W) vs the rest
-            mode = "ds-2part"
+            mode = "ds7-2part"  # build-7 write W includes the CCD acquire work: never pool with ds8 rows (M3)
             r.update(fetch_wait_ns=W, rest_ns=sub(F, W) if F is not None and W is not None else None,
                      acquire_flush_ns=g["acquire_flush_ns"], pte_install_ns=g["pte_install_ns"],
                      local_wait_ns=g["local_wait_ns"])
@@ -501,7 +629,8 @@ COLS = {
                                      "acquire_flush_us", "local_meta_us", "pte_install_us", "local_wait_us",
                                      "residual_us", "owner_h_us", "fetch_wait_us", "rest_us", "async_served_faults",
                                      "sync_faults", "owner_h_rounds", "nontrans_faults", "breakdown_faults",
-                                     "sum_check_us"],
+                                     "sum_check_us", "owner_src", "owner_rounds", "owner_revoke_us", "owner_wb_us",
+                                     "owner_meta_us", "instr_build"],
     "fig-coherence-rates.csv": ID + ["step", "sel", "offered_total", "window_s", "read_faults_s", "write_faults_s",
                                      "nontrans_faults_s", "coh_msgs_s", "pop_rounds_s", "pop_requests_s", "pop_msgs_s",
                                      "ds_fetch_s", "ds_inv_s", "ds_ack_s", "ds_msgs_s", "searches_s"],
@@ -623,10 +752,11 @@ def extract(roots, out_dir, systems, override):
                     row = {**base, "class": b["class"], "mode": b["mode"], "faults": n_f,
                            "async_served_faults": b.get("async_served_faults"), "sync_faults": b.get("sync_faults"),
                            "owner_h_rounds": b.get("owner_h_rounds"), "nontrans_faults": b.get("nontrans_faults"),
-                           "breakdown_faults": b.get("breakdown_faults")}
+                           "breakdown_faults": b.get("breakdown_faults"), "owner_src": b.get("owner_src"),
+                           "owner_rounds": b.get("owner_rounds"), "instr_build": t["gmax"].get("sys.swmc.instr.build")}
                     for k in ("F", "W", "H", "xport", "comm_xport", "comm_owner_rest", "last_revoke", "last_wb",
                               "last_meta", "acquire_flush", "local_meta", "pte_install", "local_wait", "residual",
-                              "owner_h", "fetch_wait", "rest"):
+                              "owner_h", "fetch_wait", "rest", "owner_revoke", "owner_wb", "owner_meta"):
                         row[f"{k}_us"] = pf(f"{k}_ns")
                     for k in ("cat1_comm", "cat2_unmap_tlb", "cat3_flush", "cat4_metadata", "cat5_others"):
                         row[f"{k}_us"] = pf(f"{k}_ns")
