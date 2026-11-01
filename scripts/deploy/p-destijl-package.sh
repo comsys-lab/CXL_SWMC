@@ -11,7 +11,8 @@
 # Source identity: a build from a dirty tree (MANIFEST dirty_sha256) is accepted only if EQUIV_COMMIT reproduces the
 #   dirty hash: sha256(`git diff <source_commit> <EQUIV_COMMIT> -- famfs-linux` without the files the MANIFEST lists as
 #   untracked, then `git show <EQUIV_COMMIT>:<file>` of those files) == dirty_sha256 (same recipe as MANIFEST.txt), and
-#   msg_layer_module is unchanged between both commits and clean in KTREE. Clean builds need the tag rel/destijl-<n>.
+#   msg_layer_module is unchanged between both commits and clean in KTREE. Clean builds need the tag rel/destijl-<n>,
+#   or SOURCE_TAG=<tag> for a rebuild of a tagged commit under a new release (e.g. build 7 = SOURCE_TAG=rel/destijl-6).
 # XML_SRC: directory with vm<k>/candidate-normal.xml or cxl_vm<k>/candidate-normal.xml = the CURRENT inactive XML of
 #   cxl_vm<k> (default builds/popcorn_new/12/deploy-v1: the build-12 definitions the VMs run now). The rollback XML of
 #   this bundle is that file; p-destijl-deploy.sh precheck refuses unless `virsh dumpxml --inactive` equals it.
@@ -74,9 +75,10 @@ if [ -n "$DIRTY" ]; then
   [ "$got" = "$DIRTY" ] || { echo "STOP: $EQ does not reproduce dirty_sha256 ($got != $DIRTY)"; exit 1; }
   SRC_ID="$COMMIT + dirty $DIRTY == $EQ"
 else
-  EQ=$(git -C "$KTREE" rev-parse "rel/destijl-$n^{commit}")
-  [ "$EQ" = "$(git -C "$KTREE" rev-parse "$COMMIT^{commit}")" ] || { echo "STOP: tag rel/destijl-$n != build commit"; exit 1; }
-  SRC_ID="$COMMIT (tag rel/destijl-$n)"
+  TAG=${SOURCE_TAG:-rel/destijl-$n}
+  EQ=$(git -C "$KTREE" rev-parse "$TAG^{commit}")
+  [ "$EQ" = "$(git -C "$KTREE" rev-parse "$COMMIT^{commit}")" ] || { echo "STOP: tag $TAG != build commit"; exit 1; }
+  SRC_ID="$COMMIT (tag $TAG)"
 fi
 git -C "$KTREE" diff --quiet "$COMMIT" "$EQ" -- msg_layer_module || { echo "STOP: msg_layer_module differs between $COMMIT and $EQ"; exit 1; }
 git -C "$KTREE" diff --quiet "$EQ" -- msg_layer_module && [ -z "$(git -C "$KTREE" status --porcelain -- msg_layer_module)" ] ||
