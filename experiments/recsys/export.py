@@ -21,7 +21,9 @@ Formulas (per step): achieved_x, p50/p95/p99, n_rop = loadgen query stream; wop_
   node1_tlb_irqs_per_query, seg_processing = T - C; cxl_recv_cpu_s_per_s = sum over both nodes of
   kthr.cxl_recv*.run_ns deltas / 1e9 / max target window (same rule as the vector DB); Megalon flush bytes per query =
   (sum over nodes of megalon.flush_bytes - op.*.mg.wflush_bytes) / queries, flushed_lines_per_rop = that / 64
-  (Popcorn: read faults x 4096 / 64; all-HWcc 0); valid = stream_check.py per step (stream-check.csv);
+  (Popcorn and De Stijl: read faults x 4096 / 64; all-HWcc 0); valid = stream_check.py per step (stream-check.csv);
+  De Stijl v2 (system ds, eval3): canon.DS_COH columns (canon.ds_coh, server read ops = queries of the step,
+  sys.swmc.destijl.* deltas summed over both nodes, p95_us = max end value), empty for every other system;
   slo_summary valid = stream-results.tsv valid (every judged step valid).
 """
 import argparse
@@ -66,11 +68,12 @@ def threads(life):
 
 
 def stats(part):
-    """{step: (window_s, recv_run_ns, flush_bytes, wflush_bytes, has_flush)} summed over targets"""
+    """{step: (window_s, recv_run_ns, flush_bytes, wflush_bytes, has_flush, ds)} summed over targets; ds = De Stijl v2
+    sums {canon.DS_KEYS name: delta summed over nodes; p95_us: max end value (gauge)}, empty off a De Stijl kernel"""
     out = {}
     try:
         for fx, d in stats_delta.deltas(os.path.join(part, "loadgen")):
-            t = out.setdefault(fx["step"], [0.0, 0.0, 0.0, 0.0, False])
+            t = out.setdefault(fx["step"], [0.0, 0.0, 0.0, 0.0, False, {}])
             w = canon.fl(fx.get("window_s")) or 0.0
             t[0] = max(t[0], w)
             t[1] += sum(v for k, v in d.items() if k.startswith("kthr.cxl_recv") and k.endswith(".run_ns") and v)
@@ -78,6 +81,9 @@ def stats(part):
                 t[2] += d["megalon.flush_bytes"] or 0
                 t[3] += sum(v or 0 for k, v in d.items() if re.fullmatch(r"op\.[a-z_]+\.mg\.wflush_bytes", k))
                 t[4] = True
+            for k, key in canon.DS_KEYS.items():  # as experiments/vectordb/export.py
+                if d.get(key) is not None:
+                    t[5][k] = max(t[5].get(k) or 0, d[key]) if k == "p95_us" else (t[5].get(k) or 0) + d[key]
     except Exception as e:  # noqa: BLE001 (analysis only)
         print(f"export.py WARNING: {part}: stats unreadable ({e!r})", file=sys.stderr)
     return out
@@ -98,12 +104,12 @@ def step_rows(part, system):
         nq = canon.fl(b.get("queries"))
         isf = canon.fl(b.get("serve_is_faults"))
         rf = isf / nq if isf is not None and nq else (0.0 if system == "hw" and b else None)
-        win, recv, fb, wfb, hasf = stt.get(n, (0, 0, 0, 0, False))
+        win, recv, fb, wfb, hasf, ds = stt.get(n, (0, 0, 0, 0, False, {}))
         mgfb = (fb - wfb) / nq if hasf and nq else None
         lines = (mgfb / 64 if mgfb is not None else None) if system in ("mg", "mgoff") else \
-            (rf * 4096 / 64 if rf is not None else None) if system == "pop" else 0.0
+            (rf * 4096 / 64 if rf is not None else None) if system in ("pop", "ds") else 0.0
         v = sc.get(n, {}).get("valid")
-        out.append(dict(step=n, phase=d["phase"], offered_x=q.get("offered"), achieved_x=q.get("achieved"),
+        out.append(dict(canon.ds_coh(ds, nq, win), step=n, phase=d["phase"], offered_x=q.get("offered"), achieved_x=q.get("achieved"),
                         n_rop=q.get("done"), p50_ms=q.get("p50_ms"), p95_ms=q.get("p95_ms"), p99_ms=q.get("p99_ms"),
                         pass_=d["pass"], aborted=d.get("aborted"), valid=None if v is None else v == "True",
                         wop_per_s=u.get("achieved"), wop_offered_per_s=u.get("offered"),
@@ -143,7 +149,8 @@ def export_stream(E, out, vcpus):
                 out.add("slo_steps.csv", **c, **{k: r[k] for k in (
                     "step", "phase", "offered_x", "achieved_x", "n_rop", "p50_ms", "p95_ms", "p99_ms", "valid", "aborted",
                     "wop_per_s", "wop_offered_per_s", "wop_done_ratio", "T_ms_rop", "C_ms_rop", "T_ms_wop", "C_ms_wop",
-                    "pop_read_faults_per_rop", "owner_wait_ms_rop", "cxl_recv_cpu_s_per_s")}, **{"pass": r["pass_"]}, at_result=int(r["step"] in at),
+                    "pop_read_faults_per_rop", "owner_wait_ms_rop", "cxl_recv_cpu_s_per_s") + tuple(canon.DS_COH)},
+                        **{"pass": r["pass_"]}, at_result=int(r["step"] in at),
                         slo_pct=slo.get("pct"), slo_ms=slo.get("ms"), lifetime="sep")
             js = {d["step"]: d for d in canon.measured_steps(part)}
             for step, bins in sorted(canon.latency_hist(part, "query").items()):
@@ -216,7 +223,7 @@ def fix_row(r, c, level, valid, part, life):
             "wop_done_ratio", "T_ms_rop", "C_ms_rop", "T_ms_wop",
             "C_ms_wop", "pop_read_faults_per_rop", "seg_is_ms_rop", "seg_sm_ms_rop", "seg_wp_ms_rop",
             "seg_nontrans_ms_rop", "seg_inval_ipis_per_rop", "seg_processing_ms_rop", "mg_flush_bytes_per_rop",
-            "flushed_lines_per_rop", "cxl_recv_cpu_s_per_s")
+            "flushed_lines_per_rop", "cxl_recv_cpu_s_per_s") + tuple(canon.DS_COH)
     return dict(c, level=level, step=r["step"], valid=valid if valid is not None else r["valid"],
                 seg_owner_wait_ms_rop=r["owner_wait_ms_rop"], lifetime=life, source_dir=part, **{k: r[k] for k in keep})
 

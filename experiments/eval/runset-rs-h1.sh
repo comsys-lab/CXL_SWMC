@@ -10,9 +10,14 @@
 #          lifetime is the mg window when RS_MG_FIX_LEVELS = RS_MG_PROBE_Q) or mg + mgoff fix-only lifetimes.
 #   runs k >= 2 (cut Q8): no probe; decisions from run LEVELS_FROM_RUN's mg-decision.tsv (accepted run).
 # Layout: E/eval-manifest.txt, E/eval-state.txt, E/mg-decision.tsv, E/{probe,slo,fix}/ (block evidence dirs).
+# Optional conf key RS_MG_MGOFF (default 1; eval3 block C: 0): 0 = no mgoff lifetime (no C_diff): the probe alone is the
+#   Megalon floor at a "fix" rate; a "slo" rate gets the mg SLO lifetime only (no fixed windows).
 # usage: runset-rs-h1.sh <k> [--dry] [--v N]   (lib.sh)
 RUNSET=rs-h1 WL=recsys
+unset RS_MG_MGOFF   # conf key only (never inherited from the environment)
 . "$(dirname "$0")/lib.sh"
+MGOFF=${RS_MG_MGOFF:-1}
+[[ $MGOFF =~ ^[01]$ ]] || die "bad RS_MG_MGOFF ($MGOFF)"
 rs_checks
 for r in $RS_MG_POINTS; do [[ $r =~ ^[1-9][0-9]*$ ]] && [ $((r % 50)) = 0 ] || die "bad RS_MG_POINTS rate $r"; done
 case $RS_MG_SLO in auto|always|never) ;; *) die "bad RS_MG_SLO";; esac
@@ -59,9 +64,14 @@ groups() {  # from mg-decision.tsv (or RS_MG_SLO) -> SLO_RATES, FIX_RATES
 if [ $DRY = 1 ]; then
   [ $PROBE = 0 ] || block probe "$RS_MG_POINTS" mg mg "$RS_MG_PROBE_Q"
   groups "${DEC:-/dev/null}"
-  plan "decisions (dry: unknown rates shown as fix): slo [$SLO_RATES] fix [$FIX_RATES]"
-  [ -z "$SLO_RATES" ] || block slo "$SLO_RATES" "mg mgoff" mgoff "$RS_MG_FIX_LEVELS"
-  [ -z "$FIX_RATES" ] || block fix "$FIX_RATES" "mg mgoff" "mg mgoff" "$RS_MG_FIX_LEVELS"
+  plan "decisions (dry: unknown rates shown as fix): slo [$SLO_RATES] fix [$FIX_RATES] (RS_MG_MGOFF=$MGOFF)"
+  if [ $MGOFF = 0 ]; then
+    [ -z "$SLO_RATES" ] || block slo "$SLO_RATES" mg "" ""
+    [ -z "$FIX_RATES" ] || [ $PROBE = 1 ] || block fix "$FIX_RATES" mg mg "$RS_MG_FIX_LEVELS"
+  else
+    [ -z "$SLO_RATES" ] || block slo "$SLO_RATES" "mg mgoff" mgoff "$RS_MG_FIX_LEVELS"
+    [ -z "$FIX_RATES" ] || block fix "$FIX_RATES" "mg mgoff" "mg mgoff" "$RS_MG_FIX_LEVELS"
+  fi
   echo "DRY START OK ($RUNSET run $K): stops here, before the lock"; exit 0
 fi
 mkdir "$E" || die "mkdir $E"
@@ -80,8 +90,13 @@ else
   for r in $RS_MG_POINTS; do printf '%s\t%s\t\t\tRS_MG_SLO=%s\n' $r $([ $RS_MG_SLO = always ] && echo slo || echo fix) $RS_MG_SLO >> "$E/mg-decision.tsv"; done
 fi
 groups "$E/mg-decision.tsv"
-[ -z "$SLO_RATES" ] || block slo "$SLO_RATES" "mg mgoff" mgoff "$RS_MG_FIX_LEVELS"
-if [ -n "$FIX_RATES" ]; then
+if [ $MGOFF = 0 ]; then  # eval3: no mgoff; a probed "fix" rate is done (the probe window is the floor)
+  [ -z "$SLO_RATES" ] || block slo "$SLO_RATES" mg "" ""
+  [ -z "$FIX_RATES" ] || [ $PROBE = 1 ] || block fix "$FIX_RATES" mg mg "$RS_MG_FIX_LEVELS"
+else
+  [ -z "$SLO_RATES" ] || block slo "$SLO_RATES" "mg mgoff" mgoff "$RS_MG_FIX_LEVELS"
+fi
+if [ $MGOFF = 1 ] && [ -n "$FIX_RATES" ]; then
   if [ $PROBE = 1 ] && [ "$RS_MG_FIX_LEVELS" = "$RS_MG_PROBE_Q" ]; then block fix "$FIX_RATES" mgoff mgoff "$RS_MG_FIX_LEVELS"
   else block fix "$FIX_RATES" "mg mgoff" "mg mgoff" "$RS_MG_FIX_LEVELS"; fi
 fi

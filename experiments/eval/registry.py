@@ -30,7 +30,7 @@ if not os.path.exists(REG):
     shutil.copyfile(os.path.join(HERE, "runs.tsv"), REG)
 COLS = ["workload", "runset", "k", "evidence_dir", "config_sha256", "status", "date", "note"]
 STATUS = ("started", "measured", "stopped", "accepted", "invalid")
-WORKLOADS = {"vdb": ("vdb",), "recsys": ("rs-main", "rs-h1")}
+WORKLOADS = {"vdb": ("vdb",), "recsys": ("rs-main", "rs-h1", "rs-ds")}  # rs-ds: De Stijl RecSys (runset-rs-ds.sh)
 # H3 run set per N (RUN-H3.md); new H2 vector DB VM-count scaling per N (h2n-n<N>, RUN-H2N.md)
 H3_RUNSET = {"vdb": re.compile(r"h3-vdb-n[2-8]|h2n-n[2-8]"), "recsys": re.compile(r"h3-rs-n[2-8]")}
 

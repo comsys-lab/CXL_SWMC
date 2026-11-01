@@ -25,10 +25,19 @@
 #   (N-VM scripts, e.g. scripts/host/measure-env-n.sh) and EXPECT_RUNNING (default VM_DOMAINS) for h1-gate.sh;
 #   GATE_SCRIPT (optional): a Host gate wrapper called as `bash $GATE_SCRIPT check <out>` (rc 0 = pass) instead of
 #   h1-gate.sh / host-gate.sh, for H0 and for every run (N-VM measurement gate, e.g. scripts/host/h3-gate.sh).
+# eval3 additions (2026-11-01; all optional, unset = the behaviour above):
+#   POP_BUNDLE_SHA  sha256 of C8/packet.sha256; checked (+ sha256sum -c) before anything runs when a run has SYS=Popcorn;
+#                   REGION must then equal C8/tools/cxl_region.yaml
+#   EXPECT_NPROC    online CPUs every guest must show (precheck; 4 = the 4 vCPU rule, user 2026-11-01)
+#   SLO_EXTRA       exported loadgen arguments appended to every KIND=slo run (pilot-run.sh)
+#   DRY=1           validate the environment, bundles, region, build files and every RUNS line (pilot-run.sh DRY=1) and
+#                   print the plan; no lock, no ssh, nothing written; the evidence dir need not exist. "BLOCK DRY PASS".
+# The helper scripts are taken from this script's own directory (the live tree when run from CXL_SWMC).
 set -uo pipefail
 export PYTHONDONTWRITEBYTECODE=1
 E=$1
-P=/home/comsys/sungsu/destijl-control X=$P/CXL_SWMC/experiments/rocksdb G=$P/CXL_SWMC/experiments/vectordb/host-gate.sh
+DRY=${DRY:-0}; [[ $DRY =~ ^[01]$ ]] || { echo "BLOCK STOP: bad DRY"; exit 2; }
+P=/home/comsys/sungsu/destijl-control X=$(cd "$(dirname "$0")" && pwd) G=$P/CXL_SWMC/experiments/vectordb/host-gate.sh
 : "${OWNER:?}" "${EXPECT_K:?}" "${PRETOUCH_DIR:?}" "${L:?L = new guest install dir}" "${RUNS:?}"
 case "$L" in /home/comsys/?*) ;; *) echo "BLOCK STOP: L must be under /home/comsys/"; exit 2;; esac
 read -r -a IPS <<< "${NODES:-192.168.122.100 192.168.122.101}"
@@ -59,6 +68,39 @@ if [ -n "${GATE_SCRIPT:-}" ]; then  # h3-gate.sh (popcorn-n): needs the running 
   [ -f "$GATE_SCRIPT" ] || { echo "BLOCK STOP: GATE_SCRIPT $GATE_SCRIPT missing"; exit 2; }
   : "${MEASURE_ENV_DIR:?GATE_SCRIPT needs MEASURE_ENV_DIR}" "${MEASURE_PART_DIR:?GATE_SCRIPT needs MEASURE_PART_DIR}"
   export GATE_SCRIPT MEASURE_ENV_DIR MEASURE_PART_DIR EXPECT_RUNNING="${EXPECT_RUNNING:-$VM_DOMAINS}"
+fi
+if grep -q "SYS=Popcorn" <<< "$RUNS" && [ -n "${POP_BUNDLE_SHA:-}" ]; then  # eval3: verified Popcorn bundle + its region
+  [ -f "$C8/p-popcorn-shm.sh" ] && [ "$(sha256sum < "$C8/packet.sha256" | cut -c1-64)" = "$POP_BUNDLE_SHA" ] \
+    && (cd "$C8" && sha256sum -c --quiet packet.sha256) || { echo "BLOCK STOP: C8 is not the verified Popcorn bundle (POP_BUNDLE_SHA)"; exit 2; }
+  cmp -s "$REGION" "$C8/tools/cxl_region.yaml" || { echo "BLOCK STOP: REGION differs from the Popcorn bundle's region config"; exit 2; }
+fi
+[ -z "${EXPECT_NPROC:-}" ] || [[ $EXPECT_NPROC =~ ^[1-9][0-9]*$ ]] || { echo "BLOCK STOP: bad EXPECT_NPROC"; exit 2; }
+[ -f "$BUILD/manifest.txt" ] && [ -x "$BUILD/bin/rocksdb-server" ] && [ -x "$LOADGEN_BUILD/loadgen" ] || { echo "BLOCK STOP: BUILD or LOADGEN_BUILD incomplete"; exit 2; }
+[ -f "$REGION" ] || { echo "BLOCK STOP: REGION $REGION missing"; exit 2; }
+if [ "$DRY" = 1 ]; then  # plan only: no lock, no ssh, nothing written
+  echo "BLOCK DRY: E=$E OWNER=$OWNER N=${#IPS[@]} NODES=[${IPS[*]}] VM_DOMAINS=[$VM_DOMAINS] EXPECT_K=$EXPECT_K"
+  echo "BLOCK DRY: L=$L BUILD=$BUILD (server $(sha256sum < $BUILD/bin/rocksdb-server | cut -c1-16)) LOADGEN_BUILD=$LOADGEN_BUILD (loadgen $(sha256sum < $LOADGEN_BUILD/loadgen | cut -c1-16))"
+  echo "BLOCK DRY: REGION=$REGION sha256=$(sha256sum < "$REGION" | cut -c1-16) $(grep -E '^msg_ring:' "$REGION" | cut -d'#' -f1)"
+  echo "BLOCK DRY: PRETOUCH_DIR=$PRETOUCH_DIR GATE=${GATE_SCRIPT:-host-gate/h1-gate} MEASURE=${MEASURE:-0} EXPECT_DAX_UUID=${EXPECT_DAX_UUID:-} EXPECT_NPROC=${EXPECT_NPROC:-} MIN_MEM_G=${MIN_MEM_G:-16}"
+  echo "BLOCK DRY: SLO_EXTRA=[${SLO_EXTRA:-}]"
+  echo "BLOCK DRY: steps: lock $OWNER; pretouch-check-n; H0 gate; G1 install.sh -> $L on ${#IPS[@]} VMs; G2 precheck x${#IPS[@]}; dmesg base"
+  [ -d "$E" ] && echo "BLOCK DRY: evidence dir exists ($(ls -A "$E" | wc -l) entries)" || echo "BLOCK DRY: evidence dir does not exist yet (the caller creates it + tasks-check.txt)"
+  drc=0
+  while read -r name args; do
+    [ -n "${name:-}" ] || continue
+    # shellcheck disable=SC2206
+    A=($args)
+    sys=""; for x in "${A[@]}"; do case $x in SYS=*) sys=${x#SYS=};; esac; done
+    case "$sys" in
+      all-HWcc) ;;
+      Popcorn) A+=(C8=$C8 K8=$K8 GT8=$GT8 RECV_MODE=$RECV_MODE);;
+      DeStijl) A+=(DS_C=$DS_C DS_K=$DS_K DS_GT=$DS_GT RECV_MODE=$RECV_MODE);;
+      *) echo "BLOCK DRY STOP: $name: SYS must be all-HWcc, Popcorn or DeStijl"; drc=1; continue;;
+    esac
+    env DRY=1 LOCK_OWNER=$OWNER NODES="${IPS[*]}" V=$L BUILD=$BUILD LOADGEN_BUILD=$LOADGEN_BUILD "${A[@]}" bash $X/pilot-run.sh "$name" "$E" < /dev/null 2>&1 | sed 's/^/  /'
+    [ "${PIPESTATUS[0]}" = 0 ] || drc=1
+  done <<< "$RUNS"
+  [ $drc = 0 ] && { echo "BLOCK DRY PASS"; exit 0; } || { echo "BLOCK DRY FAIL"; exit 1; }
 fi
 [ -d "$E" ] && [ -z "$(ls -A "$E" | grep -vE '^(tasks-check\.txt|block\.out)$')" ] || { echo "BLOCK STOP: $E missing or not empty"; exit 2; }
 [ -s "$E/tasks-check.txt" ] || { echo "BLOCK STOP: $E/tasks-check.txt missing (state/TASKS.md: no other active VM user)"; exit 2; }
@@ -144,7 +186,7 @@ WANT="$(sha256sum < $BUILD/bin/rocksdb-server | cut -c1-64) $(sha256sum < $X/roc
   echo "msg_ring_slots_per_window(popcorn-n, 2 MiB ring)=$s (meaningful with cxl_region-ring2m.yaml)"; } | tee -a "$E/block.log" > "$E/region.txt"
 step "G2 pre-check"
 for i in "${!IPS[@]}"; do
-  $SSH comsys@${IPS[$i]} "EXPECT_K=$EXPECT_K L=$L EXPECT_SHA='$WANT' EXPECT_DAX_UUID=${EXPECT_DAX_UUID:-} MIN_MEM_G=${MIN_MEM_G:-16} bash -s" \
+  $SSH comsys@${IPS[$i]} "EXPECT_K=$EXPECT_K L=$L EXPECT_SHA='$WANT' EXPECT_DAX_UUID=${EXPECT_DAX_UUID:-} EXPECT_NPROC=${EXPECT_NPROC:-} MIN_MEM_G=${MIN_MEM_G:-16} bash -s" \
     < $X/precheck.sh > "$E/precheck-vm$i.txt" 2>&1
   grep -q "PRECHECK PASS" "$E/precheck-vm$i.txt" || stop "precheck vm$i: $(grep 'PRECHECK FAIL' "$E/precheck-vm$i.txt")"
 done

@@ -408,14 +408,19 @@ confirm_half() { python3 $X/main_util.py half "$1"; }        # 0.5 x confirm mea
 gatechk() { python3 $X/main_util.py gate "$1" "$SLO_MS" "$SLO_PCT"; }  # validity + within the SLO (p95)
 precheck() {
   local i f h files="${VM_PLAIN#/home/comsys/}/bin/recsys-server ${VM_PLAIN#/home/comsys/}/bin/recsys-node.sh ${VM_PLAIN#/home/comsys/}/cfg/cxl_region.yaml ${VM_MEG#/home/comsys/}/bin/recsys-server ${VM_MEG#/home/comsys/}/bin/recsys-node.sh ${VM_MEG#/home/comsys/}/lib/libmegalon-objapi.so ${VM_MEG#/home/comsys/}/lib/libmegalon.so ${VM_MEG#/home/comsys/}/cfg/megalon.yaml ${VM_MEG#/home/comsys/}/cfg/cxl_region.yaml"
+  # a De Stijl block without a Megalon lifetime (eval3 rs-ds: SYSTEMS=ds, REGION = the De Stijl region) does not compare
+  # the Megalon install's region (ring2m) with REGION; every other block is unchanged
+  local megr="${VM_MEG#/home/comsys/}/cfg/cxl_region.yaml ${REGION:-$P/CXL_SWMC/config/cxl_region.yaml}"
+  case " ${SYSTEMS:-hw pop mg} " in *" mg "*|*" mgoff "*|*" mgrow "*) ;; *) [ $HASDS = 0 ] || megr="";; esac
   for i in 0 1; do
     $SSH comsys@${IPS[$i]} "EXPECT_K=$KEXP MEM_MIN=60 EXPECT_DAX_UUID='${EXPECT_DAX_UUID:-}' INSTALL_FILES='$files' bash -s" < $X/precheck.sh > "$E/precheck-${IPS[$i]}.out" 2>&1
     grep -q "^PRECHECK PASS" "$E/precheck-${IPS[$i]}.out" || stop "precheck ${IPS[$i]}"
     for f in "${VM_PLAIN#/home/comsys/}/bin/recsys-server $HOST_PLAIN" "${VM_MEG#/home/comsys/}/bin/recsys-server $MB/bin/recsys-server" \
              "${VM_MEG#/home/comsys/}/lib/libmegalon-objapi.so $MB/lib/libmegalon-objapi.so" "${VM_MEG#/home/comsys/}/lib/libmegalon.so $MB/lib/libmegalon.so" \
              "${VM_MEG#/home/comsys/}/cfg/megalon.yaml $P/CXL_SWMC/systems/megalon/recsys-2vm.yaml" \
-             "${VM_PLAIN#/home/comsys/}/cfg/cxl_region.yaml ${REGION:-$P/CXL_SWMC/config/cxl_region.yaml}" "${VM_MEG#/home/comsys/}/cfg/cxl_region.yaml ${REGION:-$P/CXL_SWMC/config/cxl_region.yaml}" \
+             "${VM_PLAIN#/home/comsys/}/cfg/cxl_region.yaml ${REGION:-$P/CXL_SWMC/config/cxl_region.yaml}" "$megr" \
              "${VM_PLAIN#/home/comsys/}/bin/recsys-node.sh $P/CXL_SWMC/scripts/guest/recsys-node.sh" "${VM_MEG#/home/comsys/}/bin/recsys-node.sh $P/CXL_SWMC/scripts/guest/recsys-node.sh"; do
+      [ -n "$f" ] || continue
       set -- $f
       grep -q "^$(sha256sum "$2" | cut -d' ' -f1)  /home/comsys/$1\$" "$E/precheck-${IPS[$i]}.out" || stop "${IPS[$i]} /home/comsys/$1 != $2"
     done

@@ -22,6 +22,14 @@
 #   (54000000), THREADS (server request workers per node, 4), PREPARE_THREADS (4), FILE_EXTENTS (0 = rest of share),
 #   SEED (20261018), LOG (0), GATE (1), V (/home/comsys/rocksdb3), BUILD (builds/rocksdb/3), LOADGEN_BUILD
 #   (builds/rocksdb-loadgen/1), STOP_EXTENTS_FREE / STOP_BLOCKS_FREE (run.sh), SERVER_CPUS, READY_TIMEOUT (7200).
+#   SLO_EXTRA (KIND=slo only; eval3 2026-11-01): loadgen arguments appended after the slo arguments above (loadgen keeps
+#   the last value of a repeated option), e.g. the vector DB cell rule "--confirm-rule pooled --confirm-full
+#   --confirm-reps 1 --confirm-s 90 --confirm-warmup-s 15 --overload-base result --overload 0.9,...,2.0
+#   --start-fail-steps 1.25,1.5,2,2.5,3.4"; every --option in it must exist in the loadgen binary (builds/rocksdb-
+#   loadgen/2 or later). With SLO_EXTRA the loadgen note "the start rate already violates the SLO" is a NOTE (a result:
+#   no rate under the SLO at or above the start; as experiments/eval/h2n-block.sh), not a STOP.
+#   DRY=1: validate the arguments and print the plan (cxl_shm cycle, run.sh call, loadgen arguments); no ssh, no lock,
+#   no evidence written; exit 0.
 # Prints "PILOTRUN <name> OK|NOTE|STOP <reason>"; exit 0 for OK/NOTE, 1 for STOP.
 set -uo pipefail
 export PYTHONDONTWRITEBYTECODE=1
@@ -35,8 +43,12 @@ KEYS=${KEYS:-54000000} THREADS=${THREADS:-4} PREPARE_THREADS=${PREPARE_THREADS:-
 SEED=${SEED:-20261018} LOG=${LOG:-0}
 V=${V:-/home/comsys/rocksdb3} BUILD=${BUILD:-$P/builds/rocksdb/3} LOADGEN_BUILD=${LOADGEN_BUILD:-$P/builds/rocksdb-loadgen/1}
 stop() { echo "PILOTRUN $NAME STOP $*"; exit 1; }
-[ -d "$E" ] || stop "missing evidence dir $E"
-[ -e "$E/$NAME" ] && stop "$E/$NAME exists"
+DRY=${DRY:-0}
+[[ $DRY =~ ^[01]$ ]] || stop "bad DRY"
+if [ "$DRY" = 0 ]; then
+  [ -d "$E" ] || stop "missing evidence dir $E"
+  [ -e "$E/$NAME" ] && stop "$E/$NAME exists"
+fi
 [[ $UPDATE_RATIO =~ ^(0\.05|0\.5|0\.8)$ ]] || stop "bad UPDATE_RATIO"
 [[ $KEYS =~ ^[1-9][0-9]*$ ]] && [[ $THREADS =~ ^[1-9][0-9]*$ ]] || stop "bad KEYS/THREADS"
 [[ $LOG =~ ^[01]$ ]] && [[ ${GATE:-1} =~ ^[01]$ ]] || stop "bad LOG/GATE"
@@ -77,6 +89,32 @@ case "$KIND" in
        LG+=(--slo mixed:99:600000 --raw --warmup-s 10 --step-warmup-s 5 --step-measure-s 30 --drain-s 10);;
   *) stop "bad KIND";;
 esac
+if [ -n "${SLO_EXTRA:-}" ]; then
+  [ "$KIND" = slo ] || stop "SLO_EXTRA is for KIND=slo only"
+  [[ $SLO_EXTRA =~ ^[-a-z0-9.,\ ]+$ ]] || stop "SLO_EXTRA: only lower-case options, numbers, commas and spaces"
+  [ -x "$LOADGEN" ] || stop "loadgen $LOADGEN missing"
+  # shellcheck disable=SC2206
+  XA=($SLO_EXTRA)
+  for a in "${XA[@]}"; do
+    case "$a" in --*) grep -a -q -E -e "(^| )$a( |$)" "$LOADGEN" || stop "loadgen $LOADGEN has no option $a (needs builds/rocksdb-loadgen/2+)";; esac
+  done
+  LG+=("${XA[@]}")
+fi
+if [ "$DRY" = 1 ]; then
+  [ -x "$LOADGEN" ] && [ -x "$HOST_SERVER" ] || stop "loadgen $LOADGEN or server $HOST_SERVER missing"
+  [ $COH = 0 ] || [ -f "$SHMS" ] || stop "$SHMS missing"
+  echo "DRY $NAME SYS=$SYS SYSTEM=$SYSTEM N=$N KIND=$KIND UPDATE_RATIO=$UPDATE_RATIO KEYS=$KEYS THREADS=$THREADS V=$V"
+  echo "DRY $NAME loadgen=$LOADGEN sha256=$(sha256sum < "$LOADGEN" | cut -c1-16) server=$HOST_SERVER sha256=$(sha256sum < "$HOST_SERVER" | cut -c1-16)"
+  echo "DRY $NAME server_args=[$SERVER_ARGS] gate=${GATE_SCRIPT:-host-gate or h1-gate} lock_owner=${LOCK_OWNER:-unset}"
+  if [ $COH = 1 ]; then
+    echo "DRY $NAME cxl_shm cycle: env ${PS[*]} bash $SHMS {precheck,load,chown,enable}; recv_mode=$RECV_MODE; status runpre/runpost; teardown"
+    plan=$(env "${PS[@]}" bash $SHMS plan precheck load chown enable status teardown 2>&1) || stop "$SHMS plan failed: $(tail -n 2 <<< "$plan")"
+    echo "DRY $NAME $(head -n 1 <<< "$plan") -> $(grep -c '^ssh ' <<< "$plan") ssh commands planned"
+  fi
+  echo "DRY $NAME run.sh $NAME $E -- ${LG[*]}${PER_VM_RATES:+ (+ --mode fixed --rates N x $PER_VM_RATES)}"
+  echo "PILOTRUN $NAME DRY OK"
+  exit 0
+fi
 SSH="ssh -o BatchMode=yes -o ConnectTimeout=8"
 PAT='(^|[ /])bin/rocksdb-serve[r]( |$)'
 servers_gone() {  # no rocksdb-server of ours and /dev/dax0.0 unused on every VM (fail-closed)
@@ -164,6 +202,8 @@ grep -q "workload_finish\":\"ok" $R/loadgen/summary.json || stop "loadgen worklo
 if [ $RC != 0 ]; then
   note=$(python3 -B -c 'import json,sys; print(json.load(open(sys.argv[1])).get("note",""))' $R/loadgen/summary.json 2>/dev/null)
   [ "$KIND" = slo ] && [[ "$note" == *"confirm failed at three rates"* ]] && { echo "PILOTRUN $NAME NOTE $note"; exit 0; }
+  [ "$KIND" = slo ] && [ -n "${SLO_EXTRA:-}" ] && [ "$note" = "the start rate already violates the SLO; lower --start" ] \
+    && { echo "PILOTRUN $NAME NOTE $note"; exit 0; }
   stop "run.sh rc $RC ($note)"
 fi
 [ "$LOG" = 1 ] && { grep -q "^check_log rc=0$" $R/check-log.txt || stop "check_log"; }

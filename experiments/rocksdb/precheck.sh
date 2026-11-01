@@ -1,13 +1,15 @@
 #!/bin/bash
 # RocksDB guest pre-check (reports/ROCKSDB-V1-packet.md), per guest, read-only + sudo -n fuser (standing grant A):
 #   ssh comsys@<ip> 'EXPECT_K=<release> L=<install dir> EXPECT_SHA="<sha server> <sha node.sh> <sha region>" bash -s' < precheck.sh
-# optional EXPECT_DAX_UUID (namespace0.0 uuid), EXPECT_DAX_SIZE (103060340736), MIN_MEM_G (16).
+# optional EXPECT_DAX_UUID (namespace0.0 uuid), EXPECT_DAX_SIZE (103060340736), MIN_MEM_G (16), EXPECT_NPROC.
 # FAILS (exit 1, "PRECHECK FAIL <item>") unless: kernel = EXPECT_K, cxl_shm not loaded, no famfs, /dev/dax0.0 root:root 600
 # and unused, no rocksdb-server/kv/lmdb/vdb/recsys process (command line), the installed files' sha256 = EXPECT_SHA
 # (in that order: bin/rocksdb-server bin/rocksdb-node.sh cfg/cxl_region.yaml), ldd complete, available memory >= MIN_MEM_G.
 fail() { echo "PRECHECK FAIL $*"; exit 1; }
 echo "host=$(hostname) uname=$(uname -r) nproc=$(nproc) $(date -Is)"
 [ "$(uname -r)" = "${EXPECT_K:?}" ] || fail "kernel $(uname -r) != $EXPECT_K"
+# optional EXPECT_NPROC (eval3: 4 = the 4 vCPU rule; on the 16 vCPU XMLs guest CPUs 4-15 must be offline)
+[ -z "${EXPECT_NPROC:-}" ] || [ "$(nproc)" = "$EXPECT_NPROC" ] || fail "nproc $(nproc) != $EXPECT_NPROC (online $(cat /sys/devices/system/cpu/online))"
 echo "cxl_shm_loaded=$(lsmod | grep -c cxl_shm) famfs_mounts=$(grep -c famfs /proc/mounts)"
 [ "$(grep -c famfs /proc/mounts)" = 0 ] || fail famfs
 [ "$(lsmod | grep -c cxl_shm)" = 0 ] || fail "cxl_shm loaded"
