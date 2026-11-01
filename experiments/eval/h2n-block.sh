@@ -11,7 +11,7 @@
 # Called by experiments/eval/runset-h2n.sh (never by hand in a real run).
 # usage: h2n-block.sh <evidence dir (exists; empty except sequence*)>
 # env: H2N_N (2..8), H2N_VCPU (4; 16 on the 2-VM topology, runset-h2n.sh H2N_TOPO=2), H2N_LIFETIMES ("<sys>:<mix>
-#   ..." or "<sys>:<mix>:r<j> ..." in execution order; sys hw | pop | mg | mgoff, mix u5 | u10 | u50 | u90 | u95), EVAL_RUN (k), SEED, REGION, C8 K8 GT8 RECV_MODE POP_BUNDLE_SHA, PRETOUCH_DIR (VM8-v* evidence
+#   ..." or "<sys>:<mix>:r<j> ..." in execution order; sys hw | pop | ds | mg | mgoff, mix u5 | u10 | u50 | u90 | u95), EVAL_RUN (k), SEED, REGION, C8 K8 GT8 RECV_MODE POP_BUNDLE_SHA, PRETOUCH_DIR (VM8-v* evidence
 #   of the current QEMU lifetimes), MEASURE_ENV_DIR MEASURE_PART_DIR (h3-gate.sh), EXPECT_DAX_UUID,
 #   VPLAIN PLAIN_BUILD LOADGEN X_DATA X_WRITES X_NB X_MAXIDS X_MAXW X_MAXD X_INIT_CAP, X_NA (optional: pool A size =
 #   the init image's record count, conf VDB_X_NA; unset = 26990000, the 28M image, as every run before 2026-10-30),
@@ -19,6 +19,19 @@
 #   conf VDB_MG_CAPACITY: h1 = --max-ids 28000000 without --init-capacity, the fp32 28M cap, unset = h1 as before;
 #   x = the plain layout values --max-ids X_MAXIDS --init-capacity X_INIT_CAP, for the 54M SQ8 set),
 #   H2N_SLO_PART (loadgen SLO part arguments), H2N_OPCOH_STRICT (0 | 1), H2N_CXLBW (0 | 1), H2N_HOSTCPU (0 | 1)
+#   De Stijl v2 (only when a lifetime is ds; systems/destijl/system.yaml): DS_C (bundle dir with p-destijl-shm.sh and
+#   packet.sha256), DS_BUNDLE_SHA (sha256 of that packet.sha256), DS_K (guest release -ds-destijl-<n>: every VM of the
+#   block runs it, so hw lifetimes of a ds block run on the De Stijl kernel without cxl_shm, and pop and ds never share
+#   a block), DS_GT (guest tools dir: p-destijl-guest.sh, destijl.env, faultlat, cxl_region.yaml), DS_REGION (optional;
+#   default config/cxl_region-destijl.yaml; replaces REGION for the whole block: the app area sits below the 16 MiB De
+#   Stijl block), H2N_DS_T_US (optional staleness bound T in us for the servers, default 0 = synchronous; passed as
+#   ENV:CXL_SYSTEM=ds ENV:CXL_DESTIJL_T_US=<T>). ds cycle = p-destijl-shm.sh precheck / load (protocol=destijl,
+#   init_state=shared, recv_mode=RECV_MODE: poll | sleep) / chown / preload (as pop) / enable / recv_mode / status, and
+#   teardown after the lifetime. ds lifetimes are checked with opcoh_check.py destijl (popcorn rules + De Stijl
+#   counters present, tx_timeout / protocol_error deltas 0; same H2N_OPCOH_STRICT rule as pop) and, after the
+#   teardown, recv_check.py --name <lifetime> (E/recv-check-<name>.txt: recv_mode, cxl_shm v13 state, protocol, De
+#   Stijl counters, receive thread, tx_timeout / protocol_error status deltas 0, per-step ds columns); a recv check FAIL
+#   always stops the block (as runset-vdb.sh / runset-rs-main.sh).
 # Order: lock -> [CXL.mem sampler] -> pretouch check (N VMs) -> h3 gate -> guest prechecks + install sha256 vs the Host
 # builds -> dmesg baseline -> lifetimes (each: h3 gate, dax owner, [Popcorn: shm load / preload / enable / recv_mode /
 # instr], run.sh part slo, checks, [teardown], dmesg check) -> pretouch check (end) -> BLOCK DONE.
@@ -38,7 +51,7 @@ die() { echo "BLOCK STOP: $*"; exit 2; }
 # pending artifact (per-N Megalon build / install dir / config) is reported, not fatal, in a dry start only
 DRYB=${H2N_BLOCK_DRY:-0}
 pending() { if [ "$DRYB" = 1 ]; then echo "BLOCK DRY NOTE: $* (a real run stops here)"; else die "$*"; fi; }
-: "${H2N_N:?}" "${H2N_VCPU:?}" "${H2N_LIFETIMES:?}" "${H2N_SLO_PART:?}" "${EVAL_RUN:?}" "${SEED:?}" "${REGION:?}" "${C8:?}" "${K8:?}" "${GT8:?}"
+: "${H2N_N:?}" "${H2N_VCPU:?}" "${H2N_LIFETIMES:?}" "${H2N_SLO_PART:?}" "${EVAL_RUN:?}" "${SEED:?}" "${C8:?}" "${K8:?}" "${GT8:?}"
 : "${RECV_MODE:?}" "${POP_BUNDLE_SHA:?}" "${PRETOUCH_DIR:?}" "${MEASURE_ENV_DIR:?}" "${MEASURE_PART_DIR:?}" "${EXPECT_DAX_UUID:?}"
 : "${VPLAIN:?}" "${PLAIN_BUILD:?}" "${LOADGEN:?}" "${X_DATA:?}" "${X_WRITES:?}" "${X_NB:?}" "${X_MAXIDS:?}" "${X_MAXW:?}" "${X_MAXD:?}" "${X_INIT_CAP:?}"
 N=$H2N_N VCPU=$H2N_VCPU STRICT=${H2N_OPCOH_STRICT:-0} CXLBW=${H2N_CXLBW:-0} HOSTCPU=${H2N_HOSTCPU:-0}
@@ -50,17 +63,30 @@ N=$H2N_N VCPU=$H2N_VCPU STRICT=${H2N_OPCOH_STRICT:-0} CXLBW=${H2N_CXLBW:-0} HOST
 [[ $X_MAXD =~ ^[1-9][0-9]*$ ]] || die "bad X_MAXD"
 # lifetimes: <sys>:<mix> or <sys>:<mix>:r<j> (repeat j, runset-h2n.sh H2N_REPEATS; run dir <sys>-<mix>-n<N>-r<j>), no
 # id twice
-LIVES=() HASMG=0 HASPOP=0 seen=" "
+LIVES=() HASMG=0 HASPOP=0 HASDS=0 seen=" "
 for l in $H2N_LIFETIMES; do
   s=${l%%:*} m=${l#*:} m=${m%%:*}
   [[ $l =~ ^[a-z]+:u[0-9]+(:r[1-9])?$ ]] || die "bad lifetime id $l (<sys>:<mix>[:r<j>])"
-  case $s in hw|pop) ;; mg|mgoff) HASMG=1;; *) die "bad system in $l";; esac
+  case $s in hw|pop) ;; ds) HASDS=1;; mg|mgoff) HASMG=1;; *) die "bad system in $l";; esac
   case $m in u5|u10|u50|u90|u95) ;; *) die "bad mix in $l (u5 | u10 | u50 | u90 | u95)";; esac   # u10 u95: new H1 on H2N_TOPO=2
   [ $s = pop ] && HASPOP=1
   [[ $seen == *" $l "* ]] && die "lifetime $l listed twice"; seen+="$l "
   LIVES+=("$l")
 done
 [ ${#LIVES[@]} -ge 1 ] || die "no lifetimes"
+# De Stijl v2 (ds): its own guest kernel (CONFIG_SWMC_DE_STIJL excludes Popcorn MSI), bundle, region and T
+KEXP=$K8 DST=0
+if [ $HASDS = 1 ]; then
+  [ $HASPOP = 0 ] || die "pop and ds lifetimes need different guest kernels: run them in separate blocks"
+  : "${DS_C:?}" "${DS_BUNDLE_SHA:?}" "${DS_K:?}" "${DS_GT:?}"
+  [[ $DS_K == *-ds-destijl-* ]] || die "DS_K=$DS_K is not a De Stijl release (-ds-destijl-<n>)"
+  [[ $RECV_MODE =~ ^(poll|sleep)$ ]] || die "RECV_MODE=$RECV_MODE: De Stijl (cxl_shm v13 protocol=destijl) refuses idle"
+  DST=${H2N_DS_T_US:-0}
+  [[ $DST =~ ^(0|[1-9][0-9]*)$ ]] || die "bad H2N_DS_T_US ($DST: integer us, 0 = synchronous)"
+  REGION=${DS_REGION:-$TREE/config/cxl_region-destijl.yaml}   # replaces REGION for the whole block (app offset)
+  KEXP=$DS_K
+fi
+: "${REGION:?}"
 # Fixed-window lifetimes (optional; unset = every lifetime is one SLO search, as before): H2N_FIXED = tokens
 #   <sys>/<part>/<detail>/<recv>/<rates>/<warmup s>/<measure s>/<drain s>
 # A lifetime of system <sys> runs the parts of its tokens in the given order (run.sh PARTS, one server lifetime;
@@ -79,7 +105,7 @@ declare -A FPARTS=()   # sys -> "part ..."
 FDET=0
 for t in $FIXED; do
   IFS=/ read -r fs fp fd fr frt fw fm fdr <<< "$t"
-  [[ $fs =~ ^(hw|pop|mg|mgoff)(@u[0-9]+)?$ ]] && [[ $fp =~ ^[a-z0-9]+$ ]] && [[ $fd =~ ^(0|1|-)$ ]] && [[ $fr =~ ^(poll|idle|sleep|-)$ ]] \
+  [[ $fs =~ ^(hw|pop|ds|mg|mgoff)(@u[0-9]+)?$ ]] && [[ $fp =~ ^[a-z0-9]+$ ]] && [[ $fd =~ ^(0|1|-)$ ]] && [[ $fr =~ ^(poll|idle|sleep|-)$ ]] \
     && [[ $frt =~ ^[0-9.]+(,[0-9.]+)*$ ]] && [[ $fw =~ ^[0-9]+$ ]] && [[ $fm =~ ^[1-9][0-9]*$ ]] && [[ $fdr =~ ^[0-9]+$ ]] \
     || die "bad H2N_FIXED token $t (<sys>/<part>/<0|1|->/<poll|idle|sleep|->/<rates>/<warmup>/<measure>/<drain>)"
   [ ${fs%%@*} = pop ] || [ "$fd:$fr" = "-:-" ] || die "H2N_FIXED $t: detail / recv_mode only for pop"
@@ -96,8 +122,13 @@ if [ -n "$FIXED" ]; then
 fi
 [[ $ALLOWDET =~ ^[01]$ ]] || die "bad H2N_ALLOW_DETAIL"
 [ -z "$NENV_X" ] || [[ $NENV_X =~ ^(ENV:[A-Z_][A-Z0-9_]*=[^[:space:]]*( |$))+$ ]] || die "bad H2N_NODE_ENV_EXTRA ($NENV_X)"
+if [ $HASDS = 1 ]; then  # the De Stijl bundle instead of the Popcorn one (no pop lifetime in a ds block)
+  [ -f "$REGION" ] && [ -f "$DS_C/p-destijl-shm.sh" ] && [ "$(sha256sum < "$DS_C/packet.sha256" | cut -c1-64)" = "$DS_BUNDLE_SHA" ] \
+    && (cd "$DS_C" && sha256sum -c --quiet packet.sha256) || die "REGION ($REGION) or the De Stijl bundle ($DS_C) does not verify"
+else
 [ -f "$REGION" ] && [ "$(sha256sum < "$C8/packet.sha256" | cut -c1-64)" = "$POP_BUNDLE_SHA" ] \
   && (cd "$C8" && sha256sum -c --quiet packet.sha256) || die "REGION or the Popcorn bundle ($C8) does not verify"
+fi
 IPS=() DOMS=()
 for k in $(seq 0 $((N - 1))); do IPS+=(192.168.122.$((100 + k))); DOMS+=(cxl_vm$k); done
 export NODES="${IPS[*]}" VM_DOMAINS="${DOMS[*]}" POP_IPS="${IPS[*]}" EXPECT_RUNNING="${DOMS[*]}"
@@ -189,6 +220,7 @@ OWNER=eval-h2n-n$N-run$EVAL_RUN
 echo "BLOCK PLAN: vec_format=$VF ef=$EF init=$INIT host_image=$HOST_IMAGE"
 echo "BLOCK PLAN: h2n vdb N=$N vcpu/VM=$VCPU threads $ST+1 nodes=[${IPS[*]}] lifetimes=[${LIVES[*]}] app=$APP mg_app=$MGAPP ring=$RING cxlbw=$CXLBW hostcpu=$HOSTCPU opcoh_strict=$STRICT"
 echo "BLOCK PLAN: server_args plain=[$SA]${MGSA:+ megalon=[$MGSA]}"
+[ $HASDS = 0 ] || echo "BLOCK PLAN: destijl release=$DS_K bundle=$DS_C guest_tools=$DS_GT region=$REGION T=$DST us recv_mode=$RECV_MODE (node env CXL_SYSTEM=ds CXL_DESTIJL_T_US=$DST)"
 echo "BLOCK PLAN: $LAYOUT"
 [ -z "$FIXED" ] || echo "BLOCK PLAN: fixed windows (no SLO search) [$FIXED] node_env_extra=[$NENV_X] allow_detail=$ALLOWDET"
 if [ "$DRYB" = 1 ]; then echo "BLOCK DRY STOP: evidence-dir check reached ($E; dry: no lock, no VM contact)"; exit 0; fi
@@ -250,6 +282,13 @@ shm_teardown_left() {  # every cxl_shm load of this block without "teardown PASS
            && env K=$K8 GT=$GT8 C=$C8 R=$r bash $C8/p-popcorn-shm.sh teardown >> "$E/cleanup.out" 2>&1; }
     grep -q "teardown PASS" "$r/steps.log" 2>/dev/null || echo "CLEANUP FAILED: $r (manual: P-popcorn packet §6)" | tee -a "$E/cleanup.out"
   done
+  for r in "$E"/dsshm-*/; do  # De Stijl loads (ds lifetimes): same rule, p-destijl-shm.sh teardown
+    r=${r%/}; [ -d "$r" ] && [ -f "$r/load-vm0.txt" ] || continue
+    grep -q "teardown PASS" "$r/steps.log" 2>/dev/null && continue
+    dax_unused cleanup || { echo "CLEANUP FAILED: $r: /dev/dax0.0 in use, teardown not attempted (manual: p-destijl-shm.sh teardown)" | tee -a "$E/cleanup.out"; continue; }
+    env K=$DS_K GT=$DS_GT C=$DS_C R=$r bash $DS_C/p-destijl-shm.sh teardown >> "$E/cleanup.out" 2>&1
+    grep -q "teardown PASS" "$r/steps.log" 2>/dev/null || echo "CLEANUP FAILED: $r (manual: p-destijl-shm.sh teardown)" | tee -a "$E/cleanup.out"
+  done
 }
 finish() {
   trap '' INT TERM HUP
@@ -284,6 +323,7 @@ gate() { bash "$HG" check "$E/gate-$1.txt" > /dev/null || stop "h3 gate ($1; see
   [ $HASMG = 1 ] && echo "megalon_build=$MEG_BUILD lib=$MEG_LIB cfg=$MEG_CFG sha256=$(sha256sum < "$MEG_CFG" | cut -c1-64) vmeg=$VMEG mg_max_deletes=$MG_MAXD"
   echo "writes=$X_WRITES sha256=$(sha256sum < "$X_WRITES" | cut -c1-64) max_deletes=$X_MAXD"
   echo "slo_part=[$H2N_SLO_PART]"
+  [ $HASDS = 0 ] || echo "destijl: bundle=$DS_C bundle_sha=$DS_BUNDLE_SHA release=$DS_K guest_tools=$DS_GT region=$REGION t_us=$DST recv_mode=$RECV_MODE"
   [ -z "$FIXED" ] || echo "fixed=[$FIXED] node_env_extra=[$NENV_X] allow_detail=$ALLOWDET (H2N_FIXED: the slo part is not run)"
   for d in "${DOMS[@]}"; do x=$(virsh -c qemu:///system dumpxml --inactive "$d" 2>/dev/null); echo "vm_xml_sha256.$d=$(printf '%s' "$x" | sha256sum | cut -c1-64) bytes=${#x}"; done
 } > "$E/h2n-params.txt"
@@ -295,7 +335,7 @@ SUMS=$(sha256sum < "$HOST_IMAGE/SHA256SUMS" | cut -c1-64)
 ALLINST=$INSTALL${MGINSTALL:+
 $MGINSTALL}
 for i in "${!IPS[@]}"; do
-  $SSH comsys@${IPS[$i]} "PRECHECK_ALLOW_DETAIL=$ALLOWDET EXPECT_K=$K8 EXPECT_DAX_UUID=$EXPECT_DAX_UUID INIT_DIR=$INIT INIT_SUMS=$SUMS INIT_CHECK=$([ $i = 0 ] && echo 1 || echo 0) INSTALL_DIRS='$(echo "$ALLINST" | awk '{print $1}' | tr '\n' ' ')' bash -s" \
+  $SSH comsys@${IPS[$i]} "PRECHECK_ALLOW_DETAIL=$ALLOWDET EXPECT_K=$KEXP EXPECT_DAX_UUID=$EXPECT_DAX_UUID INIT_DIR=$INIT INIT_SUMS=$SUMS INIT_CHECK=$([ $i = 0 ] && echo 1 || echo 0) INSTALL_DIRS='$(echo "$ALLINST" | awk '{print $1}' | tr '\n' ' ')' bash -s" \
     < $XV/m4-precheck.sh > "$E/precheck-vm$i.txt" 2>&1
   grep -q "^PRECHECK PASS" "$E/precheck-vm$i.txt" || stop "precheck vm$i: $(grep -m1 'PRECHECK FAIL' "$E/precheck-vm$i.txt")"
   while read -r g h; do
@@ -341,11 +381,57 @@ pop_down() {
   dax_unused pre-teardown || stop "/dev/dax0.0 in use before the cxl_shm teardown"
   env "${PS[@]}" bash $C8/p-popcorn-shm.sh teardown >> "$E/block.log" 2>&1 || stop "shm teardown"
 }
-sys_up() {  # <sys> <name>: dax owner (hw, mg, mgoff: comsys) + Popcorn cycle
+# ---- De Stijl v2 cxl_shm cycle (protocol=destijl, init_state=shared; systems/destijl/system.yaml) on the N guests ------
+# Same order and checks as pop_up: precheck, load (+ state running on every node), chown, region check, preload
+# through a plain mapping (node 0), enable (syscall 470, protocol destijl), recv_mode, status.
+ds_up() {  # <name>
+  DSP=(K=$DS_K GT=$DS_GT C=$DS_C R=$E/dsshm-$1 INIT_STATE=shared "LOAD_EXTRA=recv_mode=$RECV_MODE")
+  [ $OWNED = root ] || { dax_owner root || stop "dax0.0 back to root before De Stijl"; OWNED=root; }
+  servers_gone || stop "a server runs before the De Stijl load"
+  env "${DSP[@]}" bash $DS_C/p-destijl-shm.sh precheck >> "$E/block.log" 2>&1 || stop "ds shm precheck"
+  dax_unused pre-load-$1 || stop "/dev/dax0.0 in use before the cxl_shm (destijl) load"
+  local ph ip m p i t
+  for ph in load chown; do env "${DSP[@]}" bash $DS_C/p-destijl-shm.sh $ph >> "$E/block.log" 2>&1 || stop "ds shm $ph"; done
+  for ip in "${IPS[@]}"; do
+    [ "$($SSH comsys@$ip "test -f $VPLAIN/cfg/cxl_region.yaml && test -f $DS_GT/cxl_region.yaml && sha256sum $VPLAIN/cfg/cxl_region.yaml $DS_GT/cxl_region.yaml | cut -d' ' -f1 | sort -u | wc -l" < /dev/null)" = 1 ] \
+      || stop "region config missing or different on $ip (De Stijl tools)"
+  done
+  t=$(date +%s)
+  $SSH comsys@${IPS[0]} "mkdir -p $VPLAIN/runs && echo \$\$ > $VPLAIN/runs/preload-$1.pid && exec timeout -k 30 1200 env CXL_REGION_CONFIG=$VPLAIN/cfg/cxl_region.yaml $VPLAIN/bin/vdb-server --node 0 --preload-only --init-dir $INIT $SA" \
+    < /dev/null > "$E/preload-$1.log" 2>&1
+  echo "preload_wall_s=$(( $(date +%s) - t ))" >> "$E/preload-$1.log"
+  { grep -q "PRELOAD DONE" "$E/preload-$1.log" && servers_gone; } || stop "preload ($1)"
+  env "${DSP[@]}" bash $DS_C/p-destijl-shm.sh enable >> "$E/block.log" 2>&1 || stop "ds enable gate"
+  for ip in "${IPS[@]}"; do
+    m=$($SSH comsys@$ip "sudo -n sh -c 'echo $RECV_MODE > /sys/module/cxl_shm/parameters/recv_mode' && cat /sys/module/cxl_shm/parameters/recv_mode" < /dev/null)
+    p=$($SSH comsys@$ip "cat /sys/kernel/swmc/page_coherence/protocol" < /dev/null)
+    i=$($SSH comsys@$ip "cat /sys/kernel/swmc/instr/enabled 2>/dev/null || echo absent" < /dev/null)
+    echo "$ip recv_mode=$m protocol=$p instr_enabled=$i" >> "$E/recv-mode-$1.txt"
+    [ "$m" = "$RECV_MODE" ] && [ "$p" = destijl ] || stop "recv_mode / protocol on $ip ($m, $p)"
+  done
+  env "${DSP[@]}" STATUS_TAG=pre bash $DS_C/p-destijl-shm.sh status >> "$E/block.log" 2>&1 || stop "ds status pre"
+}
+ds_down() {
+  env "${DSP[@]}" STATUS_TAG=post bash $DS_C/p-destijl-shm.sh status >> "$E/block.log" 2>&1
+  servers_gone || stop "servers left (De Stijl teardown not attempted)"
+  dax_unused pre-teardown || stop "/dev/dax0.0 in use before the cxl_shm (destijl) teardown"
+  env "${DSP[@]}" bash $DS_C/p-destijl-shm.sh teardown >> "$E/block.log" 2>&1 || stop "ds shm teardown"
+}
+sys_up() {  # <sys> <name>: dax owner (hw, mg, mgoff: comsys) + Popcorn / De Stijl cycle
   case $1 in
     hw|mg|mgoff) [ $OWNED = comsys ] || { dax_owner comsys || stop "dax0.0 -> comsys"; OWNED=comsys; };;
     pop) pop_up "$2";;
+    ds) ds_up "$2";;
   esac
+}
+sys_down() {  # <sys>: Popcorn / De Stijl teardown after the lifetime (nothing for the others)
+  case $1 in pop) pop_down;; ds) ds_down;; esac
+}
+ds_recv() {  # <name>: recv_check.py on this ds lifetime (needs its teardown files and stats-steps.csv); FAIL stops
+  python3 -I -B $EV/recv_check.py "$E" --mode "$RECV_MODE" --name "$1" --out "$E/recv-check-$1.txt" > /dev/null 2>&1
+  local r; r=$(tail -n 1 "$E/recv-check-$1.txt" 2>/dev/null)
+  log "$1: recv check: ${r:-no recv-check-$1.txt}"
+  [[ $r == "RECVCHECK PASS"* ]] || stop "$1: recv check FAIL (see recv-check-$1.txt)"
 }
 # ---- one lifetime: run.sh (N nodes, PARTS=slo) with the H1 SLO part arguments ---------------------------------------
 vdb_life() {  # <sys> <mix> [r<j>]
@@ -358,6 +444,7 @@ vdb_life() {  # <sys> <mix> [r<j>]
   case $s in
     hw)  RE+=(SYSTEM=all-HWcc NODE_ENV= NODE0_ENV= "SERVER_ARGS=$SA"); mode=hwcc OPS=none;;
     pop) RE+=(SYSTEM=Popcorn-$RECV_MODE NODE_ENV= NODE0_ENV= "SERVER_ARGS=$SA --preloaded"); mode=popcorn OPS=swmc_acct;;
+    ds)  RE+=(SYSTEM=DeStijl-$RECV_MODE-T$DST "NODE_ENV=ENV:CXL_SYSTEM=ds ENV:CXL_DESTIJL_T_US=$DST" NODE0_ENV= "SERVER_ARGS=$SA --preloaded"); mode=destijl OPS=ds;;
     mg)  RE+=(SYSTEM=Megalon V=$VMEG HOST_SERVER=$MEG_BUILD/bin/vdb-server "SERVER_ARGS=$MGSA" "NODE_ENV=ENV:RACKOBJ_CONFIG=$VMEG/cfg/megalon.yaml"
               NODE0_ENV=ENV:MEGALON_REINIT=1); mode=megalon-vm OPS=cohsnap;;
     mgoff) RE+=(SYSTEM=Megalon V=$VMEG HOST_SERVER=$MEG_BUILD/bin/vdb-server "SERVER_ARGS=$MGSA"
@@ -368,7 +455,7 @@ vdb_life() {  # <sys> <mix> [r<j>]
   log "$name: run.sh part slo ($s, $mix, N=$N)"
   env "${RE[@]}" bash $XV/run.sh "$name" "$E" -- "${LG[@]}" > "$E/$name.out" 2>&1; rc=$?
   log "$name: run.sh rc $rc: $(tail -n 1 "$E/$name.out")"
-  [ $s = pop ] && pop_down
+  sys_down $s
   servers_gone || stop "servers left after $name"
   [ -d "$R" ] || stop "$name: no run dir"
   for k in "${!IPS[@]}"; do  # clean stop, no bad record, op coherence on and error-free (m4-run.sh rules, N nodes)
@@ -378,6 +465,7 @@ vdb_life() {  # <sys> <mix> [r<j>]
     case $OPS in
       swmc_acct) grep -qE "^vdb-server: op coherence on, popcorn source swmc_acct[ ,]" $L || stop "$name node$k: popcorn source != swmc_acct";;
       cohsnap) grep -qE "^vdb-server: op coherence on, .*megalon cohsnap on," $L || stop "$name node$k: megalon cohsnap not on";;
+      ds) [ "$DST" = 0 ] || grep -q "^vdb-server: de stijl staleness T=$DST us on " $L || stop "$name node$k: staleness T=$DST not applied";;
     esac
     { grep -qx "opcoh.read_errors=0" $L && grep -qx "opcoh.register_errors=0" $L; } || stop "$name node$k: opcoh errors"
   done
@@ -395,6 +483,7 @@ vdb_life() {  # <sys> <mix> [r<j>]
     [ $STRICT = 1 ] && stop "$name: opcoh_check $mode $oc (see $RP/opcoh-check.txt)"
     log "$name NOTE: opcoh_check $mode $oc on $N nodes (H2N_OPCOH_STRICT=0: recorded; see $RP/opcoh-check.txt)"
   fi
+  [ $s != ds ] || ds_recv $name
   python3 $XV/urate_check.py $RP --writers 1 > $RP/urate-check.txt 2>&1 || true
   python3 $XV/e1_check.py --writes $X_WRITES --na $NA --nb $X_NB --searches $RP/loadgen/searches.bin --out $RP/e1 --sample 500 > /dev/null \
     || stop "$name: E1 violation (see $RP/e1.e1.txt)"
@@ -436,6 +525,7 @@ vdb_fixed_life() {  # <sys> <mix>
   case $s in
     hw)  RE+=(SYSTEM=all-HWcc "NODE_ENV=$NENV_X" NODE0_ENV= "SERVER_ARGS=$SA"); mode=hwcc OPS=none;;
     pop) RE+=(SYSTEM=Popcorn-$RECV_MODE "NODE_ENV=$NENV_X" NODE0_ENV= "SERVER_ARGS=$SA --preloaded"); mode=popcorn OPS=swmc_acct;;
+    ds)  RE+=(SYSTEM=DeStijl-$RECV_MODE-T$DST "NODE_ENV=ENV:CXL_SYSTEM=ds ENV:CXL_DESTIJL_T_US=$DST${NENV_X:+ $NENV_X}" NODE0_ENV= "SERVER_ARGS=$SA --preloaded"); mode=destijl OPS=ds;;
     mg)  RE+=(SYSTEM=Megalon V=$VMEG HOST_SERVER=$MEG_BUILD/bin/vdb-server "SERVER_ARGS=$MGSA" "NODE_ENV=ENV:RACKOBJ_CONFIG=$VMEG/cfg/megalon.yaml${NENV_X:+ $NENV_X}"
               NODE0_ENV=ENV:MEGALON_REINIT=1); mode=megalon-vm OPS=cohsnap;;
     mgoff) RE+=(SYSTEM=Megalon V=$VMEG HOST_SERVER=$MEG_BUILD/bin/vdb-server "SERVER_ARGS=$MGSA"
@@ -447,7 +537,7 @@ vdb_fixed_life() {  # <sys> <mix>
   env "${RE[@]}" FIXED_SPEC="$FIXED" RECV_MODE=$RECV_MODE bash $XV/run.sh "$name" "$E" -- "${LG[@]}" > "$E/$name.out" 2>&1; rc=$?
   log "$name: run.sh rc $rc: $(tail -n 1 "$E/$name.out")"
   env FIXED_SPEC="$FIXED" RECV_MODE=$RECV_MODE bash $EV/fixed-part-hook.sh check $s end >>"$E/$name-hook-end.txt" 2>&1 || log "$name NOTE: detail / recv_mode not at the defaults after the lifetime (see $name-hook-end.txt; the EXIT trap restores detail)"
-  [ $s = pop ] && pop_down
+  sys_down $s
   servers_gone || stop "servers left after $name"
   [ -d "$R" ] || stop "$name: no run dir"
   [ $rc = 0 ] || stop "$name: run.sh rc $rc (a part failed; see $E/$name.out, $R/part-hooks.txt)"
@@ -458,6 +548,7 @@ vdb_fixed_life() {  # <sys> <mix>
     case $OPS in
       swmc_acct) grep -qE "^vdb-server: op coherence on, popcorn source swmc_acct[ ,]" $L || stop "$name node$k: popcorn source != swmc_acct";;
       cohsnap) grep -qE "^vdb-server: op coherence on, .*megalon cohsnap on," $L || stop "$name node$k: megalon cohsnap not on";;
+      ds) [ "$DST" = 0 ] || grep -q "^vdb-server: de stijl staleness T=$DST us on " $L || stop "$name node$k: staleness T=$DST not applied";;
     esac
     { grep -qx "opcoh.read_errors=0" $L && grep -qx "opcoh.register_errors=0" $L; } || stop "$name node$k: opcoh errors"
     [[ $NENV_X != *VDB_LOCK_SPLIT=1* ]] || grep -q "^vdb-server: lock split on" $L || stop "$name node$k: lock split not on"
@@ -480,6 +571,7 @@ vdb_fixed_life() {  # <sys> <mix>
     python3 $XV/e1_check.py --writes $X_WRITES --na $NA --nb $X_NB --searches $RP/loadgen/searches.bin --out $RP/e1 --sample 500 > /dev/null \
       || stop "$name/$p: E1 violation (see $RP/e1.e1.txt)"
   done
+  [ $s != ds ] || ds_recv $name
   note="fixed parts: $parts"
   # dmesg first (review M1): a result row means every check of this lifetime passed, so a resume never skips the next
   # cell for a failure of this one

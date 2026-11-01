@@ -235,6 +235,16 @@ class Server {
       be_ = std::make_unique<Be>(r_, map_, p_, api_, uint64_t(o_.mg_rows_per_object));
     else be_ = std::make_unique<Be>(r_, map_, p_);
     if (!be_->fits(&err)) die(err);
+    if constexpr (std::is_same_v<Be, PlainBackend>) {
+      // De Stijl v2: staleness bound T ($CXL_DESTIJL_T_US, only with CXL_SYSTEM=ds) on each embedding table's row
+      // range (widened to whole pages; neighbouring tables share a boundary page, same T), once after the mapping;
+      // a no-op for every other system and for T unset / 0. The striped version table stays HWcc.
+      uint64_t t = 0;
+      for (uint32_t k = 0; k < kSparse; k++)
+        if (p_.rows[k] && cxl::region_apply_staleness(r_, be_->slot(k, 0), p_.rows[k] * p_.slot_bytes, &t) != 0)
+          die("de stijl staleness (CXL_DESTIJL_T_US) on table " + std::to_string(k) + ": " + std::strerror(errno));
+      if (t) std::fprintf(stderr, "recsys-server: de stijl staleness T=%lu us on %u tables\n", (unsigned long)t, kSparse);
+    }
     be_->set_time_sample(o_.megalon_time_sample);
     be_->thread_init(0);
     pool_.start(o_.load_threads, [this](int i) { be_->thread_init(1 + i, kRolePrep); cxl::proc::name_thread("rs-prep"); });

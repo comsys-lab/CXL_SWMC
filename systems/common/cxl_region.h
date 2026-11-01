@@ -13,6 +13,10 @@
 #include <string>
 #include <vector>
 
+#ifdef CXL_REGION_DESTIJL
+#include "de_stijl.h"  // systems/destijl/lib (libdestijl): region_apply_staleness below
+#endif
+
 namespace cxl {
 
 struct range {
@@ -215,6 +219,36 @@ inline bool region_load(const char *path, region *r, std::string *err,
     }
   }
   return true;
+}
+
+// De Stijl v2 staleness bound T (reports/design/DS2-protocol-spec.md §6) of an SWcc range of the whole-device
+// mapping at map_va. T comes from $CXL_DESTIJL_T_US (microseconds); it applies only when $CXL_SYSTEM is "ds" (set by
+// the harness for De Stijl lifetimes, experiments/eval/h2n-block.sh). Unset/empty/0 T or another system: no-op,
+// returns 0 without a syscall (behaviour of every other system unchanged). Otherwise [addr, addr + len), widened to
+// whole 4 KiB pages, must lie inside swcc; then de_stijl_set_staleness (libdestijl, syscall 472). The call is
+// compiled in only with -DCXL_REGION_DESTIJL (the build includes systems/destijl/lib and links libdestijl); without
+// it a T > 0 request fails with ENOSYS (fail closed: a ds run never silently runs synchronous).
+// Returns 0 (applied or no-op; *t_us = the T applied, 0 for a no-op) or -1 with errno (EINVAL: bad T value or range
+// outside swcc; ENOSYS; or the syscall's errno).
+inline int region_apply_staleness(const region &r, void *addr, size_t len, uint64_t *t_us = nullptr) {
+  if (t_us) *t_us = 0;
+  const char *t = getenv("CXL_DESTIJL_T_US");
+  const char *sys = getenv("CXL_SYSTEM");
+  if (!t || !*t || !sys || std::strcmp(sys, "ds") != 0) return 0;
+  uint64_t v = 0;
+  if (!detail::parse_u64(t, &v)) { errno = EINVAL; return -1; }
+  if (v == 0) return 0;
+  const uint64_t a = reinterpret_cast<uint64_t>(addr), lo = a & ~4095ull, hi = (a + len + 4095) & ~4095ull;
+  const uint64_t s0 = r.map_va + r.swcc.offset, s1 = r.map_va + r.swcc.end();
+  if (len == 0 || lo < s0 || hi > s1) { errno = EINVAL; return -1; }
+#ifdef CXL_REGION_DESTIJL
+  if (de_stijl_set_staleness(reinterpret_cast<void *>(lo), size_t(hi - lo), v) != 0) return -1;
+  if (t_us) *t_us = v;
+  return 0;
+#else
+  errno = ENOSYS;
+  return -1;
+#endif
 }
 
 // One-line summary for logs and run manifests.

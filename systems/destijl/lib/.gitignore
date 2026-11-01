@@ -1,0 +1,3 @@
+*.o
+libdestijl.a
+de_stijl_test

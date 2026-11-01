@@ -33,6 +33,39 @@ VDB_COH = ["srv_searches", "srv_updates", "mg_fetch_per_s", "mg_flush_writeend_p
            "mg_flush_bytes_per_s", "mg_wflush_bytes_per_s", "mg_wflushes_per_s", "mg_rflush_bytes_per_rop",
            "mg_rflushes_per_rop", "mg_rflush_bytes_per_flush", "mg_search_events_per_rop", "pop_search_is_per_rop",
            "fig3_lines_per_rop", "mg_fetch_per_op"]
+# per-step De Stijl v2 columns (systems/common/proc_stats.h sys.swmc.destijl.*, summed over the nodes of a step;
+# empty for every other system), appended after VDB_COH to slo_steps.csv and fixed.csv. Formulas (ds_coh below):
+#   ds_{filtered,merged,fetch,inv}_per_rop = ccd_filtered | ccd_merged | fetch_sent | inv_sent / server read ops
+#   ds_async_share          = async_issued / (async_issued + async_fallback_mean + async_fallback_p95)
+#   ds_async_fallback_share = (async_fallback_mean + async_fallback_p95) / the same denominator
+#                             (both empty when no read fault on a T > 0 range needed a FETCH in the step)
+#   ds_p95_us               = max over nodes of the end value of p95_us (SS residence p95, gauge)
+#   ds_bpd_evict_per_s      = bpd_evict / step window (s)
+#   ds_replica_refresh_per_rop = replica_refresh / server read ops (replica_mode=all: every completed async page costs
+#                             one extra minor fault after the ACK refresh; a reader may subtract it; 0 without replicas)
+DS_COH = ["ds_filtered_per_rop", "ds_merged_per_rop", "ds_fetch_per_rop", "ds_inv_per_rop", "ds_async_share",
+          "ds_async_fallback_share", "ds_p95_us", "ds_bpd_evict_per_s", "ds_replica_refresh_per_rop"]
+DS_KEYS = {k: "sys.swmc.destijl." + k for k in ("ccd_filtered", "ccd_merged", "fetch_sent", "inv_sent", "async_issued",
+                                                "async_fallback_mean", "async_fallback_p95", "p95_us", "bpd_evict",
+                                                "replica_refresh")}
+
+
+def ds_coh(sums, rops, window_s):
+    """DS_COH values of one step. sums: {DS_KEYS name: summed delta over nodes (p95_us: max end value)}, None when no
+    node reported it (not a De Stijl kernel -> every column empty); rops: server read ops of the step; window_s: s"""
+    if all(sums.get(k) is None for k in DS_KEYS):
+        return {c: None for c in DS_COH}
+    g = lambda k: sums.get(k) or 0.0  # noqa: E731 (a listed counter missing on a De Stijl kernel reads 0)
+    pr = lambda v: v / rops if rops else None  # noqa: E731
+    den = g("async_issued") + g("async_fallback_mean") + g("async_fallback_p95")
+    return {"ds_filtered_per_rop": pr(g("ccd_filtered")), "ds_merged_per_rop": pr(g("ccd_merged")),
+            "ds_fetch_per_rop": pr(g("fetch_sent")), "ds_inv_per_rop": pr(g("inv_sent")),
+            "ds_async_share": g("async_issued") / den if den else None,
+            "ds_async_fallback_share": (g("async_fallback_mean") + g("async_fallback_p95")) / den if den else None,
+            "ds_p95_us": sums.get("p95_us"), "ds_bpd_evict_per_s": g("bpd_evict") / window_s if window_s else None,
+            "ds_replica_refresh_per_rop": pr(g("replica_refresh"))}
+
+
 # lowest measured ramp step of an SLO search (verifier L3): hatched bars for searches without a confirmed max
 LOWEST = ["lowest_ramp_step", "lowest_ramp_offered_x", "lowest_ramp_achieved_x", "lowest_ramp_p99_ms",
           "lowest_ramp_mg_fetch_per_op"]
@@ -48,7 +81,7 @@ SCHEMA = {
         "step", "phase", "offered_x", "achieved_x", "n_rop", "p50_ms", "p95_ms", "p99_ms", "pass", "valid",
         "at_result", "aborted", "wop_per_s", "wop_offered_per_s", "wop_done_ratio", "T_ms_rop", "C_ms_rop", "T_ms_wop", "C_ms_wop",
         "pop_read_faults_per_rop", "pop_write_faults_per_rop", "pop_read_faults_per_wop", "pop_write_faults_per_wop",
-        "owner_wait_ms_rop", "cxl_recv_cpu_s_per_s", "slo_pct", "slo_ms", "lifetime"] + VDB_COH,
+        "owner_wait_ms_rop", "cxl_recv_cpu_s_per_s", "slo_pct", "slo_ms", "lifetime"] + VDB_COH + DS_COH,
     "latency_hist.csv": KEY + ["system", "point", "step", "phase", "offered_x", "bin_hi_us", "count"],
     "fixed.csv": KEY + POINT + [
         "level", "level_set", "step", "offered_x", "achieved_x", "valid", "slo_pass", "n_rop", "p95_ms", "p99_ms", "wop_per_s",
@@ -58,7 +91,7 @@ SCHEMA = {
         "seg_is_ms_rop", "seg_sm_ms_rop", "seg_wp_ms_rop", "seg_ipi_ms_rop", "seg_nontrans_ms_rop",
         "seg_owner_wait_ms_rop", "seg_inval_ipis_per_rop", "seg_processing_ms_rop",
         "mg_flush_bytes_per_rop", "mg_wflush_bytes_per_wop", "flushed_lines_per_rop", "cxl_recv_cpu_s_per_s",
-        "mgoff_T_ms_rop", "mgoff_T_ms_wop", "lifetime", "source_dir"] + VDB_COH,
+        "mgoff_T_ms_rop", "mgoff_T_ms_wop", "lifetime", "source_dir"] + VDB_COH + DS_COH,
     "mg_probe.csv": KEY + ["point", "offered_x", "T_ms_rop", "p95_ms", "achieved_wop_per_s", "backlog_end",
                            "lag_ms_max", "valid", "decision", "source_dir"],
 }

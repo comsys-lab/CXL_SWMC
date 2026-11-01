@@ -38,6 +38,17 @@ BUILD=${BUILD:-$P/builds/rocksdb/3} LOADGEN_BUILD=${LOADGEN_BUILD:-$P/builds/roc
 PAT='(^|[ /])bin/rocksdb-serve[r]( |$)'
 SSH="ssh -o BatchMode=yes -o ConnectTimeout=8"
 if grep -q "SYS=Popcorn" <<< "$RUNS"; then : "${C8:?}" "${K8:?}" "${GT8:?}" "${RECV_MODE:?}"; [ "$EXPECT_K" = "$K8" ] || { echo "BLOCK STOP: EXPECT_K != K8"; exit 2; }; fi
+# De Stijl v2 runs (SYS=DeStijl; as experiments/eval/h2n-block.sh ds): DS_C DS_K DS_GT DS_BUNDLE_SHA RECV_MODE (poll |
+# sleep); EXPECT_K = DS_K (every run of the block on the De Stijl kernel), so Popcorn and De Stijl never share a block;
+# REGION must be the De Stijl region config (the bundle's tools/cxl_region.yaml, e.g. config/cxl_region-destijl.yaml).
+if grep -q "SYS=DeStijl" <<< "$RUNS"; then
+  : "${DS_C:?}" "${DS_K:?}" "${DS_GT:?}" "${DS_BUNDLE_SHA:?}" "${RECV_MODE:?}"
+  ! grep -q "SYS=Popcorn" <<< "$RUNS" || { echo "BLOCK STOP: Popcorn and De Stijl runs need different guest kernels"; exit 2; }
+  [ "$EXPECT_K" = "$DS_K" ] || { echo "BLOCK STOP: EXPECT_K != DS_K"; exit 2; }
+  [ -f "$DS_C/p-destijl-shm.sh" ] && [ "$(sha256sum < "$DS_C/packet.sha256" | cut -c1-64)" = "$DS_BUNDLE_SHA" ] \
+    && (cd "$DS_C" && sha256sum -c --quiet packet.sha256) || { echo "BLOCK STOP: DS_C is not the verified De Stijl bundle"; exit 2; }
+  cmp -s "$REGION" "$DS_C/tools/cxl_region.yaml" || { echo "BLOCK STOP: REGION differs from the De Stijl bundle's region config"; exit 2; }
+fi
 if [ "${MEASURE:-0}" = 1 ]; then  # h1-gate.sh needs both (partition + measurement environment evidence)
   : "${MEASURE_PART_DIR:?MEASURE=1 needs MEASURE_PART_DIR}" "${MEASURE_ENV_DIR:?MEASURE=1 needs MEASURE_ENV_DIR}"
   export H1_MEASURE_RUN=1 MEASURE_PART_DIR MEASURE_ENV_DIR EXPECT_RUNNING="${EXPECT_RUNNING:-$VM_DOMAINS}"
@@ -71,6 +82,12 @@ finish() {
       || { grep -q "instr_enabled=1 missing" "$r/steps.log" 2>/dev/null && env POP_IPS="$POP_IPS" K=$K8 GT=$GT8 C=$C8 R=$r bash $C8/p-popcorn-shm.sh instr-on >> "$E/cleanup.out" 2>&1 \
            && env POP_IPS="$POP_IPS" K=$K8 GT=$GT8 C=$C8 R=$r bash $C8/p-popcorn-shm.sh teardown >> "$E/cleanup.out" 2>&1; }
     grep -q "teardown PASS" "$r/steps.log" 2>/dev/null || echo "CLEANUP FAILED: $r (manual: reports/M5-pilot-kv.md §6)" | tee -a "$E/cleanup.out"
+  done
+  for r in "$E"/dsshm-*/; do  # De Stijl loads: same rule, p-destijl-shm.sh teardown
+    r=${r%/}; [ -d "$r" ] && [ -f "$r/load-vm0.txt" ] || continue
+    grep -q "teardown PASS" "$r/steps.log" 2>/dev/null && continue
+    env DS_IPS="${IPS[*]}" K=$DS_K GT=$DS_GT C=$DS_C R=$r bash $DS_C/p-destijl-shm.sh teardown >> "$E/cleanup.out" 2>&1
+    grep -q "teardown PASS" "$r/steps.log" 2>/dev/null || echo "CLEANUP FAILED: $r (manual: p-destijl-shm.sh teardown)" | tee -a "$E/cleanup.out"
   done
   for ip in "${IPS[@]}"; do
     out=$($SSH comsys@$ip 'sudo -n chown root:root /dev/dax0.0 && sudo -n chmod 600 /dev/dax0.0; echo stat=$(stat -c "%U:%G %a" /dev/dax0.0)' < /dev/null 2>&1)
@@ -142,7 +159,9 @@ while read -r name args; do
     all-HWcc) [ "$OWNED" = comsys ] || { step "dax0.0 -> comsys (all-HWcc)"; dax_owner comsys; OWNED=comsys; };;
     Popcorn)  [ "$OWNED" = root ] || { step "dax0.0 -> root:root 600 (Popcorn cycle owns it)"; dax_owner root; OWNED=root; }
               A+=(C8=$C8 K8=$K8 GT8=$GT8 RECV_MODE=$RECV_MODE);;
-    *) stop "$name: SYS must be all-HWcc or Popcorn";;
+    DeStijl)  [ "$OWNED" = root ] || { step "dax0.0 -> root:root 600 (De Stijl cycle owns it)"; dax_owner root; OWNED=root; }
+              A+=(DS_C=$DS_C DS_K=$DS_K DS_GT=$DS_GT RECV_MODE=$RECV_MODE);;
+    *) stop "$name: SYS must be all-HWcc, Popcorn or DeStijl";;
   esac
   step "$name ${A[*]}"
   env LOCK_OWNER=$OWNER NODES="${IPS[*]}" V=$L BUILD=$BUILD LOADGEN_BUILD=$LOADGEN_BUILD "${A[@]}" bash $X/pilot-run.sh "$name" "$E" < /dev/null 2>&1 \

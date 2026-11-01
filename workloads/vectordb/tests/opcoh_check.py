@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Checks of the per-operation time split (DESIGN.md §15) on a host_smoke.sh scratch dir (Host only).
 
-usage: opcoh_check.py <run or scratch dir> fake|megalon|none|hwcc|popcorn|megalon-vm|megalon-t0
+usage: opcoh_check.py <run or scratch dir> fake|megalon|none|hwcc|popcorn|destijl|megalon-vm|megalon-t0
   (host_smoke.sh scratch dirs and run.sh run dirs have the same layout: loadgen/, node<k>.log)
   N nodes (h2n blocks, N = 2..8): OPCOH_NODES=N, else every contiguous node<k>.log from node0; server totals are
   summed over all N nodes ("both nodes" below = every node).
@@ -32,6 +32,17 @@ usage: opcoh_check.py <run or scratch dir> fake|megalon|none|hwcc|popcorn|megalo
               together (warm-up excluded for both); a
               measured step whose searches have C = 0 prints "OPCOH_CHECK NOTE" (few invalidated pages read at a low
               rate), not a failure; no Megalon part.
+  destijl:    De Stijl v2 (plain backend with libdestijl, cxl_shm v13 protocol=destijl loaded; h2n-block.sh ds): every
+              popcorn-mode check (De Stijl fills the same swmc_acct), plus: the De Stijl counters
+              sys.swmc.destijl.{ccd_filtered,fetch_sent,inv_sent,async_issued,async_fallback_mean,async_fallback_p95,
+              tx_timeout,protocol_error} (systems/common/proc_stats.h) in every node's final stats; tx_timeout and
+              protocol_error deltas = 0 on every target between the first begin and the last end loadgen stats
+              snapshot (<part>/loadgen/stats/, ordered by mono_ns) of the parts in OPCOH_PARTS (no snapshots or a
+              missing key: FAIL); prints ds_async_share = async_issued / (async_issued + async_fallback_mean +
+              async_fallback_p95) over the same window and nodes (experiments/eval/canon.py DS_COH); prints
+              replica_pages / replica_pool_full of every node's final stats, FAIL if replica_pool_full != 0 (a full
+              pool maps CXL directly: replicated and unreplicated pages mixed); OPCOH_DS_REPLICA_MODE=all also
+              FAILs when either key is missing.
   megalon-vm: Megalon with CohSnap + AnchorSnap (shim v3): both present on every record, sum of c_ns > 0 per op type,
               validation copies counted; every Popcorn part 0 (cxl_shm unloaded); MEGALON_LEAN=1 in the environment
               (Megalon >= 76 runs, reports/VDB-V1-packet.md v1.3): lean bit on and events_always off on every record,
@@ -255,13 +266,72 @@ pop_zero = ((c["pf_ns"] == 0).all() and (c["pf_cnt"] == 0).all() and (c["ipi_ns"
 mg_fields = [f for f in opsplit.OPCOH.names if f.startswith("mg_") or f.startswith("an_") or f.startswith("vcopy")]
 if mode == "hwcc":
     check(pop_zero and all((c[f] == 0).all() for f in mg_fields) and (c["c_ns"] == 0).all(), "all-HWcc: C = 0")
-elif mode == "popcorn":
+elif mode in ("popcorn", "destijl"):  # De Stijl v2 fills the same swmc_acct (kernel/swmc/destijl.c): same rules
     check(all(s["opcoh.pop_source"] == "swmc_acct" and s["opcoh.register_errors"] == 0 for s in st)
           and ((c["src"] & 3) == 1).all(), "swmc_acct registered on every node")
     meas = logs["measured"] == 1  # both sums over the measured steps only (warm-up excluded for both)
-    check(int(logs["c"]["c_ns"][(logs["op"] == 4) & meas].sum()) > 0, "Popcorn update C > 0 over all measured steps")
-    check(int(logs["c"]["c_ns"][(logs["op"] == 3) & meas].sum()) > 0, "Popcorn search C > 0 over all measured steps")
+    check(int(logs["c"]["c_ns"][(logs["op"] == 4) & meas].sum()) > 0, f"{mode} update C > 0 over all measured steps")
+    check(int(logs["c"]["c_ns"][(logs["op"] == 3) & meas].sum()) > 0, f"{mode} search C > 0 over all measured steps")
     check(all((c[f] == 0).all() for f in mg_fields), "no Megalon part")
+if mode == "destijl":
+    DSP = "sys.swmc.destijl."
+    DSK = ("ccd_filtered", "fetch_sent", "inv_sent", "async_issued", "async_fallback_mean", "async_fallback_p95",
+           "tx_timeout", "protocol_error")
+    miss = sorted({k for s in st for k in DSK if not isinstance(s.get(DSP + k), int)})
+    check(not miss, "De Stijl counters in every node's final stats" + (f" (missing {', '.join(miss)})" if miss else ""))
+
+    def snap(path):  # loadgen stats snapshot: header line "# when=.. mono_ns=..", then the server's key=value text
+        hdr, kv = {}, {}
+        with open(path) as f:
+            first = f.readline()
+            if first.startswith("#"):
+                hdr = dict(t.partition("=")[::2] for t in first[1:].split())
+            for line in f:
+                k, sep, v = line.rstrip("\n").partition("=")
+                if sep and v.isdigit():
+                    kv[k] = int(v)
+        return int(hdr.get("mono_ns", 0) or 0), kv
+
+    first, last = {}, {}  # target -> (mono_ns, kv) of the first begin / the last end snapshot over the parts
+    for i, x in enumerate(parts):
+        for p in glob.glob(os.path.join(x, "loadgen", "stats", "step*-*-t*.txt")):
+            b = os.path.basename(p)
+            when, tgt = b.split("-")[1], b.rsplit("-t", 1)[1][:-4]
+            t_ns, kv = snap(p)
+            key = (i, t_ns)
+            if when == "begin" and (tgt not in first or key < first[tgt][0]):
+                first[tgt] = (key, kv)
+            if when == "end" and (tgt not in last or key > last[tgt][0]):
+                last[tgt] = (key, kv)
+    tg = sorted(set(first) & set(last), key=int)
+    check(len(tg) >= NODES, f"loadgen stats snapshots (begin and end) for every node ({len(tg)} targets, {NODES} nodes)")
+    tot = {k: 0 for k in DSK}
+    for t in tg:
+        b, e = first[t][1], last[t][1]
+        for k in DSK:
+            if DSP + k not in b or DSP + k not in e:
+                check(False, f"target {t}: {DSP + k} missing in the stats snapshots")
+                continue
+            tot[k] += e[DSP + k] - b[DSP + k]
+            if k in ("tx_timeout", "protocol_error"):
+                check(e[DSP + k] == b[DSP + k], f"target {t}: De Stijl {k} delta {e[DSP + k] - b[DSP + k]} (must be 0)")
+    den = tot["async_issued"] + tot["async_fallback_mean"] + tot["async_fallback_p95"]
+    # replica pool (replication review 2026-11-01): a full pool silently maps CXL directly, so a lifetime with
+    # replica_pool_full != 0 mixes replicated and unreplicated pages: FAIL. End values of every node's final stats;
+    # OPCOH_DS_REPLICA_MODE=all (replica_mode=all lifetimes) also requires the keys (absent = kernel without them).
+    rmode = os.environ.get("OPCOH_DS_REPLICA_MODE", "off")
+    rp = [s.get(DSP + "replica_pages") for s in st]
+    rf = [s.get(DSP + "replica_pool_full") for s in st]
+    if rmode == "all":
+        check(all(isinstance(x, int) for x in rp + rf), "replica_mode=all: replica_pages and replica_pool_full in every "
+              f"node's final stats (pages {rp}, pool_full {rf})")
+    check(all(not isinstance(x, int) or x == 0 for x in rf), f"De Stijl replica_pool_full 0 on every node ({rf})")
+    print(f"destijl: replica_mode {rmode} replica_pages {rp} replica_pool_full {rf} (final stats per node)")
+    print(f"destijl: ds_async_share {tot['async_issued'] / den:.4f}" if den else "destijl: ds_async_share n/a (no admission decision)",
+          f"(async_issued {tot['async_issued']}, async_fallback_mean {tot['async_fallback_mean']}, async_fallback_p95 "
+          f"{tot['async_fallback_p95']}; ccd_filtered {tot['ccd_filtered']} fetch_sent {tot['fetch_sent']} inv_sent "
+          f"{tot['inv_sent']}; tx_timeout {tot['tx_timeout']} protocol_error {tot['protocol_error']}; {len(tg)} targets, "
+          "first begin to last end snapshot)")
 elif mode in ("megalon-vm", "megalon-t0"):
     check(all(s["opt.meg_coh"] == 1 and s.get("opt.meg_anchor") == 1 for s in st), "CohSnap and AnchorSnap on every node")
     check(((c["src"] & 12) == 12).all(), "src bits 2 and 3 on every record")
@@ -319,7 +389,7 @@ if r.returncode == 0:
         check(all(x["match"] == "req_id" for x in rows), "id-based matching (rawid sidecars present)")
     check(tags.get("T_ms") == "measured" and tags.get("C_ms") == "derived" and tags.get("mg_check_ms", "").startswith("sampled×"),
           "column tags")
-    if mode == "popcorn":
+    if mode in ("popcorn", "destijl"):
         for x in rows:
             if x["op"] == "search" and x["n_ops"] not in ("", "0") and float(x["C_ms"] or 0) == 0:
                 print(f"OPCOH_CHECK NOTE: step {x['step']} ({x['achieved_per_s']} search/s): search C = 0")

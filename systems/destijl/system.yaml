@@ -1,14 +1,40 @@
 name: destijl
 level: kernel
+status: v2 (reports/design/DS2-protocol-spec.md); harness name "ds" (experiments/eval/h2n-block.sh)
 kernel:
   submodule: kernels/destijl
-  branch: DE_STIJL_DAMON
+  branch: destijl-v2
   source_dir: famfs-linux
-  config_base: T/build/.config of rel/destijl-p3a (PAGE_COHERENCE, DE_STIJL, DAMON)
+  config_base: builds/popcorn_new/12/.config + kernel/configs/destijl.config (SWMC_DE_STIJL, no SWMC_POPCORN_MSI)
+  build_dir: builds/destijl/<n>
   localversion: -ds-destijl-<n>
-  external_modules: [msg_layer_module]      # cxl_shm.ko
-guest_setup:
-  - scripts/guest/mount_famfs.sh            # MODE=DeStijl, NODE_ID per VM
-  - scripts/guest/start_cxlshm.sh           # clears shared rings at DAX base +94 GiB: approval-gated
-  - systems/destijl/start_damon.sh          # selective replication (damo_yamls/)
-boot_params: [page_replication_ext=on]
+  external_modules: [msg_layer_module]      # cxl_shm.ko v13
+module:
+  name: cxl_shm
+  version: 13
+  # Region values (dax_name nr_nodes node_id ring_offset ring_size managed_offset managed_size) come from the
+  # region config through `faultlat params --protocol destijl`; the rest is fixed here.
+  params:
+    protocol: destijl
+    init_state: shared
+    bpd_sets: 65536
+    ring_slots: 2048
+  runtime:
+    recv_mode: sleep                        # same receiver tier as Popcorn (DS2-decision-points.md §3a D7)
+    replica_mode: "off"                     # off | all | damon (phase 4); off by default
+  state_ready: running                      # /sys/kernel/cxl_shm/state after the node barrier + registration
+region_config: config/cxl_region-destijl.yaml   # msg_ring = De Stijl HWcc block, last 16 MiB of hwcc
+syscalls: {enable: 470, disable: 471, set_staleness: 472}
+library: "systems/destijl/lib (libdestijl.a: de_stijl_set_staleness, de_stijl_alloc; C++ link)"
+staleness:
+  env: CXL_DESTIJL_T_US                     # unset or 0 = synchronous (no syscall); applied only when CXL_SYSTEM=ds
+  applied_by: systems/common/cxl_region.h region_apply_staleness (vector DB segment arenas, RecSys tables)
+counters:
+  - /sys/kernel/swmc/page_coherence         # protocol = destijl
+  - /sys/kernel/swmc/destijl                # ccd_*, fetch/inv/ack_sent, rx_*, bpd_*, async_*, pending_now, lambda, p95_us, replica_*
+  - /sys/kernel/cxl_shm                     # state, layout, ring_*_count, rx_*_count
+deploy:
+  guest: scripts/deploy/p-destijl-guest.sh  # runs on a guest as root (destijl.env next to it)
+  host: scripts/deploy/p-destijl-shm.sh     # load / enable / status / teardown on N guests
+damon: none by default                      # DAMON-era scripts kept in systems/destijl/legacy/ (phase 4 reuses the yamls)
+boot_params: []

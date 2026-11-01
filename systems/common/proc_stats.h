@@ -17,6 +17,11 @@
 //   sys.<dir>.<file>                         every single-integer file in configured sysfs dirs (e.g. Popcorn counters;
 //                                            <dir> = path below /sys/kernel/ with '.' for '/', e.g. swmc.page_coherence)
 //   sys.<dir>.<file>.<name>                  files of "name value" lines in those dirs (e.g. Popcorn instr/ histograms)
+//   sys.swmc.destijl.<name>                  De Stijl v2 counters (/sys/kernel/swmc/destijl), only when that directory
+//                                            exists (De Stijl kernels): the fixed list destijl_counters() (a missing
+//                                            file = 0) plus any other rx_* / replica_* file there; pending_now,
+//                                            lambda_per_s, p95_us, ss_residence_max_us, replica_pages are gauges
+//                                            (stats_delta.py keeps the end value)
 // cpu_ticks are USER_HZ ticks (utime + stime); run_ns / wait_ns are ns from schedstat. Key names never contain '='
 // or spaces. *.max_ns style keys are maxima, not sums (stats_delta.py reports their end value).
 #pragma once
@@ -35,6 +40,12 @@
 #include <sstream>
 #include <string>
 #include <vector>
+
+// De Stijl v2 counter dir; servers use the default. Host tests compile with -DCXL_PROC_DESTIJL_DIR=<fake dir> to run
+// the same snapshot code against synthetic counter files (workspaces/destijl-v2/phase5d/t/ds_dump.cc).
+#ifndef CXL_PROC_DESTIJL_DIR
+#define CXL_PROC_DESTIJL_DIR "/sys/kernel/swmc/destijl"
+#endif
 
 namespace cxl::proc {
 
@@ -82,6 +93,24 @@ inline std::vector<std::string> dir_entries(const std::string &d) {
       if (e->d_name[0] != '.') v.push_back(e->d_name);
     closedir(dp);
   }
+  return v;
+}
+
+// De Stijl v2 counters exported in every snapshot of a De Stijl kernel (DS2-protocol-spec.md §4-§8): every counter of
+// kernel/swmc/destijl.c DS_DS_COUNTERS (kernel commit 2424ff336; tx_timeout / protocol_error are the error counters
+// opcoh_check.py destijl requires to stay 0), the gauges pending_now, lambda_per_s, p95_us, ss_residence_max_us, and
+// the spec's replica_* names (a kernel without them reads 0; further replica_* / rx_* files come from the dir scan)
+inline const std::vector<std::string> &destijl_counters() {
+  static const std::vector<std::string> v{
+      "ccd_filtered",   "ccd_merged",      "ccd_write_wait",      "fetch_sent",         "inv_sent",
+      "ack_sent",       "rx_fetch",        "rx_inv",              "rx_ack",             "read_complete",
+      "bpd_insert",     "bpd_evict",       "bpd_evict_m",         "evict_self_fetch",   "tx_timeout",
+      "protocol_error", "async_issued",    "async_installed",     "async_completed",    "async_dropped",
+      "async_early_ack", "async_raced",    "async_fallback_mean", "async_fallback_p95", "async_fallback_write",
+      "async_fallback_nomem", "async_probe", "async_superseded_write", "async_superseded_inv", "ack_deferred",
+      "ack_retried",    "ack_overflow",    "pending_now",         "lambda_per_s",       "p95_us",
+      "ss_residence_max_us", "replica_pages", "replica_create",  "replica_evict",      "replica_writeback",
+      "replica_refresh"};
   return v;
 }
 
@@ -197,6 +226,22 @@ inline std::string text(const Opts &o) {
             name.find('=') == std::string::npos)
           kv["sys." + tag + "." + f + "." + name] = std::strtoull(val.c_str(), nullptr, 10);
       }
+    }
+  }
+  // De Stijl v2 counters (only on a De Stijl kernel: the directory exists); a listed file that is missing reads 0
+  {
+    const std::string ds = CXL_PROC_DESTIJL_DIR;
+    if (DIR *dp = opendir(ds.c_str())) {
+      closedir(dp);
+      auto num = [](const std::string &v) {  // integer prefix ("12", "12 us"); anything else 0
+        return std::strtoull(v.c_str(), nullptr, 10);
+      };
+      for (const std::string &f : destijl_counters()) kv["sys.swmc.destijl." + f] = num(trim(slurp(ds + "/" + f, 256)));
+      for (const std::string &f : dir_entries(ds))
+        if (f.compare(0, 3, "rx_") == 0 || f.compare(0, 8, "replica_") == 0) {
+          const std::string v = trim(slurp(ds + "/" + f, 256));
+          if (!v.empty() && v.find_first_not_of("0123456789") == std::string::npos) kv["sys.swmc.destijl." + f] = num(v);
+        }
     }
   }
   std::ostringstream out;

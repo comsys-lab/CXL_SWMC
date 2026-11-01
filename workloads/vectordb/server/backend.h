@@ -49,6 +49,9 @@ class PlainBackend {
     return map_ + segs_ + s * seg_bytes_ + p_.g.groups() * vstride_ + g * lstride_;
   }
   DlogEntry *dlog(uint32_t node) const { return reinterpret_cast<DlogEntry *>(map_ + dlog_ + node * dlog_node_); }
+  // segment s's SWcc arena: all its vector chunks then all its link chunks (2 MiB aligned; De Stijl T per segment)
+  uint8_t *seg_arena(uint32_t s) const { return map_ + segs_ + s * seg_bytes_; }
+  uint64_t seg_arena_bytes() const { return seg_bytes_; }
 
   Acc::Mem mem(uint32_t s, GraphMeta *meta) const {
     Acc::Mem m{meta, {}, {}};

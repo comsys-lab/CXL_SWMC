@@ -9,9 +9,10 @@
 //
 // Subcommands (see README.md):
 //   faultlat params [--nodes N] [--device-size B] [--init-state invalid|shared]
+//                   [--protocol popcorn|destijl [--bpd-sets S] [--ring-slots R]]
 //   faultlat access --op read|write|rw [--pages N] [--page-offset P] [--stride S]
 //                   [--passes K] [--shuffle] [--cpu C] [--out F] [--raw F]
-//                   [--pattern X] [--expect X] [--acct 0|1]
+//                   [--pattern X] [--expect X] [--acct 0|1] [--staleness-us T]
 //   faultlat pingpong --role R --nonce X [--nodes N] [--iters N] [--page-offset P]
 //                   [--cpu C] [--out F] [--raw F]
 //   faultlat contend --node K --nodes N --run-id X --threads T --pages H --page-offset P --read-pct R
@@ -57,12 +58,14 @@
 #include "../../systems/common/hwcc_app.h"
 #include "contend.h"
 #include "../../systems/popcorn_new/include/swmc_acct.h"
+#include "../../systems/destijl/lib/de_stijl.h"
 
 namespace {
 
 constexpr uint64_t kPage = 4096;
 constexpr const char *kSysfs = "/sys/kernel/swmc/page_coherence";
-constexpr const char *kVersion = "faultlat-5";
+constexpr const char *kDsSysfs = "/sys/kernel/swmc/destijl";  // De Stijl v2 counters (absent on other kernels)
+constexpr const char *kVersion = "faultlat-6";
 
 [[noreturn]] void die(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 void die(const char *fmt, ...) {
@@ -96,6 +99,9 @@ struct Args {
   uint64_t iters = 10000;
   uint64_t device_size = 0;   // params only: override /sys/bus/dax/.../size (Host dry run)
   std::string init_state = "invalid";  // params only: cxl_shm init_state
+  std::string protocol = "popcorn";    // params only: cxl_shm protocol (destijl = De Stijl v2 block, cxl_shm v13)
+  uint64_t bpd_sets = 65536, ring_slots = 2048;  // params --protocol destijl only
+  uint64_t staleness_us = 0;  // access: De Stijl staleness bound T of the window (0 = synchronous, no syscall)
   bool has_pattern = false, has_expect = false;
   uint64_t pattern = 0, expect = 0;  // access: written / expected value X ^ page index (data check)
   std::string out, raw, config;
@@ -156,6 +162,10 @@ Args parse_args(int argc, char **argv) {
     else if (k == "--raw") a.raw = val("--raw");
     else if (k == "--config") a.config = val("--config");
     else if (k == "--init-state") a.init_state = val("--init-state");
+    else if (k == "--protocol") a.protocol = val("--protocol");
+    else if (k == "--bpd-sets") a.bpd_sets = parse_num(val("--bpd-sets"), "--bpd-sets");
+    else if (k == "--ring-slots") a.ring_slots = parse_num(val("--ring-slots"), "--ring-slots");
+    else if (k == "--staleness-us") a.staleness_us = parse_num(val("--staleness-us"), "--staleness-us");
     else if (k == "--device-size") a.device_size = parse_num(val("--device-size"), "--device-size");
     else if (k == "--pattern") { a.pattern = parse_num(val("--pattern"), "--pattern"); a.has_pattern = true; }
     else if (k == "--expect") { a.expect = parse_num(val("--expect"), "--expect"); a.has_expect = true; }
@@ -185,6 +195,7 @@ Args parse_args(int argc, char **argv) {
     else die("unknown option %s", k.c_str());
   }
   if (a.stride == 0 || a.pages == 0 || a.passes < 1) die("--pages, --stride, --passes must be > 0");
+  if (a.staleness_us && a.cmd != "access") die("--staleness-us applies to access only");
   return a;
 }
 
@@ -199,18 +210,27 @@ cxl::region load_region(const Args &a) {
 // ---------------------------------------------------------------------------
 // Kernel counters (read-only sysfs)
 
+// page_coherence files by name; De Stijl v2 files (/sys/kernel/swmc/destijl) as "ds_<name>" (none on other kernels)
 std::map<std::string, std::string> read_sysfs() {
   std::map<std::string, std::string> m;
-  DIR *d = opendir(kSysfs);
-  if (!d) return m;
-  while (struct dirent *e = readdir(d)) {
-    if (e->d_name[0] == '.' || !strcmp(e->d_name, "reset_counters")) continue;
-    std::ifstream f(std::string(kSysfs) + "/" + e->d_name);
-    std::string v;
-    if (f && std::getline(f, v)) m[e->d_name] = v;
+  const std::pair<const char *, const char *> dirs[] = {{kSysfs, ""}, {kDsSysfs, "ds_"}};
+  for (const auto &dp : dirs) {
+    DIR *d = opendir(dp.first);
+    if (!d) continue;
+    while (struct dirent *e = readdir(d)) {
+      if (e->d_name[0] == '.' || !strcmp(e->d_name, "reset_counters")) continue;
+      std::ifstream f(std::string(dp.first) + "/" + e->d_name);
+      std::string v;
+      if (f && std::getline(f, v)) m[std::string(dp.second) + e->d_name] = v;
+    }
+    closedir(d);
   }
-  closedir(d);
   return m;
+}
+
+// De Stijl gauges (current values, not differenced in the step JSON)
+bool ds_gauge(const std::string &k) {
+  return k == "ds_pending_now" || k == "ds_lambda" || k == "ds_p95_us" || k == "ds_replica_pages";
 }
 
 bool is_number(const std::string &s) {
@@ -406,9 +426,10 @@ void json_header(FILE *f, const Args &a, const cxl::region &r, const Mapping &m)
   fprintf(f, "  \"region\": \"%s\",\n", cxl::region_describe(r).c_str());
   fprintf(f, "  \"params\": {\"op\": \"%s\", \"pages\": %" PRIu64 ", \"page_offset\": %" PRIu64
              ", \"stride\": %" PRIu64 ", \"passes\": %d, \"shuffle\": %s, \"cpu\": %d, \"role\": %d, \"nodes\": %d"
-             ", \"nonce\": %" PRIu64 ", \"iters\": %" PRIu64 ", \"dev_offset\": %" PRIu64 "},\n",
+             ", \"nonce\": %" PRIu64 ", \"iters\": %" PRIu64 ", \"dev_offset\": %" PRIu64
+             ", \"staleness_us\": %" PRIu64 "},\n",
           a.op.c_str(), a.pages, a.page_offset, a.stride, a.passes, a.shuffle ? "true" : "false",
-          a.cpu, a.role, a.nodes, a.nonce, a.iters, m.dev_offset);
+          a.cpu, a.role, a.nodes, a.nonce, a.iters, m.dev_offset, a.staleness_us);
 }
 
 void json_sysfs(FILE *f, const std::map<std::string, std::string> &before,
@@ -418,7 +439,8 @@ void json_sysfs(FILE *f, const std::map<std::string, std::string> &before,
   for (auto &kv : after) {
     auto it = before.find(kv.first);
     bool counter = kv.first.find("count") != std::string::npos ||
-                   kv.first.find("time") != std::string::npos;
+                   kv.first.find("time") != std::string::npos ||
+                   (kv.first.compare(0, 3, "ds_") == 0 && !ds_gauge(kv.first));
     if (counter && is_number(kv.second) && it != before.end() && is_number(it->second)) {
       long long d = std::stoll(kv.second) - std::stoll(it->second);
       fprintf(f, "%s\"%s_delta\": %lld", first ? "" : ", ", kv.first.c_str(), d);
@@ -432,6 +454,31 @@ void json_sysfs(FILE *f, const std::map<std::string, std::string> &before,
 
 // ---------------------------------------------------------------------------
 // Subcommands
+
+// cxl_shm v13 protocol=destijl: msg_ring is the whole De Stijl HWcc block. Same layout formula as cxl_shm.c
+// ds_layout_compute (workspaces/destijl-v2/phase2a/PROGRESS.md): header page, HPD = PAGE_ALIGN(ceil(pages/512) x 4),
+// BPD = PAGE_ALIGN(bpd_sets x 64), then 3 rings (FETCH, INV, ACK) per node of PAGE_ALIGN(128 + ring_slots x 64);
+// the module refuses a block smaller than the total. No ring_coherent (optional for destijl, the block is HWcc).
+int params_destijl(const Args &a, const cxl::region &r) {
+  const cxl::range ring = r.msg_ring;
+  auto pow2 = [](uint64_t x) { return x && !(x & (x - 1)); };
+  if (!pow2(a.bpd_sets)) die("--bpd-sets must be a power of two");
+  if (!pow2(a.ring_slots) || a.ring_slots < 2) die("--ring-slots must be a power of two >= 2");
+  if (r.swcc.offset < r.hwcc.end() && r.hwcc.offset < r.swcc.end()) die("swcc overlaps hwcc");
+  auto pa = [](uint64_t x) { return (x + kPage - 1) / kPage * kPage; };
+  const uint64_t pages = r.swcc.size / kPage;
+  const uint64_t hpd = pa((pages + 511) / 512 * 4), bpd = pa(a.bpd_sets * 64), stride = pa(128 + a.ring_slots * 64);
+  const uint64_t total = kPage + hpd + bpd + uint64_t(a.nodes) * 3 * stride;
+  if (ring.size < total)
+    die("msg_ring size %" PRIu64 " too small for the De Stijl block at %d nodes: need >= %" PRIu64, ring.size, a.nodes,
+        total);
+  std::string dev = r.device.substr(r.device.rfind('/') + 1);
+  printf("protocol=destijl dax_name=%s nr_nodes=%d ring_offset=%" PRIu64 " ring_size=%" PRIu64 " managed_offset=%" PRIu64
+         " managed_size=%" PRIu64 " bpd_sets=%" PRIu64 " ring_slots=%" PRIu64 " init_state=%s\n",
+         dev.c_str(), a.nodes, ring.offset, ring.size, r.swcc.offset, r.swcc.size, a.bpd_sets, a.ring_slots,
+         a.init_state.c_str());
+  return 0;
+}
 
 // The message ring is `msg_ring: [offset, size]` in the region config: cxl_region.h requires it at the end of
 // the HWcc range (hardware-coherent, so cxl_shm runs with ring_coherent=1).
@@ -450,6 +497,8 @@ int cmd_params(const Args &a) {
   if (a.nodes < 2 || a.nodes > 8) die("--nodes must be 2..8 (cxl_shm nr_nodes)");
   const uint64_t hdr = (windows * 2 * 64 + 3 * n * 64 + 4095) / 4096 * 4096;
   if (a.init_state != "invalid" && a.init_state != "shared") die("--init-state must be invalid or shared");
+  if (a.protocol == "destijl") return params_destijl(a, r);
+  if (a.protocol != "popcorn") die("--protocol must be popcorn or destijl");
   const uint64_t need = hdr + windows * 256 * 64;
   if (ring.size < need)
     die("msg_ring size %" PRIu64 " too small for %d nodes: need >= %" PRIu64, ring.size, a.nodes, need);
@@ -478,6 +527,10 @@ int cmd_access(const Args &a) {
   pin_cpu(a.cpu);
   auto sys_before = read_sysfs();
   Mapping m = map_window(r, a.page_offset, span);
+  // De Stijl v2 (async step): staleness bound T on the whole window before the first access; read faults on pages
+  // another node holds in M may then map at once (SS) while the FETCH completes asynchronously.
+  if (a.staleness_us && de_stijl_set_staleness(m.base, m.len, a.staleness_us) != 0)
+    die("de_stijl_set_staleness(T=%" PRIu64 " us) on the window: %s", a.staleness_us, strerror(errno));
   AcctView acct;
   acct.start(a.acct != 0);
 

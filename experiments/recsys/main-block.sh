@@ -151,7 +151,7 @@ elif [ $BLOCK = stream ]; then  # RecSys streaming block (header "BLOCK=stream")
     [[ $EVAL_RUN =~ ^[1-9]$ ]] || { echo "SEQUENCE STOP: bad EVAL_RUN"; exit 2; }
     [ -f "${REGION:-}" ] || { echo "SEQUENCE STOP: EVAL_RUN needs REGION (region file of every lifetime)"; exit 2; }
     [[ ${RS_THREADS:-} =~ ^[1-9][0-9]?$ ]] || { echo "SEQUENCE STOP: EVAL_RUN needs RS_THREADS"; exit 2; }
-    for s in ${SYSTEMS:-hw pop}; do case $s in hw|pop|mg|mgoff) ;; *) echo "SEQUENCE STOP: eval stream systems are hw, pop, mg, mgoff"; exit 2;; esac; done
+    for s in ${SYSTEMS:-hw pop}; do case $s in hw|pop|ds|mg|mgoff) ;; *) echo "SEQUENCE STOP: eval stream systems are hw, pop, ds, mg, mgoff"; exit 2;; esac; done
     for s in ${STREAM_FIXONLY:-}; do [[ " ${SYSTEMS:-hw pop} " == *" $s "* ]] || { echo "SEQUENCE STOP: STREAM_FIXONLY $s not in SYSTEMS"; exit 2; }; done
     [[ " ${SYSTEMS:-} " != *" mgoff "* ]] || [[ " ${STREAM_FIXONLY:-} " == *" mgoff "* ]] || { echo "SEQUENCE STOP: mgoff is fix-only (STREAM_FIXONLY)"; exit 2; }
     for t in ${STREAM_FIX_LEVELS:-} $(for m in ${STREAM_FIX_LEVELS_MAP:-}; do [[ ${m%%=*} =~ ^[1-9][0-9]*$ ]] || echo BAD; echo "${m#*=}" | tr ',' ' '; done); do
@@ -256,7 +256,7 @@ OWNER="RECSYS-$BLOCK-$(basename "$E")"; [ $BLOCK = h1 ] && OWNER="H1-recsys-$H1M
 # SYSTEMS (subset of "hw pop mg", default all): a rerun of some systems (the SLO is fixed; L for the fixed window
 # comes from L_FROM). SLO_MS_FROM (v5) is not used: refused if set.
 [ -z "${SLO_MS_FROM:-}" ] || { echo "SEQUENCE STOP: SLO_MS_FROM is a v5 option (v6 SLO is fixed)"; exit 2; }
-for s in ${SYSTEMS:-hw pop mg}; do case $s in hw|pop|mg) ;; mgoff|mgrow) [ $BLOCK = v1 ] || { [ $s = mgoff ] && [ $BLOCK = stream ] && [ -n "${EVAL_RUN:-}" ]; } || { echo "SEQUENCE STOP: $s only with BLOCK=v1 (mgoff also with BLOCK=stream and EVAL_RUN)"; exit 2; };; *) echo "SEQUENCE STOP: bad SYSTEMS entry $s"; exit 2;; esac; done
+for s in ${SYSTEMS:-hw pop mg}; do case $s in hw|pop|mg) ;; ds) [ $BLOCK = stream ] && [ -n "${EVAL_RUN:-}" ] || { echo "SEQUENCE STOP: ds only with BLOCK=stream and EVAL_RUN"; exit 2; };; mgoff|mgrow) [ $BLOCK = v1 ] || { [ $s = mgoff ] && [ $BLOCK = stream ] && [ -n "${EVAL_RUN:-}" ]; } || { echo "SEQUENCE STOP: $s only with BLOCK=v1 (mgoff also with BLOCK=stream and EVAL_RUN)"; exit 2; };; *) echo "SEQUENCE STOP: bad SYSTEMS entry $s"; exit 2;; esac; done
 # Megalon object granularity (v1.4): MG_RPO_OPT N per Megalon system; mgrow needs the option
 MG_RPO_OPT=${MG_RPO_OPT:-} MG_TABLE_N=${MG_TABLE_N:-0} MG_ROW_N=${MG_ROW_N:-1} V1_OPFAIL_CONTINUE=${V1_OPFAIL_CONTINUE:-}
 [[ -z "$MG_RPO_OPT" || "$MG_RPO_OPT" =~ ^--[a-z][a-z0-9-]*$ ]] || { echo "SEQUENCE STOP: bad MG_RPO_OPT"; exit 2; }
@@ -285,6 +285,27 @@ POP_BUILD=${POP_BUILD:-10} POP_BUNDLE_SHA=${POP_BUNDLE_SHA:-626f6a0eb265553aaa6e
 [ -d "$C8" ] && [ ! -e $C8/SUPERSEDED.txt ] \
   && [ "$(sha256sum < $C8/packet.sha256 | cut -d' ' -f1)" = "$POP_BUNDLE_SHA" ] \
   && (cd $C8 && sha256sum -c --quiet packet.sha256) || { echo "SEQUENCE STOP: C8 is not the verified Popcorn build-$POP_BUILD bundle"; exit 2; }
+# De Stijl v2 (SYSTEMS entry ds, BLOCK=stream + EVAL_RUN only; same keys and rules as experiments/eval/h2n-block.sh):
+# DS_C (bundle dir: p-destijl-shm.sh, packet.sha256), DS_BUNDLE_SHA, DS_K (guest release -ds-destijl-<n>: both VMs run
+# it, so hw / mg lifetimes of a ds block run on the De Stijl kernel without cxl_shm; pop and ds never share a block),
+# DS_GT (guest tools dir), RS_DS_T_US (staleness bound T in us, default 0 = synchronous; servers get
+# ENV:CXL_SYSTEM=ds ENV:CXL_DESTIJL_T_US=<T>). REGION must be the De Stijl region config (config/cxl_region-destijl.yaml;
+# the guest copies are checked against DS_GT/cxl_region.yaml at every load). L1 / L2 fix tokens need confirmed hw and
+# pop results (eval_levels_compute): a ds block uses numeric STREAM_FIX_LEVELS.
+KEXP=$K8 DST=0 HASDS=0
+[[ " ${SYSTEMS:-} " != *" ds "* ]] || HASDS=1
+if [ $HASDS = 1 ]; then
+  [[ " ${SYSTEMS:-} " != *" pop "* ]] || { echo "SEQUENCE STOP: pop and ds need different guest kernels: separate blocks"; exit 2; }
+  : "${DS_C:?}" "${DS_BUNDLE_SHA:?}" "${DS_K:?}" "${DS_GT:?}"
+  [[ $DS_K == *-ds-destijl-* ]] || { echo "SEQUENCE STOP: DS_K=$DS_K is not a De Stijl release"; exit 2; }
+  [[ $RECV_MODE =~ ^(poll|sleep)$ ]] || { echo "SEQUENCE STOP: RECV_MODE=$RECV_MODE: De Stijl refuses idle"; exit 2; }
+  DST=${RS_DS_T_US:-0}
+  [[ $DST =~ ^(0|[1-9][0-9]*)$ ]] || { echo "SEQUENCE STOP: bad RS_DS_T_US ($DST)"; exit 2; }
+  [ -f "$DS_C/p-destijl-shm.sh" ] && [ "$(sha256sum < "$DS_C/packet.sha256" | cut -d' ' -f1)" = "$DS_BUNDLE_SHA" ] \
+    && (cd "$DS_C" && sha256sum -c --quiet packet.sha256) || { echo "SEQUENCE STOP: DS_C is not the verified De Stijl bundle"; exit 2; }
+  cmp -s "$REGION" "$DS_C/tools/cxl_region.yaml" || { echo "SEQUENCE STOP: REGION differs from the De Stijl bundle's region config"; exit 2; }
+  KEXP=$DS_K
+fi
 [ -d "$E" ] && [ -z "$(ls -A "$E" | grep -v '^sequence')" ] || { echo "SEQUENCE STOP: $E missing or not empty"; exit 2; }
 LOCKF=${LOCK:-$P/workspaces/MEASUREMENT.lock}
 if [ $BLOCK = h1 ]; then  # parent lock rule: H1 main holds the lock; this block never locks or unlocks
@@ -294,6 +315,7 @@ else
 fi
 export LOADGEN PROFILE=main RUN_KIND=measurement STATS_OP=10 READY_TIMEOUT=$((XT / 2)) IDLE_WAIT_S=2400  # idle: an overrunning T = 60 s round may take > 10 min (Megalon); at T = 1 s the last round ends within ~1 s
 SHMR=$E/shm-pop; PS=(K=$K8 GT=$GT8 C=$C8 R=$SHMR INIT_STATE=shared)   # per page MSI lifetime (system(): shm-<name>)
+SHMS=$C8/p-popcorn-shm.sh   # the shm script of the current load (De Stijl lifetimes: $DS_C/p-destijl-shm.sh)
 CHOWNED=0
 stop_servers() {  # this block's servers only: every session dir's guest run dir + the preload pid dir
   local ip g
@@ -327,10 +349,10 @@ shm_cleanup() {  # page MSI loaded (load attempted) and no "teardown PASS" (the 
   grep -q "teardown PASS" "$r/steps.log" 2>/dev/null && return 0
   dax_free cleanup || { echo "CLEANUP FAILED: /dev/dax0.0 still in use or fuser not clean on a VM (see $E/fuser-cleanup-*.out); teardown not attempted (manual: P-popcorn packet §6)" | tee -a "$E/cleanup.out"; return 0; }
   echo "$(date -Is) cleanup teardown $r" >> "$E/cleanup.out"
-  if ! env "${PS[@]}" bash $C8/p-popcorn-shm.sh teardown >> "$E/cleanup.out" 2>&1; then
-    if grep -q "instr_enabled=1 missing" "$r/steps.log" 2>/dev/null; then
-      env "${PS[@]}" bash $C8/p-popcorn-shm.sh instr-on >> "$E/cleanup.out" 2>&1 \
-        && env "${PS[@]}" bash $C8/p-popcorn-shm.sh teardown >> "$E/cleanup.out" 2>&1
+  if ! env "${PS[@]}" bash $SHMS teardown >> "$E/cleanup.out" 2>&1; then
+    if [ "$SHMS" = $C8/p-popcorn-shm.sh ] && grep -q "instr_enabled=1 missing" "$r/steps.log" 2>/dev/null; then
+      env "${PS[@]}" bash $SHMS instr-on >> "$E/cleanup.out" 2>&1 \
+        && env "${PS[@]}" bash $SHMS teardown >> "$E/cleanup.out" 2>&1
     fi
   fi
   grep -q "teardown PASS" "$r/steps.log" 2>/dev/null || echo "CLEANUP FAILED: $r (manual: P-popcorn packet §6)" | tee -a "$E/cleanup.out"
@@ -387,7 +409,7 @@ gatechk() { python3 $X/main_util.py gate "$1" "$SLO_MS" "$SLO_PCT"; }  # validit
 precheck() {
   local i f h files="${VM_PLAIN#/home/comsys/}/bin/recsys-server ${VM_PLAIN#/home/comsys/}/bin/recsys-node.sh ${VM_PLAIN#/home/comsys/}/cfg/cxl_region.yaml ${VM_MEG#/home/comsys/}/bin/recsys-server ${VM_MEG#/home/comsys/}/bin/recsys-node.sh ${VM_MEG#/home/comsys/}/lib/libmegalon-objapi.so ${VM_MEG#/home/comsys/}/lib/libmegalon.so ${VM_MEG#/home/comsys/}/cfg/megalon.yaml ${VM_MEG#/home/comsys/}/cfg/cxl_region.yaml"
   for i in 0 1; do
-    $SSH comsys@${IPS[$i]} "EXPECT_K=$K8 MEM_MIN=60 EXPECT_DAX_UUID='${EXPECT_DAX_UUID:-}' INSTALL_FILES='$files' bash -s" < $X/precheck.sh > "$E/precheck-${IPS[$i]}.out" 2>&1
+    $SSH comsys@${IPS[$i]} "EXPECT_K=$KEXP MEM_MIN=60 EXPECT_DAX_UUID='${EXPECT_DAX_UUID:-}' INSTALL_FILES='$files' bash -s" < $X/precheck.sh > "$E/precheck-${IPS[$i]}.out" 2>&1
     grep -q "^PRECHECK PASS" "$E/precheck-${IPS[$i]}.out" || stop "precheck ${IPS[$i]}"
     for f in "${VM_PLAIN#/home/comsys/}/bin/recsys-server $HOST_PLAIN" "${VM_MEG#/home/comsys/}/bin/recsys-server $MB/bin/recsys-server" \
              "${VM_MEG#/home/comsys/}/lib/libmegalon-objapi.so $MB/lib/libmegalon-objapi.so" "${VM_MEG#/home/comsys/}/lib/libmegalon.so $MB/lib/libmegalon.so" \
@@ -439,6 +461,31 @@ pop_setup() {  # P-popcorn-deploy §6a cycle with build POP_BUILD (init_state=sh
   done
   env "${PS[@]}" STATUS_TAG=pre bash $C8/p-popcorn-shm.sh status || stop "status pre"
 }
+ds_setup() {  # De Stijl v2 cycle (protocol=destijl, init_state=shared; as pop_setup and h2n-block.sh ds_up), once per lifetime
+  env "${PS[@]}" bash $SHMS precheck || stop "ds shm precheck"
+  local ip m p i t ph
+  for ph in load chown; do env "${PS[@]}" bash $SHMS $ph || stop "ds shm $ph"; done
+  for ip in "${IPS[@]}"; do  # the server's region config must equal the module parameters' one
+    [ "$($SSH comsys@$ip "test -f $VM_PLAIN/cfg/cxl_region.yaml && test -f $DS_GT/cxl_region.yaml && sha256sum $VM_PLAIN/cfg/cxl_region.yaml $DS_GT/cxl_region.yaml | cut -d' ' -f1 | sort -u | wc -l" < /dev/null)" = 1 ] \
+      || stop "region config missing or different on $ip (De Stijl tools)"
+  done
+  t=$(date +%s)
+  local PD=$VM_PLAIN/runs/preload-main-$(date +%s)
+  echo "$PD" > "$E/preload-$NAME.dir"
+  $SSH comsys@${IPS[0]} "mkdir -p $PD && CXL_REGION_CONFIG=$VM_PLAIN/cfg/cxl_region.yaml setsid -w sh -c 'echo \$\$ > $PD/node0.pid; exec timeout $XT $VM_PLAIN/bin/recsys-server --node 0 --preload-only $SA --publish-ms $T_MS'" \
+    < /dev/null > "$E/preload-$NAME.log" 2>&1
+  echo "preload_wall_s=$(( $(date +%s) - t ))" >> "$E/preload-$NAME.log"
+  { grep -q "PRELOAD DONE" "$E/preload-$NAME.log" && servers_gone; } || stop "preload"
+  env "${PS[@]}" bash $SHMS enable || stop "ds enable gate"
+  for ip in "${IPS[@]}"; do
+    m=$($SSH comsys@$ip "sudo -n sh -c 'echo $RECV_MODE > /sys/module/cxl_shm/parameters/recv_mode' && cat /sys/module/cxl_shm/parameters/recv_mode" < /dev/null)
+    p=$($SSH comsys@$ip "cat /sys/kernel/swmc/page_coherence/protocol" < /dev/null)
+    i=$($SSH comsys@$ip "cat /sys/kernel/swmc/instr/enabled 2>/dev/null || echo absent" < /dev/null)
+    echo "$ip recv_mode=$m protocol=$p instr_enabled=$i" >> "$E/recv-mode-$NAME.txt"
+    [ "$m" = "$RECV_MODE" ] && [ "$p" = destijl ] || stop "recv_mode / protocol on $ip ($m, $p)"
+  done
+  env "${PS[@]}" STATUS_TAG=pre bash $SHMS status || stop "ds status pre"
+}
 h1_lockchk() {  # BLOCK=h1: the parent lock must still name owner=H1-main (checked at block start and before every lifetime)
   [ $BLOCK = h1 ] || return 0
   grep -q "^owner=H1-main " "$LOCKF" 2>/dev/null || stop "lock $LOCKF not held by H1-main ($(cat "$LOCKF" 2>/dev/null))"
@@ -448,7 +495,8 @@ life_start() {  # <sys> <name>: prepare + session start of one server lifetime -
   h1_lockchk
   NAME=$2 LS=$E/$2
   local S=$LS
-  if [ $s = pop ]; then SHMR=$E/shm-$NAME; PS=(K=$K8 GT=$GT8 C=$C8 R=$SHMR INIT_STATE=shared); fi
+  if [ $s = pop ]; then SHMR=$E/shm-$NAME; PS=(K=$K8 GT=$GT8 C=$C8 R=$SHMR INIT_STATE=shared) SHMS=$C8/p-popcorn-shm.sh; fi
+  if [ $s = ds ]; then SHMR=$E/dsshm-$NAME; PS=(K=$DS_K GT=$DS_GT C=$DS_C R=$SHMR INIT_STATE=shared "LOAD_EXTRA=recv_mode=$RECV_MODE") SHMS=$DS_C/p-destijl-shm.sh; fi
   t0=$(date +%s)
   echo "$(date -Is) system $s start"
   case $s in
@@ -461,8 +509,11 @@ life_start() {  # <sys> <name>: prepare + session start of one server lifetime -
                         "NODE_ENV=ENV:RACKOBJ_CONFIG=$VM_MEG/cfg/megalon.yaml ENV:MEGALON_COH_TIMERS=0 ENV:XTIMEOUT=$XT$MGSE" "NODE0_ENV=ENV:MEGALON_REINIT=1");;
     pop) dax_root; pop_setup
          SE=(SYSTEM=Popcorn-$RECV_MODE V=$VM_PLAIN HOST_SERVER=$HOST_PLAIN "SERVER_ARGS=$SA" NODE0_ARGS=--preloaded "NODE_ENV=ENV:XTIMEOUT=$XT");;
+    ds) dax_root; ds_setup
+        SE=(SYSTEM=DeStijl-$RECV_MODE-T$DST V=$VM_PLAIN HOST_SERVER=$HOST_PLAIN "SERVER_ARGS=$SA" NODE0_ARGS=--preloaded
+            "NODE_ENV=ENV:XTIMEOUT=$XT ENV:CXL_SYSTEM=ds ENV:CXL_DESTIJL_T_US=$DST");;
   esac
-  [ -z "$N0X" ] || SE+=("NODE0_ARGS=$([ $s = pop ] && echo "--preloaded ")$N0X")   # BLOCK=stream (later value wins in env)
+  [ -z "$N0X" ] || SE+=("NODE0_ARGS=$(case $s in pop|ds) echo "--preloaded ";; esac)$N0X")   # BLOCK=stream (later value wins in env)
   servers_gone || stop "a recsys-server runs before $s"
   env "${SE[@]}" T_MS=$T_MS bash $X/session.sh start "$S" > "$S.start.out" 2>&1 || { tail -3 "$S.start.out"; stop "$s session start"; }
   tail -1 "$S.start.out"
@@ -473,11 +524,14 @@ life_stop() {  # <sys>: session stop, final checks, page MSI teardown (pop)
   local s=$1 S=$LS
   bash $X/session.sh stop "$S" > "$S.stop.out" 2>&1 || { tail -5 "$S.stop.out"; stop "$s session stop / final checks"; }
   tail -1 "$S.stop.out"
-  if [ $s = pop ]; then
-    env "${PS[@]}" STATUS_TAG=post bash $C8/p-popcorn-shm.sh status
+  if [ $s = ds ] && [ "$DST" != 0 ]; then local k
+    for k in 0 1; do grep -q "^recsys-server: de stijl staleness T=$DST us on " "$S/node$k.log" || stop "node$k: staleness T=$DST not applied"; done
+  fi
+  if [ $s = pop ] || [ $s = ds ]; then
+    env "${PS[@]}" STATUS_TAG=post bash $SHMS status
     servers_gone || stop "servers left (page MSI teardown not attempted)"
     dax_free pre-teardown || stop "/dev/dax0.0 in use before the cxl_shm teardown"
-    env "${PS[@]}" bash $C8/p-popcorn-shm.sh teardown || stop "shm teardown"
+    env "${PS[@]}" bash $SHMS teardown || stop "shm teardown"
     grep -q "teardown PASS" "$SHMR/steps.log" || stop "no teardown PASS"
   fi
   servers_gone || stop "servers left after $NAME"

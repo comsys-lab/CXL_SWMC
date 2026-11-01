@@ -309,6 +309,16 @@ class Server {
     if constexpr (std::is_same_v<Be, MegalonBackend>) be_ = std::make_unique<Be>(r_, map_, p_, api_);
     else be_ = std::make_unique<Be>(r_, map_, p_);
     if (!be_->fits(&err)) die(err);
+    if constexpr (std::is_same_v<Be, PlainBackend>) {
+      // De Stijl v2: staleness bound T ($CXL_DESTIJL_T_US, only with CXL_SYSTEM=ds) on every segment's arena (vectors
+      // + links), once after the mapping; a no-op for every other system and for T unset / 0
+      uint64_t t = 0;
+      for (uint32_t s = 0; s < p_.segments; s++)
+        if (cxl::region_apply_staleness(r_, be_->seg_arena(s), be_->seg_arena_bytes(), &t) != 0)
+          die("de stijl staleness (CXL_DESTIJL_T_US) on segment " + std::to_string(s) + ": " + std::strerror(errno));
+      if (t) std::fprintf(stderr, "vdb-server: de stijl staleness T=%lu us on %u segment arenas (%lu B each)\n",
+                          (unsigned long)t, p_.segments, (unsigned long)be_->seg_arena_bytes());
+    }
     tsc_khz_ = calibrate_tsc_khz();
     if constexpr (std::is_same_v<Be, MegalonBackend>)
       be_->set_trace(o_.trace_dir.empty() ? nullptr : h_->wsec, o_.node, (o_.trace_max_mb << 20) / sizeof(TraceRec),

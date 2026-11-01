@@ -125,9 +125,9 @@ SUMMARY = SUMMARY_HEAD + [k + "_per_op" for k in PER_OP] + [
     "lowest_ramp_mg_fetch_per_op"]     # verifier L3: hatched bars of Figs 5 / 7 (searches without a confirmed max)
 STEP = ["nodes", "mix", "system", "u", "step", "phase", "offered_x", "search_s", "update_s", "p50_ms", "p95_ms",
         "p99_ms", "pass", "at_result", "valid", "window_s"] + RATE + WAIT + CXL + HCPU + ["run", "config_sha256",
-                                                                                         "lifetime"] + FIG8 + ["aborted"]
+                                                                                         "lifetime"] + FIG8 + ["aborted"] + canon.DS_COH
 STEP_VM = ["nodes", "mix", "system", "step", "phase", "offered_x", "vm", "window_s"] + RATE + ["run", "lifetime"]
-SYS = {"hw", "pop", "mg", "mgoff"}
+SYS = {"hw", "pop", "mg", "mgoff", "ds"}   # ds = De Stijl v2 (swmc counters as pop + canon.DS_COH step columns)
 
 
 def fl(v):
@@ -347,6 +347,12 @@ def lifetime_rows(part, nodes, sampler, hc=None):
             o.update(fig8_cols(rs))
             o["_has"] = {k: (any(rr.get(key) not in (None, "") for rr in rs)) for k, key in MG.items()}
             o["_has_pop"] = any(rr.get("sys.swmc.page_coherence.fault_read_count") not in (None, "") for rr in rs)
+            ds = {}  # De Stijl v2 counters summed over the VMs (p95_us: max end value); empty on other kernels
+            for kk, key in canon.DS_KEYS.items():
+                v = [fl(rr.get(key)) for rr in rs if fl(rr.get(key)) is not None]
+                if v:
+                    ds[kk] = max(v) if kk == "p95_us" else sum(v)
+            o.update(canon.ds_coh(ds, (o["search_s"] or 0) * (win or 0), win))
             agg.append(o)
         else:
             k = int(r["vm"])
@@ -391,7 +397,7 @@ def summary_row(system, agg, sm, u):
     o["counter_source"] = "+".join(src) or "none"
     popz = list(POPC) + ["coherence_events"]
     mgz = list(MG) + ["mg_flush_writeend"]
-    zero = {"hw": popz + mgz, "pop": mgz, "mg": popz, "mgoff": popz}[system]
+    zero = {"hw": popz + mgz, "pop": mgz, "mg": popz, "mgoff": popz, "ds": mgz}[system]
     for k in zero:
         if o.get(k) is None and at:
             o[k] = 0.0
@@ -399,7 +405,7 @@ def summary_row(system, agg, sm, u):
     ramp = [r for r in agg if r["phase"] == "ramp" and fl(r.get("offered_x")) is not None]
     lo = min(ramp, key=lambda r: (fl(r["offered_x"]), r["step"])) if ramp else {}
     lops = (lo.get("search_s") or 0) + (lo.get("update_s") or 0)
-    mf = 0.0 if system in ("hw", "pop") and lo else lo.get("mg_fetch")
+    mf = 0.0 if system in ("hw", "pop", "ds") and lo else lo.get("mg_fetch")
     o.update(lowest_ramp_step=lo.get("step"), lowest_ramp_offered_x=fl(lo.get("offered_x")),
              lowest_ramp_search_s=lo.get("search_s"), lowest_ramp_p99_ms=fl(lo.get("p99_ms")),
              lowest_ramp_mg_fetch_per_op=mf / lops if mf is not None and lops else None)
