@@ -1,7 +1,7 @@
 # pins-vdb-ds-54m.sh (2026-11-01, experiment ds-h1-quick): pins-vdb-sq8-54m.sh (54M SQ8 dataset + image, loadgen/12,
 # Popcorn bundle, ring2m region) with VDB_PLAIN_BUILD = builds/vdb/22 (libdestijl vdb-server, hashes as pins-vdb-ds.sh)
 # instead of builds/vdb/18, no Megalon builds (no mg lifetime), plus the De Stijl build-7 bundle (H2N_DS_C =
-# builds/destijl/7/deploy-v6 since 2026-11-02 (eval3, ds-bundles; was deploy-v5 c428ba4e...) = deploy-v2 inputs repackaged for a re-deploy (each re-deploy needs a new bundle: XMLs fix the Host images dir)) and the De Stijl region config (as pins-vdb-ds.sh).
+# builds/destijl/7/deploy-v7 since 2026-11-02 (eval3; deploy-v6 unusable; was deploy-v5 c428ba4e...) = deploy-v2 inputs repackaged for a re-deploy (each re-deploy needs a new bundle: XMLs fix the Host images dir)) and the De Stijl region config (as pins-vdb-ds.sh).
 P=/home/comsys/sungsu/destijl-control
 EVD=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 eval "$(python3 -I -B "$EVD/evalconf.py" shell ${EVAL_CONF:+--conf "$EVAL_CONF"})"   # lib.sh exports EVAL_CONF
@@ -12,7 +12,7 @@ aeb0248ae7debe3f246e6d40fd51c79ec58bfcf04b24b14e64fc20744c05f63e  $VDB_PLAIN_BUI
 82da28d45a32c68246d5ca0402c3c7dfc28394a165f4bb16dfa167c2c5058927  $VDB_LOADGEN_BUILD/loadgen
 88692448ee780398254b5683f07af35769dc1156d778cd50def0b049a1505436  $POP_C/packet.sha256
 dc85f4c57055225bc20d990764a1b3c7a28aed21598121a7a07937c6e57782ae  $REGION
-ffa01d102104c7372841c4d6b0ea71d305823d8348b073983b65683b961baa4e  $H2N_DS_C/packet.sha256
+589e2ec0c2065d897b34e0d5c05e2b5e934629831b8eb03c821c44b9611e02f9  $H2N_DS_C/packet.sha256
 2271c5285b3406e65c2ad2edad614ab713616e0eacc8ab03cdbfb985612dc2ac  $DSR
 bb52e76c5f2bedbe8661e61026cc8c7c267f4c310465cfa29ffddae002bd971f  $H2N_HOST_IMAGE/SHA256SUMS
 925e5a0c57bbccdaeab2d4fe17fcf5871559d90c9a1af6af62626aa1a6b05afc  $P/builds/vdb-inputs/5/SHA256SUMS
