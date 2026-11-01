@@ -8,6 +8,8 @@
 #   v6 (reports/RECSYS-V1-packet.md): PLAIN_BUILD (default builds/recsys/3), MEGALON_BASE (default builds/megalon/70).
 # Each dir is installed only if it does not exist; an existing dir is accepted only if every file equals the Host's
 # (sha256), otherwise the script stops (never overwrites). No data goes to the guests.
+# env PLAIN_ONLY=1 (eval3 rs14ds / rs14r2m): only the plain dir PLAIN_DIR (no Megalon dir, no MEG_BUILD check).
+# env DRY_RUN=1: Host-only plan (every Host file must exist; prints "<sha256>  <guest path>" per file), no ssh/scp.
 # usage: install.sh <log file>
 set -euo pipefail
 P=/home/comsys/sungsu/destijl-control C=$P/CXL_SWMC LOG=$1
@@ -23,9 +25,21 @@ MEG="$VM/bin/recsys-server $MB/bin/recsys-server
 $VM/bin/recsys-node.sh $C/scripts/guest/recsys-node.sh
 $VM/cfg/cxl_region.yaml ${REGION:-$C/config/cxl_region.yaml}
 $VM/cfg/megalon.yaml $MCFG"
-for f in "$MB"/lib/*; do MEG="$MEG
+PO=${PLAIN_ONLY:-0} DRY=${DRY_RUN:-0}
+[[ $PO =~ ^[01]$ && $DRY =~ ^[01]$ ]] || { echo "STOP: PLAIN_ONLY / DRY_RUN must be 0 or 1"; exit 1; }
+if [ "$PO" = 0 ]; then
+  for f in "$MB"/lib/*; do MEG="$MEG
 $VM/lib/$(basename "$f") $f"; done
-grep -q "^megalon_build=$MBASE$" "$MB/manifest.txt" || { echo "STOP: $MB is not on $MBASE"; exit 1; }
+  grep -q "^megalon_build=$MBASE$" "$MB/manifest.txt" || { echo "STOP: $MB is not on $MBASE"; exit 1; }
+else MEG=""; fi
+if [ "$DRY" = 1 ]; then  # Host-only plan
+  echo "$PLAIN"${MEG:+$'\n'"$MEG"} | while read -r g h; do
+    [ -f "$h" ] || { echo "STOP: missing Host file $h"; exit 1; }
+    echo "$(sha256sum "$h" | cut -d' ' -f1)  $g"
+  done | tee -a "$LOG"
+  echo "INSTALL DRY OK: dirs $PD${MEG:+ $VM} on 192.168.122.100 192.168.122.101 (nothing copied)" | tee -a "$LOG"
+  exit 0
+fi
 install_dir() {  # ip, dir, list
   local ip=$1 dir=$2 list=$3 g h
   if $SSH comsys@$ip "test -e $dir" < /dev/null; then
@@ -42,7 +56,11 @@ install_dir() {  # ip, dir, list
 }
 for ip in 192.168.122.100 192.168.122.101; do
   install_dir $ip $PD "$PLAIN"
+  if [ "$PO" = 1 ]; then
+    { echo "== $ip $(date -Is)"; $SSH comsys@$ip "sha256sum $PD/bin/* $PD/cfg/*; echo ldd_not_found=\$(ldd $PD/bin/recsys-server | grep -c 'not found')" < /dev/null; } | tee -a $LOG
+    continue
+  fi
   install_dir $ip $VM "$MEG"
   { echo "== $ip $(date -Is)"; $SSH comsys@$ip "sha256sum $PD/bin/* $PD/cfg/* $VM/bin/* $VM/lib/* $VM/cfg/*; echo ldd_not_found=\$(ldd $VM/lib/libmegalon-objapi.so $VM/bin/recsys-server $PD/bin/recsys-server | grep -c 'not found')" < /dev/null; } | tee -a $LOG
 done
-{ echo "== Host expected"; echo "$PLAIN"$'\n'"$MEG" | while read -r g h; do echo "$(sha256sum "$h" | cut -d' ' -f1)  $g"; done; } | tee -a $LOG
+{ echo "== Host expected"; echo "$PLAIN"${MEG:+$'\n'"$MEG"} | while read -r g h; do echo "$(sha256sum "$h" | cut -d' ' -f1)  $g"; done; } | tee -a $LOG
