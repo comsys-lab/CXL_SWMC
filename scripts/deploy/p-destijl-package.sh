@@ -21,7 +21,10 @@
 #                                                   the build's own key, depmod -b
 #   builds/destijl/<n>/deploy-v<v>/
 #     modules.tar, modules-manifest.json, kernel.config, prepare-guest.sh, sanitize-initrd.py, verify-module-payload.py,
-#     verify-initrd.py, preparation.sha256                        guest install set (generic l-vanilla scripts, copied)
+#     verify-initrd.py, verify-installed-modules.py, preparation.sha256
+#                                                   guest install set (l-vanilla scripts; prepare-guest.sh and
+#                                                   verify-installed-modules.py = ds-* copies that also accept an
+#                                                   installed /lib/modules/<K> identical to this bundle)
 #     tools/{faultlat,run.sh,cxl_region.yaml,p-destijl-guest.sh,ds-replica-check.sh,destijl.env,de_stijl_test,tools.sha256}
 #                                                                 guest tools (GT; ds-replica-check.sh from phase 5d on)
 #     vm0/, vm1/ {rollback-inactive.xml,candidate-normal.xml,candidate-restricted.xml,xml.sha256}
@@ -155,12 +158,13 @@ manifest = {'release': release, 'archive_sha256': sha(out / 'modules.tar'),
                                     f'updates/cxl_shm.ko payload == build output\n')
 print(f'{len(mods)} modules signed and verified; cxl_shm {mods["updates/cxl_shm.ko"]}')
 PY
-cp "$DEP/l-vanilla-prepare-guest.sh" "$OUT/prepare-guest.sh"
+cp "$DEP/ds-prepare-guest.sh" "$OUT/prepare-guest.sh"   # l-vanilla copy + re-deploy of an installed release
+cp "$DEP/ds-verify-installed-modules.py" "$OUT/verify-installed-modules.py"
 cp "$DEP/l-vanilla-sanitize-initrd.py" "$OUT/sanitize-initrd.py"
 cp "$DEP/l-vanilla-verify-module-payload.py" "$OUT/verify-module-payload.py"
 cp "$DEP/l-vanilla-verify-initrd.py" "$OUT/verify-initrd.py"
 (cd "$OUT" && sha256sum modules-manifest.json kernel.config prepare-guest.sh sanitize-initrd.py \
-  verify-module-payload.py verify-initrd.py > preparation.sha256)
+  verify-module-payload.py verify-initrd.py verify-installed-modules.py > preparation.sha256)
 (cd "$OUT" && python3 -I verify-module-payload.py)
 
 # 3. guest tools: faultlat (faultlat-6, built from this tree), libdestijl test, region config, guest script, destijl.env
