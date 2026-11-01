@@ -111,7 +111,7 @@ REPL=${H2N_DS_REPLICA_MODE:-off} RPOOL=${H2N_DS_REPLICA_POOL_BYTES:-}
 [ "$REPL" = off ] || { [[ $RPOOL =~ ^[1-9][0-9]*$ ]] && [ "$RPOOL" -ge 60000000000 ]; } \
   || die "H2N_DS_REPLICA_MODE=all needs H2N_DS_REPLICA_POOL_BYTES >= 60000000000 (54M SQ8 index ~53 GB; got '$RPOOL')"
 [ -z "$RPOOL" ] || [ "$REPL" = all ] || die "H2N_DS_REPLICA_POOL_BYTES without H2N_DS_REPLICA_MODE=all"
-[ "$REPL" = off ] || [ $HASDS = 1 ] || die "H2N_DS_REPLICA_MODE=all without a ds lifetime"
+[ "$REPL" = off ] || [ $HASDS = 1 ] || echo "BLOCK NOTE: H2N_DS_REPLICA_MODE=all applies to ds lifetimes only (none in this block)"
 [ $HAST = 0 ] || [ -z "${H2N_FIXED:-}" ] || die "ds:<mix>:t<T> lifetimes are SLO lifetimes (not with H2N_FIXED)"
 if [ $DSKER = 1 ]; then
   [ $HASPOP = 0 ] || die "pop and ds lifetimes need different guest kernels: run them in separate blocks"
