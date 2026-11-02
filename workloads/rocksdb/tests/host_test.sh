@@ -12,7 +12,8 @@
 # usage: host_test.sh <work dir (new)> <rocksdb build dir> <loadgen build dir with the rocksdb plugin> [keys (200000)]
 #        env: CPUS0 / CPUS1 / CPUSL (node0 / node1 / loadgen CPU lists), RATES, STEP_S, UPDATE_RATIO, WBMB,
 #             BACKEND=megalon (the build must carry lib/libmegalon-objapi.so; MEG_EXTENTS file extents per node),
-#             REGION_GB (sparse region file size, 8; 96 with MEG_EXTENTS=45000 = the VM object count, eval run2)
+#             REGION_GB (sparse region file size, 8; 96 with MEG_EXTENTS=45000 = the VM object count, eval run2),
+#             READY_S (server READY wait in s, 600; the full-size 27M keys/node image needs longer)
 set -uo pipefail
 WD=$1; B=$(cd "$2" && pwd); LG=$(cd "$3" && pwd); N=${4:-200000}
 HERE=$(cd "$(dirname "$0")" && pwd); W=$(cd "$HERE/.." && pwd)
@@ -55,7 +56,7 @@ R=$(rid)
 P=(--nodes 2 --run-id "$R" --region "$WD/region.yaml" --threads 4 --write-buffer-mb ${WBMB:-4} --prepare-threads 2 "${SP[@]}")
 env "${ENV0[@]}" taskset -c "$C0" "$B/bin/rocksdb-server" --node 0 --port 17200 --local-dir "$WD/local0" "${P[@]}" > srv0.log 2>&1 &
 taskset -c "$C1" "$B/bin/rocksdb-server" --node 1 --port 17201 --local-dir "$WD/local1" "${P[@]}" > srv1.log 2>&1 &
-for _ in $(seq 1200); do grep -q READY srv0.log && grep -q READY srv1.log && break
+for _ in $(seq $(( ${READY_S:-600} * 2 ))); do grep -q READY srv0.log && grep -q READY srv1.log && break
   grep -q FATAL srv0.log srv1.log && break; sleep 0.5; done
 grep -h "rocksdb-server: \(node\|IMAGE\|primary\|READY\|FATAL\)" srv0.log srv1.log
 if ! grep -q READY srv0.log || ! grep -q READY srv1.log; then
