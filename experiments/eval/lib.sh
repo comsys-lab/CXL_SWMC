@@ -117,6 +117,7 @@ manifest() {  # written into E at the real start
     echo "region $(sha256sum "$REGION")"
     echo "popcorn bundle $POP_C packet_sha256=$(sha256sum < "$POP_C/packet.sha256" | cut -c1-64) (expected $POP_BUNDLE_SHA)"
     echo "PRETOUCH_DIR=${PRETOUCH_DIR:-} MEASURE_ENV_DIR=${MEASURE_ENV_DIR:-} MEASURE_PART_DIR=${MEASURE_PART_DIR:-}"
+    [ "$WL" != recsys ] || echo "EVAL_RS_LEAN=${EVAL_RS_LEAN:-0} (1 = confirm probes capped at 3)"
   } > "$E/eval-manifest.txt"
 }
 ring_check() {  # REGION's msg_ring must equal the Popcorn bundle's region (cxl_shm module parameters come from it)
@@ -133,10 +134,17 @@ rs_env() {
     MG_COH_SAMPLE=$RS_MG_COH_SAMPLE EXPECT_DAX_UUID=$EXPECT_DAX_UUID STREAM_FIX_S=$RS_FIX_S
     STREAM_FIX_SETTLE_S=$RS_FIX_SETTLE_S H1_MEASURE_RUN=1)
   [ -z "${RS_PROC_CXL_SHM:-}" ] || RSENV+=(STREAM_PROC_CXL_SHM=$RS_PROC_CXL_SHM)
+  # RS_SLO_MS 400 (user 2026-11-02, 4 vCPU): main-block.sh STREAM_SLO_MS; 100 = its built-in value (env unchanged)
+  [ "$RS_SLO_MS" = 100 ] || RSENV+=(STREAM_SLO_MS=$RS_SLO_MS)
+  # env EVAL_RS_LEAN=1 (eval3 schedule §1 cell-time cut, only when late): loadgen confirm probes capped at 3
+  case ${EVAL_RS_LEAN:-0} in 0) ;; 1) RSENV+=(STREAM_CONFIRM_PROBES=3); plan "LEAN: confirm probes capped at 3 (EVAL_RS_LEAN=1)";;
+    *) die "bad EVAL_RS_LEAN (${EVAL_RS_LEAN}: 0 or 1)";; esac
+  plan "RecSys SLO query p$RS_SLO_PCT <= $RS_SLO_MS ms, max confirm probes $([ "${EVAL_RS_LEAN:-0}" = 1 ] && echo 3 || echo 6)"
   local v; for v in PRETOUCH_DIR MEASURE_ENV_DIR MEASURE_PART_DIR; do [ -z "${!v:-}" ] || RSENV+=("$v=${!v}"); done
 }
 rs_checks() {  # static checks shared by the RecSys drivers
-  [ "$RS_SLO_PCT:$RS_SLO_MS:$RS_RAMP_START" = 95:100:1 ] || die "RecSys SLO / ramp start are fixed in BLOCK=stream (query:95:100, start 1)"
+  case $RS_SLO_PCT:$RS_SLO_MS:$RS_RAMP_START in 95:100:1|95:400:1) ;;
+    *) die "RecSys SLO / ramp start: BLOCK=stream takes query:95:100 or query:95:400 (STREAM_SLO_MS), start 1";; esac
   [ -z "$RS_LOW_RAMP_FACTOR" ] || die "RS_LOW_RAMP_FACTOR needs a loadgen option that does not exist yet (cut Q8; RUN.md)"
   need_files "$RS_PLAIN_BUILD/bin/recsys-server" "$RS_MEG_BUILD/bin/recsys-server" "$RS_LOADGEN" "$REGION" "$RS_MEG_CFG" \
     "$POP_C/p-popcorn-shm.sh" "$RS_INPUTS/MANIFEST.txt" "$TREE/experiments/recsys/main-block.sh"
