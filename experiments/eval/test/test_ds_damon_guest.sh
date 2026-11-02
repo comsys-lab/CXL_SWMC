@@ -22,7 +22,7 @@ out=$(g start $ARGS); [[ $out == "DAMON ON range=4294967296-103079215104 "* ]] |
 [ "$(cat $H/quotas/ms)" = 100 ] && [ "$(cat $H/quotas/bytes)" = 1073741824 ] && [ "$(cat $H/quotas/reset_interval_ms)" = 1000 ] || fail "quota"
 [ "$(cat $C/monitoring_attrs/intervals/sample_us)" = 50000 ] && [ "$(cat $C/monitoring_attrs/nr_regions/max)" = 10000 ] || fail "attrs"
 out=$(g start $ARGS); [[ $out == "DAMON FAIL: a kdamond exists already"* ]] || fail "second start not refused: $out"
-out=$(g stats); [[ $out == "DAMON STATS nr_tried=7 "*"replica_create=3"*"replica_pages=12"* ]] || fail "stats: $out"
+out=$(g stats); [[ $out == "DAMON STATS nr_tried=7 "*"sz_applied=7 "*"cpu_ticks="*" replica_pages=12 replica_create=3 replica_evict=absent "*"replica_mode=damon" ]] || fail "stats: $out"
 out=$(g stop); [[ $out == "DAMON OFF (nr_kdamonds 0, was 1)" ]] && [ "$(cat $A/0/state)" = off ] || fail "stop: $out"
 out=$(g stop); [[ $out == "DAMON OFF (nr_kdamonds 0, was 0)" ]] || fail "idempotent stop: $out"
 out=$(g stats); [[ $out == "DAMON STATS scheme=none "* ]] || fail "stats without kdamond: $out"

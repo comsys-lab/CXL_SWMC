@@ -69,7 +69,9 @@ stats)
     H=$K/0/contexts/0/schemes/0/stats
     s="nr_tried=$(cat $H/nr_tried) sz_tried=$(cat $H/sz_tried) nr_applied=$(cat $H/nr_applied) sz_applied=$(cat $H/sz_applied) qt_exceeds=$(cat $H/qt_exceeds)"
   else s="scheme=none"; fi
-  r=; for f in $DS/replica_*; do [ -f "$f" ] && r="$r $(basename $f)=$(head -n 1 $f)"; done
+  # replica counters by name (DS_DS_COUNTERS files of /sys/kernel/swmc/destijl; "absent" when a file is missing)
+  r=; for f in replica_pages replica_create replica_evict replica_lru_evict replica_writeback replica_refresh replica_pool_full \
+      replica_pool_max_bytes replica_mode; do r="$r $f=$(head -n 1 $DS/$f 2>/dev/null || echo absent)"; done
   echo "DAMON STATS $s $(kstat) mem_available_kb=$(awk '/^MemAvailable:/{print $2}' /proc/meminfo)$r" ;;
 stop)
   [ -d $A ] || { echo "DAMON OFF (no $A)"; exit 0; }
