@@ -42,6 +42,15 @@
 #                       VMA exists); after the teardown (and in the EXIT trap) back to off. off = only checked (reads off)
 #   H2N_DS_REPLICA_POOL_BYTES  /sys/kernel/swmc/destijl/replica_pool_max_bytes for an all lifetime (required with all;
 #                       the 54M SQ8 index is ~53 GB > the 48 GB default); the previous value is restored after it
+#   H2N_DS_REPLICA_MODE=damon (outline §6, De Stijl + DAMON): replica_mode damon + pool bound (required, >= 1 GiB; the
+#                       lifetime stops when pool + 4 GiB > MemAvailable of a VM) written directly to sysfs before the
+#                       preload; after the enable one kdamond per VM (ds-damon-guest.sh start, DAMON sysfs, paddr, target
+#                       = the managed CXL range of /sys/kernel/swmc/destijl/registered, scheme "replicate"); DAMON stats
+#                       (scheme nr/sz tried/applied, kdamond CPU ticks, replica_* counters) at start, every 30 s during
+#                       the run (E/ds-damon-<name>.txt) and after it; kdamond stopped before the teardown (and in the
+#                       EXIT trap), replica_mode back to off after the teardown.
+#   H2N_DS_DAMON       (with damon, required) "sample_us=<n> aggr_us=<n> update_us=<n> min_regions=<n> max_regions=<n>
+#                       min_acc=<n> quota_ms=<n> quota_bytes=<n> reset_ms=<n>" (ds-damon-guest.sh header)
 #   H2N_DS_RECV_EXTRA "idle_sleep_us=<n> idle_spin_us=<n>" (either or both; default empty = module defaults 20 / 50):
 #                       extra cxl_shm load parameters of the De Stijl receiver (recv_mode=sleep tier), appended to
 #                       LOAD_EXTRA of every ds lifetime; after the enable the block reads both values back from
@@ -112,12 +121,29 @@ done
 KEXP=$K8 DST=0 DSKER=${H2N_DS_KERNEL:-0}
 [[ $DSKER =~ ^[01]$ ]] || die "bad H2N_DS_KERNEL ($DSKER: 0 | 1)"
 [ $HASDS = 0 ] || DSKER=1
-REPL=${H2N_DS_REPLICA_MODE:-off} RPOOL=${H2N_DS_REPLICA_POOL_BYTES:-}
-[[ $REPL =~ ^(off|all)$ ]] || die "bad H2N_DS_REPLICA_MODE ($REPL: off | all)"
-[ "$REPL" = off ] || { [[ $RPOOL =~ ^[1-9][0-9]*$ ]] && [ "$RPOOL" -ge 60000000000 ]; } \
+REPL=${H2N_DS_REPLICA_MODE:-off} RPOOL=${H2N_DS_REPLICA_POOL_BYTES:-} DAMONP=${H2N_DS_DAMON:-}
+[[ $REPL =~ ^(off|all|damon)$ ]] || die "bad H2N_DS_REPLICA_MODE ($REPL: off | all | damon)"
+[ "$REPL" != all ] || { [[ $RPOOL =~ ^[1-9][0-9]*$ ]] && [ "$RPOOL" -ge 60000000000 ]; } \
   || die "H2N_DS_REPLICA_MODE=all needs H2N_DS_REPLICA_POOL_BYTES >= 60000000000 (54M SQ8 index ~53 GB; got '$RPOOL')"
-[ -z "$RPOOL" ] || [ "$REPL" = all ] || die "H2N_DS_REPLICA_POOL_BYTES without H2N_DS_REPLICA_MODE=all"
-[ "$REPL" = off ] || [ $HASDS = 1 ] || echo "BLOCK NOTE: H2N_DS_REPLICA_MODE=all applies to ds lifetimes only (none in this block)"
+[ "$REPL" != damon ] || { [[ $RPOOL =~ ^[1-9][0-9]*$ ]] && [ "$RPOOL" -ge 1073741824 ]; } \
+  || die "H2N_DS_REPLICA_MODE=damon needs H2N_DS_REPLICA_POOL_BYTES >= 1073741824 (got '$RPOOL')"
+[ -z "$RPOOL" ] || [ "$REPL" != off ] || die "H2N_DS_REPLICA_POOL_BYTES without H2N_DS_REPLICA_MODE=all | damon"
+[ -z "$DAMONP" ] || [ "$REPL" = damon ] || die "H2N_DS_DAMON without H2N_DS_REPLICA_MODE=damon"
+DAMONARGS=
+if [ "$REPL" = damon ]; then  # the 9 DAMON parameters, all required, in ds-damon-guest.sh start order
+  for x in sample_us aggr_us update_us min_regions max_regions min_acc quota_ms quota_bytes reset_ms; do
+    v=$(echo " $DAMONP " | sed -n "s/.* $x=\([0-9][0-9]*\) .*/\1/p")
+    [ -n "$v" ] || die "H2N_DS_DAMON lacks $x=<integer> ('$DAMONP')"
+    DAMONARGS+=" $v"
+  done
+  [ "$(echo $DAMONP | wc -w)" = 9 ] || die "H2N_DS_DAMON: exactly the 9 keys sample_us aggr_us update_us min_regions max_regions min_acc quota_ms quota_bytes reset_ms ('$DAMONP')"
+  read -r -a DA <<< "$DAMONARGS"
+  [ "${DA[0]}" -ge 1000 ] && [ "${DA[1]}" -ge "${DA[0]}" ] && [ "${DA[5]}" -ge 1 ] && [ "${DA[5]}" -le $(( DA[1] / DA[0] )) ] \
+    && [ "${DA[3]}" -ge 3 ] && [ "${DA[4]}" -ge "${DA[3]}" ] \
+    || die "H2N_DS_DAMON out of range (sample_us >= 1000, aggr_us >= sample_us, 1 <= min_acc <= aggr/sample, 3 <= min_regions <= max_regions)"
+  [ -f "$EV/ds-damon-guest.sh" ] || die "missing $EV/ds-damon-guest.sh"
+fi
+[ "$REPL" = off ] || [ $HASDS = 1 ] || echo "BLOCK NOTE: H2N_DS_REPLICA_MODE=$REPL applies to ds lifetimes only (none in this block)"
 DSRX=${H2N_DS_RECV_EXTRA:-}
 [[ $DSRX =~ ^((idle_sleep_us|idle_spin_us)=[0-9]+( |$))*$ ]] \
   || die "bad H2N_DS_RECV_EXTRA ($DSRX: 'idle_sleep_us=<n> idle_spin_us=<n>', either or both)"
@@ -287,7 +313,7 @@ OWNER=eval-h2n-n$N-run$EVAL_RUN
 echo "BLOCK PLAN: vec_format=$VF ef=$EF init=$INIT host_image=$HOST_IMAGE"
 echo "BLOCK PLAN: h2n vdb N=$N vcpu/VM=$VCPU threads $ST+1 nodes=[${IPS[*]}] lifetimes=[${LIVES[*]}] app=$APP mg_app=$MGAPP ring=$RING cxlbw=$CXLBW hostcpu=$HOSTCPU opcoh_strict=$STRICT"
 echo "BLOCK PLAN: server_args plain=[$SA]${MGSA:+ megalon=[$MGSA]}"
-[ $DSKER = 0 ] || echo "BLOCK PLAN: destijl release=$DS_K bundle=$DS_C guest_tools=$DS_GT region=$REGION T=$DST us recv_mode=$RECV_MODE (node env CXL_SYSTEM=ds CXL_DESTIJL_T_US=<T>; ds:<mix>:t<T> overrides T) replica_mode=$REPL pool_bytes=${RPOOL:--}"
+[ $DSKER = 0 ] || echo "BLOCK PLAN: destijl release=$DS_K bundle=$DS_C guest_tools=$DS_GT region=$REGION T=$DST us recv_mode=$RECV_MODE (node env CXL_SYSTEM=ds CXL_DESTIJL_T_US=<T>; ds:<mix>:t<T> overrides T) replica_mode=$REPL pool_bytes=${RPOOL:--}${DAMONP:+ damon=[$DAMONP] damon_guest_sha256=$(sha256sum < "$EV/ds-damon-guest.sh" | cut -c1-64)}"
 [ $L1ON = 0 ] || echo "BLOCK PLAN: L1 step on hw/pop/ds lifetimes: --mode fixed --rates <L1> ${L1W}s warm-up + ${L1M}s + ${L1D}s drain; L1 from mg-<mix>-n$N rows of [${L1FROM:-} + this block]; no mg max -> L1 = ramp start $L1START, no step"
 [ $ACCX = 0 ] || echo "BLOCK PLAN: accuracy export per lifetime (<run>/accuracy-export.txt)"
 echo "BLOCK PLAN: $LAYOUT"
@@ -305,7 +331,7 @@ fi
 [ -d "$E" ] && [ -z "$(ls -A "$E" | grep -v '^sequence')" ] || die "$E missing or not empty"
 # ---------------------------------------------------------------------------------------------------- real block
 bash "$HG" lock "$OWNER" || die "lock"
-DMESG_DONE=0 REPL_SET=0
+DMESG_DONE=0 REPL_SET=0 DAMON_SET=0 DAMON_SAMPLER=
 log() { echo "$(date -Is) $*" | tee -a "$E/block.log"; }
 stop() { log "BLOCK STOP $*"; exit 1; }
 if [ $CXLBW = 1 ]; then  # stops by itself within ~10 s of the unlock (UNTIL_UNLOCK=1); a refusal is recorded, not fatal
@@ -386,8 +412,12 @@ finish() {
       [ "$out" = 0 ] || [ "$out" = absent ] || echo "ROLLBACK FAIL: $ip instr/detail not 0 ($out)" | tee -a "$E/rollback.out"
     done
   fi
+  damon_sampler_stop
+  if [ "$DAMON_SET" = 1 ]; then  # a stopped damon lifetime: kdamond off before the cxl_shm teardown
+    damon_cmd rollback stop stop || echo "ROLLBACK FAIL: kdamond not stopped on a VM (see ds-damon-rollback.txt)" | tee -a "$E/rollback.out"
+  fi
   shm_teardown_left
-  if [ "$REPL_SET" = 1 ]; then  # a stopped replicate-all lifetime: replica_mode off + pool bound restored (after teardown)
+  if [ "$REPL_SET" = 1 ]; then  # a stopped replicate-all / damon lifetime: replica_mode off + pool bound restored (after teardown)
     replica_set rollback off || echo "ROLLBACK FAIL: replica_mode not off / pool bound not restored on a VM (see ds-replica-rollback.txt)" | tee -a "$E/rollback.out"
   fi
   dax_unused rollback || echo "ROLLBACK FAIL: /dev/dax0.0 in use on a VM (see dax-users.txt)" | tee -a "$E/rollback.out"
@@ -404,7 +434,7 @@ gate() { bash "$HG" check "$E/gate-$1.txt" > /dev/null || stop "h3 gate ($1; see
   [ $HASMG = 1 ] && echo "megalon_build=$MEG_BUILD lib=$MEG_LIB cfg=$MEG_CFG sha256=$(sha256sum < "$MEG_CFG" | cut -c1-64) vmeg=$VMEG mg_max_deletes=$MG_MAXD"
   echo "writes=$X_WRITES sha256=$(sha256sum < "$X_WRITES" | cut -c1-64) max_deletes=$X_MAXD"
   echo "slo_part=[$H2N_SLO_PART]"
-  [ $DSKER = 0 ] || echo "destijl: bundle=$DS_C bundle_sha=$DS_BUNDLE_SHA release=$DS_K guest_tools=$DS_GT region=$REGION t_us=$DST recv_mode=$RECV_MODE replica_mode=$REPL replica_pool_bytes=${RPOOL:--}"
+  [ $DSKER = 0 ] || echo "destijl: bundle=$DS_C bundle_sha=$DS_BUNDLE_SHA release=$DS_K guest_tools=$DS_GT region=$REGION t_us=$DST recv_mode=$RECV_MODE replica_mode=$REPL replica_pool_bytes=${RPOOL:--}${DAMONP:+ damon=[$DAMONP] damon_guest_sha256=$(sha256sum < "$EV/ds-damon-guest.sh" | cut -c1-64)}"
   [ $L1ON = 0 ] || echo "l1: from=[$L1FROM] warmup_s=$L1W measure_s=$L1M drain_s=$L1D ramp_start=$L1START"
   [ $ACCX = 0 ] || echo "accuracy_export=1"
   [ -z "$FIXED" ] || echo "fixed=[$FIXED] node_env_extra=[$NENV_X] allow_detail=$ALLOWDET (H2N_FIXED: the slo part is not run)"
@@ -476,8 +506,8 @@ ds_up() {  # <name>
   dax_unused pre-load-$1 || stop "/dev/dax0.0 in use before the cxl_shm (destijl) load"
   local ph ip m p i t
   for ph in load chown; do env "${DSP[@]}" bash $DS_C/p-destijl-shm.sh $ph >> "$E/block.log" 2>&1 || stop "ds shm $ph"; done
-  if [ "$REPL" = all ]; then  # before the preload / enable: no managed VMA may exist (EBUSY otherwise)
-    REPL_SET=1; replica_set "$1" all || stop "replica_mode all / pool bound on a VM (see ds-replica-$1.txt)"
+  if [ "$REPL" != off ]; then  # before the preload / enable: no managed VMA may exist (EBUSY otherwise)
+    REPL_SET=1; replica_set "$1" $REPL || stop "replica_mode $REPL / pool bound on a VM (see ds-replica-$1.txt)"
   else replica_off_check "$1" || stop "replica_mode is not off on a VM (see ds-replica-$1.txt)"; fi
   for ip in "${IPS[@]}"; do
     [ "$($SSH comsys@$ip "test -f $VPLAIN/cfg/cxl_region.yaml && test -f $DS_GT/cxl_region.yaml && sha256sum $VPLAIN/cfg/cxl_region.yaml $DS_GT/cxl_region.yaml | cut -d' ' -f1 | sort -u | wc -l" < /dev/null)" = 1 ] \
@@ -499,10 +529,19 @@ ds_up() {  # <name>
     for x in $DSRX; do [[ " $t " == *" $x "* ]] || stop "receiver parameter $x not applied on $ip ($t)"; done
   done
   env "${DSP[@]}" STATUS_TAG=pre bash $DS_C/p-destijl-shm.sh status >> "$E/block.log" 2>&1 || stop "ds status pre"
+  if [ "$REPL" = damon ]; then
+    DAMON_SET=1; damon_start "$1" || stop "DAMON start on a VM (see ds-damon-$1.txt)"
+  fi
 }
 ds_down() {  # <name>
-  env "${DSP[@]}" STATUS_TAG=post bash $DS_C/p-destijl-shm.sh status >> "$E/block.log" 2>&1
   local ip out
+  if [ "$REPL" = damon ]; then  # stats after the run, then the kdamond off before the teardown
+    damon_sampler_stop
+    damon_cmd "$1" post stats || log "$1 NOTE: DAMON post stats unreadable on a VM (see ds-damon-$1.txt)"
+    damon_cmd "$1" stop stop || stop "DAMON stop on a VM (see ds-damon-$1.txt)"
+    DAMON_SET=0
+  fi
+  env "${DSP[@]}" STATUS_TAG=post bash $DS_C/p-destijl-shm.sh status >> "$E/block.log" 2>&1
   if [ "$REPL" = all ]; then  # a full pool maps CXL directly (replicated and unreplicated pages mixed): recorded, NOTE
     for ip in "${IPS[@]}"; do
       out=$($SSH comsys@$ip "echo replica_pages=\$(cat /sys/kernel/swmc/destijl/replica_pages 2>/dev/null) replica_pool_full=\$(cat /sys/kernel/swmc/destijl/replica_pool_full 2>/dev/null)" < /dev/null 2>&1)
@@ -513,8 +552,36 @@ ds_down() {  # <name>
   servers_gone || stop "servers left (De Stijl teardown not attempted)"
   dax_unused pre-teardown || stop "/dev/dax0.0 in use before the cxl_shm (destijl) teardown"
   env "${DSP[@]}" bash $DS_C/p-destijl-shm.sh teardown >> "$E/block.log" 2>&1 || stop "ds shm teardown"
-  if [ "$REPL" = all ]; then replica_set "$1" off || stop "replica_mode back to off / pool bound restore (see ds-replica-$1.txt)"; REPL_SET=0; fi
+  if [ "$REPL" != off ]; then replica_set "$1" off || stop "replica_mode back to off / pool bound restore (see ds-replica-$1.txt)"; REPL_SET=0; fi
 }
+# ---- DAMON (H2N_DS_REPLICA_MODE=damon): ds-damon-guest.sh streamed to every VM as root (sudo -n sh -s) ---------------
+damon_cmd() {  # <name> <tag> <stats|stop>: on every VM; output lines in E/ds-damon-<name>.txt; 1 when a VM fails
+  local ip out rc=0
+  for ip in "${IPS[@]}"; do
+    out=$($SSH comsys@$ip "sudo -n sh -s -- $3" < "$EV/ds-damon-guest.sh" 2>&1)
+    echo "$(date -Is) $1 $2 $ip: $out" >> "$E/ds-damon-$1.txt"
+    case $3 in stats) [[ $out == "DAMON STATS "* ]] || rc=1;; stop) [[ $out == "DAMON OFF"* ]] || rc=1;; esac
+  done
+  return $rc
+}
+damon_start() {  # <name>: kdamond on every VM over its managed CXL range (registered), stats sampler every 30 s
+  local ip reg sp np s e out
+  for ip in "${IPS[@]}"; do
+    reg=$($SSH comsys@$ip "cat /sys/kernel/swmc/destijl/registered" < /dev/null 2>&1)
+    sp=$(echo "$reg" | sed -n 's/^managed_start_pfn \(0x[0-9a-f]*\)$/\1/p') np=$(echo "$reg" | sed -n 's/^managed_pages \([0-9]*\)$/\1/p')
+    echo "$(date -Is) $1 $ip registered: $(echo $reg)" >> "$E/ds-damon-$1.txt"
+    [ -n "$sp" ] && [ -n "$np" ] && [ "$np" -gt 0 ] || return 1
+    s=$(( sp * 4096 )) e=$(( (sp + np) * 4096 ))
+    out=$($SSH comsys@$ip "sudo -n sh -s -- start $s $e$DAMONARGS" < "$EV/ds-damon-guest.sh" 2>&1)
+    echo "$(date -Is) $1 start $ip: $out" >> "$E/ds-damon-$1.txt"
+    [[ $out == "DAMON ON "* ]] || return 1
+  done
+  damon_cmd "$1" pre stats || return 1
+  ( trap - EXIT INT TERM HUP; while sleep 30; do damon_cmd "$1" run stats > /dev/null 2>&1; done ) &
+  DAMON_SAMPLER=$!
+  log "$1: DAMON on (${#IPS[@]} VMs, params [$DAMONP], pool $RPOOL bytes; ds-damon-$1.txt)"
+}
+damon_sampler_stop() { [ -z "${DAMON_SAMPLER:-}" ] || { kill "$DAMON_SAMPLER" 2>/dev/null; wait "$DAMON_SAMPLER" 2>/dev/null; DAMON_SAMPLER=; }; }
 sys_up() {  # <sys> <name>: dax owner (hw, mg, mgoff: comsys) + Popcorn / De Stijl cycle
   case $1 in
     hw|mg|mgoff) [ $OWNED = comsys ] || { dax_owner comsys || stop "dax0.0 -> comsys"; OWNED=comsys; };;
@@ -537,7 +604,19 @@ replica_set() {  # <name> <off|all>: replica_mode (and with all the pool bound) 
   local i ip out prev D=/sys/kernel/swmc/destijl
   for i in "${!IPS[@]}"; do
     ip=${IPS[$i]}
-    if [ "$2" = all ]; then
+    if [ "$2" = damon ]; then  # p-destijl-guest.sh replica-mode takes off|all only: direct sysfs write + read back
+      prev=$($SSH comsys@$ip "cat $D/replica_pool_max_bytes" < /dev/null 2>/dev/null)
+      [[ $prev =~ ^[0-9]+$ ]] || { echo "$(date -Is) $1 $ip pool read failed ($prev)" >> "$E/ds-replica-$1.txt"; return 1; }
+      [ -f "$E/ds-replica-pool-prev-vm$i" ] || echo "$prev" > "$E/ds-replica-pool-prev-vm$i"
+      out=$($SSH comsys@$ip "echo mem_available_kb=\$(awk '/^MemAvailable:/{print \$2}' /proc/meminfo)" < /dev/null 2>&1)
+      local ma=${out#mem_available_kb=}
+      echo "$(date -Is) $1 $ip $out pool=$RPOOL" >> "$E/ds-replica-$1.txt"
+      [[ $ma =~ ^[0-9]+$ ]] && [ $(( RPOOL + 4294967296 )) -le $(( ma * 1024 )) ] \
+        || { echo "$(date -Is) $1 $ip STOP: pool $RPOOL + 4 GiB > MemAvailable ($out)" >> "$E/ds-replica-$1.txt"; return 1; }
+      out=$($SSH comsys@$ip "sudo -n sh -c 'echo $RPOOL > $D/replica_pool_max_bytes && echo damon > $D/replica_mode' && echo pool=\$(cat $D/replica_pool_max_bytes) mode=\$(cat $D/replica_mode) replica_pages=\$(cat $D/replica_pages)" < /dev/null 2>&1)
+      echo "$(date -Is) $1 $ip set damon (pool_prev=$prev): $out" >> "$E/ds-replica-$1.txt"
+      [[ $out == *"pool=$RPOOL mode=damon replica_pages=0"* ]] || return 1
+    elif [ "$2" = all ]; then
       prev=$($SSH comsys@$ip "cat $D/replica_pool_max_bytes" < /dev/null 2>/dev/null)
       [[ $prev =~ ^[0-9]+$ ]] || { echo "$(date -Is) $1 $ip pool read failed ($prev)" >> "$E/ds-replica-$1.txt"; return 1; }
       [ -f "$E/ds-replica-pool-prev-vm$i" ] || echo "$prev" > "$E/ds-replica-pool-prev-vm$i"
