@@ -8,6 +8,26 @@
 //     -I<wt>/workloads/rocksdb/server -I<wt>/systems/common -I<wt>/systems/megalon/shim -I<wt>/experiments/loadgen \
 //     -I<wt>/systems/popcorn_new/include -I<wt>/workloads/kv/server tests/mem_read_tail_test.cc \
 //     <B>/rocksdb-build/librocksdb.a -ldl -o mem_read_tail_test && ./mem_read_tail_test   -> "MEM READ TAIL TEST PASS"
+// backend.h's own includes first (include guards), so the private -> public define reaches only backend.h's classes,
+// not libstdc++ (which rejects redeclared access) or the RocksDB / region headers
+#include <dlfcn.h>
+
+#include <algorithm>
+#include <atomic>
+#include <cstddef>
+#include <cstdint>
+#include <cstdio>
+#include <cstring>
+#include <fstream>
+#include <sstream>
+#include <string>
+#include <utility>
+#include <vector>
+
+#include "cxl_region.h"
+#include "layout.h"
+#include "megalon_objapi.h"
+#include "rocksdb/cxl.h"
 #define private public  // test access to MegalonBackend::mem_read / tail_clamps_ (no production API added)
 #include "backend.h"
 #undef private
