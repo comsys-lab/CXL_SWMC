@@ -4,7 +4,7 @@
 # bundle: the candidate XMLs fix the Host images dir /var/lib/libvirt/images/destijl-<n>-vm<k>-v<v> and p-destijl-deploy.sh
 # install never overwrites an existing one (the guest rebuilds the initramfs on every prepare), and the bundle's rollback
 # XML must equal the VM's current `virsh dumpxml --inactive`. Host-local only: no virsh, no ssh, no sudo.
-#   p-destijl-bundle.sh [--dry-run] [--build 7|8] [--rollback <popcorn bundle dir>] [--topo 2|8] [--xml-src <dir>] [--version <v>]
+#   p-destijl-bundle.sh [--dry-run] [--build 7|8|9] [--rollback <popcorn bundle dir>] [--topo 2|8] [--xml-src <dir>] [--version <v>]
 # --build 7 (default, unchanged): see "Fixed inputs (build 7)" below.
 # --build 8 (fault-latency breakdown port, d529ac9d9, user decision 2026-11-02 for blocks D, B2+C, E): SOURCE_TAG =
 #   rel/destijl-8; MANIFEST.txt must say "status: COMPLETE" (workspaces/eval3/build8/finish-build8.sh) and System.map must
@@ -12,6 +12,14 @@
 #   scripts, de_stijl_test byte-identical; destijl.env differs only in K and KO_SHA, so tools.sha256 differs too) ->
 #   new guest tools dir GT=/home/comsys/destijl-8 (p-destijl-deploy.sh tools refuses a GT with other content); every
 #   later build-8 bundle must have the tools.sha256 of the first build-8 bundle (same GT reused).
+# --build 9 (write path phase A + adaptive receiver, cxl_shm 13.3, 4d1597980): SOURCE_TAG = rel/destijl-9, KTREE =
+#   workspaces/destijl-v2/build9 (tag and msg_layer_module live there); MANIFEST "status: COMPLETE", System.map holds
+#   swmc_instr_breakdown_key and ds_rx_mark_empty, staged cxl_shm.ko is version 13.3 with parameter fault_poll.
+#   TOOLS_FROM = builds/destijl/7/deploy-v1 for faultlat, run.sh, cxl_region.yaml, ds-replica-check.sh, de_stijl_test
+#   (byte-identical); NOT the "only K and KO_SHA differ" rule: tools/p-destijl-guest.sh = scripts/deploy/
+#   p-destijl-guest-adaptive.sh (load accepts recv_mode=adaptive, fault_poll=0|1) and destijl.env gains
+#   LOAD_DEFAULTS="fault_poll=0" (applied at every load unless LOAD_EXTRA sets fault_poll) -> new tools set, new guest
+#   tools dir GT=/home/comsys/destijl-9; later build-9 bundles must match the first one's tools.sha256.
 # --topo 2 (default): cxl_vm0/1; rollback XML = <rollback bundle>/vm<k>/candidate-normal.xml (what the VMs run after a
 #   Popcorn deploy from that bundle). --xml-src overrides it (a dir with vm<k>/candidate-normal.xml or
 #   cxl_vm<k>.after-define.xml).
@@ -43,7 +51,7 @@ while [ $# -gt 0 ]; do
     --topo) TOPO=${2:?}; shift;;
     --xml-src) XSRC=${2:?}; shift;;
     --version) V=${2:?}; shift;;
-    *) sed -n '2,32p' "$0"; exit 2;;
+    *) sed -n '2,38p' "$0"; exit 2;;
   esac; shift
 done
 stop() { echo "BUNDLE STOP: $*"; exit 1; }
@@ -51,8 +59,13 @@ sh_() { sha256sum "$1" | cut -d' ' -f1; }
 case $n in
   7) B=$ROOT/builds/destijl/7 SOURCE_TAG=rel/destijl-6 TOOLS_FROM=$ROOT/builds/destijl/7/deploy-v1;;
   8) B=$ROOT/builds/destijl/8 SOURCE_TAG=rel/destijl-8 TOOLS_FROM=$ROOT/builds/destijl/7/deploy-v1;;
-  *) stop "--build must be 7 or 8";;
+  9) B=$ROOT/builds/destijl/9 SOURCE_TAG=rel/destijl-9 TOOLS_FROM=$ROOT/builds/destijl/7/deploy-v1
+     KTREE=$ROOT/workspaces/destijl-v2/build9;;
+  *) stop "--build must be 7, 8 or 9";;
 esac
+# build 9 rule: own guest script and destijl.env LOAD_DEFAULTS (new tools set); builds 7/8: none (unchanged)
+GUEST_SRC= ENV_EXTRA=
+if [ "$n" = 9 ]; then GUEST_SRC=$SW/scripts/deploy/p-destijl-guest-adaptive.sh ENV_EXTRA='LOAD_DEFAULTS="fault_poll=0"'; fi
 # test hook (dry runs only): a stand-in build dir / source tag, for the build-8 path before build 8 is finished
 if [ $DRY = 1 ] && [ -n "${BUNDLE_TEST_BUILD_DIR:-}" ]; then
   B=$(readlink -f "$BUNDLE_TEST_BUILD_DIR"); SOURCE_TAG=${BUNDLE_TEST_SOURCE_TAG:-$SOURCE_TAG}
@@ -61,6 +74,7 @@ fi
 GT=/home/comsys/destijl-$n
 # tools of TOOLS_FROM that must be byte-identical (destijl.env: only for the same build; else equal except K / KO_SHA)
 SAME=(faultlat run.sh cxl_region.yaml p-destijl-guest.sh ds-replica-check.sh de_stijl_test)
+[ -z "$GUEST_SRC" ] || SAME=(faultlat run.sh cxl_region.yaml ds-replica-check.sh de_stijl_test)
 [ "$(dirname "$TOOLS_FROM")" = "$B" ] && SAME+=(destijl.env tools.sha256)
 case $TOPO in
   2) VMS="0 1";;
@@ -114,6 +128,19 @@ if [ "$n" = 8 ]; then
   grep -q ' swmc_instr_breakdown_key$' "$B/System.map" || stop "build 8 System.map has no swmc_instr_breakdown_key"
   [ "$(sh_ "$B/System.map")" = "$(art System.map)" ] || stop "System.map changed since the MANIFEST"
 fi
+if [ "$n" = 9 ]; then
+  [ "$(mf status)" = COMPLETE ] || stop "build 9 MANIFEST status '$(mf status)'"
+  for s in swmc_instr_breakdown_key ds_rx_mark_empty; do
+    grep -q " $s\$" "$B/System.map" || stop "build 9 System.map has no $s"; done
+  [ "$(sh_ "$B/System.map")" = "$(art System.map)" ] || stop "System.map changed since the MANIFEST"
+  SKO=$B/stage/lib/modules/$K/updates/cxl_shm.ko
+  test -f "$SKO" || stop "no staged $SKO"
+  [ "$(modinfo -F version "$SKO")" = 13.3 ] || stop "staged cxl_shm.ko is not version 13.3"
+  modinfo -F parm "$SKO" | grep -q '^fault_poll:' || stop "staged cxl_shm.ko has no fault_poll parameter"
+  modinfo -F parm "$SKO" | grep -q '^recv_mode:.*adaptive' || stop "staged cxl_shm.ko recv_mode has no adaptive"
+  test -f "$GUEST_SRC" && bash -n "$GUEST_SRC" || stop "guest script $GUEST_SRC missing or not valid bash"
+  grep -qF 'recv_mode=(poll|sleep|adaptive)|fault_poll=[01]' "$GUEST_SRC" || stop "$GUEST_SRC does not accept recv_mode=adaptive / fault_poll"
+fi
 [ "$(sh_ "$BZ")" = "$BZ_SHA" ] || stop "bzImage changed"
 [ "$(sh_ "$B/.config")" = "$(mf config_sha256)" ] || stop ".config changed"
 [ "$(sh_ "$B/cxl_shm/cxl_shm.ko")" = "$(art cxl_shm/cxl_shm.ko)" ] || stop "cxl_shm.ko changed"
@@ -140,6 +167,7 @@ FIRST_TOOLS=$(find "$B" -maxdepth 3 -path "$B/deploy-v*/tools/tools.sha256" 2>/d
 
 PKG=(env XML_SRC="$XSRC" VMS="$VMS" KTREE="$KTREE" SOURCE_TAG="$SOURCE_TAG" FAULTLAT_BUILD="$FAULTLAT_BUILD"
      TOOLS_FROM="$TOOLS_FROM" bash "$SW/scripts/ctl/build-wrap.sh" bash "$SW/scripts/deploy/p-destijl-package.sh" "$n" "$V")
+[ -z "$GUEST_SRC" ] || PKG=(env GUEST_SRC="$GUEST_SRC" ENV_EXTRA="$ENV_EXTRA" "${PKG[@]:1}")
 denv() {  # deploy environment (sourceable)
   echo "# De Stijl build $n bundle deploy-v$V: deploy environment for p-destijl-deploy.sh / p-destijl-shm.sh"
   echo "C=$OUT"; echo "V=$V"; echo "K=$K"; echo "PRE_K=$PRE_K"; echo "BZ=$BZ"; echo "BZ_SHA=$BZ_SHA"; echo "GT=$GT"
@@ -158,6 +186,7 @@ if [ $DRY = 1 ]; then
   done
   echo "rollback bundle $RB (packet $RB_PKT), PRE_K $PRE_K"
   echo "would run: ${PKG[*]}"
+  [ -z "$GUEST_SRC" ] || echo "build $n rule: tools/p-destijl-guest.sh = $GUEST_SRC ($(sh_ "$GUEST_SRC" | cut -c1-12)), destijl.env + $ENV_EXTRA, KTREE $KTREE"
   denv
   echo "BUNDLE DRY PASS (topo $TOPO, deploy-v$V, nothing written under $B)"
   exit 0
@@ -170,7 +199,15 @@ fi
 for f in "${SAME[@]}"; do
   cmp -s "$OUT/tools/$f" "$TOOLS_FROM/tools/$f" || stop "tools/$f differs from $TOOLS_FROM (guest dir $GT could not be reused)"
 done
-if [ "$n" != 7 ]; then   # cross-build tools: destijl.env = TOOLS_FROM's except K and KO_SHA; K = this release
+if [ -n "$GUEST_SRC" ]; then   # build 9 rule: own guest script, destijl.env = TOOLS_FROM's except K, KO_SHA + ENV_EXTRA
+  cmp -s "$OUT/tools/p-destijl-guest.sh" "$GUEST_SRC" || stop "tools/p-destijl-guest.sh != $GUEST_SRC"
+  diff -q <(grep -vE '^(K|KO_SHA|LOAD_DEFAULTS)=' "$OUT/tools/destijl.env") <(grep -vE '^(K|KO_SHA|LOAD_DEFAULTS)=' "$TOOLS_FROM/tools/destijl.env") > /dev/null ||
+    stop "tools/destijl.env differs from $TOOLS_FROM beyond K / KO_SHA / LOAD_DEFAULTS"
+  grep -qx "K=$K" "$OUT/tools/destijl.env" || stop "tools/destijl.env K is not $K"
+  grep -qxF "$ENV_EXTRA" "$OUT/tools/destijl.env" || stop "tools/destijl.env lacks $ENV_EXTRA"
+  [ -z "$FIRST_TOOLS" ] || cmp -s "$OUT/tools/tools.sha256" "$FIRST_TOOLS" ||
+    stop "tools/tools.sha256 differs from the first build-$n bundle ($FIRST_TOOLS): guest dir $GT could not be reused"
+elif [ "$n" != 7 ]; then   # cross-build tools: destijl.env = TOOLS_FROM's except K and KO_SHA; K = this release
   diff -q <(grep -vE '^(K|KO_SHA)=' "$OUT/tools/destijl.env") <(grep -vE '^(K|KO_SHA)=' "$TOOLS_FROM/tools/destijl.env") > /dev/null ||
     stop "tools/destijl.env differs from $TOOLS_FROM beyond K / KO_SHA"
   grep -qx "K=$K" "$OUT/tools/destijl.env" || stop "tools/destijl.env K is not $K"
@@ -189,6 +226,7 @@ denv "$PKT_SHA" > "$OUT/deploy-env.sh"
   echo "  $(sh_ "$OUT/modules.tar")  modules.tar"
   echo "  $(sh_ "$OUT/package-record.json")  package-record.json"
   if [ "$n" = 7 ]; then echo "  $(sh_ "$OUT/tools/tools.sha256")  tools/tools.sha256 (== $TOOLS_FROM/tools/tools.sha256)"
+  elif [ -n "$GUEST_SRC" ]; then echo "  $(sh_ "$OUT/tools/tools.sha256")  tools/tools.sha256 (guest dir $GT; tools of $TOOLS_FROM, p-destijl-guest.sh = $GUEST_SRC, destijl.env K/KO_SHA + $ENV_EXTRA of build $n)"
   else echo "  $(sh_ "$OUT/tools/tools.sha256")  tools/tools.sha256 (guest dir $GT; tools of $TOOLS_FROM, destijl.env K/KO_SHA of build $n)"; fi
   echo "  $(sh_ "$OUT/deploy-env.sh")  deploy-env.sh"
   for k in $VMS; do echo "  $(sh_ "$OUT/vm$k/xml.sha256")  vm$k/xml.sha256 (rollback = ${XS[$k]})"; done

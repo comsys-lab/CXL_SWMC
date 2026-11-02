@@ -11,6 +11,10 @@
 #   its cxl_swmc_commit), so an existing guest tools dir of that bundle is reused by p-destijl-deploy.sh.
 #   TOOLS_FROM of ANOTHER build (build 8 from builds/destijl/7/deploy-v1): the same, except destijl.env, whose K and
 #   KO_SHA are this build's (all other lines identical) -> new tools.sha256, new guest tools dir (p-destijl-bundle.sh).
+# GUEST_SRC=<file> / ENV_EXTRA=<lines NAME=value> (build 9 on, set by p-destijl-bundle.sh; unset = unchanged output):
+#   tools/p-destijl-guest.sh is a copy of GUEST_SRC instead of scripts/deploy/p-destijl-guest.sh, and the ENV_EXTRA lines
+#   are appended to destijl.env; with TOOLS_FROM of another build, p-destijl-guest.sh and the ENV_EXTRA names are then
+#   exempt from the byte-identity checks (only allowed with TOOLS_FROM of ANOTHER build).
 # Inputs (builds/destijl/<n>):  MANIFEST.txt (release, source_commit, dirty_sha256, config_sha256, artifact sha256s),
 #   .config, arch/x86/boot/bzImage, System.map, certs/, cxl_shm/cxl_shm.ko (cxl_shm v13, M=<KTREE>/msg_layer_module).
 # Source identity: a build from a dirty tree (MANIFEST dirty_sha256) is accepted only if EQUIV_COMMIT reproduces the
@@ -60,6 +64,17 @@ DEV_SIZE=103060340736   # observed /sys/bus/dax/devices/dax0.0/size on the guest
 WRAP="bash $SW/scripts/ctl/build-wrap.sh"   # node 1, or the session CPUs while MEASUREMENT.lock exists
 SCR=${TMPDIR:-/tmp}/p-destijl-package-$$
 VMS=${VMS:-0 1}
+GUEST=${GUEST_SRC:-$DEP/p-destijl-guest.sh}
+test -f "$GUEST" || { echo "STOP: no guest script $GUEST"; exit 1; }
+EXN=()   # ENV_EXTRA names (exempt from the cross-build destijl.env check)
+if [ -n "${ENV_EXTRA:-}" ]; then
+  while IFS= read -r l; do
+    [[ "$l" =~ ^([A-Z][A-Z0-9_]*)=\"[a-z0-9_=\ -]*\"$ ]] || { echo "STOP: ENV_EXTRA line '$l' is not NAME=\"...\""; exit 2; }
+    [[ " K KO_SHA PARAMS MANAGED_BASE_OFF MANAGED_BYTES " != *" ${BASH_REMATCH[1]} "* && "${BASH_REMATCH[1]}" != PARAMS_N* ]] ||
+      { echo "STOP: ENV_EXTRA may not set ${BASH_REMATCH[1]}"; exit 2; }
+    EXN+=("${BASH_REMATCH[1]}")
+  done <<< "$ENV_EXTRA"
+fi
 read -r -a VML <<< "$VMS"
 [ ${#VML[@]} -ge 1 ] || { echo "VMS is empty"; exit 2; }
 for k in "${VML[@]}"; do [[ "$k" =~ ^[0-7]$ ]] || { echo "VMS: bad VM id '$k'"; exit 2; }; done
@@ -206,7 +221,8 @@ if [ -z "${TOOLS_FROM:-}" ]; then   # with TOOLS_FROM the earlier de_stijl_test 
 fi
 cp "$SCR/fl/faultlat" "$SW/workloads/faultlat/run.sh" "$OUT/tools/"
 cp "$REG" "$OUT/tools/cxl_region.yaml"
-cp "$DEP/p-destijl-guest.sh" "$DEP/ds-replica-check.sh" "$OUT/tools/"   # replica check: p-destijl-guest.sh replica-check
+cp "$GUEST" "$OUT/tools/p-destijl-guest.sh"
+cp "$DEP/ds-replica-check.sh" "$OUT/tools/"   # replica check: p-destijl-guest.sh replica-check
 FL=$OUT/tools/faultlat
 grep -aq 'faultlat-6' "$FL" || { echo "STOP: faultlat is not faultlat-6 (no --protocol destijl)"; exit 1; }
 par() { "$FL" params --protocol destijl --config "$OUT/tools/cxl_region.yaml" --device-size $DEV_SIZE --nodes "$1" \
@@ -224,20 +240,29 @@ KO_SHA=$(sha256sum "$MD/updates/cxl_shm.ko" | cut -d' ' -f1)
   for m in 2 3 4 5 6 7 8; do echo "PARAMS_N$m=\"$(par $m)\""; done
   echo "MANAGED_BASE_OFF=$MOFF"
   echo "MANAGED_BYTES=$MBYTES"
+  [ -z "${ENV_EXTRA:-}" ] || printf '%s\n' "$ENV_EXTRA"
 } > "$OUT/tools/destijl.env"
 for m in 2 3 4 5 6 7 8; do echo "N=$m $(par $m)"; done > "$OUT/params-layout.txt"
 if [ -n "${TOOLS_FROM:-}" ]; then   # re-package with the guest tools of an earlier bundle of the same build (byte-identical)
   TR=$TOOLS_FROM/package-record.json
   (cd "$TOOLS_FROM/tools" && sha256sum --quiet -c tools.sha256) || { echo "STOP: $TOOLS_FROM/tools fails its tools.sha256"; exit 1; }
-  for f in faultlat run.sh cxl_region.yaml p-destijl-guest.sh ds-replica-check.sh; do
+  SAMEF=(faultlat run.sh cxl_region.yaml p-destijl-guest.sh ds-replica-check.sh)
+  [ -z "${GUEST_SRC:-}" ] || SAMEF=(faultlat run.sh cxl_region.yaml ds-replica-check.sh)
+  for f in "${SAMEF[@]}"; do
     cmp -s "$OUT/tools/$f" "$TOOLS_FROM/tools/$f" || { echo "STOP: tools/$f differs from $TOOLS_FROM"; exit 1; }
   done
   if [ "$(readlink -f "$(dirname "$TOOLS_FROM")")" = "$(readlink -f "$B")" ]; then   # same build: destijl.env identical
+    [ -z "${GUEST_SRC:-}${ENV_EXTRA:-}" ] || { echo "STOP: GUEST_SRC / ENV_EXTRA need TOOLS_FROM of another build"; exit 1; }
     cmp -s "$OUT/tools/destijl.env" "$TOOLS_FROM/tools/destijl.env" || { echo "STOP: tools/destijl.env differs from $TOOLS_FROM"; exit 1; }
-  else   # another build's tools (e.g. build 8 from build 7): K and KO_SHA are this build's, everything else identical
+  elif [ -z "${GUEST_SRC:-}${ENV_EXTRA:-}" ]; then   # another build's tools (e.g. build 8 from build 7): K and KO_SHA are this build's, everything else identical
     diff -q <(grep -vE '^(K|KO_SHA)=' "$OUT/tools/destijl.env") <(grep -vE '^(K|KO_SHA)=' "$TOOLS_FROM/tools/destijl.env") > /dev/null ||
       { echo "STOP: tools/destijl.env differs from $TOOLS_FROM beyond K / KO_SHA"; exit 1; }
     XB=" (other build: destijl.env K/KO_SHA of build $n)"
+  else   # build 9 on: also the guest script (GUEST_SRC) and the ENV_EXTRA lines are this build's
+    XRE="^(K|KO_SHA"; for x in "${EXN[@]}"; do XRE+="|$x"; done; XRE+=")="
+    diff -q <(grep -vE "$XRE" "$OUT/tools/destijl.env") <(grep -vE "$XRE" "$TOOLS_FROM/tools/destijl.env") > /dev/null ||
+      { echo "STOP: tools/destijl.env differs from $TOOLS_FROM beyond K / KO_SHA / ENV_EXTRA"; exit 1; }
+    XB=" (other build: destijl.env K/KO_SHA${EXN[*]:+ + ${EXN[*]}} of build $n; p-destijl-guest.sh = ${GUEST_SRC:-scripts/deploy/p-destijl-guest.sh})"
   fi
   TC=$(python3 -I -c 'import json,sys; r=json.load(open(sys.argv[1])); assert r["cxl_swmc_dirty_files"]==0; print(r["cxl_swmc_commit"])' "$TR") ||
     { echo "STOP: $TR has no clean cxl_swmc_commit"; exit 1; }
