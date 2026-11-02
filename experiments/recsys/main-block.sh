@@ -313,6 +313,9 @@ if [ $HASDS = 1 ]; then
   [[ $RECV_MODE =~ ^(poll|sleep)$ ]] || { echo "SEQUENCE STOP: RECV_MODE=$RECV_MODE: De Stijl refuses idle"; exit 2; }
   DST=${RS_DS_T_US:-0}
   [[ $DST =~ ^(0|[1-9][0-9]*)$ ]] || { echo "SEQUENCE STOP: bad RS_DS_T_US ($DST)"; exit 2; }
+  # DS_RECV_EXTRA (optional, runset-rs-ds.sh RS_DS_RECV_EXTRA): "idle_sleep_us=<n> idle_spin_us=<n>" appended to the
+  # cxl_shm load of every ds lifetime, read back after the enable (recv-mode-<name>.txt), mismatch = stop
+  [[ ${DS_RECV_EXTRA:-} =~ ^((idle_sleep_us|idle_spin_us)=[0-9]+( |$))*$ ]] || { echo "SEQUENCE STOP: bad DS_RECV_EXTRA (${DS_RECV_EXTRA:-})"; exit 2; }
   [ -f "$DS_C/p-destijl-shm.sh" ] && [ "$(sha256sum < "$DS_C/packet.sha256" | cut -d' ' -f1)" = "$DS_BUNDLE_SHA" ] \
     && (cd "$DS_C" && sha256sum -c --quiet packet.sha256) || { echo "SEQUENCE STOP: DS_C is not the verified De Stijl bundle"; exit 2; }
   cmp -s "$REGION" "$DS_C/tools/cxl_region.yaml" || { echo "SEQUENCE STOP: REGION differs from the De Stijl bundle's region config"; exit 2; }
@@ -498,8 +501,10 @@ ds_setup() {  # De Stijl v2 cycle (protocol=destijl, init_state=shared; as pop_s
     m=$($SSH comsys@$ip "sudo -n sh -c 'echo $RECV_MODE > /sys/module/cxl_shm/parameters/recv_mode' && cat /sys/module/cxl_shm/parameters/recv_mode" < /dev/null)
     p=$($SSH comsys@$ip "cat /sys/kernel/swmc/page_coherence/protocol" < /dev/null)
     i=$($SSH comsys@$ip "cat /sys/kernel/swmc/instr/enabled 2>/dev/null || echo absent" < /dev/null)
-    echo "$ip recv_mode=$m protocol=$p instr_enabled=$i" >> "$E/recv-mode-$NAME.txt"
+    t=$($SSH comsys@$ip "echo idle_sleep_us=\$(cat /sys/module/cxl_shm/parameters/idle_sleep_us 2>/dev/null || echo absent) idle_spin_us=\$(cat /sys/module/cxl_shm/parameters/idle_spin_us 2>/dev/null || echo absent)" < /dev/null)
+    echo "$ip recv_mode=$m protocol=$p instr_enabled=$i $t" >> "$E/recv-mode-$NAME.txt"
     [ "$m" = "$RECV_MODE" ] && [ "$p" = destijl ] || stop "recv_mode / protocol on $ip ($m, $p)"
+    for x in ${DSRX:-}; do [[ " $t " == *" $x "* ]] || stop "receiver parameter $x not applied on $ip ($t)"; done
   done
   env "${PS[@]}" STATUS_TAG=pre bash $SHMS status || stop "ds status pre"
 }
@@ -513,7 +518,7 @@ life_start() {  # <sys> <name>: prepare + session start of one server lifetime -
   NAME=$2 LS=$E/$2
   local S=$LS
   if [ $s = pop ]; then SHMR=$E/shm-$NAME; PS=(K=$K8 GT=$GT8 C=$C8 R=$SHMR INIT_STATE=shared) SHMS=$C8/p-popcorn-shm.sh; fi
-  if [ $s = ds ]; then SHMR=$E/dsshm-$NAME; PS=(K=$DS_K GT=$DS_GT C=$DS_C R=$SHMR INIT_STATE=shared "LOAD_EXTRA=recv_mode=$RECV_MODE") SHMS=$DS_C/p-destijl-shm.sh; fi
+  if [ $s = ds ]; then SHMR=$E/dsshm-$NAME; DSRX=${DS_RECV_EXTRA:-}; PS=(K=$DS_K GT=$DS_GT C=$DS_C R=$SHMR INIT_STATE=shared "LOAD_EXTRA=recv_mode=$RECV_MODE${DSRX:+ ${DSRX% }}") SHMS=$DS_C/p-destijl-shm.sh; fi
   t0=$(date +%s)
   echo "$(date -Is) system $s start"
   case $s in

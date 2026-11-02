@@ -14,14 +14,19 @@
 #   RS_DS_T_US        staleness bound T in us (servers: ENV:CXL_SYSTEM=ds ENV:CXL_DESTIJL_T_US=<T>; 0 = synchronous).
 #                     The literal @MAIN_T@ is the unresolved placeholder: a dry start plans with T = 0 and says so, a
 #                     real run stops. T > 0 needs a libdestijl server (RS_PLAIN_BUILD: de_stijl_set_staleness).
+#   RS_DS_RECV_EXTRA  optional "idle_sleep_us=<n> idle_spin_us=<n>" (either or both): De Stijl receiver sleep tier,
+#                     appended to the cxl_shm load of every ds lifetime and checked after the enable (main-block.sh
+#                     DS_RECV_EXTRA; user 2026-11-02 17:0x: 200 / 50 for every ds cell from now on). Empty = defaults.
 # After the block: rs_check.py (SLO ds at every rate, no fixed windows) and recv_check.py --mode RECV_MODE (De Stijl
 # lifetime rules: protocol destijl, tx_timeout / protocol_error deltas 0, per-step sys.swmc.destijl.* columns).
 # Layout: E/eval-manifest.txt, E/eval-state.txt, E/block/ (stream-results.tsv, ds-u<R>/slo, dsshm-ds-u<R>/, rs-check.txt,
 # recv-check.txt). The block takes and releases the measurement lock itself.
 # usage: runset-rs-ds.sh <k> [--dry] [--v N]   (lib.sh)
 RUNSET=rs-ds WL=recsys
-unset RS_DS_C RS_DS_BUNDLE_SHA RS_DS_K RS_DS_GT RS_DS_REGION RS_DS_VM_PLAIN RS_DS_T_US
+unset RS_DS_C RS_DS_BUNDLE_SHA RS_DS_K RS_DS_GT RS_DS_REGION RS_DS_VM_PLAIN RS_DS_T_US RS_DS_RECV_EXTRA
 . "$(dirname "$0")/lib.sh"
+RSRX=${RS_DS_RECV_EXTRA:-}
+[[ $RSRX =~ ^((idle_sleep_us|idle_spin_us)=[0-9]+( |$))*$ ]] || die "bad RS_DS_RECV_EXTRA ($RSRX: 'idle_sleep_us=<n> idle_spin_us=<n>')"
 rs_checks
 for x in RS_DS_C RS_DS_BUNDLE_SHA RS_DS_K RS_DS_GT RS_DS_REGION RS_DS_VM_PLAIN RS_DS_T_US; do
   [ -n "${!x:-}" ] || die "rs-ds needs $x in $EVAL_CONF"
@@ -48,6 +53,7 @@ evidence_dir
 rs_env
 RSENV+=(REGION=$RS_DS_REGION VM_PLAIN=$RS_DS_VM_PLAIN SYSTEMS=ds STREAM_RATES="$RS_POINTS" STREAM_FIX_LEVELS= STREAM_FIX_SEP=1
   DS_C=$RS_DS_C DS_BUNDLE_SHA=$RS_DS_BUNDLE_SHA DS_K=$RS_DS_K DS_GT=$RS_DS_GT RS_DS_T_US=$T)   # later assignments win in env
+[ -z "$RSRX" ] || { RSENV+=("DS_RECV_EXTRA=$RSRX"); plan "De Stijl receiver parameters: $RSRX (cxl_shm load, checked after the enable)"; }
 BLK=(bash $TREE/experiments/recsys/main-block.sh $E/block)
 plan "rates [$RS_POINTS] system ds, SLO lifetimes only"
 plan "block: env ${RSENV[*]} ${BLK[*]}"
