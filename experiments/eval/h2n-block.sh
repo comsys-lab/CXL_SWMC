@@ -807,8 +807,10 @@ vdb_life() {  # <sys> <mix> [r<j> | t<T us>]
   { grep -qx "ok_without_coh=0" $RP/loadgen/vectordb.txt && grep -qx "updates_ok_without_coh=0" $RP/loadgen/vectordb.txt &&
     grep -qx "bad_coh_version=0" $RP/loadgen/vectordb.txt; } || stop "$name: responses without an op coherence block"
   python3 $XV/opsplit.py $RP > $RP/opsplit.log 2>&1 || stop "$name: opsplit.py (see $RP/opsplit.log)"
-  # opcoh_check on all N nodes (generalised; OPCOH_NODES = N): a FAIL stops only with H2N_OPCOH_STRICT=1
-  OPCOH_NODES=$N OPCOH_PARTS=$RP MEGALON_LEAN=1 OPCOH_RECORD_BYTES=$([ $VF = sq8 ] && echo 832 || echo 3136) \
+  # opcoh_check on all N nodes (generalised; OPCOH_NODES = N): a FAIL stops only with H2N_OPCOH_STRICT=1; warmup parts
+  # that ran (H2N_DS_DAMON_WARMUP) join OPCOH_PARTS: the server's stop totals cover them (closure checks)
+  local WPD= wp; for wp in $DXWPARTS; do [ ! -d "$R/$wp/loadgen" ] || WPD+="$R/$wp "; done
+  OPCOH_NODES=$N OPCOH_PARTS="$WPD$RP" MEGALON_LEAN=1 OPCOH_RECORD_BYTES=$([ $VF = sq8 ] && echo 832 || echo 3136) \
     python3 $OPC $RP $mode > $RP/opcoh-check.txt 2>&1
   oc=$(grep -m1 -oE '^OPCOH_CHECK (PASS|FAIL)' $RP/opcoh-check.txt | cut -d' ' -f2); oc=${oc:-ERROR}
   if [ "$oc" != PASS ]; then
@@ -851,7 +853,7 @@ vdb_life() {  # <sys> <mix> [r<j> | t<T us>]
         || stop "$name/l1: E1 violation (see $t/e1.e1.txt)"
     fi
     python3 $XV/opsplit.py $t > $t/opsplit.log 2>&1 || log "$name/l1 NOTE: opsplit.py failed (see $t/opsplit.log)"
-    OPCOH_NODES=$N OPCOH_PARTS="$RP $t" MEGALON_LEAN=1 OPCOH_RECORD_BYTES=$([ $VF = sq8 ] && echo 832 || echo 3136) \
+    OPCOH_NODES=$N OPCOH_PARTS="$WPD$RP $t" MEGALON_LEAN=1 OPCOH_RECORD_BYTES=$([ $VF = sq8 ] && echo 832 || echo 3136) \
       python3 $OPC $t $mode > $t/opcoh-check.txt 2>&1
     l1p=$(grep -m1 -oE '^OPCOH_CHECK (PASS|FAIL)' $t/opcoh-check.txt | cut -d' ' -f2); [ -n "$l1p" ] || l1p=ERROR
     read -r l1x l1p99 <<< "$(python3 -I -c 'import json,sys
