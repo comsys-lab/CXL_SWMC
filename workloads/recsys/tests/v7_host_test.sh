@@ -68,7 +68,7 @@ grep -h "initial tables from image" "$S"/*.log 2>/dev/null | head -2
 export LOADGEN=$LGB/loadgen PROFILE=pilot RUN_KIND=functional STATS_OP=10 IDLE_WAIT_S=120
 SMP=$DATA/v7-samples/day23-0-2M.v3.smp
 LGC=(--opt samples=$SMP --opt quantiles=$W/tools/dist_quantile.txt --fixed update=$R --mix query=1 --x-stream query
-     --opt prequential=1 --opt update_rate=$R --opt query_window_s=${W_S:-60} --opt wrap=1 --drain-s 5)
+     --opt prequential=1 --opt update_rate=$R --opt query_window_s=${W_S:-60} --drain-s 5)  # seq_base / wrap=1: added by session.sh
 m() { SESSION_LOCAL=1 bash "$X/session.sh" measure "$S" "$@"; }
 m warmup -- "${LGC[@]}" --mode fixed --rates 1 --warmup-s 2 --step-warmup-s 0 --step-measure-s 5; rc=$?
 [ $rc = 0 ] || bad "warmup rc $rc"
