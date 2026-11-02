@@ -43,12 +43,15 @@
 #   H2N_DS_REPLICA_POOL_BYTES  /sys/kernel/swmc/destijl/replica_pool_max_bytes for an all lifetime (required with all;
 #                       the 54M SQ8 index is ~53 GB > the 48 GB default); the previous value is restored after it
 #   H2N_DS_REPLICA_MODE=damon (outline §6, De Stijl + DAMON): replica_mode damon + pool bound (required, >= 1 GiB; the
-#                       lifetime stops when pool + 4 GiB > MemAvailable of a VM) written directly to sysfs before the
-#                       preload; after the enable one kdamond per VM (ds-damon-guest.sh start, DAMON sysfs, paddr, target
-#                       = the managed CXL range of /sys/kernel/swmc/destijl/registered, scheme "replicate"); DAMON stats
-#                       (scheme nr/sz tried/applied, kdamond CPU ticks, replica_* counters) at start, every 30 s during
-#                       the run (E/ds-damon-<name>.txt) and after it; kdamond stopped before the teardown (and in the
-#                       EXIT trap), replica_mode back to off after the teardown.
+#                       lifetime stops when pool + 4 GiB > MemAvailable of a VM, checked before the preload and again
+#                       after the enable) written directly to sysfs before the preload; after the enable one kdamond per
+#                       VM (ds-damon-guest.sh start, DAMON sysfs, paddr, target = the managed CXL range of
+#                       /sys/kernel/swmc/destijl/registered, scheme "replicate"); DAMON stats (scheme nr/sz
+#                       tried/applied, kdamond CPU ticks, MemAvailable, replica counters) at start, every 10 s during the
+#                       run (>= 1 per 15 s step; E/ds-damon-<name>.txt, join to steps.csv by time) and after it; after
+#                       60 s a VM with sz_applied=0 and replica_pages=0 -> WARN + RUNLOG NOTE; kdamond stopped before the
+#                       teardown (and in the EXIT trap; if that stop fails the cxl_shm teardown is skipped and left to the
+#                       De Stijl rollback reboot), replica_mode back to off after the teardown.
 #   H2N_DS_DAMON       (with damon, required) "sample_us=<n> aggr_us=<n> update_us=<n> min_regions=<n> max_regions=<n>
 #                       min_acc=<n> quota_ms=<n> quota_bytes=<n> reset_ms=<n>" (ds-damon-guest.sh header)
 #   H2N_DS_RECV_EXTRA "idle_sleep_us=<n> idle_spin_us=<n>" (either or both; default empty = module defaults 20 / 50):
@@ -413,11 +416,13 @@ finish() {
     done
   fi
   damon_sampler_stop
+  local dmok=1
   if [ "$DAMON_SET" = 1 ]; then  # a stopped damon lifetime: kdamond off before the cxl_shm teardown
-    damon_cmd rollback stop stop || echo "ROLLBACK FAIL: kdamond not stopped on a VM (see ds-damon-rollback.txt)" | tee -a "$E/rollback.out"
+    damon_cmd rollback stop stop || { dmok=0
+      echo "ROLLBACK FAIL: kdamond not stopped on a VM (see ds-damon-rollback.txt): cxl_shm teardown and replica_mode off SKIPPED (DAMON must stop before the unregister); cxl_shm stays loaded, the De Stijl rollback (VM reboot) clears it" | tee -a "$E/rollback.out"; }
   fi
-  shm_teardown_left
-  if [ "$REPL_SET" = 1 ]; then  # a stopped replicate-all / damon lifetime: replica_mode off + pool bound restored (after teardown)
+  [ $dmok = 0 ] || shm_teardown_left
+  if [ "$REPL_SET" = 1 ] && [ $dmok = 1 ]; then  # a stopped replicate-all / damon lifetime: replica_mode off + pool bound restored (after teardown)
     replica_set rollback off || echo "ROLLBACK FAIL: replica_mode not off / pool bound not restored on a VM (see ds-replica-rollback.txt)" | tee -a "$E/rollback.out"
   fi
   dax_unused rollback || echo "ROLLBACK FAIL: /dev/dax0.0 in use on a VM (see dax-users.txt)" | tee -a "$E/rollback.out"
@@ -564,8 +569,15 @@ damon_cmd() {  # <name> <tag> <stats|stop>: on every VM; output lines in E/ds-da
   done
   return $rc
 }
-damon_start() {  # <name>: kdamond on every VM over its managed CXL range (registered), stats sampler every 30 s
-  local ip reg sp np s e out
+damon_start() {  # <name>: kdamond on every VM over its managed CXL range (registered), stats sampler every 10 s
+  local ip reg sp np s e out ma
+  for ip in "${IPS[@]}"; do  # verifier M1: the pool bound against MemAvailable again, after the preload / enable
+    out=$($SSH comsys@$ip "echo mem_available_kb=\$(awk '/^MemAvailable:/{print \$2}' /proc/meminfo)" < /dev/null 2>&1)
+    ma=${out#mem_available_kb=}
+    echo "$(date -Is) $1 $ip after enable: $out pool=$RPOOL" >> "$E/ds-damon-$1.txt"
+    [[ $ma =~ ^[0-9]+$ ]] && [ $(( RPOOL + 4294967296 )) -le $(( ma * 1024 )) ] \
+      || { echo "$(date -Is) $1 $ip STOP: pool $RPOOL + 4 GiB > MemAvailable after the enable ($out)" >> "$E/ds-damon-$1.txt"; return 1; }
+  done
   for ip in "${IPS[@]}"; do
     reg=$($SSH comsys@$ip "cat /sys/kernel/swmc/destijl/registered" < /dev/null 2>&1)
     sp=$(echo "$reg" | sed -n 's/^managed_start_pfn \(0x[0-9a-f]*\)$/\1/p') np=$(echo "$reg" | sed -n 's/^managed_pages \([0-9]*\)$/\1/p')
@@ -577,7 +589,28 @@ damon_start() {  # <name>: kdamond on every VM over its managed CXL range (regis
     [[ $out == "DAMON ON "* ]] || return 1
   done
   damon_cmd "$1" pre stats || return 1
-  ( trap - EXIT INT TERM HUP; while sleep 30; do damon_cmd "$1" run stats > /dev/null 2>&1; done ) &
+  # sampler: every 10 s (< the 15 s step window: >= 1 sample per measurement step, joined to steps.csv by time;
+  # verifier L2/L3); exits when the block process is gone (L6: survives no SIGKILL of the block); one check after the
+  # first 60 s (L8): a VM with sz_applied=0 and replica_pages=0 -> WARN in block.log + RUNLOG NOTE (cell ~ replica off)
+  local bp=$$ t0; t0=$(date +%s)
+  ( trap - EXIT INT TERM HUP; chk=0
+    while sleep 10; do
+      kill -0 $bp 2>/dev/null || exit 0
+      damon_cmd "$1" run stats > /dev/null 2>&1
+      if [ $chk = 0 ] && [ $(( $(date +%s) - t0 )) -ge 60 ]; then chk=1
+        local ip l bad=
+        for ip in "${IPS[@]}"; do
+          l=$(grep " $1 run $ip: DAMON STATS " "$E/ds-damon-$1.txt" | tail -n 1)
+          [[ $l == *" sz_applied=0 "* ]] && [[ $l == *" replica_pages=0"* ]] && bad+=" $ip"
+          [ -n "$l" ] || bad+=" $ip(no-stats)"
+        done
+        if [ -n "$bad" ]; then
+          log "$1 WARN: DAMON after 60 s: sz_applied=0 and replica_pages=0 on$bad (the cell measures ~replica off; ds-damon-$1.txt)"
+          printf '%s | de-stijl-evaluation-run1 h2n NOTE: %s DAMON inactive after 60 s on%s (sz_applied=0, replica_pages=0; cell ~ replica off; %s)\n' \
+            "$(date '+%Y-%m-%d %H:%M KST')" "$1" "$bad" "$E/ds-damon-$1.txt" >> $P/state/RUNLOG.md
+        else log "$1: DAMON active after 60 s on every VM (ds-damon-$1.txt)"; fi
+      fi
+    done ) &
   DAMON_SAMPLER=$!
   log "$1: DAMON on (${#IPS[@]} VMs, params [$DAMONP], pool $RPOOL bytes; ds-damon-$1.txt)"
 }
