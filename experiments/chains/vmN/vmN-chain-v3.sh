@@ -175,6 +175,8 @@ basesz() { stat -c '%s %Y' $BASE; }   # /var/lib/libvirt/images is o+x: no sudo 
 frozensz() { awk '{print $3, $4}' $SRCD/freeze/stat-before.txt; }
 running() { $V list --name --state-running | grep -E '^cxl_vm[0-7]$' | sed 's/cxl_vm//' | sort -n; }
 node0free() { numastat -m | awk '/^MemFree/{f=$2} /^Inactive\(file\)/{c=$2} END{print int(f+c)}'; }
+# whole-topology check: clean page cache (Active(file) too) is reclaimable by the kernel when the VMs fault their RAM in
+node0avail() { numastat -m | awk '/^MemFree/{f=$2} /^Inactive\(file\)/{c=$2} /^Active\(file\)/{a=$2} END{print int(f+c+a)}'; }
 oomk() { awk '/^oom_kill /{print $2}' /proc/vmstat; }
 
 # ---------------------------------------------------------------- read-only prechecks (dry and pre)
@@ -342,7 +344,8 @@ ph_start() { livegate any; ok "DEFINE PASS" || fail "define not passed (start ru
     local free; free=$(node0free)
     [ "$free" -ge $FREE_MIN ] || fail "node0 MemFree+Inactive(file) $free MB < $FREE_MIN MB"
     if ! ok "START PASS vm"; then   # first start of this switch: the whole topology must fit (N x RAM + 10 GiB)
-      [ "$free" -ge $((N * RAMG * 1024 + 10240)) ] || fail "first start: node0 MemFree+Inactive(file) $free MB < $((N * RAMG * 1024 + 10240)) MB"
+      local avail; avail=$(node0avail)   # eval3 E 2026-11-02: 47 GB Active(file) cache made MemFree+Inactive 2 GB short
+      [ "$avail" -ge $((N * RAMG * 1024 + 10240)) ] || fail "first start: node0 MemFree+file cache $avail MB < $((N * RAMG * 1024 + 10240)) MB"
     fi
     oom0=$(oomk)
     x $V start cxl_vm$k || fail "start vm$k"
