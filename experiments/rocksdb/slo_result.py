@@ -9,9 +9,13 @@ Decision rules (same as the vector DB cells and experiments/h1/levels.py decisio
   - confirmed search: max_rps_under_slo = confirm.x_mean (mean achieved requests/s of the confirm repeats), src confirm;
     consistency: the highest passing confirm step's offered rate must equal summary max_offered_x_pass
     (single-repeat confirms; with confirm_reps > 1 the pooled verdict is not recomputable from steps.jsonl: skipped);
-  - noted notes ("the start rate already violates the SLO; lower --start", "confirm failed at three rates; ..."):
-    max_rps_under_slo = achieved x of the lowest-offered measured ramp step, src lowest_step (decision E); never for
-    all-HWcc (check ERROR: a broken hw lifetime);
+  - start-fail note ("the start rate already violates the SLO; lower --start"): max_rps_under_slo = achieved x of the
+    lowest-offered measured ramp step, src lowest_step (decision E); never for all-HWcc (check ERROR: a broken hw
+    lifetime);
+  - unconfirmed note ("confirm failed at three rates; ..."; rocks-fix 2026-11-02): check UNCONFIRMED for every system
+    (a result row, not an error: max_offered_x_pass = the search's highest passing offered rate, confirmed False, the
+    note = the reason); Popcorn / De Stijl keep decision E (lowest_step) in max_rps_under_slo, all-HWcc leaves it
+    empty (src unconfirmed); the user decides how an unconfirmed cell is charted;
   - any other note, workload_finish != ok, unreadable files, SLO != mixed:99:1: check ERROR, empty max;
   - past the knee (user rule: SLO curves include points past the knee): overload_past_knee = number of overload steps
     with offered > max_offered_x_pass (start rate for a start-fail search) that violate the SLO (pass false);
@@ -19,7 +23,8 @@ Decision rules (same as the vector DB cells and experiments/h1/levels.py decisio
   - send_lag_steps = summary passing_steps_with_send_lag; > 0 -> check WARN (the Host loadgen may bound the result,
     a risk at N = 8 hw).
 usage: slo_result.py [--slo-ms 1] [--out results.tsv] <run dir> [<run dir> ...]
-       run dir name <sys>-<mix>-n<N> (sys hw | pop | ds; mix u<k>); exit 1 if any row is ERROR.
+       run dir name <sys>-<mix>-n<N> (sys hw | pop | ds; mix u<k>); exit 1 if any row is ERROR, else 3 if any row is
+       UNCONFIRMED, else 0.
 """
 import argparse, json, os, re, sys
 
@@ -74,13 +79,19 @@ def decide(summary, steps, system, slo_ms=1.0):
                 err(f"highest passing confirm step {best} != max_offered_x_pass {out['max_offered_x_pass']}")
     elif note in NOTED:
         ramp = [s for s in meas if s.get("phase") == "ramp"]
-        if system == "hw":
+        unconf = note == NOTED[1]
+        if system == "hw" and unconf:
+            out["src"] = "unconfirmed"
+        elif system == "hw":
             err(f"all-HWcc search without a confirmed max ({note})")
         elif not ramp or not (min(ramp, key=lambda s: s["offered_x"]).get("x", 0) > 0):
             err("decision E: no measured ramp step with x > 0")
         else:
             lo = min(ramp, key=lambda s: s["offered_x"])
             out["max_rps_under_slo"], out["src"] = lo["x"], "lowest_step"
+        if unconf and out["check"] == "OK":
+            out["check"] = "UNCONFIRMED"
+            out["why"].append(f"unconfirmed: max_offered_x_pass {out['max_offered_x_pass']} confirmed False ({note})")
         out["confirm_x_mean"] = conf.get("x_mean") if summary.get("confirmed") else None
     elif note:
         err(f"loadgen note: {note}")
@@ -135,13 +146,14 @@ def main(argv=None):
     ap.add_argument("--out")
     ap.add_argument("runs", nargs="+")
     a = ap.parse_args(argv)
-    lines, bad = ["# " + "\t".join(COLS)], 0
+    lines, bad, unc = ["# " + "\t".join(COLS)], 0, 0
     for r in a.runs:
         rw, why = row(r, a.slo_ms, a.vcpus)
         lines.append("\t".join(fmt(rw[c]) for c in COLS))
         if why:
             print(f"{rw['name']}: {rw['check']}: {'; '.join(why)}", file=sys.stderr)
         bad += rw["check"] == "ERROR"
+        unc += rw["check"] == "UNCONFIRMED"
     text = "\n".join(lines) + "\n"
     if a.out:
         if os.path.exists(a.out):
@@ -150,7 +162,7 @@ def main(argv=None):
         with open(a.out, "w") as f:
             f.write(text)
     sys.stdout.write(text)
-    return 1 if bad else 0
+    return 1 if bad else 3 if unc else 0
 
 
 if __name__ == "__main__":

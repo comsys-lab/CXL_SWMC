@@ -55,7 +55,8 @@ host_check() {  # any compiler/linker/build tool running on the Host invalidates
 STARTED=()
 stop_nodes() { for k in "${STARTED[@]}"; do $SSH comsys@"${NODE[$k]}" "$V/bin/rocksdb-node.sh stop $GRUN $k 60" < /dev/null || true; done; }
 collect() { for k in "${STARTED[@]}"; do scp -q "comsys@${NODE[$k]}:$GRUN/node$k.*" "$RUN/" 2>/dev/null || true; done; }
-trap 'echo "run $NAME: error, stopping servers"; stop_nodes; collect' ERR
+on_err() { echo "run $NAME: error, stopping servers"; stop_nodes; collect; }
+trap on_err ERR
 trap 'echo "run $NAME: interrupted, stopping servers"; stop_nodes; collect; exit 130' INT TERM HUP
 
 host_check before
@@ -119,11 +120,14 @@ cpu_snap before
 LG_STATS=(); [ "$STATS_OP" = 0 ] || LG_STATS=(--stats-op "$STATS_OP")
 LGPRE=(); [ "${H1_MEASURE_RUN:-0}" = 1 ] && LGPRE=(bash "$ROOT/scripts/host/measure-run.sh" --)
 echo "loadgen_launcher=${LGPRE[*]:-direct}" >> "$RUN/manifest.txt"
-set +e
+# A non-zero loadgen rc (e.g. the SLO-search note "confirm failed at three rates") is judged after verify and the checks:
+# the ERR trap fires on a failing pipeline even under `set +e`, so it is lifted here; otherwise it stopped the servers
+# before verify (eval3 block E 2026-11-02: verify connection refused -> "verify entries 0 < keys" -> block STOP).
+set +e; trap - ERR
 "${LGPRE[@]}" numactl --physcpubind="$LG_CPUS" --membind=1 "$LOADGEN" --workload rocksdb --target "$TARGETS" --out "$RUN/loadgen" \
   "${LG_STATS[@]}" "$@" "${RATE_ARGS[@]}" 2>&1 | tee "$RUN/loadgen.log"
 LG=${PIPESTATUS[0]}
-set -e
+trap on_err ERR; set -e
 [ -z "${SERVER_CPUS:-}" ] || server_cpus check
 cpu_snap after
 VRC=0

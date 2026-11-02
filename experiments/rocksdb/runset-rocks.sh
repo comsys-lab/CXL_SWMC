@@ -11,6 +11,8 @@
 #   --dry-run  validate the conf and the chain environment, print the block plan and run v1-block.sh DRY=1 (bundle
 #            hashes, region configs, builds, every run's arguments, the cxl_shm plan); no ssh, no lock, nothing written
 #   --v V    evidence dir version (default: the next free one); --only: a subset of the phase's cells, in conf order
+# exit: 0 all cells confirmed | 3 block done, some cell UNCONFIRMED (loadgen note "confirm failed at three rates"; the
+#   other cells still ran; a WARN, not a failure) | 1 real failure (block stop or result ERROR row) | 2 usage / env stop
 # Chain environment (required unless --dry-run): PRETOUCH_DIR (pretouch evidence of the VMs' current QEMU lifetimes),
 #   MEASURE_ENV_DIR, MEASURE_PART_DIR (Host measurement evidence; h3-gate.sh). Real runs also require
 #   state/EXPERIMENTS.md "### de-stijl-evaluation-run1" to read "- Status: approved" or "- Status: running".
@@ -105,10 +107,26 @@ mkdir -p "$E" || die "mkdir $E"
 bash "$HERE/v1-block.sh" "$E" > "$E/block.out" 2>&1; rc=$?
 tail -n 3 "$E/block.out"
 RD=(); for n in $NAMES; do [ -d "$E/$n/loadgen" ] && RD+=("$E/$n"); done
+RRC=0 UNC=
 if [ ${#RD[@]} -gt 0 ]; then
   python3 -I -B "$HERE/slo_result.py" --slo-ms "$ROCKS_SLO_MS" --vcpus "$EXPECT_NPROC" --out "$E/rocks-results.tsv" "${RD[@]}" \
-    > /dev/null 2> "$E/rocks-results.err" || echo "RUNSET NOTE: rocks-results has ERROR rows (see $E/rocks-results.err)"
+    > /dev/null 2> "$E/rocks-results.err"; RRC=$?
+  case $RRC in
+    0) ;;
+    3) UNC=$(awk -F'\t' '!/^#/ && $21 == "UNCONFIRMED" {printf "%s%s", s, $1; s=" "}' "$E/rocks-results.tsv")
+       echo "RUNSET NOTE: unconfirmed cells (a result, not a failure): $UNC (see $E/rocks-results.err)";;
+    *) echo "RUNSET NOTE: rocks-results has ERROR rows (rc $RRC, see $E/rocks-results.err)";;
+  esac
   cut -f1,7,8,11,12,19,20,21 "$E/rocks-results.tsv"   # name, offered max, confirm x, max req/s, src, past knee, lag, check
 fi
-grep -q "BLOCK DONE" "$E/block.log" 2>/dev/null && [ $rc = 0 ] && { echo "RUNSET DONE $E"; exit 0; }
+# rc: 0 = every cell confirmed; 3 = block done, every cell has a result row, some unconfirmed (WARN: the calling chain
+# continues and counts the part as done); 1 = a real failure (block stop: crash, verify, server / protocol / error
+# counter checks, ... or a result ERROR row); 2 = usage / environment stop before the block.
+if grep -q "BLOCK DONE" "$E/block.log" 2>/dev/null && [ $rc = 0 ]; then
+  case $RRC in
+    0) echo "RUNSET DONE $E"; exit 0;;
+    3) echo "RUNSET DONE-UNCONFIRMED $E ($UNC)"; exit 3;;
+    *) echo "RUNSET FAILED result ERROR rows $E ($(head -c 300 "$E/rocks-results.err" | tr '\n' ';'))"; exit 1;;
+  esac
+fi
 echo "RUNSET FAILED rc=$rc $E (block.log: $(grep -m1 'BLOCK STOP' "$E/block.log" 2>/dev/null))"; exit 1

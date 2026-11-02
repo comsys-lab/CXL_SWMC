@@ -71,8 +71,24 @@ class Decide(unittest.TestCase):
         s, steps = confirmed_cell()
         s.update(note=sr.NOTED[1], confirmed=False, max_offered_x_pass=3990)
         d = sr.decide(s, steps, "ds")
-        self.assertEqual((d["check"], d["src"], d["max_rps_under_slo"]), ("OK", "lowest_step", 495.0))
+        self.assertEqual((d["check"], d["src"], d["max_rps_under_slo"]), ("UNCONFIRMED", "lowest_step", 495.0))
+        self.assertEqual((d["max_offered_x_pass"], d["confirmed"]), (3990, False))
         self.assertIsNone(d["confirm_x_mean"])
+
+    def test_confirm_failed_note_hw_is_unconfirmed_not_error(self):
+        # eval3 block E 2026-11-02: hw-u50-n4 / n8 ended with this note; a result row, not a broken hw lifetime
+        s, steps = confirmed_cell()
+        s.update(note=sr.NOTED[1], confirmed=False, max_offered_x_pass=3990)
+        d = sr.decide(s, steps, "hw")
+        self.assertEqual((d["check"], d["src"], d["max_rps_under_slo"]), ("UNCONFIRMED", "unconfirmed", None))
+        self.assertEqual((d["max_offered_x_pass"], d["confirmed"]), (3990, False))
+        self.assertTrue(any("unconfirmed" in w and "3990" in w for w in d["why"]), d["why"])
+
+    def test_confirm_failed_note_with_real_error_stays_error(self):
+        s, steps = confirmed_cell()
+        s.update(note=sr.NOTED[1], confirmed=False, max_offered_x_pass=3990, workload_finish="error")
+        for sysn in ("hw", "pop", "ds"):
+            self.assertEqual(sr.decide(s, steps, sysn)["check"], "ERROR", sysn)
 
     def test_errors(self):
         s, steps = confirmed_cell()
@@ -102,6 +118,16 @@ class Files(unittest.TestCase):
                              ("pop", "u50", "50", "4", "3985", "OK"))
             self.assertEqual(sr.main(["--out", out, good]), 2)  # never overwrites
             self.assertEqual(sr.main([good, bad]), 1)
+            unc = os.path.join(td, "hw-u50-n4")
+            os.makedirs(os.path.join(unc, "loadgen"))
+            json.dump(dict(s, note=sr.NOTED[1], confirmed=False), open(os.path.join(unc, "loadgen", "summary.json"), "w"))
+            with open(os.path.join(unc, "loadgen", "steps.jsonl"), "w") as f:
+                f.write("\n".join(json.dumps(x) for x in steps) + "\n")
+            out2 = os.path.join(td, "r2.tsv")
+            self.assertEqual(sr.main(["--out", out2, good, unc]), 3)  # unconfirmed: a WARN rc, distinct from ERROR
+            r = dict(zip(sr.COLS, open(out2).read().splitlines()[2].split("\t")))
+            self.assertEqual((r["name"], r["check"], r["confirmed"], r["max_offered_x_pass"]), ("hw-u50-n4", "UNCONFIRMED", "False", "3990"))
+            self.assertEqual(sr.main([good, unc, bad]), 1)  # an ERROR row wins
 
 
 if __name__ == "__main__":
