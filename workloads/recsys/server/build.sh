@@ -14,7 +14,7 @@ FLAGS=(-std=c++17 -O3 -g -mavx2 -mfma -mavx512f -mavx512vl -mavx512bw -pthread -
 DSL=$ROOT/systems/destijl/lib
 cc -O2 -g -Wall -Wextra -Werror -std=gnu11 -I"$DSL" -c "$DSL/de_stijl.c" -o "$OUT/obj/de_stijl.o"
 ar rcs "$OUT/obj/libdestijl.a" "$OUT/obj/de_stijl.o"
-c++ "${FLAGS[@]}" -DCXL_REGION_DESTIJL -I"$DSL" "$HERE/server.cc" -o "$OUT/bin/recsys-server" -L"$OUT/obj" -ldestijl -ldl ${EXTRA_LDFLAGS:-}
+c++ "${FLAGS[@]}" -mf16c -DCXL_REGION_DESTIJL -I"$DSL" "$HERE/server.cc" -o "$OUT/bin/recsys-server" -L"$OUT/obj" -ldestijl -ldl ${EXTRA_LDFLAGS:-}
 c++ "${FLAGS[@]}" "$W/tools/gen_samples.cc" -o "$OUT/bin/recsys-gen-samples"
 c++ "${FLAGS[@]}" "$W/tools/rate_calib.cc" -o "$OUT/bin/recsys-rate"
 c++ "${FLAGS[@]}" "$W/tests/model_test.cc" -o "$OUT/bin/recsys-model-test"

@@ -1622,6 +1622,7 @@ int main(int argc, char **argv) {
     std::fprintf(stderr, "recsys-server: --image needs --update-mode train (on every node; serving nodes idle their trainers)\n");
     return 2;
   }
+  if (print_bytes) {
     std::printf("%lu\n", (unsigned long)HwccLayout(o.p).L.bytes());
     return 0;
   }
