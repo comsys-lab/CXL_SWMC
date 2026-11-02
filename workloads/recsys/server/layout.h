@@ -48,6 +48,7 @@ struct Params {
   uint32_t ver_stripes = 1u << 16;  // S: striped version counters (power of two; libcuckoo kMaxNumLocks)
   uint64_t seed = 20261016;     // initial embeddings, multi-hot expansion, model weights
   uint32_t multi_hot_div = 1;   // test scaling of multi-hot sizes (>= 1 each)
+  uint32_t v7_elt = 0;          // v7 record (emb_v7.h; --image): element bytes 2 (fp16) / 4 (fp32); 0 = v6 record
   // derived
   std::vector<uint64_t> rows, row_base;  // per table: rows, global record index of row 0
   std::vector<uint32_t> hot, hot_off;           // ids used per sample per table; offset of table k in Sample::ids
@@ -72,6 +73,7 @@ struct Params {
       lookups_per_sample += hot.back();
     }
     slot_bytes = (8 + uint64_t(dim) * 4 + 16 + 63) / 64 * 64;  // key + emb + seq + csum/pad, whole lines
+    if (v7_elt) slot_bytes = (64 + uint64_t(dim) * v7_elt + 63) / 64 * 64;  // emb_v7.h rec_bytes: 64 B header + emb
   }
   uint64_t swcc_bytes() const { return total_rows * slot_bytes; }
   std::string describe() const {
@@ -81,6 +83,7 @@ struct Params {
       << " seed=" << seed << " multi_hot_div=" << multi_hot_div
       << " rows=" << total_rows << " slot_bytes=" << slot_bytes
       << " swcc_bytes=" << swcc_bytes() << " lookups_per_sample=" << lookups_per_sample;
+    if (v7_elt) o << " record=v7 elt_bytes=" << v7_elt;  // v6 layouts keep their tag (and hash) unchanged
     return o.str();
   }
 

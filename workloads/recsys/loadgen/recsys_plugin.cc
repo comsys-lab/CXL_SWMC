@@ -8,6 +8,16 @@
 //          max_queries=N (default 50M), seq_base=N (default 0: update seqs continue after N; the trace position of
 //          seq s is s-1, so measurements against one server lifetime replay the trace on from where the previous one
 //          stopped), wrap=0|1 (default 0; 1 = the update trace wraps to its start instead of ending the stream).
+// v7 (DESIGN.md §10.6, test-then-train): prequential=1 draws every query from the UPDATE trace ahead of the update
+//          position: start uniform in [u, u + N), u = trace position of the next update to send (every sample before
+//          u has been sent to node 0, none at or after it), N = query_window_samples, or query_window_s (default 60)
+//          x update_rate (samples/s; the harness passes the --fixed update rate). Positions wrap with wrap=1. Scores
+//          are always returned; queries= is ignored.
+//          Outputs <out>/scores.bin ("RSYSSCR1" 64 B header + count; {u64 trace position, f32 score, u8 label,
+//          u8 measured, u8[2]} per scored sample, tools/auc.py format) and <out>/scoreq.bin ("RSYSSCQ1" 64 B header
+//          + count; ScoreQuery per query response: query seq, make time CLOCK_MONOTONIC ns = the loadgen's step clock
+//          (stats/stepNNN-*.txt mono_ns), first score record, pairs, status, measured), so that tools/v7_metrics.py
+//          assigns scores to ramp steps.
 // Output: <out>/queries.bin (one QueryLog per query response) and <out>/recsys.txt (counts).
 #include <fcntl.h>
 #include <sys/mman.h>
@@ -24,6 +34,8 @@
 #include <sstream>
 #include <string>
 #include <vector>
+
+#include <time.h>
 
 #include "../proto.h"
 #include "../samples.h"
@@ -42,6 +54,26 @@ struct __attribute__((packed)) QueryLog {  // one per query response
   uint64_t last_update_made;  // update seq made (scheduled) before this query
   QueryResp r;
 };
+
+struct __attribute__((packed)) ScoreRec {  // scores.bin (tools/auc.py REC: pad[0] = measured)
+  uint64_t sample;  // absolute trace position (seq - 1 of the update carrying it; not reduced modulo the trace)
+  float score;
+  uint8_t label, measured, pad[2];
+};
+static_assert(sizeof(ScoreRec) == 16, "score record");
+struct __attribute__((packed)) ScoreQuery {  // scoreq.bin
+  uint64_t qseq, t_make_ns, first;  // first = index of the query's first ScoreRec
+  uint32_t pairs;
+  uint16_t status;
+  uint8_t measured, pad;
+};
+static_assert(sizeof(ScoreQuery) == 32, "score query record");
+
+inline uint64_t mono_ns() {
+  timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return uint64_t(ts.tv_sec) * 1000000000ull + uint64_t(ts.tv_nsec);
+}
 
 struct SampleFile {
   const Sample *rows = nullptr;
@@ -112,6 +144,19 @@ class Recsys : public loadgen::Workload {
       quantiles_path_ = qf;
     }
     if (quant_.empty()) return *err = "need --opt quantiles=dist_quantile.txt or --opt pairs=N", false;
+    preq_ = get("prequential", "0") == "1";
+    if (preq_) {
+      scores_ = true;
+      window_s_ = std::stod(get("query_window_s", "60"));
+      const std::string ws = get("query_window_samples", ""), ur = get("update_rate", "");
+      if (!ws.empty()) window_ = std::stoull(ws);
+      else if (!ur.empty()) window_ = uint64_t(window_s_ * std::stod(ur) + 0.5);
+      else return *err = "prequential=1 needs query_window_samples=N or update_rate=R (window = query_window_s x R)", false;
+      if (window_ == 0) return *err = "query window must be >= 1 sample", false;
+      qry_ = upd_;  // queries come from the update trace
+      queries_path_ = samples_path_ + " (prequential)";
+      scorelog_.reserve(1 << 22);
+    }
     for (uint32_t q : quant_)
       if (q == 0 || q > qry_.n || sizeof(QueryReq) + uint64_t(q) * sizeof(Sample) > frame::kMaxFrame)
         return *err = "query size " + std::to_string(q) + " invalid for the query pool", false;
@@ -136,18 +181,32 @@ class Recsys : public loadgen::Workload {
     }
     if (next_q_ >= max_queries_) return false;
     const uint32_t pairs = quant_[std::uniform_int_distribution<size_t>(0, quant_.size() - 1)(rng_)];
-    const uint64_t start = std::uniform_int_distribution<uint64_t>(0, qry_.n - pairs)(rng_);
+    uint64_t start;
+    if (preq_) {  // test-then-train: [u, u + W), u = next update's trace position (everything before it was sent)
+      start = next_u_ + std::uniform_int_distribution<uint64_t>(0, window_ - 1)(rng_);
+      if (!wrap_ && start + pairs > upd_.n) {  // end of an unwrapped trace: shift back (counted; may include trained)
+        start = upd_.n - pairs;
+        query_clamped_++;
+      }
+    } else {
+      start = std::uniform_int_distribution<uint64_t>(0, qry_.n - pairs)(rng_);
+    }
     r->target = serve_targets_.empty() ? query_target_ : serve_targets_[next_q_ % serve_targets_.size()];
     r->op = kOpQuery;
     r->seq = next_q_++;
     {
       std::lock_guard<std::mutex> g(mu_);
-      meta_.push_back({start, pairs, next_u_});
+      meta_.push_back({start, pairs, next_u_, preq_ ? mono_ns() : 0});
     }
     QueryReq q{pairs, scores_ ? kQueryReturnScores : 0u};
     p->resize(sizeof(q) + uint64_t(pairs) * sizeof(Sample));
     std::memcpy(p->data(), &q, sizeof(q));
-    std::memcpy(p->data() + sizeof(q), &qry_.rows[start], uint64_t(pairs) * sizeof(Sample));
+    if (preq_) {
+      for (uint32_t i = 0; i < pairs; i++)
+        std::memcpy(p->data() + sizeof(q) + uint64_t(i) * sizeof(Sample), &upd_.rows[(start + i) % upd_.n], sizeof(Sample));
+    } else {
+      std::memcpy(p->data() + sizeof(q), &qry_.rows[start], uint64_t(pairs) * sizeof(Sample));
+    }
     return true;
   }
 
@@ -168,19 +227,38 @@ class Recsys : public loadgen::Workload {
     lg.seq = r.seq;
     lg.status = status;
     lg.measured = measured;
+    uint64_t t_make = 0;
     {
       std::lock_guard<std::mutex> g(mu_);
       const Meta &m = meta_[r.seq];
       lg.start = m.start, lg.pairs = m.pairs, lg.last_update_made = m.last_update;
+      t_make = m.t_make;
     }
+    bool ok = false;
     if (status == frame::kStatusOk && len >= sizeof(QueryResp)) {
       std::memcpy(&lg.r, p, sizeof(QueryResp));
       if (lg.r.pairs != lg.pairs || lg.r.misses) bad_responses_++;
+      else ok = true;
     } else {
       query_errors_++;
     }
     std::lock_guard<std::mutex> g(mu_);
     logs_.push_back(lg);
+    if (!preq_) return;
+    ScoreQuery sq{r.seq, t_make, uint64_t(scorelog_.size()), 0, status, uint8_t(measured), 0};
+    if (ok && len >= sizeof(QueryResp) + uint64_t(lg.pairs) * 4) {
+      sq.pairs = lg.pairs;
+      const float *sc = reinterpret_cast<const float *>(p + sizeof(QueryResp));
+      for (uint32_t i = 0; i < lg.pairs; i++) {
+        const uint64_t pos = lg.start + i;
+        float s;
+        std::memcpy(&s, sc + i, 4);
+        scorelog_.push_back(ScoreRec{pos, s, upd_.rows[pos % upd_.n].label, uint8_t(measured), {0, 0}});
+      }
+    } else if (ok) {
+      bad_responses_++;  // scores requested but missing
+    }
+    scoreq_.push_back(sq);
   }
 
   bool finish(const std::string &dir, std::string *err) override {
@@ -206,6 +284,28 @@ class Recsys : public loadgen::Workload {
                  (unsigned long)misses,
                  sizeof(QueryLog), (unsigned long)seq_base_, (unsigned long)next_u_, (unsigned long)upd_.n,
                  (unsigned long)(next_u_ ? (next_u_ - 1) / upd_.n : 0));
+    if (preq_) {
+      std::fprintf(t, "prequential=1\nquery_window_s=%g\nquery_window_samples=%lu\nquery_clamped=%lu\nscores_logged=%zu\n"
+                      "score_queries=%zu\n", window_s_, (unsigned long)window_, (unsigned long)query_clamped_,
+                   scorelog_.size(), scoreq_.size());
+      auto wr = [&](const char *name, const char *magic, const void *d, size_t rec, size_t n) {
+        FILE *o = std::fopen((dir + "/" + name).c_str(), "wb");
+        if (!o) return false;
+        char h[64] = {};
+        std::memcpy(h, magic, 8);
+        const uint64_t c = n;
+        std::memcpy(h + 8, &c, 8);
+        std::fwrite(h, 1, 64, o);
+        if (n) std::fwrite(d, rec, n, o);
+        return std::fclose(o) == 0;
+      };
+      std::lock_guard<std::mutex> g(mu_);
+      if (!wr("scores.bin", "RSYSSCR1", scorelog_.data(), sizeof(ScoreRec), scorelog_.size()) ||
+          !wr("scoreq.bin", "RSYSSCQ1", scoreq_.data(), sizeof(ScoreQuery), scoreq_.size())) {
+        std::fclose(t);
+        return *err = "cannot write scores.bin / scoreq.bin", false;
+      }
+    }
     std::fclose(t);
     if (update_errors_ || query_errors_ || bad_responses_) {
       *err = "errors: update " + std::to_string(update_errors_.load()) + " query " + std::to_string(query_errors_.load()) +
@@ -228,6 +328,7 @@ class Recsys : public loadgen::Workload {
     }
     o << " seed=" << seed_
       << " seq_base=" << seq_base_ << " wrap=" << wrap_;
+    if (preq_) o << " prequential=1 query_window_s=" << window_s_ << " query_window_samples=" << window_;
     return o.str();
   }
 
@@ -236,6 +337,7 @@ class Recsys : public loadgen::Workload {
     uint64_t start;
     uint32_t pairs;
     uint64_t last_update;
+    uint64_t t_make;  // prequential: CLOCK_MONOTONIC at make()
   };
   SampleFile upd_, qry_;
   std::string samples_path_, queries_path_, quantiles_path_;
@@ -243,7 +345,11 @@ class Recsys : public loadgen::Workload {
   uint32_t update_target_ = 0, query_target_ = 1;
   std::vector<uint32_t> serve_targets_;  // query_spread=rr: query k -> serve_targets_[k % size]
   uint64_t seed_ = 0, max_queries_ = 0, next_u_ = 0, next_q_ = 0, seq_base_ = 0;
-  bool scores_ = false, wrap_ = false;
+  bool scores_ = false, wrap_ = false, preq_ = false;
+  double window_s_ = 60;
+  uint64_t window_ = 0, query_clamped_ = 0;
+  std::vector<ScoreRec> scorelog_;
+  std::vector<ScoreQuery> scoreq_;
   std::mt19937_64 rng_;
   std::mutex mu_;
   std::vector<Meta> meta_;

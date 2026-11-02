@@ -14,6 +14,7 @@
 #include <signal.h>
 #include <sys/mman.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <sys/syscall.h>
 #include <time.h>
 #include <unistd.h>
@@ -26,6 +27,7 @@
 #include <cstring>
 #include <deque>
 #include <functional>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <sstream>
@@ -37,6 +39,7 @@
 
 #include "../proto.h"
 #include "backend.h"
+#include "emb_v7.h"
 #include "frame.h"
 #include "layout.h"
 #include "model.h"
@@ -55,6 +58,18 @@ volatile sig_atomic_t g_stop = 0;
 uint64_t now_ns() {
   timespec ts;
   clock_gettime(CLOCK_MONOTONIC, &ts);
+  return uint64_t(ts.tv_sec) * 1000000000ull + uint64_t(ts.tv_nsec);
+}
+// v7 stale-read logs (both nodes): CLOCK_REALTIME, so that node 0's write times and node 1's read times share a clock
+// (guests of one Host: kvm-clock; the residual offset between the guests bounds the age resolution; DESIGN.md §10.6)
+uint64_t real_ns() {
+  timespec ts;
+  clock_gettime(CLOCK_REALTIME, &ts);
+  return uint64_t(ts.tv_sec) * 1000000000ull + uint64_t(ts.tv_nsec);
+}
+uint64_t thread_cpu_ns() {
+  timespec ts;
+  clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts);
   return uint64_t(ts.tv_sec) * 1000000000ull + uint64_t(ts.tv_nsec);
 }
 
@@ -85,6 +100,18 @@ struct Opts {
                                      // by default (CohSnap replaces them; they perturb timing)
   std::string region, backend = "plain", megalon_lib;
   cxl::proc::Opts proc;
+  // ---- v7 (DESIGN.md §10.6). Defaults of lr / acc_init / train_batch are NOT decided (user); every run records them
+  // (startup line + stats `train.*`), the harness passes them explicitly.
+  std::string image;            // --image: initial rows from the converted checkpoint (emb_v7.h ImageHeader + records)
+  std::string model_dense;      // --model-dense: trained dense weights (RSYSDNS1); else deterministic random (v6)
+  bool train = false;           // --update-mode train: online training on this node (test-then-train), implies stream
+  uint32_t train_threads = 0;   // trainer threads (0 = --update-threads); rows are written by the U row owners
+  uint32_t train_batch = 8;     // --train-batch: samples per training step (max; taken without waiting)
+  AdagradCfg ada;               // --lr (0.004 = MLPerf DLRMv2 reference, to be confirmed), --eps
+  double acc_init = -1;         // --acc-init: initial row-wise Adagrad state written at load (< 0: as in the image)
+  std::string stale_log;        // --stale-log FILE: (row, seq, CLOCK_REALTIME ns) of sampled rows; node 0 = every
+                                // write, other nodes = every serving lookup of a sampled row
+  uint32_t stale_mod = 256;     // --stale-sample N: a row is sampled iff mix64(global row) % N == 0 (same on every node)
 };
 
 struct Conn {
@@ -154,6 +181,10 @@ struct Stats {
       flush_ns_max{0}, flush_overruns{0}, lock_spins{0}, write_ns{0}, accum_cyc{0}, publish_rounds{0},
       round_rows{0}, round_rows_max{0}, uq_max{0};
   std::atomic<uint64_t> accepted_seq{0}, lag_ns_sum{0}, lag_n{0}, lag_ns_max{0};  // stream mode (DESIGN.md §5.1)
+  // v7 train mode: trainer (forward + backward) and row-owner (read-modify-write) thread CPU, from
+  // CLOCK_THREAD_CPUTIME_ID; updater_cpu_ns = train_cpu_ns + owner_cpu_ns (steps.csv updater_cpu_s_per_s)
+  std::atomic<uint64_t> train_samples{0}, train_batches{0}, train_cpu_ns{0}, train_fwd_ns{0}, train_bwd_ns{0},
+      owner_cpu_ns{0}, train_lookups{0}, grad_rows{0}, stale_reads_logged{0}, stale_writes_logged{0};
   OpAcc op_query, op_row_update;  // MOT1 v6 Fig 2 (optime.h)
   std::atomic<uint32_t> coh_pc_threads{0}, coh_mg_threads{0};
 };
@@ -219,8 +250,8 @@ class Server {
       tag += " rows_per_object=" + std::to_string(o_.mg_rows_per_object);
     HwccLayout lay(p_, tag.c_str());
     if constexpr (std::is_same_v<Be, MegalonBackend>) {
-      if (1 + o_.load_threads + o_.update_threads + o_.serve_threads > 32)
-        die("megalon: at most 32 thread registrations per node (main + load + update + serve threads)");
+      if (1 + o_.load_threads + o_.update_threads + o_.serve_threads + train_threads() > 32)
+        die("megalon: at most 32 thread registrations per node (main + load + update + serve + train threads)");
       api_ = megalon_load(o_.megalon_lib, &err);
       if (!api_) die(err);
       if (api_->node_id() != o_.node) die("megalon node id != --node");
@@ -248,9 +279,16 @@ class Server {
     be_->set_time_sample(o_.megalon_time_sample);
     be_->thread_init(0);
     pool_.start(o_.load_threads, [this](int i) { be_->thread_init(1 + i, kRolePrep); cxl::proc::name_thread("rs-prep"); });
-    ModelSpec ms;
-    ms.dim = p_.dim, ms.rank = o_.rank;
-    model_.init(ms, p_.seed);
+    if (o_.model_dense.empty()) {
+      ModelSpec ms;
+      ms.dim = p_.dim, ms.rank = o_.rank;
+      model_.init(ms, p_.seed);
+    } else {
+      if (!model_.load_dense(o_.model_dense, &err)) die("model: " + err);
+      if (model_.spec().dim != p_.dim || model_.spec().rank != o_.rank) die("model: dense weights do not match --dim/--rank");
+    }
+    if (!o_.stale_log.empty()) open_stale_log();
+    std::fprintf(stderr, "recsys-server: v7 %s\n", v7_text(" ").c_str());
     std::fprintf(stderr,
                  "recsys-server: node %u/%u run %#lx %s\nrecsys-server: region %s\nrecsys-server: app layout %lu B "
                  "(used %lu, hash %016lx), backend %s\nrecsys-server: model %.1f MFLOP/pair, weights %.1f MiB\n",
@@ -279,8 +317,12 @@ class Server {
     done_seq_.reset(new std::atomic<uint64_t>[o_.update_threads]);
     for (uint32_t w = 0; w < o_.update_threads; w++) done_seq_[w] = 0;
     uq_.reset(new Queue<std::shared_ptr<UpdJob>>[o_.update_threads]);
-    for (uint32_t w = 0; w < o_.update_threads; w++) std::thread([this, w] { updater(w); }).detach();
+    gq_.reset(new Queue<std::shared_ptr<GradJob>>[o_.update_threads]);
+    for (uint32_t w = 0; w < o_.update_threads; w++)
+      std::thread([this, w] { o_.train ? owner(w) : updater(w); }).detach();
     for (uint32_t i = 0; i < o_.serve_threads; i++) std::thread([this, i] { server(i); }).detach();
+    if (o_.train)
+      for (uint32_t i = 0; i < train_threads(); i++) std::thread([this, i] { trainer(i); }).detach();
     std::thread([this] { listen_loop(); }).detach();
     cxl::proc::name_thread("rs-main");
   }
@@ -303,7 +345,7 @@ class Server {
       << "\npublish_rounds=" << st_.publish_rounds << "\nround_rows=" << st_.round_rows
       << "\nround_rows_max_worker=" << st_.round_rows_max << "\nupdate_rate_sustained=" << (st_.flush_overruns ? 0 : 1)
       << "\nupdate_queue_max=" << st_.uq_max << "\naccum_ns=" << tsc_to_ns(st_.accum_cyc)
-      << stream_text()
+      << stream_text() << "\n" << v7_text("\n")
       << "\nver_stripes=" << p_.ver_stripes << "\ntsc_khz=" << tsc_khz()
       << "\nop.coh_src=pc_threads:" << st_.coh_pc_threads << ",mg_threads:" << st_.coh_mg_threads << "\n" << op_tags()
       << op_text() << "mem.vm_rss_kb=" << status_kb("VmRSS:")
@@ -330,7 +372,163 @@ class Server {
                  (unsigned long)p_.total_rows);
   }
 
+  void flush_stale_log() {  // drain every thread's buffer into the file (stats reads and stop)
+    if (!stale_f_) return;
+    std::lock_guard<std::mutex> g(stale_mu_);
+    for (auto &b : stale_bufs_) {
+      std::lock_guard<std::mutex> l(b->mu);
+      if (!b->v.empty()) std::fwrite(b->v.data(), sizeof(StaleRec), b->v.size(), stale_f_);
+      b->v.clear();
+    }
+    std::fflush(stale_f_);
+  }
+
  private:
+  // ---------------------------------------------------------------- v7 (DESIGN.md §10.6)
+  uint32_t train_threads() const { return o_.train ? (o_.train_threads ? o_.train_threads : o_.update_threads) : 0; }
+  std::string v7_text(const char *sep) {
+    std::ostringstream o;
+    o << "v7.image=" << (o_.image.empty() ? "-" : o_.image) << sep << "v7.model_dense="
+      << (o_.model_dense.empty() ? "-" : o_.model_dense) << sep << "v7.record_bytes=" << p_.slot_bytes << sep
+      << "v7.elt_bytes=" << p_.v7_elt << sep << "update_train=" << (o_.train ? 1 : 0) << sep
+      << "train.threads=" << train_threads() << sep << "train.batch=" << o_.train_batch << sep
+      << "train.lr=" << o_.ada.lr << sep << "train.eps=" << o_.ada.eps << sep << "train.acc_init="
+      << (o_.acc_init < 0 ? std::string("image") : std::to_string(o_.acc_init)) << sep
+      << "train.optimizer=rowwise_adagrad" << sep << "train.dense=frozen" << sep
+      << "train_samples=" << st_.train_samples << sep << "train_batches=" << st_.train_batches << sep
+      << "train_lookups=" << st_.train_lookups << sep << "train_grad_rows=" << st_.grad_rows << sep
+      << "train_cpu_ns=" << st_.train_cpu_ns << sep << "train_fwd_ns=" << st_.train_fwd_ns << sep
+      << "train_bwd_ns=" << st_.train_bwd_ns << sep << "owner_cpu_ns=" << st_.owner_cpu_ns << sep
+      << "updater_cpu_ns=" << (st_.train_cpu_ns + st_.owner_cpu_ns) << sep
+      << "stale.log=" << (o_.stale_log.empty() ? "-" : o_.stale_log) << sep << "stale.sample_mod=" << o_.stale_mod
+      << sep << "stale.reads_logged=" << st_.stale_reads_logged << sep << "stale.writes_logged="
+      << st_.stale_writes_logged << sep << "stale.clock=CLOCK_REALTIME";
+    if (std::string(sep) == "\n") flush_stale_log();  // a stats read also drains the log (bounded buffers)
+    return o.str();
+  }
+
+  // Stale-read log: header (64 B) "RSYSSTL1" | u32 node | u32 sample_mod | u64 record_bytes 24 | pad; records
+  // {u64 global row, u64 seq, u64 CLOCK_REALTIME ns}. Node 0 logs each write of a sampled row after it is visible;
+  // a serving node each lookup of a sampled row (seq read, time after the copy). Joined offline (tools/v7_metrics.py).
+  struct StaleRec {
+    uint64_t gslot, seq, t_ns;
+  };
+  struct StaleBuf {
+    std::mutex mu;
+    std::vector<StaleRec> v;
+  };
+  void open_stale_log() {
+    stale_f_ = std::fopen(o_.stale_log.c_str(), "wbx");
+    if (!stale_f_) die("--stale-log " + o_.stale_log + ": cannot create (exists?)");
+    if (o_.stale_mod == 0) die("--stale-sample must be > 0");
+    uint8_t h[64] = {};
+    std::memcpy(h, "RSYSSTL1", 8);
+    const uint32_t node = o_.node, mod = o_.stale_mod;
+    const uint64_t rb = sizeof(StaleRec);
+    std::memcpy(h + 8, &node, 4), std::memcpy(h + 12, &mod, 4), std::memcpy(h + 16, &rb, 8);
+    std::fwrite(h, 1, 64, stale_f_);
+  }
+  bool stale_sampled(uint64_t gslot) const { return stale_f_ && mix64(gslot ^ 0x57a1e5ull) % o_.stale_mod == 0; }
+  void stale_add(uint64_t gslot, uint64_t seq, bool write) {
+    thread_local StaleBuf *b = nullptr;
+    if (!b) {
+      std::lock_guard<std::mutex> g(stale_mu_);
+      stale_bufs_.push_back(std::make_unique<StaleBuf>());
+      b = stale_bufs_.back().get();
+    }
+    {
+      std::lock_guard<std::mutex> l(b->mu);
+      b->v.push_back(StaleRec{gslot, seq, real_ns()});
+    }
+    (write ? st_.stale_writes_logged : st_.stale_reads_logged)++;
+    if (b->v.size() >= (1u << 16)) flush_stale_log();  // never unbounded between stats reads
+  }
+
+  // Record format: v6 (layout.h SlotView: key | emb fp32 | seq | csum) or v7 (emb_v7.h: key | seq | csum | acc | pad |
+  // emb fp16/fp32). The csum covers (key, seq, emb bytes as u32 words) in both (v6: = row_csum over the floats).
+  struct RecFmt {
+    uint64_t key_off, seq_off, csum_off, acc_off, emb_off;
+    uint32_t elt, emb_bytes, ewords;
+    explicit RecFmt(const Params &p) {
+      elt = p.v7_elt ? p.v7_elt : 4;
+      emb_bytes = p.dim * elt, ewords = emb_bytes / 4;
+      if (p.v7_elt) key_off = RecOff::key, seq_off = RecOff::seq, csum_off = RecOff::csum, acc_off = RecOff::acc,
+                    emb_off = RecOff::emb;
+      else {
+        const SlotView v(p);
+        key_off = v.key_off, seq_off = v.seq_off, csum_off = v.csum_off, acc_off = ~0ull, emb_off = v.emb_off;
+      }
+    }
+  };
+  // Image file (--image): node 0 copies it into the tables at prepare; checked against the derived layout in main().
+  void load_image_tables() {
+    const RecFmt f(p_);
+    const int fd = ::open(o_.image.c_str(), O_RDONLY | O_CLOEXEC);
+    if (fd < 0) die("--image " + o_.image + ": open");
+    ImageHeader ih{};
+    if (pread(fd, &ih, sizeof ih, 0) != ssize_t(sizeof ih)) die("--image: header");
+    const uint64_t t0 = now_ns(), rb = p_.slot_bytes;
+    std::atomic<uint64_t> next{0}, bad{0};
+    const float acc = float(o_.acc_init);
+    auto fix = [&](uint8_t *rec, uint32_t k, uint64_t r) {  // check the key, apply --acc-init (acc is not in the csum)
+      uint64_t key;
+      std::memcpy(&key, rec + f.key_off, 8);
+      if (key != Params::key(k, r)) bad++;
+      if (o_.acc_init >= 0) std::memcpy(rec + f.acc_off, &acc, 4);
+    };
+    auto rd = [&](uint8_t *dst, uint64_t row0, uint64_t n) {
+      uint64_t got = 0, len = n * rb, off = ih.data_off + row0 * rb;
+      while (got < len) {
+        const ssize_t x = pread(fd, dst + got, len - got, off + got);
+        if (x <= 0) die("--image: read");
+        got += uint64_t(x);
+      }
+      posix_fadvise(fd, off, len, POSIX_FADV_DONTNEED);  // 61 GiB never stays in the page cache
+    };
+    if constexpr (!Be::kAppSeqlock) {
+      // Megalon: one write section per object; rows read straight into the object in 16 MiB pieces
+      const uint64_t nobj = be_->objects(), piece = std::max<uint64_t>(1, (16ull << 20) / rb);
+      const std::vector<uint64_t> &ob = be_->obj_base();
+      pool_.run([&](int) {
+        for (;;) {
+          const uint64_t g = next.fetch_add(1);
+          if (g >= nobj) break;
+          uint32_t k = 0;
+          while (k + 1 < kSparse && ob[k + 1] <= g) k++;
+          const uint64_t ch = g - ob[k], r0 = be_->first_row(k, ch), n = be_->object_rows(k, ch);
+          be_->write_object(k, ch, [&](uint8_t *obj) {
+            for (uint64_t i = 0; i < n; i += piece) {
+              const uint64_t m = std::min(piece, n - i);
+              rd(obj + i * rb, p_.row_base[k] + r0 + i, m);
+              for (uint64_t x = 0; x < m; x++) fix(obj + (i + x) * rb, k, r0 + i + x);
+            }
+          });
+        }
+      });
+    } else {
+      pool_.run([&](int) {
+        std::vector<uint8_t> buf(4096 * rb);
+        for (;;) {
+          const uint64_t c = next.fetch_add(4096);
+          if (c >= p_.total_rows) break;
+          const uint64_t e = std::min(p_.total_rows, c + 4096);
+          rd(buf.data(), c, e - c);
+          uint32_t k = 0;
+          for (uint64_t g = c; g < e; g++) {
+            while (k + 1 < kSparse && p_.row_base[k + 1] <= g) k++;
+            uint8_t *rec = buf.data() + (g - c) * rb;
+            fix(rec, k, g - p_.row_base[k]);
+            be_->write_slot(k, g - p_.row_base[k], [&](uint8_t *dst) { std::memcpy(dst, rec, rb); });
+          }
+        }
+      });
+    }
+    close(fd);
+    if (bad) die("--image: " + std::to_string(bad.load()) + " records with a wrong key");
+    std::fprintf(stderr, "recsys-server: initial tables from image %s: %lu rows, %.1f GiB in %.1f s (acc_init %s)\n",
+                 o_.image.c_str(), (unsigned long)p_.total_rows, p_.swcc_bytes() / 1073741824.0, (now_ns() - t0) / 1e9,
+                 o_.acc_init < 0 ? "image" : std::to_string(o_.acc_init).c_str());
+  }
   // Stream mode: what a run needs to be judged (achieved update rate, lag not growing; DESIGN.md §5.1). Rates follow
   // from deltas of two snapshots (stats_mono_ns). update_lag_ns_* = acceptance (frame read) to the owning worker's rows
   // written, per (sample, worker); _max is reset by every stats read (one reader per node: the loadgen snapshots).
@@ -341,8 +539,12 @@ class Server {
     o << "\nupdate_mode=stream\nstats_mono_ns=" << now_ns() << "\nupdate_accepted_seq=" << acc
       << "\nupdate_lag_samples=" << (acc > pub ? acc - pub : 0) << "\nupdate_lag_ns_sum=" << st_.lag_ns_sum
       << "\nupdate_lag_n=" << st_.lag_n << "\nupdate_lag_ns_max=" << st_.lag_ns_max.exchange(0);
-    if (uq_)
+    if (uq_ && !o_.train)
       for (uint32_t w = 0; w < o_.update_threads; w++) o << "\nupdate_queue.w" << w << "=" << uq_[w].size();
+    if (gq_ && o_.train) {  // v7: samples waiting for a trainer; gradient batches waiting for each row owner
+      o << "\nupdate_queue.train=" << tq_.size();
+      for (uint32_t w = 0; w < o_.update_threads; w++) o << "\nupdate_queue.w" << w << "=" << gq_[w].size();
+    }
     return o.str();
   }
   std::string op_text() const {
@@ -379,6 +581,7 @@ class Server {
   // Direct addressing (every system, user decision 2026-10-18): row r of table k is record row_base[k] + r (plain:
   // that offset in SWcc; Megalon: the object (k, r)). Every row written once with seq 0. Deterministic.
   void write_tables() {
+    if (!o_.image.empty()) return load_image_tables();  // v7: the converted checkpoint instead of synthetic rows
     const uint64_t t0 = now_ns();
     std::atomic<uint64_t> next{0};
     if constexpr (!Be::kAppSeqlock) {
@@ -458,11 +661,11 @@ class Server {
   void warm_up() {
     const uint64_t t0 = now_ns();
     std::atomic<uint64_t> next{0}, occupied{0}, bad{0};
-    const SlotView v(p_);
+    const RecFmt v(p_);
     const uint64_t total = p_.total_rows;  // every row is a record and must hold its own key
     const std::vector<uint64_t> &base = p_.row_base;
     pool_.run([&](int) {
-        std::vector<float> e(p_.dim);
+        std::vector<uint8_t> e(v.emb_bytes);
         for (;;) {
           const uint64_t c = next.fetch_add(4096);
           if (c >= total) break;
@@ -479,8 +682,8 @@ class Server {
               if (key != Params::key(k, i)) return 2;
               std::memcpy(&seq, s + v.seq_off, 8);
               std::memcpy(&cs, s + v.csum_off, 4);
-              std::memcpy(e.data(), s + v.emb_off, size_t(p_.dim) * 4);
-              return row_csum(key, seq, e.data(), p_.dim) == cs ? 1 : 2;
+              std::memcpy(e.data(), s + v.emb_off, v.emb_bytes);
+              return row_csum_words(key, seq, e.data(), v.ewords) == cs ? 1 : 2;
             });
             if (r) occupied++;
             if (r == 2) bad++;
@@ -518,13 +721,14 @@ class Server {
       _mm_pause();
     }
   }
+  // tmp receives the raw embedding bytes of the record (fp32 v6/v7-fp32, fp16 v7; fmt_.emb_bytes <= dim x 4)
   Probe read_probe(uint32_t k, uint64_t r, uint64_t key, float *tmp) const {
-    const SlotView v(p_);
+    const RecFmt &v = fmt_;
     return be_->read_slot(k, r, [&](const uint8_t *src) {
       Probe x{};
       x.key = __atomic_load_n(reinterpret_cast<const uint64_t *>(src + v.key_off), __ATOMIC_RELAXED);
       if (x.key == key) {
-        std::memcpy(tmp, src + v.emb_off, size_t(p_.dim) * 4);
+        std::memcpy(tmp, src + v.emb_off, v.emb_bytes);
         std::memcpy(&x.seq, src + v.seq_off, 8);
         std::memcpy(&x.csum, src + v.csum_off, 4);
       }
@@ -533,7 +737,8 @@ class Server {
   }
   // Look up `key` in table k; on hit, adds the row's embedding into acc[dim]. Returns false on a miss (a key out of
   // range or a record holding another key; cannot happen after a complete initial load, warm-up checks every key).
-  bool lookup(uint32_t k, uint64_t key, float *acc, float *tmp, LookupCnt *c) {
+  // log_stale: serving lookups of sampled rows go to the stale-read log (v7); the trainer's reads do not.
+  bool lookup(uint32_t k, uint64_t key, float *acc, float *tmp, LookupCnt *c, bool log_stale = false) {
     const uint64_t r = Params::key_row(key);
     if (r >= p_.rows[k]) return false;
     Probe pr;
@@ -547,7 +752,7 @@ class Server {
         std::atomic_thread_fence(std::memory_order_acquire);
         if (o_.test_no_seqlock || load_relaxed(ver) == v1) break;   // v2 == v1: copy is consistent
         c->retries++;
-        const bool consistent = row_csum(key, pr.seq, tmp, p_.dim) == pr.csum;
+        const bool consistent = row_csum_words(key, pr.seq, tmp, fmt_.ewords) == pr.csum;
         const uint64_t seq0 = pr.seq;
         v1 = wait_even(ver, c);
         pr = read_probe(k, r, key, tmp);
@@ -558,9 +763,14 @@ class Server {
       c->probes++;
       if (pr.key != key) return false;
     }
-    if (o_.verify_rows && row_csum(key, pr.seq, tmp, p_.dim) != pr.csum) st_.torn++;
-    for (uint32_t j = 0; j < p_.dim; j++) acc[j] += tmp[j];   // sum pooling into x0
+    if (o_.verify_rows && row_csum_words(key, pr.seq, tmp, fmt_.ewords) != pr.csum) st_.torn++;
+    if (fmt_.elt == 4 && !p_.v7_elt) {
+      for (uint32_t j = 0; j < p_.dim; j++) acc[j] += tmp[j];  // sum pooling into x0 (v6 loop, unchanged)
+    } else {
+      emb_to_f32(tmp, fmt_.elt, p_.dim, acc, true);  // v7: sum pooling of the record's precision
+    }
     if (pr.seq > c->max_seq) c->max_seq = pr.seq;
+    if (log_stale && stale_sampled(p_.row_base[k] + r)) stale_add(p_.row_base[k] + r, pr.seq, false);
     return true;
   }
   // Writer: CAS even -> odd on the row's stripe (MemC3), write the row, release-store +2. Rows are owned by
@@ -614,6 +824,13 @@ class Server {
       j.c->reply(frame::kStatusOk, j.h.req_id, &r, sizeof(r));
     } else {
       u->job = std::move(j);
+    }
+    if (o_.train) {  // v7: one training queue in seq order (the ordered update stream); trainers take batches
+      const uint64_t q = tq_.push_size(u);
+      uint64_t m = st_.uq_max.load();
+      while (q > m && !st_.uq_max.compare_exchange_weak(m, q)) {
+      }
+      return;
     }
     for (uint32_t w = 0; w < o_.update_threads; w++) {
       const uint64_t q = uq_[w].push_size(u);
@@ -787,6 +1004,227 @@ class Server {
     }
   }
 
+  // ---------------------------------------------------------------- v7 online training (node 0; DESIGN.md §10.6)
+  // Trainers (--train-threads, default U): take queued update samples in seq order in batches of up to --train-batch
+  // (no waiting for a full batch), read the rows through the coherent lookup path (lookup(), as serving: plain = MemC3
+  // reader, Megalon = read sections), forward + backward through the frozen dense part (BCE, mean over the batch),
+  // per row the summed gradient of its lookups (sum pooling); then every row owner (owner(), as in stream mode) gets
+  // its rows of the batch (possibly none). Owners: read-modify-write of each row (emb + acc + seq + csum) in the
+  // system's write path (plain: under the row's stripe; Megalon: one write section per touched object), row-wise
+  // Adagrad (emb_v7.h). Test-then-train: serving never sees a sample before node 0 got it (loadgen query window).
+  // published_seq = last sample of the longest prefix of batches whose rows every owner has written (ledger_); row
+  // seq = last sample seq of the batch that wrote it.
+  struct GradJob {
+    uint64_t batch = 0, seq = 0, t_arr = 0;  // batch id (seq order), last sample seq, earliest acceptance time
+    std::vector<Touched> rows;               // this owner's rows, gslot order
+    std::vector<float> g;                    // rows.size() x dim summed gradients
+  };
+  struct Led {
+    uint64_t seq;
+    uint32_t left;
+  };
+
+  void trainer(uint32_t i) {
+    be_->thread_init(int(1 + o_.load_threads + o_.update_threads + o_.serve_threads + i), kRoleUpdate);
+    cxl::proc::name_thread("rs-train");
+    coh_init();
+    const uint32_t B = o_.train_batch, D = model_.spec().inter(), dim = p_.dim, U = o_.update_threads;
+    Model::Scratch sc;
+    Model::Train tr;
+    model_.scratch(&sc, B);
+    model_.train_scratch(&tr, B);
+    std::vector<float> dense(size_t(B) * kDense), score(B), dz(B), tmp(dim);
+    std::vector<std::shared_ptr<UpdJob>> jobs;
+    struct Ent {
+      uint64_t gslot;
+      uint32_t slot;  // batch row * 26 + table
+    };
+    std::vector<Ent> ent;
+    for (;;) {
+      jobs.clear();
+      uint64_t batch, seq;
+      {
+        std::lock_guard<std::mutex> g(tmu_);  // batches are formed and numbered in seq order
+        std::shared_ptr<UpdJob> u;
+        tq_.pop(&u, 0);
+        jobs.push_back(std::move(u));
+        while (jobs.size() < B && tq_.pop(&u, 1)) jobs.push_back(std::move(u));  // deadline 1 ns: no waiting
+        batch = next_batch_++;
+        seq = jobs.back()->seq;
+        std::lock_guard<std::mutex> l(lmu_);
+        ledger_[batch] = Led{seq, U};
+      }
+      const uint64_t c0 = thread_cpu_ns();
+      const uint32_t m = uint32_t(jobs.size());
+      for (uint32_t r = 0; r < m; r++) std::memcpy(&dense[size_t(r) * kDense], jobs[r]->s.dense, kDense * 4);
+      model_.bottom(dense.data(), m, &sc);
+      LookupCnt lc;
+      ent.clear();
+      uint64_t looks = 0;
+      for (uint32_t r = 0; r < m; r++) {
+        const Sample &smp = jobs[r]->s;
+        for (uint32_t k = 0; k < kSparse; k++) {
+          float *acc = &sc.x0[size_t(r) * D + size_t(k + 1) * dim];
+          std::memset(acc, 0, size_t(dim) * 4);
+          for (uint32_t j = 0; j < p_.hot[k]; j++) {
+            const uint64_t row = p_.row_of(k, smp, j);
+            looks++;
+            if (lookup(k, Params::key(k, row), acc, tmp.data(), &lc)) ent.push_back(Ent{p_.row_base[k] + row, r * kSparse + k});
+            else st_.update_misses++;
+          }
+        }
+      }
+      model_.top_train(m, &sc, &tr, score.data());
+      for (uint32_t r = 0; r < m; r++) dz[r] = (score[r] - float(jobs[r]->s.label)) / float(m);  // dBCE/dlogit, mean
+      const uint64_t c1 = thread_cpu_ns();
+      const float *gx = model_.backward(m, &tr, dz.data());
+      const uint64_t c2 = thread_cpu_ns();
+      std::sort(ent.begin(), ent.end(), [](const Ent &a, const Ent &b) { return a.gslot < b.gslot; });
+      std::vector<std::shared_ptr<GradJob>> out(U);
+      for (uint32_t w = 0; w < U; w++) {
+        out[w] = std::make_shared<GradJob>();
+        out[w]->batch = batch, out[w]->seq = seq, out[w]->t_arr = jobs[0]->t_arr;
+      }
+      uint64_t nrows = 0;
+      for (size_t x = 0; x < ent.size();) {
+        const uint64_t gs = ent[x].gslot;
+        const uint32_t k = ent[x].slot % kSparse;
+        const uint64_t key = Params::key(k, gs - p_.row_base[k]);
+        GradJob &gj = *out[owner(k, key)];
+        gj.rows.push_back(Touched{gs, key, seq, k});
+        const size_t o0 = gj.g.size();
+        gj.g.resize(o0 + dim, 0.f);
+        for (; x < ent.size() && ent[x].gslot == gs; x++) {
+          const float *g = gx + size_t(ent[x].slot / kSparse) * D + size_t(ent[x].slot % kSparse + 1) * dim;
+          for (uint32_t c = 0; c < dim; c++) gj.g[o0 + c] += g[c];
+        }
+        nrows++;
+      }
+      st_.seq_spins += lc.spins;
+      st_.train_samples += m, st_.train_batches++, st_.train_lookups += looks, st_.grad_rows += nrows;
+      st_.train_fwd_ns += c1 - c0, st_.train_bwd_ns += c2 - c1;
+      st_.train_cpu_ns += thread_cpu_ns() - c0;
+      for (uint32_t w = 0; w < U; w++) gq_[w].push(std::move(out[w]));
+    }
+  }
+
+  // One row update in a private copy of the record (rec, slot_bytes): Adagrad on the fp32 row, stored back in the
+  // record precision; seq = the batch's last sample; csum over the new (key, seq, emb).
+  void rmw_record(uint8_t *rec, const float *g, uint64_t key, uint64_t seq, float *w) {
+    const RecFmt &f = fmt_;
+    float acc;
+    std::memcpy(&acc, rec + f.acc_off, 4);
+    emb_to_f32(rec + f.emb_off, f.elt, p_.dim, w, false);
+    rowwise_adagrad(w, &acc, g, p_.dim, o_.ada);
+    f32_to_emb(w, f.elt, p_.dim, rec + f.emb_off);
+    std::memcpy(rec + f.acc_off, &acc, 4);
+    std::memcpy(rec + f.seq_off, &seq, 8);
+    const uint32_t cs = row_csum_words(key, seq, rec + f.emb_off, f.ewords);
+    std::memcpy(rec + f.csum_off, &cs, 4);
+  }
+
+  void owner(uint32_t w) {
+    be_->thread_init(int(1 + o_.load_threads + w), kRoleUpdate);
+    cxl::proc::name_thread("rs-update");
+    coh_init();
+    OpTimer ot(&tcoh_);
+    const uint32_t dim = p_.dim;
+    std::vector<float> wv(dim);
+    std::vector<uint8_t> buf(p_.slot_bytes);
+    // Every owner gets every batch (possibly empty) and applies them in batch order (= seq order), although several
+    // trainers may finish out of order: row seqs then only grow, and a row's history is the sample order.
+    std::map<uint64_t, std::shared_ptr<GradJob>> pend;
+    uint64_t want = 0;
+    for (;;) {
+      if (pend.empty() || pend.begin()->first != want) {
+        std::shared_ptr<GradJob> in;
+        gq_[w].pop(&in, 0);
+        const uint64_t b = in->batch;
+        pend.emplace(b, std::move(in));
+        continue;
+      }
+      std::shared_ptr<GradJob> jp = std::move(pend.begin()->second);
+      pend.erase(pend.begin());
+      want++;
+      const GradJob &j = *jp;
+      const uint64_t c0 = thread_cpu_ns(), t0 = now_ns();
+      ot.begin();
+      uint64_t sections = 0, bad_key = 0;
+      if constexpr (!Be::kAppSeqlock) {
+        for (size_t i = 0; i < j.rows.size();) {
+          const uint32_t k = j.rows[i].k;
+          const uint64_t c = be_->chunk_of(k, j.rows[i].gslot - p_.row_base[k]);
+          size_t e = i + 1;
+          while (e < j.rows.size() && j.rows[e].k == k && be_->chunk_of(k, j.rows[e].gslot - p_.row_base[k]) == c) e++;
+          be_->write_object(k, c, [&](uint8_t *obj) {
+            for (size_t x = i; x < e; x++) {
+              uint8_t *rec = obj + be_->row_offset(k, j.rows[x].gslot - p_.row_base[k]);
+              std::memcpy(buf.data(), rec, p_.slot_bytes);
+              uint64_t key;
+              std::memcpy(&key, buf.data() + fmt_.key_off, 8);
+              if (key != j.rows[x].key) { bad_key++; continue; }
+              rmw_record(buf.data(), &j.g[x * dim], key, j.seq, wv.data());
+              std::memcpy(rec, buf.data(), p_.slot_bytes);
+            }
+          });
+          sections++;
+          for (size_t x = i; x < e; x++)  // visible after write_end
+            if (stale_sampled(j.rows[x].gslot)) stale_add(j.rows[x].gslot, j.seq, true);
+          i = e;
+        }
+      } else {
+        for (size_t x = 0; x < j.rows.size(); x++) {
+          const Touched &t = j.rows[x];
+          const uint64_t r = t.gslot - p_.row_base[t.k];
+          uint32_t *ver = &h_->ver[p_.stripe(t.key)];
+          const uint32_t v = lock_stripe(ver);
+          be_->read_slot(t.k, r, [&](const uint8_t *src) { std::memcpy(buf.data(), src, p_.slot_bytes); });
+          uint64_t key;
+          std::memcpy(&key, buf.data() + fmt_.key_off, 8);
+          if (key == t.key) {
+            rmw_record(buf.data(), &j.g[x * dim], key, j.seq, wv.data());
+            be_->write_slot(t.k, r, [&](uint8_t *dst) { std::memcpy(dst, buf.data(), p_.slot_bytes); });
+          } else {
+            bad_key++;
+          }
+          store_release(ver, v + 2);
+          if (stale_sampled(t.gslot)) stale_add(t.gslot, j.seq, true);
+        }
+      }
+      st_.write_ns += now_ns() - t0;
+      st_.rows_written += j.rows.size() - bad_key;
+      st_.update_misses += bad_key;
+      st_.update_sections += sections;
+      __atomic_fetch_add(&h_->nodes[o_.node].rows_written, uint64_t(j.rows.size() - bad_key), __ATOMIC_RELAXED);
+      batch_done(j.batch);
+      ot.end(&st_.op_row_update, j.rows.size());  // RMW of this owner's rows .. published_seq raised
+      st_.owner_cpu_ns += thread_cpu_ns() - c0;
+      const uint64_t lag = now_ns() - j.t_arr;
+      st_.lag_ns_sum += lag, st_.lag_n++;
+      uint64_t mx = st_.lag_ns_max.load();
+      while (lag > mx && !st_.lag_ns_max.compare_exchange_weak(mx, lag)) {
+      }
+    }
+  }
+
+  void batch_done(uint64_t b) {  // owner finished its part of batch b: advance published_seq over the done prefix
+    uint64_t pub = 0;
+    {
+      std::lock_guard<std::mutex> l(lmu_);
+      auto it = ledger_.find(b);
+      if (it == ledger_.end() || --it->second.left) return;
+      while (!ledger_.empty() && ledger_.begin()->first == next_pub_ && ledger_.begin()->second.left == 0) {
+        pub = ledger_.begin()->second.seq;
+        ledger_.erase(ledger_.begin());
+        next_pub_++;
+      }
+    }
+    if (!pub) return;
+    uint64_t *f = &h_->nodes[o_.node].published_seq, cur = load_acquire(f);
+    while (cur < pub && !cxl::hwcc::cas(f, &cur, pub)) {
+    }
+  }
+
   // ---------------------------------------------------------------- serving
   struct QueryCtx {
     Job job;
@@ -889,7 +1327,7 @@ class Server {
         std::memset(acc, 0, size_t(p_.dim) * 4);
         for (uint32_t j = 0; j < p_.hot[k]; j++) {
           lookups++;
-          if (!lookup(k, Params::key(k, p_.row_of(k, smp, j)), acc, tmp.data(), &lc)) misses++;
+          if (!lookup(k, Params::key(k, p_.row_of(k, smp, j)), acc, tmp.data(), &lc, true)) misses++;
         }
       }
     }
@@ -1026,6 +1464,16 @@ class Server {
   std::condition_variable scv_;
   std::deque<Job> queries_;
   std::deque<QueryCtx *> tasks_;
+  // v7
+  RecFmt fmt_{p_};
+  Queue<std::shared_ptr<UpdJob>> tq_;                       // train mode: accepted samples, seq order
+  std::unique_ptr<Queue<std::shared_ptr<GradJob>>[]> gq_;   // train mode: per row owner
+  std::mutex tmu_, lmu_;
+  uint64_t next_batch_ = 0, next_pub_ = 0;
+  std::map<uint64_t, Led> ledger_;
+  FILE *stale_f_ = nullptr;
+  std::mutex stale_mu_;
+  std::vector<std::unique_ptr<StaleBuf>> stale_bufs_;
 };
 
 template <class Be>
@@ -1045,12 +1493,43 @@ int run(const Opts &o) {
   std::_Exit(0);
 }
 
+// --image: record format and table sizes come from the image header; the derived layout must match it exactly (rows
+// per table, row_base). Full image = no row cap (--row-cap defaults to the largest MLPerf table with --image); a
+// scaled test image (tests/make_test_image.py) is built for given --row-cap/--row-div and needs the same options here.
+bool apply_image(Opts *o, bool row_cap_set) {
+  const int fd = ::open(o->image.c_str(), O_RDONLY | O_CLOEXEC);
+  if (fd < 0) return std::fprintf(stderr, "recsys-server: --image %s: cannot open\n", o->image.c_str()), false;
+  ImageHeader h{};
+  struct stat st{};
+  const bool ok = pread(fd, &h, sizeof h, 0) == ssize_t(sizeof h) && fstat(fd, &st) == 0;
+  close(fd);
+  if (!ok || h.magic != kImageMagic || h.version != kImageVersion || (h.elt_bytes != 2 && h.elt_bytes != 4) ||
+      h.record_bytes != rec_bytes(h.dim, h.elt_bytes) || h.data_off != kImageHeaderBytes ||
+      uint64_t(st.st_size) != h.data_off + h.rows * h.record_bytes)
+    return std::fprintf(stderr, "recsys-server: --image %s: not a RSYSIMG1 v1 image or size mismatch\n", o->image.c_str()), false;
+  o->p.dim = h.dim, o->p.v7_elt = h.elt_bytes;
+  if (!row_cap_set) o->p.row_cap = *std::max_element(mlperf_rows().begin(), mlperf_rows().end());
+  o->p.derive();
+  for (uint32_t k = 0; k < kSparse; k++)
+    if (o->p.rows[k] != h.table_rows[k] || o->p.row_base[k] != h.row_base[k])
+      return std::fprintf(stderr, "recsys-server: --image table %u: %lu rows at %lu, layout has %lu at %lu (--row-cap/"
+                                  "--row-div must be those of the image)\n", k, (unsigned long)h.table_rows[k],
+                          (unsigned long)h.row_base[k], (unsigned long)o->p.rows[k], (unsigned long)o->p.row_base[k]),
+             false;
+  if (o->p.total_rows != h.rows || o->p.slot_bytes != h.record_bytes)
+    return std::fprintf(stderr, "recsys-server: --image: rows/record size differ from the layout\n"), false;
+  return true;
+}
+
 void usage() {
   std::fprintf(stderr,
                "usage: recsys-server --node K --nodes N --run-id 0x.. [--port P] [--region yaml]\n"
                "  [--serve-threads S (14)] [--update-threads U (4)] [--chunk-pairs C (0 = adaptive)] [--min-chunk M (16)] [--load-threads L (8)]\n"
                "  [--publish-ms T | --publish-us T (0 = write each sample immediately)] [--publish-frac F (target rows/T, reported)]\n"
-               "  [--update-mode batch|stream]   stream (T = 0 only): reply on acceptance, rows written right away (batch = default)\n"
+               "  [--update-mode batch|stream|train]   stream (T = 0 only): reply on acceptance, rows written right away (batch = default)\n"
+               "  v7 (DESIGN.md §10.6): [--image F] [--model-dense F] [--update-mode train] [--train-threads N (= U)]\n"
+               "     [--train-batch B (8)] [--lr X (0.004)] [--eps X (1e-8)] [--acc-init X (< 0 = image)]\n"
+               "     [--stale-log FILE] [--stale-sample N (256)]   train needs --image and --model-dense\n"
                "  [--dim D (128)] [--row-cap R (26000000)] [--row-div N (1)] [--ver-stripes S (65536)]\n"
                "  [--multi-hot-div N (1)] [--rank R (512)] [--seed N] [--verify-rows 0|1] [--warm-up 0|1]\n"
                "  [--check-stride N (4096)] [--megalon-time-sample N (0 = off)] [--start-timeout-ms T] [--backend plain|megalon] [--megalon-lib PATH]\n"
@@ -1066,7 +1545,7 @@ void usage() {
 
 int main(int argc, char **argv) {
   Opts o;
-  bool print_bytes = false, print_layout = false;
+  bool print_bytes = false, print_layout = false, row_cap_set = false;
   for (int i = 1; i < argc; i++) {
     std::string a = argv[i];
     auto v = [&]() -> std::string {
@@ -1087,11 +1566,21 @@ int main(int argc, char **argv) {
     else if (a == "--publish-us") o.publish_us = std::stoull(v());
     else if (a == "--update-mode") {
       const std::string m = v();
-      if (m != "stream" && m != "batch") usage();
-      o.stream = m == "stream";
+      if (m != "stream" && m != "batch" && m != "train") usage();
+      o.stream = m == "stream" || m == "train";  // train: acknowledged on acceptance as in stream (DESIGN.md §10.6)
+      o.train = m == "train";
     }
+    else if (a == "--image") o.image = v();
+    else if (a == "--model-dense") o.model_dense = v();
+    else if (a == "--train-threads") o.train_threads = std::stoul(v());
+    else if (a == "--train-batch") o.train_batch = std::stoul(v());
+    else if (a == "--lr") o.ada.lr = std::stof(v());
+    else if (a == "--eps") o.ada.eps = std::stof(v());
+    else if (a == "--acc-init") o.acc_init = std::stod(v());
+    else if (a == "--stale-log") o.stale_log = v();
+    else if (a == "--stale-sample") o.stale_mod = std::stoul(v());
     else if (a == "--dim") o.p.dim = std::stoul(v());
-    else if (a == "--row-cap") o.p.row_cap = std::stoull(v());
+    else if (a == "--row-cap") o.p.row_cap = std::stoull(v()), row_cap_set = true;
     else if (a == "--row-div") o.p.row_div = std::stoull(v());
     else if (a == "--ver-stripes") o.p.ver_stripes = std::stoul(v());
     else if (a == "--publish-frac") o.publish_frac = std::stod(v());
@@ -1122,7 +1611,17 @@ int main(int argc, char **argv) {
     return 2;
   }
   o.p.derive();
-  if (print_bytes) {
+  if (!o.image.empty() && !apply_image(&o, row_cap_set)) return 2;
+  if (o.train && (o.image.empty() || o.model_dense.empty() || o.publish_us || o.train_batch == 0 || o.train_batch > 64 ||
+                  !(o.ada.lr > 0) || o.p.multi_hot_div != 1)) {
+    std::fprintf(stderr, "recsys-server: --update-mode train needs --image, --model-dense, --publish-ms 0, "
+                         "1 <= --train-batch <= 64, --lr > 0 and --multi-hot-div 1\n");
+    return 2;
+  }
+  if (!o.image.empty() && !o.train) {  // the v6 writer (make_slot) would overwrite v7 records with synthetic v6 rows
+    std::fprintf(stderr, "recsys-server: --image needs --update-mode train (on every node; serving nodes idle their trainers)\n");
+    return 2;
+  }
     std::printf("%lu\n", (unsigned long)HwccLayout(o.p).L.bytes());
     return 0;
   }

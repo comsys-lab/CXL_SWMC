@@ -331,7 +331,37 @@ Status 2026-11-03: Host side done (10.1-10.5); server/loadgen/harness wiring ope
   on 1 thread (725/s), 1.57 ms on 4 threads (2538/s). Row update (Adagrad) 0.07-0.09 ms/sample.
 - Prequential AUC on [0, 20k), 4 threads, batch 8 (frozen 0.80937): lr 0.004 -> 0.76565, lr 4e-4 -> 0.81344,
   lr 4e-5 -> 0.81100 (batch 1, lr 0.004: 0.76028).
-### 10.6 Open: server / loadgen / harness (not implemented yet)
+### 10.6 Server / loadgen / harness (written 2026-11-03, NOT yet compiled or run: MEASUREMENT.lock; see 10.7)
+- server: `--image F` (header checked against the derived layout; with --image the row cap defaults to the largest
+  MLPerf table, i.e. no cap; layout tag gains ` record=v7 elt_bytes=N`), rows copied by node 0 at prepare (plain:
+  4096-row preads; Megalon: one write section per object, 16 MiB preads straight into the object; page cache dropped
+  behind), `--acc-init X` patches acc at load (< 0 = image value). `--model-dense F`. `--update-mode train` (needs
+  --image, --model-dense, --publish-ms 0; required on every node with --image): acknowledged on acceptance; one
+  training queue; `--train-threads` (default U) trainers form batches of up to `--train-batch` in seq order (numbered),
+  read rows with lookup() (coherent path), forward + backward, per-row summed gradients to every owner (empty batches
+  too); owners apply batches in batch order (reorder buffer: row seqs only grow) and do read-copy-modify-write of each
+  row in the system's write path (plain: under the stripe, read_slot + write_slot of the whole record; Megalon: one
+  write section per touched object). published_seq = last sample of the longest prefix of fully written batches.
+  `--lr`, `--eps`, `--acc-init`, `--train-batch` are recorded at start and in every stats snapshot (`train.*`), plus
+  train_samples, train_cpu_ns (trainers), owner_cpu_ns, updater_cpu_ns = their sum (CLOCK_THREAD_CPUTIME_ID).
+- stale log (`--stale-log F --stale-sample N`, default 256): rows with mix64(global row ^ c) % N == 0 on every node;
+  node 0 logs (row, seq, CLOCK_REALTIME ns) after each write is visible; a serving node logs each lookup of such a row
+  (seq read). RSYSSTL1 file, drained at every stats read and at stop.
+- loadgen: `prequential=1` queries from the update trace at start uniform in [u, u + N), u = next update position,
+  N = `query_window_samples` or `query_window_s` (60) x `update_rate`; scores always returned; scores.bin (RSYSSCR1,
+  pad[0] = measured) + scoreq.bin (query make time on the loadgen clock).
+- tools/v7_metrics.py: per measured step samples_scored, auc, logloss, stale_read_frac, stale_age_p50/p95/max_ms,
+  updater_cpu_s_per_s (formulas in its docstring), `--merge-steps steps.csv`, `--auc-run auc_run.csv` (system,
+  update_rate, T, run, samples_scored, auc, logloss, auc_frozen, auc_fresh, gain_retained; hw: fresh = its own AUC;
+  other systems: auc_fresh/gain empty unless --fresh, filled after the block from the hw row at the same rate).
+  Test: tests/v7_metrics_test.py (synthetic, PASS 2026-11-03).
+- harness: conf keys RS_V7, RS_V7_* (experiments/eval/eval4-rs-v7.conf, DRAFT) -> lib.sh rs_env -> main-block.sh
+  V7_* (BLOCK=stream + EVAL_RUN): train-mode server args, per-lifetime stale logs, prequential loadgen options per
+  rate, v7_post after each SLO part; `@USER@` values = undecided methodology (dry plans with defaults, real run stops).
+  Dry starts rs-main / rs-h1 / rs-ds: DRY START OK (2026-11-03). Megalon probe lifetimes (fix parts) get no v7_post yet.
+- Host test: tests/make_test_image.py (scaled image, rows copied from the converted checkpoint; csum/key verified
+  equal) + tests/v7_host_test.sh (session.sh SESSION_LOCAL=1, two processes over a /dev/shm file); not run yet.
+### 10.7 Original plan text (kept)
 - server: `--image` (initial rows from the image instead of make_slot), `--model-dense`, record size from the image;
   node 0 `--update-mode train`: trainer threads take queued update samples in seq order in micro-batches of up to
   `--train-batch` (no waiting), read rows through the coherent lookup path, forward + backward, hand (row, gradient)
