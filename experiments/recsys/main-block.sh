@@ -99,7 +99,7 @@
 #   (subset of "hw pop mg", default "hw pop"); EKKO and RS_T_MS are refused. Servers: --publish-ms 0 --update-mode stream,
 #   node 0 --update-threads 14 --serve-threads 1, node 1 --update-threads 1 --serve-threads 14 (N0X below). Per rate
 #   (in STREAM_RATES order), per system (order shuffle(seed recsys-stream-<rate>), <E>/order.txt) one lifetime
-#   <sys>-u<rate>: warmup (1 query/s + the update stream, 10 + 50 s, unmeasured) -> slo (query p95 <= 100 ms, start 1,
+#   <sys>-u<rate>: warmup (1 query/s + the update stream, 10 + 50 s, unmeasured) -> slo (query p95 <= 100 ms or EVAL STREAM_SLO_MS, start 1,
 #   factor 1.5, precision 0.02, confirm 3 x 30 s as H1, --tol 0.02, --max-steps 40, --min-step-queries 100,
 #   --ramp-knee 2, rise 1.2 default) -> stream_check.py (FAIL stops; NOTE "update rate not sustained" recorded) -> check_breakdown.py.
 #   loadgen rc 1 with a note is recorded (MAIN NOTE), not a stop. <E>/stream-results.tsv (one row per lifetime),
@@ -168,7 +168,19 @@ else
 fi
 MEGALON_BASE=${MEGALON_BASE:-$P/builds/megalon/75}
 UPD_FILE=${UPD_FILE:-updates-day23-0-2M.smp} QRY_FILE=${QRY_FILE:-queries-day23-89137318-1M.smp}
-SLO_PCT=95 SLO_MS=100
+SLO_PCT=95 SLO_MS=100 SLO_SRC="MOT1 v6, user 2026-10-16"
+# EVAL stream options (experiments/eval/lib.sh rs_env; BLOCK=stream with EVAL_RUN only; unset = the values above):
+#   STREAM_SLO_MS 100 | 400: query p95 SLO in ms (400 = user decision 2026-11-02 for 4 vCPU guests: 100 ms x 16 / 4 vCPU,
+#     DeepRecSys DLRM-RMC targets "hundreds of ms")
+#   STREAM_CONFIRM_PROBES 6 | 3: loadgen --max-confirm-probes of the SLO search (3 = the lean cut, schedule §1 "cap 3";
+#     the RecSys overload ladder is loadgen's default 3 points 1.05 / 1.1 / 1.2, already below the cap of 7)
+if [ -n "${STREAM_SLO_MS:-}${STREAM_CONFIRM_PROBES:-}" ]; then
+  [ $BLOCK = stream ] && [ -n "${EVAL_RUN:-}" ] || { echo "SEQUENCE STOP: STREAM_SLO_MS / STREAM_CONFIRM_PROBES need BLOCK=stream and EVAL_RUN"; exit 2; }
+  case ${STREAM_SLO_MS:-100} in 100) ;; 400) SLO_MS=400 SLO_SRC="4 vCPU guests, user 2026-11-02";;
+    *) echo "SEQUENCE STOP: STREAM_SLO_MS must be 100 or 400 (got ${STREAM_SLO_MS})"; exit 2;; esac
+  case ${STREAM_CONFIRM_PROBES:-6} in 3|6) ;; *) echo "SEQUENCE STOP: STREAM_CONFIRM_PROBES must be 3 or 6"; exit 2;; esac
+fi
+STREAM_CONFIRM_PROBES=${STREAM_CONFIRM_PROBES:-6}
 # Publication period T (H1 v0.6.9, user decision 2026-10-18 "T=1로 바로 가는게 좋아보여"): RS_T_MS = the updater's
 # --publish-ms. Default 60000 (every earlier block, unchanged). BLOCK=h1 requires it explicitly (pins-recsys.sh).
 # The Ekko operating point is defined at the reference T = 60 s and is an UPDATE SAMPLE RATE: EKKO_FRAC60 of all rows
@@ -246,7 +258,7 @@ if [ $BLOCK = stream ]; then
   fi
 fi
 if [ $BLOCK != h1 ] && [ $BLOCK != stream ]; then ekko_set "$EKKO" || { echo "SEQUENCE STOP: EKKO must be avg, peak, f087, f149, f253, f330, f350, f370, f400, f385 or f392"; exit 2; }; fi
-export SLO_MS SLO_RULE="DeepRecSys ISCA'20: query p${SLO_PCT} <= ${SLO_MS} ms (MOT1 v6, user 2026-10-16)"
+export SLO_MS SLO_RULE="DeepRecSys ISCA'20: query p${SLO_PCT} <= ${SLO_MS} ms ($SLO_SRC)"
 HOST_PLAIN=$PLAIN_BUILD/bin/recsys-server
 SSH="ssh -o BatchMode=yes -o ConnectTimeout=8"
 IPS=(192.168.122.100 192.168.122.101)
@@ -687,7 +699,7 @@ stream_slo() {  # <sys> <rate>
     --warmup-s 10 --step-warmup-s 0 --step-measure-s 50 --drain-s 10
   rc=$?; [ $rc = 0 ] || stop "$NAME warm-up rc $rc"
   measure "$LS" slo "${LGC[@]}" --opt seed=$SEED --seed $SEED --slo query:$SLO_PCT:$SLO_MS --raw --tol 0.02 \
-    --mode slo --start 1 --factor 1.5 --precision 0.02 --confirm-precision 0.01 --max-confirm-probes 6 --confirm-step-down 0.05 \
+    --mode slo --start 1 --factor 1.5 --precision 0.02 --confirm-precision 0.01 --max-confirm-probes $STREAM_CONFIRM_PROBES --confirm-step-down 0.05 \
     --max-steps 40 --min-step-queries 100 --ramp-knee 2
   rc=$?
   grep -q 'workload_finish":"ok' "$RD/loadgen/summary.json" 2>/dev/null || stop "$NAME slo: loadgen workload finish (rc $rc)"
@@ -982,7 +994,8 @@ if [ $BLOCK = stream ]; then  # RecSys streaming driver (header "BLOCK=stream")
     printf '# rate_sps\tL1_q_s\tL2_q_s\tsource\n' > "$E/stream-levels.tsv"
     { echo "EVAL_RUN=$EVAL_RUN RS_THREADS=$RS_THREADS REGION=$REGION sha256=$(sha256sum < "$REGION" | cut -c1-64)"
       echo "SYSTEMS=${SYSTEMS:-hw pop} STREAM_FIXONLY=${STREAM_FIXONLY:-} STREAM_FIX_LEVELS=${STREAM_FIX_LEVELS:-} STREAM_FIX_LEVELS_MAP=${STREAM_FIX_LEVELS_MAP:-} STREAM_FIX_FALLBACK=${STREAM_FIX_FALLBACK:-} STREAM_FIX_SEP=${STREAM_FIX_SEP:-1} STREAM_LEVELS=${STREAM_LEVELS:-}"
-      echo "STREAM_FIX_S=${STREAM_FIX_S:-60} STREAM_FIX_SETTLE_S=${STREAM_FIX_SETTLE_S:-60} server_args=[$SA] node0_extra=[$N0X]"; } | tee "$E/eval-params.txt"
+      echo "STREAM_FIX_S=${STREAM_FIX_S:-60} STREAM_FIX_SETTLE_S=${STREAM_FIX_SETTLE_S:-60} server_args=[$SA] node0_extra=[$N0X]"
+      echo "slo=query:$SLO_PCT:$SLO_MS ($SLO_RULE) max_confirm_probes=$STREAM_CONFIRM_PROBES"; } | tee "$E/eval-params.txt"
   fi
   { echo "# RecSys streaming block: per rate (in STREAM_RATES order) one lifetime per system, order shuffle(seed recsys-stream-<rate>)"
     for r in $STREAM_RATES; do echo "u$r: $(h1shuffle recsys-stream-$r ${SYSTEMS:-hw pop})"; done; } | tee "$E/order.txt"
