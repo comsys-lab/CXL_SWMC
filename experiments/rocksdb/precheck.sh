@@ -1,7 +1,8 @@
 #!/bin/bash
 # RocksDB guest pre-check (reports/ROCKSDB-V1-packet.md), per guest, read-only + sudo -n fuser (standing grant A):
 #   ssh comsys@<ip> 'EXPECT_K=<release> L=<install dir> EXPECT_SHA="<sha server> <sha node.sh> <sha region>" bash -s' < precheck.sh
-# optional EXPECT_DAX_UUID (namespace0.0 uuid), EXPECT_DAX_SIZE (103060340736), MIN_MEM_G (16), EXPECT_NPROC.
+# optional EXPECT_DAX_UUID (namespace0.0 uuid), EXPECT_DAX_SIZE (103060340736), MIN_MEM_G (16), EXPECT_NPROC,
+#   EXPECT_MEG_SHA (Megalon: "<sha shim> <sha libmegalon.so> <sha cfg/megalon.yaml>").
 # FAILS (exit 1, "PRECHECK FAIL <item>") unless: kernel = EXPECT_K, cxl_shm not loaded, no famfs, /dev/dax0.0 root:root 600
 # and unused, no rocksdb-server/kv/lmdb/vdb/recsys process (command line), the installed files' sha256 = EXPECT_SHA
 # (in that order: bin/rocksdb-server bin/rocksdb-node.sh cfg/cxl_region.yaml), ldd complete, available memory >= MIN_MEM_G.
@@ -35,6 +36,12 @@ got=$(cd "${L:?}" && for f in bin/rocksdb-server bin/rocksdb-node.sh cfg/cxl_reg
 echo "install_sha=[${got% }] expect=[${EXPECT_SHA:?}]"
 [ "${got% }" = "$EXPECT_SHA" ] || fail "install sha256 mismatch"
 ldd "$L/bin/rocksdb-server" | grep -q "not found" && fail "ldd rocksdb-server"
+if [ -n "${EXPECT_MEG_SHA:-}" ]; then  # Megalon runs (eval run2): lib/libmegalon-objapi.so lib/libmegalon.so cfg/megalon.yaml
+  got=$(cd "$L" && for f in lib/libmegalon-objapi.so lib/libmegalon.so cfg/megalon.yaml; do sha256sum < $f | cut -c1-64; done | tr '\n' ' ')
+  echo "megalon_sha=[${got% }] expect=[$EXPECT_MEG_SHA]"
+  [ "${got% }" = "$EXPECT_MEG_SHA" ] || fail "megalon install sha256 mismatch"
+  ldd "$L/lib/libmegalon-objapi.so" | grep -q "not found" && fail "ldd libmegalon-objapi.so"
+fi
 m=$(free -g | awk '/Mem/{print $7}'); echo "mem_avail=${m}G"
 [ "$m" -ge "${MIN_MEM_G:-16}" ] || fail "mem_avail ${m}G < ${MIN_MEM_G:-16}G"
 echo PRECHECK PASS

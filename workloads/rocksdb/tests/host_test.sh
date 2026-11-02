@@ -11,7 +11,8 @@
 #   4 opsplit rows (get/update with T > 0, C within [0, T]) and clean-stop counts
 # usage: host_test.sh <work dir (new)> <rocksdb build dir> <loadgen build dir with the rocksdb plugin> [keys (200000)]
 #        env: CPUS0 / CPUS1 / CPUSL (node0 / node1 / loadgen CPU lists), RATES, STEP_S, UPDATE_RATIO, WBMB,
-#             BACKEND=megalon (the build must carry lib/libmegalon-objapi.so; MEG_EXTENTS file extents per node)
+#             BACKEND=megalon (the build must carry lib/libmegalon-objapi.so; MEG_EXTENTS file extents per node),
+#             REGION_GB (sparse region file size, 8; 96 with MEG_EXTENTS=45000 = the VM object count, eval run2)
 set -uo pipefail
 WD=$1; B=$(cd "$2" && pwd); LG=$(cd "$3" && pwd); N=${4:-200000}
 HERE=$(cd "$(dirname "$0")" && pwd); W=$(cd "$HERE/.." && pwd)
@@ -21,12 +22,13 @@ mkdir "$WD" || exit 2; WD=$(cd "$WD" && pwd); cd "$WD"
 RESULT=0
 fail() { echo "STEP FAIL: $*"; RESULT=1; }
 rid() { printf '0x%x' $(( $(date +%s%N) & 0xffffffffff | 1 )); }
-truncate -s 8G region.img
+RGB=${REGION_GB:-8}; [[ $RGB =~ ^[1-9][0-9]*$ ]] || { echo "bad REGION_GB"; exit 2; }
+truncate -s ${RGB}G region.img
 cat > region.yaml <<EOF
 # Host test region: copy of CXL_SWMC/config/cxl_region.yaml with a sparse file standing in for the device
 device: $WD/region.img
 map_va: 0x600000000000
-device_size: 8589934592
+device_size: $(( RGB << 30 ))
 align: 2097152
 hwcc_offset: 0
 hwcc_size: 268435456

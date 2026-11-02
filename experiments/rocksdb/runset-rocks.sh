@@ -26,11 +26,17 @@
 #   (phase ds: exported as DS_RECV_EXTRA to pilot-run.sh = appended to the cxl_shm load, read back after the enable;
 #   empty / absent = module defaults). ROCKS_BLOCK may then be D200 | E200 (evidence <prefix>-D200-ds-n<N>-v<V>,
 #   guest dir <ROCKS_GUEST_PREFIX>-d200-...), so the 200 / 50 cells never share a name with the block D / E cells.
+# Megalon (eval run2, 2026-11-03; workloads/rocksdb DESIGN.md §7): phase mg = the mg cells (Object SWcc, user level, no
+#   cxl_shm) on the all-HWcc guest kernel and region (POP_K, POP_REGION, dax0.0 chowned to comsys as for hw), with the
+#   Megalon server build of that N: ROCKS_MG_BUILD_N<N> (build.sh with builds/megalon/<b>-n<N>; lib/ shipped),
+#   ROCKS_MG_CFG_N<N> (Megalon config, object_arena_size >= N x (512 + extents) MiB), ROCKS_MG_EXTENTS_N<N> (file extents
+#   per node). ROCKS_SYSTEMS may then contain mg; ROCKS_BLOCK may be MG. ROCKS_EXPERIMENT (optional): the
+#   state/EXPERIMENTS.md block a real run requires approved/running (default de-stijl-evaluation-run1).
 set -uo pipefail
 P=/home/comsys/sungsu/destijl-control
 HERE=$(cd "$(dirname "$0")" && pwd); TREE=$(cd "$HERE/../.." && pwd)
 die() { echo "RUNSET STOP: $*"; exit 2; }
-CONF=${1:-}; N=${2:-}; PHASE=${3:-}; shift 3 2>/dev/null || die "usage: runset-rocks.sh <conf> <N> <hwpop|ds> [--dry-run] [--v V] [--only '...']"
+CONF=${1:-}; N=${2:-}; PHASE=${3:-}; shift 3 2>/dev/null || die "usage: runset-rocks.sh <conf> <N> <hwpop|ds|mg> [--dry-run] [--v V] [--only '...']"
 DRY=0 V= ONLY=
 while [ $# -gt 0 ]; do
   case $1 in --dry-run) DRY=1; shift;; --v) V=${2:-}; shift 2;; --only) ONLY=${2:-}; shift 2;; *) die "unknown argument $1";; esac
@@ -39,7 +45,8 @@ done
 KEYS="ROCKS_BLOCK ROCKS_TOPO ROCKS_NODES ROCKS_MIXES ROCKS_SYSTEMS ROCKS_SLO_MS ROCKS_KEYS ROCKS_THREADS EXPECT_NPROC MIN_MEM_G
   ROCKS_BUILD ROCKS_LOADGEN_BUILD ROCKS_SLO_EXTRA RECV_MODE EXPECT_DAX_UUID RESULTS_ROOT EVIDENCE_PREFIX ROCKS_GUEST_PREFIX
   POP_REGION POP_C POP_BUNDLE_SHA POP_K POP_GT DS_REGION DS_C DS_BUNDLE_SHA DS_K DS_GT"
-OPTKEYS="ROCKS_DS_RECV_EXTRA"
+OPTKEYS="ROCKS_DS_RECV_EXTRA ROCKS_EXPERIMENT ROCKS_MG_BUILD_N2 ROCKS_MG_BUILD_N4 ROCKS_MG_BUILD_N8 ROCKS_MG_CFG_N2
+  ROCKS_MG_CFG_N4 ROCKS_MG_CFG_N8 ROCKS_MG_EXTENTS_N2 ROCKS_MG_EXTENTS_N4 ROCKS_MG_EXTENTS_N8"
 # shellcheck disable=SC2086
 unset $KEYS $OPTKEYS
 # the conf may set only these keys (a typo or a foreign key stops)
@@ -51,7 +58,9 @@ for k in $KEYS; do [ -n "${!k:-}" ] || die "conf key $k empty"; done
 abs() { case $1 in /*) echo "$1";; *) echo "$P/$1";; esac; }
 ROCKS_BUILD=$(abs "$ROCKS_BUILD") ROCKS_LOADGEN_BUILD=$(abs "$ROCKS_LOADGEN_BUILD") RESULTS_ROOT=$(abs "$RESULTS_ROOT")
 POP_REGION=$(abs "$POP_REGION") POP_C=$(abs "$POP_C") DS_REGION=$(abs "$DS_REGION") DS_C=$(abs "$DS_C")
-[[ $ROCKS_BLOCK =~ ^[DE](200)?$ ]] || die "ROCKS_BLOCK D | E | D200 | E200"
+[[ $ROCKS_BLOCK =~ ^([DE](200)?|MG)$ ]] || die "ROCKS_BLOCK D | E | D200 | E200 | MG"
+EXPN=${ROCKS_EXPERIMENT:-de-stijl-evaluation-run1}
+[[ $EXPN =~ ^[a-z0-9][-a-z0-9]*$ ]] || die "bad ROCKS_EXPERIMENT ($EXPN)"
 DSRX=${ROCKS_DS_RECV_EXTRA:-}
 [[ $DSRX =~ ^((idle_sleep_us|idle_spin_us)=[0-9]+( |$))*$ ]] || die "bad ROCKS_DS_RECV_EXTRA ($DSRX: 'idle_sleep_us=<n> idle_spin_us=<n>')"
 [[ $ROCKS_BLOCK != *200 ]] || [ -n "$DSRX" ] || die "ROCKS_BLOCK $ROCKS_BLOCK needs ROCKS_DS_RECV_EXTRA"
@@ -68,21 +77,29 @@ case $PHASE in
   hwpop) SYSS=""; for s in hw pop; do [[ " $ROCKS_SYSTEMS " == *" $s "* ]] && SYSS="$SYSS $s"; done
          EXPECT_K=$POP_K REGION=$POP_REGION;;
   ds) [[ " $ROCKS_SYSTEMS " == *" ds "* ]] || die "ds not in ROCKS_SYSTEMS"; SYSS=" ds"; EXPECT_K=$DS_K REGION=$DS_REGION;;
-  *) die "phase hwpop | ds";;
+  mg) [[ " $ROCKS_SYSTEMS " == *" mg "* ]] || die "mg not in ROCKS_SYSTEMS"; SYSS=" mg"; EXPECT_K=$POP_K REGION=$POP_REGION
+      kb=ROCKS_MG_BUILD_N$N kc=ROCKS_MG_CFG_N$N kx=ROCKS_MG_EXTENTS_N$N
+      [ -n "${!kb:-}" ] && [ -n "${!kc:-}" ] && [ -n "${!kx:-}" ] || die "phase mg at N = $N needs $kb, $kc and $kx"
+      MG_BUILD=$(abs "${!kb}") MEG_CFG=$(abs "${!kc}") MG_EXTENTS=${!kx}
+      [[ $MG_EXTENTS =~ ^[1-9][0-9]*$ ]] || die "bad $kx"
+      [ -f "$MG_BUILD/manifest.txt" ] && [ -f "$MEG_CFG" ] || die "$kb ($MG_BUILD) or $kc ($MEG_CFG) missing"
+      ROCKS_BUILD=$MG_BUILD;;
+  *) die "phase hwpop | ds | mg";;
 esac
 [ -n "$SYSS" ] || die "no system of phase $PHASE in ROCKS_SYSTEMS"
 RUNS=""; NAMES=""
 for s in $SYSS; do
-  case $s in hw) SYS=all-HWcc;; pop) SYS=Popcorn;; ds) SYS=DeStijl;; esac
+  XR=""
+  case $s in hw) SYS=all-HWcc;; pop) SYS=Popcorn;; ds) SYS=DeStijl;; mg) SYS=Megalon XR=" FILE_EXTENTS=$MG_EXTENTS";; esac
   for mix in $ROCKS_MIXES; do
     case $mix in u5) UR=0.05;; u50) UR=0.5;; *) die "mix $mix: u5 | u50 (pilot-run.sh UPDATE_RATIO 0.05 | 0.5)";; esac
     name=$s-$mix-n$N
     [ -z "$ONLY" ] || [[ " $ONLY " == *" $s-$mix "* ]] || continue
-    RUNS+="$name SYS=$SYS KIND=slo KEYS=$ROCKS_KEYS THREADS=$ROCKS_THREADS UPDATE_RATIO=$UR"$'\n'; NAMES+=" $name"
+    RUNS+="$name SYS=$SYS KIND=slo KEYS=$ROCKS_KEYS THREADS=$ROCKS_THREADS UPDATE_RATIO=$UR$XR"$'\n'; NAMES+=" $name"
   done
 done
 [ -n "$RUNS" ] || die "no cell selected (--only '$ONLY')"
-BL=$(tr 'DE' 'de' <<< "$ROCKS_BLOCK")
+BL=$(tr 'A-Z' 'a-z' <<< "$ROCKS_BLOCK")
 [ "$PHASE" = ds ] || [ -z "$DSRX" ] || echo "RUNSET NOTE: ROCKS_DS_RECV_EXTRA ignored in phase $PHASE (De Stijl only)"
 if [ -z "$V" ]; then V=1; while [ -e "$RESULTS_ROOT/$EVIDENCE_PREFIX-$ROCKS_BLOCK-$PHASE-n$N-v$V" ]; do V=$((V + 1)); done; fi
 [[ $V =~ ^[1-9][0-9]*$ ]] || die "bad --v"
@@ -92,8 +109,8 @@ if [ $DRY = 1 ]; then
   : "${PRETOUCH_DIR:=<chain PRETOUCH_DIR>}" "${MEASURE_ENV_DIR:=<chain MEASURE_ENV_DIR>}" "${MEASURE_PART_DIR:=<chain MEASURE_PART_DIR>}"
 else
   : "${PRETOUCH_DIR:?chain env PRETOUCH_DIR}" "${MEASURE_ENV_DIR:?chain env MEASURE_ENV_DIR}" "${MEASURE_PART_DIR:?chain env MEASURE_PART_DIR}"
-  st=$(awk '/^### de-stijl-evaluation-run1/{f=1; next} /^### /{f=0} f && /^- Status:/' "$P/state/EXPERIMENTS.md" | head -1)
-  [[ $st =~ ^-\ Status:\ (approved|running) ]] || die "experiment de-stijl-evaluation-run1 not approved/running ($st)"
+  st=$(awk -v h="### $EXPN" '$0 == h || index($0, h " ") == 1 {f=1; next} /^### /{f=0} f && /^- Status:/' "$P/state/EXPERIMENTS.md" | head -1)
+  [[ $st =~ ^-\ Status:\ (approved|running) ]] || die "experiment $EXPN not approved/running ($st)"
   [ ! -e "$E" ] || die "$E exists (results are immutable; use the next --v)"
   [ -z "$(git -C "$TREE" status --porcelain --untracked-files=no)" ] || die "tree $TREE dirty"
 fi
@@ -101,6 +118,7 @@ export OWNER EXPECT_K PRETOUCH_DIR L RUNS NODES="$IPS" VM_DOMAINS="$DOMS" EXPECT
   LOADGEN_BUILD=$ROCKS_LOADGEN_BUILD REGION EXPECT_DAX_UUID MIN_MEM_G EXPECT_NPROC RECV_MODE SLO_EXTRA="$ROCKS_SLO_EXTRA" \
   MEASURE=1 MEASURE_ENV_DIR MEASURE_PART_DIR GATE_SCRIPT=$TREE/scripts/host/h3-gate.sh
 if [ $PHASE = hwpop ]; then export C8=$POP_C K8=$POP_K GT8=$POP_GT POP_BUNDLE_SHA
+elif [ $PHASE = mg ]; then export MEG_CFG
 else export DS_C DS_K DS_GT DS_BUNDLE_SHA DS_RECV_EXTRA="$DSRX"; fi
 echo "RUNSET rocks conf=$CONF ($(sha256sum < "$CONF" | cut -c1-16)) block=$ROCKS_BLOCK N=$N phase=$PHASE topo=$ROCKS_TOPO E=$E"
 [ "$PHASE" != ds ] || echo "RUNSET De Stijl receiver: ${DSRX:-module defaults}"

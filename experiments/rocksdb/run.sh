@@ -7,12 +7,12 @@
 # host-check.txt, port-check.txt, guest-cpu.txt, steps.csv, stats-steps.csv, opsplit.csv, check.txt, ...).
 # usage: run.sh <name> <out_root> -- <loadgen args (mode, rates/SLO, --mix mixed=1 --opt update_ratio=R
 #        --opt keys=N ...)>
-# env (required): SYSTEM (label: all-HWcc | Popcorn), V (guest install dir: bin/rocksdb-server, bin/rocksdb-node.sh,
+# env (required): SYSTEM (label: all-HWcc | Popcorn-<mode> | DeStijl-<mode>-T0 | Megalon), V (guest install dir: bin/rocksdb-server, bin/rocksdb-node.sh,
 #   cfg/cxl_region.yaml), HOST_SERVER (Host rocksdb-server of the same build: --print-app-bytes), LOADGEN (loadgen with
 #   the rocksdb plugin), SERVER_ARGS (identical on every node; must contain --keys N and --nodes N = number of NODES).
 # optional: NODES (192.168.122.100 192.168.122.101; order = node id), PORT (7200), LG_CPUS (56-63), READY_TIMEOUT (7200 s:
 #   image build), RUN_KIND (measurement | functional: a Host build is recorded, not fatal), NODE_ENV (extra ENV:K=V
-#   tokens for every node), SERVER_CPUS (guest CPU list; every rocksdb-server thread pinned after READY and verified),
+#   tokens for every node), NODE0_ENV (Megalon only: ENV:MEGALON_REINIT=1 for node 0), SERVER_CPUS (guest CPU list; every rocksdb-server thread pinned after READY and verified),
 #   STATS_OP (10; 0 = off), VERIFY (1), PER_VM_RATES (r1,r2,..: fixed-rate steps given per VM; the harness passes
 #   --mode fixed --rates N*r1,N*r2,..), STOP_EXTENTS_FREE (2048 = 2 GiB of file extents) / STOP_BLOCKS_FREE (16):
 #   pool floors that every stats snapshot of every node must keep (DESIGN.md §9 MED-5; a lower value FAILS the run).
@@ -34,7 +34,18 @@ KEYS=$(sed -n 's/.* --keys \([0-9][0-9]*\).*/\1/p' <<< " $SERVER_ARGS ")
 [ -n "$KEYS" ] || { echo "SERVER_ARGS must contain --keys N"; exit 2; }
 SN=$(sed -n 's/.* --nodes \([0-9][0-9]*\).*/\1/p' <<< " $SERVER_ARGS ")
 [ "$SN" = "$N" ] || { echo "SERVER_ARGS --nodes $SN != number of NODES $N"; exit 2; }
-grep -qE -- "--backend megalon" <<< "$SERVER_ARGS" && { echo "this harness runs the plain backend (all-HWcc, Popcorn)"; exit 2; }
+# Megalon backend (eval run2; workloads/rocksdb/DESIGN.md §7): SYSTEM=Megalon <=> --backend megalon; every node gets
+# ENV:RACKOBJ_CONFIG=<V>/cfg/megalon.yaml (NODE_ENV), node 0 also ENV:MEGALON_REINIT=1 (NODE0_ENV: node 0 formats
+# Megalon's region and creates every node's objects); the install carries lib/libmegalon-objapi.so (+ Megalon libs).
+MEG=0; grep -qE -- "--backend megalon( |$)" <<< "$SERVER_ARGS" && MEG=1
+if [ $MEG = 1 ] || [ "$SYSTEM" = Megalon ]; then
+  [ $MEG = 1 ] && [ "$SYSTEM" = Megalon ] || { echo "SYSTEM=Megalon and --backend megalon go together"; exit 2; }
+  [[ " ${NODE_ENV:-} " == *" ENV:RACKOBJ_CONFIG=$V/cfg/megalon.yaml "* ]] || { echo "Megalon: NODE_ENV must hold ENV:RACKOBJ_CONFIG=$V/cfg/megalon.yaml"; exit 2; }
+  [ "${NODE0_ENV:-}" = "ENV:MEGALON_REINIT=1" ] || { echo "Megalon: NODE0_ENV must be ENV:MEGALON_REINIT=1"; exit 2; }
+  grep -qE -- "--file-extents [1-9][0-9]*( |$)" <<< "$SERVER_ARGS" || { echo "Megalon: SERVER_ARGS needs an explicit --file-extents"; exit 2; }
+else
+  [ -z "${NODE0_ENV:-}" ] || { echo "NODE0_ENV is for Megalon only"; exit 2; }
+fi
 okeys=""; prev=""; for a in "$@"; do [ "$prev" = --opt ] && case "$a" in keys=*) okeys=${a#keys=};; esac; prev=$a; done
 [ "$okeys" = "$KEYS" ] || { echo "loadgen --opt keys=$okeys != rocksdb-server --keys $KEYS"; exit 2; }
 RATE_ARGS=()
@@ -71,13 +82,14 @@ APP=$("$HOST_SERVER" --print-app-bytes $LAYOUT)
   echo "cxl_swmc_commit=$(git -C "$ROOT" rev-parse HEAD)"; echo "cxl_swmc_dirty=$(git -C "$ROOT" status --porcelain | wc -l)"
   echo "host_server=$HOST_SERVER sha256=$(sha256sum "$HOST_SERVER" | cut -d' ' -f1)"
   echo "loadgen=$LOADGEN sha256=$(sha256sum "$LOADGEN" | cut -d' ' -f1)"
-  echo "server_args=$SERVER_ARGS"; echo "node_env=${NODE_ENV:-}"; echo "app_hwcc_bytes=$APP"; echo "keys=$KEYS"
+  echo "server_args=$SERVER_ARGS"; echo "node_env=${NODE_ENV:-}"; echo "node0_env=${NODE0_ENV:-}"; echo "app_hwcc_bytes=$APP"; echo "keys=$KEYS"
   echo "loadgen_args=$* ${RATE_ARGS[*]}"; echo "per_vm_rates=${PER_VM_RATES:-}"; echo "lg_cpus=$LG_CPUS"
   echo "stats_op=$STATS_OP verify=$VERIFY stop_extents_free=$STOP_EXTENTS_FREE stop_blocks_free=$STOP_BLOCKS_FREE"
   echo "block_cache=per DB instance (primary + $((N - 1)) secondaries), RocksDB default 32 MiB each"
   [ -z "${SERVER_CPUS:-}" ] || echo "server_cpus=$SERVER_CPUS"
   for k in "${!NODE[@]}"; do
-    info=$($SSH comsys@"${NODE[$k]}" "uname -r; sha256sum $V/bin/rocksdb-server $V/bin/rocksdb-node.sh $V/cfg/cxl_region.yaml | cut -c1-64; grep -E '^msg_ring:' $V/cfg/cxl_region.yaml; nproc; grep MemTotal /proc/meminfo" < /dev/null | tr '\n' ' ')
+    MF=""; [ $MEG = 0 ] || MF=" $V/lib/libmegalon-objapi.so $V/lib/libmegalon.so $V/cfg/megalon.yaml"
+    info=$($SSH comsys@"${NODE[$k]}" "uname -r; sha256sum $V/bin/rocksdb-server $V/bin/rocksdb-node.sh $V/cfg/cxl_region.yaml$MF | cut -c1-64; grep -E '^msg_ring:' $V/cfg/cxl_region.yaml; nproc; grep MemTotal /proc/meminfo" < /dev/null | tr '\n' ' ')
     [ -n "$info" ] || { echo "node$k info empty" >&2; exit 4; }
     echo "node$k=${NODE[$k]} $info"
   done
@@ -89,8 +101,9 @@ APP=$("$HOST_SERVER" --print-app-bytes $LAYOUT)
 
 for k in "${!NODE[@]}"; do
   STARTED+=("$k")
-  $SSH comsys@"${NODE[$k]}" "$V/bin/rocksdb-node.sh start $V $GRUN $k $RID $APP ${NODE_ENV:-} $SERVER_ARGS --port $PORT" < /dev/null
-  [ "$k" = 0 ] && sleep 2  # node 0 initialises the app layout first
+  E0=""; [ "$k" != 0 ] || E0=${NODE0_ENV:-}
+  $SSH comsys@"${NODE[$k]}" "$V/bin/rocksdb-node.sh start $V $GRUN $k $RID $APP ${NODE_ENV:-} $E0 $SERVER_ARGS --port $PORT" < /dev/null
+  [ "$k" = 0 ] && sleep 2  # node 0 initialises the app layout first (Megalon: node 0 formats; every node waits in its start barrier)
 done
 for k in "${!NODE[@]}"; do $SSH comsys@"${NODE[$k]}" "$V/bin/rocksdb-node.sh ready $GRUN $k ${READY_TIMEOUT:-7200}" < /dev/null; done
 for k in "${!NODE[@]}"; do  # image build time per node (fresh image every run)

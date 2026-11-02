@@ -58,6 +58,24 @@ if grep -q "SYS=DeStijl" <<< "$RUNS"; then
     && (cd "$DS_C" && sha256sum -c --quiet packet.sha256) || { echo "BLOCK STOP: DS_C is not the verified De Stijl bundle"; exit 2; }
   cmp -s "$REGION" "$DS_C/tools/cxl_region.yaml" || { echo "BLOCK STOP: REGION differs from the De Stijl bundle's region config"; exit 2; }
 fi
+# Megalon runs (SYS=Megalon, eval run2; workloads/rocksdb DESIGN.md §7): user-level, no cxl_shm; same guest kernel as
+# all-HWcc (EXPECT_K), /dev/dax0.0 chowned to comsys as for all-HWcc. MEG_CFG = Host Megalon config (installed as
+# cfg/megalon.yaml); BUILD must carry lib/libmegalon-objapi.so built on a Megalon build for exactly N nodes
+# (BUILD manifest megalon_build=<dir>, whose manifest says megalon_nodes=N). Not in a De Stijl block.
+HASMG=0; MEG_SHA=""
+if grep -q "SYS=Megalon" <<< "$RUNS"; then
+  HASMG=1
+  : "${MEG_CFG:?SYS=Megalon needs MEG_CFG}"
+  [ -f "$MEG_CFG" ] || { echo "BLOCK STOP: MEG_CFG $MEG_CFG missing"; exit 2; }
+  ! grep -q "SYS=DeStijl" <<< "$RUNS" || { echo "BLOCK STOP: Megalon runs on the all-HWcc guest kernel, not in a De Stijl block"; exit 2; }
+  [ -f "$BUILD/lib/libmegalon-objapi.so" ] && [ -f "$BUILD/lib/libmegalon.so" ] || { echo "BLOCK STOP: BUILD $BUILD has no Megalon lib/"; exit 2; }
+  MB=$(sed -n 's/^megalon_build=//p' "$BUILD/manifest.txt")
+  [ -n "$MB" ] && grep -qx "megalon_nodes=${#IPS[@]}" "$MB/manifest.txt" 2>/dev/null \
+    || { echo "BLOCK STOP: BUILD's Megalon build ($MB) is not built for ${#IPS[@]} nodes (megalon_nodes)"; exit 2; }
+  [ "$(sha256sum < "$BUILD/lib/libmegalon.so" | cut -c1-64)" = "$(sed -n 's/^sha256\[lib\/libmegalon.so\]=//p' "$BUILD/manifest.txt")" ] \
+    || { echo "BLOCK STOP: BUILD lib/libmegalon.so != its manifest"; exit 2; }
+  MEG_SHA="$(sha256sum < $BUILD/lib/libmegalon-objapi.so | cut -c1-64) $(sha256sum < $BUILD/lib/libmegalon.so | cut -c1-64) $(sha256sum < $MEG_CFG | cut -c1-64)"
+fi
 if [ "${MEASURE:-0}" = 1 ]; then  # h1-gate.sh needs both (partition + measurement environment evidence)
   : "${MEASURE_PART_DIR:?MEASURE=1 needs MEASURE_PART_DIR}" "${MEASURE_ENV_DIR:?MEASURE=1 needs MEASURE_ENV_DIR}"
   export H1_MEASURE_RUN=1 MEASURE_PART_DIR MEASURE_ENV_DIR EXPECT_RUNNING="${EXPECT_RUNNING:-$VM_DOMAINS}"
@@ -83,6 +101,7 @@ if [ "$DRY" = 1 ]; then  # plan only: no lock, no ssh, nothing written
   echo "BLOCK DRY: REGION=$REGION sha256=$(sha256sum < "$REGION" | cut -c1-16) $(grep -E '^msg_ring:' "$REGION" | cut -d'#' -f1)"
   echo "BLOCK DRY: PRETOUCH_DIR=$PRETOUCH_DIR GATE=${GATE_SCRIPT:-host-gate/h1-gate} MEASURE=${MEASURE:-0} EXPECT_DAX_UUID=${EXPECT_DAX_UUID:-} EXPECT_NPROC=${EXPECT_NPROC:-} MIN_MEM_G=${MIN_MEM_G:-16}"
   echo "BLOCK DRY: SLO_EXTRA=[${SLO_EXTRA:-}]"
+  [ $HASMG = 0 ] || echo "BLOCK DRY: Megalon MEG_CFG=$MEG_CFG megalon_build=$MB (megalon_nodes=${#IPS[@]}) install sha256 [shim libmegalon cfg]=[${MEG_SHA// /,}]"
   echo "BLOCK DRY: steps: lock $OWNER; pretouch-check-n; H0 gate; G1 install.sh -> $L on ${#IPS[@]} VMs; G2 precheck x${#IPS[@]}; dmesg base"
   [ -d "$E" ] && echo "BLOCK DRY: evidence dir exists ($(ls -A "$E" | wc -l) entries)" || echo "BLOCK DRY: evidence dir does not exist yet (the caller creates it + tasks-check.txt)"
   drc=0
@@ -95,7 +114,8 @@ if [ "$DRY" = 1 ]; then  # plan only: no lock, no ssh, nothing written
       all-HWcc) ;;
       Popcorn) A+=(C8=$C8 K8=$K8 GT8=$GT8 RECV_MODE=$RECV_MODE);;
       DeStijl) A+=(DS_C=$DS_C DS_K=$DS_K DS_GT=$DS_GT RECV_MODE=$RECV_MODE);;
-      *) echo "BLOCK DRY STOP: $name: SYS must be all-HWcc, Popcorn or DeStijl"; drc=1; continue;;
+      Megalon) A+=(MEG_CFG=$MEG_CFG);;
+      *) echo "BLOCK DRY STOP: $name: SYS must be all-HWcc, Popcorn, DeStijl or Megalon"; drc=1; continue;;
     esac
     env DRY=1 LOCK_OWNER=$OWNER NODES="${IPS[*]}" V=$L BUILD=$BUILD LOADGEN_BUILD=$LOADGEN_BUILD "${A[@]}" bash $X/pilot-run.sh "$name" "$E" < /dev/null 2>&1 | sed 's/^/  /'
     [ "${PIPESTATUS[0]}" = 0 ] || drc=1
@@ -178,7 +198,7 @@ if [ -n "${GATE_SCRIPT:-}" ]; then export GATE_SCRIPT; bash "$GATE_SCRIPT" check
 elif [ "${MEASURE:-0}" = 1 ]; then bash $P/CXL_SWMC/experiments/h1/h1-gate.sh check "$E/gate-H0.txt" || stop "h1 gate"
 else bash $G check "$E/gate-H0.txt" || stop "host gate"; fi
 step "G1 install ($L)"
-NODES="${IPS[*]}" BUILD=$BUILD L=$L REGION=$REGION bash $X/install.sh "$E/install.log" > "$E/install.out" 2>&1 || stop "install (see install.out)"
+NODES="${IPS[*]}" BUILD=$BUILD L=$L REGION=$REGION MEG_CFG=$([ $HASMG = 1 ] && echo "$MEG_CFG") bash $X/install.sh "$E/install.log" > "$E/install.out" 2>&1 || stop "install (see install.out)"
 [ "$(grep -c '^ldd_not_found=0$' "$E/install.log")" = "${#IPS[@]}" ] || stop "install: ldd"
 WANT="$(sha256sum < $BUILD/bin/rocksdb-server | cut -c1-64) $(sha256sum < $X/rocksdb-node.sh | cut -c1-64) $(sha256sum < $REGION | cut -c1-64)"
 { echo "region=$REGION sha256=$(sha256sum < $REGION | cut -c1-64) $(grep -E '^msg_ring:' $REGION) nodes=${#IPS[@]}"
@@ -186,7 +206,7 @@ WANT="$(sha256sum < $BUILD/bin/rocksdb-server | cut -c1-64) $(sha256sum < $X/roc
   echo "msg_ring_slots_per_window(popcorn-n, 2 MiB ring)=$s (meaningful with cxl_region-ring2m.yaml)"; } | tee -a "$E/block.log" > "$E/region.txt"
 step "G2 pre-check"
 for i in "${!IPS[@]}"; do
-  $SSH comsys@${IPS[$i]} "EXPECT_K=$EXPECT_K L=$L EXPECT_SHA='$WANT' EXPECT_DAX_UUID=${EXPECT_DAX_UUID:-} EXPECT_NPROC=${EXPECT_NPROC:-} MIN_MEM_G=${MIN_MEM_G:-16} bash -s" \
+  $SSH comsys@${IPS[$i]} "EXPECT_K=$EXPECT_K L=$L EXPECT_SHA='$WANT' EXPECT_DAX_UUID=${EXPECT_DAX_UUID:-} EXPECT_NPROC=${EXPECT_NPROC:-} MIN_MEM_G=${MIN_MEM_G:-16} EXPECT_MEG_SHA='$MEG_SHA' bash -s" \
     < $X/precheck.sh > "$E/precheck-vm$i.txt" 2>&1
   grep -q "PRECHECK PASS" "$E/precheck-vm$i.txt" || stop "precheck vm$i: $(grep 'PRECHECK FAIL' "$E/precheck-vm$i.txt")"
 done
@@ -203,7 +223,9 @@ while read -r name args; do
               A+=(C8=$C8 K8=$K8 GT8=$GT8 RECV_MODE=$RECV_MODE);;
     DeStijl)  [ "$OWNED" = root ] || { step "dax0.0 -> root:root 600 (De Stijl cycle owns it)"; dax_owner root; OWNED=root; }
               A+=(DS_C=$DS_C DS_K=$DS_K DS_GT=$DS_GT RECV_MODE=$RECV_MODE);;
-    *) stop "$name: SYS must be all-HWcc, Popcorn or DeStijl";;
+    Megalon)  [ "$OWNED" = comsys ] || { step "dax0.0 -> comsys (Megalon)"; dax_owner comsys; OWNED=comsys; }
+              A+=(MEG_CFG=$MEG_CFG);;
+    *) stop "$name: SYS must be all-HWcc, Popcorn, DeStijl or Megalon";;
   esac
   step "$name ${A[*]}"
   env LOCK_OWNER=$OWNER NODES="${IPS[*]}" V=$L BUILD=$BUILD LOADGEN_BUILD=$LOADGEN_BUILD "${A[@]}" bash $X/pilot-run.sh "$name" "$E" < /dev/null 2>&1 \
