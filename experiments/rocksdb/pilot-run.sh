@@ -18,6 +18,10 @@
 #   p-destijl-shm.sh (protocol destijl checked); T = 0 only: rocksdb-server has no region_apply_staleness call (no
 #   CXL_DESTIJL_T_US hook), so a DS_T_US other than 0 is refused (unlike the vector DB / RecSys H2N_DS_T_US / RS_DS_T_US /
 #   DS_T_US keys); error counters over the run: swmc.transaction_error_count, ds.protocol_error, ds.tx_timeout deltas = 0.
+#   DS_RECV_EXTRA (optional, SYS=DeStijl; runset-rocks.sh ROCKS_DS_RECV_EXTRA): "idle_sleep_us=<n> idle_spin_us=<n>"
+#   (either or both) appended to the cxl_shm load (De Stijl receiver sleep tier; user 2026-11-02 17:0x: 200 / 50 for
+#   every ds cell from now on), read back from /sys/module/cxl_shm/parameters after the enable (recv-mode-<name>.txt),
+#   mismatch = stop. Empty = module defaults (20 / 50).
 # optional: NODES ("192.168.122.100 192.168.122.101"; N = count; p-popcorn-shm.sh must cover the same VMs), KEYS
 #   (54000000), THREADS (server request workers per node, 4), PREPARE_THREADS (4), FILE_EXTENTS (0 = rest of share),
 #   SEED (20261018), LOG (0), GATE (1), V (/home/comsys/rocksdb3), BUILD (builds/rocksdb/3), LOADGEN_BUILD
@@ -71,8 +75,11 @@ case "$SYS" in
             [[ $RECV_MODE =~ ^(poll|sleep)$ ]] || stop "bad RECV_MODE for De Stijl (poll | sleep)"
             [ "${DS_T_US:-0}" = 0 ] || stop "DS_T_US=${DS_T_US}: RocksDB runs De Stijl at T = 0 only (rocksdb-server has no staleness hook)"
             export SYSTEM=DeStijl-$RECV_MODE-T0
+            DSRX=${DS_RECV_EXTRA:-}
+            [[ $DSRX =~ ^((idle_sleep_us|idle_spin_us)=[0-9]+( |$))*$ ]] || stop "bad DS_RECV_EXTRA ($DSRX: 'idle_sleep_us=<n> idle_spin_us=<n>')"
+            DSRX=${DSRX% }
             SHMS=$DS_C/p-destijl-shm.sh GTX=$DS_GT SHMR=$E/dsshm-$NAME
-            PS=(DS_IPS="${IPS[*]}" K=$DS_K GT=$DS_GT C=$DS_C R=$SHMR INIT_STATE=shared "LOAD_EXTRA=recv_mode=$RECV_MODE");;
+            PS=(DS_IPS="${IPS[*]}" K=$DS_K GT=$DS_GT C=$DS_C R=$SHMR INIT_STATE=shared "LOAD_EXTRA=recv_mode=$RECV_MODE${DSRX:+ $DSRX}");;
   *) stop "bad SYS";;
 esac
 COH=0; case "$SYS" in Popcorn|DeStijl) COH=1;; esac   # a cxl_shm cycle around the run (PS / SHMS / GTX above)
@@ -108,6 +115,7 @@ if [ "$DRY" = 1 ]; then
   echo "DRY $NAME server_args=[$SERVER_ARGS] gate=${GATE_SCRIPT:-host-gate or h1-gate} lock_owner=${LOCK_OWNER:-unset}"
   if [ $COH = 1 ]; then
     echo "DRY $NAME cxl_shm cycle: env ${PS[*]} bash $SHMS {precheck,load,chown,enable}; recv_mode=$RECV_MODE; status runpre/runpost; teardown"
+    [ -z "${DSRX:-}" ] || echo "DRY $NAME De Stijl receiver parameters: $DSRX (cxl_shm load, read back after the enable)"
     plan=$(env "${PS[@]}" bash $SHMS plan precheck load chown enable status teardown 2>&1) || stop "$SHMS plan failed: $(tail -n 2 <<< "$plan")"
     echo "DRY $NAME $(head -n 1 <<< "$plan") -> $(grep -c '^ssh ' <<< "$plan") ssh commands planned"
   fi
@@ -151,9 +159,13 @@ if [ $COH = 1 ]; then  # as experiments/lmdb/pilot-run.sh: enable BEFORE the ser
   for ip in "${IPS[@]}"; do
     m=$($SSH comsys@$ip "sudo -n sh -c 'echo $RECV_MODE > /sys/module/cxl_shm/parameters/recv_mode' && cat /sys/module/cxl_shm/parameters/recv_mode" < /dev/null)
     pr=$($SSH comsys@$ip "cat /sys/kernel/swmc/page_coherence/protocol" < /dev/null)
-    echo "$ip recv_mode=$m protocol=$pr" >> "$E/recv-mode-$NAME.txt"
+    rt=""; [ "$SYS" != DeStijl ] || rt=" $($SSH comsys@$ip "echo idle_sleep_us=\$(cat /sys/module/cxl_shm/parameters/idle_sleep_us 2>/dev/null || echo absent) idle_spin_us=\$(cat /sys/module/cxl_shm/parameters/idle_spin_us 2>/dev/null || echo absent)" < /dev/null)"
+    echo "$ip recv_mode=$m protocol=$pr$rt" >> "$E/recv-mode-$NAME.txt"
     [ "$m" = "$RECV_MODE" ] || { env "${PS[@]}" bash $SHMS teardown; stop "recv_mode on $ip = $m"; }
     [ "$SYS" != DeStijl ] || [ "$pr" = destijl ] || { env "${PS[@]}" bash $SHMS teardown; stop "protocol on $ip = $pr"; }
+    if [ "$SYS" = DeStijl ]; then
+      for x in ${DSRX:-}; do [[ "$rt " == *" $x "* ]] || { env "${PS[@]}" bash $SHMS teardown; stop "receiver parameter $x not applied on $ip ($rt)"; }; done
+    fi
   done
   env "${PS[@]}" STATUS_TAG=runpre bash $SHMS status || { env "${PS[@]}" bash $SHMS teardown; stop "status pre"; }
 fi

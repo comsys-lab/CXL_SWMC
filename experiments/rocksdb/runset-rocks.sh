@@ -22,6 +22,10 @@
 #   ROCKS_KEYS, ROCKS_THREADS, EXPECT_NPROC, MIN_MEM_G, ROCKS_BUILD, ROCKS_LOADGEN_BUILD, ROCKS_SLO_EXTRA, RECV_MODE,
 #   EXPECT_DAX_UUID, RESULTS_ROOT, EVIDENCE_PREFIX, ROCKS_GUEST_PREFIX, POP_REGION POP_C POP_BUNDLE_SHA POP_K POP_GT,
 #   DS_REGION DS_C DS_BUNDLE_SHA DS_K DS_GT.
+# Optional keys (2026-11-02, receiver 200 / 50 re-measure): ROCKS_DS_RECV_EXTRA "idle_sleep_us=<n> idle_spin_us=<n>"
+#   (phase ds: exported as DS_RECV_EXTRA to pilot-run.sh = appended to the cxl_shm load, read back after the enable;
+#   empty / absent = module defaults). ROCKS_BLOCK may then be D200 | E200 (evidence <prefix>-D200-ds-n<N>-v<V>,
+#   guest dir <ROCKS_GUEST_PREFIX>-d200-...), so the 200 / 50 cells never share a name with the block D / E cells.
 set -uo pipefail
 P=/home/comsys/sungsu/destijl-control
 HERE=$(cd "$(dirname "$0")" && pwd); TREE=$(cd "$HERE/../.." && pwd)
@@ -35,10 +39,11 @@ done
 KEYS="ROCKS_BLOCK ROCKS_TOPO ROCKS_NODES ROCKS_MIXES ROCKS_SYSTEMS ROCKS_SLO_MS ROCKS_KEYS ROCKS_THREADS EXPECT_NPROC MIN_MEM_G
   ROCKS_BUILD ROCKS_LOADGEN_BUILD ROCKS_SLO_EXTRA RECV_MODE EXPECT_DAX_UUID RESULTS_ROOT EVIDENCE_PREFIX ROCKS_GUEST_PREFIX
   POP_REGION POP_C POP_BUNDLE_SHA POP_K POP_GT DS_REGION DS_C DS_BUNDLE_SHA DS_K DS_GT"
+OPTKEYS="ROCKS_DS_RECV_EXTRA"
 # shellcheck disable=SC2086
-unset $KEYS
+unset $KEYS $OPTKEYS
 # the conf may set only these keys (a typo or a foreign key stops)
-bad=$(grep -vE '^[[:space:]]*(#|$)' "$CONF" | grep -vE "^($(echo $KEYS | tr ' ' '|'))=" | head -3)
+bad=$(grep -vE '^[[:space:]]*(#|$)' "$CONF" | grep -vE "^($(echo $KEYS $OPTKEYS | tr ' ' '|'))=" | head -3)
 [ -z "$bad" ] || die "conf lines that are not KEY=value of a known key: $bad"
 # shellcheck disable=SC1090
 . "$CONF"
@@ -46,7 +51,10 @@ for k in $KEYS; do [ -n "${!k:-}" ] || die "conf key $k empty"; done
 abs() { case $1 in /*) echo "$1";; *) echo "$P/$1";; esac; }
 ROCKS_BUILD=$(abs "$ROCKS_BUILD") ROCKS_LOADGEN_BUILD=$(abs "$ROCKS_LOADGEN_BUILD") RESULTS_ROOT=$(abs "$RESULTS_ROOT")
 POP_REGION=$(abs "$POP_REGION") POP_C=$(abs "$POP_C") DS_REGION=$(abs "$DS_REGION") DS_C=$(abs "$DS_C")
-[[ $ROCKS_BLOCK =~ ^[DE]$ ]] || die "ROCKS_BLOCK D | E"
+[[ $ROCKS_BLOCK =~ ^[DE](200)?$ ]] || die "ROCKS_BLOCK D | E | D200 | E200"
+DSRX=${ROCKS_DS_RECV_EXTRA:-}
+[[ $DSRX =~ ^((idle_sleep_us|idle_spin_us)=[0-9]+( |$))*$ ]] || die "bad ROCKS_DS_RECV_EXTRA ($DSRX: 'idle_sleep_us=<n> idle_spin_us=<n>')"
+[[ $ROCKS_BLOCK != *200 ]] || [ -n "$DSRX" ] || die "ROCKS_BLOCK $ROCKS_BLOCK needs ROCKS_DS_RECV_EXTRA"
 [[ " $ROCKS_NODES " == *" $N "* ]] || die "N=$N not in ROCKS_NODES ($ROCKS_NODES)"
 [ "$ROCKS_SLO_MS" = 1 ] || die "ROCKS_SLO_MS must be 1 (user decision: RocksDB SLO p99 1 ms)"
 [ "$EXPECT_NPROC" = 4 ] || die "EXPECT_NPROC must be 4 (4 vCPU rule, user 2026-11-01)"
@@ -75,6 +83,7 @@ for s in $SYSS; do
 done
 [ -n "$RUNS" ] || die "no cell selected (--only '$ONLY')"
 BL=$(tr 'DE' 'de' <<< "$ROCKS_BLOCK")
+[ "$PHASE" = ds ] || [ -z "$DSRX" ] || echo "RUNSET NOTE: ROCKS_DS_RECV_EXTRA ignored in phase $PHASE (De Stijl only)"
 if [ -z "$V" ]; then V=1; while [ -e "$RESULTS_ROOT/$EVIDENCE_PREFIX-$ROCKS_BLOCK-$PHASE-n$N-v$V" ]; do V=$((V + 1)); done; fi
 [[ $V =~ ^[1-9][0-9]*$ ]] || die "bad --v"
 E=$RESULTS_ROOT/$EVIDENCE_PREFIX-$ROCKS_BLOCK-$PHASE-n$N-v$V
@@ -92,8 +101,9 @@ export OWNER EXPECT_K PRETOUCH_DIR L RUNS NODES="$IPS" VM_DOMAINS="$DOMS" EXPECT
   LOADGEN_BUILD=$ROCKS_LOADGEN_BUILD REGION EXPECT_DAX_UUID MIN_MEM_G EXPECT_NPROC RECV_MODE SLO_EXTRA="$ROCKS_SLO_EXTRA" \
   MEASURE=1 MEASURE_ENV_DIR MEASURE_PART_DIR GATE_SCRIPT=$TREE/scripts/host/h3-gate.sh
 if [ $PHASE = hwpop ]; then export C8=$POP_C K8=$POP_K GT8=$POP_GT POP_BUNDLE_SHA
-else export DS_C DS_K DS_GT DS_BUNDLE_SHA; fi
+else export DS_C DS_K DS_GT DS_BUNDLE_SHA DS_RECV_EXTRA="$DSRX"; fi
 echo "RUNSET rocks conf=$CONF ($(sha256sum < "$CONF" | cut -c1-16)) block=$ROCKS_BLOCK N=$N phase=$PHASE topo=$ROCKS_TOPO E=$E"
+[ "$PHASE" != ds ] || echo "RUNSET De Stijl receiver: ${DSRX:-module defaults}"
 echo "RUNSET cells:$NAMES"
 if [ $DRY = 1 ]; then
   DRY=1 bash "$HERE/v1-block.sh" "$E"; rc=$?
