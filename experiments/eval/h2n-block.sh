@@ -42,7 +42,12 @@
 #                       VMA exists); after the teardown (and in the EXIT trap) back to off. off = only checked (reads off)
 #   H2N_DS_REPLICA_POOL_BYTES  /sys/kernel/swmc/destijl/replica_pool_max_bytes for an all lifetime (required with all;
 #                       the 54M SQ8 index is ~53 GB > the 48 GB default); the previous value is restored after it
-#   H2N_L1=1            hw / pop / ds lifetimes append ONE fixed step at L1 inside the same server lifetime (run.sh
+#   H2N_DS_RECV_EXTRA "idle_sleep_us=<n> idle_spin_us=<n>" (either or both; default empty = module defaults 20 / 50):
+#                       extra cxl_shm load parameters of the De Stijl receiver (recv_mode=sleep tier), appended to
+#                       LOAD_EXTRA of every ds lifetime; after the enable the block reads both values back from
+#                       /sys/module/cxl_shm/parameters on every VM (recv-mode-<name>.txt) and stops on a mismatch.
+#                       Popcorn lifetimes are not affected (user 2026-11-02: receiver tuning for De Stijl only)
+#   H2N_L1=1           hw / pop / ds lifetimes append ONE fixed step at L1 inside the same server lifetime (run.sh
 #                       PARTS "slo l1"; loadgen --mode fixed --rates L1, H2N_L1_WARMUP_S (15) s warm-up + H2N_L1_MEASURE_S
 #                       (90) s window + H2N_L1_DRAIN_S (5) s drain, no --slo: no early abort), so stats-steps.csv holds
 #                       the per-step counters of every system at the same load. L1 (offered ops/s) = the LOWEST max
@@ -113,6 +118,10 @@ REPL=${H2N_DS_REPLICA_MODE:-off} RPOOL=${H2N_DS_REPLICA_POOL_BYTES:-}
   || die "H2N_DS_REPLICA_MODE=all needs H2N_DS_REPLICA_POOL_BYTES >= 60000000000 (54M SQ8 index ~53 GB; got '$RPOOL')"
 [ -z "$RPOOL" ] || [ "$REPL" = all ] || die "H2N_DS_REPLICA_POOL_BYTES without H2N_DS_REPLICA_MODE=all"
 [ "$REPL" = off ] || [ $HASDS = 1 ] || echo "BLOCK NOTE: H2N_DS_REPLICA_MODE=all applies to ds lifetimes only (none in this block)"
+DSRX=${H2N_DS_RECV_EXTRA:-}
+[[ $DSRX =~ ^((idle_sleep_us|idle_spin_us)=[0-9]+( |$))*$ ]] \
+  || die "bad H2N_DS_RECV_EXTRA ($DSRX: 'idle_sleep_us=<n> idle_spin_us=<n>', either or both)"
+[ -z "$DSRX" ] || [ $HASDS = 1 ] || echo "BLOCK NOTE: H2N_DS_RECV_EXTRA applies to ds lifetimes only (none in this block)"
 [ $HAST = 0 ] || [ -z "${H2N_FIXED:-}" ] || die "ds:<mix>:t<T> lifetimes are SLO lifetimes (not with H2N_FIXED)"
 if [ $DSKER = 1 ]; then
   [ $HASPOP = 0 ] || die "pop and ds lifetimes need different guest kernels: run them in separate blocks"
@@ -460,7 +469,7 @@ pop_down() {
 # Same order and checks as pop_up: precheck, load (+ state running on every node), chown, region check, preload
 # through a plain mapping (node 0), enable (syscall 470, protocol destijl), recv_mode, status.
 ds_up() {  # <name>
-  DSP=(K=$DS_K GT=$DS_GT C=$DS_C R=$E/dsshm-$1 INIT_STATE=shared "LOAD_EXTRA=recv_mode=$RECV_MODE")
+  DSP=(K=$DS_K GT=$DS_GT C=$DS_C R=$E/dsshm-$1 INIT_STATE=shared "LOAD_EXTRA=recv_mode=$RECV_MODE${DSRX:+ ${DSRX% }}")
   [ $OWNED = root ] || { dax_owner root || stop "dax0.0 back to root before De Stijl"; OWNED=root; }
   servers_gone || stop "a server runs before the De Stijl load"
   env "${DSP[@]}" bash $DS_C/p-destijl-shm.sh precheck >> "$E/block.log" 2>&1 || stop "ds shm precheck"
@@ -484,8 +493,10 @@ ds_up() {  # <name>
     m=$($SSH comsys@$ip "sudo -n sh -c 'echo $RECV_MODE > /sys/module/cxl_shm/parameters/recv_mode' && cat /sys/module/cxl_shm/parameters/recv_mode" < /dev/null)
     p=$($SSH comsys@$ip "cat /sys/kernel/swmc/page_coherence/protocol" < /dev/null)
     i=$($SSH comsys@$ip "cat /sys/kernel/swmc/instr/enabled 2>/dev/null || echo absent" < /dev/null)
-    echo "$ip recv_mode=$m protocol=$p instr_enabled=$i" >> "$E/recv-mode-$1.txt"
+    t=$($SSH comsys@$ip "echo idle_sleep_us=\$(cat /sys/module/cxl_shm/parameters/idle_sleep_us 2>/dev/null || echo absent) idle_spin_us=\$(cat /sys/module/cxl_shm/parameters/idle_spin_us 2>/dev/null || echo absent)" < /dev/null)
+    echo "$ip recv_mode=$m protocol=$p instr_enabled=$i $t" >> "$E/recv-mode-$1.txt"
     [ "$m" = "$RECV_MODE" ] && [ "$p" = destijl ] || stop "recv_mode / protocol on $ip ($m, $p)"
+    for x in $DSRX; do [[ " $t " == *" $x "* ]] || stop "receiver parameter $x not applied on $ip ($t)"; done
   done
   env "${DSP[@]}" STATUS_TAG=pre bash $DS_C/p-destijl-shm.sh status >> "$E/block.log" 2>&1 || stop "ds status pre"
 }
