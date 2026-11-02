@@ -32,6 +32,12 @@
 #   called with the gate log file instead of h1-gate.sh check before every later part when H1_MEASURE_RUN=1),
 #   PART_PRE_CMD / PART_POST_CMD (word-split commands called with the part name right before the part's loadgen /
 #   right after it, servers up; output in <run>/part-hooks.txt; a failure stops the lifetime, rc 97 / 98).
+#   Warmup parts (damon-policy-exploration, experiments/eval/damonx-hook.sh; optional, unset = unchanged):
+#   PART_SKIP_CMD (word-split command called with the part name before anything else of that part, output in
+#   <run>/part-hooks.txt; rc 0 = the part is skipped: no gate, no loadgen, no dir, manifest "part_<p>=skipped", the
+#   next part continues the update stream of the last part that ran; rc 1 = the part runs; any other rc stops the
+#   lifetime, rc 96), PART_NOGATE (part names without the part gate before them: unmeasured warmup parts, so the load
+#   does not pause between them; the first measured part after them keeps its gate).
 # Stops (and stops the servers) on the first error. Measurement hygiene: no Host build before/after (pgrep).
 set -euo pipefail
 NAME=$1 OUT=$2; shift 2; [ "${1:-}" = "--" ] && shift
@@ -152,6 +158,11 @@ else  # H1-HOOK v2: several loadgen parts in this server lifetime
   LG=0 WS=0 PREV=
   for p in $PARTS; do
     [[ $p =~ ^[a-z0-9]+$ ]] || { echo "bad part name $p"; false; }
+    if [ -n "${PART_SKIP_CMD:-}" ]; then  # warmup parts: rc 0 skip, 1 run, else stop (header)
+      rc=0; $PART_SKIP_CMD "$p" >> "$RUN/part-hooks.txt" 2>&1 || rc=$?   # || form: no ERR trap (retrospective §3)
+      if [ $rc = 0 ]; then echo "part_$p=skipped $(date -Is)" >> "$RUN/manifest.txt"; continue; fi
+      [ $rc = 1 ] || { echo "part $p: PART_SKIP_CMD rc $rc (see $RUN/part-hooks.txt)"; LG=96; break; }
+    fi
     PR=$RUN/$p; mkdir "$PR"
     v=PART_ARGS_$p; read -r -a PA <<< "${!v:-}"
     if [ -n "$PREV" ]; then
@@ -174,7 +185,7 @@ else  # H1-HOOK v2: several loadgen parts in this server lifetime
     fi
     v=PART_SEED_$p; PS=()  # per-part query seed (m4-run.sh KIND=h1: slo SEED, fix SEED+1)
     [ -z "${!v:-}" ] || { [[ ${!v} =~ ^[0-9]+$ ]] || { echo "bad $v"; false; }; PS=(--opt seed=${!v} --seed ${!v}); }
-    if [ -n "$PREV" ] && [ "${H1_MEASURE_RUN:-0}" = 1 ]; then  # H1 gate before every later part (servers stay up)
+    if [ -n "$PREV" ] && [ "${H1_MEASURE_RUN:-0}" = 1 ] && [[ " ${PART_NOGATE:-} " != *" $p "* ]]; then  # H1 gate before every later part (servers stay up)
       if [ -n "${PART_GATE_CMD:-}" ]; then  # H3 (experiments/eval/h3-block.sh): the N-VM gate scripts/host/h3-gate.sh
         $PART_GATE_CMD "$OUT/gate-$NAME-$p.txt" || { echo "part $p: gate failed (see $OUT/gate-$NAME-$p.txt)"; false; }
       else

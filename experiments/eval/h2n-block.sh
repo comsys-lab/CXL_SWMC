@@ -141,11 +141,50 @@ if [ "$REPL" = damon ]; then  # the 9 DAMON parameters, all required, in ds-damo
   done
   [ "$(echo $DAMONP | wc -w)" = 9 ] || die "H2N_DS_DAMON: exactly the 9 keys sample_us aggr_us update_us min_regions max_regions min_acc quota_ms quota_bytes reset_ms ('$DAMONP')"
   read -r -a DA <<< "$DAMONARGS"
-  [ "${DA[0]}" -ge 1000 ] && [ "${DA[1]}" -ge "${DA[0]}" ] && [ "${DA[5]}" -ge 1 ] && [ "${DA[5]}" -le $(( DA[1] / DA[0] )) ] \
+  [ "${DA[0]}" -ge 1000 ] && [ "${DA[1]}" -ge "${DA[0]}" ] && [ "${DA[5]}" -ge 0 ] && [ "${DA[5]}" -le $(( DA[1] / DA[0] )) ] \
     && [ "${DA[3]}" -ge 3 ] && [ "${DA[4]}" -ge "${DA[3]}" ] \
-    || die "H2N_DS_DAMON out of range (sample_us >= 1000, aggr_us >= sample_us, 1 <= min_acc <= aggr/sample, 3 <= min_regions <= max_regions)"
+    || die "H2N_DS_DAMON out of range (sample_us >= 1000, aggr_us >= sample_us, 0 <= min_acc <= aggr/sample (0: action=stat only), 3 <= min_regions <= max_regions)"
   [ -f "$EV/ds-damon-guest.sh" ] || die "missing $EV/ds-damon-guest.sh"
 fi
+# damon-policy-exploration keys (DESIGN workspaces/destijl-v2/damon-replication/DESIGN.md; all optional, unset = run 1)
+#   H2N_DS_DAMON_EXTRA "range=index|managed action=replicate|stat min_age=<aggr> w_sz=<permil> w_acc=<permil>
+#                       w_age=<permil> nice=<-20..19>" (any subset): range index = [managed start, + swcc_used_end -
+#                       swcc offset) from the server's layout line (needs H2N_DS_DAMON_AT=ready); the rest are
+#                       ds-damon-guest.sh start keys (its header). action=stat allows min_acc=0 (hot-set picture)
+#   H2N_DS_DAMON_AT    enable (default: kdamond right after the cxl_shm enable, before the server start, as run 1) |
+#                       ready (damonx-hook.sh starts it in run.sh's PART_PRE_CMD of the lifetime's first part, i.e.
+#                       after READY + port check, +5 s settle; the block's 10 s sampler runs from the enable on)
+#   H2N_DS_DAMON_WARMUP "rate=<ops/s> learn_s=<s> part_s=<s> max_parts=<n> min_fill_s=<s> end_pps=<pages/s> end_n=<n>
+#                       fill_ms=<ms> fill_bytes=<B>" (needs ready; SLO lifetimes): parts wa wb01..wb<max_parts> before
+#                       slo at the fixed total rate <rate> (loadgen --mode fixed, no --slo; wb parts without the part
+#                       gate), phase A action stat, phase B replicate with quota fill_ms / fill_bytes per 1 s, end at
+#                       the DESIGN §5 condition or the cap, then the 9 H2N_DS_DAMON quotas (damonx-hook.sh header)
+#   H2N_DS_DAMON_REGIONS=1  the sampler also stores the scheme's tried regions every 10 s
+#                       (E/ds-damon-regions-<name>-vm<i>.txt: "DAMON REGIONS t=.." + "start end nr_accesses age" lines)
+DXEXTRA=${H2N_DS_DAMON_EXTRA:-} DXAT=${H2N_DS_DAMON_AT:-enable} DXWARM=${H2N_DS_DAMON_WARMUP:-} DXREG=${H2N_DS_DAMON_REGIONS:-0}
+DXRANGE=managed DXSTART= DXACT=replicate
+[ -z "$DXEXTRA$DXWARM" ] && [ "$DXAT" = enable ] && [ "$DXREG" = 0 ] || [ "$REPL" = damon ] || die "H2N_DS_DAMON_EXTRA / _AT / _WARMUP / _REGIONS need H2N_DS_REPLICA_MODE=damon"
+[[ $DXAT =~ ^(enable|ready)$ ]] && [[ $DXREG =~ ^[01]$ ]] || die "bad H2N_DS_DAMON_AT ($DXAT: enable | ready) / H2N_DS_DAMON_REGIONS ($DXREG)"
+for t in $DXEXTRA; do
+  [[ $t =~ ^(range=(index|managed)|action=(replicate|stat)|min_age=[0-9]+|w_(sz|acc|age)=[0-9]+|nice=-?[0-9]+)$ ]] || die "bad H2N_DS_DAMON_EXTRA token $t"
+  case $t in range=*) DXRANGE=${t#range=};; action=*) DXACT=${t#action=}; DXSTART+="${DXSTART:+ }$t";; *) DXSTART+="${DXSTART:+ }$t";; esac
+done
+[ "$DXRANGE" = managed ] || [ "$DXAT" = ready ] || die "range=index needs H2N_DS_DAMON_AT=ready (the layout line exists only after the server start)"
+[ "$REPL" != damon ] || [ "$DXACT" = stat ] || [ "${DA[5]}" -ge 1 ] || die "min_acc 0 only with action=stat"
+DXWPARTS= DXWNOGATE=
+if [ -n "$DXWARM" ]; then
+  [ "$DXAT" = ready ] && [ -z "${H2N_FIXED:-}" ] && [ "$DXACT" = replicate ] || die "H2N_DS_DAMON_WARMUP needs H2N_DS_DAMON_AT=ready, SLO lifetimes and action=replicate"
+  for x in rate learn_s part_s max_parts min_fill_s end_pps end_n fill_ms fill_bytes; do
+    [[ " $DXWARM " =~ \ $x=[0-9]+\  ]] || die "H2N_DS_DAMON_WARMUP lacks $x=<integer> ('$DXWARM')"
+  done
+  [ "$(echo $DXWARM | wc -w)" = 9 ] || die "H2N_DS_DAMON_WARMUP: exactly the 9 keys ('$DXWARM')"
+  dxw() { echo " $DXWARM " | sed -n "s/.* $1=\([0-9][0-9]*\) .*/\1/p"; }
+  [ "$(dxw max_parts)" -ge 1 ] && [ "$(dxw max_parts)" -le 99 ] && [ "$(dxw part_s)" -ge 10 ] && [ "$(dxw learn_s)" -ge 1 ] && [ "$(dxw rate)" -ge 1 ] \
+    && [ "$(dxw end_n)" -ge 1 ] || die "H2N_DS_DAMON_WARMUP out of range (1 <= max_parts <= 99, part_s >= 10, learn_s >= 1, rate >= 1, end_n >= 1)"
+  for i in $(seq 1 "$(dxw max_parts)"); do DXWPARTS+=" wb$(printf %02d $i)"; done
+  DXWNOGATE=${DXWPARTS# }; DXWPARTS="wa$DXWPARTS"
+fi
+[ "$DXAT" = enable ] || [ -f "$EV/damonx-hook.sh" ] || die "missing $EV/damonx-hook.sh"
 [ "$REPL" = off ] || [ $HASDS = 1 ] || echo "BLOCK NOTE: H2N_DS_REPLICA_MODE=$REPL applies to ds lifetimes only (none in this block)"
 DSRX=${H2N_DS_RECV_EXTRA:-}
 [[ $DSRX =~ ^((idle_sleep_us|idle_spin_us)=[0-9]+( |$))*$ ]] \
@@ -317,6 +356,7 @@ echo "BLOCK PLAN: vec_format=$VF ef=$EF init=$INIT host_image=$HOST_IMAGE"
 echo "BLOCK PLAN: h2n vdb N=$N vcpu/VM=$VCPU threads $ST+1 nodes=[${IPS[*]}] lifetimes=[${LIVES[*]}] app=$APP mg_app=$MGAPP ring=$RING cxlbw=$CXLBW hostcpu=$HOSTCPU opcoh_strict=$STRICT"
 echo "BLOCK PLAN: server_args plain=[$SA]${MGSA:+ megalon=[$MGSA]}"
 [ $DSKER = 0 ] || echo "BLOCK PLAN: destijl release=$DS_K bundle=$DS_C guest_tools=$DS_GT region=$REGION T=$DST us recv_mode=$RECV_MODE (node env CXL_SYSTEM=ds CXL_DESTIJL_T_US=<T>; ds:<mix>:t<T> overrides T) replica_mode=$REPL pool_bytes=${RPOOL:--}${DAMONP:+ damon=[$DAMONP] damon_guest_sha256=$(sha256sum < "$EV/ds-damon-guest.sh" | cut -c1-64)}"
+[ "$REPL" != damon ] || echo "BLOCK PLAN: DAMON at=$DXAT range=$DXRANGE start_keys=[$DXSTART] regions_capture=$DXREG warmup=[${DXWARM:-none}]${DXWARM:+ warm_parts=[$DXWPARTS] nogate=[$DXWNOGATE]}$([ "$DXAT" = enable ] || echo " hook_sha256=$(sha256sum < "$EV/damonx-hook.sh" | cut -c1-64)")"
 [ $L1ON = 0 ] || echo "BLOCK PLAN: L1 step on hw/pop/ds lifetimes: --mode fixed --rates <L1> ${L1W}s warm-up + ${L1M}s + ${L1D}s drain; L1 from mg-<mix>-n$N rows of [${L1FROM:-} + this block]; no mg max -> L1 = ramp start $L1START, no step"
 [ $ACCX = 0 ] || echo "BLOCK PLAN: accuracy export per lifetime (<run>/accuracy-export.txt)"
 echo "BLOCK PLAN: $LAYOUT"
@@ -440,6 +480,7 @@ gate() { bash "$HG" check "$E/gate-$1.txt" > /dev/null || stop "h3 gate ($1; see
   echo "writes=$X_WRITES sha256=$(sha256sum < "$X_WRITES" | cut -c1-64) max_deletes=$X_MAXD"
   echo "slo_part=[$H2N_SLO_PART]"
   [ $DSKER = 0 ] || echo "destijl: bundle=$DS_C bundle_sha=$DS_BUNDLE_SHA release=$DS_K guest_tools=$DS_GT region=$REGION t_us=$DST recv_mode=$RECV_MODE replica_mode=$REPL replica_pool_bytes=${RPOOL:--}${DAMONP:+ damon=[$DAMONP] damon_guest_sha256=$(sha256sum < "$EV/ds-damon-guest.sh" | cut -c1-64)}"
+  [ "$REPL" != damon ] || echo "damon: at=$DXAT range=$DXRANGE start_keys=[$DXSTART] regions_capture=$DXREG warmup=[$DXWARM] warm_parts=[$DXWPARTS]$([ "$DXAT" = enable ] || echo " hook_sha256=$(sha256sum < "$EV/damonx-hook.sh" | cut -c1-64)")"
   [ $L1ON = 0 ] || echo "l1: from=[$L1FROM] warmup_s=$L1W measure_s=$L1M drain_s=$L1D ramp_start=$L1START"
   [ $ACCX = 0 ] || echo "accuracy_export=1"
   [ -z "$FIXED" ] || echo "fixed=[$FIXED] node_env_extra=[$NENV_X] allow_detail=$ALLOWDET (H2N_FIXED: the slo part is not run)"
@@ -534,7 +575,10 @@ ds_up() {  # <name>
     for x in $DSRX; do [[ " $t " == *" $x "* ]] || stop "receiver parameter $x not applied on $ip ($t)"; done
   done
   env "${DSP[@]}" STATUS_TAG=pre bash $DS_C/p-destijl-shm.sh status >> "$E/block.log" 2>&1 || stop "ds status pre"
-  if [ "$REPL" = damon ]; then
+  if [ "$REPL" = damon ] && [ "$DXAT" = ready ]; then  # damonx-hook.sh starts the kdamond after READY; sampler from now
+    DAMON_SET=1; damon_sampler_start "$1" 0
+    log "$1: DAMON at READY (damonx-hook.sh, range $DXRANGE, keys [$DXSTART], warmup [${DXWARM:-none}]); sampler on (ds-damon-$1.txt)"
+  elif [ "$REPL" = damon ]; then
     DAMON_SET=1; damon_start "$1" || stop "DAMON start on a VM (see ds-damon-$1.txt)"
   fi
 }
@@ -584,19 +628,29 @@ damon_start() {  # <name>: kdamond on every VM over its managed CXL range (regis
     echo "$(date -Is) $1 $ip registered: $(echo $reg)" >> "$E/ds-damon-$1.txt"
     [ -n "$sp" ] && [ -n "$np" ] && [ "$np" -gt 0 ] || return 1
     s=$(( sp * 4096 )) e=$(( (sp + np) * 4096 ))
-    out=$($SSH comsys@$ip "sudo -n sh -s -- start $s $e$DAMONARGS" < "$EV/ds-damon-guest.sh" 2>&1)
+    out=$($SSH comsys@$ip "sudo -n sh -s -- start $s $e$DAMONARGS${DXSTART:+ $DXSTART}" < "$EV/ds-damon-guest.sh" 2>&1)
     echo "$(date -Is) $1 start $ip: $out" >> "$E/ds-damon-$1.txt"
     [[ $out == "DAMON ON "* ]] || return 1
   done
   damon_cmd "$1" pre stats || return 1
+  damon_sampler_start "$1" $([ "$DXACT" = replicate ] && echo 1 || echo 0)
+  log "$1: DAMON on (${#IPS[@]} VMs, params [$DAMONP], pool $RPOOL bytes; ds-damon-$1.txt)"
+}
+damon_sampler_start() {  # <name> <check 0|1>
   # sampler: every 10 s (< the 15 s step window: >= 1 sample per measurement step, joined to steps.csv by time;
-  # verifier L2/L3); exits when the block process is gone (L6: survives no SIGKILL of the block); one check after the
-  # first 60 s (L8): a VM with sz_applied=0 and replica_pages=0 -> WARN in block.log + RUNLOG NOTE (cell ~ replica off)
+  # verifier L2/L3); exits when the block process is gone (L6: survives no SIGKILL of the block); with check 1 one check
+  # after the first 60 s (L8): a VM with sz_applied=0 and replica_pages=0 -> WARN in block.log + RUNLOG NOTE (cell ~
+  # replica off); H2N_DS_DAMON_REGIONS=1: tried regions per VM appended to E/ds-damon-regions-<name>-vm<i>.txt
   local bp=$$ t0; t0=$(date +%s)
-  ( trap - EXIT INT TERM HUP; chk=0
+  ( trap - EXIT INT TERM HUP; chk=$((1 - $2))
     while sleep 10; do
       kill -0 $bp 2>/dev/null || exit 0
       damon_cmd "$1" run stats > /dev/null 2>&1
+      if [ "$DXREG" = 1 ]; then
+        for i in "${!IPS[@]}"; do
+          $SSH comsys@${IPS[$i]} "sudo -n sh -s -- regions" < "$EV/ds-damon-guest.sh" >> "$E/ds-damon-regions-$1-vm$i.txt" 2>&1
+        done
+      fi
       if [ $chk = 0 ] && [ $(( $(date +%s) - t0 )) -ge 60 ]; then chk=1
         local ip l bad=
         for ip in "${IPS[@]}"; do
@@ -612,7 +666,6 @@ damon_start() {  # <name>: kdamond on every VM over its managed CXL range (regis
       fi
     done ) &
   DAMON_SAMPLER=$!
-  log "$1: DAMON on (${#IPS[@]} VMs, params [$DAMONP], pool $RPOOL bytes; ds-damon-$1.txt)"
 }
 damon_sampler_stop() { [ -z "${DAMON_SAMPLER:-}" ] || { kill "$DAMON_SAMPLER" 2>/dev/null; wait "$DAMON_SAMPLER" 2>/dev/null; DAMON_SAMPLER=; }; }
 sys_up() {  # <sys> <name>: dax owner (hw, mg, mgoff: comsys) + Popcorn / De Stijl cycle
@@ -701,10 +754,25 @@ vdb_life() {  # <sys> <mix> [r<j> | t<T us>]
     fi
     log "$name: L1 $L1V append=$L1A source $L1S"
   fi
+  local DXE=()   # damon-policy-exploration: DAMON at READY (+ warmup parts) for ds lifetimes (header, H2N_DS_DAMON_AT)
+  if [ $s = ds ] && [ "$REPL" = damon ] && [ "$DXAT" = ready ]; then
+    DXE=("PART_PRE_CMD=bash $EV/damonx-hook.sh pre" DAMONX_E=$E DAMONX_NAME=$name "DAMONX_IPS=${IPS[*]}" DAMONX_GUEST=$EV/ds-damon-guest.sh
+      "DAMONX_ARGS=${DAMONARGS# }" "DAMONX_START_EXTRA=$DXSTART" DAMONX_RANGE=$DXRANGE DAMONX_POOL=$RPOOL DAMONX_V=$VPLAIN "DAMONX_WARM=$DXWARM")
+    if [ -n "$DXWARM" ]; then  # wa wb01.. at the fixed rate before slo; --slo only in the slo part (no SLO abort in warmup)
+      local wr wl wp
+      wr=$(dxw rate) wl=$(dxw learn_s) wp=$(dxw part_s)
+      [[ " $PSLO " == *" --slo "* ]] || PSLO="--slo search:99:100 $PSLO"
+      SLOARG=() PARTSV="$DXWPARTS $PARTSV"
+      DXE+=("PART_SKIP_CMD=bash $EV/damonx-hook.sh skip" "PART_NOGATE=$DXWNOGATE"
+        "PART_ARGS_wa=--mode fixed --rates $wr --warmup-s 0 --step-warmup-s 0 --step-measure-s $wl --drain-s 0" PART_SEED_wa=$SEED)
+      for p in $DXWNOGATE; do DXE+=("PART_ARGS_$p=--mode fixed --rates $wr --warmup-s 0 --step-warmup-s 0 --step-measure-s $wp --drain-s 0" PART_SEED_$p=$SEED); done
+    fi
+    log "$name: DAMON at READY, parts [$PARTSV]"
+  fi
   local LG=(--opt data=$X_DATA --opt writes=$X_WRITES --opt k=10 --mix "update=$U,search=$((100 - U))" "${SLOARG[@]}" --x-stream search --raw)
   local RE=(V=$VPLAIN HOST_SERVER=$HOSTSRV LOADGEN=$LOADGEN INIT=$INIT READY_TIMEOUT=5400 RUN_KIND=measurement TRACE=0 STATS_OP=10
     "PARTS=$PARTSV" H1_MEASURE_RUN=1 MEASURE_PART_DIR=$MEASURE_PART_DIR "PART_ARGS_slo=$PSLO" PART_SEED_slo=$SEED "${L1X[@]}"
-    "PART_GATE_CMD=bash $HG check")   # between parts: the N-VM gate (run.sh part hook), never the 2-VM h1-gate.sh
+    "PART_GATE_CMD=bash $HG check" "${DXE[@]}")   # between parts: the N-VM gate (run.sh part hook), never the 2-VM h1-gate.sh
   case $s in
     hw)  RE+=(SYSTEM=all-HWcc NODE_ENV= NODE0_ENV= "SERVER_ARGS=$SA"); mode=hwcc OPS=none;;
     pop) RE+=(SYSTEM=Popcorn-$RECV_MODE NODE_ENV= NODE0_ENV= "SERVER_ARGS=$SA --preloaded"); mode=popcorn OPS=swmc_acct;;
@@ -818,6 +886,12 @@ vdb_fixed_life() {  # <sys> <mix>
     [ "$fs" = "$fk" ] || continue
     RE+=("PART_ARGS_$fp=--mode fixed --rates $frt --warmup-s 0 --step-warmup-s $fw --step-measure-s $fm --drain-s $fdr" "PART_SEED_$fp=$SEED")
   done
+  if [ $s = ds ] && [ "$REPL" = damon ] && [ "$DXAT" = ready ]; then  # DAMON at READY (E0b): damonx-hook.sh wraps fixed-part-hook.sh
+    RE+=("PART_PRE_CMD=bash $EV/damonx-hook.sh pre" "PART_POST_CMD=bash $EV/damonx-hook.sh post" DAMONX_FIXED_KEY=$fk DAMONX_E=$E DAMONX_NAME=$name
+      "DAMONX_IPS=${IPS[*]}" DAMONX_GUEST=$EV/ds-damon-guest.sh "DAMONX_ARGS=${DAMONARGS# }" "DAMONX_START_EXTRA=$DXSTART" DAMONX_RANGE=$DXRANGE
+      DAMONX_POOL=$RPOOL DAMONX_V=$VPLAIN DAMONX_WARM=)
+    log "$name: DAMON at READY (fixed parts [$parts])"
+  fi
   case $s in
     hw)  RE+=(SYSTEM=all-HWcc "NODE_ENV=$NENV_X" NODE0_ENV= "SERVER_ARGS=$SA"); mode=hwcc OPS=none;;
     pop) RE+=(SYSTEM=Popcorn-$RECV_MODE "NODE_ENV=$NENV_X" NODE0_ENV= "SERVER_ARGS=$SA --preloaded"); mode=popcorn OPS=swmc_acct;;
