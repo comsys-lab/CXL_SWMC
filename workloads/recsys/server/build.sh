@@ -18,6 +18,9 @@ c++ "${FLAGS[@]}" -DCXL_REGION_DESTIJL -I"$DSL" "$HERE/server.cc" -o "$OUT/bin/r
 c++ "${FLAGS[@]}" "$W/tools/gen_samples.cc" -o "$OUT/bin/recsys-gen-samples"
 c++ "${FLAGS[@]}" "$W/tools/rate_calib.cc" -o "$OUT/bin/recsys-rate"
 c++ "${FLAGS[@]}" "$W/tests/model_test.cc" -o "$OUT/bin/recsys-model-test"
+# v7 (DESIGN.md §10): Host scorer / prequential trainer (baseline + frozen AUC, updater CPU) and the backward test
+c++ "${FLAGS[@]}" -mf16c "$W/tools/recsys_score.cc" -o "$OUT/bin/recsys-score"
+c++ "${FLAGS[@]}" -mf16c "$W/tests/model_grad_test.cc" -o "$OUT/bin/recsys-model-grad-test"
 COMMIT=$(git -C "$HERE" rev-parse HEAD)
 DIRTY=$(git -C "$HERE" status --porcelain -- "$W" "$ROOT/systems/common" "$ROOT/experiments/loadgen" "$ROOT/systems/megalon/shim" "$ROOT/systems/popcorn_new/include" "$DSL" | wc -l)
 { echo "# recsys build (CXL_SWMC/workloads/recsys/server/build.sh)"; echo "date=$(date -Is)"
