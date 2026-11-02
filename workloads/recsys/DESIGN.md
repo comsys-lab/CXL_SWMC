@@ -293,3 +293,52 @@ Evidence: workspaces/recsys-table/host-test-1 (control dir). Host numbers only; 
 - D5 Embedding values synthetic per (key, seq) (MOT1: synthetic values in the motivation study).
 - D6 Inputs (v6): MLPerf day 23 multi-hot as is; time order of day 23 not verified.
 - D7 Dense features are not used by the updater (no training); the serving bottom MLP uses them.
+
+## 10. v7: trained model, online-training updater, AUC (reports/experiments/de-stijl-evaluation-isca27.md §R)
+Status 2026-11-03: Host side done (10.1-10.5); server/loadgen/harness wiring open (10.6). v7 removes D1, D4, D5, D7.
+### 10.1 Inputs
+- tools/ckpt_convert.py: MLPerf DLRMv2 checkpoint (torchsnapshot, 214 files) read directly (.snapshot_metadata JSON,
+  raw fp32 shards; small tables and the dense weights at byte_range inside the batched files) -> emb-<fp16|fp32>.img
+  (server/emb_v7.h ImageHeader + 204,184,588 records, full tables, no cap) + dense.bin (torch layout) + convert.json.
+  Record: key | seq | csum | acc (row-wise Adagrad state, f32) | pad | emb[128]; fp16 = 320 B (5 lines, default),
+  fp32 = 576 B (`--emb-dtype`). fp16 conversion error <= 2.4e-4 (max |w| 0.65), per table in convert.json.
+- Samples v3 (samples.h, proto.h): 912 B = v6 record + label byte + 3 pad (tools/mlperf_npz_to_samples.py; ids are
+  checked < MLPerf rows, labels 0/1).
+### 10.2 Dense part (server/model.h)
+- `load_dense`: trained weights; `top_train` keeps activations; `backward` returns dLoss/dx0 for the frozen dense part
+  (top MLP and cross network transposes, ReLU masks; 31.8 MFLOP vs 32.1 forward). tests/model_grad_test.cc: forward
+  vs a double reference, backward vs central finite differences.
+### 10.3 Updater math (configurable; defaults pending user confirmation)
+- Loss BCE, mean over the micro-batch; per row the summed gradient of all its lookups in the batch (sum pooling);
+  row-wise Adagrad (FBGEMM EXACT_ROWWISE_ADAGRAD): acc += mean(g^2); w -= lr g / (sqrt(acc) + eps), eps 1e-8;
+  state in the record (acc), row stored back in the record precision. lr default 0.004 (MLPerf DLRMv2 training
+  reference, to be verified by WebFetch), `--lr`.
+- The checkpoint has no optimizer state: acc starts at `--acc-init` (converter, default 0). Host finding: with acc 0,
+  lr 0.004 lowers AUC (10.5); lr / acc-init are a user decision.
+### 10.4 Host tool tools/recsys_score.cc (`recsys-score`)
+- `--mode frozen`: scores a sample range with the checkpoint (baseline AUC, frozen AUC of every run); streams the image
+  once per chunk (sorted lookups, page cache dropped behind).
+- `--mode train`: prequential (score, then train) with rows in DRAM, T threads, micro-batch B; reports CPU per sample
+  split into forward / backward / row update.
+- Score files: "RSYSSCR1" 64 B header + {u64 sample, f32 score, u8 label, pad} records; tools/auc.py computes AUC
+  (rank formula = sklearn roc_auc_score), logloss, frozen AUC over the same sample multiset, gain retained G.
+### 10.5 Host results (2026-11-03, builds/recsys/15, workspaces/recsys-v7/auc/)
+- Baseline (frozen) AUC day 23 [0, 2M): 0.80506 (logloss 0.12130); [0, 250k): 0.81272. Acceptance >= 0.99 x 0.8031
+  = 0.7951: PASS. Frozen scores: workspaces/recsys-data/v7-ckpt-fp16/frozen-day23-0-2M.scr.
+- 2M samples touch 10.1M distinct rows per 500k samples (53.5M lookups -> 6.0M rows per 250k).
+- Updater CPU, Host CPUs 18-21 (node 1, nice 19), 20k samples: batch 1: 6.8 ms/sample on 1 thread (147 samples/s),
+  8.0 ms/sample on 4 threads (498 samples/s; weight streaming, 63 MB fp32 per sample pass); batch 8: 1.37 ms/sample
+  on 1 thread (725/s), 1.57 ms on 4 threads (2538/s). Row update (Adagrad) 0.07-0.09 ms/sample.
+- Prequential AUC on [0, 20k), 4 threads, batch 8 (frozen 0.80937): lr 0.004 -> 0.76565, lr 4e-4 -> 0.81344,
+  lr 4e-5 -> 0.81100 (batch 1, lr 0.004: 0.76028).
+### 10.6 Open: server / loadgen / harness (not implemented yet)
+- server: `--image` (initial rows from the image instead of make_slot), `--model-dense`, record size from the image;
+  node 0 `--update-mode train`: trainer threads take queued update samples in seq order in micro-batches of up to
+  `--train-batch` (no waiting), read rows through the coherent lookup path, forward + backward, hand (row, gradient)
+  to the row-owner update worker, which does read-modify-write (emb + acc + seq + csum) in the system's write path.
+- serving: replies already carry scores (kQueryReturnScores); the loadgen draws query starts uniformly in [u, u + W)
+  (W = 60 s x update rate, `--query-window-s`) from the update file and logs RSYSSCR1 records per step (queries.bin).
+- stale-read fraction / age: node 1 logs (row, seq read, t) for sampled lookups, node 0 (row, seq, t) per write;
+  joined offline. CSV: steps.csv + samples_scored, auc, logloss, stale_read_frac, stale_age_p50/p95/max_ms,
+  updater_cpu_s_per_s; auc_run.csv (system, update_rate, T, run, samples_scored, auc, logloss, auc_frozen, auc_fresh,
+  gain_retained).
