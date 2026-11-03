@@ -57,6 +57,19 @@ recv_rules() {
   return 0
 }
 
+# recv_run2_guard: run-2 confs set REQUIRE_ADAPTIVE=1 (verifier M3, 2026-11-03): a real run needs RECV_MODE=adaptive
+# (De Stijl, and Popcorn unless POP_RECV_MODE is set), POP_RECV_MODE empty or adaptive, and POP_ADAPT_KO set; prints
+# nothing and returns 0 when satisfied (or REQUIRE_ADAPTIVE unset / 0), else prints why and returns 1. The callers
+# stop on 1 in a real run and only print the reason in a dry run (placeholder pins dry-run cleanly).
+recv_run2_guard() {
+  case ${REQUIRE_ADAPTIVE:-0} in 0) return 0;; 1) ;; *) echo "bad REQUIRE_ADAPTIVE '${REQUIRE_ADAPTIVE}' (0 | 1)"; return 1;; esac
+  local why=
+  [ "${RECV_MODE:-}" = adaptive ] || why="RECV_MODE=${RECV_MODE:-} (want adaptive)"
+  [[ ${POP_RECV_MODE:-adaptive} == adaptive ]] || why="${why:+$why; }POP_RECV_MODE=$POP_RECV_MODE (want adaptive)"
+  [ -n "${POP_ADAPT_KO:-}" ] || why="${why:+$why; }POP_ADAPT_KO unset"
+  [ -z "$why" ] || { echo "run 2 needs the adaptive receiver for pop and ds: $why"; return 1; }
+}
+
 recv_pop_srcversion() {  # srcversion of POP_ADAPT_KO (- when unset)
   [ -f "${POP_ADAPT_KO:-}" ] && modinfo -F srcversion "$POP_ADAPT_KO" 2>/dev/null || echo -
 }
@@ -69,7 +82,12 @@ recv_rb_check() {
   [ "$m" = adaptive ] || return 0
   rbv ring_coherent; case $s:$v in pop:1|ds:1|ds:-1) ;; *) echo "ring_coherent=$v with recv_mode=adaptive"; return 1;; esac
   rbv ipoll; [ -n "$v" ] && [ "$v" != absent ] || { echo "no ipoll parameter (module is not the adaptive receiver)"; return 1; }
-  [ "$ip" = - ] || [ "$v" = "$ip" ] || { echo "ipoll=$v (want $ip)"; return 1; }
+  [ "$v" = "$([ "$ip" = - ] && echo 1 || echo "$ip")" ] || { echo "ipoll=$v (want ${ip/-/1})"; return 1; }
+  # one adaptive configuration for pop and ds (verifier M4): busy tier 50 / 200 us, sleep tier 50..200 us
+  local p w
+  for p in spin_us=50 watch_us=200 s_min_us=50 s_max_us=200; do
+    rbv ${p%%=*}; w=${p#*=}; [ "$v" = "$w" ] || { echo "${p%%=*}=$v (want $w: pop and ds use the same adaptive parameters)"; return 1; }
+  done
   rbv fault_poll; [ "$fp" = - ] || [ "$v" = absent ] || [ "$v" = "$fp" ] || { echo "fault_poll=$v (want $fp)"; return 1; }
   [ $s != ds ] || [ "$fp" = - ] || [ "$v" = "$fp" ] || { echo "fault_poll=$v (want $fp)"; return 1; }
   rbv srcversion; [ "$sv" = - ] || [ "$v" = "$sv" ] || { echo "srcversion=$v (want $sv of POP_ADAPT_KO)"; return 1; }

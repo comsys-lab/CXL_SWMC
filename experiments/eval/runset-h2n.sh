@@ -141,6 +141,12 @@ PINS=$EVD/${H2N_PINS:-pins-vdb.sh}
 [[ ${H2N_PINS:-x} != */* ]] || die "H2N_PINS is a file name next to runset-h2n.sh"
 VF=${H2N_VEC_FORMAT:-fp32}
 ( cd "$H" && . "$PINS" && echo "$PIN_SHA256" | sha256sum --quiet -c - ) || die "eval pins ($PINS: builds, data, region, Megalon) do not verify"
+# run-2 guard (REQUIRE_ADAPTIVE=1, verifier M5): the vector DB server must sample the idle pollers per step (kthread
+# prefix cxl_ipoll, workloads/vectordb/server/server.cc; builds/vdb/24 on); builds/vdb/23 lacks it
+if [ "${REQUIRE_ADAPTIVE:-0}" = 1 ] && ! grep -qa cxl_ipoll "$VDB_PLAIN_BUILD/bin/vdb-server"; then
+  [ $DRY = 1 ] && plan "run-2 guard: $VDB_PLAIN_BUILD/bin/vdb-server has no cxl_ipoll kthread prefix (needs builds/vdb/24; a real run stops here)" \
+    || die "run-2 guard: $VDB_PLAIN_BUILD/bin/vdb-server has no cxl_ipoll kthread prefix (re-pin to builds/vdb/24)"
+fi
 if [ $HASMG = 1 ]; then
   MGPEND=
   for x in "$MGB" "$MGV" "$MGC" "$MGL"; do [[ $x == *PLACEHOLDER* ]] && MGPEND="$MGPEND $x"; done

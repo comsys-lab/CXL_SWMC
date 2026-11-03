@@ -47,7 +47,7 @@ KEYS="ROCKS_BLOCK ROCKS_TOPO ROCKS_NODES ROCKS_MIXES ROCKS_SYSTEMS ROCKS_SLO_MS 
   POP_REGION POP_C POP_BUNDLE_SHA POP_K POP_GT DS_REGION DS_C DS_BUNDLE_SHA DS_K DS_GT"
 OPTKEYS="ROCKS_DS_RECV_EXTRA ROCKS_EXPERIMENT ROCKS_MG_BUILD_N2 ROCKS_MG_BUILD_N4 ROCKS_MG_BUILD_N8 ROCKS_MG_CFG_N2
   ROCKS_MG_CFG_N4 ROCKS_MG_CFG_N8 ROCKS_MG_EXTENTS_N2 ROCKS_MG_EXTENTS_N4 ROCKS_MG_EXTENTS_N8
-  POP_RECV_MODE POP_ADAPT_KO RECV_IPOLL ROCKS_PMAX ROCKS_PMAX_FROM ROCKS_PMAX_MEASURE_S"
+  POP_RECV_MODE POP_ADAPT_KO RECV_IPOLL ROCKS_PMAX ROCKS_PMAX_FROM ROCKS_PMAX_MEASURE_S REQUIRE_ADAPTIVE"
 # shellcheck disable=SC2086
 unset $KEYS $OPTKEYS
 # the conf may set only these keys (a typo or a foreign key stops)
@@ -74,6 +74,10 @@ elif [ "$PHASE" = ds ]; then
   why=$(recv_rules ds "$RECV_MODE" "$DS_C" "$N") || die "De Stijl receiver: $why"
 fi
 [[ $ROCKS_BLOCK != *200 ]] || [ -n "$DSRX" ] || die "ROCKS_BLOCK $ROCKS_BLOCK needs ROCKS_DS_RECV_EXTRA"
+# run-2 guard (conf REQUIRE_ADAPTIVE=1, verifier M3): phases hwpop / ds of a real run refuse placeholder receiver pins
+if [ "$PHASE" != mg ] && ! why=$(recv_run2_guard); then
+  [ $DRY = 1 ] && echo "RUNSET NOTE: run-2 guard: $why (a real run stops here)" || die "run-2 guard: $why"
+fi
 [[ " $ROCKS_NODES " == *" $N "* ]] || die "N=$N not in ROCKS_NODES ($ROCKS_NODES)"
 [ "$ROCKS_SLO_MS" = 1 ] || die "ROCKS_SLO_MS must be 1 (user decision: RocksDB SLO p99 1 ms)"
 [ "$EXPECT_NPROC" = 4 ] || die "EXPECT_NPROC must be 4 (4 vCPU rule, user 2026-11-01)"

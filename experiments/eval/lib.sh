@@ -135,6 +135,10 @@ manifest() {  # written into E at the real start
 RECVENV=()
 for _v in POP_RECV_MODE POP_ADAPT_KO RECV_IPOLL; do [ -z "${!_v:-}" ] || RECVENV+=("$_v=${!_v}"); done
 [[ ${RECV_IPOLL:-} =~ ^[01]?$ ]] || { echo "RUNSET STOP: bad RECV_IPOLL (${RECV_IPOLL})"; exit 2; }
+# run-2 guard (conf REQUIRE_ADAPTIVE=1; recv-mode.sh recv_run2_guard): a real run refuses placeholder receiver pins
+if _why=$(recv_run2_guard); then [ "${REQUIRE_ADAPTIVE:-0}" = 0 ] || plan "run-2 guard: adaptive receiver for pop and ds, POP_ADAPT_KO set: OK"
+elif [ $DRY = 1 ]; then plan "run-2 guard: $_why (a real run stops here)"
+else die "run-2 guard: $_why"; fi
 recv_pop_check() {  # <N>
   local why m=${POP_RECV_MODE:-$RECV_MODE}
   why=$(recv_rules pop "$m" "$POP_C" "$1") || die "Popcorn receiver: $why"
