@@ -263,6 +263,7 @@ class MegalonBackend final : public Backend {
       << "\nmegalon.replay_flush_bytes=" << s.replay_flush_bytes << "\nrdb.mem_write_sections=" << mem_writes_.load()
       << "\nrdb.mem_read_sections=" << mem_reads_.load() << "\nrdb.file_write_sections=" << file_writes_.load()
       << "\nrdb.file_read_sections=" << file_reads_.load() << "\nrdb.read_retries=" << retries_.load()
+      << "\nrdb.mem_read_tail_clamps=" << tail_clamps_.load()
       << "\nrdb.megalon_threads=" << next_tid_.load() << "\nshim=" << api_->info << "\n";
     return o.str();
   }
@@ -284,7 +285,16 @@ class MegalonBackend final : public Backend {
   void mem_read(uint32_t v, const void *p, void *out, size_t n) {
     uint64_t i;
     if (!block_containing(v, p, &i)) backend_fatal("remote memtable read outside node's arena blocks");
-    read_section(id(0, v, i), block(v, i), p, out, n);
+    // verifier LOW-1 (2026-11-03): a fixed-size read (the 5-byte varint probe of patch 0001) of an entry at the tail
+    // of a block may extend past the 1 MiB object; copy only the bytes inside this object (inside its section) and
+    // zero the rest. An arena allocation never spans blocks, so a varint ends inside the block and a zero byte (high
+    // bit clear) can only follow its last byte; a read whose real data crossed the end would be a corrupt entry.
+    const size_t in = std::min(n, size_t(kUnit - (static_cast<const uint8_t *>(p) - block(v, i))));
+    read_section(id(0, v, i), block(v, i), p, out, in);
+    if (in < n) {
+      std::memset(static_cast<uint8_t *>(out) + in, 0, n - in);
+      tail_clamps_.fetch_add(1, std::memory_order_relaxed);
+    }
     mem_reads_.fetch_add(1, std::memory_order_relaxed);
   }
   void *mem_write_begin(const void *addr) {
@@ -303,7 +313,7 @@ class MegalonBackend final : public Backend {
   const mshim::Api *api_;
   uint32_t me_ = 0, nodes_ = 0;
   std::atomic<int> next_tid_{0};
-  std::atomic<uint64_t> mem_writes_{0}, mem_reads_{0}, file_writes_{0}, file_reads_{0}, retries_{0};
+  std::atomic<uint64_t> mem_writes_{0}, mem_reads_{0}, file_writes_{0}, file_reads_{0}, retries_{0}, tail_clamps_{0};
 };
 
 }  // namespace rdbw

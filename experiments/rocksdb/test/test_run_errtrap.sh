@@ -7,6 +7,8 @@
 #      check.txt PASS (pilot-run.sh then reports a NOTE, v1-block.sh continues with the next cell)
 #   B  loadgen rc 0, a real error after the loadgen (server_cpus check fails): the ERR trap is armed again
 #      ("error, stopping servers", servers stopped, run.sh fails)
+#   C  Megalon run (eval run2): RACKOBJ_CONFIG on every node's start, MEGALON_REINIT=1 on node 0 only, run OK
+#   D/E  --backend megalon without SYSTEM=Megalon, or without NODE0_ENV: refused (rc 2) before any server starts
 # usage: bash test/test_run_errtrap.sh   -> "TEST RUN ERRTRAP PASS" (exit 0) or FAIL lines (exit 1)
 set -uo pipefail
 HERE=$(cd "$(dirname "$0")" && pwd); RUNSH=${RUNSH:-$HERE/../run.sh}   # RUNSH=<other run.sh>: test another copy
@@ -61,8 +63,9 @@ fails=0
 runcase() {  # <case> <lg rc> <fail check 0|1>
   local c=$1 out rc
   export STUB_LOG=$TD/$c.ssh.log; : > "$STUB_LOG"
-  out=$(env PATH="$TD/bin:$PATH" SYSTEM=all-HWcc V=/home/comsys/stub HOST_SERVER=$TD/server LOADGEN=$TD/loadgen \
-    SERVER_ARGS="--nodes 2 --keys 4 --threads 1" NODES="127.0.0.1 127.0.0.1" PORT=$PORT RUN_KIND=functional STATS_OP=0 VERIFY=0 \
+  out=$(env PATH="$TD/bin:$PATH" SYSTEM=${C_SYSTEM:-all-HWcc} V=/home/comsys/stub HOST_SERVER=$TD/server LOADGEN=$TD/loadgen \
+    NODE_ENV="${C_NODE_ENV:-}" NODE0_ENV="${C_NODE0_ENV:-}" \
+    SERVER_ARGS="--nodes 2 --keys 4 --threads 1${C_SA:-}" NODES="127.0.0.1 127.0.0.1" PORT=$PORT RUN_KIND=functional STATS_OP=0 VERIFY=0 \
     SERVER_CPUS=0-3 FAKE_LG_RC=$2 FAKE_FAIL_CHECK=$3 FAKE_KEYS=4 FAKE_N=2 FAKE_PORT=$PORT \
     bash "$RUNSH" "case$c" "$TD/out" -- --opt keys=4 2>&1); rc=$?
   echo "$out" > "$TD/$c.out"
@@ -85,5 +88,19 @@ runcase B 0 1
 [ $RC != 0 ] || bad B "run.sh rc 0 after a failing server_cpus check"
 grep -q "error, stopping servers" <<< "$OUT" || bad B "ERR trap not armed after the loadgen"
 grep -q "rocksdb-node.sh stop" "$STUB_LOG" || bad B "servers not stopped"
+# ---- C (eval run2): Megalon run: RACKOBJ_CONFIG on every node, MEGALON_REINIT=1 on node 0 only, run OK
+C_SYSTEM=Megalon C_SA=" --file-extents 8 --backend megalon" C_NODE_ENV="ENV:RACKOBJ_CONFIG=/home/comsys/stub/cfg/megalon.yaml" \
+  C_NODE0_ENV="ENV:MEGALON_REINIT=1" runcase C 0 0
+[ $RC = 0 ] || bad C "run.sh rc $RC != 0 ($(tail -n 2 "$TD/C.out" | tr '\n' ';'))"
+s0=$(grep "rocksdb-node.sh start .* 0 0x" "$STUB_LOG"); s1=$(grep "rocksdb-node.sh start .* 1 0x" "$STUB_LOG")
+grep -q "ENV:RACKOBJ_CONFIG=/home/comsys/stub/cfg/megalon.yaml ENV:MEGALON_REINIT=1 --nodes 2" <<< "$s0" || bad C "node 0 start: $s0"
+grep -q "ENV:RACKOBJ_CONFIG=/home/comsys/stub/cfg/megalon.yaml *--nodes 2" <<< "$s1" && ! grep -q MEGALON_REINIT <<< "$s1" || bad C "node 1 start: $s1"
+grep -q "^node0_env=ENV:MEGALON_REINIT=1$" "$TD/out/caseC/manifest.txt" || bad C "manifest node0_env"
+# ---- D: --backend megalon without SYSTEM=Megalon / without the Megalon env is refused (rc 2, nothing started)
+C_SA=" --file-extents 8 --backend megalon" runcase D 0 0
+[ $RC = 2 ] && grep -q "SYSTEM=Megalon and --backend megalon go together" <<< "$OUT" || bad D "rc $RC: $OUT"
+C_SYSTEM=Megalon C_SA=" --file-extents 8 --backend megalon" C_NODE_ENV="ENV:RACKOBJ_CONFIG=/home/comsys/stub/cfg/megalon.yaml" runcase E 0 0
+[ $RC = 2 ] && grep -q "NODE0_ENV must be" <<< "$OUT" || bad E "rc $RC: $OUT"
+grep -q "rocksdb-node.sh start" "$TD/D.ssh.log" "$TD/E.ssh.log" && bad D "a server was started"
 if [ $fails = 0 ]; then echo "TEST RUN ERRTRAP PASS"; exit 0; fi
 echo "outputs: $TD/A.out $TD/B.out (kept)"; trap 'kill $LPID 2>/dev/null' EXIT; exit 1

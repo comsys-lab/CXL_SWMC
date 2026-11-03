@@ -4,7 +4,7 @@
 # YCSB keys (24 B), value 1,000 B (+ 8 B stamp stored), ScrambledZipfian 0.99; request = one get or one update
 # (mixed stream: update with probability UPDATE_RATIO); SLO per request mixed p99 < 1 ms (as kv/lmdb).
 # usage: pilot-run.sh <name> <evidence dir>
-# env (required): SYS (all-HWcc | Popcorn | DeStijl), UPDATE_RATIO (0.05 | 0.5 | 0.8), KIND:
+# env (required): SYS (all-HWcc | Popcorn | DeStijl | Megalon), UPDATE_RATIO (0.05 | 0.5 | 0.8), KIND:
 #   functional  fixed RATES (total, default 200,1000), 30 s windows, LOG=1 recommended (check_log)
 #   slo         SLO search with the KV/LMDB H1 loadgen arguments (precision 0.02, confirm 0.01, max 6 confirm probes,
 #               step-down 0.05; fill 0.7,0.8,0.9; overload 1.05,1.1,1.2)
@@ -80,6 +80,19 @@ case "$SYS" in
             DSRX=${DSRX% }
             SHMS=$DS_C/p-destijl-shm.sh GTX=$DS_GT SHMR=$E/dsshm-$NAME
             PS=(DS_IPS="${IPS[*]}" K=$DS_K GT=$DS_GT C=$DS_C R=$SHMR INIT_STATE=shared "LOAD_EXTRA=recv_mode=$RECV_MODE${DSRX:+ $DSRX}");;
+  Megalon)  # Object SWcc, user level (eval run2; workloads/rocksdb DESIGN.md §7): no cxl_shm cycle; /dev/dax0.0 owned by
+            # comsys (v1-block.sh, as all-HWcc); objects = 1 MiB arena blocks + 1 MiB file extents (explicit count)
+            [ "$FILE_EXTENTS" != 0 ] || stop "SYS=Megalon needs FILE_EXTENTS (Megalon's object_arena_size >= N x (arena blocks + extents) MiB)"
+            export SYSTEM=Megalon SERVER_ARGS="$SA --backend megalon" NODE_ENV="ENV:RACKOBJ_CONFIG=$V/cfg/megalon.yaml" \
+              NODE0_ENV="ENV:MEGALON_REINIT=1"
+            [ -f "$BUILD/lib/libmegalon-objapi.so" ] || stop "BUILD $BUILD has no lib/libmegalon-objapi.so (build.sh with a Megalon build dir)"
+            # MEG_CFG = the Host copy v1-block.sh installed as cfg/megalon.yaml: its object arena must hold every node's
+            # pools (rocksdb-server default 512 arena blocks + FILE_EXTENTS, 1 MiB each; GB/MB = GiB/MiB in Megalon)
+            [ -f "${MEG_CFG:-}" ] || stop "SYS=Megalon needs MEG_CFG (Host Megalon config)"
+            oa=$(sed -n 's/^object_arena_size: *\([0-9]*\)\([GM]B\).*/\1 \2/p' "$MEG_CFG")
+            case "$oa" in *GB) oam=$(( ${oa% GB} * 1024 ));; *MB) oam=${oa% MB};; *) stop "MEG_CFG object_arena_size unreadable ($oa)";; esac
+            need=$(( N * (512 + FILE_EXTENTS) ))
+            [ "$oam" -ge "$need" ] || stop "MEG_CFG object_arena_size ${oam} MiB < N x (512 + $FILE_EXTENTS) = $need MiB";;
   *) stop "bad SYS";;
 esac
 COH=0; case "$SYS" in Popcorn|DeStijl) COH=1;; esac   # a cxl_shm cycle around the run (PS / SHMS / GTX above)
@@ -112,6 +125,7 @@ if [ "$DRY" = 1 ]; then
   [ $COH = 0 ] || [ -f "$SHMS" ] || stop "$SHMS missing"
   echo "DRY $NAME SYS=$SYS SYSTEM=$SYSTEM N=$N KIND=$KIND UPDATE_RATIO=$UPDATE_RATIO KEYS=$KEYS THREADS=$THREADS V=$V"
   echo "DRY $NAME loadgen=$LOADGEN sha256=$(sha256sum < "$LOADGEN" | cut -c1-16) server=$HOST_SERVER sha256=$(sha256sum < "$HOST_SERVER" | cut -c1-16)"
+  [ "$SYS" != Megalon ] || echo "DRY $NAME megalon node_env=[$NODE_ENV] node0_env=[$NODE0_ENV] shim=$BUILD/lib/libmegalon-objapi.so"
   echo "DRY $NAME server_args=[$SERVER_ARGS] gate=${GATE_SCRIPT:-host-gate or h1-gate} lock_owner=${LOCK_OWNER:-unset}"
   if [ $COH = 1 ]; then
     echo "DRY $NAME cxl_shm cycle: env ${PS[*]} bash $SHMS {precheck,load,chown,enable}; recv_mode=$RECV_MODE; status runpre/runpost; teardown"

@@ -14,7 +14,7 @@ Decision rules (same as the vector DB cells and experiments/h1/levels.py decisio
     lifetime);
   - unconfirmed note ("confirm failed at three rates; ..."; rocks-fix 2026-11-02): check UNCONFIRMED for every system
     (a result row, not an error: max_offered_x_pass = the search's highest passing offered rate, confirmed False, the
-    note = the reason); Popcorn / De Stijl keep decision E (lowest_step) in max_rps_under_slo, all-HWcc leaves it
+    note = the reason); Popcorn / De Stijl / Megalon keep decision E (lowest_step) in max_rps_under_slo, all-HWcc leaves it
     empty (src unconfirmed); the user decides how an unconfirmed cell is charted;
   - any other note, workload_finish != ok, unreadable files, SLO != mixed:99:1: check ERROR, empty max;
   - past the knee (user rule: SLO curves include points past the knee): overload_past_knee = number of overload steps
@@ -23,7 +23,7 @@ Decision rules (same as the vector DB cells and experiments/h1/levels.py decisio
   - send_lag_steps = summary passing_steps_with_send_lag; > 0 -> check WARN (the Host loadgen may bound the result,
     a risk at N = 8 hw).
 usage: slo_result.py [--slo-ms 1] [--out results.tsv] <run dir> [<run dir> ...]
-       run dir name <sys>-<mix>-n<N> (sys hw | pop | ds; mix u<k>); exit 1 if any row is ERROR, else 3 if any row is
+       run dir name <sys>-<mix>-n<N> (sys hw | pop | ds | mg; mix u<k>); exit 1 if any row is ERROR, else 3 if any row is
        UNCONFIRMED, else 0.
 """
 import argparse, json, os, re, sys
@@ -32,7 +32,7 @@ NOTED = ("the start rate already violates the SLO; lower --start",
          "confirm failed at three rates; the knee is noisy (longer --confirm-s?)")
 COLS = ("name system mix U nodes vcpus_per_vm max_offered_x_pass confirm_x_mean confirmed note max_rps_under_slo src "
         "confirm_p99_ms n_ramp n_bisect n_confirm n_fill n_overload overload_past_knee send_lag_steps check run_dir").split()
-NAME_RE = re.compile(r"^(hw|pop|ds)-u(\d+)-n([2-8])$")
+NAME_RE = re.compile(r"^(hw|pop|ds|mg)-u(\d+)-n([2-8])$")
 
 
 def fmt(v):

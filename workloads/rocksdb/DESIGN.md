@@ -1,4 +1,4 @@
-# rocksdb workload — design (v0.3: plain backend tested; Megalon backend written, untested)
+# rocksdb workload — design (v0.4: plain backend tested; Megalon backend Host-tested 2026-11-03, §10)
 
 Status 2026-10-18: plain backend (all-HWcc, Popcorn) built and Host-tested (builds/rocksdb/<n>, tests/host_test.sh,
 tests/stress_test.sh); verifier review v1 FAIL (HIGH-1) -> fixes in v0.2 (§9). Megalon backend not implemented (§7).
@@ -114,7 +114,7 @@ Decision: G1 (user, 2026-10-18).
   threads (default `max_background_jobs`), one catch-up thread per remote view, one reclaim thread. Every thread
   that reads another node's state owns one epoch slot.
 
-## 7. Megalon (paper first, artifact where it matches) — implemented in v0.3, not yet built/tested
+## 7. Megalon (paper first, artifact where it matches) — implemented in v0.3, Host-tested in v0.4 (§10)
 - Objects (user decision 2026-10-18): one 1 MiB object per arena block and per 1 MiB file extent of every node,
   id `"RK" << 48 | kind << 44 | node << 36 | index` (kind 0 block, 1 extent), all created by node 0 at prepare
   (index order) before any node opens its DB; every node looks them all up and keeps their addresses (Megalon maps
@@ -179,3 +179,13 @@ Decision: G1 (user, 2026-10-18).
   seq_cst fence is to be added with the next server source change (build 3 is kept unchanged for the packet).
   Residual: a MANIFEST replay during catch-up may touch already-reclaimed files of intermediate versions; it would
   surface as remoteN.catchup_errors (gated = 0).
+
+## 10. Megalon backend for eval run2 (2026-11-03; workspaces/megalon-rocksdb/DESIGN.md)
+- No source change to the server or the RocksDB patches: the v0.3 Megalon backend (§7) is built for the first time
+  (build.sh with a Megalon build dir; N = 2: builds/megalon/78-n2, the library of the vector DB run-1 mg cells).
+- Host tests (two processes over a sparse file, tests/host_test.sh BACKEND=megalon): PASS at 1,280 objects per node
+  and at REGION_GB=96 MEG_EXTENTS=45000 (45,256 objects per node, the VM object count; created by node 0 in 39 s).
+- VM harness: experiments/rocksdb phase mg (runset-rocks.sh, v1-block.sh, pilot-run.sh SYS=Megalon, run.sh
+  NODE0_ENV, install.sh MEG_CFG, precheck.sh EXPECT_MEG_SHA); conf experiments/rocksdb/eval-run2-rocks-mg.conf.
+- VM sizing: object_arena_size 90 GiB (config/megalon-2vm.yaml, as the vector DB), 512 arena blocks + 45,000 file
+  extents per node (plain backend: 48,501 extents per node; image 26,992 extents per node at 54M keys).

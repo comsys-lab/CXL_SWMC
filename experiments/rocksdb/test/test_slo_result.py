@@ -128,6 +128,15 @@ class Files(unittest.TestCase):
             r = dict(zip(sr.COLS, open(out2).read().splitlines()[2].split("\t")))
             self.assertEqual((r["name"], r["check"], r["confirmed"], r["max_offered_x_pass"]), ("hw-u50-n4", "UNCONFIRMED", "False", "3990"))
             self.assertEqual(sr.main([good, unc, bad]), 1)  # an ERROR row wins
+            mg = os.path.join(td, "mg-u5-n2")  # Megalon cells (eval run2): parsed like pop / ds, decision E allowed
+            os.makedirs(os.path.join(mg, "loadgen"))
+            json.dump(dict(s, note=sr.NOTED[0], confirmed=False), open(os.path.join(mg, "loadgen", "summary.json"), "w"))
+            with open(os.path.join(mg, "loadgen", "steps.jsonl"), "w") as f:
+                f.write("\n".join(json.dumps(x) for x in steps) + "\n")
+            out3 = os.path.join(td, "r3.tsv")
+            self.assertEqual(sr.main(["--out", out3, mg]), 0)
+            r = dict(zip(sr.COLS, open(out3).read().splitlines()[1].split("\t")))
+            self.assertEqual((r["system"], r["mix"], r["nodes"], r["src"]), ("mg", "u5", "2", "lowest_step"))
 
 
 if __name__ == "__main__":
