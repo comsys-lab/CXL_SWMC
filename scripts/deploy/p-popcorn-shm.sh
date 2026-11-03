@@ -28,6 +28,12 @@
 #             ("name value" lines, mode 0400, its uid; read/wp counts >= 1).
 #             Line count by build (from K): <= 8: 16, 9: 57, 10: 59, 11: 62, >= 12: 65
 #             (build 12 adds instr_build/instr_detail/instr_sample_shift; instr/build = 12).
+#             Build >= 13: 75 lines (9 breakdown keys + instr_breakdown); instr/build = 13,
+#             instr/breakdown = 1, serve_{fetch,invalidate}.meta_ns; per-thread instr_build 13,
+#             instr_breakdown 1, breakdown_faults >= 1.
+# Build >= 13 (verifier L3, no mixed deployment): precheck and load first check on EVERY node
+#   that /sys/kernel/swmc/instr/build == <build> and that the installed cxl_shm.ko has
+#   modinfo version <build>.0; load also requires version=<build>.0 after each insmod.
 #             Build >= 11 also: instr/detail = 0 and instr/sample_shift present.
 #             Build >= 9 also: the build-9 instr files, and the process
 #             registers a swmc_acct area (/proc/thread-self/swmc_acct, 0600)
@@ -89,7 +95,7 @@ IPAGE=${IPAGE:-25019000} OBASE=${OBASE:-25020000} OREPS=${OREPS:-3} ORUN=${ORUN:
 # Popcorn build number from the release (…-ds-popcorn-new-<n>); selects the build-8/9/10 expectations.
 PBUILD=$(sed -n 's/.*-ds-popcorn-new-\([0-9]\{1,\}\)$/\1/p' <<<"$K")
 [ -n "$PBUILD" ] || PBUILD=0
-if [ "$PBUILD" -ge 12 ]; then SWMC_LINES=65; elif [ "$PBUILD" -ge 11 ]; then SWMC_LINES=62; elif [ "$PBUILD" -ge 10 ]; then SWMC_LINES=59; elif [ "$PBUILD" -ge 9 ]; then SWMC_LINES=57; else SWMC_LINES=16; fi
+if [ "$PBUILD" -ge 13 ]; then SWMC_LINES=75; elif [ "$PBUILD" -ge 12 ]; then SWMC_LINES=65; elif [ "$PBUILD" -ge 11 ]; then SWMC_LINES=62; elif [ "$PBUILD" -ge 10 ]; then SWMC_LINES=59; elif [ "$PBUILD" -ge 9 ]; then SWMC_LINES=57; else SWMC_LINES=16; fi
 fl() {  # fl <node> <step> <faultlat args...>: one faultlat step on a guest (results in popcorn-results/$PRUN)
   local k=$1; shift
   echo "[$(date +%T)] vm$k $1"
@@ -118,6 +124,23 @@ wait_no_faultlat() {  # bounded wait (120 s) until no faultlat runs on the given
     sleep 2
   done
   return 1
+}
+MODVER=; [ "$PBUILD" -ge 13 ] && MODVER=$PBUILD.0   # cxl_shm MODULE_VERSION of builds >= 13
+# module override bundle (p-popcorn-package.sh --module-override): tools/popcorn.env next to this script carries
+# KO_VERSION = the version of the shipped tools/cxl_shm.ko (KO_PATH); it is the version required after each insmod,
+# while same_build keeps checking the INSTALLED /lib/modules module (= the deployed kernel's build, MODVER)
+LOADVER=$MODVER
+KOV=$(sed -n 's/^KO_VERSION=//p' "$(dirname "$(readlink -f "$0")")/tools/popcorn.env" 2>/dev/null | tail -n 1)
+[ -z "$KOV" ] || { [[ $KOV =~ ^$PBUILD\.[0-9]+(-[a-z0-9]+)?$ ]] || { echo "bundle KO_VERSION '$KOV' is not a build-$PBUILD module version"; exit 2; }; LOADVER=$KOV; }
+same_build() {  # build >= 13: refuse a mixed deployment (every node: kernel instr/build and installed module version)
+  [ -n "$MODVER" ] || return 0
+  local k got
+  for k in "${ALL[@]}"; do
+    got=$(on "$k" "cat /sys/kernel/swmc/instr/build; modinfo -F version /lib/modules/$K/updates/cxl_shm.ko" | tr '\n' ' ')
+    [ "$got" = "$PBUILD $MODVER " ] ||
+      { log "STOP: mixed deployment: vm$k instr/build + cxl_shm version = '$got', expected '$PBUILD $MODVER'"; exit 1; }
+  done
+  log "same build on all $N nodes (instr/build $PBUILD, cxl_shm $MODVER installed)"
 }
 smoke_accept() {  # smoke_accept <before> <after> <node>: counters and dmesg
   python3 -I - "$1" "$2" "$3" <<'PY'
@@ -149,6 +172,9 @@ plan)
   g() { echo "ssh comsys@${IP[$1]} 'sudo -n $GT/p-popcorn-guest.sh ${*:2}'"; }
   for p in "${ph[@]}"; do
     echo "## $p"
+    if [ -n "$MODVER" ] && [[ $p =~ ^(precheck|load)$ ]]; then
+      for k in "${ALL[@]}"; do echo "ssh comsys@${IP[$k]} 'cat /sys/kernel/swmc/instr/build; modinfo -F version /lib/modules/$K/updates/cxl_shm.ko'  # == $PBUILD $MODVER"; done
+    fi
     case $p in
       precheck) for k in "${ALL[@]}"; do echo "ssh comsys@${IP[$k]} 'uname -r; cd $GT && sha256sum --quiet -c tools.sha256'"; g "$k" status; done ;;
       load) for k in "${ALL[@]}"; do g "$k" load "$k" "$INIT_STATE" $NARG $LOAD_EXTRA; done
@@ -165,6 +191,7 @@ plan)
     esac
   done ;;
 precheck)
+  same_build
   for k in "${ALL[@]}"; do
     test "$(on $k 'uname -r')" = "$K"
     on $k "cd $GT && sha256sum --quiet -c tools.sha256"
@@ -176,9 +203,12 @@ precheck)
   done
   log "shm precheck PASS" ;;
 load)
+  same_build
   for k in "${ALL[@]}"; do
     # shellcheck disable=SC2086
     G $k load $k "$INIT_STATE" $NARG $LOAD_EXTRA | tee "$R/load-vm$k.txt"; grep -q "load OK (node $k)" "$R/load-vm$k.txt"
+    [ -z "$LOADVER" ] || grep -qx "version=$LOADVER" "$R/load-vm$k.txt" ||
+      { log "STOP: vm$k loaded cxl_shm $(sed -n 's/^version=//p' "$R/load-vm$k.txt"), expected $LOADVER"; exit 1; }
     grep -qx "init_state=$INIT_STATE" "$R/load-vm$k.txt" && grep -qx "nr_nodes=$N" "$R/load-vm$k.txt" ||
       { log "STOP: vm$k loaded with unexpected init_state/nr_nodes"; exit 1; }
   done
@@ -288,6 +318,11 @@ instr-check)
       grep -qx "swmc.build.$PBUILD" "$R/instr-before-vm$k.txt" && grep -qx "swmc.serve_fetch.revoke_samples [0-9]*" "$R/instr-before-vm$k.txt" ||
         { log "STOP: build-12 instr files (build $PBUILD, revoke_samples) missing on vm$k"; exit 1; }
     fi
+    if [ "$PBUILD" -ge 13 ]; then
+      grep -qx "swmc.breakdown.1" "$R/instr-before-vm$k.txt" && grep -qx "swmc.serve_fetch.meta_ns [0-9]*" "$R/instr-before-vm$k.txt" &&
+        grep -qx "swmc.serve_invalidate.meta_ns [0-9]*" "$R/instr-before-vm$k.txt" ||
+        { log "STOP: build-13 instr files (breakdown 1, serve_*.meta_ns) missing on vm$k"; exit 1; }
+    fi
   done
   for k in "${ALL[@]}"; do
     page=$((IPAGE + k))   # one fresh page per node
@@ -341,6 +376,11 @@ if pbuild >= 9:
 assert all(re.fullmatch(r'[a-z0-9_]+', k) and v.isdigit() for k, v in kv.items()), kv
 assert int(kv['read_faults']) >= 1 and int(kv['wp_faults']) >= 1 and int(kv['write_faults']) >= 1, kv
 assert int(kv['fault_errors']) == 0, kv
+if pbuild >= 13:   # breakdown keys (instr/breakdown default 1) and the build marker of this kernel
+    assert int(kv['instr_build']) == pbuild and kv['instr_breakdown'] == '1', kv
+    assert int(kv['breakdown_faults']) >= 1, kv
+    print('build-13 keys OK: instr_build=%s instr_breakdown=%s breakdown_faults=%s' % (
+        kv['instr_build'], kv['instr_breakdown'], kv['breakdown_faults']))
 print('per-thread file OK:', ' '.join('%s=%s' % (k, kv[k]) for k in ('read_faults', 'read_transactions',
       'read_msg_wait_ns', 'write_faults', 'wp_faults', 'write_transactions', 'write_msg_wait_ns')))
 PY

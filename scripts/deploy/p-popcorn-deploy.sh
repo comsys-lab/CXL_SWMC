@@ -13,7 +13,10 @@
 #   normal    define normal XML (same kernel, no init=), start, verify over
 #             SSH; NVDIMM namespace/devices/driver set must equal precheck
 #   tools     copy the Popcorn guest tools (faultlat, run.sh, region config,
-#             p-popcorn-guest.sh, popcorn.env) to $GT (comsys-owned, no sudo)
+#             p-popcorn-guest.sh, popcorn.env) to $GT (comsys-owned, no sudo).
+#             A module override bundle (p-popcorn-package.sh --module-override; popcorn.env KO_PATH) also ships
+#             tools/cxl_shm.ko: its hash is checked as $GT/cxl_shm.ko instead of the installed module. On guests that
+#             already run $K this phase alone is the module deploy (new GT; precheck..normal are for a fresh disk)
 #   rollback  stop VM (graceful, destroy after 120 s), define saved XML,
 #             verify, start on the original definition
 # Env (all required): VM IP C X G D GT K BZ BZ_SHA R PRE_K
@@ -168,8 +171,12 @@ tools)
   ssh_vm "umask 022; mkdir -m 0755 $GT"
   scp_vm "$C"/tools/* "comsys@$IP:$GT/"
   ssh_vm "cd $GT && sha256sum -c tools.sha256 && chmod 0755 faultlat run.sh p-popcorn-guest.sh" | tee "$R/tools.txt"
-  ssh_vm "sha256sum /lib/modules/$K/updates/cxl_shm.ko; modinfo -F vermagic /lib/modules/$K/updates/cxl_shm.ko" | tee -a "$R/tools.txt"
-  grep -q "^$(sed -n 's/^KO_SHA=//p' "$C/tools/popcorn.env")  /lib/modules/$K/updates/cxl_shm.ko$" "$R/tools.txt"
+  # module override bundle (popcorn.env KO_PATH = the shipped tools/cxl_shm.ko): KO_SHA / vermagic of that copy
+  KOF=/lib/modules/$K/updates/cxl_shm.ko
+  grep -q '^KO_PATH=' "$C/tools/popcorn.env" && KOF=$GT/cxl_shm.ko
+  ssh_vm "sha256sum $KOF; modinfo -F vermagic $KOF" | tee -a "$R/tools.txt"
+  grep -q "^$(sed -n 's/^KO_SHA=//p' "$C/tools/popcorn.env")  $KOF$" "$R/tools.txt"
+  grep -qx "$K SMP preempt mod_unload" "$R/tools.txt" || grep -q "^$K " "$R/tools.txt"
   log "tools PASS ($GT)" ;;
 rollback)
   if [ "$(state)" = "running" ] && xml_is "$R/before.xml"; then

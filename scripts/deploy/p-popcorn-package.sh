@@ -17,6 +17,125 @@
 #     vm0/, vm1/ {rollback-inactive.xml,candidate-*.xml,xml.sha256}   from the current inactive XMLs
 #     p-popcorn-deploy.sh, p-popcorn-shm.sh, smoke.sh, vm-console.py, p-popcorn-xml.py
 #     signatures.txt, package-record.json, packet.sha256
+#
+# Module override (run 2, 2026-11-03): a bundle of an ALREADY DEPLOYED Popcorn kernel with another signed cxl_shm.ko
+#   [DRY=1] p-popcorn-package.sh --module-override <source bundle> <module build dir> <bundle version>
+#   e.g. builds/popcorn_new/13/deploy-v2 builds/popcorn_new/13-recv2 1 -> builds/popcorn_new/13-recv2/deploy-v1
+#   Nothing compiles, nothing under the source build or bundle changes. Inputs: <module build dir>/build-record.json
+#   (release, cxl_shm_ko_signed_sha256, module_version) and its signed stage/lib/modules/<K>/updates/cxl_shm.ko
+#   (vermagic K, signature verified against <source build>/certs/signing_key.x509, exported symbols == the source
+#   module's, so modules.dep / symbols stay valid). Output (refuses if it exists):
+#     modules.tar           = the source modules.tar with ONLY updates/cxl_shm.ko replaced (member order and metadata
+#                             kept; this is the separate stage copy, written as an archive: <source build>/stage and the
+#                             source bundle stay untouched); modules-manifest.json / signatures.txt / preparation.sha256
+#                             rebuilt (every other module sha256 == the source manifest)
+#     tools/                = the source tools + cxl_shm.ko (the new module) with popcorn.env KO_SHA = its sha256,
+#                             KO_PATH="$H/cxl_shm.ko" (p-popcorn-guest.sh loads the shipped file) and KO_VERSION (module
+#                             version; p-popcorn-shm.sh checks it after every insmod); new tools.sha256
+#     p-popcorn-deploy.sh, p-popcorn-shm.sh = the repo copies (KO_PATH-aware tools phase / KO_VERSION load check)
+#     everything else (kernel.config, guest prepare scripts, smoke*, params-layout.txt, vm*/ XMLs) copied unchanged
+#   Install on guests that already run <K> from the source bundle: p-popcorn-deploy.sh tools with C = this bundle and a
+#   NEW GT (no reboot, no /lib/modules change; precheck..normal are for a fresh disk only). Rollback = keep using the
+#   source bundle's GT (its popcorn.env loads the installed 13.0 module). DRY=1: every check, no write.
+if [ "${1:-}" = --module-override ]; then
+  set -euo pipefail; umask 022
+  ROOT=/home/comsys/sungsu/destijl-control
+  DEP=$(cd "$(dirname "$(readlink -f "$0")")" && pwd)
+  SRC=$(readlink -f "${2:?source bundle}"); MB=$(readlink -f "${3:?module build dir}"); v=${4:?bundle version}
+  [[ $v =~ ^[0-9]+$ ]] || { echo "STOP: bad bundle version"; exit 2; }
+  OUT=$MB/deploy-v$v SB=$(dirname "$SRC")
+  stop() { echo "STOP: $*"; exit 1; }
+  test ! -e "$OUT" || stop "$OUT exists"
+  [ "$SB" != "$MB" ] || stop "the module build dir must not be the source build dir"
+  (cd "$SRC" && sha256sum --quiet -c packet.sha256) || stop "$SRC fails its packet.sha256"
+  (cd "$SRC/tools" && sha256sum --quiet -c tools.sha256) || stop "$SRC/tools fails tools.sha256"
+  r() { python3 -I -c 'import json,sys; print(json.load(open(sys.argv[1]))[sys.argv[2]])' "$1" "$2"; }
+  K=$(r "$SRC/package-record.json" release)
+  [ "$(r "$MB/build-record.json" release)" = "$K" ] || stop "module build release != source bundle release $K"
+  KO=$MB/stage/lib/modules/$K/updates/cxl_shm.ko KOS=$(r "$MB/build-record.json" cxl_shm_ko_signed_sha256)
+  KOV=$(r "$MB/build-record.json" module_version)
+  [ "$(sha256sum < "$KO" | cut -c1-64)" = "$KOS" ] || stop "$KO sha256 != build-record cxl_shm_ko_signed_sha256"
+  [ "$(modinfo -F version "$KO")" = "$KOV" ] || stop "$KO version != $KOV"
+  [ "$(modinfo -F vermagic "$KO" | cut -d' ' -f1)" = "$K" ] || stop "$KO vermagic != $K"
+  OKO=$SB/stage/lib/modules/$K/updates/cxl_shm.ko
+  [ "$(sha256sum < "$OKO" | cut -c1-64)" = "$(sed -n 's/^KO_SHA=//p' "$SRC/tools/popcorn.env")" ] || stop "$OKO is not the source bundle's module"
+  ksym() { readelf -Ws "$1" | awk '$8 ~ /^__ksymtab_/ {print $8}' | sort; }
+  [ "$(ksym "$KO")" = "$(ksym "$OKO")" ] || stop "exported symbols of $KO differ from $OKO (modules.dep / symbols would change)"
+  grep -q 'KO_PATH' "$SRC/tools/p-popcorn-guest.sh" || stop "source guest script has no KO_PATH support"
+  for f in p-popcorn-deploy.sh p-popcorn-shm.sh; do bash -n "$DEP/$f" || stop "$DEP/$f"; done
+  grep -q 'KO_VERSION' "$DEP/p-popcorn-shm.sh" && grep -q 'KO_PATH' "$DEP/p-popcorn-deploy.sh" || stop "repo p-popcorn-shm.sh / p-popcorn-deploy.sh lack KO_VERSION / KO_PATH support"
+  SCR=$(mktemp -d "${TMPDIR:-/tmp}/p-popcorn-modover.XXXXXX"); trap 'rm -rf "$SCR"' EXIT
+  python3 -I - "$KO" "$SB/certs/signing_key.x509" "$SCR" <<'PY' || stop "signature of the new module"
+import pathlib, subprocess, sys
+ko, cert, scr = pathlib.Path(sys.argv[1]), sys.argv[2], pathlib.Path(sys.argv[3])
+magic = b'~Module signature appended~\n'
+data = ko.read_bytes(); assert data.endswith(magic), 'unsigned'
+t = data[-len(magic) - 12:-len(magic)]; n = int.from_bytes(t[8:12], 'big'); assert t[2] == 2 and 0 < n < len(data)
+(scr / 'u').write_bytes(data[:-len(magic) - 12 - n]); (scr / 's').write_bytes(data[-len(magic) - 12 - n:-len(magic) - 12])
+subprocess.run(['openssl', 'x509', '-inform', 'DER', '-in', cert, '-out', scr / 'c.pem'], check=True)
+subprocess.run(['openssl', 'cms', '-verify', '-binary', '-inform', 'DER', '-in', scr / 's', '-content', scr / 'u', '-certfile',
+                scr / 'c.pem', '-nointern', '-noverify', '-out', '/dev/null'], check=True, stderr=subprocess.DEVNULL)
+print('cxl_shm.ko signature verified against the source build certificate')
+PY
+  echo "module override: $SRC ($K, module $(sed -n 's/^KO_SHA=//p' "$SRC/tools/popcorn.env" | cut -c1-12)) + $KO ($KOV, $(cut -c1-12 <<< "$KOS")) -> $OUT"
+  if [ "${DRY:-0}" = 1 ]; then echo "MODULE OVERRIDE DRY PASS (nothing written; $OUT absent)"; exit 0; fi
+  mkdir "$OUT"
+  # copy the source bundle except the files rebuilt below
+  (cd "$SRC" && find . -type f ! -name packet.sha256 ! -name modules.tar ! -name modules-manifest.json ! -name signatures.txt \
+     ! -name preparation.sha256 ! -name package-record.json ! -path './tools/*' ! -name p-popcorn-deploy.sh ! -name p-popcorn-shm.sh -print0 |
+     xargs -0 cp --parents -t "$OUT")
+  cp "$DEP/p-popcorn-deploy.sh" "$DEP/p-popcorn-shm.sh" "$OUT/"
+  mkdir "$OUT/tools"; cp "$SRC/tools/faultlat" "$SRC/tools/run.sh" "$SRC/tools/cxl_region.yaml" "$SRC/tools/p-popcorn-guest.sh" "$OUT/tools/"
+  cp "$KO" "$OUT/tools/cxl_shm.ko"
+  { sed '/^KO_SHA=/d; /^KO_PATH=/d; /^KO_VERSION=/d; 1s/.*/# Popcorn guest expectations (module override bundle: tools\/cxl_shm.ko; read by p-popcorn-guest.sh)/' "$SRC/tools/popcorn.env"
+    echo "KO_SHA=$KOS"; echo 'KO_PATH="$H/cxl_shm.ko"'; echo "KO_VERSION=$KOV"; } > "$OUT/tools/popcorn.env"
+  (cd "$OUT/tools" && sha256sum faultlat run.sh cxl_region.yaml p-popcorn-guest.sh popcorn.env cxl_shm.ko > tools.sha256)
+  python3 -I - "$SRC" "$OUT" "$KO" "$K" <<'PY' || stop "modules.tar / manifest"
+import hashlib, json, pathlib, sys, tarfile
+src, out, ko, rel = pathlib.Path(sys.argv[1]), pathlib.Path(sys.argv[2]), pathlib.Path(sys.argv[3]), sys.argv[4]
+def sha(p):
+    h = hashlib.sha256()
+    with open(p, 'rb') as f:
+        for b in iter(lambda: f.read(1 << 20), b''): h.update(b)
+    return h.hexdigest()
+m = json.loads((src / 'modules-manifest.json').read_text())
+assert m['release'] == rel and m['archive_sha256'] == sha(src / 'modules.tar'), 'source manifest / archive mismatch'
+want = 'updates/cxl_shm.ko'; hit = 0
+with tarfile.open(src / 'modules.tar') as ti, tarfile.open(out / 'modules.tar', 'w', format=ti.format) as to:
+    for mem in ti:
+        name = mem.name[2:] if mem.name.startswith('./') else mem.name
+        if mem.isfile() and name == want:
+            mem.size = ko.stat().st_size
+            with open(ko, 'rb') as f: to.addfile(mem, f)
+            hit += 1
+        elif mem.isfile():
+            f = ti.extractfile(mem); d = f.read()
+            if name in m['modules']: assert hashlib.sha256(d).hexdigest() == m['modules'][name], f'source member {name} != manifest'
+            import io; to.addfile(mem, io.BytesIO(d))
+        else:
+            to.addfile(mem)
+assert hit == 1, f'{want} found {hit} times in the source modules.tar'
+m['modules'][want] = sha(ko); m['archive_sha256'] = sha(out / 'modules.tar')
+(out / 'modules-manifest.json').write_text(json.dumps(m, indent=1, sort_keys=True) + '\n')
+(out / 'signatures.txt').write_text(f'{len(m["modules"])} modules: {len(m["modules"]) - 1} byte-identical to {src} (signed and verified '
+                                    f'there); {want} replaced by {ko} (signature verified against the source build certificate)\n')
+print(f'modules.tar rebuilt: {want} -> {m["modules"][want]}')
+PY
+  (cd "$OUT" && sha256sum modules-manifest.json kernel.config prepare-guest.sh sanitize-initrd.py verify-module-payload.py verify-initrd.py > preparation.sha256)
+  python3 -I - "$SRC/package-record.json" "$OUT/package-record.json" "$MB" "$KOS" "$KOV" "$SRC" "$(git -C "$DEP" rev-parse HEAD)" "$(git -C "$DEP" status --porcelain -- . | wc -l)" <<'PY'
+import datetime, json, sys
+s = json.load(open(sys.argv[1]))
+s.update({"kind": "module override bundle", "source_bundle": sys.argv[6], "module_build": sys.argv[3], "cxl_shm_ko_sha256": sys.argv[4],
+          "cxl_shm_module_version": sys.argv[5], "cxl_shm_ko_install": "tools/cxl_shm.ko (KO_PATH); modules.tar carries the same file",
+          "deploy_scripts_commit": sys.argv[7], "deploy_scripts_dirty_files": int(sys.argv[8]),
+          "created": datetime.datetime.now().astimezone().isoformat(timespec="seconds")})
+json.dump(s, open(sys.argv[2], "w"), indent=1); open(sys.argv[2], "a").write("\n")
+PY
+  (cd "$OUT" && find . -type f ! -name packet.sha256 -print0 | LC_ALL=C sort -z | xargs -0 sha256sum > packet.sha256)
+  (cd "$OUT" && sha256sum --quiet -c packet.sha256 && python3 -I verify-module-payload.py) || stop "post-check"
+  echo "MODULE OVERRIDE PASS $OUT packet $(sha256sum < "$OUT/packet.sha256" | cut -c1-64)"
+  exit 0
+fi
 set -euo pipefail
 umask 022
 n=${1:?build number}; v=${2:?bundle version}
