@@ -12,8 +12,10 @@ summary per step and stream) or loadgen/steps.jsonl, plus per-step server counte
 (system, mix, N) comes from the nearest path component named like <sys>-<mix>[-n<N>] (sys in hw, pop, mg, mgoff,
 ds; e.g. block/pop-u50-n2/slo, S-pop-u5, pop-u400/slo); N falls back to the number of stats targets.
 
-Outputs in OUT_DIR (all CSV, one row per cell x step unless noted; pooled rows use step = L1 / MAX):
-  cells.csv                 one row per part: identity, workload, source dir, L1 / MAX selection
+Outputs in OUT_DIR (all CSV, one row per cell x step unless noted; pooled rows use step = L1 / MAX / PMAX):
+  cells.csv                 one row per part: identity, workload, source dir, L1 / MAX / PMAX selection
+  (run 2: a part named "pmax" = h2n-block.sh H2N_PMAX, the fixed step at Popcorn's max under SLO of the cell; its
+   steps get sel / pooled step PMAX and never L1: select step == "PMAX" for the fault breakdown at Popcorn's max load)
   fig-latency-vs-rps.csv    per measured step: offered / achieved rates, p50/p95/p99/SLO-percentile latency
   fig-max-under-slo.csv     per cell: max rate under SLO (SLO stream /s and total offered req/s)
   fig-flushed-lines-l1.csv  per vector DB cell at the L1 step: average flushed cache lines per search
@@ -228,6 +230,10 @@ class Cell:
         self.slo_stream, self.slo_pct, self.slo_ms = slo_of(self.steps, self.workload)
         self.h2n = self.h2n_row()
         self.l1, self.l1_src, self.l1_rate = [], "", None
+        # run 2 (h2n-block.sh H2N_PMAX): part "pmax" = the fixed step at Popcorn's max of the cell (fault breakdown
+        # at high load); its steps are labelled PMAX, never L1
+        self.is_pmax = self.subpart.split("/")[0] == "pmax"
+        self.pm, self.pm_rate = [], None
         self.mx, self.mx_src = self.max_steps()
         self.ds_status, self.ds_status_note = None, ""
 
@@ -324,6 +330,11 @@ def choose_l1(cells, override):
                 rate, src = min(maxes), "min max-under-SLO"
         for c in cs:
             fx = [n for n in c.steps if c.steps[n]["phase"] in FIXED_PHASES]
+            if c.is_pmax:  # run 2 pmax part: PMAX steps (fixed steps at the top rate), no L1
+                if fx:
+                    top = max(c.steps[n]["offered_x"] for n in fx)
+                    c.pm, c.pm_rate = sorted(n for n in fx if c.steps[n]["offered_x"] == top), top
+                continue
             if fx:
                 top = max(c.steps[n]["offered_x"] for n in fx)
                 c.l1 = sorted(n for n in fx if c.steps[n]["offered_x"] == top)
@@ -674,7 +685,7 @@ def staleness(c, t):
 ID = ["run", "workload", "system", "mix", "N", "lifetime", "part"]
 COLS = {
     "cells.csv": ID + ["slo_stream", "slo_pct", "slo_ms", "n_steps", "stats_steps", "l1_steps", "l1_src", "l1_rate",
-                       "max_steps", "max_src", "source_dir"],
+                       "max_steps", "max_src", "pmax_steps", "pmax_rate", "source_dir"],
     "fig-latency-vs-rps.csv": ID + ["step", "phase", "sel", "measure_s", "offered_total", "achieved_total",
                                     "slo_offered", "slo_achieved", "slo_p50_ms", "slo_p95_ms", "slo_p99_ms",
                                     "slo_pslo_ms", "slo_pct", "slo_ms", "within_slo", "pass", "aborted",
@@ -736,6 +747,8 @@ def sel_of(c, n):
         s.append("L1")
     if n in c.mx:
         s.append("MAX" if c.mx_src != "floor" else "FLOOR")
+    if n in c.pm:
+        s.append("PMAX")
     return ";".join(s)
 
 
@@ -746,6 +759,8 @@ def step_sets(c):
         out.append(("L1", c.l1, "L1"))
     if c.mx and all(n in c.stats for n in c.mx):
         out.append(("MAX" if c.mx_src != "floor" else "FLOOR", c.mx, "MAX" if c.mx_src != "floor" else "FLOOR"))
+    if c.pm and all(n in c.stats for n in c.pm):
+        out.append(("PMAX", c.pm, "PMAX"))
     return out
 
 
@@ -781,7 +796,8 @@ def extract(roots, out_dir, systems, override):
         R["cells.csv"].append({**I, "slo_stream": c.slo_stream, "slo_pct": c.slo_pct, "slo_ms": c.slo_ms,
                                "n_steps": len(c.steps), "stats_steps": len(c.stats),
                                "l1_steps": " ".join(map(str, c.l1)), "l1_src": c.l1_src, "l1_rate": c.l1_rate,
-                               "max_steps": " ".join(map(str, c.mx)), "max_src": c.mx_src, "source_dir": c.part})
+                               "max_steps": " ".join(map(str, c.mx)), "max_src": c.mx_src,
+                               "pmax_steps": " ".join(map(str, c.pm)), "pmax_rate": c.pm_rate, "source_dir": c.part})
         others = [s for s in sorted({k for st in c.steps.values() for k in st["streams"]}) if s != c.slo_stream]
         for n in sorted(c.steps):
             s = c.steps[n]

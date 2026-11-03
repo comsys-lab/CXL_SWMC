@@ -24,7 +24,13 @@ TREE=$(cd "$EVD/../.." && pwd)
 #   RUNSETS          [run] the run sets this config may drive (others refuse it); empty = all
 #   EVIDENCE_TAG     [run] evidence dir tag instead of the run set name (evidence_dir; e.g. h1-u10u95.conf vdb-u10u95);
 #                    a driver that sets its own EVIDENCE_TAG after sourcing this file (runset-h2n.sh) overrides it
+#   POP_RECV_MODE    Popcorn lifetimes' cxl_shm recv_mode (default RECV_MODE; run 2: adaptive for ds AND pop)
+#   POP_ADAPT_KO     signed adaptive cxl_shm.ko the Popcorn bundle installs (required for POP_RECV_MODE=adaptive;
+#                    recv-mode.sh: sha256 = KO_SHA of the bundle's popcorn.env, srcversion checked on the guests)
+#   RECV_IPOLL       0 | 1: adaptive idle pollers written after the enable (0 = pollers-off cell); unset = default 1
+#   (De Stijl fault-entry polling: fault_poll=0|1 in H2N_DS_RECV_EXTRA / RS_DS_RECV_EXTRA; build-9 bundles load 0)
 unset REGISTRY LEVELS_SOURCE LEVELS_REGISTRY RS_PROC_CXL_SHM RUNSETS EVIDENCE_TAG EXPORT_SUFFIX
+unset POP_RECV_MODE POP_ADAPT_KO RECV_IPOLL
 unset RS_V7 RS_V7_IMAGE RS_V7_DENSE RS_V7_LR RS_V7_ACC_INIT RS_V7_TRAIN_BATCH RS_V7_TRAIN_THREADS RS_V7_W_S \
   RS_V7_STALE_SAMPLE RS_V7_STALE_DIR RS_V7_SAMPLES RS_V7_FROZEN   # v7 keys come only from the conf
 CONFSH=$(python3 -I -B "$EVD/evalconf.py" shell ${EVAL_CONF:+--conf "$EVAL_CONF"}) || { echo "RUNSET STOP: ${EVAL_CONF:-eval.conf} does not parse"; exit 2; }
@@ -122,6 +128,17 @@ manifest() {  # written into E at the real start
     [ "$WL" != recsys ] || echo "EVAL_RS_LEAN=${EVAL_RS_LEAN:-0} (1 = confirm probes capped at 3)"
   } > "$E/eval-manifest.txt"
 }
+# receiver keys of the conf for the blocks (recv-mode.sh): RECVENV = POP_RECV_MODE / POP_ADAPT_KO / RECV_IPOLL
+# assignments (only the set ones); recv_pop_check <N>: the Popcorn mode is allowed for POP_C (adaptive: POP_ADAPT_KO)
+. "$EVD/recv-mode.sh"
+RECVENV=()
+for _v in POP_RECV_MODE POP_ADAPT_KO RECV_IPOLL; do [ -z "${!_v:-}" ] || RECVENV+=("$_v=${!_v}"); done
+[[ ${RECV_IPOLL:-} =~ ^[01]?$ ]] || { echo "RUNSET STOP: bad RECV_IPOLL (${RECV_IPOLL})"; exit 2; }
+recv_pop_check() {  # <N>
+  local why m=${POP_RECV_MODE:-$RECV_MODE}
+  why=$(recv_rules pop "$m" "$POP_C" "$1") || die "Popcorn receiver: $why"
+  plan "receiver: Popcorn recv_mode $m${POP_ADAPT_KO:+ module $POP_ADAPT_KO (srcversion $(recv_pop_srcversion))} ipoll ${RECV_IPOLL:-default}"
+}
 ring_check() {  # REGION's msg_ring must equal the Popcorn bundle's region (cxl_shm module parameters come from it)
   [ "$(grep -E '^msg_ring:' "$REGION" | cut -d'#' -f1 | tr -d ' ')" = "$(grep -E '^msg_ring:' "$POP_C/tools/cxl_region.yaml" | cut -d'#' -f1 | tr -d ' ')" ] \
     || die "REGION msg_ring differs from the Popcorn bundle's region"
@@ -136,6 +153,7 @@ rs_env() {
     MG_COH_SAMPLE=$RS_MG_COH_SAMPLE EXPECT_DAX_UUID=$EXPECT_DAX_UUID STREAM_FIX_S=$RS_FIX_S
     STREAM_FIX_SETTLE_S=$RS_FIX_SETTLE_S H1_MEASURE_RUN=1)
   [ -z "${RS_PROC_CXL_SHM:-}" ] || RSENV+=(STREAM_PROC_CXL_SHM=$RS_PROC_CXL_SHM)
+  [ ${#RECVENV[@]} = 0 ] || RSENV+=("${RECVENV[@]}")   # receiver keys (recv-mode.sh; main-block.sh checks them)
   # RS_SLO_MS 400 (user 2026-11-02, 4 vCPU): main-block.sh STREAM_SLO_MS; 100 = its built-in value (env unchanged)
   [ "$RS_SLO_MS" = 100 ] || RSENV+=(STREAM_SLO_MS=$RS_SLO_MS)
   # env EVAL_RS_LEAN=1 (eval3 schedule §1 cell-time cut, only when late): loadgen confirm probes capped at 3
@@ -210,9 +228,9 @@ h3_ds_env() {  # <Host server binary of the block>: sets HASDS (0 | 1) and DSENV
   for x in H3_DS_C H3_DS_K H3_DS_GT H3_DS_BUNDLE_SHA; do [ -n "${!x:-}" ] || die "ds needs $x in $EVAL_CONF"; done
   [[ $H3_DS_K == *-ds-destijl-* ]] || die "H3_DS_K=$H3_DS_K is not a De Stijl release (-ds-destijl-<n>)"
   [[ $t =~ ^(0|[1-9][0-9]*)$ ]] || die "bad H3_DS_T_US ($t: integer us, 0 = synchronous)"
-  [[ $RECV_MODE =~ ^(poll|sleep)$ ]] || die "RECV_MODE=$RECV_MODE: De Stijl (cxl_shm v13 protocol=destijl) refuses idle"
   dsc=$H3_DS_C dsr=${H3_DS_REGION:-$TREE/config/cxl_region-destijl.yaml}
   need_files "$dsc/p-destijl-shm.sh" "$dsc/packet.sha256" "$dsr"
+  x=$(recv_rules ds "$RECV_MODE" "$dsc" "${H3_N:-2}") || die "De Stijl receiver: $x"
   [ "$(sha256sum < "$dsc/packet.sha256" | cut -c1-64)" = "$H3_DS_BUNDLE_SHA" ] || die "De Stijl bundle packet.sha256 != H3_DS_BUNDLE_SHA"
   [ "$t" = 0 ] || grep -qa de_stijl_set_staleness "$1" || die "H3_DS_T_US=$t needs a server build with libdestijl ($1 has none)"
   DSENV=(DS_C=$dsc DS_K=$H3_DS_K DS_GT=$H3_DS_GT DS_BUNDLE_SHA=$H3_DS_BUNDLE_SHA DS_REGION=$dsr H3_DS_T_US=$t)

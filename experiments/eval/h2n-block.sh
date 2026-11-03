@@ -72,6 +72,24 @@
 #                       then this block's own h2n-results.tsv (an mg lifetime earlier in the same block wins). No mg row
 #                       anywhere: NOTE, the lifetime runs without the step (E/l1.tsv says so). E/l1.tsv: one row per
 #                       lifetime (L1, source, appended, l1 part status, achieved search/s, search p99 ms).
+#   Receiver (run 2, experiments/eval/recv-mode.sh rules): RECV_MODE poll | idle | sleep | adaptive (ds: poll | sleep |
+#                       adaptive); POP_RECV_MODE (optional, default RECV_MODE) = the Popcorn lifetimes' mode; Popcorn
+#                       adaptive needs POP_ADAPT_KO (signed adaptive cxl_shm.ko = KO_SHA of C8/tools/popcorn.env;
+#                       the guest's srcversion is checked after the load); adaptive needs ring_coherent=1 (bundle
+#                       PARAMS, guest readback). RECV_IPOLL 0 | 1 (optional, adaptive only): ipoll written on every VM
+#                       after the enable (0 = pollers-off cell). H2N_DS_RECV_EXTRA also takes fault_poll=0|1 (build 9
+#                       bundles load fault_poll=0 by default; adaptive ds lifetimes are checked at fault_poll=0 unless
+#                       the extra says 1). After the enable every VM's recv-readback.sh line (parameters, srcversion,
+#                       cxl_recv / cxl_ipoll thread CPU) joins recv-mode-<name>.txt; after the run the same line goes
+#                       to recv-post-<name>.txt (lifetime receiver and poller CPU = post - pre, per VM).
+#   H2N_PMAX=1         pop / ds lifetimes append ONE fixed step "pmax" at Popcorn's max under the SLO of the cell (fault
+#                       breakdown at high load, user 2026-11-03 Q9): rate (offered ops/s) = pmax_decide.py over the pop
+#                       row of the cell: a pop lifetime uses its own slo part (run.sh PART_RATE_CMD right after the slo
+#                       part, same lifetime), a ds lifetime the pop-<mix>-n<N>[-r<j>] row of H2N_PMAX_FROM (globs, {MIX}
+#                       {N} {RUN} replaced; newest version last) of the same run. No confirmed pop max: the step is
+#                       skipped (pmax.tsv says why). Windows H2N_PMAX_WARMUP_S (15) + H2N_PMAX_MEASURE_S (90) +
+#                       H2N_PMAX_DRAIN_S (5), no --slo; the pmax part follows the l1 part when both are on. E/pmax.tsv:
+#                       one row per pop / ds lifetime (rate, source, part status, achieved search/s, p99).
 #   H2N_ACCURACY_EXPORT=1  <run>/accuracy-export.txt per lifetime: searches.bin (all responses, ref_w = E1 snapshot),
 #                       e1.sample.bin (500 measured OK searches, compute_gt.py input), w range (w_start, next_w) per part,
 #                       writes file + data dir with sha256, T, replica mode: the inputs of the offline recall@10
@@ -102,7 +120,10 @@ N=$H2N_N VCPU=$H2N_VCPU STRICT=${H2N_OPCOH_STRICT:-0} CXLBW=${H2N_CXLBW:-0} HOST
 [[ $N =~ ^[2-8]$ ]] || die "H2N_N must be 2..8"
 [[ $VCPU =~ ^[2-9]$|^[1-9][0-9]$ ]] || die "bad H2N_VCPU"
 [[ $EVAL_RUN =~ ^[1-9]$ ]] && [[ $SEED =~ ^[0-9]+$ ]] || die "bad EVAL_RUN / SEED"
-[[ $RECV_MODE =~ ^(poll|idle|sleep)$ ]] || die "bad RECV_MODE"
+. "$EV/recv-mode.sh"
+[[ $RECV_MODE =~ ^(poll|idle|sleep|adaptive)$ ]] || die "bad RECV_MODE"
+PRM=${POP_RECV_MODE:-$RECV_MODE} IPOLL=${RECV_IPOLL:-}
+[[ $IPOLL =~ ^[01]?$ ]] || die "bad RECV_IPOLL ($IPOLL: 0 | 1)"
 [[ $STRICT =~ ^[01]$ ]] && [[ $CXLBW =~ ^[01]$ ]] && [[ $HOSTCPU =~ ^[01]$ ]] || die "bad H2N_OPCOH_STRICT / H2N_CXLBW / H2N_HOSTCPU"
 [[ $X_MAXD =~ ^[1-9][0-9]*$ ]] || die "bad X_MAXD"
 # lifetimes: <sys>:<mix> or <sys>:<mix>:r<j> (repeat j, runset-h2n.sh H2N_REPEATS; run dir <sys>-<mix>-n<N>-r<j>), no
@@ -187,15 +208,16 @@ fi
 [ "$DXAT" = enable ] || [ -f "$EV/damonx-hook.sh" ] || die "missing $EV/damonx-hook.sh"
 [ "$REPL" = off ] || [ $HASDS = 1 ] || echo "BLOCK NOTE: H2N_DS_REPLICA_MODE=$REPL applies to ds lifetimes only (none in this block)"
 DSRX=${H2N_DS_RECV_EXTRA:-}
-[[ $DSRX =~ ^((idle_sleep_us|idle_spin_us)=[0-9]+( |$))*$ ]] \
-  || die "bad H2N_DS_RECV_EXTRA ($DSRX: 'idle_sleep_us=<n> idle_spin_us=<n>', either or both)"
+[[ $DSRX =~ ^(((idle_sleep_us|idle_spin_us)=[0-9]+|fault_poll=[01])( |$))*$ ]] \
+  || die "bad H2N_DS_RECV_EXTRA ($DSRX: 'idle_sleep_us=<n> idle_spin_us=<n> fault_poll=<0|1>', any subset)"
+DSFP=0; [[ " $DSRX " != *" fault_poll=1 "* ]] || DSFP=1   # adaptive ds lifetimes: fault_poll checked at this value
 [ -z "$DSRX" ] || [ $HASDS = 1 ] || echo "BLOCK NOTE: H2N_DS_RECV_EXTRA applies to ds lifetimes only (none in this block)"
 [ $HAST = 0 ] || [ -z "${H2N_FIXED:-}" ] || die "ds:<mix>:t<T> lifetimes are SLO lifetimes (not with H2N_FIXED)"
 if [ $DSKER = 1 ]; then
   [ $HASPOP = 0 ] || die "pop and ds lifetimes need different guest kernels: run them in separate blocks"
   : "${DS_C:?}" "${DS_BUNDLE_SHA:?}" "${DS_K:?}" "${DS_GT:?}"
   [[ $DS_K == *-ds-destijl-* ]] || die "DS_K=$DS_K is not a De Stijl release (-ds-destijl-<n>)"
-  [[ $RECV_MODE =~ ^(poll|sleep)$ ]] || die "RECV_MODE=$RECV_MODE: De Stijl (cxl_shm v13 protocol=destijl) refuses idle"
+  if [ $HASDS = 1 ]; then why=$(recv_rules ds "$RECV_MODE" "$DS_C" "$N") || die "De Stijl receiver: $why"; fi
   DST=${H2N_DS_T_US:-0}
   if [ "$DST" = @MAIN_T@ ]; then  # eval3-b2.conf before the main T is decided (block A recall): never a real run
     pending "H2N_DS_T_US is the placeholder @MAIN_T@ (main T not decided yet; fill it from block A's recall rule)"; DST=0
@@ -211,6 +233,22 @@ L1ON=${H2N_L1:-0} L1FROM=${H2N_L1_FROM:-} L1W=${H2N_L1_WARMUP_S:-15} L1M=${H2N_L
 [ $L1ON = 0 ] || [ -z "${H2N_FIXED:-}" ] || die "H2N_L1 appends to SLO lifetimes (not with H2N_FIXED)"
 L1START=$(echo " $H2N_SLO_PART " | sed -n 's/.* --start \([0-9.]*\) .*/\1/p')
 [ $L1ON = 0 ] || [[ $L1START =~ ^[0-9]+(\.[0-9]+)?$ ]] || die "H2N_L1: no --start <rate> in H2N_SLO_PART"
+# run-2 pmax step (H2N_PMAX; header): Popcorn's max under the SLO of the cell, decided by pmax_decide.py right before
+# the part (run.sh PART_RATE_CMD, token @RATE@)
+PMON=${H2N_PMAX:-0} PMFROM=${H2N_PMAX_FROM:-} PMW=${H2N_PMAX_WARMUP_S:-15} PMM=${H2N_PMAX_MEASURE_S:-90} PMD=${H2N_PMAX_DRAIN_S:-5}
+[[ $PMON =~ ^[01]$ ]] && [[ $PMW =~ ^[0-9]+$ ]] && [[ $PMM =~ ^[1-9][0-9]*$ ]] && [[ $PMD =~ ^[0-9]+$ ]] \
+  || die "bad H2N_PMAX / H2N_PMAX_WARMUP_S / H2N_PMAX_MEASURE_S / H2N_PMAX_DRAIN_S"
+[ $PMON = 0 ] || [ -z "${H2N_FIXED:-}" ] || die "H2N_PMAX appends to SLO lifetimes (not with H2N_FIXED)"
+[ $PMON = 0 ] || [ -f "$EV/pmax_decide.py" ] || die "missing $EV/pmax_decide.py"
+[ -z "$PMFROM" ] || [ $PMON = 1 ] || die "H2N_PMAX_FROM without H2N_PMAX=1"
+pm_from() {  # <mix>: --from arguments of a ds lifetime (H2N_PMAX_FROM globs, {MIX} {N} {RUN}; then this block's tsv)
+  local g f
+  for g in $PMFROM; do
+    g=${g//\{MIX\}/$1}; g=${g//\{N\}/$N}; g=${g//\{RUN\}/$EVAL_RUN}
+    for f in $(ls -d $g 2>/dev/null | sort -V); do printf -- '--from %s ' "$f"; done
+  done
+  printf -- '--from %s' "$E/h2n-results.tsv"
+}
 l1_resolve() {  # <mix>: sets L1V (offered ops/s | none) L1A (1 = append the step) L1S (source); l1_decide.py
   local g f out FILES=()
   for g in $L1FROM; do
@@ -240,9 +278,9 @@ declare -A FPARTS=()   # sys -> "part ..."
 FDET=0
 for t in $FIXED; do
   IFS=/ read -r fs fp fd fr frt fw fm fdr <<< "$t"
-  [[ $fs =~ ^(hw|pop|ds|mg|mgoff)(@u[0-9]+)?$ ]] && [[ $fp =~ ^[a-z0-9]+$ ]] && [[ $fd =~ ^(0|1|-)$ ]] && [[ $fr =~ ^(poll|idle|sleep|-)$ ]] \
+  [[ $fs =~ ^(hw|pop|ds|mg|mgoff)(@u[0-9]+)?$ ]] && [[ $fp =~ ^[a-z0-9]+$ ]] && [[ $fd =~ ^(0|1|-)$ ]] && [[ $fr =~ ^(poll|idle|sleep|adaptive|-)$ ]] \
     && [[ $frt =~ ^[0-9.]+(,[0-9.]+)*$ ]] && [[ $fw =~ ^[0-9]+$ ]] && [[ $fm =~ ^[1-9][0-9]*$ ]] && [[ $fdr =~ ^[0-9]+$ ]] \
-    || die "bad H2N_FIXED token $t (<sys>/<part>/<0|1|->/<poll|idle|sleep|->/<rates>/<warmup>/<measure>/<drain>)"
+    || die "bad H2N_FIXED token $t (<sys>/<part>/<0|1|->/<poll|idle|sleep|adaptive|->/<rates>/<warmup>/<measure>/<drain>)"
   [ ${fs%%@*} = pop ] || [ "$fd:$fr" = "-:-" ] || die "H2N_FIXED $t: detail / recv_mode only for pop"
   [[ " ${FPARTS[$fs]:-} " == *" $fp "* ]] && die "H2N_FIXED: part $fp twice for $fs"
   [ "$fd" = 1 ] && FDET=1
@@ -264,6 +302,19 @@ else
 [ -f "$REGION" ] && [ "$(sha256sum < "$C8/packet.sha256" | cut -c1-64)" = "$POP_BUNDLE_SHA" ] \
   && (cd "$C8" && sha256sum -c --quiet packet.sha256) || die "REGION or the Popcorn bundle ($C8) does not verify"
 fi
+POPSV=-
+if [ $HASPOP = 1 ]; then
+  why=$(recv_rules pop "$PRM" "$C8" "$N") || die "Popcorn receiver: $why"
+  [ "$PRM" != adaptive ] || POPSV=$(recv_pop_srcversion)
+fi
+RMODES=; [ $HASPOP = 0 ] || RMODES+="$PRM"; [ $HASDS = 0 ] || RMODES+="${RMODES:+ }$RECV_MODE"
+[ -z "$IPOLL" ] || [[ " $RMODES " == *" adaptive "* ]] || die "RECV_IPOLL=$IPOLL needs an adaptive pop / ds lifetime (modes: ${RMODES:-none})"
+RB=$EV/recv-readback.sh
+[ -f "$RB" ] || die "missing $RB"
+# poller CPU per step (proc_stats kthread prefix cxl_ipoll) needs a server build that lists it; else only the lifetime
+# total of recv-mode / recv-post files exists
+[[ " $RMODES " != *" adaptive "* ]] || grep -qa cxl_ipoll "$PLAIN_BUILD/bin/vdb-server" \
+  || echo "BLOCK NOTE: $PLAIN_BUILD/bin/vdb-server does not snapshot cxl_ipoll threads per step (only lifetime totals in recv-mode / recv-post files)"
 IPS=() DOMS=()
 for k in $(seq 0 $((N - 1))); do IPS+=(192.168.122.$((100 + k))); DOMS+=(cxl_vm$k); done
 export NODES="${IPS[*]}" VM_DOMAINS="${DOMS[*]}" POP_IPS="${IPS[*]}" EXPECT_RUNNING="${DOMS[*]}"
@@ -359,6 +410,7 @@ echo "BLOCK PLAN: server_args plain=[$SA]${MGSA:+ megalon=[$MGSA]}"
 [ "$REPL" != damon ] || echo "BLOCK PLAN: DAMON at=$DXAT range=$DXRANGE start_keys=[$DXSTART] regions_capture=$DXREG warmup=[${DXWARM:-none}]${DXWARM:+ warm_parts=[$DXWPARTS] nogate=[$DXWNOGATE]}$([ "$DXAT" = enable ] || echo " hook_sha256=$(sha256sum < "$EV/damonx-hook.sh" | cut -c1-64)")"
 [ $L1ON = 0 ] || echo "BLOCK PLAN: L1 step on hw/pop/ds lifetimes: --mode fixed --rates <L1> ${L1W}s warm-up + ${L1M}s + ${L1D}s drain; L1 from mg-<mix>-n$N rows of [${L1FROM:-} + this block]; no mg max -> L1 = ramp start $L1START, no step"
 [ $ACCX = 0 ] || echo "BLOCK PLAN: accuracy export per lifetime (<run>/accuracy-export.txt)"
+echo "BLOCK PLAN: receiver pop=$([ $HASPOP = 1 ] && echo "$PRM${POP_ADAPT_KO:+ ko=$POP_ADAPT_KO srcversion=$POPSV}" || echo -) ds=$([ $HASDS = 1 ] && echo "$RECV_MODE extra=[${DSRX}] fault_poll=$DSFP" || echo -) ipoll=${IPOLL:-default}"
 echo "BLOCK PLAN: $LAYOUT"
 [ -z "$FIXED" ] || echo "BLOCK PLAN: fixed windows (no SLO search) [$FIXED] node_env_extra=[$NENV_X] allow_detail=$ALLOWDET"
 if [ "$DRYB" = 1 ]; then
@@ -367,6 +419,16 @@ if [ "$DRYB" = 1 ]; then
       IFS=: read -r ls lm lr <<< "$l"; [[ $ls =~ ^(hw|pop|ds)$ ]] || continue
       l1_resolve "$lm"; echo "BLOCK PLAN: L1 $l: $L1V append=$L1A ($L1S)"
       [ "$L1A" != 1 ] || echo "BLOCK PLAN: L1 $l parts: PARTS='slo l1' PART_ARGS_slo='--slo search:99:100 <H2N_SLO_PART>' PART_ARGS_l1='--mode fixed --rates $L1V --warmup-s 0 --step-warmup-s $L1W --step-measure-s $L1M --drain-s $L1D'"
+    done
+  fi
+  if [ $PMON = 1 ]; then  # the pmax rate a ds lifetime would get now; a pop lifetime decides from its own slo part
+    for l in "${LIVES[@]}"; do
+      IFS=: read -r ls lm lr <<< "$l"
+      case $ls in
+        pop) echo "BLOCK PLAN: pmax $l: rate = own slo part (pmax_decide.py --summary <run>/slo/loadgen/summary.json), part pmax '--mode fixed --rates @RATE@ --warmup-s 0 --step-warmup-s $PMW --step-measure-s $PMM --drain-s $PMD'";;
+        ds) # shellcheck disable=SC2046
+            echo "BLOCK PLAN: pmax $l: $(python3 -I -B "$EV/pmax_decide.py" --mix "$lm" --nodes "$N" ${lr:+$([[ $lr == r* ]] && echo "--suffix=-$lr")} $(pm_from "$lm") | tr '\t' ' ')";;
+      esac
     done
   fi
   echo "BLOCK DRY STOP: evidence-dir check reached ($E; dry: no lock, no VM contact)"; exit 0
@@ -479,9 +541,11 @@ gate() { bash "$HG" check "$E/gate-$1.txt" > /dev/null || stop "h3 gate ($1; see
   [ $HASMG = 1 ] && echo "megalon_build=$MEG_BUILD lib=$MEG_LIB cfg=$MEG_CFG sha256=$(sha256sum < "$MEG_CFG" | cut -c1-64) vmeg=$VMEG mg_max_deletes=$MG_MAXD"
   echo "writes=$X_WRITES sha256=$(sha256sum < "$X_WRITES" | cut -c1-64) max_deletes=$X_MAXD"
   echo "slo_part=[$H2N_SLO_PART]"
+  echo "receiver: pop_recv_mode=$PRM pop_adapt_ko=${POP_ADAPT_KO:--} pop_adapt_ko_sha256=$([ -f "${POP_ADAPT_KO:-}" ] && sha256sum < "$POP_ADAPT_KO" | cut -c1-64 || echo -) pop_srcversion=$POPSV ds_recv_mode=$RECV_MODE ds_extra=[$DSRX] ds_fault_poll=$DSFP ipoll=${IPOLL:-default} readback_sha256=$(sha256sum < "$RB" | cut -c1-64)"
   [ $DSKER = 0 ] || echo "destijl: bundle=$DS_C bundle_sha=$DS_BUNDLE_SHA release=$DS_K guest_tools=$DS_GT region=$REGION t_us=$DST recv_mode=$RECV_MODE replica_mode=$REPL replica_pool_bytes=${RPOOL:--}${DAMONP:+ damon=[$DAMONP] damon_guest_sha256=$(sha256sum < "$EV/ds-damon-guest.sh" | cut -c1-64)}"
   [ "$REPL" != damon ] || echo "damon: at=$DXAT range=$DXRANGE start_keys=[$DXSTART] regions_capture=$DXREG warmup=[$DXWARM] warm_parts=[$DXWPARTS]$([ "$DXAT" = enable ] || echo " hook_sha256=$(sha256sum < "$EV/damonx-hook.sh" | cut -c1-64)")"
   [ $L1ON = 0 ] || echo "l1: from=[$L1FROM] warmup_s=$L1W measure_s=$L1M drain_s=$L1D ramp_start=$L1START"
+  [ $PMON = 0 ] || echo "pmax: from=[$PMFROM] warmup_s=$PMW measure_s=$PMM drain_s=$PMD decide_sha256=$(sha256sum < "$EV/pmax_decide.py" | cut -c1-64)"
   [ $ACCX = 0 ] || echo "accuracy_export=1"
   [ -z "$FIXED" ] || echo "fixed=[$FIXED] node_env_extra=[$NENV_X] allow_detail=$ALLOWDET (H2N_FIXED: the slo part is not run)"
   for d in "${DOMS[@]}"; do x=$(virsh -c qemu:///system dumpxml --inactive "$d" 2>/dev/null); echo "vm_xml_sha256.$d=$(printf '%s' "$x" | sha256sum | cut -c1-64) bytes=${#x}"; done
@@ -527,15 +591,40 @@ pop_up() {  # <name>
   echo "preload_wall_s=$(( $(date +%s) - t ))" >> "$E/preload-$1.log"
   { grep -q "PRELOAD DONE" "$E/preload-$1.log" && servers_gone; } || stop "preload ($1)"
   env "${PS[@]}" bash $C8/p-popcorn-shm.sh enable >> "$E/block.log" 2>&1 || stop "enable gate"
-  for ip in "${IPS[@]}"; do
-    m=$($SSH comsys@$ip "sudo -n sh -c 'echo $RECV_MODE > /sys/module/cxl_shm/parameters/recv_mode' && cat /sys/module/cxl_shm/parameters/recv_mode" < /dev/null)
-    i=$($SSH comsys@$ip "cat /sys/kernel/swmc/instr/enabled" < /dev/null)
-    echo "$ip recv_mode=$m instr_enabled=$i" >> "$E/recv-mode-$1.txt"
-    [ "$m" = "$RECV_MODE" ] && [ "$i" = 1 ] || stop "recv_mode / instr on $ip ($m, $i)"
-  done
+  recv_apply pop "$1" "$PRM"
   env "${PS[@]}" STATUS_TAG=pre bash $C8/p-popcorn-shm.sh status >> "$E/block.log" 2>&1 || stop "status pre"
 }
+# receiver mode of a lifetime (recv-mode.sh rules): recv_mode (+ RECV_IPOLL for adaptive) on every VM, then the
+# recv-readback.sh line per VM -> recv-mode-<name>.txt ("<ip> recv_mode=.. ... instr_enabled=..", one line per VM:
+# recv_check.py reads it) and checked (mode, ring_coherent, adaptive module, ipoll, fault_poll, Popcorn srcversion)
+recv_apply() {  # <pop|ds> <name> <mode>
+  local s=$1 ip rb i p w x why fp=-
+  [ $s = ds ] && fp=$DSFP
+  [ $s = pop ] && fp=0
+  for ip in "${IPS[@]}"; do
+    w="echo $3 > /sys/module/cxl_shm/parameters/recv_mode"
+    [ -z "$IPOLL" ] || [ "$3" != adaptive ] || w+=" && echo $IPOLL > /sys/module/cxl_shm/parameters/ipoll"
+    $SSH comsys@$ip "sudo -n sh -c '$w'" < /dev/null || stop "$2: recv_mode write on $ip"
+    rb=$($SSH comsys@$ip "bash -s" < "$RB" 2>/dev/null)
+    i=$($SSH comsys@$ip "cat /sys/kernel/swmc/instr/enabled 2>/dev/null || echo absent" < /dev/null)
+    if [ $s = ds ]; then
+      p=$($SSH comsys@$ip "cat /sys/kernel/swmc/page_coherence/protocol" < /dev/null)
+      echo "$ip $rb protocol=$p instr_enabled=$i" >> "$E/recv-mode-$2.txt"
+      [ "$p" = destijl ] || stop "$2: protocol on $ip ($p)"
+      for x in $DSRX; do [[ " $rb " == *" $x "* ]] || stop "$2: receiver parameter $x not applied on $ip ($rb)"; done
+    else
+      echo "$ip $rb instr_enabled=$i" >> "$E/recv-mode-$2.txt"
+      [ "$i" = 1 ] || stop "$2: instr on $ip ($i)"
+    fi
+    why=$(recv_rb_check $s "$3" "$rb" "$([ $s = pop ] && echo "$POPSV" || echo -)" "${IPOLL:--}" "$fp") || stop "$2: receiver on $ip: $why"
+  done
+}
+recv_post() {  # <name>: recv-readback.sh line per VM after the run (lifetime receiver / poller CPU = post - pre)
+  local ip
+  for ip in "${IPS[@]}"; do echo "$ip $($SSH comsys@$ip "bash -s" < "$RB" 2>/dev/null)" >> "$E/recv-post-$1.txt"; done
+}
 pop_down() {
+  recv_post "$1"
   env "${PS[@]}" STATUS_TAG=post bash $C8/p-popcorn-shm.sh status >> "$E/block.log" 2>&1
   servers_gone || stop "servers left (Popcorn teardown not attempted)"
   dax_unused pre-teardown || stop "/dev/dax0.0 in use before the cxl_shm teardown"
@@ -565,15 +654,7 @@ ds_up() {  # <name>
   echo "preload_wall_s=$(( $(date +%s) - t ))" >> "$E/preload-$1.log"
   { grep -q "PRELOAD DONE" "$E/preload-$1.log" && servers_gone; } || stop "preload ($1)"
   env "${DSP[@]}" bash $DS_C/p-destijl-shm.sh enable >> "$E/block.log" 2>&1 || stop "ds enable gate"
-  for ip in "${IPS[@]}"; do
-    m=$($SSH comsys@$ip "sudo -n sh -c 'echo $RECV_MODE > /sys/module/cxl_shm/parameters/recv_mode' && cat /sys/module/cxl_shm/parameters/recv_mode" < /dev/null)
-    p=$($SSH comsys@$ip "cat /sys/kernel/swmc/page_coherence/protocol" < /dev/null)
-    i=$($SSH comsys@$ip "cat /sys/kernel/swmc/instr/enabled 2>/dev/null || echo absent" < /dev/null)
-    t=$($SSH comsys@$ip "echo idle_sleep_us=\$(cat /sys/module/cxl_shm/parameters/idle_sleep_us 2>/dev/null || echo absent) idle_spin_us=\$(cat /sys/module/cxl_shm/parameters/idle_spin_us 2>/dev/null || echo absent)" < /dev/null)
-    echo "$ip recv_mode=$m protocol=$p instr_enabled=$i $t" >> "$E/recv-mode-$1.txt"
-    [ "$m" = "$RECV_MODE" ] && [ "$p" = destijl ] || stop "recv_mode / protocol on $ip ($m, $p)"
-    for x in $DSRX; do [[ " $t " == *" $x "* ]] || stop "receiver parameter $x not applied on $ip ($t)"; done
-  done
+  recv_apply ds "$1" "$RECV_MODE"
   env "${DSP[@]}" STATUS_TAG=pre bash $DS_C/p-destijl-shm.sh status >> "$E/block.log" 2>&1 || stop "ds status pre"
   if [ "$REPL" = damon ] && [ "$DXAT" = ready ]; then  # damonx-hook.sh starts the kdamond after READY; sampler from now
     DAMON_SET=1; damon_sampler_start "$1" 0
@@ -590,6 +671,7 @@ ds_down() {  # <name>
     damon_cmd "$1" stop stop || stop "DAMON stop on a VM (see ds-damon-$1.txt)"
     DAMON_SET=0
   fi
+  recv_post "$1"
   env "${DSP[@]}" STATUS_TAG=post bash $DS_C/p-destijl-shm.sh status >> "$E/block.log" 2>&1
   if [ "$REPL" = all ]; then  # a full pool maps CXL directly (replicated and unreplicated pages mixed): recorded, NOTE
     for ip in "${IPS[@]}"; do
@@ -676,7 +758,7 @@ sys_up() {  # <sys> <name>: dax owner (hw, mg, mgoff: comsys) + Popcorn / De Sti
   esac
 }
 sys_down() {  # <sys> <name>: Popcorn / De Stijl teardown after the lifetime (nothing for the others)
-  case $1 in pop) pop_down;; ds) ds_down "$2";; esac
+  case $1 in pop) pop_down "$2";; ds) ds_down "$2";; esac
 }
 ds_recv() {  # <name>: recv_check.py on this ds lifetime (needs its teardown files and stats-steps.csv); FAIL stops
   python3 -I -B $EV/recv_check.py "$E" --mode "$RECV_MODE" --name "$1" --out "$E/recv-check-$1.txt" > /dev/null 2>&1
@@ -742,7 +824,7 @@ acc_export() {  # <name> <run dir> <parts> <sys> <T us>: inputs of the offline r
   } > "$2/accuracy-export.txt"
 }
 vdb_life() {  # <sys> <mix> [r<j> | t<T us>]
-  local s=$1 mix=$2 U=${2#u} name=$1-$2-n$N${3:+-$3} R k L RP note rc mode oc=- OPS lt=$DST src l1rc l1st=- l1x=- l1p=- l1p99=- t
+  local s=$1 mix=$2 U=${2#u} name=$1-$2-n$N${3:+-$3} R k L RP note rc mode oc=- OPS lt=$DST src l1rc l1st=- l1x=- l1p=- l1p99=- t pmrc
   [[ ${3:-} != t* ]] || lt=${3#t}
   R=$E/$name
   local L1V=- L1A=0 L1S=- PSLO="$H2N_SLO_PART" PARTSV=slo SLOARG=(--slo search:99:100) L1X=()
@@ -753,6 +835,16 @@ vdb_life() {  # <sys> <mix> [r<j> | t<T us>]
       L1X=("PART_ARGS_l1=--mode fixed --rates $L1V --warmup-s 0 --step-warmup-s $L1W --step-measure-s $L1M --drain-s $L1D" PART_SEED_l1=$SEED)
     fi
     log "$name: L1 $L1V append=$L1A source $L1S"
+  fi
+  local PMX=() pmsrc=()   # run-2 pmax step (H2N_PMAX): last part, rate decided by pmax_decide.py right before it
+  if [ $PMON = 1 ] && [[ $s =~ ^(pop|ds)$ ]]; then
+    [[ " $PSLO " == *" --slo "* ]] || PSLO="--slo search:99:100 $PSLO"
+    SLOARG=() PARTSV="$PARTSV pmax"
+    if [ $s = pop ]; then pmsrc=(--summary "$R/slo/loadgen/summary.json")
+    else read -r -a pmsrc <<< "$(pm_from $mix)"; [[ ${3:-} != r* ]] || pmsrc+=("--suffix=-$3"); fi
+    PMX=("PART_ARGS_pmax=--mode fixed --rates @RATE@ --warmup-s 0 --step-warmup-s $PMW --step-measure-s $PMM --drain-s $PMD" PART_SEED_pmax=$SEED
+      "PART_RATE_CMD=python3 -I -B $EV/pmax_decide.py --mix $mix --nodes $N --emit rate --log $E/pmax-$name.txt ${pmsrc[*]}")
+    log "$name: pmax step appended (rate from $([ $s = pop ] && echo "its own slo part" || echo "pop rows: ${pmsrc[*]}"))"
   fi
   local DXE=()   # damon-policy-exploration: DAMON at READY (+ warmup parts) for ds lifetimes (header, H2N_DS_DAMON_AT)
   if [ $s = ds ] && [ "$REPL" = damon ] && [ "$DXAT" = ready ]; then
@@ -772,10 +864,10 @@ vdb_life() {  # <sys> <mix> [r<j> | t<T us>]
   local LG=(--opt data=$X_DATA --opt writes=$X_WRITES --opt k=10 --mix "update=$U,search=$((100 - U))" "${SLOARG[@]}" --x-stream search --raw)
   local RE=(V=$VPLAIN HOST_SERVER=$HOSTSRV LOADGEN=$LOADGEN INIT=$INIT READY_TIMEOUT=5400 RUN_KIND=measurement TRACE=0 STATS_OP=10
     "PARTS=$PARTSV" H1_MEASURE_RUN=1 MEASURE_PART_DIR=$MEASURE_PART_DIR "PART_ARGS_slo=$PSLO" PART_SEED_slo=$SEED "${L1X[@]}"
-    "PART_GATE_CMD=bash $HG check" "${DXE[@]}")   # between parts: the N-VM gate (run.sh part hook), never the 2-VM h1-gate.sh
+    "PART_GATE_CMD=bash $HG check" "${DXE[@]}" "${PMX[@]}")   # between parts: the N-VM gate (run.sh part hook), never the 2-VM h1-gate.sh
   case $s in
     hw)  RE+=(SYSTEM=all-HWcc NODE_ENV= NODE0_ENV= "SERVER_ARGS=$SA"); mode=hwcc OPS=none;;
-    pop) RE+=(SYSTEM=Popcorn-$RECV_MODE NODE_ENV= NODE0_ENV= "SERVER_ARGS=$SA --preloaded"); mode=popcorn OPS=swmc_acct;;
+    pop) RE+=(SYSTEM=Popcorn-$PRM NODE_ENV= NODE0_ENV= "SERVER_ARGS=$SA --preloaded"); mode=popcorn OPS=swmc_acct;;
     ds)  RE+=(SYSTEM=DeStijl-$RECV_MODE-T$lt "NODE_ENV=ENV:CXL_SYSTEM=ds ENV:CXL_DESTIJL_T_US=$lt" NODE0_ENV= "SERVER_ARGS=$SA --preloaded"); mode=destijl OPS=ds;;
     mg)  RE+=(SYSTEM=Megalon V=$VMEG HOST_SERVER=$MEG_BUILD/bin/vdb-server "SERVER_ARGS=$MGSA" "NODE_ENV=ENV:RACKOBJ_CONFIG=$VMEG/cfg/megalon.yaml"
               NODE0_ENV=ENV:MEGALON_REINIT=1); mode=megalon-vm OPS=cohsnap;;
@@ -836,7 +928,9 @@ vdb_life() {  # <sys> <mix> [r<j> | t<T us>]
     # with the L1 step run.sh rc also carries the l1 part's rc: the slo part's own rc decides here, the l1 part below
     src=$(sed -n 's/^part_slo_loadgen_rc=\([0-9]*\) .*/\1/p' $R/manifest.txt | tail -n 1)
     l1rc=$(sed -n 's/^part_l1_loadgen_rc=\([0-9]*\) .*/\1/p' $R/manifest.txt | tail -n 1)
-    [ "$L1A" = 1 ] && [ "$src" = 0 ] && [ -n "$l1rc" ] && [ "$l1rc" != 0 ] || stop "$name: run.sh rc $rc"
+    pmrc=$(sed -n 's/^part_pmax_loadgen_rc=\([0-9]*\) .*/\1/p' $R/manifest.txt | tail -n 1)
+    [ "$src" = 0 ] && { { [ "$L1A" = 1 ] && [ -n "$l1rc" ] && [ "$l1rc" != 0 ]; } || { [ ${#PMX[@]} -gt 0 ] && [ -n "$pmrc" ] && [ "$pmrc" != 0 ]; }; } \
+      || stop "$name: run.sh rc $rc"
   fi
   if [ "$L1A" = 1 ]; then  # the appended L1 step: same response checks; a failure is a NOTE (the SLO row stands)
     t=$R/l1 l1st=ok
@@ -864,6 +958,37 @@ print(s.get("achieved","-"), s.get("p99_ms","-"))' $t/loadgen/steps.jsonl 2>/dev
     l1st="$l1st opcoh:$l1p"
   fi
   [ $L1ON = 0 ] || [[ ! $s =~ ^(hw|pop|ds)$ ]] || printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$name" $s $mix "$L1V" "$L1A" "$l1st" "${l1x:--}/${l1p99:--}" "$L1S" >> "$E/l1.tsv"
+  if [ ${#PMX[@]} -gt 0 ]; then  # the pmax step: same response checks as the L1 step; a failure is a NOTE (SLO row stands)
+    local pmv=- pma=0 pms=- pmst=ok pmx=- pmp99=- pmo pdirs="$WPD$RP"
+    pmrc=$(sed -n 's/^part_pmax_loadgen_rc=\([0-9]*\) .*/\1/p' $R/manifest.txt | tail -n 1)
+    [ ! -d "$R/l1/loadgen" ] || pdirs+=" $R/l1"
+    IFS=$'\t' read -r pmv pma pms _ <<< "$(tail -n 1 "$E/pmax-$name.txt" 2>/dev/null)"
+    t=$R/pmax
+    if grep -q '^part_pmax=skipped' $R/manifest.txt; then pmst=skipped
+    elif [ ! -s $t/loadgen/summary.json ]; then pmst="no-output"
+    elif [ "${pmrc:-x}" != 0 ]; then pmst="rc${pmrc:-?}"
+    elif grep -q '"reason":"stream [a-z]* exhausted' $t/loadgen/steps.jsonl; then pmst="writes-exhausted"
+    elif ! { grep -qx "ok_without_coh=0" $t/loadgen/vectordb.txt && grep -qx "updates_ok_without_coh=0" $t/loadgen/vectordb.txt &&
+             grep -qx "bad_coh_version=0" $t/loadgen/vectordb.txt; }; then pmst="no-coh-block"
+    elif ! grep -q 'workload_finish":"ok' $t/loadgen/summary.json; then pmst="workload-finish"
+    fi
+    if [ "$pmst" != skipped ] && [ -d $t/loadgen ]; then
+      [ ! -s $t/loadgen/searches.bin ] || python3 $XV/e1_check.py --writes $X_WRITES --na $NA --nb $X_NB --searches $t/loadgen/searches.bin --out $t/e1 --sample 500 > /dev/null \
+        || stop "$name/pmax: E1 violation (see $t/e1.e1.txt)"
+      python3 $XV/opsplit.py $t > $t/opsplit.log 2>&1 || log "$name/pmax NOTE: opsplit.py failed (see $t/opsplit.log)"
+      OPCOH_NODES=$N OPCOH_PARTS="$pdirs $t" MEGALON_LEAN=1 OPCOH_RECORD_BYTES=$([ $VF = sq8 ] && echo 832 || echo 3136) \
+        python3 $OPC $t $mode > $t/opcoh-check.txt 2>&1
+      pmo=$(grep -m1 -oE '^OPCOH_CHECK (PASS|FAIL)' $t/opcoh-check.txt | cut -d' ' -f2); pmst="$pmst opcoh:${pmo:-ERROR}"
+      read -r pmx pmp99 <<< "$(python3 -I -c 'import json,sys
+d=[json.loads(l) for l in open(sys.argv[1]) if l.strip()]; d=[x for x in d if x.get("phase")=="fixed"]
+s=d[-1]["streams"]["search"] if d else {}
+print(s.get("achieved","-"), s.get("p99_ms","-"))' $t/loadgen/steps.jsonl 2>/dev/null || echo "- -")"
+    fi
+    [[ $pmst == ok* ]] || [ "$pmst" = skipped ] || log "$name NOTE: pmax step $pmst (the SLO row is kept; see $t/)"
+    [ -s "$E/pmax.tsv" ] || printf '# name\tsystem\tmix\tpmax_offered\tappended\tpmax_status\tpmax_search_achieved/p99_ms\tsource\n' > "$E/pmax.tsv"
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$name" $s $mix "${pmv:--}" "${pma:-0}" "$pmst" "${pmx:--}/${pmp99:--}" "${pms:-no pmax-$name.txt}" >> "$E/pmax.tsv"
+    log "$name: pmax ${pmv:--} append=${pma:-0} status $pmst"
+  fi
   [ $ACCX = 0 ] || acc_export "$name" "$R" "$PARTSV" "$s" "$lt"
   python3 -I -c 'import json,sys
 s=json.load(open(sys.argv[1])); c=s.get("confirm",{}); f=lambda v: "" if v is None else str(v)
@@ -896,7 +1021,7 @@ vdb_fixed_life() {  # <sys> <mix>
   fi
   case $s in
     hw)  RE+=(SYSTEM=all-HWcc "NODE_ENV=$NENV_X" NODE0_ENV= "SERVER_ARGS=$SA"); mode=hwcc OPS=none;;
-    pop) RE+=(SYSTEM=Popcorn-$RECV_MODE "NODE_ENV=$NENV_X" NODE0_ENV= "SERVER_ARGS=$SA --preloaded"); mode=popcorn OPS=swmc_acct;;
+    pop) RE+=(SYSTEM=Popcorn-$PRM "NODE_ENV=$NENV_X" NODE0_ENV= "SERVER_ARGS=$SA --preloaded"); mode=popcorn OPS=swmc_acct;;
     ds)  RE+=(SYSTEM=DeStijl-$RECV_MODE-T$DST "NODE_ENV=ENV:CXL_SYSTEM=ds ENV:CXL_DESTIJL_T_US=$DST${NENV_X:+ $NENV_X}" NODE0_ENV= "SERVER_ARGS=$SA --preloaded"); mode=destijl OPS=ds;;
     mg)  RE+=(SYSTEM=Megalon V=$VMEG HOST_SERVER=$MEG_BUILD/bin/vdb-server "SERVER_ARGS=$MGSA" "NODE_ENV=ENV:RACKOBJ_CONFIG=$VMEG/cfg/megalon.yaml${NENV_X:+ $NENV_X}"
               NODE0_ENV=ENV:MEGALON_REINIT=1); mode=megalon-vm OPS=cohsnap;;
@@ -906,9 +1031,10 @@ vdb_fixed_life() {  # <sys> <mix>
   gate $name; sys_up $s $name
   servers_gone || stop "a vdb-server runs before $name"
   log "$name: run.sh fixed parts [$parts] ($s, $mix, N=$N)"
-  env "${RE[@]}" FIXED_SPEC="$FIXED" RECV_MODE=$RECV_MODE bash $XV/run.sh "$name" "$E" -- "${LG[@]}" > "$E/$name.out" 2>&1; rc=$?
+  local lrm=$RECV_MODE; [ $s != pop ] || lrm=$PRM   # the lifetime's receiver mode (fixed-part-hook.sh restores it)
+  env "${RE[@]}" FIXED_SPEC="$FIXED" RECV_MODE=$lrm bash $XV/run.sh "$name" "$E" -- "${LG[@]}" > "$E/$name.out" 2>&1; rc=$?
   log "$name: run.sh rc $rc: $(tail -n 1 "$E/$name.out")"
-  env FIXED_SPEC="$FIXED" RECV_MODE=$RECV_MODE bash $EV/fixed-part-hook.sh check $s end >>"$E/$name-hook-end.txt" 2>&1 || log "$name NOTE: detail / recv_mode not at the defaults after the lifetime (see $name-hook-end.txt; the EXIT trap restores detail)"
+  env FIXED_SPEC="$FIXED" RECV_MODE=$lrm bash $EV/fixed-part-hook.sh check $s end >>"$E/$name-hook-end.txt" 2>&1 || log "$name NOTE: detail / recv_mode not at the defaults after the lifetime (see $name-hook-end.txt; the EXIT trap restores detail)"
   sys_down $s $name
   servers_gone || stop "servers left after $name"
   [ -d "$R" ] || stop "$name: no run dir"

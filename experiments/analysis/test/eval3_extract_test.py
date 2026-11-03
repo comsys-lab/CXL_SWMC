@@ -357,6 +357,42 @@ class Eval3ExtractTest(unittest.TestCase):
         self.close(r, "ss_residence_max_us", 3000)
 
 
+class PmaxTest(unittest.TestCase):
+    """run 2: a pop lifetime with a pmax part (h2n-block.sh H2N_PMAX) = only the fixed step of the slo fixture's rows"""
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = tempfile.TemporaryDirectory()
+        run = write_fixture(cls.tmp.name)
+        src, dst = os.path.join(run, "block", "pop-u50-n2", "slo"), os.path.join(run, "block", "pop-u50-n2", "pmax")
+        os.makedirs(dst)
+        for fn in ("steps.csv", "stats-steps.csv"):
+            with open(os.path.join(src, fn)) as f, open(os.path.join(dst, fn), "w", newline="") as g:
+                r = list(csv.reader(f))
+                w = csv.writer(g)
+                w.writerow(r[0])
+                ph = r[0].index("phase")
+                w.writerows(x for x in r[1:] if x[ph] == "fixed")
+        cls.out = os.path.join(cls.tmp.name, "out")
+        E.extract([run], cls.out, {"hw", "pop", "mg", "mgoff", "ds"}, {})
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.tmp.cleanup()
+
+    def test_pmax_selection(self):
+        c = rows(self.out, "cells.csv", system="pop", part="pmax")
+        self.assertEqual(len(c), 1)
+        self.assertEqual(c[0]["pmax_steps"], "4")
+        self.assertEqual(c[0]["l1_steps"], "")
+        self.assertEqual(float(c[0]["pmax_rate"]), 30.0)
+        s = rows(self.out, "cells.csv", system="pop", part="slo")
+        self.assertEqual(s[0]["l1_steps"], "4")   # the slo part's own fixed step stays L1
+        self.assertEqual(s[0]["pmax_steps"], "")
+        f = rows(self.out, "fig-fault-breakdown.csv", system="pop", part="pmax", step="PMAX", **{"class": "read"})
+        self.assertEqual(len(f), 1)
+        self.assertEqual(f[0]["sel"], "PMAX")
+
+
 if __name__ == "__main__":
     if len(sys.argv) == 3 and sys.argv[1] == "--write-fixture":
         print(write_fixture(sys.argv[2]))

@@ -2,7 +2,10 @@
 """Receive-mode check of the Popcorn and De Stijl lifetimes of one evaluation block dir (Host only, read-only;
 recv-sleep experiment, reports/experiments/recv-sleep.md; De Stijl v2 lifetimes, systems/destijl/system.yaml).
 
-usage: recv_check.py <dir> --mode poll|idle|sleep [--out FILE] [--name <lifetime> ...]
+usage: recv_check.py <dir> --mode poll|idle|sleep|adaptive [--out FILE] [--name <lifetime> ...]
+  --mode adaptive (run 2): also FAIL on a stats-steps.csv without the per-step adaptive counters (ADAPT_STEP), a VM
+  whose recv-mode readback shows ring_coherent=0 or no ipoll parameter; prints the adaptive counter deltas (status
+  post - pre) and the lifetime CPU of cxl_recv and cxl_ipoll threads (recv-post - recv-mode readback lines)
   --name: check only these lifetimes (h2n-block.sh / h3-block.sh run it after every ds lifetime with
   --out <dir>/recv-check-<name>.txt; a missing recv-mode-<name>.txt is a FAIL)
 <dir> = a dir holding the per-lifetime files the blocks write side by side (vector DB: <E>/vdb/r1/run or an h2n / h3
@@ -38,6 +41,23 @@ import sys
 
 PER_STEP = ("instr.counters.kthread_work_ns", "instr.counters.kthread_idle_ns", "instr.counters.kthread_sleep_ns",
             "cxl_shm.sleep_wakeups", "cxl_shm.tick_kicks")
+# --mode adaptive (run 2, cxl_shm 13.1-adaptive / De Stijl build >= 9): per-step adaptive receiver counters of
+# /sys/kernel/cxl_shm (single-integer files, proc_stats sys.cxl_shm.<file>); missing = FAIL
+ADAPT_STEP = ("cxl_shm.r_wake_by_ipoll", "cxl_shm.r_wake_timeout_covered", "cxl_shm.r_wake_timeout_timed",
+              "cxl_shm.r_wake_timeout_cold", "cxl_shm.r_found_after_timeout", "cxl_shm.ipoll_wake")
+ADAPT_STATUS = ("r_wake_by_ipoll", "r_wake_timeout_covered", "r_wake_timeout_timed", "r_wake_timeout_cold",
+                "r_found_after_timeout", "ipoll_detect", "ipoll_wake", "r_sleep_aborted")
+
+
+def rb_line(path, ip):
+    """key=value tokens of the recv-readback.sh line of <ip> in a recv-mode / recv-post file ({} if none)"""
+    if not os.path.isfile(path):
+        return {}
+    for x in open(path):
+        t = x.split()
+        if t and t[0] == ip:
+            return dict(y.split("=", 1) for y in t[1:] if "=" in y)
+    return {}
 DS_COUNTERS = ("tx_timeout", "protocol_error", "async_issued", "async_fallback_mean", "async_fallback_p95")
 DS_ZERO = ("tx_timeout", "protocol_error")
 DS_STEP_PREFIX = "sys.swmc.destijl."
@@ -70,7 +90,7 @@ def vms_of(shm):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("dir")
-    ap.add_argument("--mode", required=True, choices=("poll", "idle", "sleep"))
+    ap.add_argument("--mode", required=True, choices=("poll", "idle", "sleep", "adaptive"))
     ap.add_argument("--out")
     ap.add_argument("--replica-mode", choices=("off", "all"), default="off",
                     help="all: De Stijl lifetimes loaded with replica_mode=all must report ds.replica_pages / pool_full")
@@ -126,6 +146,20 @@ def main():
                  for c in ("sleep_wakeups", "tick_kicks")}
             out.append(f"{n} vm{k}: sleep_wakeups {d['sleep_wakeups']} tick_kicks {d['tick_kicks']} "
                        f"recv_thread_ticks {ticks(post) - ticks(pre)} (status post - pre)")
+            if a.mode == "adaptive":
+                ad = {c: (integer(post.get(f"cxl_shm.{c}")), integer(pre.get(f"cxl_shm.{c}"))) for c in ADAPT_STATUS}
+                out.append(f"{n} vm{k}: adaptive " + " ".join(f"{c} {e - b if e is not None and b is not None else 'n/a'}"
+                                                               for c, (e, b) in ad.items()) + " (status post - pre)")
+                ip = lines[k][0] if k < len(lines) and lines[k] else None
+                r0, r1 = rb_line(os.path.join(D, f"recv-mode-{n}.txt"), ip), rb_line(os.path.join(D, f"recv-post-{n}.txt"), ip)
+                if r0.get("ring_coherent") == "0":
+                    fail(f"{n} vm{k}: recv_mode=adaptive with ring_coherent=0")
+                if r0.get("ipoll", "absent") == "absent":
+                    fail(f"{n} vm{k}: recv_mode=adaptive but no ipoll parameter (not the adaptive module)")
+                cpu = {x: (integer(r1.get(f"{x}_run_ns")), integer(r0.get(f"{x}_run_ns"))) for x in ("recv", "ipoll")}
+                out.append(f"{n} vm{k} ({ip}): lifetime CPU s recv " + " ipoll ".join(
+                    f"{(e - b) / 1e9:.3f}" if e is not None and b is not None else "n/a" for e, b in cpu.values())
+                    + f" (recv-post - recv-mode readback; ipoll={r0.get('ipoll')} fault_poll={r0.get('fault_poll')})")
             if ds:
                 if not any(x.startswith("recv_thread.") for x in post):
                     fail(f"{n} vm{k}: no receive thread (recv_thread.*) in status-post (receiver not on a CPU)")
@@ -158,6 +192,13 @@ def main():
                 fail(f"{rel}: no per-step column for {', '.join(miss)}")
             else:
                 out.append(f"{rel}: per-step receive counters {'present' if not miss else 'missing ' + ','.join(miss)}")
+            if a.mode == "adaptive":
+                am = [c for c in ADAPT_STEP if not any(x.endswith(c) for x in cols)]
+                if am:
+                    fail(f"{rel}: no per-step adaptive receiver column for {', '.join(am)}")
+                ip = any("kthr.cxl_ipoll" in x for x in cols)
+                out.append(f"{rel}: per-step adaptive counters {'present' if not am else 'missing'}; per-step poller CPU "
+                           f"(kthr.cxl_ipoll*) {'present' if ip else 'absent (server build without the cxl_ipoll prefix: lifetime totals only)'}")
             if ds and not any(DS_STEP_PREFIX in x for x in cols):
                 fail(f"{rel}: no per-step De Stijl counter column ({DS_STEP_PREFIX}*)")
         if not parts:

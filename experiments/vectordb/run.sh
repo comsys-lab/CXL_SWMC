@@ -38,6 +38,11 @@
 #   next part continues the update stream of the last part that ran; rc 1 = the part runs; any other rc stops the
 #   lifetime, rc 96), PART_NOGATE (part names without the part gate before them: unmeasured warmup parts, so the load
 #   does not pause between them; the first measured part after them keeps its gate).
+#   Decided-rate parts (run 2 pmax step, experiments/eval/h2n-block.sh H2N_PMAX; optional): the token @RATE@ in
+#   PART_ARGS_<p> becomes the stdout of PART_RATE_CMD (word-split command called with the part name right before the
+#   part, after the previous part ended, servers up; stderr to <run>/part-hooks.txt): a rate, or "skip" = the part is
+#   skipped as with PART_SKIP_CMD (manifest "part_<p>=skipped rate_cmd"); rc != 0 or other output stops the lifetime
+#   (rc 95). The rc line goes to the manifest ("part <p> rate_cmd rc= out=[..]").
 # Stops (and stops the servers) on the first error. Measurement hygiene: no Host build before/after (pgrep).
 set -euo pipefail
 NAME=$1 OUT=$2; shift 2; [ "${1:-}" = "--" ] && shift
@@ -163,8 +168,17 @@ else  # H1-HOOK v2: several loadgen parts in this server lifetime
       if [ $rc = 0 ]; then echo "part_$p=skipped $(date -Is)" >> "$RUN/manifest.txt"; continue; fi
       [ $rc = 1 ] || { echo "part $p: PART_SKIP_CMD rc $rc (see $RUN/part-hooks.txt)"; LG=96; break; }
     fi
+    v=PART_ARGS_$p; PRATE=
+    if [[ " ${!v:-} " == *" @RATE@ "* ]]; then  # run-2 pmax step: one rate decided right before the part (header)
+      set +e; out=$(${PART_RATE_CMD:?PART_RATE_CMD needed for @RATE@} "$p" 2>> "$RUN/part-hooks.txt"); rc=$?; set -e
+      echo "$(date -Is) part $p rate_cmd rc=$rc out=[$out]" >> "$RUN/manifest.txt"
+      if [ $rc = 0 ] && [ "$out" = skip ]; then echo "part_$p=skipped rate_cmd $(date -Is)" >> "$RUN/manifest.txt"; continue; fi
+      [ $rc = 0 ] && [[ $out =~ ^[0-9]+(\.[0-9]+)?$ ]] || { echo "part $p: PART_RATE_CMD rc=$rc out=[$out]"; LG=95; break; }
+      PRATE=$out
+    fi
     PR=$RUN/$p; mkdir "$PR"
-    v=PART_ARGS_$p; read -r -a PA <<< "${!v:-}"
+    read -r -a PA <<< "${!v:-}"
+    [ -z "$PRATE" ] || PA=("${PA[@]/@RATE@/$PRATE}")
     if [ -n "$PREV" ]; then
       WS=$(sed -n 's/^next_w=//p' "$RUN/$PREV/loadgen/vectordb.txt" 2>/dev/null)
       [[ $WS =~ ^[0-9]+$ ]] && grep -qx "write_errors=0" "$RUN/$PREV/loadgen/vectordb.txt" \

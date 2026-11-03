@@ -33,7 +33,11 @@ unset H2N_PINS H2N_VEC_FORMAT H2N_EF H2N_INIT H2N_HOST_IMAGE H2N_REPEATS H2N_LOA
   H2N_DS_C H2N_DS_K H2N_DS_GT H2N_DS_BUNDLE_SHA H2N_DS_REGION H2N_DS_T_US \
   H2N_ORDER H2N_DS_T_SWEEP H2N_DS_KERNEL H2N_DS_REPLICA_MODE H2N_DS_REPLICA_POOL_BYTES H2N_L1 H2N_L1_FROM \
   H2N_ACCURACY_EXPORT H2N_DS_RECV_EXTRA H2N_DS_DAMON \
-  H2N_DS_DAMON_EXTRA H2N_DS_DAMON_AT H2N_DS_DAMON_WARMUP H2N_DS_DAMON_REGIONS   # optional conf keys: never inherited from the environment
+  H2N_DS_DAMON_EXTRA H2N_DS_DAMON_AT H2N_DS_DAMON_WARMUP H2N_DS_DAMON_REGIONS \
+  H2N_PMAX H2N_PMAX_FROM H2N_PMAX_WARMUP_S H2N_PMAX_MEASURE_S H2N_PMAX_DRAIN_S   # optional conf keys: never inherited from the environment
+# run-2 keys: H2N_PMAX (1 = fault-breakdown step at Popcorn's max), H2N_PMAX_FROM (pop result globs, relative to the
+# project root made absolute; {MIX} {N} {RUN} replaced by the block), H2N_PMAX_WARMUP_S / _MEASURE_S / _DRAIN_S
+# (h2n-block.sh header); receiver keys POP_RECV_MODE / POP_ADAPT_KO / RECV_IPOLL (lib.sh)
 # damon-policy-exploration keys H2N_DS_DAMON_EXTRA / _AT / _WARMUP / _REGIONS: passed to h2n-block.sh (its header)
 # eval3 keys (experiment de-stijl-evaluation-run1, 2026-11-02; absent = unchanged):
 #   H2N_ORDER=mix        lifetime list mixes outer, systems inner (B1: per mix mg -> pop -> hw); default systems outer
@@ -178,6 +182,14 @@ BENV=(H2N_N=$N H2N_VCPU=$VCPUS_PER_VM "H2N_LIFETIMES=${LIVES[*]}" EVAL_RUN=$K SE
   X_NB=$VDB_X_NB X_MAXIDS=$VDB_X_MAXIDS X_MAXW=$VDB_X_MAXW X_MAXD=$MAXD X_INIT_CAP=$VDB_X_INIT_CAP X_NA=$X_NA
   "H2N_SLO_PART=$SLOPART" H2N_OPCOH_STRICT=$H2N_OPCOH_STRICT H2N_CXLBW=$H2N_CXLBW H2N_HOSTCPU=${H2N_HOSTCPU:-0})
 [ ${#DSENV[@]} = 0 ] || BENV+=("${DSENV[@]}")   # also H2N_DS_KERNEL=1 without a ds lifetime (block A --only hw:u90)
+[ ${#RECVENV[@]} = 0 ] || BENV+=("${RECVENV[@]}")   # receiver keys (lib.sh; recv-mode.sh rules, checked in the block)
+HASPOPL=0; for l in "${LIVES[@]}"; do [[ $l != pop:* ]] || HASPOPL=1; done
+[ $HASPOPL = 0 ] || recv_pop_check "$N"
+for x in H2N_PMAX H2N_PMAX_WARMUP_S H2N_PMAX_MEASURE_S H2N_PMAX_DRAIN_S; do [ -z "${!x:-}" ] || BENV+=("$x=${!x}"); done
+PMFROM_A=; read -r -a PMG <<< "${H2N_PMAX_FROM:-}"
+for g in "${PMG[@]}"; do PMFROM_A+="${PMFROM_A:+ }$(ab "$g")"; done
+[ -z "$PMFROM_A" ] || BENV+=("H2N_PMAX_FROM=$PMFROM_A")
+[ "${H2N_PMAX:-0}" = 0 ] || plan "pmax step: pop / ds lifetimes append loadgen --mode fixed --rates <Popcorn's max of the cell> (pop: its own slo part; ds: pop rows of [${PMFROM_A:-}])"
 [ $HASMG = 0 ] || BENV+=(MEG_BUILD=$MGB VMEG=$MGV MEG_CFG=$MGC MEG_LIB=$MGL MG_MAXD=$MGD MG_CAPACITY=$VDB_MG_CAPACITY)
 for x in H2N_VEC_FORMAT H2N_EF H2N_INIT H2N_HOST_IMAGE H2N_SEARCH_THREADS H2N_FIXED H2N_NODE_ENV_EXTRA H2N_ALLOW_DETAIL \
   H2N_DS_REPLICA_MODE H2N_DS_REPLICA_POOL_BYTES H2N_L1 H2N_ACCURACY_EXPORT H2N_DS_RECV_EXTRA H2N_DS_DAMON \
