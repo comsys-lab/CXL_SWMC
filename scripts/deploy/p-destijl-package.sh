@@ -90,6 +90,9 @@ mf() { sed -n "s/^$1: \([^ ]*\).*/\1/p" "$M" | head -1; }
 art() { awk -v f="$1" '$1 == f {print $2; exit}' "$M"; }
 K=$(mf release); COMMIT=$(mf source_commit); DIRTY=$(mf dirty_sha256); CSHA=$(mf config_sha256)
 BZ_SHA=$(art arch/x86/boot/bzImage); KO_BUILD_SHA=$(art cxl_shm/cxl_shm.ko)
+# clean-tree spellings of dirty_sha256: empty (build 10: "dirty_sha256:  (empty: clean tree, no diff)") or "none"
+# (build 9: "dirty_sha256: none (clean tree)"); anything else must be a sha256
+case $DIRTY in ""|none|"(empty"*) DIRTY=;; *) [[ $DIRTY =~ ^[0-9a-f]{64}$ ]] || { echo "STOP: MANIFEST dirty_sha256 '$DIRTY' is neither a sha256 nor clean (empty / none)"; exit 1; };; esac
 [ "$K" = "6.14.0-famfs-de-stijl+$LV" ] || { echo "STOP: MANIFEST release '$K' is not 6.14.0-famfs-de-stijl+$LV"; exit 1; }
 for x in COMMIT CSHA BZ_SHA KO_BUILD_SHA; do [ -n "${!x}" ] || { echo "STOP: MANIFEST lacks $x"; exit 1; }; done
 [ "$(sha256sum "$B/.config" | cut -d' ' -f1)" = "$CSHA" ] || { echo "STOP: .config changed since the build"; exit 1; }

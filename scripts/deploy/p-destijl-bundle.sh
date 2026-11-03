@@ -4,7 +4,7 @@
 # bundle: the candidate XMLs fix the Host images dir /var/lib/libvirt/images/destijl-<n>-vm<k>-v<v> and p-destijl-deploy.sh
 # install never overwrites an existing one (the guest rebuilds the initramfs on every prepare), and the bundle's rollback
 # XML must equal the VM's current `virsh dumpxml --inactive`. Host-local only: no virsh, no ssh, no sudo.
-#   p-destijl-bundle.sh [--dry-run] [--build 7|8|9] [--rollback <popcorn bundle dir>] [--topo 2|8] [--xml-src <dir>] [--version <v>]
+#   p-destijl-bundle.sh [--dry-run] [--build 7|8|9|10] [--rollback <popcorn bundle dir>] [--topo 2|8] [--xml-src <dir>] [--version <v>]
 # --build 7 (default, unchanged): see "Fixed inputs (build 7)" below.
 # --build 8 (fault-latency breakdown port, d529ac9d9, user decision 2026-11-02 for blocks D, B2+C, E): SOURCE_TAG =
 #   rel/destijl-8; MANIFEST.txt must say "status: COMPLETE" (workspaces/eval3/build8/finish-build8.sh) and System.map must
@@ -20,6 +20,11 @@
 #   p-destijl-guest-adaptive.sh (load accepts recv_mode=adaptive, fault_poll=0|1) and destijl.env gains
 #   LOAD_DEFAULTS="fault_poll=0" (applied at every load unless LOAD_EXTRA sets fault_poll) -> new tools set, new guest
 #   tools dir GT=/home/comsys/destijl-9; later build-9 bundles must match the first one's tools.sha256.
+# --build 10 (build 9 + review fixes, cxl_shm 13.4, rel/destijl-10 934ad4a68): the build-9 rules with KTREE =
+#   workspaces/destijl-v2/build10 and staged module version 13.4. Tools-identity rule: destijl.env carries K and KO_SHA
+#   of build 10, so tools.sha256 can never equal build 9's -> new guest tools dir GT=/home/comsys/destijl-10 (the
+#   destijl-9 dir is not reused); later build-10 bundles must match the first one's tools.sha256. MANIFEST
+#   dirty_sha256 may be empty or "none" (both = clean; p-destijl-package.sh).
 # --topo 2 (default): cxl_vm0/1; rollback XML = <rollback bundle>/vm<k>/candidate-normal.xml (what the VMs run after a
 #   Popcorn deploy from that bundle). --xml-src overrides it (a dir with vm<k>/candidate-normal.xml or
 #   cxl_vm<k>.after-define.xml).
@@ -60,12 +65,14 @@ case $n in
   7) B=$ROOT/builds/destijl/7 SOURCE_TAG=rel/destijl-6 TOOLS_FROM=$ROOT/builds/destijl/7/deploy-v1;;
   8) B=$ROOT/builds/destijl/8 SOURCE_TAG=rel/destijl-8 TOOLS_FROM=$ROOT/builds/destijl/7/deploy-v1;;
   9) B=$ROOT/builds/destijl/9 SOURCE_TAG=rel/destijl-9 TOOLS_FROM=$ROOT/builds/destijl/7/deploy-v1
-     KTREE=$ROOT/workspaces/destijl-v2/build9;;
-  *) stop "--build must be 7, 8 or 9";;
+     KTREE=$ROOT/workspaces/destijl-v2/build9 KOVER=13.3;;
+  10) B=$ROOT/builds/destijl/10 SOURCE_TAG=rel/destijl-10 TOOLS_FROM=$ROOT/builds/destijl/7/deploy-v1
+      KTREE=$ROOT/workspaces/destijl-v2/build10 KOVER=13.4;;
+  *) stop "--build must be 7, 8, 9 or 10";;
 esac
-# build 9 rule: own guest script and destijl.env LOAD_DEFAULTS (new tools set); builds 7/8: none (unchanged)
+# build 9 / 10 rule: own guest script and destijl.env LOAD_DEFAULTS (new tools set); builds 7/8: none (unchanged)
 GUEST_SRC= ENV_EXTRA=
-if [ "$n" = 9 ]; then GUEST_SRC=$SW/scripts/deploy/p-destijl-guest-adaptive.sh ENV_EXTRA='LOAD_DEFAULTS="fault_poll=0"'; fi
+if [ "$n" = 9 ] || [ "$n" = 10 ]; then GUEST_SRC=$SW/scripts/deploy/p-destijl-guest-adaptive.sh ENV_EXTRA='LOAD_DEFAULTS="fault_poll=0"'; fi
 # test hook (dry runs only): a stand-in build dir / source tag, for the build-8 path before build 8 is finished
 if [ $DRY = 1 ] && [ -n "${BUNDLE_TEST_BUILD_DIR:-}" ]; then
   B=$(readlink -f "$BUNDLE_TEST_BUILD_DIR"); SOURCE_TAG=${BUNDLE_TEST_SOURCE_TAG:-$SOURCE_TAG}
@@ -128,14 +135,15 @@ if [ "$n" = 8 ]; then
   grep -q ' swmc_instr_breakdown_key$' "$B/System.map" || stop "build 8 System.map has no swmc_instr_breakdown_key"
   [ "$(sh_ "$B/System.map")" = "$(art System.map)" ] || stop "System.map changed since the MANIFEST"
 fi
-if [ "$n" = 9 ]; then
-  [ "$(mf status)" = COMPLETE ] || stop "build 9 MANIFEST status '$(mf status)'"
+if [ "$n" = 9 ] || [ "$n" = 10 ]; then
+  [ "$(mf status)" = COMPLETE ] || stop "build $n MANIFEST status '$(mf status)'"
   for s in swmc_instr_breakdown_key ds_rx_mark_empty; do
-    grep -q " $s\$" "$B/System.map" || stop "build 9 System.map has no $s"; done
+    grep -q " $s\$" "$B/System.map" || stop "build $n System.map has no $s"; done
   [ "$(sh_ "$B/System.map")" = "$(art System.map)" ] || stop "System.map changed since the MANIFEST"
   SKO=$B/stage/lib/modules/$K/updates/cxl_shm.ko
   test -f "$SKO" || stop "no staged $SKO"
-  [ "$(modinfo -F version "$SKO")" = 13.3 ] || stop "staged cxl_shm.ko is not version 13.3"
+  [ "$(modinfo -F version "$SKO")" = "$KOVER" ] || stop "staged cxl_shm.ko is not version $KOVER"
+  [ "$(modinfo -F vermagic "$SKO" | cut -d' ' -f1)" = "$K" ] || stop "staged cxl_shm.ko vermagic is not $K"
   modinfo -F parm "$SKO" | grep -q '^fault_poll:' || stop "staged cxl_shm.ko has no fault_poll parameter"
   modinfo -F parm "$SKO" | grep -q '^recv_mode:.*adaptive' || stop "staged cxl_shm.ko recv_mode has no adaptive"
   test -f "$GUEST_SRC" && bash -n "$GUEST_SRC" || stop "guest script $GUEST_SRC missing or not valid bash"
