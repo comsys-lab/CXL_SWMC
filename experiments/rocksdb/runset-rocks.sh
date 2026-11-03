@@ -47,7 +47,8 @@ KEYS="ROCKS_BLOCK ROCKS_TOPO ROCKS_NODES ROCKS_MIXES ROCKS_SYSTEMS ROCKS_SLO_MS 
   POP_REGION POP_C POP_BUNDLE_SHA POP_K POP_GT DS_REGION DS_C DS_BUNDLE_SHA DS_K DS_GT"
 OPTKEYS="ROCKS_DS_RECV_EXTRA ROCKS_EXPERIMENT ROCKS_MG_BUILD_N2 ROCKS_MG_BUILD_N4 ROCKS_MG_BUILD_N8 ROCKS_MG_CFG_N2
   ROCKS_MG_CFG_N4 ROCKS_MG_CFG_N8 ROCKS_MG_EXTENTS_N2 ROCKS_MG_EXTENTS_N4 ROCKS_MG_EXTENTS_N8
-  POP_RECV_MODE POP_ADAPT_KO RECV_IPOLL ROCKS_PMAX ROCKS_PMAX_FROM ROCKS_PMAX_MEASURE_S REQUIRE_ADAPTIVE"
+  POP_RECV_MODE POP_ADAPT_KO RECV_IPOLL ROCKS_PMAX ROCKS_PMAX_FROM ROCKS_PMAX_MEASURE_S REQUIRE_ADAPTIVE
+  ROCKS_FIXED ROCKS_FIXED_RECVP ROCKS_FIXED_RECVP_BASE"
 # shellcheck disable=SC2086
 unset $KEYS $OPTKEYS
 # the conf may set only these keys (a typo or a foreign key stops)
@@ -59,7 +60,41 @@ for k in $KEYS; do [ -n "${!k:-}" ] || die "conf key $k empty"; done
 abs() { case $1 in /*) echo "$1";; *) echo "$P/$1";; esac; }
 ROCKS_BUILD=$(abs "$ROCKS_BUILD") ROCKS_LOADGEN_BUILD=$(abs "$ROCKS_LOADGEN_BUILD") RESULTS_ROOT=$(abs "$RESULTS_ROOT")
 POP_REGION=$(abs "$POP_REGION") POP_C=$(abs "$POP_C") DS_REGION=$(abs "$DS_REGION") DS_C=$(abs "$DS_C")
-[[ $ROCKS_BLOCK =~ ^([DE](200)?|MG)$ ]] || die "ROCKS_BLOCK D | E | D200 | E200 | MG"
+[[ $ROCKS_BLOCK =~ ^([DE](200)?|MG|ABL)$ ]] || die "ROCKS_BLOCK D | E | D200 | E200 | MG | ABL"
+# Receiver-ablation lifetimes (run 2, 2026-11-04; optional, unset = every cell is one SLO search as before):
+#   ROCKS_FIXED       tokens <sys>/<part>/-/-/<rates>/<step warm-up s>/<measure s>/<drain s> (sys pop | ds; per system in
+#                     order, the first = the warm part at the base): the pop / ds cell is ONE lifetime of fixed-rate parts
+#                     (pilot-run.sh KIND=parts), no SLO search, no pmax; exactly one mix; ROCKS_BLOCK ABL
+#   ROCKS_FIXED_RECVP tokens <sys>/<part>/<k>=<v>[,<k>=<v>...] (k: recv_mode poll|sleep|adaptive, ipoll, spin_us,
+#                     watch_us, s_min_us, s_max_us, idle_spin_us, idle_sleep_us): written before the part on every VM,
+#                     restored after it (experiments/eval/fixed-part-hook.sh via part-hook.sh; recv_mode last)
+#   ROCKS_FIXED_RECVP_BASE <k>=<v>,... = the lifetime's receiver state (recv_mode = RECV_MODE, ipoll = RECV_IPOLL),
+#                     checked on every VM before the parts, before each variant part and after each part
+FX=${ROCKS_FIXED:-} FXR=${ROCKS_FIXED_RECVP:-} FXB=${ROCKS_FIXED_RECVP_BASE:-}
+if [ -n "$FX$FXR$FXB" ]; then
+  [ -n "$FX" ] && [ -n "$FXB" ] || die "ROCKS_FIXED and ROCKS_FIXED_RECVP_BASE go together"
+  [ "$ROCKS_BLOCK" = ABL ] || die "ROCKS_FIXED needs ROCKS_BLOCK ABL (evidence names apart from the SLO blocks)"
+  [ "$(wc -w <<< "$ROCKS_MIXES")" = 1 ] || die "ROCKS_FIXED: exactly one mix in ROCKS_MIXES"
+  [ "${ROCKS_PMAX:-0}" = 0 ] || die "ROCKS_FIXED: ROCKS_PMAX must be 0 (no SLO part)"
+  RPKRE='(recv_mode=(poll|sleep|adaptive)|(ipoll|spin_us|watch_us|s_min_us|s_max_us|idle_spin_us|idle_sleep_us)=[0-9]+)'
+  [[ $FXB =~ ^$RPKRE(,$RPKRE)*$ ]] && [[ ,$FXB, == *,recv_mode=$RECV_MODE,* ]] || die "bad ROCKS_FIXED_RECVP_BASE ($FXB; recv_mode must be RECV_MODE $RECV_MODE)"
+  [ -z "${POP_RECV_MODE:-}" ] || [ "$POP_RECV_MODE" = "$RECV_MODE" ] || die "ROCKS_FIXED: POP_RECV_MODE != RECV_MODE (one base)"
+  [ -z "${RECV_IPOLL:-}" ] || [[ ,$FXB, == *,ipoll=$RECV_IPOLL,* ]] || die "ROCKS_FIXED_RECVP_BASE ipoll != RECV_IPOLL $RECV_IPOLL"
+  declare -A FXP=()
+  for t in $FX; do
+    [[ $t =~ ^(pop|ds)/[a-z0-9]+/-/-/[0-9]+(,[0-9]+)*/[0-9]+/[1-9][0-9]*/[0-9]+$ ]] || die "bad ROCKS_FIXED token $t (<pop|ds>/<part>/-/-/<rates>/<warm-up>/<measure>/<drain>)"
+    IFS=/ read -r fs fp _ <<< "$t"
+    [[ " ${FXP[$fs]:-} " != *" $fp "* ]] || die "ROCKS_FIXED: part $fp twice for $fs"
+    FXP[$fs]+=" $fp"
+  done
+  for t in $FXR; do
+    [[ $t =~ ^(pop|ds)/[a-z0-9]+/$RPKRE(,$RPKRE)*$ ]] || die "bad ROCKS_FIXED_RECVP token $t"
+    IFS=/ read -r fs fp fkv <<< "$t"
+    [[ " ${FXP[$fs]:-} " == *" $fp "* ]] || die "ROCKS_FIXED_RECVP $t: no ROCKS_FIXED part $fp for $fs"
+    [ "$fp" != "$(set -- ${FXP[$fs]}; echo "$1")" ] || die "ROCKS_FIXED_RECVP $t: the first (warm) part runs at the base"
+    for x in ${fkv//,/ }; do [[ ,$FXB, == *,${x%%=*}=* ]] || die "ROCKS_FIXED_RECVP $t: ${x%%=*} not in ROCKS_FIXED_RECVP_BASE"; done
+  done
+fi
 EXPN=${ROCKS_EXPERIMENT:-de-stijl-evaluation-run1}
 [[ $EXPN =~ ^[a-z0-9][-a-z0-9]*$ ]] || die "bad ROCKS_EXPERIMENT ($EXPN)"
 DSRX=${ROCKS_DS_RECV_EXTRA:-}
@@ -110,7 +145,13 @@ for s in $SYSS; do
     case $mix in u5) UR=0.05;; u50) UR=0.5;; *) die "mix $mix: u5 | u50 (pilot-run.sh UPDATE_RATIO 0.05 | 0.5)";; esac
     name=$s-$mix-n$N
     [ -z "$ONLY" ] || [[ " $ONLY " == *" $s-$mix "* ]] || continue
-    RUNS+="$name SYS=$SYS KIND=slo KEYS=$ROCKS_KEYS THREADS=$ROCKS_THREADS UPDATE_RATIO=$UR$XR"$'\n'; NAMES+=" $name"
+    KD=slo
+    if [ -n "$FX" ]; then  # receiver ablation: pop / ds cells only, each with its own ROCKS_FIXED parts
+      [[ $s =~ ^(pop|ds)$ ]] || die "ROCKS_FIXED: cell $name (only pop / ds cells are part lifetimes)"
+      [ -n "${FXP[$s]:-}" ] || die "ROCKS_FIXED has no part for $s"
+      KD=parts
+    fi
+    RUNS+="$name SYS=$SYS KIND=$KD KEYS=$ROCKS_KEYS THREADS=$ROCKS_THREADS UPDATE_RATIO=$UR$XR"$'\n'; NAMES+=" $name"
   done
 done
 [ -n "$RUNS" ] || die "no cell selected (--only '$ONLY')"
@@ -139,6 +180,11 @@ echo "RUNSET rocks conf=$CONF ($(sha256sum < "$CONF" | cut -c1-16)) block=$ROCKS
 [ "$PHASE" != ds ] || echo "RUNSET De Stijl receiver: recv_mode $RECV_MODE ${DSRX:-module defaults} ipoll ${RECV_IPOLL:-default}"
 [ "$PHASE" != hwpop ] || echo "RUNSET Popcorn receiver: recv_mode ${POP_RECV_MODE:-$RECV_MODE}${POP_ADAPT_KO:+ module $POP_ADAPT_KO} ipoll ${RECV_IPOLL:-default}"
 for x in POP_RECV_MODE POP_ADAPT_KO RECV_IPOLL; do [ -z "${!x:-}" ] || export "$x"; done
+if [ -n "$FX" ]; then  # receiver ablation: no SLO search arguments; the part plan for pilot-run.sh / part-hook.sh
+  unset SLO_EXTRA
+  export FIXED_SPEC="$FX" FIXED_RECVP="$FXR" FIXED_RECVP_BASE="$FXB"
+  echo "RUNSET receiver ablation: fixed parts [$FX] receiver parameters [$FXR] base [$FXB] (no SLO search)"
+fi
 # run-2 pmax step (pilot-run.sh PMAX): ROCKS_PMAX 0 | 1; ROCKS_PMAX_FROM = rocks-results.tsv globs of the hwpop block
 # (phase ds; {N} = this N, {V} = this block's evidence version, i.e. run j of ds reads run j of hwpop; relative = project
 # root; later files win per row); ROCKS_PMAX_MEASURE_S (30) = the window

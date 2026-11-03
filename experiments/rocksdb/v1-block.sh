@@ -233,9 +233,9 @@ while read -r name args; do
   [ ${PIPESTATUS[0]} = 0 ] || stop "$name"
   kind=""; for x in "${A[@]}"; do case $x in KIND=*) kind=${x#KIND=};; esac; done
   if grep -q "^PILOTRUN $name OK" "$E/runs.log"; then :
-  elif grep -q "^PILOTRUN $name NOTE" "$E/runs.log" && [[ $kind =~ ^(slo|fix)$ ]]; then  # slo: confirm note; fix: aborted step (judged after)
+  elif grep -q "^PILOTRUN $name NOTE" "$E/runs.log" && [[ $kind =~ ^(slo|fix|parts)$ ]]; then  # slo: confirm note; fix / parts: aborted step (judged after)
     echo "$(date -Is) $name NOTE accepted (KIND=$kind): $(grep "^PILOTRUN $name NOTE" "$E/runs.log")" | tee -a "$E/block.log"
-  else stop "$name not OK (a NOTE is accepted only for KIND=slo and KIND=fix)"; fi
+  else stop "$name not OK (a NOTE is accepted only for KIND=slo, KIND=fix and KIND=parts)"; fi
   dmesg_check "$name" || stop "$name: dmesg check"
 done <<< "$RUNS"
 [ "$OWNED" = root ] || { step "dax0.0 -> root:root 600"; dax_owner root; }

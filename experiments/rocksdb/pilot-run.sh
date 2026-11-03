@@ -10,6 +10,8 @@
 #               step-down 0.05; fill 0.7,0.8,0.9; overload 1.05,1.1,1.2)
 #   fix         PER_VM_RATES=r1[,r2..] (requests/s per VM; total = N x r): fixed 30 s windows after 10 s warm-up, no SLO
 #               abort (judged after); H3: every N at the same per-VM rate (= the 2-VM Popcorn L2)
+#   parts       (run-2 receiver ablation; SYS=Popcorn | DeStijl) FIXED_SPEC / FIXED_RECVP / FIXED_RECVP_BASE: one server
+#               lifetime, fixed-rate parts, receiver parameters per part (see the parts case below; part-hook.sh)
 #   SYS=Popcorn: C8 (deploy bundle dir with p-popcorn-shm.sh), K8 (release), GT8 (guest tools dir), RECV_MODE
 #   (poll | idle | sleep); cxl_shm loaded and coherence ENABLED (init_state=shared) before the servers start, so the
 #   image build runs under coherence. LOCK_OWNER: the calling block's measurement lock.
@@ -114,6 +116,41 @@ case "$KIND" in
   fix) [[ ${PER_VM_RATES:?fix needs PER_VM_RATES} =~ ^[0-9]+(\.[0-9]+)?(,[0-9]+(\.[0-9]+)?)*$ ]] || stop "bad PER_VM_RATES"
        export PER_VM_RATES  # run.sh adds --mode fixed --rates N x r
        LG+=(--slo mixed:99:600000 --raw --warmup-s 10 --step-warmup-s 5 --step-measure-s 30 --drain-s 10);;
+  parts) # run-2 receiver ablation (runset-rocks.sh ROCKS_FIXED*): FIXED_SPEC tokens <sys>/<part>/-/-/<rates>/<step
+       # warm-up s>/<measure s>/<drain s> of this system (pop | ds, in order; the first = the warm part = run.sh's first
+       # loadgen, at the base), FIXED_RECVP <sys>/<part>/<k>=<v>,... (receiver parameters of a part),
+       # FIXED_RECVP_BASE (the lifetime's receiver state: recv_mode = RECV_MODE, ipoll = RECV_IPOLL). Every later part:
+       # h3 gate, part-hook.sh pre (base check, write, readback; receiver snapshot), fixed loadgen (no SLO abort),
+       # part-hook.sh post (snapshot, base restored + checked). Value checks per part = correctness (stop).
+       unset PER_VM_RATES
+       [ $COH = 1 ] || stop "KIND=parts is for SYS=Popcorn | DeStijl (receiver-parameter parts)"
+       : "${FIXED_SPEC:?KIND=parts needs FIXED_SPEC}" "${FIXED_RECVP_BASE:?KIND=parts needs FIXED_RECVP_BASE}"
+       HK=pop; [ "$SYS" = DeStijl ] && HK=ds
+       [[ ,$FIXED_RECVP_BASE, == *,recv_mode=$RECV_MODE,* ]] || stop "FIXED_RECVP_BASE recv_mode != the lifetime's $RECV_MODE"
+       [ -z "$IPOLL" ] || [[ ,$FIXED_RECVP_BASE, == *,ipoll=$IPOLL,* ]] || stop "FIXED_RECVP_BASE ipoll != RECV_IPOLL $IPOLL"
+       PNAMES=() PENV=() FA=
+       for t in $FIXED_SPEC; do
+         IFS=/ read -r fs fp fd fr frt fw fm fdr fx <<< "$t"
+         [ "$fs" = "$HK" ] || continue
+         [[ $fp =~ ^[a-z0-9]+$ && $fd/$fr = -/- && $frt =~ ^[0-9]+(,[0-9]+)*$ && $fw =~ ^[0-9]+$ && $fm =~ ^[1-9][0-9]*$ && $fdr =~ ^[0-9]+$ && -z $fx ]] \
+           || stop "bad FIXED_SPEC token $t (<sys>/<part>/-/-/<rates>/<step warm-up s>/<measure s>/<drain s>)"
+         [[ " ${PNAMES[*]} " != *" $fp "* ]] || stop "FIXED_SPEC part $fp twice for $HK"
+         pa="--mode fixed --rates $frt --warmup-s 0 --step-warmup-s $fw --step-measure-s $fm --drain-s $fdr"
+         if [ ${#PNAMES[@]} = 0 ]; then FA=$pa; else PENV+=("PART_ARGS_$fp=$pa"); fi
+         PNAMES+=("$fp")
+       done
+       [ ${#PNAMES[@]} -ge 2 ] || stop "KIND=parts needs >= 2 FIXED_SPEC parts for $HK (the first = warm)"
+       for t in ${FIXED_RECVP:-}; do
+         IFS=/ read -r fs fp _ <<< "$t"
+         [ "$fs" = "$HK" ] || continue
+         [ "$fp" != "${PNAMES[0]}" ] || stop "FIXED_RECVP $t: the first part (warm) runs at the base"
+         [[ " ${PNAMES[*]} " == *" $fp "* ]] || stop "FIXED_RECVP $t: no FIXED_SPEC part $fp for $HK"
+       done
+       HX=$(cd "$(dirname "$0")" && pwd)
+       [ -f "$HX/part-hook.sh" ] && [ -f "$HX/../eval/fixed-part-hook.sh" ] || stop "part-hook.sh / fixed-part-hook.sh missing next to $0"
+       PENV+=("FIRST_ARGS=$FA" "PARTS=${PNAMES[*]:1}" "PART_PRE_CMD=bash $HX/part-hook.sh pre $HK" "PART_POST_CMD=bash $HX/part-hook.sh post $HK")
+       [ -z "${GATE_SCRIPT:-}" ] || PENV+=("PART_GATE_CMD=bash $GATE_SCRIPT check")
+       LG+=(--slo mixed:99:600000 --raw);;
   *) stop "bad KIND";;
 esac
 if [ -n "${SLO_EXTRA:-}" ]; then
@@ -163,6 +200,17 @@ if [ "$DRY" = 1 ]; then
     plan=$(env "${PS[@]}" bash $SHMS plan precheck load chown enable status teardown 2>&1) || stop "$SHMS plan failed: $(tail -n 2 <<< "$plan")"
     echo "DRY $NAME $(head -n 1 <<< "$plan") -> $(grep -c '^ssh ' <<< "$plan") ssh commands planned"
   fi
+  if [ "$KIND" = parts ]; then
+    echo "DRY $NAME parts: first (warm, base) ${PNAMES[0]} [$FA]; then ${#PENV[@]} env [$(printf '%s; ' "${PENV[@]}")]"
+    echo "DRY $NAME receiver base [$FIXED_RECVP_BASE] parts [$(for t in ${FIXED_RECVP:-}; do [ "${t%%/*}" = "$HK" ] && printf '%s ' "$t"; done)]"
+    for p in "${PNAMES[@]:1}"; do
+      ho=$(env FIXED_HOOK_DRY=1 NODES="${IPS[*]}" RECV_MODE=$RECV_MODE bash "$HX/part-hook.sh" pre $HK "$p" "$E/$NAME/$p" 2>&1) \
+        || stop "part-hook.sh pre $HK $p (dry) failed: $(tail -n 1 <<< "$ho")"
+      ho2=$(env FIXED_HOOK_DRY=1 NODES="${IPS[*]}" RECV_MODE=$RECV_MODE bash "$HX/part-hook.sh" post $HK "$p" "$E/$NAME/$p" 2>&1) \
+        || stop "part-hook.sh post $HK $p (dry) failed: $(tail -n 1 <<< "$ho2")"
+      echo "DRY $NAME hook $p pre: $(grep -m1 '^DRY 192' <<< "$ho" | sed 's/^DRY [^:]*: //' | grep -oE "(sudo -n sh -c 'echo [^']*'; )+" | sed "s/sudo -n sh -c 'echo \([^ ]*\) > \/sys\/module\/cxl_shm\/parameters\/\([a-z_]*\)'; /\2=\1 /g")| expect $(grep -m1 -oE 'expect [^)]*' <<< "$ho" | cut -c8-)| post: $(grep -m1 '^DRY 192' <<< "$ho2" | grep -oE "(sudo -n sh -c 'echo [^']*'; )+" | sed "s/sudo -n sh -c 'echo \([^ ]*\) > \/sys\/module\/cxl_shm\/parameters\/\([a-z_]*\)'; /\2=\1 /g")"
+    done
+  fi
   echo "DRY $NAME run.sh $NAME $E -- ${LG[*]}${PER_VM_RATES:+ (+ --mode fixed --rates N x $PER_VM_RATES)}"
   echo "PILOTRUN $NAME DRY OK"
   exit 0
@@ -205,8 +253,18 @@ if [ $COH = 1 ]; then  # as experiments/lmdb/pilot-run.sh: enable BEFORE the ser
   RECV_STOP=td_stop recv_apply "$([ "$SYS" = DeStijl ] && echo ds || echo pop)" "$NAME" "$RECV_MODE"
   env "${PS[@]}" STATUS_TAG=runpre bash $SHMS status || { env "${PS[@]}" bash $SHMS teardown; stop "status pre"; }
 fi
-bash $X/run.sh "$NAME" "$E" -- "${LG[@]}"
+RUNENV=()
+if [ "$KIND" = parts ]; then  # every VM at the full receiver base before the warm part (fixed-part-hook.sh check)
+  env NODES="${IPS[*]}" RECV_MODE=$RECV_MODE bash "$HX/../eval/fixed-part-hook.sh" check $HK start > "$E/$NAME-hook-start.txt" 2>&1 \
+    || td_stop "receiver not at FIXED_RECVP_BASE before the parts ($E/$NAME-hook-start.txt)"
+  RUNENV=("${PENV[@]}")
+fi
+env "${RUNENV[@]}" bash $X/run.sh "$NAME" "$E" -- "${LG[@]}"
 RC=$?
+if [ "$KIND" = parts ]; then  # base after the lifetime (a miss = NOTE: the teardown unloads the module anyway)
+  env NODES="${IPS[*]}" RECV_MODE=$RECV_MODE bash "$HX/../eval/fixed-part-hook.sh" check $HK end > "$E/$NAME-hook-end.txt" 2>&1 \
+    || echo "$NAME NOTE: receiver not at the base after the parts (see $E/$NAME-hook-end.txt)"
+fi
 if [ $COH = 1 ]; then
   recv_post "$NAME"   # receiver / idle-poller CPU after the run (recv-post-<name>.txt)
   env "${PS[@]}" STATUS_TAG=runpost bash $SHMS status
@@ -248,6 +306,15 @@ R=$E/$NAME
 grep -q "^check: PASS$" $R/check.txt 2>/dev/null || stop "server checks (check.txt): $(grep '^FAIL' $R/check.txt 2>/dev/null | head -3 | tr '\n' ';')"
 for kv in not_found=0 errors=0 bad_values=0 stale_reads=0; do grep -q "^$kv\$" $R/loadgen/rocksdb.txt || stop "value check: $kv violated"; done
 grep -q "workload_finish\":\"ok" $R/loadgen/summary.json || stop "loadgen workload finish"
+if [ "$KIND" = parts ]; then  # every later part: value checks (correctness), finish, per-part stats rows
+  for p in "${PNAMES[@]:1}"; do
+    [ -d $R/$p/loadgen ] || stop "part $p: no loadgen dir (parts_rc: $(sed -n 's/^parts=.* parts_rc=//p' $R/manifest.txt))"
+    for kv in not_found=0 errors=0 bad_values=0 stale_reads=0; do grep -q "^$kv\$" $R/$p/loadgen/rocksdb.txt || stop "part $p value check: $kv violated"; done
+    grep -q "workload_finish\":\"ok" $R/$p/loadgen/summary.json || stop "part $p: loadgen workload finish"
+    [ -s $R/$p/stats-steps.csv ] && [ "$(wc -l < $R/$p/stats-steps.csv)" -ge 2 ] || stop "part $p: no stats-steps.csv rows"
+    [ -s $R/$p/recv-snap.txt ] || echo "$NAME NOTE: part $p has no receiver snapshot"
+  done
+fi
 PMNOTE=
 if [ "$PMAX" = 1 ]; then  # run-2 pmax part: value checks are correctness (stop), the rest a NOTE
   pmv=$(sed -n 's/^pmax_rate=\([^ ]*\) pmax_loadgen_rc=\(.*\)$/\1 \2/p' $R/manifest.txt | tail -n 1)
@@ -268,6 +335,27 @@ if [ $RC != 0 ]; then
 fi
 [ "$LOG" = 1 ] && { grep -q "^check_log rc=0$" $R/check-log.txt || stop "check_log"; }
 [ -s $R/stats-steps.csv ] && [ "$(wc -l < $R/stats-steps.csv)" -ge 2 ] || stop "no stats-steps.csv rows"
+if [ "$KIND" = parts ]; then  # one table over all parts (part = the loadgen dir); an aborted (saturated) step is a NOTE
+  LDIRS=("${PNAMES[0]}=$R/loadgen"); for p in "${PNAMES[@]:1}"; do LDIRS+=("$p=$R/$p/loadgen"); done
+  python3 -B - "$N" "${LDIRS[@]}" > $R/ladder-result.txt <<'EOP' || stop "parts result"
+import json, sys
+n = int(sys.argv[1])
+print("part step offered_x per_vm_x achieved p50_ms p99_ms p999_ms max_ms done aborted reason")
+for spec in sys.argv[2:]:
+    p, d = spec.split("=", 1)
+    for l in open(d + "/steps.jsonl"):
+        if not l.strip():
+            continue
+        s = json.loads(l)
+        if s["phase"] != "fixed":
+            continue
+        m = s["streams"]["mixed"]
+        print(p, s["step"], s["offered_x"], round(s["offered_x"] / n, 3), m["achieved"], m["p50_ms"], m["p99_ms"], m.get("p999_ms"),
+              m["max_ms"], m.get("done"), str(s["aborted"]).lower(), (s["reason"] or "-").replace(" ", "_"))
+EOP
+  cat $R/ladder-result.txt
+  awk 'NR>1 && $11=="true"' $R/ladder-result.txt | grep -q . && { echo "PILOTRUN $NAME NOTE parts: step aborted ($(awk 'NR>1 && $11=="true" {printf "%s ", $1}' $R/ladder-result.txt))"; exit 0; }
+fi
 if [[ $KIND =~ ^(fix|functional)$ ]]; then  # per-step table; an aborted fixed step is a NOTE
   python3 -B - $R/loadgen/steps.jsonl "$N" > $R/ladder-result.txt <<'EOP' || stop "fixed steps result"
 import json, sys

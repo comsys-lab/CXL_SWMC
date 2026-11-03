@@ -18,6 +18,8 @@
 #   pool floors that every stats snapshot of every node must keep (DESIGN.md §9 MED-5; a lower value FAILS the run).
 #   PMAX_RATE_CMD + PMAX_ARGS (run 2, pilot-run.sh PMAX=1): a second loadgen part "pmax" right after the first one in
 #   the same server lifetime, at the rate the command prints (see the comment at the loadgen call); <run>/pmax/.
+#   PARTS + PART_ARGS_<p> (+ PART_GATE_CMD, PART_PRE_CMD, PART_POST_CMD) (run 2 receiver ablation, pilot-run.sh
+#   KIND=parts): further loadgen parts after the first one in the same server lifetime; <run>/<p>/ (see the PARTS loop).
 # Pass criteria (check.txt, DESIGN.md §9): loadgen rc 0 (plugin: no stale/bad/not-found/error), verify of every node,
 # check_log (log=1), and on every node at stop: remote_errors = get_errors = update_errors = get_retry_limit =
 # remoteN.errors = remoteN.catchup_errors = 0, pools floors in every snapshot.
@@ -54,6 +56,12 @@ RATE_ARGS=()
 if [ -n "${PER_VM_RATES:-}" ]; then  # same request rate on every VM: total = N x per-VM rate
   tot=$(tr ',' '\n' <<< "$PER_VM_RATES" | awk -v n="$N" '{printf "%s%.3f", (NR > 1 ? "," : ""), $1 * n}')
   RATE_ARGS=(--mode fixed --rates "$tot")
+fi
+# FIRST_ARGS (optional, receiver-ablation parts): word-split loadgen arguments for the first loadgen only (loadgen
+# appends repeated --rates, so the mode / rates of every part travel in its own arguments, never in the common ones)
+if [ -n "${FIRST_ARGS:-}" ]; then
+  [ -z "${PER_VM_RATES:-}" ] || { echo "FIRST_ARGS and PER_VM_RATES exclude each other"; exit 2; }
+  read -r -a RATE_ARGS <<< "$FIRST_ARGS"
 fi
 SSH="ssh -o BatchMode=yes -o ConnectTimeout=5"
 RUN=$OUT/$NAME
@@ -165,6 +173,43 @@ if [ -n "${PMAX_RATE_CMD:-}" ]; then
   else PMRC=decide-rc$prc; fi
 fi
 echo "pmax_rate=$PMRATE pmax_loadgen_rc=$PMRC" >> "$RUN/manifest.txt"
+# run-2 receiver ablation (optional; pilot-run.sh KIND=parts): PARTS = space-separated part names ([a-z0-9]+) run after
+# the first loadgen (= the warm part) inside the same server lifetime, in order; per part p: PART_GATE_CMD <gate file>
+# (word-split; e.g. "bash h3-gate.sh check"), PART_PRE_CMD <p> <part dir>, loadgen = the common args after -- plus
+# PART_ARGS_<p> (word-split) into <run>/<p>/loadgen, PART_POST_CMD <p> <part dir>; hook / gate output in
+# <run>/part-hooks.txt. Manifest lines part_<p>=start / part_<p>_loadgen_rc=. The first failure (gate, hook, loadgen rc)
+# ends the parts (parts_rc != 0: run.sh exits 1 after verify and the checks). Not run when the first loadgen failed.
+PARTS_RC=-
+if [ -n "${PARTS:-}" ]; then
+  PARTS_RC=0
+  [ "$LG" = 0 ] || { PARTS_RC=first-loadgen-rc$LG; PARTS=; }
+  for p in $PARTS; do
+    [[ $p =~ ^[a-z0-9]+$ ]] && [ ! -e "$RUN/$p" ] || { echo "part $p: bad name or exists"; PARTS_RC=badname; break; }
+    v=PART_ARGS_$p
+    [ -n "${!v:-}" ] || { echo "part $p: $v empty"; PARTS_RC=noargs; break; }
+    PR=$RUN/$p; mkdir "$PR"
+    if [ -n "${PART_GATE_CMD:-}" ]; then
+      # shellcheck disable=SC2086
+      ${PART_GATE_CMD} "$OUT/gate-$NAME-$p.txt" >> "$RUN/part-hooks.txt" 2>&1 || { echo "part $p: gate failed ($OUT/gate-$NAME-$p.txt)"; PARTS_RC=gate; break; }
+    fi
+    if [ -n "${PART_PRE_CMD:-}" ]; then
+      # shellcheck disable=SC2086
+      ${PART_PRE_CMD} "$p" "$PR" >> "$RUN/part-hooks.txt" 2>&1 || { echo "part $p: PART_PRE_CMD failed (see $RUN/part-hooks.txt)"; PARTS_RC=pre; break; }
+    fi
+    read -r -a PA <<< "${!v}"
+    echo "part_$p=start $(date -Is) args=${PA[*]}" >> "$RUN/manifest.txt"
+    "${LGPRE[@]}" numactl --physcpubind="$LG_CPUS" --membind=1 "$LOADGEN" --workload rocksdb --target "$TARGETS" \
+      --out "$PR/loadgen" "${LG_STATS[@]}" "$@" "${PA[@]}" 2>&1 | tee "$PR/loadgen.log"
+    prc=${PIPESTATUS[0]}
+    echo "part_${p}_loadgen_rc=$prc end=$(date -Is)" >> "$RUN/manifest.txt"
+    if [ -n "${PART_POST_CMD:-}" ]; then
+      # shellcheck disable=SC2086
+      ${PART_POST_CMD} "$p" "$PR" >> "$RUN/part-hooks.txt" 2>&1 || { echo "part $p: PART_POST_CMD failed (see $RUN/part-hooks.txt)"; PARTS_RC=post; break; }
+    fi
+    [ "$prc" = 0 ] || { echo "part $p: loadgen rc $prc: parts stopped"; PARTS_RC=loadgen-rc$prc; break; }
+  done
+fi
+echo "parts=[${PARTS:-}] parts_rc=$PARTS_RC" >> "$RUN/manifest.txt"
 trap on_err ERR; set -e
 [ -z "${SERVER_CPUS:-}" ] || server_cpus check
 cpu_snap after
@@ -195,6 +240,14 @@ if [ -s "$RUN/pmax/loadgen/steps.jsonl" ]; then  # run-2 pmax part: its own step
   fi
   python3 -B "$ROOT/experiments/loadgen/export_csv.py" --out "$RUN/pmax/steps.csv" "$RUN/pmax/loadgen=$SYSTEM" > /dev/null || true
 fi
+for p in ${PARTS:-}; do  # receiver-ablation parts: per part steps.csv / stats-steps.csv / opsplit.csv (as pmax)
+  [ -s "$RUN/$p/loadgen/steps.jsonl" ] || continue
+  if [ -d "$RUN/$p/loadgen/stats" ]; then
+    python3 -B "$ROOT/experiments/loadgen/stats_delta.py" "$RUN/$p/loadgen" --out "$RUN/$p/stats-steps.csv" || true
+    python3 -I -B "$ROOT/workloads/kv/tools/opsplit.py" "$RUN/$p/loadgen" --system "$SYSTEM" --out "$RUN/$p/opsplit.csv" || true
+  fi
+  python3 -B "$ROOT/experiments/loadgen/export_csv.py" --out "$RUN/$p/steps.csv" "$RUN/$p/loadgen=$SYSTEM" > /dev/null || true
+done
 CRC=skip
 if [ -s "$RUN/loadgen/gets.bin" ]; then  # loadgen --opt log=1: exact check
   CRC=0; python3 -I -B "$W/tools/check_log.py" "$RUN/loadgen" > "$RUN/check-log.txt" 2>&1 || CRC=$?
@@ -209,4 +262,5 @@ cat "$RUN/check.txt"
 [ "$VRC" = 0 ] || { echo "run $NAME: verify failed"; exit 1; }
 [ "$CRC" = skip ] || [ "$CRC" = 0 ] || { echo "run $NAME: check_log failed"; exit 1; }
 [ "$KRC" = 0 ] || { echo "run $NAME: server checks failed (check.txt)"; exit 1; }
+[ "$PARTS_RC" = - ] || [ "$PARTS_RC" = 0 ] || { echo "run $NAME: parts failed ($PARTS_RC)"; exit 1; }
 echo "run $NAME: OK -> $RUN"
