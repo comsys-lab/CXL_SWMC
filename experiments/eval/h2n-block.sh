@@ -352,7 +352,9 @@ if [ $HASPOP = 1 ]; then
   [ "$PRM" != adaptive ] || POPSV=$(recv_pop_srcversion)
 fi
 RMODES=; [ $HASPOP = 0 ] || RMODES+="$PRM"; [ $HASDS = 0 ] || RMODES+="${RMODES:+ }$RECV_MODE"
-[ -z "$IPOLL" ] || [[ " $RMODES " == *" adaptive "* ]] || die "RECV_IPOLL=$IPOLL needs an adaptive pop / ds lifetime (modes: ${RMODES:-none})"
+# RECV_IPOLL without an adaptive pop / ds lifetime (hw-only block, or a dry stand-in with RECV_MODE=sleep): not
+# applied (recv_apply writes ipoll for adaptive only); one conf serves the hw, pop and ds cells (run 2: RECV_IPOLL=0)
+[ -z "$IPOLL" ] || [[ " $RMODES " == *" adaptive "* ]] || echo "BLOCK NOTE: RECV_IPOLL=$IPOLL not applied: no adaptive pop / ds lifetime in this block (modes: ${RMODES:-none})"
 RB=$EV/recv-readback.sh
 [ -f "$RB" ] || die "missing $RB"
 # poller CPU per step (proc_stats kthread prefix cxl_ipoll) needs a server build that lists it; else only the lifetime
