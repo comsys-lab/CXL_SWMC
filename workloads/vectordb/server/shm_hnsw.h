@@ -92,6 +92,22 @@ struct alignas(64) ElemHeader {  // first line of a vector record (vector chunk)
 };
 static_assert(sizeof(ElemHeader) == 64, "element header is one line");
 constexpr uint32_t kElemMagic = 0x484e5357u;
+inline uint32_t elem_check(uint64_t ext_id, uint32_t ins_seq, uint32_t level) {
+  return uint32_t(ext_id) ^ uint32_t(ext_id >> 32) ^ ins_seq ^ level ^ kElemMagic;
+}
+
+// Stale-header guard (run 2, user decision 2026-11-03; workspaces/damonx/e0a-crash/FINDINGS.md): a reader may see a
+// slot whose header line is not (yet) a valid record — a stale replica of a newly linked slot holds the bytes the
+// slot had before the insert (zeros after the preload zeroing; bytes of an earlier experiment before it). Searches
+// never use such a header: the canary must match and level / upper_off must stay inside the group's upper arena
+// (ext_id / ins_seq bounds: layout.h elem_visible). A rejected header is treated as not visible and counted; link
+// blocks read during a search are bounded too (count <= the level's maximum, ids < capacity). Valid records are
+// never rejected, so search results are unchanged for them. Counters are per search, summed by the server
+// (stats stale_header_rejects / stale_link_rejects).
+struct SearchRejects {
+  uint64_t headers = 0;  // headers that failed the canary / bounds check (not visible, not expanded)
+  uint64_t links = 0;    // link counts above the level's maximum (block skipped) or link ids >= capacity (id skipped)
+};
 
 // Vector storage format (--vec-format; user decision 2026-10-21, vdb-vm-scaling): fp32 = dim floats (every build
 // before SQ8; images and layout unchanged); sq8 = 8-bit scalar quantization, one uint8 per dimension with per-dimension
@@ -125,6 +141,14 @@ struct GraphParams {
   }
   uint64_t lchunk_bytes() const { return per_chunk() * links0_bytes() + upper_group_bytes(); }
 };
+
+// Canary and upper-arena bounds of a header (shm_hnsw.h "Stale-header guard"); an all-zero line fails the canary.
+inline bool elem_header_ok(const ElemHeader &h, const GraphParams &p) {
+  if (h.check != elem_check(h.ext_id, h.ins_seq, h.level)) return false;
+  if (h.level == 0) return true;
+  const uint64_t ub = p.upper_group_bytes();
+  return h.upper_off <= ub && uint64_t(h.level) * p.links_bytes() <= ub - h.upper_off;
+}
 
 inline float dot(const float *a, const float *b, uint32_t dim) {
   float s = 0;
@@ -275,7 +299,7 @@ class HnswT {
         throw std::runtime_error("upper-level arena of the group full");
       meta_->upper_cur = h.upper_off + uint64_t(curlevel) * p_.links_bytes();
     }
-    h.check = uint32_t(ext_id) ^ uint32_t(ext_id >> 32) ^ ins_seq ^ uint32_t(curlevel) ^ kElemMagic;
+    h.check = elem_check(ext_id, ins_seq, uint32_t(curlevel));
     a_.write_elem(cur, h, vbytes, uint64_t(curlevel) * p_.links_bytes());
 
     const uint64_t epl = meta_->ep_level;
@@ -309,15 +333,20 @@ class HnswT {
   }
 
   // ---------------------------------------------------------------- query (hnswlib searchKnn); read lock held
-  // allowed(internal id) -> bool filters results (E1 visibility); traversal goes through every element, as
-  // hnswlib searchBaseLayerST with deletions. visited/tag: the calling thread's own tag array (>= capacity).
+  // allowed(internal id) filters results (E1 visibility): > 0 visible, 0 not visible, < 0 header rejected (stale-
+  // header guard: neither a result nor expanded; a bool predicate never rejects); traversal goes through every
+  // element, as hnswlib searchBaseLayerST with deletions. visited/tag: the calling thread's own tag array
+  // (>= capacity). rej (optional): stale-header guard counters of this call are added to it.
   template <class Allowed>
   void search(const float *q, uint32_t k, uint32_t ef, Allowed allowed, std::vector<std::pair<Dist, uint32_t>> *out,
-              std::vector<uint16_t> &visited, uint16_t &tag, uint64_t *dists = nullptr) const {
+              std::vector<uint16_t> &visited, uint16_t &tag, uint64_t *dists = nullptr,
+              SearchRejects *rej = nullptr) const {
     out->clear();
     const uint64_t epl = meta_->ep_level;
     uint32_t lb[kMaxLinkWords];
     if (epl == kNoEntry) return;
+    SearchRejects rj;
+    const uint64_t cap = p_.capacity;
     uint64_t nd = 0;
     uint32_t curr = uint32_t(epl);
     Dist curdist = dist(q, curr);
@@ -325,8 +354,9 @@ class HnswT {
     for (int level = int(epl >> 32); level > 0; level--)
       for (bool changed = true; changed;) {
         changed = false;
-        const uint32_t *ll = links(curr, level, lb);
+        const uint32_t *ll = search_links_upper(curr, level, lb, &rj);
         for (uint32_t j = 0; j < ll[0]; j++) {
+          if (ll[1 + j] >= cap) { rj.links++; continue; }
           Dist d = dist(q, ll[1 + j]);
           nd++;
           if (d < curdist) curdist = d, curr = ll[1 + j], changed = true;
@@ -341,25 +371,35 @@ class HnswT {
     std::priority_queue<P> top;                                   // worst kept result on top
     std::priority_queue<P, std::vector<P>, std::greater<P>> cand;  // closest candidate first
     Dist lower = std::numeric_limits<Dist>::max();
-    if (allowed(curr)) top.emplace(curdist, curr), lower = curdist;
+    {  // the entry point is expanded even when its header is rejected (the search needs a start)
+      const int a = int(allowed(curr));
+      if (a > 0) top.emplace(curdist, curr), lower = curdist;
+      else if (a < 0) rj.headers++;
+    }
     cand.emplace(curdist, curr);
     visited[curr] = tag;
+    const uint32_t m0 = p_.M0();
     while (!cand.empty()) {
       P c = cand.top();
       if (c.first > lower && top.size() == ef) break;
       cand.pop();
       const uint32_t *ll = links(c.second, 0, lb);
-      const uint32_t sz = ll[0];
-      for (uint32_t j = 0; j < sz; j++) a_.prefetch(ll[1 + j]);
+      uint32_t sz = ll[0];
+      if (sz > m0) rj.links++, sz = 0;
+      for (uint32_t j = 0; j < sz; j++)
+        if (ll[1 + j] < cap) a_.prefetch(ll[1 + j]);
       for (uint32_t j = 0; j < sz; j++) {
         const uint32_t id = ll[1 + j];
+        if (id >= cap) { rj.links++; continue; }
         if (visited[id] == tag) continue;
         visited[id] = tag;
         Dist d = dist(q, id);
         nd++;
         if (top.size() < ef || lower > d) {
+          const int a = int(allowed(id));  // header read before the candidate is kept (no effect on valid headers)
+          if (a < 0) { rj.headers++; continue; }
           cand.emplace(d, id);
-          if (allowed(id)) {
+          if (a > 0) {
             top.emplace(d, id);
             if (top.size() > ef) top.pop();
           }
@@ -371,6 +411,7 @@ class HnswT {
     out->resize(top.size());
     for (size_t i = top.size(); i-- > 0;) (*out)[i] = top.top(), top.pop();
     if (dists) *dists += nd;
+    if (rej) rej->headers += rj.headers, rej->links += rj.links;
   }
 
   Dist dist(const float *a, uint32_t id) const { return -a_.dot(a, id); }
@@ -385,6 +426,17 @@ class HnswT {
   }
   const uint32_t *links(uint32_t i, int level, uint32_t *tmp) const {
     return a_.links(i, level, upper_off(i, level), tmp);
+  }
+  // search descent (level > 0): links(i, level) with the stale-header guard on the header that locates the block
+  // (one header read, as upper_off); a rejected header or an over-full block yields an empty block
+  const uint32_t *search_links_upper(uint32_t i, int level, uint32_t *tmp, SearchRejects *rj) const {
+    static const uint32_t kEmpty[1] = {0};
+    ElemHeader th;
+    const ElemHeader h = a_.header(i, th);  // one copy: check and use the same bytes
+    if (!elem_header_ok(h, p_) || h.level < uint32_t(level)) return rj->headers++, kEmpty;
+    const uint32_t *ll = a_.links(i, level, h.upper_off, tmp);
+    if (ll[0] > p_.M) return rj->links++, kEmpty;
+    return ll;
   }
   Dist dist_ids(uint32_t a, uint32_t b) const {
     return -a_.dot(a_.vec(a, vtmp_.data()), b);

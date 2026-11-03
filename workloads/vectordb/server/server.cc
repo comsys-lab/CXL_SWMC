@@ -139,6 +139,9 @@ struct Stats {
       wait_ns{0}, replay_ns{0}, search_ns{0}, lock_ns{0}, insert_ns{0}, insert_lock_ns{0}, update_ns{0},
       search_busy_ns{0}, writer_busy_ns{0};
   std::atomic<uint64_t> opc_read_errors{0}, opc_register_errors{0}, opc_unattributed_ns{0}, opc_unattributed_t_ns{0};
+  // stale-header guard (shm_hnsw.h SearchRejects, summed over every segment search; a staleness metric, PROJECT.md
+  // "Evaluation run 2"); searches_with_stale_header = searches that rejected at least one header in some segment
+  std::atomic<uint64_t> stale_header_rejects{0}, stale_link_rejects{0}, searches_with_stale_header{0};
   // write path accounting (DESIGN.md §17): jobs queued by the connection readers / finished by a writer (incl. bad
   // requests); lag = finish - queue time per job; lag max is a window value (reset by every stats read)
   std::atomic<uint64_t> write_jobs_accepted{0}, write_jobs_done{0}, write_lag_ns_sum{0}, write_lag_n{0}, write_lag_max_ns{0};
@@ -397,6 +400,9 @@ class Server {
       << "\nreplay_ns_total=" << st_.replay_ns << "\nsearch_lock_ns_total=" << st_.lock_ns
       << "\ninsert_ns_total=" << st_.insert_ns << "\ninsert_lock_ns_total=" << st_.insert_lock_ns
       << "\nsearch_queue=" << search_queue_len();
+    o << "\nstale_header_rejects=" << st_.stale_header_rejects << "\nstale_link_rejects=" << st_.stale_link_rejects
+      << "\nsearches_with_stale_header=" << st_.searches_with_stale_header << "\nzeroed_unused_bytes=" << zeroed_bytes_
+      << "\nzeroed_unused_ms=" << zeroed_ns_ / 1000000;
     {  // write path (DESIGN.md §17): done is read before accepted, so backlog >= 0
       const uint64_t done = st_.write_jobs_done.load(), acc = st_.write_jobs_accepted.load();
       o << "\nwriter_threads=" << o_.writer_threads << "\nwrite_jobs_accepted=" << acc << "\nwrite_jobs_done=" << done
@@ -452,6 +458,34 @@ class Server {
     store_release(&h_->sq8->ready, kSq8Magic);
   }
 
+  // Preload zeroing (run 2, user decision 2026-11-03; stale-header guard in shm_hnsw.h): after the initial images,
+  // node 0 zeroes every byte of segment s's chunks that the images did not write — the vector records [count, capacity)
+  // of every group (the tail of the last populated group and the whole vector chunk of every later group) and the
+  // link chunks of the groups without initial records (populated groups' link chunks are written whole by the image).
+  // A never-written slot then holds zeros (canary fails), never bytes of an earlier experiment on the device. Same
+  // code in every system: through the backend's write_chunk (plain mapping for --preload-only, Megalon write sections
+  // over whole lines). Returns the bytes zeroed.
+  uint64_t zero_unused(uint32_t s, uint64_t count) {
+    const uint64_t N = p_.g.per_chunk(), vr = p_.g.vrec_bytes(), vc = p_.g.vchunk_bytes(), lc = p_.g.lchunk_bytes();
+    uint64_t bytes = 0;
+    for (uint64_t g = 0; g < p_.g.groups(); g++) {
+      const uint64_t used = g * N < count ? std::min(N, count - g * N) : 0, vb = used * vr;
+      if (vb < vc) {
+        be_->write_chunk(Chunk::kVec, s, g, vb, vc - vb, [&](uint8_t *dst) { std::memset(dst, 0, vc - vb); });
+        bytes += vc - vb;
+      }
+      if (!used) {
+        be_->write_chunk(Chunk::kLink, s, g, 0, lc, [&](uint8_t *dst) { std::memset(dst, 0, lc); });
+        bytes += lc;
+      }
+    }
+    return bytes;
+  }
+  void zero_report(const char *where) const {
+    std::fprintf(stderr, "vdb-server: ZEROED UNUSED %lu MiB of slot capacity in %.1f s (%s)\n",
+                 (unsigned long)(zeroed_bytes_ >> 20), zeroed_ns_ / 1e9, where);
+  }
+
   void load_initial() {
     for (uint32_t s = 0; s < p_.segments; s++) Graph::init_empty(&h_->segs[s].meta);
     const uint64_t t0 = now_ns();
@@ -461,7 +495,13 @@ class Server {
       if (!o_.init_dir.empty()) check_manifest();
       publish_sq8();
     }
-    if (o_.init_dir.empty()) return;
+    if (o_.init_dir.empty()) {  // no initial records: every slot is unused
+      const uint64_t z0 = now_ns();
+      for (uint32_t s = 0; s < p_.segments; s++) zeroed_bytes_ += zero_unused(s, 0);
+      zeroed_ns_ += now_ns() - z0;
+      zero_report("load, no init dir");
+      return;
+    }
     check_manifest();
     std::ifstream f(o_.init_dir + "/segments.txt");
     uint64_t s, count, epl, ucur, total = 0;
@@ -475,6 +515,11 @@ class Server {
         be_->write_chunk(Chunk::kVec, uint32_t(s), g, 0, vb, [&](uint8_t *dst) { read_file(b + "-v" + std::to_string(g) + ".bin", dst, vb); });
         be_->write_chunk(Chunk::kLink, uint32_t(s), g, 0, lb, [&](uint8_t *dst) { read_file(b + "-l" + std::to_string(g) + ".bin", dst, lb); });
       }
+      if (!o_.preloaded) {  // --preloaded: --preload-only zeroed them before coherence was enabled
+        const uint64_t z0 = now_ns();
+        zeroed_bytes_ += zero_unused(uint32_t(s), count);
+        zeroed_ns_ += now_ns() - z0;
+      }
       GraphMeta &m = h_->segs[s].meta;
       m.upper_cur = ucur;
       m.ep_level = epl;
@@ -485,6 +530,7 @@ class Server {
     if (seen != p_.segments) die("segments.txt lists " + std::to_string(seen) + " segments");
     std::fprintf(stderr, "vdb-server: %s %lu initial records in %u segments (%.1f s)\n",
                  o_.preloaded ? "published preloaded" : "loaded", (unsigned long)total, seen, (now_ns() - t0) / 1e9);
+    if (!o_.preloaded) zero_report("load");
   }
 
  public:
@@ -517,12 +563,17 @@ class Server {
         be_->write_chunk(Chunk::kLink, uint32_t(s), g, 0, lb, [&](uint8_t *dst) { read_file(b + "-l" + std::to_string(g) + ".bin", dst, lb); });
         bytes += vb + lb;
       }
+      const uint64_t z0 = now_ns();  // never-written slot capacity (zero_unused), timed separately
+      zeroed_bytes_ += zero_unused(uint32_t(s), count);
+      zeroed_ns_ += now_ns() - z0;
       total += count;
     }
     if (munmap(m, r_.device_size) != 0) die("munmap");
     close(fd);
-    std::fprintf(stderr, "vdb-server: PRELOAD DONE %lu records, %lu MiB in %.1f s (plain mapping, no HWcc access)\n",
-                 (unsigned long)total, (unsigned long)(bytes >> 20), (now_ns() - t0) / 1e9);
+    zero_report("preload");
+    std::fprintf(stderr, "vdb-server: PRELOAD DONE %lu records, %lu MiB in %.1f s (plain mapping, no HWcc access; "
+                 "incl. zeroing %.1f s)\n",
+                 (unsigned long)total, (unsigned long)(bytes >> 20), (now_ns() - t0) / 1e9, zeroed_ns_ / 1e9);
   }
 
  private:
@@ -815,6 +866,7 @@ class Server {
     std::atomic<uint32_t> next{0}, done{0};
     std::atomic<uint32_t> refs{0};  // task entries + the owner; freed when the last one is released
     std::atomic<uint64_t> lock_ns{0}, dists{0};
+    std::atomic<uint64_t> stale_headers{0};  // stale-header guard rejects over the query's segment searches
     std::mutex mu;
     std::vector<std::pair<float, uint64_t>> all;
     OpAcc oa;  // per-operation time split (under mu once the segment tasks are published)
@@ -926,13 +978,15 @@ class Server {
     if (lock_split_) LockSplit::hist(ls_.seg_lock_hist, lw), ls_.seg_tasks++;
     const Graph &g = *g_[sg];
     const uint32_t s = c->s;
-    auto allowed = [&](uint32_t i) {
+    auto allowed = [&](uint32_t i) {  // E1 visibility + stale-header guard (layout.h elem_visible)
       ElemHeader tmp;
-      const ElemHeader &h = g.header(i, tmp);
-      return h.ins_seq <= s && __atomic_load_n(&del_seq_[h.ext_id], __ATOMIC_RELAXED) > s;
+      return elem_visible(g.header(i, tmp), s, del_seq_.get(), p_);
     };
     uint64_t nd = 0;
-    g.search(c->q, c->k, o_.ef, allowed, &part, visited, tag, &nd);
+    SearchRejects rj;
+    g.search(c->q, c->k, o_.ef, allowed, &part, visited, tag, &nd, &rj);
+    if (rj.headers) st_.stale_header_rejects += rj.headers, c->stale_headers += rj.headers;
+    if (rj.links) st_.stale_link_rejects += rj.links;
     std::vector<std::pair<float, uint64_t>> mine;
     for (auto &pr : part) {
       ElemHeader tmp;
@@ -991,6 +1045,7 @@ class Server {
     }
     c->job.c->reply(frame::kStatusOk, c->job.h.req_id, out.data(), uint32_t(out.size()));
     st_.searches++;
+    if (c->stale_headers.load()) st_.searches_with_stale_header++;
     st_.dists += c->dists.load();
     st_.wait_ns += c->t1 - c->t0;
     st_.replay_ns += c->t2 - c->t1;
@@ -1089,6 +1144,7 @@ class Server {
   std::mutex dlog_mu_;      // delete-log append with several writer threads
   std::mt19937_64 rng_;     // writer 0: HNSW levels
   std::unique_ptr<uint32_t[]> del_seq_;
+  uint64_t zeroed_bytes_ = 0, zeroed_ns_ = 0;  // preload zeroing of the unused slot capacity (node 0, zero_unused)
   std::vector<uint64_t> dcursor_;
   std::unique_ptr<std::mutex[]> dmu_;
   OpCohSrc oc_;

@@ -32,6 +32,19 @@ PARAMS="--backend $BACKEND --nodes 2 --segments $SEG --chunk-bytes $CHUNK --max-
 VFARG=(); [ "$VF" = fp32 ] || VFARG=("$VF")
 taskset -c "$CPUS" "${INDEX_BUILDER:-$B/bin/vdb-build-index}" "$D/pool_a.fbin" "$S/init" "$SEG" "$MAXIDS" 16 128 0 8 20261015 "$CHUNK" ${VFARG[@]+"${VFARG[@]}"} > "$S/index.log" 2>&1
 truncate -s "$DEVSZ" "$S/device.img"
+# PREFILL=1 (plain backend; run-2 slot zeroing check): the SWcc part of the device file (from 256 MiB, the default
+# hwcc_size) starts as random bytes (= data of an earlier experiment); after the run the last slot of every segment
+# (never written: capacity > records) must read as zeros (header, vector and level-0 links)
+if [ "${PREFILL:-0}" = 1 ]; then
+  python3 - "$S/device.img" "$DEVSZ" <<'PY'
+import sys, numpy as np
+f, n = sys.argv[1], int(sys.argv[2]); off, step = 268435456, 64 << 20
+rng = np.random.default_rng(20261103)
+with open(f, "r+b") as d:
+    d.seek(off)
+    for o in range(off, n, step): d.write(rng.integers(0, 256, min(step, n - o), dtype=np.uint8).tobytes())
+PY
+fi
 sed -e "s|^device: .*|device: $S/device.img|" -e "s|^device_size: .*|device_size: $DEVSZ|" "$ROOT/config/cxl_region.yaml" > "$S/region.yaml"
 sed -e "s|^object_arena_size: .*|object_arena_size: ${ARENA:-512MB}|" "$ROOT/systems/megalon/vectordb-2vm.yaml" > "$S/megalon.yaml"
 # shellcheck disable=SC2086
@@ -101,6 +114,24 @@ if (wsec != 0) != expect_on or objseq.any():
     sys.exit("hwcc trace lines: unexpected (wsec " + ("should be written" if expect_on else "must stay 0") + ", objseq must stay 0)")
 PY
 RC=$LGRC
+for k in 0 1; do sed -n '/vdb-server: stopping/,$p' "$S/node$k.log" | grep -E "^(stale_header_rejects|stale_link_rejects|searches_with_stale_header|zeroed_unused_bytes|zeroed_unused_ms)=" | tr '\n' ' '; echo; done
+grep -h "ZEROED UNUSED" "$S/node0.log" || { echo "no ZEROED UNUSED line"; RC=1; }
+if [ "${PREFILL:-0}" = 1 ]; then
+  python3 - "$S" <<'PY' || RC=1
+import re, sys, numpy as np
+S = sys.argv[1]; log = open(S + "/node0.log").read()
+u = re.search(r"plain segments=(\d+) groups=(\d+) per_chunk=(\d+) vchunk=(\d+) lchunk=(\d+) seg_bytes=(\d+)", log)
+C = int(re.search(r" capacity=(\d+) ", log).group(1)); M = int(re.search(r" M=(\d+) ", log).group(1))
+nseg, G, N, V, L, B = map(int, u.groups()); pg = lambda x: (x + 4095) // 4096 * 4096
+vrec, l0, sw = V // N, (4 * (1 + 2 * M) + 63) // 64 * 64, 268435456
+dev = np.memmap(S + "/device.img", dtype=np.uint8, mode="r"); c = C - 1; g, i = c // N, c % N; bad = 0
+for s in range(nseg):
+    vo = sw + s * B + g * pg(V) + i * vrec; lo = sw + s * B + G * pg(V) + g * pg(L) + i * l0
+    bad += int(dev[vo:vo + vrec].any()) + int(dev[lo:lo + l0].any())
+print(f"prefill check: last slot ({c}) of {nseg} segments: {bad} non-zero records/link blocks")
+sys.exit(1 if bad else 0)
+PY
+fi
 if [ "$BACKEND" = megalon ] && [ "$TRACE" = 1 ]; then
   python3 "$HERE/../tools/classify_sharing.py" "$S" || RC=1
   grep -h "^trace\." "$S"/node*.log | sort | uniq -c | sed -n '1,12p'
