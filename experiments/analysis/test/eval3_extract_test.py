@@ -379,6 +379,13 @@ class PmaxTest(unittest.TestCase):
     def tearDownClass(cls):
         cls.tmp.cleanup()
 
+    def test_stale_and_recv_columns_empty_for_old_keys(self):
+        r = rows(self.out, "fig-coherence-rates.csv", system="pop", part="pmax", step="PMAX")
+        self.assertEqual(len(r), 1)
+        for c in ("stale_header_rejects_s", "stale_header_search_share", "ipoll_cpu_per_s"):
+            self.assertIn(c, r[0])
+            self.assertEqual(r[0][c], "")
+
     def test_pmax_selection(self):
         c = rows(self.out, "cells.csv", system="pop", part="pmax")
         self.assertEqual(len(c), 1)

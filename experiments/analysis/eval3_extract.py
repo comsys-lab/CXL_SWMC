@@ -636,7 +636,19 @@ def rates(c, t):
             "pop_rounds_s": pr(sum(v for v in rounds if v is not None) if any(v is not None for v in rounds) else None),
             "pop_requests_s": pr(pop_req), "pop_msgs_s": pr(pop_msgs),
             "ds_fetch_s": pr(dsk["fetch_sent"]), "ds_inv_s": pr(dsk["inv_sent"]), "ds_ack_s": pr(dsk["ack_sent"]),
-            "ds_msgs_s": pr(ds_msgs), "coh_msgs_s": pr(coh), "searches_s": pr(S.get("searches"))}
+            "ds_msgs_s": pr(ds_msgs), "coh_msgs_s": pr(coh), "searches_s": pr(S.get("searches")),
+            # run 2 vector DB guard (builds/vdb/23+; every system): rejected stale HNSW headers / links per s and the
+            # share of searches that rejected a header (staleness metric, user 2026-11-03); empty for older builds
+            "stale_header_rejects_s": pr(S.get("stale_header_rejects")), "stale_link_rejects_s": pr(S.get("stale_link_rejects")),
+            "stale_header_search_share": div(S.get("searches_with_stale_header"), S.get("searches")),
+            # run 2 adaptive receiver: CPU of the receive thread and of the idle pollers (vCPU-s per s, summed over nodes)
+            "recv_cpu_per_s": pr(_ksum(S, "kthr.cxl_recv")), "ipoll_cpu_per_s": pr(_ksum(S, "kthr.cxl_ipoll"))}
+
+
+def _ksum(S, prefix):
+    """sum of <prefix>*.run_ns over the keys present, in s (None when no such key)"""
+    v = [x for k, x in S.items() if k.startswith(prefix) and k.endswith(".run_ns") and x is not None]
+    return sum(v) / 1e9 if v else None
 
 
 OPT = re.compile(r"^opt\.([^.]+)\.ops$")
@@ -707,7 +719,9 @@ COLS = {
                                      "owner_meta_us", "instr_build"],
     "fig-coherence-rates.csv": ID + ["step", "sel", "offered_total", "window_s", "read_faults_s", "write_faults_s",
                                      "nontrans_faults_s", "coh_msgs_s", "pop_rounds_s", "pop_requests_s", "pop_msgs_s",
-                                     "ds_fetch_s", "ds_inv_s", "ds_ack_s", "ds_msgs_s", "searches_s"],
+                                     "ds_fetch_s", "ds_inv_s", "ds_ack_s", "ds_msgs_s", "searches_s",
+                                     "stale_header_rejects_s", "stale_link_rejects_s", "stale_header_search_share",
+                                     "recv_cpu_per_s", "ipoll_cpu_per_s"],
     "fig-search-breakdown.csv": ID + ["step", "sel", "offered_total", "op", "ops", "t_ms", "wait_ms", "c_ms",
                                       "pop_is_ms", "pop_sm_ms", "pop_wp_ms", "pop_ipi_ms", "pop_nontrans_ms",
                                       "pop_sum_ms", "rest_ms"],

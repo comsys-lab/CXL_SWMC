@@ -252,7 +252,7 @@ pm_from() {  # <mix>: --from arguments of a ds lifetime (H2N_PMAX_FROM globs, {M
 l1_resolve() {  # <mix>: sets L1V (offered ops/s | none) L1A (1 = append the step) L1S (source); l1_decide.py
   local g f out FILES=()
   for g in $L1FROM; do
-    g=${g//\{MIX\}/$1}; g=${g//\{N\}/$N}
+    g=${g//\{MIX\}/$1}; g=${g//\{N\}/$N}; g=${g//\{RUN\}/$EVAL_RUN}   # {RUN}: run 2 (same run's cells)
     for f in $(ls -d $g 2>/dev/null | sort -V); do FILES+=("$f"); done
   done
   FILES+=("$E/h2n-results.tsv")

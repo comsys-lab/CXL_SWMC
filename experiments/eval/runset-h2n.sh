@@ -162,7 +162,7 @@ lock_free
 EVIDENCE_TAG=${EVIDENCE_TAG:+$EVIDENCE_TAG-}n$N
 x=H2N_FIXED_N$N; [ -z "${!x:-}" ] || H2N_FIXED=${!x}
 if [ -n "${H2N_EVIDENCE_NAME:-}" ]; then
-  H2N_EVIDENCE_NAME=${H2N_EVIDENCE_NAME//\{N\}/$N}
+  H2N_EVIDENCE_NAME=${H2N_EVIDENCE_NAME//\{N\}/$N}; H2N_EVIDENCE_NAME=${H2N_EVIDENCE_NAME//\{RUN\}/$K}   # {RUN}: run 2
   if [[ $H2N_EVIDENCE_NAME == *\{* ]]; then  # {SYS} {MIX} {CELL}: one evidence dir per cell (eval3)
     [ ${#LIVES[@]} = 1 ] || die "H2N_EVIDENCE_NAME $H2N_EVIDENCE_NAME needs exactly one lifetime (--only <sys>:<mix>)"
     IFS=: read -r cs cm cx <<< "${LIVES[0]}"
