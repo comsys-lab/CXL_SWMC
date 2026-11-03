@@ -315,6 +315,29 @@ if [ -n "$FIXED" ]; then
   [ $FDET = 0 ] || [ "$ALLOWDET" = 1 ] || die "H2N_FIXED has a detail=1 part: H2N_ALLOW_DETAIL=1 needed (approved scope)"
 fi
 [[ $ALLOWDET =~ ^[01]$ ]] || die "bad H2N_ALLOW_DETAIL"
+# Receiver-parameter parts (run-2 receiver ablation, workspaces/de-stijl-evaluation-run2-recv-ablation-chain-v1.sh;
+# unset = unchanged): H2N_FIXED_RECVP = tokens <sys>/<part>/<k>=<v>[,<k>=<v>...] (k: recv_mode poll|sleep|adaptive,
+# ipoll, spin_us, watch_us, s_min_us, s_max_us, idle_spin_us, idle_sleep_us; pop / ds parts of H2N_FIXED whose <recv>
+# field is -): written on every VM before the part, restored after it (fixed-part-hook.sh, recv_mode last).
+# H2N_FIXED_RECVP_BASE = <k>=<v>,... = the lifetime's receiver state (required with H2N_FIXED_RECVP; recv_mode = the
+# lifetime's mode; every token key must be in it); checked before every such part, after it and after the lifetime.
+# The lifetime start still applies and checks the conf receiver (recv_apply, REQUIRE_ADAPTIVE readback).
+FRECVP=${H2N_FIXED_RECVP:-} FRBASE=${H2N_FIXED_RECVP_BASE:-}
+RPKRE='(recv_mode=(poll|sleep|adaptive)|(ipoll|spin_us|watch_us|s_min_us|s_max_us|idle_spin_us|idle_sleep_us)=[0-9]+)'
+if [ -n "$FRECVP$FRBASE" ]; then
+  [ -n "$FIXED" ] && [ -n "$FRECVP" ] && [ -n "$FRBASE" ] || die "H2N_FIXED_RECVP and H2N_FIXED_RECVP_BASE go together, with H2N_FIXED"
+  [[ $FRBASE =~ ^$RPKRE(,$RPKRE)*$ ]] && [[ ,$FRBASE, == *,recv_mode=* ]] || die "bad H2N_FIXED_RECVP_BASE ($FRBASE)"
+  for t in $FRECVP; do
+    IFS=/ read -r fs fp fkv <<< "$t"
+    [[ $fs =~ ^(pop|ds)(@u[0-9]+)?$ ]] && [[ $fkv =~ ^$RPKRE(,$RPKRE)*$ ]] || die "bad H2N_FIXED_RECVP token $t (<pop|ds>/<part>/<k>=<v>,...)"
+    [[ " ${FPARTS[$fs]:-} " == *" $fp "* ]] || die "H2N_FIXED_RECVP $t: no H2N_FIXED part $fp for $fs"
+    for x in ${fkv//,/ }; do [[ ,$FRBASE, == *,${x%%=*}=* ]] || die "H2N_FIXED_RECVP $t: ${x%%=*} not in H2N_FIXED_RECVP_BASE"; done
+    for u in $FIXED; do IFS=/ read -r us up ud ur _ <<< "$u"; [ "$us/$up" != "$fs/$fp" ] || [ "$ur" = - ] || die "H2N_FIXED_RECVP $t: the H2N_FIXED token sets recv_mode $ur too"; done
+  done
+  bm=${FRBASE#*recv_mode=}; bm=${bm%%,*}
+  [ $HASPOP = 0 ] || [ "$bm" = "$PRM" ] || die "H2N_FIXED_RECVP_BASE recv_mode=$bm != the Popcorn lifetime mode $PRM"
+  [ $HASDS = 0 ] || [ "$bm" = "$RECV_MODE" ] || die "H2N_FIXED_RECVP_BASE recv_mode=$bm != the De Stijl lifetime mode $RECV_MODE"
+fi
 [ -z "$NENV_X" ] || [[ $NENV_X =~ ^(ENV:[A-Z_][A-Z0-9_]*=[^[:space:]]*( |$))+$ ]] || die "bad H2N_NODE_ENV_EXTRA ($NENV_X)"
 if [ $DSKER = 1 ]; then  # the De Stijl bundle instead of the Popcorn one (no pop lifetime in a ds block)
   [ -f "$REGION" ] && [ -f "$DS_C/p-destijl-shm.sh" ] && [ "$(sha256sum < "$DS_C/packet.sha256" | cut -c1-64)" = "$DS_BUNDLE_SHA" ] \
@@ -435,6 +458,7 @@ echo "BLOCK PLAN: server_args plain=[$SA]${MGSA:+ megalon=[$MGSA]}"
 echo "BLOCK PLAN: receiver pop=$([ $HASPOP = 1 ] && echo "$PRM${POP_ADAPT_KO:+ ko=$POP_ADAPT_KO srcversion=$POPSV}" || echo -) ds=$([ $HASDS = 1 ] && echo "$RECV_MODE extra=[${DSRX}] fault_poll=$DSFP" || echo -) ipoll=${IPOLL:-default}"
 echo "BLOCK PLAN: $LAYOUT"
 [ -z "$FIXED" ] || echo "BLOCK PLAN: fixed windows (no SLO search) [$FIXED] node_env_extra=[$NENV_X] allow_detail=$ALLOWDET"
+[ -z "$FRECVP" ] || echo "BLOCK PLAN: receiver parameters per part [$FRECVP] base [$FRBASE] (fixed-part-hook.sh: base checked, written, read back, restored)"
 if [ "$DRYB" = 1 ]; then
   if [ $L1ON = 1 ]; then  # the L1 each lifetime would get from the results present now (mg lifetimes of this block not run yet)
     for l in "${LIVES[@]}"; do
@@ -571,6 +595,7 @@ gate() { bash "$HG" check "$E/gate-$1.txt" > /dev/null || stop "h3 gate ($1; see
   [ -z "$FWARM" ] || echo "warmup: fixed=[$FWARM] parts=[$FWPARTS] duration_s=$FWDUR (hw/pop/ds SLO lifetimes)"
   [ $ACCX = 0 ] || echo "accuracy_export=1"
   [ -z "$FIXED" ] || echo "fixed=[$FIXED] node_env_extra=[$NENV_X] allow_detail=$ALLOWDET (H2N_FIXED: the slo part is not run)"
+  [ -z "$FRECVP" ] || echo "fixed_recvp=[$FRECVP] fixed_recvp_base=[$FRBASE]"
   for d in "${DOMS[@]}"; do x=$(virsh -c qemu:///system dumpxml --inactive "$d" 2>/dev/null); echo "vm_xml_sha256.$d=$(printf '%s' "$x" | sha256sum | cut -c1-64) bytes=${#x}"; done
 } > "$E/h2n-params.txt"
 log "== PT pretouch check (start, $N VMs)"
@@ -1038,9 +1063,9 @@ vdb_fixed_life() {  # <sys> <mix>
   servers_gone || stop "a vdb-server runs before $name"
   log "$name: run.sh fixed parts [$parts] ($s, $mix, N=$N)"
   local lrm=$RECV_MODE; [ $s != pop ] || lrm=$PRM   # the lifetime's receiver mode (fixed-part-hook.sh restores it)
-  env "${RE[@]}" FIXED_SPEC="$FIXED" RECV_MODE=$lrm bash $XV/run.sh "$name" "$E" -- "${LG[@]}" > "$E/$name.out" 2>&1; rc=$?
+  env "${RE[@]}" FIXED_SPEC="$FIXED" FIXED_RECVP="$FRECVP" FIXED_RECVP_BASE="$FRBASE" RECV_MODE=$lrm bash $XV/run.sh "$name" "$E" -- "${LG[@]}" > "$E/$name.out" 2>&1; rc=$?
   log "$name: run.sh rc $rc: $(tail -n 1 "$E/$name.out")"
-  env FIXED_SPEC="$FIXED" RECV_MODE=$lrm bash $EV/fixed-part-hook.sh check $s end >>"$E/$name-hook-end.txt" 2>&1 || log "$name NOTE: detail / recv_mode not at the defaults after the lifetime (see $name-hook-end.txt; the EXIT trap restores detail)"
+  env FIXED_SPEC="$FIXED" FIXED_RECVP="$FRECVP" FIXED_RECVP_BASE="$FRBASE" RECV_MODE=$lrm bash $EV/fixed-part-hook.sh check $s end >>"$E/$name-hook-end.txt" 2>&1 || log "$name NOTE: detail / recv_mode not at the defaults after the lifetime (see $name-hook-end.txt; the EXIT trap restores detail)"
   sys_down $s $name
   servers_gone || stop "servers left after $name"
   [ -d "$R" ] || stop "$name: no run dir"
