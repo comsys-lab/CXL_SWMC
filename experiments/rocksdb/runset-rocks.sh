@@ -216,6 +216,11 @@ mkdir -p "$E" || die "mkdir $E"
 bash "$HERE/v1-block.sh" "$E" > "$E/block.out" 2>&1; rc=$?
 tail -n 3 "$E/block.out"
 RD=(); for n in $NAMES; do [ -d "$E/$n/loadgen" ] && RD+=("$E/$n"); done
+if [ -n "$FX" ]; then  # receiver ablation: no SLO result (slo_result.py); the parts table is the chain's derive step
+  for n in $NAMES; do [ -f "$E/$n/ladder-result.txt" ] && cat "$E/$n/ladder-result.txt"; done
+  if grep -q "BLOCK DONE" "$E/block.log" 2>/dev/null && [ $rc = 0 ]; then echo "RUNSET DONE $E (fixed parts)"; exit 0; fi
+  echo "RUNSET FAILED rc=$rc $E (block.log: $(grep -m1 'BLOCK STOP' "$E/block.log" 2>/dev/null))"; exit 1
+fi
 RRC=0 UNC=
 if [ ${#RD[@]} -gt 0 ]; then
   python3 -I -B "$HERE/slo_result.py" --slo-ms "$ROCKS_SLO_MS" --vcpus "$EXPECT_NPROC" --out "$E/rocks-results.tsv" "${RD[@]}" \
