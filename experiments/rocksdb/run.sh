@@ -16,6 +16,8 @@
 #   STATS_OP (10; 0 = off), VERIFY (1), PER_VM_RATES (r1,r2,..: fixed-rate steps given per VM; the harness passes
 #   --mode fixed --rates N*r1,N*r2,..), STOP_EXTENTS_FREE (2048 = 2 GiB of file extents) / STOP_BLOCKS_FREE (16):
 #   pool floors that every stats snapshot of every node must keep (DESIGN.md §9 MED-5; a lower value FAILS the run).
+#   PMAX_RATE_CMD + PMAX_ARGS (run 2, pilot-run.sh PMAX=1): a second loadgen part "pmax" right after the first one in
+#   the same server lifetime, at the rate the command prints (see the comment at the loadgen call); <run>/pmax/.
 # Pass criteria (check.txt, DESIGN.md §9): loadgen rc 0 (plugin: no stale/bad/not-found/error), verify of every node,
 # check_log (log=1), and on every node at stop: remote_errors = get_errors = update_errors = get_retry_limit =
 # remoteN.errors = remoteN.catchup_errors = 0, pools floors in every snapshot.
@@ -140,6 +142,29 @@ set +e; trap - ERR
 "${LGPRE[@]}" numactl --physcpubind="$LG_CPUS" --membind=1 "$LOADGEN" --workload rocksdb --target "$TARGETS" --out "$RUN/loadgen" \
   "${LG_STATS[@]}" "$@" "${RATE_ARGS[@]}" 2>&1 | tee "$RUN/loadgen.log"
 LG=${PIPESTATUS[0]}
+# run-2 pmax step (optional; pilot-run.sh PMAX=1): PMAX_RATE_CMD (word-split command, prints a rate or "skip") decides
+# the rate right after the first loadgen, inside the same server lifetime; PMAX_ARGS (word-split loadgen arguments with
+# the token @RATE@) then drive a second loadgen into $RUN/pmax/loadgen. Its rc is recorded (pmax_loadgen_rc), never
+# fatal here (pilot-run.sh judges it: value checks = stop, anything else = NOTE).
+PMRATE=- PMRC=-
+if [ -n "${PMAX_RATE_CMD:-}" ]; then
+  # shellcheck disable=SC2086
+  PMRATE=$(${PMAX_RATE_CMD} pmax 2>> "$RUN/pmax-decide.err"); prc=$?
+  if [ $prc = 0 ] && [[ $PMRATE =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
+    : "${PMAX_ARGS:?PMAX_RATE_CMD needs PMAX_ARGS}"
+    [[ " $PMAX_ARGS " == *" @RATE@ "* ]] || { echo "PMAX_ARGS lacks @RATE@"; PMRC=badargs; }
+    if [ "$PMRC" = - ]; then
+      mkdir -p "$RUN/pmax"
+      read -r -a PMA <<< "${PMAX_ARGS//@RATE@/$PMRATE}"
+      echo "pmax: rate $PMRATE, loadgen ${PMA[*]}" | tee -a "$RUN/pmax/loadgen.log"
+      "${LGPRE[@]}" numactl --physcpubind="$LG_CPUS" --membind=1 "$LOADGEN" --workload rocksdb --target "$TARGETS" \
+        --out "$RUN/pmax/loadgen" "${LG_STATS[@]}" "${PMA[@]}" 2>&1 | tee -a "$RUN/pmax/loadgen.log"
+      PMRC=${PIPESTATUS[0]}
+    fi
+  elif [ $prc = 0 ] && [ "$PMRATE" = skip ]; then PMRC=skipped
+  else PMRC=decide-rc$prc; fi
+fi
+echo "pmax_rate=$PMRATE pmax_loadgen_rc=$PMRC" >> "$RUN/manifest.txt"
 trap on_err ERR; set -e
 [ -z "${SERVER_CPUS:-}" ] || server_cpus check
 cpu_snap after
@@ -162,6 +187,13 @@ if [ -s "$RUN/loadgen/steps.jsonl" ] && [ -s "$RUN/loadgen/summary.json" ]; then
   fi
   python3 -B "$ROOT/experiments/loadgen/export_csv.py" --out "$RUN/steps.csv" "$RUN/loadgen=$SYSTEM" > /dev/null || true
   python3 -B "$ROOT/experiments/loadgen/plot_slo.py" --out "$RUN/slo.png" "$RUN/loadgen=$SYSTEM" > "$RUN/slo-points.txt" 2>&1 || true
+fi
+if [ -s "$RUN/pmax/loadgen/steps.jsonl" ]; then  # run-2 pmax part: its own steps.csv / stats-steps.csv / opsplit.csv
+  if [ -d "$RUN/pmax/loadgen/stats" ]; then
+    python3 -B "$ROOT/experiments/loadgen/stats_delta.py" "$RUN/pmax/loadgen" --out "$RUN/pmax/stats-steps.csv" || true
+    python3 -I -B "$ROOT/workloads/kv/tools/opsplit.py" "$RUN/pmax/loadgen" --system "$SYSTEM" --out "$RUN/pmax/opsplit.csv" || true
+  fi
+  python3 -B "$ROOT/experiments/loadgen/export_csv.py" --out "$RUN/pmax/steps.csv" "$RUN/pmax/loadgen=$SYSTEM" > /dev/null || true
 fi
 CRC=skip
 if [ -s "$RUN/loadgen/gets.bin" ]; then  # loadgen --opt log=1: exact check

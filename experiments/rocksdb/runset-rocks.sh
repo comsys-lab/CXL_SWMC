@@ -47,7 +47,7 @@ KEYS="ROCKS_BLOCK ROCKS_TOPO ROCKS_NODES ROCKS_MIXES ROCKS_SYSTEMS ROCKS_SLO_MS 
   POP_REGION POP_C POP_BUNDLE_SHA POP_K POP_GT DS_REGION DS_C DS_BUNDLE_SHA DS_K DS_GT"
 OPTKEYS="ROCKS_DS_RECV_EXTRA ROCKS_EXPERIMENT ROCKS_MG_BUILD_N2 ROCKS_MG_BUILD_N4 ROCKS_MG_BUILD_N8 ROCKS_MG_CFG_N2
   ROCKS_MG_CFG_N4 ROCKS_MG_CFG_N8 ROCKS_MG_EXTENTS_N2 ROCKS_MG_EXTENTS_N4 ROCKS_MG_EXTENTS_N8
-  POP_RECV_MODE POP_ADAPT_KO RECV_IPOLL"
+  POP_RECV_MODE POP_ADAPT_KO RECV_IPOLL ROCKS_PMAX ROCKS_PMAX_FROM ROCKS_PMAX_MEASURE_S"
 # shellcheck disable=SC2086
 unset $KEYS $OPTKEYS
 # the conf may set only these keys (a typo or a foreign key stops)
@@ -101,6 +101,7 @@ RUNS=""; NAMES=""
 for s in $SYSS; do
   XR=""
   case $s in hw) SYS=all-HWcc;; pop) SYS=Popcorn;; ds) SYS=DeStijl;; mg) SYS=Megalon XR=" FILE_EXTENTS=$MG_EXTENTS";; esac
+  [ "${ROCKS_PMAX:-0}" = 0 ] || [[ ! $s =~ ^(pop|ds)$ ]] || XR="$XR PMAX=1"   # run-2 pmax step (pop / ds cells)
   for mix in $ROCKS_MIXES; do
     case $mix in u5) UR=0.05;; u50) UR=0.5;; *) die "mix $mix: u5 | u50 (pilot-run.sh UPDATE_RATIO 0.05 | 0.5)";; esac
     name=$s-$mix-n$N
@@ -134,6 +135,24 @@ echo "RUNSET rocks conf=$CONF ($(sha256sum < "$CONF" | cut -c1-16)) block=$ROCKS
 [ "$PHASE" != ds ] || echo "RUNSET De Stijl receiver: recv_mode $RECV_MODE ${DSRX:-module defaults} ipoll ${RECV_IPOLL:-default}"
 [ "$PHASE" != hwpop ] || echo "RUNSET Popcorn receiver: recv_mode ${POP_RECV_MODE:-$RECV_MODE}${POP_ADAPT_KO:+ module $POP_ADAPT_KO} ipoll ${RECV_IPOLL:-default}"
 for x in POP_RECV_MODE POP_ADAPT_KO RECV_IPOLL; do [ -z "${!x:-}" ] || export "$x"; done
+# run-2 pmax step (pilot-run.sh PMAX): ROCKS_PMAX 0 | 1; ROCKS_PMAX_FROM = rocks-results.tsv globs of the hwpop block
+# (phase ds; {N} = this N, {V} = this block's evidence version, i.e. run j of ds reads run j of hwpop; relative = project
+# root; later files win per row); ROCKS_PMAX_MEASURE_S (30) = the window
+unset PMAX PMAX_FROM PMAX_MEASURE_S
+case ${ROCKS_PMAX:-0} in
+  0) [ -z "${ROCKS_PMAX_FROM:-}" ] || die "ROCKS_PMAX_FROM without ROCKS_PMAX=1";;
+  1) [ -z "${ROCKS_PMAX_MEASURE_S:-}" ] || export PMAX_MEASURE_S=$ROCKS_PMAX_MEASURE_S
+     PMF=""
+     if [ "$PHASE" = ds ]; then
+       for g in ${ROCKS_PMAX_FROM:-}; do
+         g=${g//\{N\}/$N}; g=${g//\{V\}/$V}; g=$(abs "$g")
+         for f in $g; do [ -f "$f" ] && PMF="$PMF $f"; done
+       done
+       export PMAX_FROM="${PMF# }"
+     fi
+     echo "RUNSET pmax step: pop / ds cells append one fixed window at Popcorn's max (pop: own slo part; ds: pop rows of [${PMF# }] from [${ROCKS_PMAX_FROM:-}])";;
+  *) die "bad ROCKS_PMAX (0 | 1)";;
+esac
 echo "RUNSET cells:$NAMES"
 if [ $DRY = 1 ]; then
   DRY=1 bash "$HERE/v1-block.sh" "$E"; rc=$?

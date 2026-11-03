@@ -33,6 +33,7 @@ unset REGISTRY LEVELS_SOURCE LEVELS_REGISTRY RS_PROC_CXL_SHM RUNSETS EVIDENCE_TA
 unset POP_RECV_MODE POP_ADAPT_KO RECV_IPOLL
 unset RS_V7 RS_V7_IMAGE RS_V7_DENSE RS_V7_LR RS_V7_ACC_INIT RS_V7_TRAIN_BATCH RS_V7_TRAIN_THREADS RS_V7_W_S \
   RS_V7_STALE_SAMPLE RS_V7_STALE_DIR RS_V7_SAMPLES RS_V7_FROZEN   # v7 keys come only from the conf
+unset RS_PMAX RS_PMAX_FROM RS_PMAX_S RS_PMAX_SETTLE_S   # run-2 RecSys pmax step keys (rs_env), only from the conf
 CONFSH=$(python3 -I -B "$EVD/evalconf.py" shell ${EVAL_CONF:+--conf "$EVAL_CONF"}) || { echo "RUNSET STOP: ${EVAL_CONF:-eval.conf} does not parse"; exit 2; }
 eval "$CONFSH"
 export EVAL_CONF   # absolute path of the config (evalconf.py shell); pins-vdb.sh (sourced by the hook) reads the same file
@@ -170,6 +171,19 @@ rs_env() {
     done
     plan "RecSys v7: image ${RS_V7_IMAGE} dense ${RS_V7_DENSE} lr ${RS_V7_LR} acc_init ${RS_V7_ACC_INIT} batch ${RS_V7_TRAIN_BATCH} W ${RS_V7_W_S} s stale 1/${RS_V7_STALE_SAMPLE} rows";;
     *) die "bad RS_V7 (${RS_V7}: 0 or 1)";; esac
+  # run-2 pmax step (main-block.sh STREAM_PMAX): RS_PMAX 0 | 1, RS_PMAX_FROM = stream-results.tsv globs of the rs-main
+  # block whose pop rows a ds block uses ({RUN} = this run k; relative = project root), RS_PMAX_S / RS_PMAX_SETTLE_S
+  case ${RS_PMAX:-0} in 0) [ -z "${RS_PMAX_FROM:-}" ] || die "RS_PMAX_FROM without RS_PMAX=1";;
+    1) RSENV+=(STREAM_PMAX=1)
+       for v in S SETTLE_S; do local c=RS_PMAX_$v; [ -z "${!c:-}" ] || RSENV+=("STREAM_PMAX_$v=${!c}"); done
+       local g fs="" f
+       for g in ${RS_PMAX_FROM:-}; do
+         g=${g//\{RUN\}/$K}; case $g in /*) ;; *) g=$P/$g;; esac
+         for f in $g; do [ -f "$f" ] && fs="$fs $f"; done
+       done
+       [ -z "$fs" ] || RSENV+=("STREAM_PMAX_FROM=${fs# }")
+       plan "pmax step: pop / ds lifetimes append one fixed window at Popcorn's max under the SLO (pop: own slo row; ds: pop rows of [${fs# }] from [${RS_PMAX_FROM:-}])";;
+    *) die "bad RS_PMAX (${RS_PMAX}: 0 or 1)";; esac
 }
 rs_checks() {  # static checks shared by the RecSys drivers
   case $RS_SLO_PCT:$RS_SLO_MS:$RS_RAMP_START in 95:100:1|95:400:1) ;;

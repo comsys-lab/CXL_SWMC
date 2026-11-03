@@ -127,8 +127,31 @@ if [ -n "${SLO_EXTRA:-}" ]; then
   done
   LG+=("${XA[@]}")
 fi
+# run-2 pmax step (user 2026-11-03 Q9; optional): PMAX=1 on a KIND=slo Popcorn / De Stijl run appends ONE fixed part
+# "pmax" (run.sh PMAX_RATE_CMD / PMAX_ARGS, same server lifetime) at Popcorn's max under the SLO of the cell =
+# experiments/eval/pmax_decide.py --workload rocksdb: Popcorn from its own slo summary.json, De Stijl from the pop-<mix>-n<N>
+# rows of PMAX_FROM (space-separated rocks-results.tsv of the hwpop block of the same N and run). Windows as KIND=fix
+# (10 s warm-up, 5 s step warm-up, PMAX_MEASURE_S (30) s, 10 s drain), no SLO abort. No confirmed Popcorn max = no step
+# (NOTE). The pmax part's value check (rocksdb.txt) must hold; a non-zero pmax loadgen rc is a NOTE (the SLO result stands).
+PMAX=${PMAX:-0} PMMS=${PMAX_MEASURE_S:-30}
+[[ $PMAX =~ ^[01]$ && $PMMS =~ ^[1-9][0-9]*$ ]] || stop "bad PMAX / PMAX_MEASURE_S"
+unset PMAX_RATE_CMD PMAX_ARGS
+if [ "$PMAX" = 1 ]; then
+  [ "$KIND" = slo ] || stop "PMAX=1 needs KIND=slo"
+  case "$SYS" in Popcorn|DeStijl) ;; *) stop "PMAX=1 is for SYS=Popcorn | DeStijl (the step compares them at Popcorn's max)";; esac
+  PMIX=u$(awk -v r="$UPDATE_RATIO" 'BEGIN{printf "%d", r * 100 + 0.5}')
+  PMSRC=(--summary "$E/$NAME/loadgen/summary.json")
+  if [ "$SYS" = DeStijl ]; then PMSRC=(); for f in ${PMAX_FROM:-}; do PMSRC+=(--from "$f"); done; fi
+  export PMAX_RATE_CMD="python3 -I -B $(cd "$(dirname "$0")/../eval" && pwd)/pmax_decide.py --workload rocksdb --mix $PMIX --nodes $N ${PMSRC[*]} --emit rate --log $E/pmax-$NAME.txt"
+  export PMAX_ARGS="--opt keys=$KEYS --opt update_ratio=$UPDATE_RATIO --opt seed=$SEED --seed $SEED --opt log=$LOG --mix mixed=1 --x-stream mixed --slo mixed:99:600000 --raw --mode fixed --rates @RATE@ --warmup-s 10 --step-warmup-s 5 --step-measure-s $PMMS --drain-s 10"
+elif [ -n "${PMAX_FROM:-}" ]; then stop "PMAX_FROM without PMAX=1"; fi
 if [ "$DRY" = 1 ]; then
   [ -x "$LOADGEN" ] && [ -x "$HOST_SERVER" ] || stop "loadgen $LOADGEN or server $HOST_SERVER missing"
+  if [ "$PMAX" = 1 ]; then
+    if [ "$SYS" = Popcorn ]; then echo "DRY $NAME pmax: rate = own slo summary.json (pmax_decide.py --workload rocksdb --mix $PMIX --nodes $N)"
+    else echo "DRY $NAME pmax: $(${PMAX_RATE_CMD%% --emit*} | tr '\t' ' ')"; fi
+    echo "DRY $NAME pmax part: loadgen ${PMAX_ARGS}"
+  fi
   [ $COH = 0 ] || [ -f "$SHMS" ] || stop "$SHMS missing"
   echo "DRY $NAME SYS=$SYS SYSTEM=$SYSTEM N=$N KIND=$KIND UPDATE_RATIO=$UPDATE_RATIO KEYS=$KEYS THREADS=$THREADS V=$V"
   echo "DRY $NAME loadgen=$LOADGEN sha256=$(sha256sum < "$LOADGEN" | cut -c1-16) server=$HOST_SERVER sha256=$(sha256sum < "$HOST_SERVER" | cut -c1-16)"
@@ -225,6 +248,17 @@ R=$E/$NAME
 grep -q "^check: PASS$" $R/check.txt 2>/dev/null || stop "server checks (check.txt): $(grep '^FAIL' $R/check.txt 2>/dev/null | head -3 | tr '\n' ';')"
 for kv in not_found=0 errors=0 bad_values=0 stale_reads=0; do grep -q "^$kv\$" $R/loadgen/rocksdb.txt || stop "value check: $kv violated"; done
 grep -q "workload_finish\":\"ok" $R/loadgen/summary.json || stop "loadgen workload finish"
+PMNOTE=
+if [ "$PMAX" = 1 ]; then  # run-2 pmax part: value checks are correctness (stop), the rest a NOTE
+  pmv=$(sed -n 's/^pmax_rate=\([^ ]*\) pmax_loadgen_rc=\(.*\)$/\1 \2/p' $R/manifest.txt | tail -n 1)
+  pmr=${pmv% *} pmc=${pmv#* }
+  if [ -d $R/pmax/loadgen ]; then
+    for kv in not_found=0 errors=0 bad_values=0 stale_reads=0; do grep -q "^$kv\$" $R/pmax/loadgen/rocksdb.txt || stop "pmax value check: $kv violated"; done
+    [ "$pmc" = 0 ] || PMNOTE="pmax loadgen rc $pmc at $pmr"
+  else PMNOTE="no pmax step ($pmc: $(tail -n 1 "$E/pmax-$NAME.txt" 2>/dev/null | cut -f3))"; fi
+  printf '%s\t%s\t%s\t%s\t%s\n' "$NAME" "$SYS" "$pmr" "$pmc" "$(tail -n 1 "$E/pmax-$NAME.txt" 2>/dev/null | cut -f3)" >> "$E/pmax.tsv"
+  [ -z "$PMNOTE" ] || echo "$NAME NOTE: $PMNOTE"
+fi
 if [ $RC != 0 ]; then
   note=$(python3 -B -c 'import json,sys; print(json.load(open(sys.argv[1])).get("note",""))' $R/loadgen/summary.json 2>/dev/null)
   [ "$KIND" = slo ] && [[ "$note" == *"confirm failed at three rates"* ]] && { echo "PILOTRUN $NAME NOTE $note"; exit 0; }

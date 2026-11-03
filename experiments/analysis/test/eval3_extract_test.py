@@ -400,6 +400,18 @@ class PmaxTest(unittest.TestCase):
         self.assertEqual(f[0]["sel"], "PMAX")
 
 
+class PmaxLayoutTest(unittest.TestCase):
+    """run 2: RecSys (main-block.sh STREAM_PMAX: <E>/block/<sys>-u<R>/pmax) and RocksDB (run.sh PMAX:
+    <E>/<sys>-<mix>-n<N>/pmax) pmax parts get subpart "pmax" (= sel PMAX), the parent parts not"""
+    def test_cell_of(self):
+        root = "/r/eval4-rsv7-run1-rs-ds-v1"
+        self.assertEqual(E.cell_of(root, root + "/block/ds-u200/pmax"), ("ds", "u200", None, "ds-u200", "pmax"))
+        self.assertEqual(E.cell_of(root, root + "/block/pop-u200/slo")[4], "slo")
+        root = "/r/eval-run2-D-ds-n2-v1"
+        self.assertEqual(E.cell_of(root, root + "/ds-u50-n2/pmax"), ("ds", "u50", 2, "ds-u50-n2", "pmax"))
+        self.assertEqual(E.cell_of(root, root + "/ds-u50-n2")[4], ".")
+
+
 if __name__ == "__main__":
     if len(sys.argv) == 3 and sys.argv[1] == "--write-fixture":
         print(write_fixture(sys.argv[2]))

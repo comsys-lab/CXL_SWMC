@@ -14,7 +14,7 @@ ds; e.g. block/pop-u50-n2/slo, S-pop-u5, pop-u400/slo); N falls back to the numb
 
 Outputs in OUT_DIR (all CSV, one row per cell x step unless noted; pooled rows use step = L1 / MAX / PMAX):
   cells.csv                 one row per part: identity, workload, source dir, L1 / MAX / PMAX selection
-  (run 2: a part named "pmax" = h2n-block.sh H2N_PMAX, the fixed step at Popcorn's max under SLO of the cell; its
+  (run 2: a part named "pmax" = h2n-block.sh H2N_PMAX / recsys main-block.sh STREAM_PMAX / rocksdb run.sh PMAX, the fixed step at Popcorn's max under SLO of the cell; its
    steps get sel / pooled step PMAX and never L1: select step == "PMAX" for the fault breakdown at Popcorn's max load)
   fig-latency-vs-rps.csv    per measured step: offered / achieved rates, p50/p95/p99/SLO-percentile latency
   fig-max-under-slo.csv     per cell: max rate under SLO (SLO stream /s and total offered req/s)

@@ -104,6 +104,15 @@
 #   --ramp-knee 2, rise 1.2 default) -> stream_check.py (FAIL stops; NOTE "update rate not sustained" recorded) -> check_breakdown.py.
 #   loadgen rc 1 with a note is recorded (MAIN NOTE), not a stop. <E>/stream-results.tsv (one row per lifetime),
 #   <E>/rate-basis.txt (formula and rounding).
+# STREAM_PMAX=1 (run 2, EVAL_RUN only; user 2026-11-03 Q9: fault breakdown of Popcorn and De Stijl at the SAME load =
+#   Popcorn's max under the SLO of the rate): every pop / ds lifetime appends ONE fixed-load part "pmax" after its slo
+#   (and same-lifetime fix) part: loadgen --mode fixed --rates <rate> --warmup-s STREAM_PMAX_SETTLE_S (30, discarded)
+#   --step-warmup-s 5 --step-measure-s STREAM_PMAX_S (60) --drain-s 10, seed SEED + 2, no SLO abort. Rate (query/s) =
+#   experiments/eval/pmax_decide.py --workload recsys over the pop-u<rate> row: a pop lifetime its own slo row in
+#   <E>/stream-results.tsv (written right before), a ds lifetime the rows of STREAM_PMAX_FROM (space-separated
+#   stream-results.tsv files of the rs-main block of the same run, later files win). No confirmed valid pop max = no
+#   step (NOTE). Checks: stream_check.py + check_breakdown.py recorded (a failed check is a NOTE, the slo row stands).
+#   <E>/stream-pmax.tsv: name system rate_sps pmax_q_s appended status source; <lifetime>/pmax/ = part dir.
 set -uo pipefail
 E=${1:?evidence dir}
 P=/home/comsys/sungsu/destijl-control X=$(cd "$(dirname "$0")" && pwd)
@@ -161,7 +170,13 @@ elif [ $BLOCK = stream ]; then  # RecSys streaming block (header "BLOCK=stream")
     [ -n "${STREAM_FIX_LEVELS:-}${STREAM_FIX_LEVELS_MAP:-}" ] || [ -z "${STREAM_FIXONLY:-}" ] || { echo "SEQUENCE STOP: STREAM_FIXONLY needs STREAM_FIX_LEVELS"; exit 2; }
     [ -z "${STREAM_LEVELS:-}" ] || [ -f "$STREAM_LEVELS" ] || { echo "SEQUENCE STOP: STREAM_LEVELS file missing"; exit 2; }
     [[ ${STREAM_FIX_S:-60} =~ ^[1-9][0-9]*$ && ${STREAM_FIX_SETTLE_S:-60} =~ ^[1-9][0-9]*$ ]] || { echo "SEQUENCE STOP: bad STREAM_FIX_S / STREAM_FIX_SETTLE_S"; exit 2; }
+    # run-2 pmax step (header "STREAM_PMAX")
+    [[ ${STREAM_PMAX:-0} =~ ^[01]$ && ${STREAM_PMAX_S:-60} =~ ^[1-9][0-9]*$ && ${STREAM_PMAX_SETTLE_S:-30} =~ ^[1-9][0-9]*$ ]] \
+      || { echo "SEQUENCE STOP: bad STREAM_PMAX / STREAM_PMAX_S / STREAM_PMAX_SETTLE_S"; exit 2; }
+    [ -z "${STREAM_PMAX_FROM:-}" ] || [ "${STREAM_PMAX:-0}" = 1 ] || { echo "SEQUENCE STOP: STREAM_PMAX_FROM without STREAM_PMAX=1"; exit 2; }
+    [ "${STREAM_PMAX:-0}" = 0 ] || [ -f "$X/../eval/pmax_decide.py" ] || { echo "SEQUENCE STOP: missing experiments/eval/pmax_decide.py"; exit 2; }
   fi
+  [ -n "${EVAL_RUN:-}" ] || [ -z "${STREAM_PMAX:-}${STREAM_PMAX_FROM:-}" ] || { echo "SEQUENCE STOP: STREAM_PMAX needs EVAL_RUN"; exit 2; }
   EKKO=stream
 else
   : "${EKKO:?}"
@@ -380,6 +395,16 @@ if [ $HASDS = 1 ]; then
     && (cd "$DS_C" && sha256sum -c --quiet packet.sha256) || { echo "SEQUENCE STOP: DS_C is not the verified De Stijl bundle"; exit 2; }
   cmp -s "$REGION" "$DS_C/tools/cxl_region.yaml" || { echo "SEQUENCE STOP: REGION differs from the De Stijl bundle's region config"; exit 2; }
   KEXP=$DS_K
+fi
+if [ "${STREAM_PMAX:-0}" = 1 ]; then  # run-2 pmax step plan (shown by lib.sh block_dry)
+  for s in ${SYSTEMS:-hw pop}; do
+    case $s in
+      pop) echo "BLOCK PLAN: pmax $s: rate = own slo row (pmax_decide.py --workload recsys --from <E>/stream-results.tsv), part pmax '--mode fixed --rates <rate> --warmup-s ${STREAM_PMAX_SETTLE_S:-30} --step-warmup-s 5 --step-measure-s ${STREAM_PMAX_S:-60} --drain-s 10'";;
+      ds) for r in $STREAM_RATES; do
+            echo "BLOCK PLAN: pmax ds-u$r: $(python3 -I -B "$X/../eval/pmax_decide.py" --workload recsys --mix u$r $(for f in ${STREAM_PMAX_FROM:-}; do echo "--from $f"; done) | tr '\t' ' ')"
+          done;;
+    esac
+  done
 fi
 [ -d "$E" ] && [ -z "$(ls -A "$E" | grep -v '^sequence')" ] || { echo "SEQUENCE STOP: $E missing or not empty"; exit 2; }
 [ -z "$V7PEND" ] || { echo "SEQUENCE STOP: v7 parameters not decided by the user:$V7PEND (@USER@ in the conf)"; exit 2; }
@@ -880,6 +905,33 @@ for d, t, x in zip(m, toks, rates):
 PY
   echo "$NAME fix: $(tr '\n' ';' < "$RD/fix-check.txt")"
 }
+stream_pmax() {  # <sys> <rate>: run-2 pmax part in the current lifetime (header "STREAM_PMAX"); never a stop on its result
+  local s=$1 r=$2 RD=$LS/pmax rc fs=$((SEED + 2)) src=() f v st=ok out
+  [ "${STREAM_PMAX:-0}" = 1 ] && [[ $s =~ ^(pop|ds)$ ]] || return 0
+  if [ $s = pop ]; then src=(--from "$E/stream-results.tsv"); else for f in ${STREAM_PMAX_FROM:-}; do src+=(--from "$f"); done; fi
+  [ -s "$E/stream-pmax.tsv" ] || printf '# name\tsystem\trate_sps\tpmax_q_s\tappended\tstatus\tsource\n' > "$E/stream-pmax.tsv"
+  out=$(python3 -I -B "$X/../eval/pmax_decide.py" --workload recsys --mix u$r "${src[@]}" --log "$E/pmax-$NAME.txt" 2>&1) \
+    || { echo "MAIN NOTE $NAME pmax: pmax_decide.py failed ($out)"; printf '%s\t%s\t%s\t-\t0\tdecide-failed\t%s\n' "$NAME" $s $r "$out" >> "$E/stream-pmax.tsv"; return 0; }
+  IFS=$'\t' read -r v _ f <<< "$out"
+  if [ "$v" = none ]; then
+    echo "MAIN NOTE $NAME: no pmax step ($f)"
+    printf '%s\t%s\t%s\t-\t0\tskipped\t%s\n' "$NAME" $s $r "$f" >> "$E/stream-pmax.tsv"; return 0
+  fi
+  echo "$NAME pmax: loadgen seed $fs, $v query/s ($f)" >> "$E/seeds.txt"
+  measure "$LS" pmax "${LGC[@]}" --opt seed=$fs --seed $fs --raw --mode fixed --rates "$v" \
+    --warmup-s "${STREAM_PMAX_SETTLE_S:-30}" --step-warmup-s 5 --step-measure-s "${STREAM_PMAX_S:-60}" --drain-s 10
+  rc=$?
+  if [ $rc != 0 ]; then st="loadgen-rc$rc"
+  else
+    python3 $X/stream_check.py "$RD" > "$RD/stream-check.txt" 2>&1
+    python3 $X/check_breakdown.py "$RD" > "$RD/breakdown-check.txt" 2>&1
+    grep -qE '^STREAMCHECK (PASS|NOTE)' "$RD/stream-check.txt" || st="streamcheck:$(grep -m1 '^STREAMCHECK' "$RD/stream-check.txt" | cut -d' ' -f2)"
+    grep -q '^BREAKDOWN PASS' "$RD/breakdown-check.txt" || st="$st,breakdown-fail"
+  fi
+  [ "$st" = ok ] || echo "MAIN NOTE $NAME pmax: $st (the slo row stands; see $RD)"
+  printf '%s\t%s\t%s\t%s\t1\t%s\t%s\n' "$NAME" $s $r "$v" "$st" "$f" >> "$E/stream-pmax.tsv"
+  echo "$NAME pmax: $v query/s status $st"
+}
 eval_stream_rate() {  # <rate>
   local r=$1 s ord="" defer=0 fixonly=" ${STREAM_FIXONLY:-} "
   for s in $(h1shuffle recsys-stream-$r $(for x in ${SYSTEMS:-hw pop}; do [ $x = mgoff ] || echo $x; done)); do
@@ -905,6 +957,7 @@ eval_stream_rate() {  # <rate>
     else
       life_start $s $s-u$r; stream_slo $s $r
       [ -z "$toks" ] || [ $defer = 1 ] || stream_fix $s $r
+      stream_pmax $s $r   # run 2 (STREAM_PMAX=1, pop / ds only): one appended fixed step at Popcorn's max
       life_stop $s
     fi
   done
