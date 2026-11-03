@@ -1,13 +1,14 @@
 # pins-vdb-run2.sh (2026-11-03, experiment de-stijl-evaluation-run2; confs eval-run2-vdb*.conf): ONE vector DB server
-# for hw, pop and ds = builds/vdb/23 (slot-zero + stale-header guard, libdestijl; branch run2-vdb-slotfix 0c673b714),
-# Megalon = builds/vdb-megalon/17-n2 / -n4 / -n8 (same source, megalon 78-n*), loadgen/12, 54M SQ8 image,
+# for hw, pop and ds = builds/vdb/24 (slot-zero + stale-header guard + cxl_ipoll thread-name prefix, libdestijl; branch
+# run2-harness cdd141b50, re-pinned 2026-11-03 from vdb/23 = run2-vdb-slotfix 0c673b714; the n48 confs still name vdb/23
+# and so fail these pins until they are re-pinned to vdb/24 as well), Megalon = builds/vdb-megalon/17-n2 / -n4 / -n8 (same source, megalon 78-n*), loadgen/12, 54M SQ8 image,
 # builds/vdb-inputs/5 data + writes. Bundles through the conf's POP_BUNDLE_SHA / H2N_DS_BUNDLE_SHA (re-pin = conf only);
 # the Megalon and De Stijl lines join only when the conf names them (a ds conf has no H2N_MG_*, a hw/pop/mg conf no
 # H2N_DS_*). The N = 4 / 8 writes files are checked by h2n-block.sh (targets).
 EVD=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 eval "$(python3 -I -B "$EVD/evalconf.py" shell ${EVAL_CONF:+--conf "$EVAL_CONF"})"   # lib.sh exports EVAL_CONF
-PIN_SHA256="e0c05ac2723845a49327073300bf88ee1464dba50fe4e857640209e81a4d5bf2  $VDB_PLAIN_BUILD/manifest.txt
-6cea12e938bd052424788e77b8533cf675689151e2042bd68ca6b444d8f76fc4  $VDB_PLAIN_BUILD/bin/vdb-server
+PIN_SHA256="de3d8480fe7fcf606d0190013b879b5ab713b37f29567ca4ec4633889d77ec17  $VDB_PLAIN_BUILD/manifest.txt
+bd0365b365542aa2efd78055b7977cea5268daf9348f40c90b2cf9d3603203dd  $VDB_PLAIN_BUILD/bin/vdb-server
 6e3149a1ff26bddcb62d0c5b80026f53cdc43682d5b16c7c1fdffb34cd60e023  $VDB_LOADGEN_BUILD/manifest.txt
 82da28d45a32c68246d5ca0402c3c7dfc28394a165f4bb16dfa167c2c5058927  $VDB_LOADGEN_BUILD/loadgen
 $POP_BUNDLE_SHA  $POP_C/packet.sha256
