@@ -36,6 +36,16 @@ struct Params {
   }
 };
 
+// E1 visibility of a record for snapshot s with the stale-header guard (shm_hnsw.h): -1 = header rejected (canary,
+// upper-arena bounds, ext_id >= max_ids or ins_seq > max_writes), 1 = visible (inserted at or before s, not deleted
+// at or before s), 0 = not visible. del_seq: the node's private delete sequence per record id (kInf = live).
+// The vdb-server search predicate (server.cc run_segment) and tests/stale_header_test.cc use this function.
+inline int elem_visible(const ElemHeader &hin, uint32_t s, const uint32_t *del_seq, const Params &p) {
+  const ElemHeader h = hin;  // one copy: check and use the same bytes (plain headers are read in place)
+  if (!elem_header_ok(h, p.g) || h.ext_id >= p.max_ids || h.ins_seq > p.max_writes) return -1;
+  return h.ins_seq <= s && __atomic_load_n(&del_seq[h.ext_id], __ATOMIC_RELAXED) > s ? 1 : 0;
+}
+
 // sq8 quantizer in HWcc (only with --vec-format sq8; the fp32 layout has no such field): node 0 writes the
 // parameters of the init dir's sq8.bin at prepare, then releases `ready`; read-only afterwards. Every node copies them
 // into private memory after the start barrier (GraphParams::sq8) and checks dim and the FNV-1a sum.
