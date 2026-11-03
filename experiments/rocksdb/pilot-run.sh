@@ -75,7 +75,7 @@ case "$SYS" in
   Popcorn)  : "${C8:?}" "${K8:?}" "${GT8:?}" "${RECV_MODE:?}"
             RECV_MODE=${POP_RECV_MODE:-$RECV_MODE}   # run 2: the Popcorn receiver mode (recv-mode.sh)
             why=$(recv_rules pop "$RECV_MODE" "$C8" "$N") || stop "Popcorn receiver: $why"
-            [ "$RECV_MODE" != adaptive ] || POPSV=$(recv_pop_srcversion)
+            [ "$RECV_MODE" != adaptive ] && { [ "$RECV_MODE" != sleep ] || [ -z "${POP_ADAPT_KO:-}" ]; } || POPSV=$(recv_pop_srcversion)   # run 2 sleep 20/50: same module
             export SYSTEM=Popcorn-$RECV_MODE
             SHMS=$C8/p-popcorn-shm.sh GTX=$GT8 SHMR=$E/shm-$NAME
             PS=(POP_IPS="${IPS[*]}" K=$K8 GT=$GT8 C=$C8 R=$SHMR INIT_STATE=shared);;  # POP_IPS: N-node bundle (popcorn-n)

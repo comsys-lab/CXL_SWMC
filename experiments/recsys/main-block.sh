@@ -336,7 +336,7 @@ PRM=${POP_RECV_MODE:-$RECV_MODE} IPOLL=${RECV_IPOLL:-} POPSV=- DSFP=0
 [[ $IPOLL =~ ^[01]?$ ]] || { echo "SEQUENCE STOP: bad RECV_IPOLL"; exit 2; }
 if [[ " ${SYSTEMS:-hw pop mg} " == *" pop "* ]]; then
   why=$(recv_rules pop "$PRM" "$C8" 2) || { echo "SEQUENCE STOP: Popcorn receiver: $why"; exit 2; }
-  [ "$PRM" != adaptive ] || POPSV=$(recv_pop_srcversion)
+  [ "$PRM" != adaptive ] && { [ "$PRM" != sleep ] || [ -z "${POP_ADAPT_KO:-}" ]; } || POPSV=$(recv_pop_srcversion)   # run 2 sleep 20/50: same module
 fi
 [[ $ROUNDS =~ ^[1-9]$ ]] || { echo "SEQUENCE STOP: bad ROUNDS"; exit 2; }
 # SYSTEMS (subset of "hw pop mg", default all): a rerun of some systems (the SLO is fixed; L for the fixed window

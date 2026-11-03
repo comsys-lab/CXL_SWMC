@@ -47,7 +47,7 @@ KEYS="ROCKS_BLOCK ROCKS_TOPO ROCKS_NODES ROCKS_MIXES ROCKS_SYSTEMS ROCKS_SLO_MS 
   POP_REGION POP_C POP_BUNDLE_SHA POP_K POP_GT DS_REGION DS_C DS_BUNDLE_SHA DS_K DS_GT"
 OPTKEYS="ROCKS_DS_RECV_EXTRA ROCKS_EXPERIMENT ROCKS_MG_BUILD_N2 ROCKS_MG_BUILD_N4 ROCKS_MG_BUILD_N8 ROCKS_MG_CFG_N2
   ROCKS_MG_CFG_N4 ROCKS_MG_CFG_N8 ROCKS_MG_EXTENTS_N2 ROCKS_MG_EXTENTS_N4 ROCKS_MG_EXTENTS_N8
-  POP_RECV_MODE POP_ADAPT_KO RECV_IPOLL ROCKS_PMAX ROCKS_PMAX_FROM ROCKS_PMAX_MEASURE_S REQUIRE_ADAPTIVE
+  POP_RECV_MODE POP_ADAPT_KO RECV_IPOLL ROCKS_PMAX ROCKS_PMAX_FROM ROCKS_PMAX_MEASURE_S REQUIRE_ADAPTIVE REQUIRE_SLEEP2050
   ROCKS_FIXED ROCKS_FIXED_RECVP ROCKS_FIXED_RECVP_BASE"
 # shellcheck disable=SC2086
 unset $KEYS $OPTKEYS
@@ -109,10 +109,12 @@ elif [ "$PHASE" = ds ]; then
   why=$(recv_rules ds "$RECV_MODE" "$DS_C" "$N") || die "De Stijl receiver: $why"
 fi
 [[ $ROCKS_BLOCK != *200 ]] || [ -n "$DSRX" ] || die "ROCKS_BLOCK $ROCKS_BLOCK needs ROCKS_DS_RECV_EXTRA"
-# run-2 guard (conf REQUIRE_ADAPTIVE=1, verifier M3): phases hwpop / ds of a real run refuse placeholder receiver pins
+# run-2 guard (conf REQUIRE_SLEEP2050=1, earlier REQUIRE_ADAPTIVE=1, verifier M3): phases hwpop / ds of a real run
+# refuse placeholder receiver pins; REQUIRE_SLEEP2050 is exported to pilot-run.sh (readback asserts sleep 20/50)
 if [ "$PHASE" != mg ] && ! why=$(recv_run2_guard); then
   [ $DRY = 1 ] && echo "RUNSET NOTE: run-2 guard: $why (a real run stops here)" || die "run-2 guard: $why"
 fi
+[ "$PHASE" = mg ] || [ "${REQUIRE_SLEEP2050:-0}" != 1 ] || echo "RUNSET run-2 guard: sleep 20/50 receiver for pop and ds (readback asserted)"
 [[ " $ROCKS_NODES " == *" $N "* ]] || die "N=$N not in ROCKS_NODES ($ROCKS_NODES)"
 [ "$ROCKS_SLO_MS" = 1 ] || die "ROCKS_SLO_MS must be 1 (user decision: RocksDB SLO p99 1 ms)"
 [ "$EXPECT_NPROC" = 4 ] || die "EXPECT_NPROC must be 4 (4 vCPU rule, user 2026-11-01)"
@@ -179,7 +181,7 @@ else export DS_C DS_K DS_GT DS_BUNDLE_SHA DS_RECV_EXTRA="$DSRX"; fi
 echo "RUNSET rocks conf=$CONF ($(sha256sum < "$CONF" | cut -c1-16)) block=$ROCKS_BLOCK N=$N phase=$PHASE topo=$ROCKS_TOPO E=$E"
 [ "$PHASE" != ds ] || echo "RUNSET De Stijl receiver: recv_mode $RECV_MODE ${DSRX:-module defaults} ipoll ${RECV_IPOLL:-default}"
 [ "$PHASE" != hwpop ] || echo "RUNSET Popcorn receiver: recv_mode ${POP_RECV_MODE:-$RECV_MODE}${POP_ADAPT_KO:+ module $POP_ADAPT_KO} ipoll ${RECV_IPOLL:-default}"
-for x in POP_RECV_MODE POP_ADAPT_KO RECV_IPOLL; do [ -z "${!x:-}" ] || export "$x"; done
+for x in POP_RECV_MODE POP_ADAPT_KO RECV_IPOLL REQUIRE_SLEEP2050; do [ -z "${!x:-}" ] || export "$x"; done
 if [ -n "$FX" ]; then  # receiver ablation: no SLO search arguments; the part plan for pilot-run.sh / part-hook.sh
   unset SLO_EXTRA
   export FIXED_SPEC="$FX" FIXED_RECVP="$FXR" FIXED_RECVP_BASE="$FXB"

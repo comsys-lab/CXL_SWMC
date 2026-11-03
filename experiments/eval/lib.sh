@@ -30,7 +30,9 @@ TREE=$(cd "$EVD/../.." && pwd)
 #   RECV_IPOLL       0 | 1: adaptive idle pollers written after the enable (0 = pollers-off cell); unset = default 1
 #   (De Stijl fault-entry polling: fault_poll=0|1 in H2N_DS_RECV_EXTRA / RS_DS_RECV_EXTRA; build-9 bundles load 0)
 unset REGISTRY LEVELS_SOURCE LEVELS_REGISTRY RS_PROC_CXL_SHM RUNSETS EVIDENCE_TAG EXPORT_SUFFIX
-unset POP_RECV_MODE POP_ADAPT_KO RECV_IPOLL
+#   REQUIRE_SLEEP2050 1 = run-2 receiver guard (recv-mode.sh recv_run2_guard; passed to the blocks: the readback asserts
+#                    recv_mode=sleep idle_spin_us 50 idle_sleep_us 20 for pop and ds)
+unset POP_RECV_MODE POP_ADAPT_KO RECV_IPOLL REQUIRE_SLEEP2050
 unset RS_V7 RS_V7_IMAGE RS_V7_DENSE RS_V7_LR RS_V7_ACC_INIT RS_V7_TRAIN_BATCH RS_V7_TRAIN_THREADS RS_V7_W_S \
   RS_V7_STALE_SAMPLE RS_V7_STALE_DIR RS_V7_SAMPLES RS_V7_FROZEN   # v7 keys come only from the conf
 unset RS_PMAX RS_PMAX_FROM RS_PMAX_S RS_PMAX_SETTLE_S   # run-2 RecSys pmax step keys (rs_env), only from the conf
@@ -133,10 +135,12 @@ manifest() {  # written into E at the real start
 # assignments (only the set ones); recv_pop_check <N>: the Popcorn mode is allowed for POP_C (adaptive: POP_ADAPT_KO)
 . "$EVD/recv-mode.sh"
 RECVENV=()
-for _v in POP_RECV_MODE POP_ADAPT_KO RECV_IPOLL; do [ -z "${!_v:-}" ] || RECVENV+=("$_v=${!_v}"); done
+for _v in POP_RECV_MODE POP_ADAPT_KO RECV_IPOLL REQUIRE_SLEEP2050; do [ -z "${!_v:-}" ] || RECVENV+=("$_v=${!_v}"); done
 [[ ${RECV_IPOLL:-} =~ ^[01]?$ ]] || { echo "RUNSET STOP: bad RECV_IPOLL (${RECV_IPOLL})"; exit 2; }
-# run-2 guard (conf REQUIRE_ADAPTIVE=1; recv-mode.sh recv_run2_guard): a real run refuses placeholder receiver pins
-if _why=$(recv_run2_guard); then [ "${REQUIRE_ADAPTIVE:-0}" = 0 ] || plan "run-2 guard: adaptive receiver for pop and ds, POP_ADAPT_KO set: OK"
+# run-2 guard (conf REQUIRE_SLEEP2050=1, earlier REQUIRE_ADAPTIVE=1; recv-mode.sh recv_run2_guard): a real run refuses placeholder receiver pins
+if _why=$(recv_run2_guard); then
+  if [ "${REQUIRE_SLEEP2050:-0}" = 1 ]; then plan "run-2 guard: sleep 20/50 receiver for pop and ds, POP_ADAPT_KO set: OK"
+  elif [ "${REQUIRE_ADAPTIVE:-0}" != 0 ]; then plan "run-2 guard: adaptive receiver for pop and ds, POP_ADAPT_KO set: OK"; fi
 elif [ $DRY = 1 ]; then plan "run-2 guard: $_why (a real run stops here)"
 else die "run-2 guard: $_why"; fi
 recv_pop_check() {  # <N>

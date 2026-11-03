@@ -36,6 +36,15 @@ recv_rules() {
          env=$c/tools/destijl.env;;
     *) echo "recv_rules: bad system $s"; return 1;;
   esac
+  if [ $s = pop ] && [ "$m" = sleep ] && [ -n "${POP_ADAPT_KO:-}" ]; then
+    # run 2 sleep 20/50: POP_ADAPT_KO pins the module the bundle installs (same 13-recv2 module as the adaptive runs)
+    [ -f "$POP_ADAPT_KO" ] || { echo "POP_ADAPT_KO $POP_ADAPT_KO missing"; return 1; }
+    ks=$(sed -n 's/^KO_SHA=//p' "$env" 2>/dev/null | tail -n 1)
+    [ "$(sha256sum < "$POP_ADAPT_KO" | cut -c1-64)" = "$ks" ] \
+      || { echo "POP_ADAPT_KO $POP_ADAPT_KO sha256 != KO_SHA $ks of $env (the bundle does not install that module)"; return 1; }
+    modinfo -F parm "$POP_ADAPT_KO" 2>/dev/null | grep -q '^idle_sleep_us:' || { echo "POP_ADAPT_KO $POP_ADAPT_KO has no idle_sleep_us parameter"; return 1; }
+    return 0
+  fi
   [[ $m =~ ^(adaptive|idle)$ ]] || return 0
   [ -f "$env" ] || { echo "$env missing (ring_coherent of the bundle unknown)"; return 1; }
   rc=$(recv_coherent "$env" "$n")
@@ -61,7 +70,20 @@ recv_rules() {
 # (De Stijl, and Popcorn unless POP_RECV_MODE is set), POP_RECV_MODE empty or adaptive, and POP_ADAPT_KO set; prints
 # nothing and returns 0 when satisfied (or REQUIRE_ADAPTIVE unset / 0), else prints why and returns 1. The callers
 # stop on 1 in a real run and only print the reason in a dry run (placeholder pins dry-run cleanly).
+# REQUIRE_SLEEP2050=1 (run-2 receiver REVISED 2026-11-04, PROJECT.md; replaces REQUIRE_ADAPTIVE in the run-2 confs): a
+# real run needs RECV_MODE=sleep, POP_RECV_MODE empty or sleep, POP_ADAPT_KO set (the same 13-recv2 Popcorn module),
+# and REQUIRE_ADAPTIVE unset / 0; the readback (recv_rb_check sleep) then asserts idle_spin_us 50 / idle_sleep_us 20
+# for pop and ds. Both keys set = refused.
 recv_run2_guard() {
+  case ${REQUIRE_SLEEP2050:-0} in 0) ;; 1)
+    local w=
+    [ "${REQUIRE_ADAPTIVE:-0}" = 0 ] || w="REQUIRE_ADAPTIVE=${REQUIRE_ADAPTIVE} with REQUIRE_SLEEP2050=1"
+    [ "${RECV_MODE:-}" = sleep ] || w="${w:+$w; }RECV_MODE=${RECV_MODE:-} (want sleep)"
+    [[ ${POP_RECV_MODE:-sleep} == sleep ]] || w="${w:+$w; }POP_RECV_MODE=$POP_RECV_MODE (want sleep)"
+    [ -n "${POP_ADAPT_KO:-}" ] || w="${w:+$w; }POP_ADAPT_KO unset (the 13-recv2 module must stay)"
+    [ -z "$w" ] || { echo "run 2 needs the sleep 20/50 receiver for pop and ds: $w"; return 1; }
+    return 0;;
+    *) echo "bad REQUIRE_SLEEP2050 '${REQUIRE_SLEEP2050}' (0 | 1)"; return 1;; esac
   case ${REQUIRE_ADAPTIVE:-0} in 0) return 0;; 1) ;; *) echo "bad REQUIRE_ADAPTIVE '${REQUIRE_ADAPTIVE}' (0 | 1)"; return 1;; esac
   local why=
   [ "${RECV_MODE:-}" = adaptive ] || why="RECV_MODE=${RECV_MODE:-} (want adaptive)"
@@ -79,6 +101,15 @@ recv_rb_check() {
   local s=$1 m=$2 l=" $3 " sv=$4 ip=$5 fp=$6 v
   rbv() { v=$(echo "$l" | sed -n "s/.* $1=\([^ ]*\) .*/\1/p"); }
   rbv recv_mode; [ "$v" = "$m" ] || { echo "recv_mode=$v (want $m)"; return 1; }
+  if [ "$m" = sleep ] && [ "${REQUIRE_SLEEP2050:-0}" = 1 ]; then
+    # run-2 receiver (2026-11-04, PROJECT.md): sleep idle_spin_us 50 / idle_sleep_us 20, same module for pop and ds
+    rbv ipoll; [ -n "$v" ] && [ "$v" != absent ] || { echo "no ipoll parameter (module is not the run-2 receiver module)"; return 1; }
+    rbv idle_spin_us; [ "$v" = 50 ] || { echo "idle_spin_us=$v (want 50: run-2 sleep 20/50 for pop and ds)"; return 1; }
+    rbv idle_sleep_us; [ "$v" = 20 ] || { echo "idle_sleep_us=$v (want 20: run-2 sleep 20/50 for pop and ds)"; return 1; }
+    rbv fault_poll; [ $s != ds ] || [ "$fp" = - ] || [ "$v" = "$fp" ] || { echo "fault_poll=$v (want $fp)"; return 1; }
+    rbv srcversion; [ "$sv" = - ] || [ "$v" = "$sv" ] || { echo "srcversion=$v (want $sv of POP_ADAPT_KO)"; return 1; }
+    return 0
+  fi
   [ "$m" = adaptive ] || return 0
   rbv ring_coherent; case $s:$v in pop:1|ds:1|ds:-1) ;; *) echo "ring_coherent=$v with recv_mode=adaptive"; return 1;; esac
   rbv ipoll; [ -n "$v" ] && [ "$v" != absent ] || { echo "no ipoll parameter (module is not the adaptive receiver)"; return 1; }

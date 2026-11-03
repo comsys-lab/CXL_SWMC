@@ -321,7 +321,7 @@ fi
 # field is -): written on every VM before the part, restored after it (fixed-part-hook.sh, recv_mode last).
 # H2N_FIXED_RECVP_BASE = <k>=<v>,... = the lifetime's receiver state (required with H2N_FIXED_RECVP; recv_mode = the
 # lifetime's mode; every token key must be in it); checked before every such part, after it and after the lifetime.
-# The lifetime start still applies and checks the conf receiver (recv_apply, REQUIRE_ADAPTIVE readback).
+# The lifetime start still applies and checks the conf receiver (recv_apply, REQUIRE_ADAPTIVE / REQUIRE_SLEEP2050 readback).
 FRECVP=${H2N_FIXED_RECVP:-} FRBASE=${H2N_FIXED_RECVP_BASE:-}
 RPKRE='(recv_mode=(poll|sleep|adaptive)|(ipoll|spin_us|watch_us|s_min_us|s_max_us|idle_spin_us|idle_sleep_us)=[0-9]+)'
 if [ -n "$FRECVP$FRBASE" ]; then
@@ -349,7 +349,7 @@ fi
 POPSV=-
 if [ $HASPOP = 1 ]; then
   why=$(recv_rules pop "$PRM" "$C8" "$N") || die "Popcorn receiver: $why"
-  [ "$PRM" != adaptive ] || POPSV=$(recv_pop_srcversion)
+  [ "$PRM" != adaptive ] && { [ "$PRM" != sleep ] || [ -z "${POP_ADAPT_KO:-}" ]; } || POPSV=$(recv_pop_srcversion)   # run 2 sleep 20/50: same module
 fi
 RMODES=; [ $HASPOP = 0 ] || RMODES+="$PRM"; [ $HASDS = 0 ] || RMODES+="${RMODES:+ }$RECV_MODE"
 # RECV_IPOLL without an adaptive pop / ds lifetime (hw-only block, or a dry stand-in with RECV_MODE=sleep): not

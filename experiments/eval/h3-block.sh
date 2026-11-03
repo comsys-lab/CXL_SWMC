@@ -84,7 +84,7 @@ else
 fi
 if [[ " $SYSTEMS " == *" pop "* ]]; then
   why=$(recv_rules pop "$PRM" "$C8" "$N") || die "Popcorn receiver: $why"
-  [ "$PRM" != adaptive ] || POPSV=$(recv_pop_srcversion)
+  [ "$PRM" != adaptive ] && { [ "$PRM" != sleep ] || [ -z "${POP_ADAPT_KO:-}" ]; } || POPSV=$(recv_pop_srcversion)   # run 2 sleep 20/50: same module
 fi
 IPS=() DOMS=()
 for k in $(seq 0 $((N - 1))); do IPS+=(192.168.122.$((100 + k))); DOMS+=(cxl_vm$k); done
