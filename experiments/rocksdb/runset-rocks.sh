@@ -47,7 +47,8 @@ KEYS="ROCKS_BLOCK ROCKS_TOPO ROCKS_NODES ROCKS_MIXES ROCKS_SYSTEMS ROCKS_SLO_MS 
   POP_REGION POP_C POP_BUNDLE_SHA POP_K POP_GT DS_REGION DS_C DS_BUNDLE_SHA DS_K DS_GT"
 OPTKEYS="ROCKS_DS_RECV_EXTRA ROCKS_EXPERIMENT ROCKS_MG_BUILD_N2 ROCKS_MG_BUILD_N4 ROCKS_MG_BUILD_N8 ROCKS_MG_CFG_N2
   ROCKS_MG_CFG_N4 ROCKS_MG_CFG_N8 ROCKS_MG_EXTENTS_N2 ROCKS_MG_EXTENTS_N4 ROCKS_MG_EXTENTS_N8
-  POP_RECV_MODE POP_ADAPT_KO RECV_IPOLL ROCKS_PMAX ROCKS_PMAX_FROM ROCKS_PMAX_MEASURE_S REQUIRE_ADAPTIVE REQUIRE_SLEEP2050
+  POP_RECV_MODE POP_ADAPT_KO RECV_IPOLL RECV_WATCH_US RECV_S_MAX_US ROCKS_PMAX ROCKS_PMAX_FROM ROCKS_PMAX_MEASURE_S
+  REQUIRE_ADAPTIVE REQUIRE_SLEEP2050
   ROCKS_FIXED ROCKS_FIXED_RECVP ROCKS_FIXED_RECVP_BASE"
 # shellcheck disable=SC2086
 unset $KEYS $OPTKEYS
@@ -80,6 +81,9 @@ if [ -n "$FX$FXR$FXB" ]; then
   [[ $FXB =~ ^$RPKRE(,$RPKRE)*$ ]] && [[ ,$FXB, == *,recv_mode=$RECV_MODE,* ]] || die "bad ROCKS_FIXED_RECVP_BASE ($FXB; recv_mode must be RECV_MODE $RECV_MODE)"
   [ -z "${POP_RECV_MODE:-}" ] || [ "$POP_RECV_MODE" = "$RECV_MODE" ] || die "ROCKS_FIXED: POP_RECV_MODE != RECV_MODE (one base)"
   [ -z "${RECV_IPOLL:-}" ] || [[ ,$FXB, == *,ipoll=$RECV_IPOLL,* ]] || die "ROCKS_FIXED_RECVP_BASE ipoll != RECV_IPOLL $RECV_IPOLL"
+  for x in watch_us=${RECV_WATCH_US:-} s_max_us=${RECV_S_MAX_US:-}; do
+    [ -z "${x#*=}" ] || [[ ,$FXB, != *,${x%%=*}=* ]] || [[ ,$FXB, == *,$x,* ]] || die "ROCKS_FIXED_RECVP_BASE ${x%%=*} != the conf's $x (RECV_WATCH_US / RECV_S_MAX_US)"
+  done
   declare -A FXP=()
   for t in $FX; do
     [[ $t =~ ^(pop|ds)/[a-z0-9]+/-/-/[0-9]+(,[0-9]+)*/[0-9]+/[1-9][0-9]*/[0-9]+$ ]] || die "bad ROCKS_FIXED token $t (<pop|ds>/<part>/-/-/<rates>/<warm-up>/<measure>/<drain>)"
@@ -100,9 +104,11 @@ EXPN=${ROCKS_EXPERIMENT:-de-stijl-evaluation-run1}
 DSRX=${ROCKS_DS_RECV_EXTRA:-}
 [[ $DSRX =~ ^(((idle_sleep_us|idle_spin_us)=[0-9]+|fault_poll=[01])( |$))*$ ]] || die "bad ROCKS_DS_RECV_EXTRA ($DSRX: 'idle_sleep_us=<n> idle_spin_us=<n> fault_poll=<0|1>')"
 # run-2 receiver keys (experiments/eval/recv-mode.sh; pilot-run.sh checks them per cell): POP_RECV_MODE, POP_ADAPT_KO
-# (relative = project root), RECV_IPOLL
+# (relative = project root), RECV_IPOLL, RECV_WATCH_US / RECV_S_MAX_US (adaptive watch_us / s_max_us, recv_wsm_check;
+# a non-adaptive pop / ds cell refuses them: pilot-run.sh stops, its dry run notes)
 [ -z "${POP_ADAPT_KO:-}" ] || POP_ADAPT_KO=$(abs "$POP_ADAPT_KO")
 . "$TREE/experiments/eval/recv-mode.sh"
+why=$(recv_wsm_check); [ $? != 1 ] || die "$why"
 if [ "$PHASE" = hwpop ] && [[ " $ROCKS_SYSTEMS " == *" pop "* ]]; then
   why=$(recv_rules pop "${POP_RECV_MODE:-$RECV_MODE}" "$POP_C" "$N") || die "Popcorn receiver: $why"
 elif [ "$PHASE" = ds ]; then
@@ -179,9 +185,9 @@ if [ $PHASE = hwpop ]; then export C8=$POP_C K8=$POP_K GT8=$POP_GT POP_BUNDLE_SH
 elif [ $PHASE = mg ]; then export MEG_CFG
 else export DS_C DS_K DS_GT DS_BUNDLE_SHA DS_RECV_EXTRA="$DSRX"; fi
 echo "RUNSET rocks conf=$CONF ($(sha256sum < "$CONF" | cut -c1-16)) block=$ROCKS_BLOCK N=$N phase=$PHASE topo=$ROCKS_TOPO E=$E"
-[ "$PHASE" != ds ] || echo "RUNSET De Stijl receiver: recv_mode $RECV_MODE ${DSRX:-module defaults} ipoll ${RECV_IPOLL:-default}"
-[ "$PHASE" != hwpop ] || echo "RUNSET Popcorn receiver: recv_mode ${POP_RECV_MODE:-$RECV_MODE}${POP_ADAPT_KO:+ module $POP_ADAPT_KO} ipoll ${RECV_IPOLL:-default}"
-for x in POP_RECV_MODE POP_ADAPT_KO RECV_IPOLL REQUIRE_SLEEP2050; do [ -z "${!x:-}" ] || export "$x"; done
+[ "$PHASE" != ds ] || echo "RUNSET De Stijl receiver: recv_mode $RECV_MODE ${DSRX:-module defaults} ipoll ${RECV_IPOLL:-default} $(recv_wsm_desc)"
+[ "$PHASE" != hwpop ] || echo "RUNSET Popcorn receiver: recv_mode ${POP_RECV_MODE:-$RECV_MODE}${POP_ADAPT_KO:+ module $POP_ADAPT_KO} ipoll ${RECV_IPOLL:-default} $(recv_wsm_desc)"
+for x in POP_RECV_MODE POP_ADAPT_KO RECV_IPOLL RECV_WATCH_US RECV_S_MAX_US REQUIRE_SLEEP2050; do [ -z "${!x:-}" ] || export "$x"; done
 if [ -n "$FX" ]; then  # receiver ablation: no SLO search arguments; the part plan for pilot-run.sh / part-hook.sh
   unset SLO_EXTRA
   export FIXED_SPEC="$FX" FIXED_RECVP="$FXR" FIXED_RECVP_BASE="$FXB"

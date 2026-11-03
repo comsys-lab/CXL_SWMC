@@ -77,7 +77,10 @@
 #                       adaptive needs POP_ADAPT_KO (signed adaptive cxl_shm.ko = KO_SHA of C8/tools/popcorn.env;
 #                       the guest's srcversion is checked after the load); adaptive needs ring_coherent=1 (bundle
 #                       PARAMS, guest readback). RECV_IPOLL 0 | 1 (optional, adaptive only): ipoll written on every VM
-#                       after the enable (0 = pollers-off cell). H2N_DS_RECV_EXTRA also takes fault_poll=0|1 (build 9
+#                       after the enable (0 = pollers-off cell). RECV_WATCH_US / RECV_S_MAX_US (optional integers,
+#                       unset = module default 200 / 200): watch_us / s_max_us written after ipoll and read back
+#                       (recv-mode.sh recv_wsm_check; a non-adaptive pop / ds lifetime refuses them, a hw-only block
+#                       notes them). H2N_DS_RECV_EXTRA also takes fault_poll=0|1 (build 9
 #                       bundles load fault_poll=0 by default; adaptive ds lifetimes are checked at fault_poll=0 unless
 #                       the extra says 1). After the enable every VM's recv-readback.sh line (parameters, srcversion,
 #                       cxl_recv / cxl_ipoll thread CPU) joins recv-mode-<name>.txt; after the run the same line goes
@@ -124,6 +127,7 @@ N=$H2N_N VCPU=$H2N_VCPU STRICT=${H2N_OPCOH_STRICT:-0} CXLBW=${H2N_CXLBW:-0} HOST
 [[ $RECV_MODE =~ ^(poll|idle|sleep|adaptive)$ ]] || die "bad RECV_MODE"
 PRM=${POP_RECV_MODE:-$RECV_MODE} IPOLL=${RECV_IPOLL:-}
 [[ $IPOLL =~ ^[01]?$ ]] || die "bad RECV_IPOLL ($IPOLL: 0 | 1)"
+why=$(recv_wsm_check); [ $? != 1 ] || die "$why"   # values; the modes are checked below (RMODES)
 [[ $STRICT =~ ^[01]$ ]] && [[ $CXLBW =~ ^[01]$ ]] && [[ $HOSTCPU =~ ^[01]$ ]] || die "bad H2N_OPCOH_STRICT / H2N_CXLBW / H2N_HOSTCPU"
 [[ $X_MAXD =~ ^[1-9][0-9]*$ ]] || die "bad X_MAXD"
 # lifetimes: <sys>:<mix> or <sys>:<mix>:r<j> (repeat j, runset-h2n.sh H2N_REPEATS; run dir <sys>-<mix>-n<N>-r<j>), no
@@ -337,6 +341,10 @@ if [ -n "$FRECVP$FRBASE" ]; then
   bm=${FRBASE#*recv_mode=}; bm=${bm%%,*}
   [ $HASPOP = 0 ] || [ "$bm" = "$PRM" ] || die "H2N_FIXED_RECVP_BASE recv_mode=$bm != the Popcorn lifetime mode $PRM"
   [ $HASDS = 0 ] || [ "$bm" = "$RECV_MODE" ] || die "H2N_FIXED_RECVP_BASE recv_mode=$bm != the De Stijl lifetime mode $RECV_MODE"
+  # the lifetime start writes RECV_WATCH_US / RECV_S_MAX_US: a base listing the key must hold the same value
+  for x in watch_us=${RECV_WATCH_US:-} s_max_us=${RECV_S_MAX_US:-}; do
+    [ -z "${x#*=}" ] || [[ ,$FRBASE, != *,${x%%=*}=* ]] || [[ ,$FRBASE, == *,$x,* ]] || die "H2N_FIXED_RECVP_BASE ${x%%=*} != the conf's $x (RECV_WATCH_US / RECV_S_MAX_US)"
+  done
 fi
 [ -z "$NENV_X" ] || [[ $NENV_X =~ ^(ENV:[A-Z_][A-Z0-9_]*=[^[:space:]]*( |$))+$ ]] || die "bad H2N_NODE_ENV_EXTRA ($NENV_X)"
 if [ $DSKER = 1 ]; then  # the De Stijl bundle instead of the Popcorn one (no pop lifetime in a ds block)
@@ -355,6 +363,13 @@ RMODES=; [ $HASPOP = 0 ] || RMODES+="$PRM"; [ $HASDS = 0 ] || RMODES+="${RMODES:
 # RECV_IPOLL without an adaptive pop / ds lifetime (hw-only block, or a dry stand-in with RECV_MODE=sleep): not
 # applied (recv_apply writes ipoll for adaptive only); one conf serves the hw, pop and ds cells (run 2: RECV_IPOLL=0)
 [ -z "$IPOLL" ] || [[ " $RMODES " == *" adaptive "* ]] || echo "BLOCK NOTE: RECV_IPOLL=$IPOLL not applied: no adaptive pop / ds lifetime in this block (modes: ${RMODES:-none})"
+# RECV_WATCH_US / RECV_S_MAX_US: every pop / ds lifetime must be adaptive (dry stand-in RECV_MODE=sleep: note only);
+# a hw-only block notes them
+if [ -n "${RECV_WATCH_US:-}${RECV_S_MAX_US:-}" ]; then
+  # shellcheck disable=SC2086
+  why=$(recv_wsm_check $RMODES) || pending "$why"
+  [ -n "$RMODES" ] || echo "BLOCK NOTE: $(recv_wsm_desc) not applied: no pop / ds lifetime in this block"
+fi
 RB=$EV/recv-readback.sh
 [ -f "$RB" ] || die "missing $RB"
 # poller CPU per step (proc_stats kthread prefix cxl_ipoll) needs a server build that lists it; else only the lifetime
@@ -457,7 +472,7 @@ echo "BLOCK PLAN: server_args plain=[$SA]${MGSA:+ megalon=[$MGSA]}"
 [ $L1ON = 0 ] || echo "BLOCK PLAN: L1 step on hw/pop/ds lifetimes: --mode fixed --rates <L1> ${L1W}s warm-up + ${L1M}s + ${L1D}s drain; L1 from mg-<mix>-n$N rows of [${L1FROM:-} + this block]; no mg max -> L1 = ramp start $L1START, no step"
 [ -z "$FWARM" ] || echo "BLOCK PLAN: fixed warmup (H2N_WARMUP) on hw/pop/ds SLO lifetimes: [$FWARM] parts=[$FWPARTS] nogate=[$FWNOGATE] duration_s=$FWDUR (no end condition; mg: none)"
 [ $ACCX = 0 ] || echo "BLOCK PLAN: accuracy export per lifetime (<run>/accuracy-export.txt)"
-echo "BLOCK PLAN: receiver pop=$([ $HASPOP = 1 ] && echo "$PRM${POP_ADAPT_KO:+ ko=$POP_ADAPT_KO srcversion=$POPSV}" || echo -) ds=$([ $HASDS = 1 ] && echo "$RECV_MODE extra=[${DSRX}] fault_poll=$DSFP" || echo -) ipoll=${IPOLL:-default}"
+echo "BLOCK PLAN: receiver pop=$([ $HASPOP = 1 ] && echo "$PRM${POP_ADAPT_KO:+ ko=$POP_ADAPT_KO srcversion=$POPSV}" || echo -) ds=$([ $HASDS = 1 ] && echo "$RECV_MODE extra=[${DSRX}] fault_poll=$DSFP" || echo -) ipoll=${IPOLL:-default} $(recv_wsm_desc)"
 echo "BLOCK PLAN: $LAYOUT"
 [ -z "$FIXED" ] || echo "BLOCK PLAN: fixed windows (no SLO search) [$FIXED] node_env_extra=[$NENV_X] allow_detail=$ALLOWDET"
 [ -z "$FRECVP" ] || echo "BLOCK PLAN: receiver parameters per part [$FRECVP] base [$FRBASE] (fixed-part-hook.sh: base checked, written, read back, restored)"
@@ -589,7 +604,7 @@ gate() { bash "$HG" check "$E/gate-$1.txt" > /dev/null || stop "h3 gate ($1; see
   [ $HASMG = 1 ] && echo "megalon_build=$MEG_BUILD lib=$MEG_LIB cfg=$MEG_CFG sha256=$(sha256sum < "$MEG_CFG" | cut -c1-64) vmeg=$VMEG mg_max_deletes=$MG_MAXD"
   echo "writes=$X_WRITES sha256=$(sha256sum < "$X_WRITES" | cut -c1-64) max_deletes=$X_MAXD"
   echo "slo_part=[$H2N_SLO_PART]"
-  echo "receiver: pop_recv_mode=$PRM pop_adapt_ko=${POP_ADAPT_KO:--} pop_adapt_ko_sha256=$([ -f "${POP_ADAPT_KO:-}" ] && sha256sum < "$POP_ADAPT_KO" | cut -c1-64 || echo -) pop_srcversion=$POPSV ds_recv_mode=$RECV_MODE ds_extra=[$DSRX] ds_fault_poll=$DSFP ipoll=${IPOLL:-default} readback_sha256=$(sha256sum < "$RB" | cut -c1-64)"
+  echo "receiver: pop_recv_mode=$PRM pop_adapt_ko=${POP_ADAPT_KO:--} pop_adapt_ko_sha256=$([ -f "${POP_ADAPT_KO:-}" ] && sha256sum < "$POP_ADAPT_KO" | cut -c1-64 || echo -) pop_srcversion=$POPSV ds_recv_mode=$RECV_MODE ds_extra=[$DSRX] ds_fault_poll=$DSFP ipoll=${IPOLL:-default} $(recv_wsm_desc) readback_sha256=$(sha256sum < "$RB" | cut -c1-64)"
   [ $DSKER = 0 ] || echo "destijl: bundle=$DS_C bundle_sha=$DS_BUNDLE_SHA release=$DS_K guest_tools=$DS_GT region=$REGION t_us=$DST recv_mode=$RECV_MODE replica_mode=$REPL replica_pool_bytes=${RPOOL:--}${DAMONP:+ damon=[$DAMONP] damon_guest_sha256=$(sha256sum < "$EV/ds-damon-guest.sh" | cut -c1-64)}"
   [ "$REPL" != damon ] || echo "damon: at=$DXAT range=$DXRANGE start_keys=[$DXSTART] regions_capture=$DXREG warmup=[$DXWARM] warm_parts=[$DXWPARTS]$([ "$DXAT" = enable ] || echo " hook_sha256=$(sha256sum < "$EV/damonx-hook.sh" | cut -c1-64)")"
   [ $L1ON = 0 ] || echo "l1: from=[$L1FROM] warmup_s=$L1W measure_s=$L1M drain_s=$L1D ramp_start=$L1START"

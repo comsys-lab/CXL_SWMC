@@ -328,7 +328,8 @@ IPS=(192.168.122.100 192.168.122.101)
 OWNER="RECSYS-$BLOCK-$(basename "$E")"; [ $BLOCK = h1 ] && OWNER="H1-recsys-$H1MODE-r$H1_N"
 # receiver (run 2, experiments/eval/recv-mode.sh): RECV_MODE poll | idle | sleep | adaptive (ds: no idle), POP_RECV_MODE
 # (Popcorn lifetimes, default RECV_MODE), POP_ADAPT_KO (Popcorn adaptive module, sha256 = the bundle's KO_SHA),
-# RECV_IPOLL (0 | 1, adaptive: ipoll written after the enable); adaptive lifetimes add --proc-sysfs /sys/kernel/cxl_shm
+# RECV_IPOLL (0 | 1, adaptive: ipoll written after the enable), RECV_WATCH_US / RECV_S_MAX_US (adaptive watch_us /
+# s_max_us written after ipoll, read back; unset = 200 / 200); adaptive lifetimes add --proc-sysfs /sys/kernel/cxl_shm
 # --proc-kthread cxl_ipoll (per-step adaptive counters, idle-poller CPU apart from cxl_recv) and write recv-post-<name>.txt
 . "$X/../eval/recv-mode.sh"
 [[ $RECV_MODE =~ ^(poll|idle|sleep|adaptive)$ ]] || { echo "SEQUENCE STOP: bad RECV_MODE"; exit 2; }
@@ -338,6 +339,9 @@ if [[ " ${SYSTEMS:-hw pop mg} " == *" pop "* ]]; then
   why=$(recv_rules pop "$PRM" "$C8" 2) || { echo "SEQUENCE STOP: Popcorn receiver: $why"; exit 2; }
   [ "$PRM" != adaptive ] && { [ "$PRM" != sleep ] || [ -z "${POP_ADAPT_KO:-}" ]; } || POPSV=$(recv_pop_srcversion)   # run 2 sleep 20/50: same module
 fi
+# RECV_WATCH_US / RECV_S_MAX_US (recv-mode.sh recv_wsm_check): bad values stop here; a non-adaptive pop / ds lifetime
+# refuses them in recv_apply (the lifetime start; dry starts with a RECV_MODE=sleep stand-in conf stay possible)
+why=$(recv_wsm_check); [ $? != 1 ] || { echo "SEQUENCE STOP: $why"; exit 2; }
 [[ $ROUNDS =~ ^[1-9]$ ]] || { echo "SEQUENCE STOP: bad ROUNDS"; exit 2; }
 # SYSTEMS (subset of "hw pop mg", default all): a rerun of some systems (the SLO is fixed; L for the fixed window
 # comes from L_FROM). SLO_MS_FROM (v5) is not used: refused if set.
@@ -406,8 +410,19 @@ if [ "${STREAM_PMAX:-0}" = 1 ]; then  # run-2 pmax step plan (shown by lib.sh bl
     esac
   done
 fi
+# receiver keys: modes of the pop / ds lifetimes of this block; a non-adaptive one refuses RECV_WATCH_US /
+# RECV_S_MAX_US (dry: BLOCK NOTE, then the evidence-dir check ends the dry start; real: stop below)
+RMODES=; [[ " ${SYSTEMS:-hw pop mg} " != *" pop "* ]] || RMODES+="$PRM"; [[ " ${SYSTEMS:-hw pop mg} " != *" ds "* ]] || RMODES+="${RMODES:+ }$RECV_MODE"
+WSMWHY=
+if [ -n "${RECV_WATCH_US:-}${RECV_S_MAX_US:-}" ]; then
+  # shellcheck disable=SC2086
+  WSMWHY=$(recv_wsm_check $RMODES) || echo "BLOCK NOTE: $WSMWHY (a real run stops here)"
+  [ -n "$RMODES" ] || echo "BLOCK NOTE: $(recv_wsm_desc) not applied: no pop / ds lifetime in this block"
+fi
+echo "BLOCK PLAN: receiver modes=[${RMODES:-none}] ipoll=${IPOLL:-default} $(recv_wsm_desc)"
 [ -d "$E" ] && [ -z "$(ls -A "$E" | grep -v '^sequence')" ] || { echo "SEQUENCE STOP: $E missing or not empty"; exit 2; }
-[ -z "$V7PEND" ] || { echo "SEQUENCE STOP: v7 parameters not decided by the user:$V7PEND (@USER@ in the conf)"; exit 2; }
+[ -z "$WSMWHY" ] || { echo "SEQUENCE STOP: $WSMWHY"; exit 2; }
+[ -z "$V7PEND" ] ||{ echo "SEQUENCE STOP: v7 parameters not decided by the user:$V7PEND (@USER@ in the conf)"; exit 2; }
 LOCKF=${LOCK:-$P/workspaces/MEASUREMENT.lock}
 if [ $BLOCK = h1 ]; then  # parent lock rule: H1 main holds the lock; this block never locks or unlocks
   grep -q "^owner=H1-main " "$LOCKF" 2>/dev/null || { echo "SEQUENCE STOP: lock $LOCKF not held by H1-main ($(cat "$LOCKF" 2>/dev/null))"; exit 2; }
@@ -973,7 +988,7 @@ h1_entry() {  # <name> <sys> <phase> <part> <steps> <lifetime kind>
   printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$1" "$2" "$H1_MIX" "$3" "$H1_N" "${LS#$E/}/$4" "$5" "$6" >> "$E/h1-runs.tsv"
 }
 
-echo "$(date -Is) block $OWNER start (git $(git -C $P/CXL_SWMC rev-parse --short HEAD)) K8=$K8 RECV_MODE=$RECV_MODE POP_RECV_MODE=$PRM POP_ADAPT_KO=${POP_ADAPT_KO:-} POP_SRCVERSION=$POPSV RECV_IPOLL=${IPOLL:-} MEG_BUILD=$MB VM_PLAIN=$VM_PLAIN VM_MEG=$VM_MEG D=$D SEED=$SEED ROUNDS=$ROUNDS FIXED=$FIXED XT=$XT MG_RPO_OPT='$MG_RPO_OPT' MG_TABLE_N=$MG_TABLE_N MG_ROW_N=$MG_ROW_N V1_OPFAIL_CONTINUE='$V1_OPFAIL_CONTINUE' MG_COH_SAMPLE='$MG_COH_SAMPLE'"
+echo "$(date -Is) block $OWNER start (git $(git -C $P/CXL_SWMC rev-parse --short HEAD)) K8=$K8 RECV_MODE=$RECV_MODE POP_RECV_MODE=$PRM POP_ADAPT_KO=${POP_ADAPT_KO:-} POP_SRCVERSION=$POPSV RECV_IPOLL=${IPOLL:-} RECV_WATCH_US=${RECV_WATCH_US:-} RECV_S_MAX_US=${RECV_S_MAX_US:-} MEG_BUILD=$MB VM_PLAIN=$VM_PLAIN VM_MEG=$VM_MEG D=$D SEED=$SEED ROUNDS=$ROUNDS FIXED=$FIXED XT=$XT MG_RPO_OPT='$MG_RPO_OPT' MG_TABLE_N=$MG_TABLE_N MG_ROW_N=$MG_ROW_N V1_OPFAIL_CONTINUE='$V1_OPFAIL_CONTINUE' MG_COH_SAMPLE='$MG_COH_SAMPLE'"
 [ $BLOCK = h1 ] && { bash $PTG "$PRETOUCH_DIR" "$E/pretouch-gate.txt" || stop "pretouch gate at block start"; }
 precheck
 # update rate for the Ekko operating point (Host compute, after the lock check and the input sha256 check in

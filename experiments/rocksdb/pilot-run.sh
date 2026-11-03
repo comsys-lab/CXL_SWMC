@@ -53,6 +53,7 @@ stop() { echo "PILOTRUN $NAME STOP $*"; exit 1; }
 . "$(cd "$(dirname "$0")" && pwd)/../eval/recv-mode.sh"
 IPOLL=${RECV_IPOLL:-} POPSV=- DSFP=0
 [[ $IPOLL =~ ^[01]?$ ]] || stop "bad RECV_IPOLL"
+why=$(recv_wsm_check); [ $? != 1 ] || stop "$why"   # RECV_WATCH_US / RECV_S_MAX_US values; the mode below (SYS)
 DRY=${DRY:-0}
 [[ $DRY =~ ^[01]$ ]] || stop "bad DRY"
 if [ "$DRY" = 0 ]; then
@@ -105,6 +106,11 @@ case "$SYS" in
   *) stop "bad SYS";;
 esac
 COH=0; case "$SYS" in Popcorn|DeStijl) COH=1;; esac   # a cxl_shm cycle around the run (PS / SHMS / GTX above)
+# RECV_WATCH_US / RECV_S_MAX_US: adaptive lifetimes only (dry with a RECV_MODE=sleep stand-in: note; real: stop);
+# all-HWcc / Megalon cells have no cxl_shm receiver (not applied)
+if [ $COH = 1 ] && [ -n "${RECV_WATCH_US:-}${RECV_S_MAX_US:-}" ]; then
+  why=$(recv_wsm_check "$RECV_MODE") || { [ "$DRY" = 1 ] && echo "DRY NOTE $NAME: $why (a real run stops here)"; } || stop "$why"
+fi
 LG=(--opt keys=$KEYS --opt update_ratio=$UPDATE_RATIO --opt seed=$SEED --seed "$SEED" --opt log=$LOG --mix mixed=1
     --x-stream mixed)
 case "$KIND" in
@@ -128,6 +134,9 @@ case "$KIND" in
        HK=pop; [ "$SYS" = DeStijl ] && HK=ds
        [[ ,$FIXED_RECVP_BASE, == *,recv_mode=$RECV_MODE,* ]] || stop "FIXED_RECVP_BASE recv_mode != the lifetime's $RECV_MODE"
        [ -z "$IPOLL" ] || [[ ,$FIXED_RECVP_BASE, == *,ipoll=$IPOLL,* ]] || stop "FIXED_RECVP_BASE ipoll != RECV_IPOLL $IPOLL"
+       for x in watch_us=${RECV_WATCH_US:-} s_max_us=${RECV_S_MAX_US:-}; do
+         [ -z "${x#*=}" ] || [[ ,$FIXED_RECVP_BASE, != *,${x%%=*}=* ]] || [[ ,$FIXED_RECVP_BASE, == *,$x,* ]] || stop "FIXED_RECVP_BASE ${x%%=*} != the conf's $x"
+       done
        PNAMES=() PENV=() FA=
        for t in $FIXED_SPEC; do
          IFS=/ read -r fs fp fd fr frt fw fm fdr fx <<< "$t"
@@ -195,7 +204,7 @@ if [ "$DRY" = 1 ]; then
   [ "$SYS" != Megalon ] || echo "DRY $NAME megalon node_env=[$NODE_ENV] node0_env=[$NODE0_ENV] shim=$BUILD/lib/libmegalon-objapi.so"
   echo "DRY $NAME server_args=[$SERVER_ARGS] gate=${GATE_SCRIPT:-host-gate or h1-gate} lock_owner=${LOCK_OWNER:-unset}"
   if [ $COH = 1 ]; then
-    echo "DRY $NAME cxl_shm cycle: env ${PS[*]} bash $SHMS {precheck,load,chown,enable}; recv_mode=$RECV_MODE; status runpre/runpost; teardown"
+    echo "DRY $NAME cxl_shm cycle: env ${PS[*]} bash $SHMS {precheck,load,chown,enable}; recv_mode=$RECV_MODE ipoll=${IPOLL:-default} $(recv_wsm_desc); status runpre/runpost; teardown"
     [ -z "${DSRX:-}" ] || echo "DRY $NAME De Stijl receiver parameters: $DSRX (cxl_shm load, read back after the enable)"
     plan=$(env "${PS[@]}" bash $SHMS plan precheck load chown enable status teardown 2>&1) || stop "$SHMS plan failed: $(tail -n 2 <<< "$plan")"
     echo "DRY $NAME $(head -n 1 <<< "$plan") -> $(grep -c '^ssh ' <<< "$plan") ssh commands planned"

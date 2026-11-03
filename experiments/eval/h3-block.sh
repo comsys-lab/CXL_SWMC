@@ -59,6 +59,7 @@ VCPU=$((TV / N))
 [[ $RECV_MODE =~ ^(poll|idle|sleep|adaptive)$ ]] || die "bad RECV_MODE"
 PRM=${POP_RECV_MODE:-$RECV_MODE} IPOLL=${RECV_IPOLL:-} POPSV=- DSRX= DSFP=0
 [[ $IPOLL =~ ^[01]?$ ]] || die "bad RECV_IPOLL ($IPOLL: 0 | 1)"
+why=$(recv_wsm_check); [ $? != 1 ] || die "$why"   # RECV_WATCH_US / RECV_S_MAX_US values; modes after SYSTEMS
 export H3_CDF_PFN_MOD=${H3_CDF_PFN_MOD:-1}   # kprobe hist page sampling (h3-cdf.sh; 1 = off; runset-h3-rs.sh passes 16)
 bash "$CDFS" filter > /dev/null || die "bad H3_CDF_PFN_MOD (power of two, 1 = off)"
 HASDS=0
@@ -85,6 +86,13 @@ fi
 if [[ " $SYSTEMS " == *" pop "* ]]; then
   why=$(recv_rules pop "$PRM" "$C8" "$N") || die "Popcorn receiver: $why"
   [ "$PRM" != adaptive ] && { [ "$PRM" != sleep ] || [ -z "${POP_ADAPT_KO:-}" ]; } || POPSV=$(recv_pop_srcversion)   # run 2 sleep 20/50: same module
+fi
+# RECV_WATCH_US / RECV_S_MAX_US: every pop / ds lifetime adaptive (dry stand-in: note only); hw-only: note
+RMODES=; [[ " $SYSTEMS " != *" pop "* ]] || RMODES+="$PRM"; [ $HASDS = 0 ] || RMODES+="${RMODES:+ }$RECV_MODE"
+if [ -n "${RECV_WATCH_US:-}${RECV_S_MAX_US:-}" ]; then
+  # shellcheck disable=SC2086
+  why=$(recv_wsm_check $RMODES) || pending "$why"
+  [ -n "$RMODES" ] || echo "BLOCK NOTE: $(recv_wsm_desc) not applied: no pop / ds lifetime in this block"
 fi
 IPS=() DOMS=()
 for k in $(seq 0 $((N - 1))); do IPS+=(192.168.122.$((100 + k))); DOMS+=(cxl_vm$k); done
@@ -140,6 +148,7 @@ RING=$(grep -E '^msg_ring:' "$REGION" | sed 's/.*,[[:space:]]*\([0-9]*\)\].*/\1/
 OWNER=eval-h3-$H3_WL-n$N-run$EVAL_RUN
 ORDER=$(python3 -I -c 'import random,sys; v=sys.argv[2:]; random.Random(sys.argv[1]).shuffle(v); print(" ".join(v))' "h3-$H3_WL-n$N" $SYSTEMS)
 echo "BLOCK PLAN: $H3_WL N=$N vcpu/VM=$VCPU nodes=[${IPS[*]}] order=[$ORDER] cdf=$CDF app=$APP ring=$RING server_args=[$SA]"
+echo "BLOCK PLAN: receiver modes=[${RMODES:-none}] ipoll=${IPOLL:-default} $(recv_wsm_desc)"
 [ $HASDS = 0 ] || echo "BLOCK PLAN: destijl release=$DS_K bundle=$DS_C guest_tools=$DS_GT region=$REGION T=$DST us recv_mode=$RECV_MODE (node env CXL_SYSTEM=ds CXL_DESTIJL_T_US=$DST)"
 if [ "$DRYB" = 1 ]; then echo "BLOCK DRY STOP: evidence-dir check reached ($E; dry: no lock, no VM contact)"; exit 0; fi
 [ -d "$E" ] && [ -z "$(ls -A "$E" | grep -v '^sequence')" ] || die "$E missing or not empty"
