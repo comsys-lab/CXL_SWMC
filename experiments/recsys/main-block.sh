@@ -311,7 +311,18 @@ HOST_PLAIN=$PLAIN_BUILD/bin/recsys-server
 SSH="ssh -o BatchMode=yes -o ConnectTimeout=8"
 IPS=(192.168.122.100 192.168.122.101)
 OWNER="RECSYS-$BLOCK-$(basename "$E")"; [ $BLOCK = h1 ] && OWNER="H1-recsys-$H1MODE-r$H1_N"
-[[ $RECV_MODE =~ ^(poll|idle|sleep)$ ]] || { echo "SEQUENCE STOP: bad RECV_MODE"; exit 2; }
+# receiver (run 2, experiments/eval/recv-mode.sh): RECV_MODE poll | idle | sleep | adaptive (ds: no idle), POP_RECV_MODE
+# (Popcorn lifetimes, default RECV_MODE), POP_ADAPT_KO (Popcorn adaptive module, sha256 = the bundle's KO_SHA),
+# RECV_IPOLL (0 | 1, adaptive: ipoll written after the enable); adaptive lifetimes add --proc-sysfs /sys/kernel/cxl_shm
+# --proc-kthread cxl_ipoll (per-step adaptive counters, idle-poller CPU apart from cxl_recv) and write recv-post-<name>.txt
+. "$X/../eval/recv-mode.sh"
+[[ $RECV_MODE =~ ^(poll|idle|sleep|adaptive)$ ]] || { echo "SEQUENCE STOP: bad RECV_MODE"; exit 2; }
+PRM=${POP_RECV_MODE:-$RECV_MODE} IPOLL=${RECV_IPOLL:-} POPSV=- DSFP=0
+[[ $IPOLL =~ ^[01]?$ ]] || { echo "SEQUENCE STOP: bad RECV_IPOLL"; exit 2; }
+if [[ " ${SYSTEMS:-hw pop mg} " == *" pop "* ]]; then
+  why=$(recv_rules pop "$PRM" "$C8" 2) || { echo "SEQUENCE STOP: Popcorn receiver: $why"; exit 2; }
+  [ "$PRM" != adaptive ] || POPSV=$(recv_pop_srcversion)
+fi
 [[ $ROUNDS =~ ^[1-9]$ ]] || { echo "SEQUENCE STOP: bad ROUNDS"; exit 2; }
 # SYSTEMS (subset of "hw pop mg", default all): a rerun of some systems (the SLO is fixed; L for the fixed window
 # comes from L_FROM). SLO_MS_FROM (v5) is not used: refused if set.
@@ -358,12 +369,13 @@ if [ $HASDS = 1 ]; then
   [[ " ${SYSTEMS:-} " != *" pop "* ]] || { echo "SEQUENCE STOP: pop and ds need different guest kernels: separate blocks"; exit 2; }
   : "${DS_C:?}" "${DS_BUNDLE_SHA:?}" "${DS_K:?}" "${DS_GT:?}"
   [[ $DS_K == *-ds-destijl-* ]] || { echo "SEQUENCE STOP: DS_K=$DS_K is not a De Stijl release"; exit 2; }
-  [[ $RECV_MODE =~ ^(poll|sleep)$ ]] || { echo "SEQUENCE STOP: RECV_MODE=$RECV_MODE: De Stijl refuses idle"; exit 2; }
+  why=$(recv_rules ds "$RECV_MODE" "$DS_C" 2) || { echo "SEQUENCE STOP: De Stijl receiver: $why"; exit 2; }
   DST=${RS_DS_T_US:-0}
   [[ $DST =~ ^(0|[1-9][0-9]*)$ ]] || { echo "SEQUENCE STOP: bad RS_DS_T_US ($DST)"; exit 2; }
   # DS_RECV_EXTRA (optional, runset-rs-ds.sh RS_DS_RECV_EXTRA): "idle_sleep_us=<n> idle_spin_us=<n>" appended to the
   # cxl_shm load of every ds lifetime, read back after the enable (recv-mode-<name>.txt), mismatch = stop
-  [[ ${DS_RECV_EXTRA:-} =~ ^((idle_sleep_us|idle_spin_us)=[0-9]+( |$))*$ ]] || { echo "SEQUENCE STOP: bad DS_RECV_EXTRA (${DS_RECV_EXTRA:-})"; exit 2; }
+  [[ ${DS_RECV_EXTRA:-} =~ ^(((idle_sleep_us|idle_spin_us)=[0-9]+|fault_poll=[01])( |$))*$ ]] || { echo "SEQUENCE STOP: bad DS_RECV_EXTRA (${DS_RECV_EXTRA:-})"; exit 2; }
+  [[ " ${DS_RECV_EXTRA:-} " != *" fault_poll=1 "* ]] || DSFP=1
   [ -f "$DS_C/p-destijl-shm.sh" ] && [ "$(sha256sum < "$DS_C/packet.sha256" | cut -d' ' -f1)" = "$DS_BUNDLE_SHA" ] \
     && (cd "$DS_C" && sha256sum -c --quiet packet.sha256) || { echo "SEQUENCE STOP: DS_C is not the verified De Stijl bundle"; exit 2; }
   cmp -s "$REGION" "$DS_C/tools/cxl_region.yaml" || { echo "SEQUENCE STOP: REGION differs from the De Stijl bundle's region config"; exit 2; }
@@ -521,13 +533,7 @@ pop_setup() {  # P-popcorn-deploy §6a cycle with build POP_BUILD (init_state=sh
   echo "preload_wall_s=$(( $(date +%s) - t ))" >> "$E/preload-$NAME.log"
   { grep -q "PRELOAD DONE" "$E/preload-$NAME.log" && servers_gone; } || stop "preload"
   env "${PS[@]}" bash $C8/p-popcorn-shm.sh enable || stop "enable gate"
-  for ip in "${IPS[@]}"; do
-    m=$($SSH comsys@$ip "sudo -n sh -c 'echo $RECV_MODE > /sys/module/cxl_shm/parameters/recv_mode' && cat /sys/module/cxl_shm/parameters/recv_mode" < /dev/null)
-    i=$($SSH comsys@$ip "cat /sys/kernel/swmc/instr/enabled" < /dev/null)
-    echo "$ip recv_mode=$m instr_enabled=$i" >> "$E/recv-mode-$NAME.txt"
-    [ "$m" = "$RECV_MODE" ] || stop "recv_mode on $ip = $m"
-    [ "$i" = 1 ] || stop "instr enabled on $ip = $i"
-  done
+  recv_apply pop "$NAME" "$PRM"   # recv-mode.sh: mode, readback (+ ipoll / srcversion for adaptive), instr enabled
   env "${PS[@]}" STATUS_TAG=pre bash $C8/p-popcorn-shm.sh status || stop "status pre"
 }
 ds_setup() {  # De Stijl v2 cycle (protocol=destijl, init_state=shared; as pop_setup and h2n-block.sh ds_up), once per lifetime
@@ -546,15 +552,7 @@ ds_setup() {  # De Stijl v2 cycle (protocol=destijl, init_state=shared; as pop_s
   echo "preload_wall_s=$(( $(date +%s) - t ))" >> "$E/preload-$NAME.log"
   { grep -q "PRELOAD DONE" "$E/preload-$NAME.log" && servers_gone; } || stop "preload"
   env "${PS[@]}" bash $SHMS enable || stop "ds enable gate"
-  for ip in "${IPS[@]}"; do
-    m=$($SSH comsys@$ip "sudo -n sh -c 'echo $RECV_MODE > /sys/module/cxl_shm/parameters/recv_mode' && cat /sys/module/cxl_shm/parameters/recv_mode" < /dev/null)
-    p=$($SSH comsys@$ip "cat /sys/kernel/swmc/page_coherence/protocol" < /dev/null)
-    i=$($SSH comsys@$ip "cat /sys/kernel/swmc/instr/enabled 2>/dev/null || echo absent" < /dev/null)
-    t=$($SSH comsys@$ip "echo idle_sleep_us=\$(cat /sys/module/cxl_shm/parameters/idle_sleep_us 2>/dev/null || echo absent) idle_spin_us=\$(cat /sys/module/cxl_shm/parameters/idle_spin_us 2>/dev/null || echo absent)" < /dev/null)
-    echo "$ip recv_mode=$m protocol=$p instr_enabled=$i $t" >> "$E/recv-mode-$NAME.txt"
-    [ "$m" = "$RECV_MODE" ] && [ "$p" = destijl ] || stop "recv_mode / protocol on $ip ($m, $p)"
-    for x in ${DSRX:-}; do [[ " $t " == *" $x "* ]] || stop "receiver parameter $x not applied on $ip ($t)"; done
-  done
+  recv_apply ds "$NAME" "$RECV_MODE"   # recv-mode.sh: mode, protocol destijl, DSRX applied, adaptive checks
   env "${PS[@]}" STATUS_TAG=pre bash $SHMS status || stop "ds status pre"
 }
 h1_lockchk() {  # BLOCK=h1: the parent lock must still name owner=H1-main (checked at block start and before every lifetime)
@@ -567,6 +565,12 @@ life_start() {  # <sys> <name>: prepare + session start of one server lifetime -
   NAME=$2 LS=$E/$2
   # v7: per-lifetime stale logs on each guest (node 1 via SERVER_ARGS, node 0 overrides it in NODE0_ARGS; later wins)
   [ "$V7" != 1 ] || { SA="$SA --stale-log $(v7_stale $2 1)"; V7N0=" --stale-log $(v7_stale $2 0)"; }
+  # adaptive receiver (run 2): per-step /sys/kernel/cxl_shm counters + idle-poller CPU (kthreads cxl_ipoll/<cpu>)
+  local lrm=-; case $s in pop) lrm=$PRM;; ds) lrm=$RECV_MODE;; esac
+  if [ "$lrm" = adaptive ]; then
+    [[ " $SA " == *" --proc-sysfs /sys/kernel/cxl_shm "* ]] || SA="$SA --proc-sysfs /sys/kernel/cxl_shm"
+    SA="$SA --proc-kthread cxl_ipoll"
+  fi
   local S=$LS
   if [ $s = pop ]; then SHMR=$E/shm-$NAME; PS=(K=$K8 GT=$GT8 C=$C8 R=$SHMR INIT_STATE=shared) SHMS=$C8/p-popcorn-shm.sh; fi
   if [ $s = ds ]; then SHMR=$E/dsshm-$NAME; DSRX=${DS_RECV_EXTRA:-}; PS=(K=$DS_K GT=$DS_GT C=$DS_C R=$SHMR INIT_STATE=shared "LOAD_EXTRA=recv_mode=$RECV_MODE${DSRX:+ ${DSRX% }}") SHMS=$DS_C/p-destijl-shm.sh; fi
@@ -581,7 +585,7 @@ life_start() {  # <sys> <name>: prepare + session start of one server lifetime -
     mgoff) dax_comsys; SE=(SYSTEM=Megalon V=$VM_MEG HOST_SERVER=$MB/bin/recsys-server "SERVER_ARGS=--backend megalon$(mg_rpo $MG_TABLE_N) $SA"
                         "NODE_ENV=ENV:RACKOBJ_CONFIG=$VM_MEG/cfg/megalon.yaml ENV:MEGALON_COH_TIMERS=0 ENV:XTIMEOUT=$XT$MGSE" "NODE0_ENV=ENV:MEGALON_REINIT=1");;
     pop) dax_root; pop_setup
-         SE=(SYSTEM=Popcorn-$RECV_MODE V=$VM_PLAIN HOST_SERVER=$HOST_PLAIN "SERVER_ARGS=$SA" NODE0_ARGS=--preloaded "NODE_ENV=ENV:XTIMEOUT=$XT");;
+         SE=(SYSTEM=Popcorn-$PRM V=$VM_PLAIN HOST_SERVER=$HOST_PLAIN "SERVER_ARGS=$SA" NODE0_ARGS=--preloaded "NODE_ENV=ENV:XTIMEOUT=$XT");;
     ds) dax_root; ds_setup
         SE=(SYSTEM=DeStijl-$RECV_MODE-T$DST V=$VM_PLAIN HOST_SERVER=$HOST_PLAIN "SERVER_ARGS=$SA" NODE0_ARGS=--preloaded
             "NODE_ENV=ENV:XTIMEOUT=$XT ENV:CXL_SYSTEM=ds ENV:CXL_DESTIJL_T_US=$DST");;
@@ -602,6 +606,7 @@ life_stop() {  # <sys>: session stop, final checks, page MSI teardown (pop)
     for k in 0 1; do grep -q "^recsys-server: de stijl staleness T=$DST us on " "$S/node$k.log" || stop "node$k: staleness T=$DST not applied"; done
   fi
   if [ $s = pop ] || [ $s = ds ]; then
+    recv_post "$NAME"   # receiver / idle-poller CPU after the run (recv-post-<name>.txt; recv-mode.sh)
     env "${PS[@]}" STATUS_TAG=post bash $SHMS status
     servers_gone || stop "servers left (page MSI teardown not attempted)"
     dax_free pre-teardown || stop "/dev/dax0.0 in use before the cxl_shm teardown"
@@ -915,7 +920,7 @@ h1_entry() {  # <name> <sys> <phase> <part> <steps> <lifetime kind>
   printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$1" "$2" "$H1_MIX" "$3" "$H1_N" "${LS#$E/}/$4" "$5" "$6" >> "$E/h1-runs.tsv"
 }
 
-echo "$(date -Is) block $OWNER start (git $(git -C $P/CXL_SWMC rev-parse --short HEAD)) K8=$K8 RECV_MODE=$RECV_MODE MEG_BUILD=$MB VM_PLAIN=$VM_PLAIN VM_MEG=$VM_MEG D=$D SEED=$SEED ROUNDS=$ROUNDS FIXED=$FIXED XT=$XT MG_RPO_OPT='$MG_RPO_OPT' MG_TABLE_N=$MG_TABLE_N MG_ROW_N=$MG_ROW_N V1_OPFAIL_CONTINUE='$V1_OPFAIL_CONTINUE' MG_COH_SAMPLE='$MG_COH_SAMPLE'"
+echo "$(date -Is) block $OWNER start (git $(git -C $P/CXL_SWMC rev-parse --short HEAD)) K8=$K8 RECV_MODE=$RECV_MODE POP_RECV_MODE=$PRM POP_ADAPT_KO=${POP_ADAPT_KO:-} POP_SRCVERSION=$POPSV RECV_IPOLL=${IPOLL:-} MEG_BUILD=$MB VM_PLAIN=$VM_PLAIN VM_MEG=$VM_MEG D=$D SEED=$SEED ROUNDS=$ROUNDS FIXED=$FIXED XT=$XT MG_RPO_OPT='$MG_RPO_OPT' MG_TABLE_N=$MG_TABLE_N MG_ROW_N=$MG_ROW_N V1_OPFAIL_CONTINUE='$V1_OPFAIL_CONTINUE' MG_COH_SAMPLE='$MG_COH_SAMPLE'"
 [ $BLOCK = h1 ] && { bash $PTG "$PRETOUCH_DIR" "$E/pretouch-gate.txt" || stop "pretouch gate at block start"; }
 precheck
 # update rate for the Ekko operating point (Host compute, after the lock check and the input sha256 check in

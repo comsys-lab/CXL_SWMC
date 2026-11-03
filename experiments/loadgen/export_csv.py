@@ -50,6 +50,9 @@ when the run has no snapshots or the counter is absent). Times in seconds of the
   n<k>_recv_cpu_s          kernel threads cxl_recv* (schedstat run_ns; cpu_ticks / 100 if absent)
   n<k>_lib_bg_cpu_s        this process's thread groups not named vdb-* (e.g. megalon-lib: Megalon's own threads)
   n<k>_coh_bg_cpu_s        recv_cpu_s + lib_bg_cpu_s
+  n<k>_ipoll_cpu_s         run 2 adaptive receiver: kernel threads cxl_ipoll/<cpu> (idle pollers, schedstat run_ns);
+                           empty when the server build does not list the prefix or the receiver is not adaptive;
+                           not included in coh_bg_cpu_s
   n<k>_tlb_ipi, n<k>_cal_ipi   /proc/interrupts TLB shootdowns / function-call IPIs (whole node)
   n<k>_traffic_bytes, n<k>_traffic_src   coherence traffic estimate and its source:
                            megalon       megalon.flush_bytes + megalon.replay_flush_bytes
@@ -116,7 +119,8 @@ NODE = ["window_s", "searches", "updates", "p_advance", "search_busy_frac", "wri
         "search_rq_wait_s", "writer_cpu_s", "cpu_busy_frac", "pop_search_fault_s", "pop_search_msg_wait_s",
         "pop_search_local_wait_s", "pop_writer_fault_s", "pop_node_fault_s", "meg_rd_check_s", "meg_wr_check_s",
         "meg_flush_s", "meg_reexec_s", "meg_stall_s", "coh_stall_s", "recv_cpu_s", "lib_bg_cpu_s", "coh_bg_cpu_s",
-        "tlb_ipi", "cal_ipi", "traffic_bytes", "traffic_src", "pop_remote_wb", "pop_acquire_flush", "meg_reexec_src"]
+        "tlb_ipi", "cal_ipi", "traffic_bytes", "traffic_src", "pop_remote_wb", "pop_acquire_flush", "meg_reexec_src",
+        "ipoll_cpu_s"]
 PAGE = 4096
 
 
@@ -224,6 +228,10 @@ def node_metrics(fixed, d, system=None):
     else:
         ticks = [k for k in d if k.startswith("kthr.cxl_recv") and k.endswith(".cpu_ticks")]
         m["recv_cpu_s"] = sum(d[k] for k in ticks) / 100 if ticks else None
+    # run 2: adaptive receiver idle pollers (kthreads cxl_ipoll/<cpu>, SCHED_IDLE) apart from cxl_recv; not part of
+    # coh_bg_cpu_s (they spin only on otherwise idle vCPUs; reported next to it)
+    ip = [k for k in d if k.startswith("kthr.cxl_ipoll") and k.endswith(".run_ns")]
+    m["ipoll_cpu_s"] = sum(d[k] for k in ip) / 1e9 if ip else None
     bg = [k for k in d if k.startswith("thr.") and k.endswith(".run_ns") and not k.startswith("thr.vdb-")]
     m["lib_bg_cpu_s"] = sum(d[k] for k in bg) / 1e9 if bg else (0.0 if "thr.vdb-search.run_ns" in d else None)
     if m["recv_cpu_s"] is not None or m["lib_bg_cpu_s"] is not None:

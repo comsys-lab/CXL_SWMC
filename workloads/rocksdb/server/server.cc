@@ -307,7 +307,8 @@ class Server {
   std::unique_ptr<opsplit::Table> opt_;
   std::unique_ptr<opsplit::Thread[]> oth_;
   Queue q_;
-  cxl::proc::Opts pst_{{"cxl_recv"},
+  // kthreads: receive thread cxl_recv_<n> and (run 2 adaptive receiver) idle pollers cxl_ipoll/<cpu>, kept apart
+  cxl::proc::Opts pst_{{"cxl_recv", "cxl_ipoll"},
                        {"TLB", "CAL", "RES", "LOC"},
                        {"/sys/kernel/swmc/page_coherence", "/sys/kernel/swmc/instr", "/sys/kernel/cxl_shm"}};
 };

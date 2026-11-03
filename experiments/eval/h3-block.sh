@@ -55,7 +55,10 @@ TV=${H3_TOTAL_VCPU:-32} N=$H3_N
 VCPU=$((TV / N))
 [[ $EVAL_RUN =~ ^[1-9]$ ]] && [[ $SEED =~ ^[0-9]+$ ]] || die "bad EVAL_RUN / SEED"
 [[ $CDF =~ ^[01]$ ]] && [[ $CDF_S =~ ^[1-9][0-9]*$ ]] || die "bad CDF / CDF_S"
-[[ $RECV_MODE =~ ^(poll|idle|sleep)$ ]] || die "bad RECV_MODE"
+. "$EV/recv-mode.sh"   # run 2 receiver rules (adaptive; POP_RECV_MODE, POP_ADAPT_KO, RECV_IPOLL as h2n-block.sh)
+[[ $RECV_MODE =~ ^(poll|idle|sleep|adaptive)$ ]] || die "bad RECV_MODE"
+PRM=${POP_RECV_MODE:-$RECV_MODE} IPOLL=${RECV_IPOLL:-} POPSV=- DSRX= DSFP=0
+[[ $IPOLL =~ ^[01]?$ ]] || die "bad RECV_IPOLL ($IPOLL: 0 | 1)"
 export H3_CDF_PFN_MOD=${H3_CDF_PFN_MOD:-1}   # kprobe hist page sampling (h3-cdf.sh; 1 = off; runset-h3-rs.sh passes 16)
 bash "$CDFS" filter > /dev/null || die "bad H3_CDF_PFN_MOD (power of two, 1 = off)"
 HASDS=0
@@ -67,7 +70,7 @@ if [ $HASDS = 1 ]; then
   [[ " $SYSTEMS " != *" pop "* ]] || die "pop and ds need different guest kernels: run them in separate blocks"
   : "${DS_C:?}" "${DS_BUNDLE_SHA:?}" "${DS_K:?}" "${DS_GT:?}"
   [[ $DS_K == *-ds-destijl-* ]] || die "DS_K=$DS_K is not a De Stijl release (-ds-destijl-<n>)"
-  [[ $RECV_MODE =~ ^(poll|sleep)$ ]] || die "RECV_MODE=$RECV_MODE: De Stijl (cxl_shm v13 protocol=destijl) refuses idle"
+  why=$(recv_rules ds "$RECV_MODE" "$DS_C" "$N") || die "De Stijl receiver: $why"
   DST=${H3_DS_T_US:-0}
   [[ $DST =~ ^(0|[1-9][0-9]*)$ ]] || die "bad H3_DS_T_US ($DST: integer us, 0 = synchronous)"
   REGION=${DS_REGION:-$TREE/config/cxl_region-destijl.yaml}   # replaces REGION for the whole block (app offset)
@@ -78,6 +81,10 @@ else
 : "${REGION:?}"
 [ -f "$REGION" ] && [ "$(sha256sum < "$C8/packet.sha256" | cut -c1-64)" = "$POP_BUNDLE_SHA" ] \
   && (cd "$C8" && sha256sum -c --quiet packet.sha256) || die "REGION or the Popcorn bundle ($C8) does not verify"
+fi
+if [[ " $SYSTEMS " == *" pop "* ]]; then
+  why=$(recv_rules pop "$PRM" "$C8" "$N") || die "Popcorn receiver: $why"
+  [ "$PRM" != adaptive ] || POPSV=$(recv_pop_srcversion)
 fi
 IPS=() DOMS=()
 for k in $(seq 0 $((N - 1))); do IPS+=(192.168.122.$((100 + k))); DOMS+=(cxl_vm$k); done
@@ -278,15 +285,12 @@ pop_up() {  # <name>
   done
   preload0 "$1"
   env "${PS[@]}" bash $C8/p-popcorn-shm.sh enable >> "$E/block.log" 2>&1 || stop "enable gate"
-  for ip in "${IPS[@]}"; do
-    m=$($SSH comsys@$ip "sudo -n sh -c 'echo $RECV_MODE > /sys/module/cxl_shm/parameters/recv_mode' && cat /sys/module/cxl_shm/parameters/recv_mode" < /dev/null)
-    i=$($SSH comsys@$ip "cat /sys/kernel/swmc/instr/enabled" < /dev/null)
-    echo "$ip recv_mode=$m instr_enabled=$i" >> "$E/recv-mode-$1.txt"
-    [ "$m" = "$RECV_MODE" ] && [ "$i" = 1 ] || stop "recv_mode / instr on $ip ($m, $i)"
-  done
+  recv_apply pop "$1" "$PRM"
+  POPNAME=$1
   env "${PS[@]}" STATUS_TAG=pre bash $C8/p-popcorn-shm.sh status >> "$E/block.log" 2>&1 || stop "status pre"
 }
 pop_down() {
+  recv_post "$POPNAME"
   env "${PS[@]}" STATUS_TAG=post bash $C8/p-popcorn-shm.sh status >> "$E/block.log" 2>&1
   servers_gone || stop "servers left (Popcorn teardown not attempted)"
   dax_unused pre-teardown || stop "/dev/dax0.0 in use before the cxl_shm teardown"
@@ -307,16 +311,12 @@ ds_up() {  # <name>
   done
   preload0 "$1"
   env "${DSP[@]}" bash $DS_C/p-destijl-shm.sh enable >> "$E/block.log" 2>&1 || stop "ds enable gate"
-  for ip in "${IPS[@]}"; do
-    m=$($SSH comsys@$ip "sudo -n sh -c 'echo $RECV_MODE > /sys/module/cxl_shm/parameters/recv_mode' && cat /sys/module/cxl_shm/parameters/recv_mode" < /dev/null)
-    p=$($SSH comsys@$ip "cat /sys/kernel/swmc/page_coherence/protocol" < /dev/null)
-    i=$($SSH comsys@$ip "cat /sys/kernel/swmc/instr/enabled 2>/dev/null || echo absent" < /dev/null)
-    echo "$ip recv_mode=$m protocol=$p instr_enabled=$i" >> "$E/recv-mode-$1.txt"
-    [ "$m" = "$RECV_MODE" ] && [ "$p" = destijl ] || stop "recv_mode / protocol on $ip ($m, $p)"
-  done
+  recv_apply ds "$1" "$RECV_MODE"
+  DSNAME=$1
   env "${DSP[@]}" STATUS_TAG=pre bash $DS_C/p-destijl-shm.sh status >> "$E/block.log" 2>&1 || stop "ds status pre"
 }
 ds_down() {
+  recv_post "$DSNAME"
   env "${DSP[@]}" STATUS_TAG=post bash $DS_C/p-destijl-shm.sh status >> "$E/block.log" 2>&1
   servers_gone || stop "servers left (De Stijl teardown not attempted)"
   dax_unused pre-teardown || stop "/dev/dax0.0 in use before the cxl_shm (destijl) teardown"
@@ -339,7 +339,7 @@ ds_recv() {  # <name>: recv_check.py on this ds lifetime after its teardown (as 
   [[ $r == "RECVCHECK PASS"* ]] || stop "$1: recv check FAIL (see recv-check-$1.txt)"
 }
 # SYSTEM label and the extra server arguments / node env per system (pop and ds start from the preloaded data)
-sys_label() { case $1 in pop) echo Popcorn-$RECV_MODE;; ds) echo DeStijl-$RECV_MODE-T$DST;; *) echo all-HWcc;; esac; }
+sys_label() { case $1 in pop) echo Popcorn-$PRM;; ds) echo DeStijl-$RECV_MODE-T$DST;; *) echo all-HWcc;; esac; }
 sys_pre() { case $1 in pop|ds) echo "$2";; esac; }
 sys_env() { [ $1 != ds ] || echo "ENV:CXL_SYSTEM=ds ENV:CXL_DESTIJL_T_US=$DST"; }
 # loadgen arguments of the CDF settle and cdf parts (both workloads): one CDF_S window at the CDF rate
@@ -429,6 +429,9 @@ rs_life() {  # <sys> <name> <slo | cdf> [<cdf query rate>]
   # ds with recv_mode=sleep: recv_check.py needs the per-step sleep_wakeups / tick_kicks (/sys/kernel/cxl_shm; the
   # vector DB server snapshots it always, RecSys only with this --proc-sysfs, as main-block.sh STREAM_PROC_CXL_SHM=1)
   local SAX=$SA; [ $s != ds ] || [ "$RECV_MODE" != sleep ] || SAX="$SA --proc-sysfs /sys/kernel/cxl_shm"
+  # adaptive (run 2): per-step adaptive counters (/sys/kernel/cxl_shm) and idle-poller CPU (kthreads cxl_ipoll/<cpu>)
+  local lm=-; case $s in pop) lm=$PRM;; ds) lm=$RECV_MODE;; esac
+  [ "$lm" != adaptive ] || SAX="$SA --proc-sysfs /sys/kernel/cxl_shm --proc-kthread cxl_ipoll"
   SE=(SYSTEM=$(sys_label $s) V=$V HOST_SERVER=$HOSTSRV "SERVER_ARGS=$SAX" T_MS=0
       "NODE_ENV=ENV:XTIMEOUT=$XT$([ $s != ds ] || echo " $(sys_env ds)")" "NODE0_ARGS=$(sys_pre $s '--preloaded ')$N0X" READY_TIMEOUT=$((XT / 2)))
   env "${SE[@]}" bash $XR/session.sh start "$S" > "$S.start.out" 2>&1 || stop "$name session start: $(tail -n 2 "$S.start.out" | tr '\n' ' ')"

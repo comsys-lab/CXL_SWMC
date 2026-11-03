@@ -60,6 +60,7 @@ BENV=(H3_WL=vdb H3_N=$N H3_TOTAL_VCPU=$H3_TOTAL_VCPU "SYSTEMS=$H3_SYSTEMS" EVAL_
   X_DATA=$VDB_X_DATA X_WRITES=$WRITES X_NB=$VDB_X_NB X_MAXIDS=$VDB_X_MAXIDS X_MAXW=$VDB_X_MAXW X_MAXD=$VDB_X_MAXD
   X_INIT_CAP=$VDB_X_INIT_CAP U=$U)
 [ $HASDS = 0 ] || BENV+=("${DSENV[@]}")
+[ ${#RECVENV[@]} = 0 ] || BENV+=("${RECVENV[@]}")   # receiver keys (lib.sh; checked in h3-block.sh)
 for v in PRETOUCH_DIR MEASURE_ENV_DIR MEASURE_PART_DIR; do [ -z "${!v:-}" ] || BENV+=("$v=${!v}"); done
 plan "block: env ${BENV[*]} bash $EVD/h3-block.sh <E>/block"
 if [ $DRY = 1 ]; then

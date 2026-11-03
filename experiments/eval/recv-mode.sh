@@ -75,3 +75,40 @@ recv_rb_check() {
   rbv srcversion; [ "$sv" = - ] || [ "$v" = "$sv" ] || { echo "srcversion=$v (want $sv of POP_ADAPT_KO)"; return 1; }
   return 0
 }
+
+# ---- block side (h2n-block.sh, h3-block.sh, experiments/recsys/main-block.sh, experiments/rocksdb/pilot-run.sh);
+# globals of the caller: IPS (guest IPs), SSH, E (evidence dir), stop() (log + exit; RECV_STOP = another function name,
+# e.g. one that tears cxl_shm down first), optional DSRX (ds receiver extra "name=value ..."), DSFP (ds fault_poll want,
+# default 0), IPOLL (RECV_IPOLL), POPSV (Popcorn srcversion want or -)
+RECV_RB_DEFAULT=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/recv-readback.sh
+# recv_apply <pop|ds> <name> <mode>: recv_mode (+ IPOLL for adaptive) on every VM, then the recv-readback.sh line per
+# VM -> E/recv-mode-<name>.txt ("<ip> recv_mode=.. ... instr_enabled=..", one line per VM: recv_check.py reads it) and
+# checked (mode, ring_coherent, adaptive module, ipoll, fault_poll, Popcorn srcversion); Popcorn also instr_enabled=1,
+# De Stijl protocol=destijl and every DSRX parameter applied. The first failure calls the stop function.
+recv_apply() {
+  local s=$1 ip rb i p w x why fp=- ipo=${IPOLL:-} st=${RECV_STOP:-stop} bad=
+  [ $s = ds ] && fp=${DSFP:-0}
+  [ $s = pop ] && fp=0
+  for ip in "${IPS[@]}"; do
+    w="echo $3 > /sys/module/cxl_shm/parameters/recv_mode"
+    [ -z "$ipo" ] || [ "$3" != adaptive ] || w+=" && echo $ipo > /sys/module/cxl_shm/parameters/ipoll"
+    $SSH comsys@$ip "sudo -n sh -c '$w'" < /dev/null || { $st "$2: recv_mode write on $ip"; return 1; }
+    rb=$($SSH comsys@$ip "bash -s" < "$RECV_RB_DEFAULT" 2>/dev/null)
+    i=$($SSH comsys@$ip "cat /sys/kernel/swmc/instr/enabled 2>/dev/null || echo absent" < /dev/null)
+    if [ $s = ds ]; then
+      p=$($SSH comsys@$ip "cat /sys/kernel/swmc/page_coherence/protocol" < /dev/null)
+      echo "$ip $rb protocol=$p instr_enabled=$i" >> "$E/recv-mode-$2.txt"
+      [ "$p" = destijl ] || bad="protocol on $ip ($p)"
+      for x in ${DSRX:-}; do [[ " $rb " == *" $x "* ]] || bad="receiver parameter $x not applied on $ip ($rb)"; done
+    else
+      echo "$ip $rb instr_enabled=$i" >> "$E/recv-mode-$2.txt"
+      [ "$i" = 1 ] || bad="instr on $ip ($i)"
+    fi
+    why=$(recv_rb_check $s "$3" "$rb" "$([ $s = pop ] && echo "${POPSV:--}" || echo -)" "${ipo:--}" "$fp") || bad="receiver on $ip: $why"
+    [ -z "$bad" ] || { $st "$2: $bad"; return 1; }
+  done
+}
+recv_post() {  # <name>: recv-readback.sh line per VM after the run (lifetime receiver / poller CPU = post - pre)
+  local ip rbf=$RECV_RB_DEFAULT
+  for ip in "${IPS[@]}"; do echo "$ip $($SSH comsys@$ip "bash -s" < "$rbf" 2>/dev/null)" >> "$E/recv-post-$1.txt"; done
+}

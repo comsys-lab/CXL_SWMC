@@ -47,6 +47,7 @@ BENV=(H3_WL=recsys H3_N=$N H3_TOTAL_VCPU=$H3_TOTAL_VCPU "SYSTEMS=$H3_SYSTEMS" EV
   CDF=$CDF CDF_S=$H3_CDF_S H3_CDF_PFN_MOD=$H3_RS_CDF_PFN_MOD VM_PLAIN=$RS_VM_PLAIN PLAIN_BUILD=$RS_PLAIN_BUILD LOADGEN=$H3_RS_LOADGEN D=$RS_INPUTS
   RATE=$H3_RS_RATE XT=$RS_XT)
 [ $HASDS = 0 ] || BENV+=("${DSENV[@]}")
+[ ${#RECVENV[@]} = 0 ] || BENV+=("${RECVENV[@]}")   # receiver keys (lib.sh; checked in h3-block.sh)
 for v in PRETOUCH_DIR MEASURE_ENV_DIR MEASURE_PART_DIR; do [ -z "${!v:-}" ] || BENV+=("$v=${!v}"); done
 plan "block: env ${BENV[*]} bash $EVD/h3-block.sh <E>/block"
 if [ $DRY = 1 ]; then

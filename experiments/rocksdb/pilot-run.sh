@@ -47,6 +47,10 @@ KEYS=${KEYS:-54000000} THREADS=${THREADS:-4} PREPARE_THREADS=${PREPARE_THREADS:-
 SEED=${SEED:-20261018} LOG=${LOG:-0}
 V=${V:-/home/comsys/rocksdb3} BUILD=${BUILD:-$P/builds/rocksdb/3} LOADGEN_BUILD=${LOADGEN_BUILD:-$P/builds/rocksdb-loadgen/1}
 stop() { echo "PILOTRUN $NAME STOP $*"; exit 1; }
+# receiver rules (run 2, experiments/eval/recv-mode.sh, next to this tree): POP_RECV_MODE / POP_ADAPT_KO / RECV_IPOLL
+. "$(cd "$(dirname "$0")" && pwd)/../eval/recv-mode.sh"
+IPOLL=${RECV_IPOLL:-} POPSV=- DSFP=0
+[[ $IPOLL =~ ^[01]?$ ]] || stop "bad RECV_IPOLL"
 DRY=${DRY:-0}
 [[ $DRY =~ ^[01]$ ]] || stop "bad DRY"
 if [ "$DRY" = 0 ]; then
@@ -67,16 +71,19 @@ export RUN_KIND
 case "$SYS" in
   all-HWcc) export SYSTEM=all-HWcc;;
   Popcorn)  : "${C8:?}" "${K8:?}" "${GT8:?}" "${RECV_MODE:?}"
-            [[ $RECV_MODE =~ ^(poll|idle|sleep)$ ]] || stop "bad RECV_MODE"
+            RECV_MODE=${POP_RECV_MODE:-$RECV_MODE}   # run 2: the Popcorn receiver mode (recv-mode.sh)
+            why=$(recv_rules pop "$RECV_MODE" "$C8" "$N") || stop "Popcorn receiver: $why"
+            [ "$RECV_MODE" != adaptive ] || POPSV=$(recv_pop_srcversion)
             export SYSTEM=Popcorn-$RECV_MODE
             SHMS=$C8/p-popcorn-shm.sh GTX=$GT8 SHMR=$E/shm-$NAME
             PS=(POP_IPS="${IPS[*]}" K=$K8 GT=$GT8 C=$C8 R=$SHMR INIT_STATE=shared);;  # POP_IPS: N-node bundle (popcorn-n)
   DeStijl)  : "${DS_C:?}" "${DS_K:?}" "${DS_GT:?}" "${RECV_MODE:?}"
-            [[ $RECV_MODE =~ ^(poll|sleep)$ ]] || stop "bad RECV_MODE for De Stijl (poll | sleep)"
+            why=$(recv_rules ds "$RECV_MODE" "$DS_C" "$N") || stop "De Stijl receiver: $why"
             [ "${DS_T_US:-0}" = 0 ] || stop "DS_T_US=${DS_T_US}: RocksDB runs De Stijl at T = 0 only (rocksdb-server has no staleness hook)"
             export SYSTEM=DeStijl-$RECV_MODE-T0
             DSRX=${DS_RECV_EXTRA:-}
-            [[ $DSRX =~ ^((idle_sleep_us|idle_spin_us)=[0-9]+( |$))*$ ]] || stop "bad DS_RECV_EXTRA ($DSRX: 'idle_sleep_us=<n> idle_spin_us=<n>')"
+            [[ $DSRX =~ ^(((idle_sleep_us|idle_spin_us)=[0-9]+|fault_poll=[01])( |$))*$ ]] || stop "bad DS_RECV_EXTRA ($DSRX: 'idle_sleep_us=<n> idle_spin_us=<n> fault_poll=<0|1>')"
+            [[ " $DSRX " != *" fault_poll=1 "* ]] || DSFP=1
             DSRX=${DSRX% }
             SHMS=$DS_C/p-destijl-shm.sh GTX=$DS_GT SHMR=$E/dsshm-$NAME
             PS=(DS_IPS="${IPS[*]}" K=$DS_K GT=$DS_GT C=$DS_C R=$SHMR INIT_STATE=shared "LOAD_EXTRA=recv_mode=$RECV_MODE${DSRX:+ $DSRX}");;
@@ -170,22 +177,15 @@ if [ $COH = 1 ]; then  # as experiments/lmdb/pilot-run.sh: enable BEFORE the ser
       || { env "${PS[@]}" bash $SHMS teardown; stop "region config differs on $ip"; }
   done
   env "${PS[@]}" bash $SHMS enable || { env "${PS[@]}" bash $SHMS teardown; stop "enable gate"; }
-  for ip in "${IPS[@]}"; do
-    m=$($SSH comsys@$ip "sudo -n sh -c 'echo $RECV_MODE > /sys/module/cxl_shm/parameters/recv_mode' && cat /sys/module/cxl_shm/parameters/recv_mode" < /dev/null)
-    pr=$($SSH comsys@$ip "cat /sys/kernel/swmc/page_coherence/protocol" < /dev/null)
-    rt=""; [ "$SYS" != DeStijl ] || rt=" $($SSH comsys@$ip "echo idle_sleep_us=\$(cat /sys/module/cxl_shm/parameters/idle_sleep_us 2>/dev/null || echo absent) idle_spin_us=\$(cat /sys/module/cxl_shm/parameters/idle_spin_us 2>/dev/null || echo absent)" < /dev/null)"
-    echo "$ip recv_mode=$m protocol=$pr$rt" >> "$E/recv-mode-$NAME.txt"
-    [ "$m" = "$RECV_MODE" ] || { env "${PS[@]}" bash $SHMS teardown; stop "recv_mode on $ip = $m"; }
-    [ "$SYS" != DeStijl ] || [ "$pr" = destijl ] || { env "${PS[@]}" bash $SHMS teardown; stop "protocol on $ip = $pr"; }
-    if [ "$SYS" = DeStijl ]; then
-      for x in ${DSRX:-}; do [[ "$rt " == *" $x "* ]] || { env "${PS[@]}" bash $SHMS teardown; stop "receiver parameter $x not applied on $ip ($rt)"; }; done
-    fi
-  done
+  # recv-mode.sh: mode (+ RECV_IPOLL), readback per VM -> recv-mode-<name>.txt, checks; a failure tears cxl_shm down first
+  td_stop() { env "${PS[@]}" bash $SHMS teardown; stop "$@"; }
+  RECV_STOP=td_stop recv_apply "$([ "$SYS" = DeStijl ] && echo ds || echo pop)" "$NAME" "$RECV_MODE"
   env "${PS[@]}" STATUS_TAG=runpre bash $SHMS status || { env "${PS[@]}" bash $SHMS teardown; stop "status pre"; }
 fi
 bash $X/run.sh "$NAME" "$E" -- "${LG[@]}"
 RC=$?
 if [ $COH = 1 ]; then
+  recv_post "$NAME"   # receiver / idle-poller CPU after the run (recv-post-<name>.txt)
   env "${PS[@]}" STATUS_TAG=runpost bash $SHMS status
   # error counters over the run (verifier HIGH-1): Popcorn transaction_error / send_drop / late_response deltas = 0;
   # De Stijl transaction_error, ds.protocol_error, ds.tx_timeout deltas = 0

@@ -594,35 +594,6 @@ pop_up() {  # <name>
   recv_apply pop "$1" "$PRM"
   env "${PS[@]}" STATUS_TAG=pre bash $C8/p-popcorn-shm.sh status >> "$E/block.log" 2>&1 || stop "status pre"
 }
-# receiver mode of a lifetime (recv-mode.sh rules): recv_mode (+ RECV_IPOLL for adaptive) on every VM, then the
-# recv-readback.sh line per VM -> recv-mode-<name>.txt ("<ip> recv_mode=.. ... instr_enabled=..", one line per VM:
-# recv_check.py reads it) and checked (mode, ring_coherent, adaptive module, ipoll, fault_poll, Popcorn srcversion)
-recv_apply() {  # <pop|ds> <name> <mode>
-  local s=$1 ip rb i p w x why fp=-
-  [ $s = ds ] && fp=$DSFP
-  [ $s = pop ] && fp=0
-  for ip in "${IPS[@]}"; do
-    w="echo $3 > /sys/module/cxl_shm/parameters/recv_mode"
-    [ -z "$IPOLL" ] || [ "$3" != adaptive ] || w+=" && echo $IPOLL > /sys/module/cxl_shm/parameters/ipoll"
-    $SSH comsys@$ip "sudo -n sh -c '$w'" < /dev/null || stop "$2: recv_mode write on $ip"
-    rb=$($SSH comsys@$ip "bash -s" < "$RB" 2>/dev/null)
-    i=$($SSH comsys@$ip "cat /sys/kernel/swmc/instr/enabled 2>/dev/null || echo absent" < /dev/null)
-    if [ $s = ds ]; then
-      p=$($SSH comsys@$ip "cat /sys/kernel/swmc/page_coherence/protocol" < /dev/null)
-      echo "$ip $rb protocol=$p instr_enabled=$i" >> "$E/recv-mode-$2.txt"
-      [ "$p" = destijl ] || stop "$2: protocol on $ip ($p)"
-      for x in $DSRX; do [[ " $rb " == *" $x "* ]] || stop "$2: receiver parameter $x not applied on $ip ($rb)"; done
-    else
-      echo "$ip $rb instr_enabled=$i" >> "$E/recv-mode-$2.txt"
-      [ "$i" = 1 ] || stop "$2: instr on $ip ($i)"
-    fi
-    why=$(recv_rb_check $s "$3" "$rb" "$([ $s = pop ] && echo "$POPSV" || echo -)" "${IPOLL:--}" "$fp") || stop "$2: receiver on $ip: $why"
-  done
-}
-recv_post() {  # <name>: recv-readback.sh line per VM after the run (lifetime receiver / poller CPU = post - pre)
-  local ip
-  for ip in "${IPS[@]}"; do echo "$ip $($SSH comsys@$ip "bash -s" < "$RB" 2>/dev/null)" >> "$E/recv-post-$1.txt"; done
-}
 pop_down() {
   recv_post "$1"
   env "${PS[@]}" STATUS_TAG=post bash $C8/p-popcorn-shm.sh status >> "$E/block.log" 2>&1

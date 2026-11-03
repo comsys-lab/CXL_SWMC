@@ -34,6 +34,7 @@ if [ "$K" != "$LEVELS_FROM_RUN" ] || [ "${LEVELS_SOURCE:-}" = registry ]; then
   elif [ $DRY = 1 ]; then plan "levels: run $LEVELS_FROM_RUN of rs-main not accepted yet (a real run would stop here)"
   else die "run $LEVELS_FROM_RUN of rs-main is not accepted (registry.py accept)"; fi
 fi
+[[ " $RS_SYSTEMS " != *" pop "* ]] || recv_pop_check 2   # receiver of the Popcorn lifetimes (recv-mode.sh)
 need_env
 lock_free
 evidence_dir
@@ -44,7 +45,8 @@ BLK=(bash $TREE/experiments/recsys/main-block.sh $E/block)
 plan "rates [$RS_POINTS] systems [$RS_SYSTEMS] fix levels [$RS_FIX_LEVELS] map [${MAP# }] fallback ${RS_FIX_FALLBACK_Q:-none} sep $SEP levels ${LVF:-computed in this run}"
 plan "block: env ${RSENV[*]} ${BLK[*]}"
 plan "then: rs_check.py $E/block --rates '$RS_POINTS' --slo-systems '$RS_SYSTEMS' --fix-systems '$FIXSYS'"
-[ "$RECV_MODE" = poll ] || plan "then: recv_check.py $E/block --mode $RECV_MODE (RS_PROC_CXL_SHM=${RS_PROC_CXL_SHM:-0})"
+RSPRM=${POP_RECV_MODE:-$RECV_MODE}
+[ "$RSPRM" = poll ] || plan "then: recv_check.py $E/block --mode $RSPRM (RS_PROC_CXL_SHM=${RS_PROC_CXL_SHM:-0})"
 if [ $DRY = 1 ]; then
   block_dry "missing or not empty" env "${RSENV[@]}" bash $TREE/experiments/recsys/main-block.sh @DIR@
   echo "DRY START OK ($RUNSET run $K): stops here, before the lock"; exit 0
@@ -60,8 +62,8 @@ log "block rc $?: $(tail -n 1 "$E/block/sequence.log")"
 python3 -I -B $EVD/rs_check.py "$E/block" --rates "$RS_POINTS" --slo-systems "$RS_SYSTEMS" --fix-systems "$FIXSYS" > /dev/null
 log "check: $(tail -n 1 "$E/block/rs-check.txt")"
 tail -n 1 "$E/block/rs-check.txt" | grep -q "^RSCHECK PASS" || stop "check FAIL (see $E/block/rs-check.txt)"
-if [ "$RECV_MODE" != poll ]; then  # receive mode of every Popcorn lifetime (e.g. recv-sleep.conf)
-  python3 -I -B $EVD/recv_check.py "$E/block" --mode "$RECV_MODE" > /dev/null
+if [ "$RSPRM" != poll ]; then  # receive mode of every Popcorn lifetime (e.g. recv-sleep.conf; run 2 adaptive)
+  python3 -I -B $EVD/recv_check.py "$E/block" --mode "$RSPRM" > /dev/null
   log "recv check: $(tail -n 1 "$E/block/recv-check.txt" 2>/dev/null || echo 'no recv-check.txt')"
   tail -n 1 "$E/block/recv-check.txt" | grep -q "^RECVCHECK PASS" || stop "recv check FAIL (see $E/block/recv-check.txt)"
 fi

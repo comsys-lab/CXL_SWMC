@@ -46,7 +46,8 @@ KEYS="ROCKS_BLOCK ROCKS_TOPO ROCKS_NODES ROCKS_MIXES ROCKS_SYSTEMS ROCKS_SLO_MS 
   ROCKS_BUILD ROCKS_LOADGEN_BUILD ROCKS_SLO_EXTRA RECV_MODE EXPECT_DAX_UUID RESULTS_ROOT EVIDENCE_PREFIX ROCKS_GUEST_PREFIX
   POP_REGION POP_C POP_BUNDLE_SHA POP_K POP_GT DS_REGION DS_C DS_BUNDLE_SHA DS_K DS_GT"
 OPTKEYS="ROCKS_DS_RECV_EXTRA ROCKS_EXPERIMENT ROCKS_MG_BUILD_N2 ROCKS_MG_BUILD_N4 ROCKS_MG_BUILD_N8 ROCKS_MG_CFG_N2
-  ROCKS_MG_CFG_N4 ROCKS_MG_CFG_N8 ROCKS_MG_EXTENTS_N2 ROCKS_MG_EXTENTS_N4 ROCKS_MG_EXTENTS_N8"
+  ROCKS_MG_CFG_N4 ROCKS_MG_CFG_N8 ROCKS_MG_EXTENTS_N2 ROCKS_MG_EXTENTS_N4 ROCKS_MG_EXTENTS_N8
+  POP_RECV_MODE POP_ADAPT_KO RECV_IPOLL"
 # shellcheck disable=SC2086
 unset $KEYS $OPTKEYS
 # the conf may set only these keys (a typo or a foreign key stops)
@@ -62,7 +63,16 @@ POP_REGION=$(abs "$POP_REGION") POP_C=$(abs "$POP_C") DS_REGION=$(abs "$DS_REGIO
 EXPN=${ROCKS_EXPERIMENT:-de-stijl-evaluation-run1}
 [[ $EXPN =~ ^[a-z0-9][-a-z0-9]*$ ]] || die "bad ROCKS_EXPERIMENT ($EXPN)"
 DSRX=${ROCKS_DS_RECV_EXTRA:-}
-[[ $DSRX =~ ^((idle_sleep_us|idle_spin_us)=[0-9]+( |$))*$ ]] || die "bad ROCKS_DS_RECV_EXTRA ($DSRX: 'idle_sleep_us=<n> idle_spin_us=<n>')"
+[[ $DSRX =~ ^(((idle_sleep_us|idle_spin_us)=[0-9]+|fault_poll=[01])( |$))*$ ]] || die "bad ROCKS_DS_RECV_EXTRA ($DSRX: 'idle_sleep_us=<n> idle_spin_us=<n> fault_poll=<0|1>')"
+# run-2 receiver keys (experiments/eval/recv-mode.sh; pilot-run.sh checks them per cell): POP_RECV_MODE, POP_ADAPT_KO
+# (relative = project root), RECV_IPOLL
+[ -z "${POP_ADAPT_KO:-}" ] || POP_ADAPT_KO=$(abs "$POP_ADAPT_KO")
+. "$TREE/experiments/eval/recv-mode.sh"
+if [ "$PHASE" = hwpop ] && [[ " $ROCKS_SYSTEMS " == *" pop "* ]]; then
+  why=$(recv_rules pop "${POP_RECV_MODE:-$RECV_MODE}" "$POP_C" "$N") || die "Popcorn receiver: $why"
+elif [ "$PHASE" = ds ]; then
+  why=$(recv_rules ds "$RECV_MODE" "$DS_C" "$N") || die "De Stijl receiver: $why"
+fi
 [[ $ROCKS_BLOCK != *200 ]] || [ -n "$DSRX" ] || die "ROCKS_BLOCK $ROCKS_BLOCK needs ROCKS_DS_RECV_EXTRA"
 [[ " $ROCKS_NODES " == *" $N "* ]] || die "N=$N not in ROCKS_NODES ($ROCKS_NODES)"
 [ "$ROCKS_SLO_MS" = 1 ] || die "ROCKS_SLO_MS must be 1 (user decision: RocksDB SLO p99 1 ms)"
@@ -121,7 +131,9 @@ if [ $PHASE = hwpop ]; then export C8=$POP_C K8=$POP_K GT8=$POP_GT POP_BUNDLE_SH
 elif [ $PHASE = mg ]; then export MEG_CFG
 else export DS_C DS_K DS_GT DS_BUNDLE_SHA DS_RECV_EXTRA="$DSRX"; fi
 echo "RUNSET rocks conf=$CONF ($(sha256sum < "$CONF" | cut -c1-16)) block=$ROCKS_BLOCK N=$N phase=$PHASE topo=$ROCKS_TOPO E=$E"
-[ "$PHASE" != ds ] || echo "RUNSET De Stijl receiver: ${DSRX:-module defaults}"
+[ "$PHASE" != ds ] || echo "RUNSET De Stijl receiver: recv_mode $RECV_MODE ${DSRX:-module defaults} ipoll ${RECV_IPOLL:-default}"
+[ "$PHASE" != hwpop ] || echo "RUNSET Popcorn receiver: recv_mode ${POP_RECV_MODE:-$RECV_MODE}${POP_ADAPT_KO:+ module $POP_ADAPT_KO} ipoll ${RECV_IPOLL:-default}"
+for x in POP_RECV_MODE POP_ADAPT_KO RECV_IPOLL; do [ -z "${!x:-}" ] || export "$x"; done
 echo "RUNSET cells:$NAMES"
 if [ $DRY = 1 ]; then
   DRY=1 bash "$HERE/v1-block.sh" "$E"; rc=$?

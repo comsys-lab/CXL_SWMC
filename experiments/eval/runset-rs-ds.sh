@@ -14,7 +14,8 @@
 #   RS_DS_T_US        staleness bound T in us (servers: ENV:CXL_SYSTEM=ds ENV:CXL_DESTIJL_T_US=<T>; 0 = synchronous).
 #                     The literal @MAIN_T@ is the unresolved placeholder: a dry start plans with T = 0 and says so, a
 #                     real run stops. T > 0 needs a libdestijl server (RS_PLAIN_BUILD: de_stijl_set_staleness).
-#   RS_DS_RECV_EXTRA  optional "idle_sleep_us=<n> idle_spin_us=<n>" (either or both): De Stijl receiver sleep tier,
+#   RS_DS_RECV_EXTRA  optional "idle_sleep_us=<n> idle_spin_us=<n> fault_poll=<0|1>" (any subset; fault_poll: build >= 9,
+#                     run 2 = 0): De Stijl receiver parameters (sleep tier / fault-entry polling),
 #                     appended to the cxl_shm load of every ds lifetime and checked after the enable (main-block.sh
 #                     DS_RECV_EXTRA; user 2026-11-02 17:0x: 200 / 50 for every ds cell from now on). Empty = defaults.
 # After the block: rs_check.py (SLO ds at every rate, no fixed windows) and recv_check.py --mode RECV_MODE (De Stijl
@@ -26,7 +27,7 @@ RUNSET=rs-ds WL=recsys
 unset RS_DS_C RS_DS_BUNDLE_SHA RS_DS_K RS_DS_GT RS_DS_REGION RS_DS_VM_PLAIN RS_DS_T_US RS_DS_RECV_EXTRA
 . "$(dirname "$0")/lib.sh"
 RSRX=${RS_DS_RECV_EXTRA:-}
-[[ $RSRX =~ ^((idle_sleep_us|idle_spin_us)=[0-9]+( |$))*$ ]] || die "bad RS_DS_RECV_EXTRA ($RSRX: 'idle_sleep_us=<n> idle_spin_us=<n>')"
+[[ $RSRX =~ ^(((idle_sleep_us|idle_spin_us)=[0-9]+|fault_poll=[01])( |$))*$ ]] || die "bad RS_DS_RECV_EXTRA ($RSRX: 'idle_sleep_us=<n> idle_spin_us=<n> fault_poll=<0|1>')"
 rs_checks
 for x in RS_DS_C RS_DS_BUNDLE_SHA RS_DS_K RS_DS_GT RS_DS_REGION RS_DS_VM_PLAIN RS_DS_T_US; do
   [ -n "${!x:-}" ] || die "rs-ds needs $x in $EVAL_CONF"
@@ -34,7 +35,8 @@ done
 [[ $RS_DS_K == *-ds-destijl-* ]] || die "RS_DS_K=$RS_DS_K is not a De Stijl release (-ds-destijl-<n>)"
 [[ $RS_DS_GT =~ ^/home/comsys/[A-Za-z0-9._-]+$ && $RS_DS_VM_PLAIN =~ ^/home/comsys/[A-Za-z0-9._-]+$ ]] || die "bad RS_DS_GT / RS_DS_VM_PLAIN"
 [ "$RS_DS_VM_PLAIN" != "$RS_VM_PLAIN" ] || die "RS_DS_VM_PLAIN must be its own install (De Stijl region), not RS_VM_PLAIN"
-[[ $RECV_MODE =~ ^(poll|sleep)$ ]] || die "RECV_MODE=$RECV_MODE: De Stijl (cxl_shm v13 protocol=destijl) refuses idle"
+need_files "$RS_DS_C/tools/destijl.env"
+why=$(recv_rules ds "$RECV_MODE" "$RS_DS_C" 2) || die "De Stijl receiver: $why"   # recv-mode.sh (adaptive: build >= 9 bundle)
 T=$RS_DS_T_US
 if [ "$T" = @MAIN_T@ ]; then
   [ $DRY = 1 ] || die "RS_DS_T_US is the unresolved placeholder @MAIN_T@ (resolve it into a conf copy first)"

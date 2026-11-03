@@ -1075,7 +1075,8 @@ class Server {
   std::vector<std::unique_ptr<Graph>> g_;
   std::vector<float> sq8_;  // sq8: private copy of the HWcc quantizer (p_.g.sq8 points here; read-only after start)
   Stats st_;
-  cxl::proc::Opts pst_{{"cxl_recv"},
+  // kthreads: receive thread cxl_recv_<n> and (run 2 adaptive receiver) idle pollers cxl_ipoll/<cpu>, kept apart
+  cxl::proc::Opts pst_{{"cxl_recv", "cxl_ipoll"},
                        {"TLB", "CAL", "RES", "LOC"},
                        {"/sys/kernel/swmc/page_coherence", "/sys/kernel/swmc/instr", "/sys/kernel/cxl_shm",
                         "/sys/kernel/cxl_shm/instr"}};
