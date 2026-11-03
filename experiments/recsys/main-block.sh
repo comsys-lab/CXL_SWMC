@@ -257,6 +257,54 @@ if [ $BLOCK = stream ]; then
   elif [ -n "${STREAM_PROC_CXL_SHM:-}" ]; then echo "SEQUENCE STOP: STREAM_PROC_CXL_SHM needs EVAL_RUN"; exit 2
   fi
 fi
+# ---- RecSys v7 (V7=1, BLOCK=stream + EVAL_RUN only; workloads/recsys/DESIGN.md §10.6, experiment doc §R): trained
+# checkpoint image + dense weights, node 0 trains online (--update-mode train, row-wise Adagrad, test-then-train),
+# the loadgen draws queries from the update trace ahead of the update position (prequential=1, window V7_W_S x rate)
+# and logs (score, label); both servers log sampled row reads/writes for the stale-read fraction / age.
+# Keys (lib.sh rs_env from the conf's RS_V7_*): V7_IMAGE / V7_DENSE (guest paths), V7_LR, V7_ACC_INIT, V7_TRAIN_BATCH,
+# V7_TRAIN_THREADS (0 = update threads), V7_W_S, V7_STALE_SAMPLE, V7_STALE_DIR (guest dir of the stale logs),
+# V7_SAMPLES (Host v3 samples file with labels: updates and queries), V7_FROZEN (Host frozen scores of the same trace).
+# The literal @USER@ in V7_LR / V7_ACC_INIT / V7_TRAIN_BATCH / V7_W_S = not decided by the user: a dry start plans with
+# the server defaults and says so (BLOCK DRY NOTE); a real run stops.
+V7=${V7:-0} V7PEND="" V7T=$(cd "$X/../../workloads/recsys/tools" && pwd)
+case $V7 in 0) ;; 1)
+  [ $BLOCK = stream ] && [ -n "${EVAL_RUN:-}" ] || { echo "SEQUENCE STOP: V7=1 needs BLOCK=stream and EVAL_RUN"; exit 2; }
+  for v in V7_IMAGE V7_DENSE V7_LR V7_ACC_INIT V7_TRAIN_BATCH V7_W_S V7_STALE_SAMPLE V7_STALE_DIR V7_SAMPLES V7_FROZEN; do
+    [ -n "${!v:-}" ] || { echo "SEQUENCE STOP: V7=1 needs $v"; exit 2; }
+  done
+  for v in V7_LR V7_ACC_INIT V7_TRAIN_BATCH V7_W_S; do [ "${!v}" != @USER@ ] || V7PEND="$V7PEND $v"; done
+  if [ -n "$V7PEND" ]; then
+    echo "BLOCK DRY NOTE: v7 parameters not decided by the user:$V7PEND (dry start plans with the server defaults lr 0.004, acc_init image, batch 8, W 60 s)"
+    [ "$V7_LR" != @USER@ ] || V7_LR=0.004; [ "$V7_ACC_INIT" != @USER@ ] || V7_ACC_INIT=-1
+    [ "$V7_TRAIN_BATCH" != @USER@ ] || V7_TRAIN_BATCH=8; [ "$V7_W_S" != @USER@ ] || V7_W_S=60
+  fi
+  [[ $V7_TRAIN_BATCH =~ ^[1-9][0-9]*$ && $V7_STALE_SAMPLE =~ ^[1-9][0-9]*$ && ${V7_TRAIN_THREADS:-0} =~ ^[0-9]+$ ]] \
+    || { echo "SEQUENCE STOP: bad V7_TRAIN_BATCH / V7_STALE_SAMPLE / V7_TRAIN_THREADS"; exit 2; }
+  [[ $V7_STALE_DIR =~ ^/[A-Za-z0-9._/-]+$ ]] || { echo "SEQUENCE STOP: bad V7_STALE_DIR"; exit 2; }
+  [ -f "$V7_SAMPLES" ] && [ -f "$V7_FROZEN" ] || { echo "SEQUENCE STOP: V7_SAMPLES / V7_FROZEN missing on the Host"; exit 2; }
+  SA="${SA/--update-mode stream/--update-mode train} --image $V7_IMAGE --model-dense $V7_DENSE --lr $V7_LR --acc-init $V7_ACC_INIT --train-batch $V7_TRAIN_BATCH --train-threads ${V7_TRAIN_THREADS:-0} --stale-sample $V7_STALE_SAMPLE"
+  ;; *) echo "SEQUENCE STOP: bad V7 ($V7)"; exit 2;; esac
+v7_lgc() {  # <rate>: v7 loadgen options (appended to LGC; later --opt values win)
+  [ "$V7" = 1 ] || return 0
+  LGC=(--opt samples=$V7_SAMPLES --opt queries=$V7_SAMPLES --opt quantiles=$D/dist_quantile.txt --fixed update=$1 --mix query=1
+       --x-stream query --opt prequential=1 --opt update_rate=$1 --opt query_window_s=$V7_W_S --opt wrap=1)
+}
+v7_stale() { echo "$V7_STALE_DIR/$(basename "$E")-$1-n$2.stl"; }   # <lifetime name> <node>: guest path (unique per block)
+v7_post() {  # <sys> <rate> <part dir>: fetch both stale logs (guest v7_stale paths), then v7_metrics.py
+  [ "$V7" = 1 ] || return 0
+  local k f
+  for k in 0 1; do
+    f=$(v7_stale $NAME $k)
+    if [ "${SESSION_LOCAL:-0}" = 1 ]; then cp "$f" "$3/stale-n$k.stl"
+    else $SSH comsys@${IPS[$k]} "cat $f" < /dev/null > "$3/stale-n$k.stl"; fi || stop "$NAME: stale log n$k"
+  done
+  python3 -I -B $V7T/v7_metrics.py "$3" --stale0 "$3/stale-n0.stl" --stale1 "$3/stale-n1.stl" --frozen "$V7_FROZEN" \
+    --trace-n "$(sed -n 's/^trace_samples=//p' "$3/loadgen/recsys.txt")" --steps-out "$3/v7-steps.csv" \
+    --auc-run "$E/auc_run.csv" --system "$1" --update-rate "$2" --T "${DST:-0}" --run "${EVAL_RUN:-1}" > "$3/v7-metrics.txt" 2>&1 \
+    || stop "$NAME: v7_metrics.py ($(tail -1 "$3/v7-metrics.txt"))"
+  [ ! -f "$3/steps.csv" ] || python3 -I -B $V7T/v7_metrics.py "$3" --stale0 "$3/stale-n0.stl" --stale1 "$3/stale-n1.stl" \
+    --merge-steps "$3/steps.csv" > /dev/null 2>&1 || stop "$NAME: v7 steps.csv merge"
+}
 if [ $BLOCK != h1 ] && [ $BLOCK != stream ]; then ekko_set "$EKKO" || { echo "SEQUENCE STOP: EKKO must be avg, peak, f087, f149, f253, f330, f350, f370, f400, f385 or f392"; exit 2; }; fi
 export SLO_MS SLO_RULE="DeepRecSys ISCA'20: query p${SLO_PCT} <= ${SLO_MS} ms ($SLO_SRC)"
 HOST_PLAIN=$PLAIN_BUILD/bin/recsys-server
@@ -322,6 +370,7 @@ if [ $HASDS = 1 ]; then
   KEXP=$DS_K
 fi
 [ -d "$E" ] && [ -z "$(ls -A "$E" | grep -v '^sequence')" ] || { echo "SEQUENCE STOP: $E missing or not empty"; exit 2; }
+[ -z "$V7PEND" ] || { echo "SEQUENCE STOP: v7 parameters not decided by the user:$V7PEND (@USER@ in the conf)"; exit 2; }
 LOCKF=${LOCK:-$P/workspaces/MEASUREMENT.lock}
 if [ $BLOCK = h1 ]; then  # parent lock rule: H1 main holds the lock; this block never locks or unlocks
   grep -q "^owner=H1-main " "$LOCKF" 2>/dev/null || { echo "SEQUENCE STOP: lock $LOCKF not held by H1-main ($(cat "$LOCKF" 2>/dev/null))"; exit 2; }
@@ -513,9 +562,11 @@ h1_lockchk() {  # BLOCK=h1: the parent lock must still name owner=H1-main (check
   grep -q "^owner=H1-main " "$LOCKF" 2>/dev/null || stop "lock $LOCKF not held by H1-main ($(cat "$LOCKF" 2>/dev/null))"
 }
 life_start() {  # <sys> <name>: prepare + session start of one server lifetime -> LS (session dir), NAME
-  local s=$1 SE t0
+  local s=$1 SE t0 SA0=$SA V7N0=""
   h1_lockchk
   NAME=$2 LS=$E/$2
+  # v7: per-lifetime stale logs on each guest (node 1 via SERVER_ARGS, node 0 overrides it in NODE0_ARGS; later wins)
+  [ "$V7" != 1 ] || { SA="$SA --stale-log $(v7_stale $2 1)"; V7N0=" --stale-log $(v7_stale $2 0)"; }
   local S=$LS
   if [ $s = pop ]; then SHMR=$E/shm-$NAME; PS=(K=$K8 GT=$GT8 C=$C8 R=$SHMR INIT_STATE=shared) SHMS=$C8/p-popcorn-shm.sh; fi
   if [ $s = ds ]; then SHMR=$E/dsshm-$NAME; DSRX=${DS_RECV_EXTRA:-}; PS=(K=$DS_K GT=$DS_GT C=$DS_C R=$SHMR INIT_STATE=shared "LOAD_EXTRA=recv_mode=$RECV_MODE${DSRX:+ ${DSRX% }}") SHMS=$DS_C/p-destijl-shm.sh; fi
@@ -535,7 +586,8 @@ life_start() {  # <sys> <name>: prepare + session start of one server lifetime -
         SE=(SYSTEM=DeStijl-$RECV_MODE-T$DST V=$VM_PLAIN HOST_SERVER=$HOST_PLAIN "SERVER_ARGS=$SA" NODE0_ARGS=--preloaded
             "NODE_ENV=ENV:XTIMEOUT=$XT ENV:CXL_SYSTEM=ds ENV:CXL_DESTIJL_T_US=$DST");;
   esac
-  [ -z "$N0X" ] || SE+=("NODE0_ARGS=$(case $s in pop|ds) echo "--preloaded ";; esac)$N0X")   # BLOCK=stream (later value wins in env)
+  [ -z "$N0X" ] || SE+=("NODE0_ARGS=$(case $s in pop|ds) echo "--preloaded ";; esac)$N0X$V7N0")   # BLOCK=stream (later value wins in env)
+  SA=$SA0
   servers_gone || stop "a recsys-server runs before $s"
   env "${SE[@]}" T_MS=$T_MS bash $X/session.sh start "$S" > "$S.start.out" 2>&1 || { tail -3 "$S.start.out"; stop "$s session start"; }
   tail -1 "$S.start.out"
@@ -718,6 +770,7 @@ stream_slo() {  # <sys> <rate>
   case "$sc" in "STREAMCHECK PASS"*|"STREAMCHECK NOTE"*) ;; *) stop "$NAME: ${sc:-stream_check.py failed}";; esac
   python3 $X/check_breakdown.py "$RD" > "$RD/breakdown-check.txt" 2>&1
   grep -q "^BREAKDOWN PASS" "$RD/breakdown-check.txt" || stop "$NAME: $(cat "$RD/breakdown-check.txt")"
+  v7_post "$s" "$r" "$RD"
   python3 -I -c 'import json,sys
 s=json.load(open(sys.argv[1])); c=s.get("confirm",{})
 f=lambda v: "" if v is None else str(v)
@@ -1008,6 +1061,7 @@ if [ $BLOCK = stream ]; then  # RecSys streaming driver (header "BLOCK=stream")
     lab=""; [ $r -le 400 ] || lab=" (stress, above Ekko peak)"
     LGC=(--opt samples=$D/$UPD_FILE --opt queries=$D/$QRY_FILE
          --opt quantiles=$D/dist_quantile.txt --fixed update=$r --mix query=1 --x-stream query)
+    v7_lgc $r
     if [ -n "${EVAL_RUN:-}" ]; then eval_stream_rate $r; continue; fi
     for s in $(h1shuffle recsys-stream-$r ${SYSTEMS:-hw pop}); do
       echo "$(date -Is) stream u$r$lab system $s"

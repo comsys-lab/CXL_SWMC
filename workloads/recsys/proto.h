@@ -10,11 +10,15 @@ namespace rsys {
 
 constexpr uint32_t kDense = 13, kSparse = 26, kMultiHot = 214;  // kMultiHot = sum of the MLPerf multi-hot sizes
 
+// v7 (samples.h version 3): + click label (day_23_labels.npy) and 3 pad bytes; the updater trains on the label, the
+// serving node returns it next to the score (test-then-train log, DESIGN.md §10).
 struct __attribute__((packed)) Sample {
   float dense[kDense];
   uint32_t ids[kMultiHot];  // feature k: ids[hot_off(k) .. hot_off(k) + mlperf size k)
+  uint8_t label;            // 0/1 click
+  uint8_t pad[3];
 };
-static_assert(sizeof(Sample) == 908, "sample record");
+static_assert(sizeof(Sample) == 912, "sample record");
 
 enum Op : uint16_t {
   kOpUpdate = 1,  // UpdateReq + Sample            -> UpdateResp (updater node; samples in time order)

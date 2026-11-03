@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Convert the MLCommons DLRMv2 preprocessed day 23 (multi-hot, as is) into a recsys v2 samples file (samples.h).
+"""Convert the MLCommons DLRMv2 preprocessed day 23 (multi-hot, as is) into a recsys v3 samples file (v7: with the click label) (samples.h).
 
 Input (https://inference.mlcommons-storage.org, dlrm_preprocessed/; reports/RECSYS-design.md §1.2):
   day_23_dense.npy               float32 [N, 13]   (MLPerf/torchrec preprocessing; observed log(x + 3))
@@ -19,11 +19,13 @@ import zipfile
 import numpy as np
 
 MAGIC = 0x31504D5353595352  # "RSYSSMP1"
-VERSION = 2
+VERSION = 3  # v7: + label byte (day_23_labels.npy) + 3 pad bytes
 HOT = [3, 2, 1, 2, 6, 1, 1, 1, 1, 7, 3, 8, 1, 6, 9, 5, 1, 1, 1, 12, 100, 27, 10, 3, 1, 1]
 assert sum(HOT) == 214
-REC = np.dtype([("dense", "<f4", (13,)), ("ids", "<u4", (214,))])
-assert REC.itemsize == 908
+ROWS = [40000000, 39060, 17295, 7424, 20265, 3, 7122, 1543, 63, 40000000, 3067956, 405282, 10, 2209, 11938, 155, 4,
+        976, 14, 40000000, 40000000, 40000000, 590152, 12973, 108, 36]
+REC = np.dtype([("dense", "<f4", (13,)), ("ids", "<u4", (214,)), ("label", "u1"), ("pad", "u1", (3,))])
+assert REC.itemsize == 912
 
 
 def npz_member(path, zf, name):
@@ -59,7 +61,10 @@ def main():
     npz = f"{a.dir}/day_23_sparse_multi_hot.npz"
     zf = zipfile.ZipFile(npz)
     sp = [npz_member(npz, zf, f"{k}.npy") for k in range(26)]
+    labels = np.load(f"{a.dir}/day_23_labels.npy", mmap_mode="r")
     n_all = dense.shape[0]
+    if labels.shape[0] != n_all:
+        sys.exit(f"labels shape {labels.shape} vs {n_all} samples")
     if dense.ndim != 2 or dense.shape[1] != 13:
         sys.exit(f"dense shape {dense.shape}")
     for k, m in enumerate(sp):
@@ -73,12 +78,16 @@ def main():
         f.write(struct.pack("<QIIQQ96s", MAGIC, VERSION, REC.itemsize, a.count, 0, src))
         for s in range(a.start, a.start + a.count, a.chunk):
             e = min(s + a.chunk, a.start + a.count)
-            r = np.empty(e - s, dtype=REC)
+            r = np.zeros(e - s, dtype=REC)
             r["dense"] = np.asarray(dense[s:e], dtype="<f4")
+            lab = np.asarray(labels[s:e]).reshape(-1)
+            if ((lab != 0) & (lab != 1)).any():
+                sys.exit(f"label not 0/1 in [{s},{e})")
+            r["label"] = lab.astype("u1")
             for k in range(26):
                 x = np.asarray(sp[k][s:e])
-                if (x < 0).any():
-                    sys.exit(f"negative id in table {k} rows [{s},{e})")
+                if (x < 0).any() or (x >= ROWS[k]).any():
+                    sys.exit(f"id out of [0, {ROWS[k]}) in table {k} rows [{s},{e})")
                 r["ids"][:, offs[k]:offs[k + 1]] = x.astype("<u4")
             r.tofile(f)
     print(f"wrote {a.count} samples [{a.start}, {a.start + a.count}) of {n_all} to {a.out}")

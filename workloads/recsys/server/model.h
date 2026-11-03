@@ -50,6 +50,28 @@ struct Linear {
         std::memcpy(&w[(size_t(p) * in + k) * kPanel], dense + size_t(k) * out + p * kPanel, kPanel * 4);
   }
   uint64_t flops_per_row() const { return 2ull * in * out; }
+  // v7: from a torch nn.Linear weight [o][i] (row-major) and bias [o] (nullptr: none).
+  void load_torch(const float *wt, const float *bias, uint32_t i, uint32_t o) {
+    in = i, out = o;
+    w.assign(size_t(i) * o, 0.f);
+    b.clear();
+    if (bias) b.assign(bias, bias + o);
+    if (o == 1) {
+      std::memcpy(w.data(), wt, size_t(i) * 4);
+      return;
+    }
+    std::vector<float> dense(size_t(i) * o);  // [in][out]
+    for (uint32_t r = 0; r < o; r++)
+      for (uint32_t k = 0; k < i; k++) dense[size_t(k) * o + r] = wt[size_t(r) * i + k];
+    pack(dense.data());
+  }
+  // v7 backward: the transpose (in' = o, out' = i, no bias) of the torch weight [o][i]: Y = X W^T^T, i.e. g_in = g_out W.
+  void load_torch_transposed(const float *wt, uint32_t i, uint32_t o) {
+    in = o, out = i;
+    w.assign(size_t(i) * o, 0.f);
+    b.clear();
+    pack(wt);  // [o][i] is the row-major [in'][out'] of the transpose
+  }
 };
 
 // Y[m][out] (ldy) = X[m][in] (ldx) * W + b, optional ReLU.
@@ -203,9 +225,162 @@ class Model {
     for (uint32_t r = 0; r < m; r++) score[r] = 1.f / (1.f + std::exp(-score[r]));
   }
 
+  // ---- v7: trained weights (tools/ckpt_convert.py dense.bin: torch layout, names of torchrec DLRM_DCN)
+  bool load_dense(const std::string &path, std::string *err) {
+    FILE *f = std::fopen(path.c_str(), "rb");
+    if (!f) return *err = path + ": cannot open", false;
+    char magic[8];
+    uint32_t ver = 0, n = 0;
+    if (std::fread(magic, 1, 8, f) != 8 || std::memcmp(magic, "RSYSDNS1", 8) || std::fread(&ver, 4, 1, f) != 1 ||
+        std::fread(&n, 4, 1, f) != 1 || ver != 1)
+      return std::fclose(f), *err = path + ": not a RSYSDNS1 v1 file", false;
+    struct T { uint32_t ndim, d0, d1; std::vector<float> v; };
+    std::vector<std::pair<std::string, T>> ts;
+    for (uint32_t i = 0; i < n; i++) {
+      char name[96];
+      uint32_t hd[3];
+      if (std::fread(name, 1, 96, f) != 96 || std::fread(hd, 4, 3, f) != 3)
+        return std::fclose(f), *err = path + ": truncated", false;
+      T t{hd[0], hd[1], hd[2], std::vector<float>(size_t(hd[1]) * hd[2])};
+      if (std::fread(t.v.data(), 4, t.v.size(), f) != t.v.size())
+        return std::fclose(f), *err = path + ": truncated data", false;
+      ts.emplace_back(std::string(name, strnlen(name, 96)), std::move(t));
+    }
+    std::fclose(f);
+    auto get = [&](const std::string &nm, uint32_t d0, uint32_t d1) -> const float * {
+      for (auto &p : ts)
+        if (p.first == nm) {
+          if (p.second.d0 != d0 || p.second.d1 != d1) return nullptr;
+          return p.second.v.data();
+        }
+      return nullptr;
+    };
+    s_ = ModelSpec{};
+    bottom_.assign(3, {}), V_.assign(3, {}), W_.assign(3, {}), top_.assign(5, {});
+    Vt_.assign(3, {}), Wt_.assign(3, {}), topt_.assign(4, {});
+    const uint32_t bdims[4] = {s_.dense_in, s_.bottom[0], s_.bottom[1], s_.dim};
+    for (int l = 0; l < 3; l++) {
+      const std::string p = "model.dense_arch.model._mlp." + std::to_string(l) + "._linear.";
+      const float *w = get(p + "weight", bdims[l + 1], bdims[l]), *b = get(p + "bias", bdims[l + 1], 1);
+      if (!w || !b) return *err = "dense.bin: missing/shape " + p, false;
+      bottom_[l].load_torch(w, b, bdims[l], bdims[l + 1]);
+    }
+    const uint32_t D = s_.inter(), R = s_.rank;
+    for (int l = 0; l < 3; l++) {
+      const std::string L = std::to_string(l);
+      const float *v = get("model.inter_arch.crossnet.V_kernels." + L, R, D);
+      const float *w = get("model.inter_arch.crossnet.W_kernels." + L, D, R);
+      const float *b = get("model.inter_arch.crossnet.bias." + L, D, 1);
+      if (!v || !w || !b) return *err = "dense.bin: missing/shape crossnet " + L, false;
+      V_[l].load_torch(v, nullptr, D, R), W_[l].load_torch(w, b, R, D);
+      Vt_[l].load_torch_transposed(v, D, R), Wt_[l].load_torch_transposed(w, R, D);
+    }
+    const uint32_t tdims[6] = {D, s_.top[0], s_.top[1], s_.top[2], s_.top[3], 1};
+    for (int l = 0; l < 4; l++) {
+      const std::string p = "model.over_arch.model.0._mlp." + std::to_string(l) + "._linear.";
+      const float *w = get(p + "weight", tdims[l + 1], tdims[l]), *b = get(p + "bias", tdims[l + 1], 1);
+      if (!w || !b) return *err = "dense.bin: missing/shape " + p, false;
+      top_[l].load_torch(w, b, tdims[l], tdims[l + 1]);
+      topt_[l].load_torch_transposed(w, tdims[l], tdims[l + 1]);
+    }
+    const float *w = get("model.over_arch.model.1.weight", 1, tdims[4]), *b = get("model.over_arch.model.1.bias", 1, 1);
+    if (!w || !b) return *err = "dense.bin: missing over_arch.model.1", false;
+    top_[4].load_torch(w, b, tdims[4], 1);
+    return true;
+  }
+
+  // ---- v7: training activations and the backward pass of the frozen dense part (gradient w.r.t. x0 only;
+  // the updater uses the embedding columns x0[:, dim:]). FLOPs ~ forward of cross + top (DESIGN.md §10.3).
+  struct Train {
+    uint32_t max_m = 0;
+    std::vector<float> xs[4], us[3], h[4];  // x_0..x_3 (xs[0] = x0 copy), u_l = W_l V_l x_l + b_l, top outputs
+    std::vector<float> v, g, gx, t, s, ga, gb;
+  };
+  void train_scratch(Train *t, uint32_t m) const {
+    if (t->max_m >= m) return;
+    t->max_m = m;
+    const size_t D = s_.inter();
+    for (auto &x : t->xs) x.assign(m * D, 0);
+    for (auto &u : t->us) u.assign(m * D, 0);
+    for (int l = 0; l < 4; l++) t->h[l].assign(size_t(m) * s_.top[l], 0);
+    t->v.assign(size_t(m) * s_.rank, 0), t->s.assign(size_t(m) * s_.rank, 0);
+    t->g.assign(m * D, 0), t->gx.assign(m * D, 0), t->t.assign(m * D, 0);
+    t->ga.assign(m * std::max<size_t>(D, 1024), 0), t->gb.assign(m * std::max<size_t>(D, 1024), 0);
+  }
+  // Same result as top(); keeps the activations. logit[m] optional.
+  void top_train(uint32_t m, const Scratch *s, Train *t, float *score, float *logit = nullptr) const {
+    const size_t D = s_.inter();
+    std::memcpy(t->xs[0].data(), s->x0.data(), m * D * 4);
+    const float *x0 = t->xs[0].data();
+    for (uint32_t l = 0; l < s_.cross_layers; l++) {
+      gemm(V_[l], t->xs[l].data(), D, m, t->v.data(), s_.rank, false);
+      gemm(W_[l], t->v.data(), s_.rank, m, t->us[l].data(), D, false);
+      const float *xl = t->xs[l].data(), *u = t->us[l].data();
+      float *xn = t->xs[l + 1].data();
+      for (size_t i = 0; i < m * D; i++) xn[i] = x0[i] * u[i] + xl[i];
+    }
+    const float *in = t->xs[3].data();
+    size_t ld = D;
+    for (int l = 0; l < 4; l++) {
+      gemm(top_[l], in, ld, m, t->h[l].data(), top_[l].out, true);
+      in = t->h[l].data(), ld = top_[l].out;
+    }
+    float tmp[1024];
+    float *z = logit ? logit : (m <= 1024 ? tmp : nullptr);
+    std::vector<float> big;
+    if (!z) big.resize(m), z = big.data();
+    gemm(top_[4], in, ld, m, z, 1, false);
+    for (uint32_t r = 0; r < m; r++) score[r] = 1.f / (1.f + std::exp(-z[r]));
+  }
+  // dz[m] = dLoss/dlogit (BCE: (p - y) * scale). Output gx0 = t->gx [m][inter] (dLoss/dx0).
+  const float *backward(uint32_t m, Train *t, const float *dz) const {
+    const size_t D = s_.inter();
+    // top MLP: last linear (out = 1), then 4 ReLU layers
+    const uint32_t n3 = s_.top[3];
+    float *ga = t->ga.data(), *gb = t->gb.data();
+    for (uint32_t r = 0; r < m; r++)
+      for (uint32_t k = 0; k < n3; k++) {
+        const float hv = t->h[3][size_t(r) * n3 + k];
+        ga[size_t(r) * n3 + k] = hv > 0 ? top_[4].w[k] * dz[r] : 0.f;
+      }
+    for (int l = 3; l >= 0; l--) {
+      const uint32_t o = top_[l].out, i = top_[l].in;
+      float *gin = l ? gb : t->g.data();
+      gemm(topt_[l], ga, o, m, gin, i, false);
+      if (l) {
+        const float *hp = t->h[l - 1].data();
+        for (size_t q = 0; q < size_t(m) * i; q++)
+          if (hp[q] <= 0) gin[q] = 0.f;
+        std::swap(ga, gb);
+      }
+    }
+    // cross: g = dL/dx_{l+1}; dL/dx_l = g + V^T W^T (g * x0); dL/dx0 += g * u_l
+    float *g = t->g.data(), *gx = t->gx.data(), *tt = t->t.data();
+    const float *x0 = t->xs[0].data();
+    std::memset(gx, 0, m * D * 4);
+    for (int l = int(s_.cross_layers) - 1; l >= 0; l--) {
+      const float *u = t->us[l].data();
+      for (size_t q = 0; q < m * D; q++) gx[q] += g[q] * u[q], tt[q] = g[q] * x0[q];
+      gemm(Wt_[l], tt, D, m, t->s.data(), s_.rank, false);
+      gemm(Vt_[l], t->s.data(), s_.rank, m, tt, D, false);
+      for (size_t q = 0; q < m * D; q++) g[q] += tt[q];
+    }
+    for (size_t q = 0; q < m * D; q++) gx[q] += g[q];
+    return gx;
+  }
+  uint64_t backward_flops_per_pair() const {
+    uint64_t f = 0;
+    for (int l = 0; l < 4; l++) f += topt_[l].flops_per_row();
+    for (uint32_t l = 0; l < s_.cross_layers; l++) f += Vt_[l].flops_per_row() + Wt_[l].flops_per_row() + 4ull * s_.inter();
+    return f;
+  }
+  // Raw access for tests (torch layout is not kept; the packed layout is).
+  const std::vector<Linear> &bottom_layers() const { return bottom_; }
+
  private:
   ModelSpec s_;
   std::vector<Linear> bottom_, V_, W_, top_;
+  std::vector<Linear> Vt_, Wt_, topt_;  // v7 backward (transposes, no bias); empty for random-init models
 };
 
 }  // namespace rsys

@@ -25,6 +25,8 @@ TREE=$(cd "$EVD/../.." && pwd)
 #   EVIDENCE_TAG     [run] evidence dir tag instead of the run set name (evidence_dir; e.g. h1-u10u95.conf vdb-u10u95);
 #                    a driver that sets its own EVIDENCE_TAG after sourcing this file (runset-h2n.sh) overrides it
 unset REGISTRY LEVELS_SOURCE LEVELS_REGISTRY RS_PROC_CXL_SHM RUNSETS EVIDENCE_TAG EXPORT_SUFFIX
+unset RS_V7 RS_V7_IMAGE RS_V7_DENSE RS_V7_LR RS_V7_ACC_INIT RS_V7_TRAIN_BATCH RS_V7_TRAIN_THREADS RS_V7_W_S \
+  RS_V7_STALE_SAMPLE RS_V7_STALE_DIR RS_V7_SAMPLES RS_V7_FROZEN   # v7 keys come only from the conf
 CONFSH=$(python3 -I -B "$EVD/evalconf.py" shell ${EVAL_CONF:+--conf "$EVAL_CONF"}) || { echo "RUNSET STOP: ${EVAL_CONF:-eval.conf} does not parse"; exit 2; }
 eval "$CONFSH"
 export EVAL_CONF   # absolute path of the config (evalconf.py shell); pins-vdb.sh (sourced by the hook) reads the same file
@@ -141,6 +143,15 @@ rs_env() {
     *) die "bad EVAL_RS_LEAN (${EVAL_RS_LEAN}: 0 or 1)";; esac
   plan "RecSys SLO query p$RS_SLO_PCT <= $RS_SLO_MS ms, max confirm probes $([ "${EVAL_RS_LEAN:-0}" = 1 ] && echo 3 || echo 6)"
   local v; for v in PRETOUCH_DIR MEASURE_ENV_DIR MEASURE_PART_DIR; do [ -z "${!v:-}" ] || RSENV+=("$v=${!v}"); done
+  # RecSys v7 (RS_V7=1; workloads/recsys/DESIGN.md §10.6): RS_V7_<X> -> main-block.sh V7_<X>; @USER@ values = not
+  # decided by the user (dry start plans with the server defaults, a real run stops in the block)
+  case ${RS_V7:-0} in 0) ;; 1)
+    RSENV+=(V7=1)
+    for v in IMAGE DENSE LR ACC_INIT TRAIN_BATCH TRAIN_THREADS W_S STALE_SAMPLE STALE_DIR SAMPLES FROZEN; do
+      local c=RS_V7_$v; [ -n "${!c:-}" ] || die "RS_V7=1 needs $c in $EVAL_CONF"; RSENV+=("V7_$v=${!c}")
+    done
+    plan "RecSys v7: image ${RS_V7_IMAGE} dense ${RS_V7_DENSE} lr ${RS_V7_LR} acc_init ${RS_V7_ACC_INIT} batch ${RS_V7_TRAIN_BATCH} W ${RS_V7_W_S} s stale 1/${RS_V7_STALE_SAMPLE} rows";;
+    *) die "bad RS_V7 (${RS_V7}: 0 or 1)";; esac
 }
 rs_checks() {  # static checks shared by the RecSys drivers
   case $RS_SLO_PCT:$RS_SLO_MS:$RS_RAMP_START in 95:100:1|95:400:1) ;;
