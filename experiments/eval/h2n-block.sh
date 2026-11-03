@@ -205,6 +205,27 @@ if [ -n "$DXWARM" ]; then
   for i in $(seq 1 "$(dxw max_parts)"); do DXWPARTS+=" wb$(printf %02d $i)"; done
   DXWNOGATE=${DXWPARTS# }; DXWPARTS="wa$DXWPARTS"
 fi
+# run-2 §6 fair trio (de-stijl-evaluation-run2 D6, user 2026-11-03: hw, ds replica off and ds + DAMON ALL with the same
+# warmup): H2N_WARMUP "rate=<ops/s> learn_s=<s> part_s=<s> parts=<n>" = the warmup segment of H2N_DS_DAMON_WARMUP for
+#   SLO lifetimes WITHOUT DAMON (hw / pop / ds; mg lifetimes: none): parts wa (learn_s) + wb01..wb<parts> (part_s each)
+#   before slo at the fixed total rate (loadgen --mode fixed, no --slo, wb parts without the part gate; same part names
+#   and seeds as the DAMON warmup); no end condition: every part runs, so the duration = learn_s + parts x part_s = the
+#   DAMON warmup's cap (E1b: 30 + 10 x 60 = 630 s, which E1b ran to the cap). Not with H2N_DS_DAMON_WARMUP in one block.
+FWARM=${H2N_WARMUP:-} FWPARTS= FWNOGATE= FWDUR=0
+if [ -n "$FWARM" ]; then
+  [ -z "$DXWARM" ] || die "H2N_WARMUP and H2N_DS_DAMON_WARMUP in one block (one warmup rule per block)"
+  [ -z "${H2N_FIXED:-}" ] || die "H2N_WARMUP needs SLO lifetimes (not with H2N_FIXED)"
+  for x in rate learn_s part_s parts; do
+    [[ " $FWARM " =~ \ $x=[0-9]+\  ]] || die "H2N_WARMUP lacks $x=<integer> ('$FWARM')"
+  done
+  [ "$(echo $FWARM | wc -w)" = 4 ] || die "H2N_WARMUP: exactly the 4 keys rate learn_s part_s parts ('$FWARM')"
+  fww() { echo " $FWARM " | sed -n "s/.* $1=\([0-9][0-9]*\) .*/\1/p"; }
+  [ "$(fww parts)" -ge 1 ] && [ "$(fww parts)" -le 99 ] && [ "$(fww part_s)" -ge 10 ] && [ "$(fww learn_s)" -ge 1 ] && [ "$(fww rate)" -ge 1 ] \
+    || die "H2N_WARMUP out of range (1 <= parts <= 99, part_s >= 10, learn_s >= 1, rate >= 1)"
+  for i in $(seq 1 "$(fww parts)"); do FWNOGATE+=" wb$(printf %02d $i)"; done
+  FWNOGATE=${FWNOGATE# }; FWPARTS="wa $FWNOGATE"
+  FWDUR=$(( $(fww learn_s) + $(fww parts) * $(fww part_s) ))
+fi
 [ "$DXAT" = enable ] || [ -f "$EV/damonx-hook.sh" ] || die "missing $EV/damonx-hook.sh"
 [ "$REPL" = off ] || [ $HASDS = 1 ] || echo "BLOCK NOTE: H2N_DS_REPLICA_MODE=$REPL applies to ds lifetimes only (none in this block)"
 DSRX=${H2N_DS_RECV_EXTRA:-}
@@ -409,6 +430,7 @@ echo "BLOCK PLAN: server_args plain=[$SA]${MGSA:+ megalon=[$MGSA]}"
 [ $DSKER = 0 ] || echo "BLOCK PLAN: destijl release=$DS_K bundle=$DS_C guest_tools=$DS_GT region=$REGION T=$DST us recv_mode=$RECV_MODE (node env CXL_SYSTEM=ds CXL_DESTIJL_T_US=<T>; ds:<mix>:t<T> overrides T) replica_mode=$REPL pool_bytes=${RPOOL:--}${DAMONP:+ damon=[$DAMONP] damon_guest_sha256=$(sha256sum < "$EV/ds-damon-guest.sh" | cut -c1-64)}"
 [ "$REPL" != damon ] || echo "BLOCK PLAN: DAMON at=$DXAT range=$DXRANGE start_keys=[$DXSTART] regions_capture=$DXREG warmup=[${DXWARM:-none}]${DXWARM:+ warm_parts=[$DXWPARTS] nogate=[$DXWNOGATE]}$([ "$DXAT" = enable ] || echo " hook_sha256=$(sha256sum < "$EV/damonx-hook.sh" | cut -c1-64)")"
 [ $L1ON = 0 ] || echo "BLOCK PLAN: L1 step on hw/pop/ds lifetimes: --mode fixed --rates <L1> ${L1W}s warm-up + ${L1M}s + ${L1D}s drain; L1 from mg-<mix>-n$N rows of [${L1FROM:-} + this block]; no mg max -> L1 = ramp start $L1START, no step"
+[ -z "$FWARM" ] || echo "BLOCK PLAN: fixed warmup (H2N_WARMUP) on hw/pop/ds SLO lifetimes: [$FWARM] parts=[$FWPARTS] nogate=[$FWNOGATE] duration_s=$FWDUR (no end condition; mg: none)"
 [ $ACCX = 0 ] || echo "BLOCK PLAN: accuracy export per lifetime (<run>/accuracy-export.txt)"
 echo "BLOCK PLAN: receiver pop=$([ $HASPOP = 1 ] && echo "$PRM${POP_ADAPT_KO:+ ko=$POP_ADAPT_KO srcversion=$POPSV}" || echo -) ds=$([ $HASDS = 1 ] && echo "$RECV_MODE extra=[${DSRX}] fault_poll=$DSFP" || echo -) ipoll=${IPOLL:-default}"
 echo "BLOCK PLAN: $LAYOUT"
@@ -546,6 +568,7 @@ gate() { bash "$HG" check "$E/gate-$1.txt" > /dev/null || stop "h3 gate ($1; see
   [ "$REPL" != damon ] || echo "damon: at=$DXAT range=$DXRANGE start_keys=[$DXSTART] regions_capture=$DXREG warmup=[$DXWARM] warm_parts=[$DXWPARTS]$([ "$DXAT" = enable ] || echo " hook_sha256=$(sha256sum < "$EV/damonx-hook.sh" | cut -c1-64)")"
   [ $L1ON = 0 ] || echo "l1: from=[$L1FROM] warmup_s=$L1W measure_s=$L1M drain_s=$L1D ramp_start=$L1START"
   [ $PMON = 0 ] || echo "pmax: from=[$PMFROM] warmup_s=$PMW measure_s=$PMM drain_s=$PMD decide_sha256=$(sha256sum < "$EV/pmax_decide.py" | cut -c1-64)"
+  [ -z "$FWARM" ] || echo "warmup: fixed=[$FWARM] parts=[$FWPARTS] duration_s=$FWDUR (hw/pop/ds SLO lifetimes)"
   [ $ACCX = 0 ] || echo "accuracy_export=1"
   [ -z "$FIXED" ] || echo "fixed=[$FIXED] node_env_extra=[$NENV_X] allow_detail=$ALLOWDET (H2N_FIXED: the slo part is not run)"
   for d in "${DOMS[@]}"; do x=$(virsh -c qemu:///system dumpxml --inactive "$d" 2>/dev/null); echo "vm_xml_sha256.$d=$(printf '%s' "$x" | sha256sum | cut -c1-64) bytes=${#x}"; done
@@ -832,6 +855,18 @@ vdb_life() {  # <sys> <mix> [r<j> | t<T us>]
     fi
     log "$name: DAMON at READY, parts [$PARTSV]"
   fi
+  if [ -n "$FWARM" ] && [[ $s =~ ^(hw|pop|ds)$ ]]; then  # H2N_WARMUP: the DAMON warmup's parts without DAMON (header)
+    local fr fl fp
+    fr=$(fww rate)
+    fl=$(fww learn_s)
+    fp=$(fww part_s)
+    [[ " $PSLO " == *" --slo "* ]] || PSLO="--slo search:99:100 $PSLO"
+    SLOARG=() PARTSV="$FWPARTS $PARTSV"
+    DXE+=("PART_NOGATE=$FWNOGATE"
+      "PART_ARGS_wa=--mode fixed --rates $fr --warmup-s 0 --step-warmup-s 0 --step-measure-s $fl --drain-s 0" PART_SEED_wa=$SEED)
+    for p in $FWNOGATE; do DXE+=("PART_ARGS_$p=--mode fixed --rates $fr --warmup-s 0 --step-warmup-s 0 --step-measure-s $fp --drain-s 0" PART_SEED_$p=$SEED); done
+    log "$name: fixed warmup [$FWARM] (${FWDUR} s), parts [$PARTSV]"
+  fi
   local LG=(--opt data=$X_DATA --opt writes=$X_WRITES --opt k=10 --mix "update=$U,search=$((100 - U))" "${SLOARG[@]}" --x-stream search --raw)
   local RE=(V=$VPLAIN HOST_SERVER=$HOSTSRV LOADGEN=$LOADGEN INIT=$INIT READY_TIMEOUT=5400 RUN_KIND=measurement TRACE=0 STATS_OP=10
     "PARTS=$PARTSV" H1_MEASURE_RUN=1 MEASURE_PART_DIR=$MEASURE_PART_DIR "PART_ARGS_slo=$PSLO" PART_SEED_slo=$SEED "${L1X[@]}"
@@ -872,7 +907,7 @@ vdb_life() {  # <sys> <mix> [r<j> | t<T us>]
   python3 $XV/opsplit.py $RP > $RP/opsplit.log 2>&1 || stop "$name: opsplit.py (see $RP/opsplit.log)"
   # opcoh_check on all N nodes (generalised; OPCOH_NODES = N): a FAIL stops only with H2N_OPCOH_STRICT=1; warmup parts
   # that ran (H2N_DS_DAMON_WARMUP) join OPCOH_PARTS: the server's stop totals cover them (closure checks)
-  local WPD= wp; for wp in $DXWPARTS; do [ ! -d "$R/$wp/loadgen" ] || WPD+="$R/$wp "; done
+  local WPD= wp; for wp in $DXWPARTS $FWPARTS; do [ ! -d "$R/$wp/loadgen" ] || WPD+="$R/$wp "; done
   OPCOH_NODES=$N OPCOH_PARTS="$WPD$RP" MEGALON_LEAN=1 OPCOH_RECORD_BYTES=$([ $VF = sq8 ] && echo 832 || echo 3136) \
     python3 $OPC $RP $mode > $RP/opcoh-check.txt 2>&1
   oc=$(grep -m1 -oE '^OPCOH_CHECK (PASS|FAIL)' $RP/opcoh-check.txt | cut -d' ' -f2); oc=${oc:-ERROR}

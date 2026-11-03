@@ -125,8 +125,20 @@ SUMMARY = SUMMARY_HEAD + [k + "_per_op" for k in PER_OP] + [
     "lowest_ramp_mg_fetch_per_op"]     # verifier L3: hatched bars of Figs 5 / 7 (searches without a confirmed max)
 STEP = ["nodes", "mix", "system", "u", "step", "phase", "offered_x", "search_s", "update_s", "p50_ms", "p95_ms",
         "p99_ms", "pass", "at_result", "valid", "window_s"] + RATE + WAIT + CXL + HCPU + ["run", "config_sha256",
-                                                                                         "lifetime"] + FIG8 + ["aborted"] + canon.DS_COH
-STEP_VM = ["nodes", "mix", "system", "step", "phase", "offered_x", "vm", "window_s"] + RATE + ["run", "lifetime"]
+                                                                                         "lifetime"] + FIG8 + ["aborted"] + canon.DS_COH + ["part"]
+STEP_VM = ["nodes", "mix", "system", "step", "phase", "offered_x", "vm", "window_s"] + RATE + ["run", "lifetime", "part"]
+# run-2 §6 (2026-11-03): the warmup parts of a lifetime (H2N_WARMUP / H2N_DS_DAMON_WARMUP: wa, wb01..) precede the slo
+# part in steps.csv / steps-vm.csv / steps-n<N>-<mix>-<sys>.csv as rows with phase=warmup (at_result False, part = the
+# part name; slo rows: part slo); they never enter summary.csv, fig8.csv or the lowest_ramp columns.
+WARMUP_PART = re.compile(r"^(wa|wb[0-9][0-9])$")
+
+
+def warmup_parts(life_dir):
+    """the warmup part dirs of one lifetime in run order (wa, wb01, ..), those with stats-steps.csv"""
+    if not os.path.isdir(life_dir):
+        return []
+    return [os.path.join(life_dir, d) for d in sorted(os.listdir(life_dir))
+            if WARMUP_PART.match(d) and os.path.isfile(os.path.join(life_dir, d, "stats-steps.csv"))]
 SYS = {"hw", "pop", "mg", "mgoff", "ds"}   # ds = De Stijl v2 (swmc counters as pop + canon.DS_COH step columns)
 
 
@@ -547,10 +559,16 @@ def main(argv=None):
             warn.append(f"{life}: no Host CPU sampler data ({hdir}/samples.csv): host CPU columns empty")
         agg, per_vm, sm = lifetime_rows(part, a.nodes, sampler, hcache[hdir])
         idd = dict(key, mix=mix, system=s, u=u, lifetime=life)
-        rows = [dict(r, **idd) for r in agg]
+        wrows, wvm = [], []
+        for wp in warmup_parts(os.path.dirname(part)):  # phase=warmup rows first (header comment above)
+            wa, wv, _ = lifetime_rows(wp, a.nodes, sampler, hcache[hdir])
+            wd = dict(idd, phase="warmup", part=os.path.basename(wp))
+            wrows += [dict(r, **wd, at_result=False) for r in wa]
+            wvm += [dict(r, **wd) for r in wv]
+        rows = wrows + [dict(r, **idd, part=os.path.basename(part)) for r in agg]
         steps += rows
         write(os.path.join(a.out, f"steps-n{a.nodes}-{mix}-{s}.csv"), STEP, rows)
-        steps_vm += [dict(r, **idd) for r in per_vm]
+        steps_vm += wvm + [dict(r, **idd, part=os.path.basename(part)) for r in per_vm]
         sr = summary_row(s, agg, sm, u)
         summ.append(dict(sr, **idd, vcpus_per_vm=vcpu, threads=f"{vcpu - 1}+1", source_dir=part))
         if sm.get("confirmed") is not True:

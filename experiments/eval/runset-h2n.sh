@@ -33,12 +33,13 @@ unset H2N_PINS H2N_VEC_FORMAT H2N_EF H2N_INIT H2N_HOST_IMAGE H2N_REPEATS H2N_LOA
   H2N_DS_C H2N_DS_K H2N_DS_GT H2N_DS_BUNDLE_SHA H2N_DS_REGION H2N_DS_T_US \
   H2N_ORDER H2N_DS_T_SWEEP H2N_DS_KERNEL H2N_DS_REPLICA_MODE H2N_DS_REPLICA_POOL_BYTES H2N_L1 H2N_L1_FROM \
   H2N_ACCURACY_EXPORT H2N_DS_RECV_EXTRA H2N_DS_DAMON \
-  H2N_DS_DAMON_EXTRA H2N_DS_DAMON_AT H2N_DS_DAMON_WARMUP H2N_DS_DAMON_REGIONS \
+  H2N_DS_DAMON_EXTRA H2N_DS_DAMON_AT H2N_DS_DAMON_WARMUP H2N_DS_DAMON_REGIONS H2N_WARMUP \
   H2N_PMAX H2N_PMAX_FROM H2N_PMAX_WARMUP_S H2N_PMAX_MEASURE_S H2N_PMAX_DRAIN_S   # optional conf keys: never inherited from the environment
 # run-2 keys: H2N_PMAX (1 = fault-breakdown step at Popcorn's max), H2N_PMAX_FROM (pop result globs, relative to the
 # project root made absolute; {MIX} {N} {RUN} replaced by the block), H2N_PMAX_WARMUP_S / _MEASURE_S / _DRAIN_S
 # (h2n-block.sh header); receiver keys POP_RECV_MODE / POP_ADAPT_KO / RECV_IPOLL (lib.sh)
 # damon-policy-exploration keys H2N_DS_DAMON_EXTRA / _AT / _WARMUP / _REGIONS: passed to h2n-block.sh (its header)
+# run-2 §6 key H2N_WARMUP (the DAMON warmup segment for lifetimes without DAMON): passed to h2n-block.sh (its header)
 # eval3 keys (experiment de-stijl-evaluation-run1, 2026-11-02; absent = unchanged):
 #   H2N_ORDER=mix        lifetime list mixes outer, systems inner (B1: per mix mg -> pop -> hw); default systems outer
 #   H2N_DS_T_SWEEP="T1 T2 .."  the ds entry of H2N_SYSTEMS becomes one lifetime ds:<mix>:t<T> per value (us; block A)
@@ -199,7 +200,8 @@ for g in "${PMG[@]}"; do PMFROM_A+="${PMFROM_A:+ }$(ab "$g")"; done
 [ $HASMG = 0 ] || BENV+=(MEG_BUILD=$MGB VMEG=$MGV MEG_CFG=$MGC MEG_LIB=$MGL MG_MAXD=$MGD MG_CAPACITY=$VDB_MG_CAPACITY)
 for x in H2N_VEC_FORMAT H2N_EF H2N_INIT H2N_HOST_IMAGE H2N_SEARCH_THREADS H2N_FIXED H2N_NODE_ENV_EXTRA H2N_ALLOW_DETAIL \
   H2N_DS_REPLICA_MODE H2N_DS_REPLICA_POOL_BYTES H2N_L1 H2N_ACCURACY_EXPORT H2N_DS_RECV_EXTRA H2N_DS_DAMON \
-  H2N_DS_DAMON_EXTRA H2N_DS_DAMON_AT H2N_DS_DAMON_WARMUP H2N_DS_DAMON_REGIONS; do [ -z "${!x:-}" ] || BENV+=("$x=${!x}"); done
+  H2N_DS_DAMON_EXTRA H2N_DS_DAMON_AT H2N_DS_DAMON_WARMUP H2N_DS_DAMON_REGIONS H2N_WARMUP; do [ -z "${!x:-}" ] || BENV+=("$x=${!x}"); done
+[ -z "${H2N_WARMUP:-}" ] || plan "fixed warmup (H2N_WARMUP, run-2 §6 trio): [${H2N_WARMUP}] before the slo part of hw/pop/ds SLO lifetimes"
 [ -z "${H2N_DS_DAMON:-}" ] || plan "De Stijl + DAMON: kdamond per VM with [${H2N_DS_DAMON}] (ds-damon-guest.sh, ds lifetimes only)"
 [ -z "${H2N_DS_DAMON_EXTRA:-}${H2N_DS_DAMON_AT:-}${H2N_DS_DAMON_WARMUP:-}${H2N_DS_DAMON_REGIONS:-}" ] || plan "DAMON policy keys: extra [${H2N_DS_DAMON_EXTRA:-}] at ${H2N_DS_DAMON_AT:-enable} warmup [${H2N_DS_DAMON_WARMUP:-}] regions ${H2N_DS_DAMON_REGIONS:-0}"
 [ -z "${H2N_DS_RECV_EXTRA:-}" ] || plan "De Stijl receiver parameters: ${H2N_DS_RECV_EXTRA} (cxl_shm load, ds lifetimes only; checked after the enable)"
