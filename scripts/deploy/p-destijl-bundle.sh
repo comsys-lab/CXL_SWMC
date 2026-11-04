@@ -172,7 +172,11 @@ for p in run.sh:workloads/faultlat/run.sh cxl_region.yaml:config/cxl_region-dest
   cmp -s "$TOOLS_FROM/tools/${p%%:*}" "$SW/${p#*:}" || stop "$SW/${p#*:} differs from $TOOLS_FROM/tools/${p%%:*}"
 done
 TC=$(python3 -I -c 'import json,sys; print(json.load(open(sys.argv[1]))["cxl_swmc_commit"])' "$TOOLS_FROM/package-record.json")
-git -C "$SW" diff --quiet "$TC" -- systems/destijl/lib systems/common || stop "systems/destijl/lib or systems/common changed since $TC"
+# proc_stats.h (server-side stats collector, not part of faultlat / libdestijl: no include there) and the Host tests are
+# not guest tools; a change there (2026-11-05 per-step RCA export) does not invalidate the packaged tools
+git -C "$SW" diff --quiet "$TC" -- systems/destijl/lib systems/common ':(exclude)systems/common/proc_stats.h' ':(exclude)systems/common/tests' \
+  || stop "systems/destijl/lib or systems/common changed since $TC"
+grep -rlqE '#include *"proc_stats\.h"' "$SW/workloads/faultlat" "$SW/systems/destijl/lib" 2>/dev/null && stop "faultlat / libdestijl include proc_stats.h: it is a guest-tool source again"
 DIRTY=$(git -C "$SW" status --porcelain -- scripts/deploy workloads/faultlat systems/destijl systems/common config | wc -l)
 [ "$DIRTY" = 0 ] || echo "NOTE: $DIRTY dirty files in $SW (recorded as cxl_swmc_dirty_files; commit before a real bundle)"
 
