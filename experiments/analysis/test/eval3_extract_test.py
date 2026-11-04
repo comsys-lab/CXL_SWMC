@@ -400,6 +400,52 @@ class PmaxTest(unittest.TestCase):
         self.assertEqual(f[0]["sel"], "PMAX")
 
 
+class L1FixedRuleTest(unittest.TestCase):
+    """--l1-fixed u50=30 (user 2026-11-05 u90 rule, here on the u50 fixture): the slo part's fixed step at 30 and a pmax
+    part at 30 are labelled; a fixed-only lifetime (part l1, eval-run2-vdb-l1fix.conf layout) is labelled too; no rule
+    = unchanged labels"""
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = tempfile.TemporaryDirectory()
+        run = write_fixture(cls.tmp.name)
+        src = os.path.join(run, "block", "pop-u50-n2", "slo")
+        for dst in (os.path.join(run, "block", "pop-u50-n2", "pmax"), os.path.join(cls.tmp.name, "eval-run2-vdb-pop-u50-n2-l1fix-v1",
+                                                                             "block", "pop-u50-n2", "l1")):
+            os.makedirs(dst)
+            for fn in ("steps.csv", "stats-steps.csv"):
+                with open(os.path.join(src, fn)) as f, open(os.path.join(dst, fn), "w", newline="") as g:
+                    r = list(csv.reader(f))
+                    w = csv.writer(g)
+                    w.writerow(r[0])
+                    ph = r[0].index("phase")
+                    w.writerows(x for x in r[1:] if x[ph] == "fixed")
+        cls.runs = [run, os.path.join(cls.tmp.name, "eval-run2-vdb-pop-u50-n2-l1fix-v1")]
+        cls.out = os.path.join(cls.tmp.name, "out")
+        E.extract(cls.runs, cls.out, {"hw", "pop", "mg", "mgoff", "ds"}, {}, {"u50": 30.0})
+        cls.out0 = os.path.join(cls.tmp.name, "out0")
+        E.extract(cls.runs, cls.out0, {"hw", "pop", "mg", "mgoff", "ds"}, {})
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.tmp.cleanup()
+
+    def test_labels(self):
+        r = rows(self.out, "fig-flushed-lines-l1.csv", system="pop", mix="u50")
+        by = {x["part"]: x for x in r}
+        self.assertEqual(sorted(by), ["l1", "pmax", "slo"])
+        self.assertEqual(by["slo"]["l1_src"], "fixed L1 (u50 rule)")
+        self.assertEqual(by["l1"]["l1_src"], "fixed L1 (u50 rule)")
+        self.assertEqual(by["pmax"]["l1_src"], "fixed L1 (u50 rule; pmax step)")
+        self.assertEqual(by["pmax"]["lines_per_search"], by["slo"]["lines_per_search"])   # same per-step values
+        self.assertEqual(by["l1"]["run"], "eval-run2-vdb-pop-u50-n2-l1fix-v1")
+        f = rows(self.out, "fig-fault-breakdown.csv", system="pop", part="pmax", **{"class": "read"})
+        self.assertEqual(sorted(x["sel"] for x in f), ["PMAX", "PMAX"])   # pmax steps stay PMAX (never L1)
+
+    def test_no_rule_unchanged(self):
+        r = rows(self.out0, "fig-flushed-lines-l1.csv", system="pop", mix="u50")
+        self.assertEqual(sorted((x["part"], x["l1_src"]) for x in r), [("l1", "fixed step"), ("slo", "fixed step")])
+
+
 class PmaxLayoutTest(unittest.TestCase):
     """run 2: RecSys (main-block.sh STREAM_PMAX: <E>/block/<sys>-u<R>/pmax) and RocksDB (run.sh PMAX:
     <E>/<sys>-<mix>-n<N>/pmax) pmax parts get subpart "pmax" (= sel PMAX), the parent parts not"""

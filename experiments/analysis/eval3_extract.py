@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
 """eval3 statistics extractor: run result dirs -> one CSV per evaluation figure (Host only, offline, read-only).
 
-usage: eval3_extract.py RESULT_DIR [RESULT_DIR ...] --out OUT_DIR [--l1 u50=21.6,u10=108] [--systems hw,pop,mg,ds]
+usage: eval3_extract.py RESULT_DIR [RESULT_DIR ...] --out OUT_DIR [--l1 u50=21.6,u10=108] [--l1-fixed u90=474]
+       [--systems hw,pop,mg,ds]
+  --l1-fixed  fixed L1 rule (user 2026-11-05): fixed steps at that total rate get l1_src "fixed L1 (<mix> rule)";
+              a pmax part at that rate adds a fig-flushed-lines-l1.csv row "fixed L1 (<mix> rule; pmax step)"
 
 Design doc: reports/experiments/de-stijl-evaluation-run1-schedule.md §2-§4 and reports/experiments/
 "4. Evaluation_outline.tex". Column documentation and formulas: experiments/analysis/eval3_extract.md.
@@ -234,6 +237,7 @@ class Cell:
         # at high load); its steps are labelled PMAX, never L1
         self.is_pmax = self.subpart.split("/")[0] == "pmax"
         self.pm, self.pm_rate = [], None
+        self.l1r, self.l1r_src = [], ""   # --l1-fixed: a pmax part at the rule's rate (fig-flushed-lines-l1.csv only)
         self.mx, self.mx_src = self.max_steps()
         self.ds_status, self.ds_status_note = None, ""
 
@@ -304,10 +308,21 @@ class Cell:
         return None, None, "none"
 
 
-def choose_l1(cells, override):
+def rule_hit(rate, want):
+    """a fixed step's offered rate is the --l1-fixed rate of its mix (within 1 %)"""
+    return rate is not None and want is not None and abs(rate - want) <= 0.01 * want
+
+
+def choose_l1(cells, override, fixed_rule=None):
     """L1 per (workload, mix, N): fixed-phase step of the cell if present; else the rate override (--l1) or
     the lowest max under SLO (total offered req/s) among the group's systems, falling back to the lowest measured
-    rate when some system has none (doc §2, outline 'Motivation'); the cell's nearest measured step is used."""
+    rate when some system has none (doc §2, outline 'Motivation'); the cell's nearest measured step is used.
+    fixed_rule (--l1-fixed, e.g. {"u90": 474.0}; user decision 2026-11-05: L1 = min of max-under-SLO over the systems
+    that have one): a fixed step at that total rate (within 1 %) is labelled l1_src "fixed L1 (<mix> rule)" (a
+    fixed-only lifetime's part l1, eval-run2-vdb-l1fix.conf, or an appended l1 step); a pmax part at that rate (pop:
+    its own max = the rule's rate) gets an extra fig-flushed-lines-l1.csv row "fixed L1 (<mix> rule; pmax step)"
+    (c.l1r) without becoming L1 elsewhere (its steps keep sel PMAX)."""
+    fixed_rule = fixed_rule or {}
     groups = {}
     for c in cells:
         groups.setdefault(c.group, []).append(c)
@@ -330,15 +345,20 @@ def choose_l1(cells, override):
                 rate, src = min(maxes), "min max-under-SLO"
         for c in cs:
             fx = [n for n in c.steps if c.steps[n]["phase"] in FIXED_PHASES]
+            want = fixed_rule.get(g[1])
             if c.is_pmax:  # run 2 pmax part: PMAX steps (fixed steps at the top rate), no L1
                 if fx:
                     top = max(c.steps[n]["offered_x"] for n in fx)
                     c.pm, c.pm_rate = sorted(n for n in fx if c.steps[n]["offered_x"] == top), top
+                    if rule_hit(top, want):
+                        c.l1r, c.l1r_src = list(c.pm), f"fixed L1 ({g[1]} rule; pmax step)"
                 continue
             if fx:
                 top = max(c.steps[n]["offered_x"] for n in fx)
                 c.l1 = sorted(n for n in fx if c.steps[n]["offered_x"] == top)
                 c.l1_src, c.l1_rate = "fixed step", top
+                if rule_hit(top, want):
+                    c.l1_src = f"fixed L1 ({g[1]} rule)"
             elif rate is not None and c.steps:
                 n = min(c.steps, key=lambda k: (abs(c.steps[k]["offered_x"] - rate), c.steps[k]["phase"] == "overload", k))
                 c.l1, c.l1_src, c.l1_rate = [n], f"nearest step to {rate:g} ({src})", rate
@@ -782,7 +802,7 @@ def us(v):
     return v / 1e3 if v is not None else None
 
 
-def extract(roots, out_dir, systems, override):
+def extract(roots, out_dir, systems, override, fixed_rule=None):
     cells = []
     for root, part in find_parts(roots):
         ci = cell_of(root, part)
@@ -795,7 +815,7 @@ def extract(roots, out_dir, systems, override):
         cells.append(c)
     if not cells:
         sys.exit("eval3_extract: no parts found")
-    choose_l1(cells, override)
+    choose_l1(cells, override, fixed_rule)
     nmeas = {}
     for c in cells:
         k = (c.root, c.life)
@@ -841,6 +861,11 @@ def extract(roots, out_dir, systems, override):
             t = pool(c.stats, c.l1)
             R["fig-flushed-lines-l1.csv"].append({**I, "step": " ".join(map(str, c.l1)), "l1_src": c.l1_src,
                                                   "l1_rate": c.l1_rate, "offered_total": c.steps[c.l1[0]]["offered_x"],
+                                                  "window_s": t["win"], **flushed_lines(c, t)})
+        if c.workload == "vectordb" and c.l1r and all(n in c.stats for n in c.l1r):   # --l1-fixed on a pmax part
+            t = pool(c.stats, c.l1r)
+            R["fig-flushed-lines-l1.csv"].append({**I, "step": " ".join(map(str, c.l1r)), "l1_src": c.l1r_src,
+                                                  "l1_rate": c.pm_rate, "offered_total": c.steps[c.l1r[0]]["offered_x"],
                                                   "window_s": t["win"], **flushed_lines(c, t)})
         for lab, ns, sel in step_sets(c):
             t = pool(c.stats, ns)
@@ -892,12 +917,15 @@ def main():
     ap.add_argument("--out", required=True)
     ap.add_argument("--systems", default="hw,pop,mg,mgoff,ds")
     ap.add_argument("--l1", default="", help="L1 total offered rate per mix, e.g. u50=21.6,u10=108 (overrides auto)")
+    ap.add_argument("--l1-fixed", default="", help="fixed L1 rule rate (total offered req/s) per mix, e.g. u90=474: "
+                    "fixed steps at that rate get l1_src 'fixed L1 (<mix> rule)' (pmax parts: '...; pmax step')")
     a = ap.parse_args()
-    override = {}
-    for tok in filter(None, a.l1.split(",")):
-        k, _, v = tok.partition("=")
-        override[k] = float(v)
-    extract(a.dirs, a.out, set(a.systems.split(",")), override)
+    override, fixed_rule = {}, {}
+    for arg, d in ((a.l1, override), (a.l1_fixed, fixed_rule)):
+        for tok in filter(None, arg.split(",")):
+            k, _, v = tok.partition("=")
+            d[k] = float(v)
+    extract(a.dirs, a.out, set(a.systems.split(",")), override, fixed_rule)
 
 
 if __name__ == "__main__":

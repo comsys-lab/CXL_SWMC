@@ -28,6 +28,11 @@ python3 -B experiments/analysis/test/eval3_extract_test.py -v     # unit test on
   (workload, mix, N) = `--l1` override, else the lowest max under SLO (total offered req/s) among the group's
   systems, else, when some system has no max under SLO, the lowest measured rate (outline "Motivation": all violate
   -> lowest request rate). `l1_src` says which.
+- **`--l1-fixed <mix>=<rate>`** (user 2026-11-05: L1 = min of max-under-SLO over the systems that have one; vdb N=2
+  u90 = 474 req/s): a fixed step at that total rate (within 1 %) gets `l1_src` = `fixed L1 (<mix> rule)` (fixed-only
+  lifetimes of experiments/eval/eval-run2-vdb-l1fix.conf, part `l1`); a pmax part at that rate adds one more
+  fig-flushed-lines-l1.csv row `fixed L1 (<mix> rule; pmax step)` (its steps keep sel PMAX, never L1). Without the
+  option every output is unchanged.
 - **MAX**: passing `confirm` steps at the highest passing offered rate (rates within 3 % pooled: counters and windows
   add up). No confirm phase: highest passing non-overload step. Nothing passes: **FLOOR** = the lowest-rate step.
   Pass = loadgen pass, not aborted and SLO percentile latency <= slo_ms.
