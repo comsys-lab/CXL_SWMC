@@ -278,7 +278,8 @@ fi
 # and logs (score, label); both servers log sampled row reads/writes for the stale-read fraction / age.
 # Keys (lib.sh rs_env from the conf's RS_V7_*): V7_IMAGE / V7_DENSE (guest paths), V7_LR, V7_ACC_INIT, V7_TRAIN_BATCH,
 # V7_TRAIN_THREADS (0 = update threads), V7_W_S, V7_STALE_SAMPLE, V7_STALE_DIR (guest dir of the stale logs),
-# V7_SAMPLES (Host v3 samples file with labels: updates and queries), V7_FROZEN (Host frozen scores of the same trace).
+# V7_SAMPLES (Host v3 samples file with labels: updates and queries), V7_FROZEN (Host frozen scores of the same trace),
+# V7_IMAGE_HOST / V7_DENSE_HOST (Host copies of V7_IMAGE / V7_DENSE, for the Host --print-app-bytes / --print-layout).
 # The literal @USER@ in V7_LR / V7_ACC_INIT / V7_TRAIN_BATCH / V7_W_S = not decided by the user: a dry start plans with
 # the server defaults and says so (BLOCK DRY NOTE); a real run stops.
 V7=${V7:-0} V7PEND="" V7T=$(cd "$X/../../workloads/recsys/tools" && pwd)
@@ -297,6 +298,15 @@ case $V7 in 0) ;; 1)
     || { echo "SEQUENCE STOP: bad V7_TRAIN_BATCH / V7_STALE_SAMPLE / V7_TRAIN_THREADS"; exit 2; }
   [[ $V7_STALE_DIR =~ ^/[A-Za-z0-9._/-]+$ ]] || { echo "SEQUENCE STOP: bad V7_STALE_DIR"; exit 2; }
   [ -f "$V7_SAMPLES" ] && [ -f "$V7_FROZEN" ] || { echo "SEQUENCE STOP: V7_SAMPLES / V7_FROZEN missing on the Host"; exit 2; }
+  # Host copies of the guest image / dense files: session.sh runs the Host recsys-server (--print-app-bytes /
+  # --print-layout read the image header) with these paths substituted for the guest paths (HOST_PATH_MAP)
+  for v in V7_IMAGE_HOST V7_DENSE_HOST; do
+    [ -n "${!v:-}" ] || { echo "SEQUENCE STOP: V7=1 needs $v"; exit 2; }
+    [ -f "${!v}" ] || { echo "SEQUENCE STOP: $v ${!v} missing on the Host"; exit 2; }
+  done
+  [[ "$V7_IMAGE $V7_DENSE $V7_IMAGE_HOST $V7_DENSE_HOST" =~ ^[A-Za-z0-9._/-]+\ [A-Za-z0-9._/-]+\ [A-Za-z0-9._/-]+\ [A-Za-z0-9._/-]+$ ]] \
+    || { echo "SEQUENCE STOP: V7 image / dense paths must not contain spaces or '='"; exit 2; }
+  V7_HOST_PATH_MAP="$V7_IMAGE=$V7_IMAGE_HOST $V7_DENSE=$V7_DENSE_HOST"
   SA="${SA/--update-mode stream/--update-mode train} --image $V7_IMAGE --model-dense $V7_DENSE --lr $V7_LR --acc-init $V7_ACC_INIT --train-batch $V7_TRAIN_BATCH --train-threads ${V7_TRAIN_THREADS:-0} --stale-sample $V7_STALE_SAMPLE"
   ;; *) echo "SEQUENCE STOP: bad V7 ($V7)"; exit 2;; esac
 v7_lgc() {  # <rate>: v7 loadgen options (appended to LGC; later --opt values win)
@@ -631,6 +641,7 @@ life_start() {  # <sys> <name>: prepare + session start of one server lifetime -
             "NODE_ENV=ENV:XTIMEOUT=$XT ENV:CXL_SYSTEM=ds ENV:CXL_DESTIJL_T_US=$DST");;
   esac
   [ -z "$N0X" ] || SE+=("NODE0_ARGS=$(case $s in pop|ds) echo "--preloaded ";; esac)$N0X$V7N0")   # BLOCK=stream (later value wins in env)
+  [ "$V7" != 1 ] || SE+=("HOST_PATH_MAP=$V7_HOST_PATH_MAP")   # Host-side server calls read the Host image copy
   SA=$SA0
   servers_gone || stop "a recsys-server runs before $s"
   env "${SE[@]}" T_MS=$T_MS bash $X/session.sh start "$S" > "$S.start.out" 2>&1 || { tail -3 "$S.start.out"; stop "$s session start"; }

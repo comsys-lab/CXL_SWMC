@@ -36,7 +36,7 @@ unset REGISTRY LEVELS_SOURCE LEVELS_REGISTRY RS_PROC_CXL_SHM RUNSETS EVIDENCE_TA
 #   REQUIRE_SLEEP2050 1 = run-2 receiver guard (recv-mode.sh recv_run2_guard; passed to the blocks: the readback asserts
 #                    recv_mode=sleep idle_spin_us 50 idle_sleep_us 20 for pop and ds)
 unset POP_RECV_MODE POP_ADAPT_KO RECV_IPOLL RECV_WATCH_US RECV_S_MAX_US REQUIRE_SLEEP2050
-unset RS_V7 RS_V7_IMAGE RS_V7_DENSE RS_V7_LR RS_V7_ACC_INIT RS_V7_TRAIN_BATCH RS_V7_TRAIN_THREADS RS_V7_W_S \
+unset RS_V7 RS_V7_IMAGE RS_V7_DENSE RS_V7_IMAGE_HOST RS_V7_DENSE_HOST RS_V7_LR RS_V7_ACC_INIT RS_V7_TRAIN_BATCH RS_V7_TRAIN_THREADS RS_V7_W_S \
   RS_V7_STALE_SAMPLE RS_V7_STALE_DIR RS_V7_SAMPLES RS_V7_FROZEN   # v7 keys come only from the conf
 unset RS_PMAX RS_PMAX_FROM RS_PMAX_S RS_PMAX_SETTLE_S   # run-2 RecSys pmax step keys (rs_env), only from the conf
 CONFSH=$(python3 -I -B "$EVD/evalconf.py" shell ${EVAL_CONF:+--conf "$EVAL_CONF"}) || { echo "RUNSET STOP: ${EVAL_CONF:-eval.conf} does not parse"; exit 2; }
@@ -180,7 +180,7 @@ rs_env() {
   # decided by the user (dry start plans with the server defaults, a real run stops in the block)
   case ${RS_V7:-0} in 0) ;; 1)
     RSENV+=(V7=1)
-    for v in IMAGE DENSE LR ACC_INIT TRAIN_BATCH TRAIN_THREADS W_S STALE_SAMPLE STALE_DIR SAMPLES FROZEN; do
+    for v in IMAGE DENSE IMAGE_HOST DENSE_HOST LR ACC_INIT TRAIN_BATCH TRAIN_THREADS W_S STALE_SAMPLE STALE_DIR SAMPLES FROZEN; do
       local c=RS_V7_$v; [ -n "${!c:-}" ] || die "RS_V7=1 needs $c in $EVAL_CONF"; RSENV+=("V7_$v=${!c}")
     done
     plan "RecSys v7: image ${RS_V7_IMAGE} dense ${RS_V7_DENSE} lr ${RS_V7_LR} acc_init ${RS_V7_ACC_INIT} batch ${RS_V7_TRAIN_BATCH} W ${RS_V7_W_S} s stale 1/${RS_V7_STALE_SAMPLE} rows";;
@@ -209,9 +209,14 @@ rs_checks() {  # static checks shared by the RecSys drivers
   grep -qx "megalon_build=$RS_MEGALON_BASE" "$RS_MEG_BUILD/manifest.txt" || die "$RS_MEG_BUILD is not on $RS_MEGALON_BASE"
   ring_check   # verifier L3: same check as runset-vdb.sh
   cmp -s "$RS_MEG_CFG" "$P/CXL_SWMC/systems/megalon/recsys-2vm.yaml" || die "main-block.sh prechecks systems/megalon/recsys-2vm.yaml: RS_MEG_CFG must be it"
-  local app ring scr
+  local app ring scr v7a=(--update-mode stream)
+  # v7: the app layout comes from the image header (dim, fp16 records); the Host reads its copy (RS_V7_IMAGE_HOST)
+  if [ "${RS_V7:-0}" = 1 ]; then
+    need_files "${RS_V7_IMAGE_HOST:?RS_V7=1 needs RS_V7_IMAGE_HOST}" "${RS_V7_DENSE_HOST:?RS_V7=1 needs RS_V7_DENSE_HOST}"
+    v7a=(--update-mode train --image "$RS_V7_IMAGE_HOST" --model-dense "$RS_V7_DENSE_HOST" --publish-ms 0)
+  fi
   app=$("$RS_PLAIN_BUILD/bin/recsys-server" --nodes 2 --row-div 1 --serve-threads $RS_THREADS --update-threads 1 \
-    --load-threads 8 --start-timeout-ms $((RS_XT * 500)) --update-mode stream --print-app-bytes) || die "print-app-bytes"
+    --load-threads 8 --start-timeout-ms $((RS_XT * 500)) "${v7a[@]}" --print-app-bytes) || die "print-app-bytes"
   ring=$(grep -E '^msg_ring:' "$REGION" | sed 's/.*,[[:space:]]*\([0-9]*\)\].*/\1/')
   scr=$(sed -n 's/^logical_scr_size: *\([0-9]*\)MB.*/\1/p' "$RS_MEG_CFG"); scr=$((scr * 1048576 + 14848))
   plan "app HWcc $app B + ring $ring B; Megalon SCR footprint $scr B <= hwcc - ring - app = $((268435456 - ring - app)) B"

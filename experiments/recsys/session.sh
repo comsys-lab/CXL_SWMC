@@ -13,7 +13,8 @@
 # the updater replays the trace on from where the previous measurement stopped (recsys plugin; never restarts at 1).
 # env (start): SYSTEM, V (guest install dir), HOST_SERVER (Host recsys-server of the same build, --print-app-bytes),
 #   SERVER_ARGS (every node; no --publish-ms; --publish-frac allowed), T_MS (--publish-ms), optional NODE0_ARGS, NODE_ENV, NODE0_ENV (ENV:K=V
-#   tokens, e.g. ENV:XTIMEOUT=28800), READY_TIMEOUT (s, default 14400), NODES, PORT (7100).
+#   tokens, e.g. ENV:XTIMEOUT=28800), READY_TIMEOUT (s, default 14400), NODES, PORT (7100), HOST_PATH_MAP
+#   ("guest=host ..." argument swaps for the Host --print-app-bytes / --print-layout calls only; v7 image / dense).
 # env (measure): LOADGEN, optional LG_CPUS (56-63), STATS_OP (10), PROFILE (main | pilot, as run.sh), RUN_KIND
 #   (measurement | functional), IDLE_WAIT_S (900), SLO_MS / SLO_RULE (recorded in the manifest only; the SLO itself
 #   is the caller's --slo argument).
@@ -59,9 +60,19 @@ start)
   PORTS=(); for k in "${!NODE[@]}"; do [ "$LOCAL" = 1 ] && PORTS+=($((PORT + k))) || PORTS+=("$PORT"); done
   RID=0x$(openssl rand -hex 4)$(printf '%08x' $(( (RANDOM << 16 | RANDOM) | 1 )))
   GRUN=$V/runs/session-$(basename "$S")-${RID#0x}
+  # Host-side server calls: HOST_PATH_MAP "guest=host ..." swaps guest-only file arguments (v7 --image /
+  # --model-dense) for their Host copies; the guest servers keep SA as is
+  HSA=() HSUB=""
   # shellcheck disable=SC2086
-  APP=$("$HOST_SERVER" $SA --print-app-bytes) || { echo "print-app-bytes failed"; exit 2; }
-  LAYOUT=$("$HOST_SERVER" $SA --print-layout | head -1)
+  for w in $SA; do
+    for m in ${HOST_PATH_MAP:-}; do
+      [ "${m%%=*}" = "$w" ] && [ -n "${m#*=}" ] && { [ -e "${m#*=}" ] || { echo "HOST_PATH_MAP: ${m#*=} missing on the Host"; exit 2; }
+        HSUB="$HSUB $w->${m#*=}"; w=${m#*=}; break; }
+    done
+    HSA+=("$w")
+  done
+  APP=$("$HOST_SERVER" "${HSA[@]}" --print-app-bytes) || { echo "print-app-bytes failed"; exit 2; }
+  LAYOUT=$("$HOST_SERVER" "${HSA[@]}" --print-layout | head -1)
   { echo "SYSTEM='$SYSTEM'"; echo "V='$V'"; echo "HOST_SERVER='$HOST_SERVER'"; echo "T_MS='$T_MS'"; echo "SA='$SA'"
     echo "RID='$RID'"; echo "GRUN='$GRUN'"; echo "APP='$APP'"; echo "NODES_S='${NODE[*]}'"; echo "PORTS_S='${PORTS[*]}'"
     echo "LOCAL='$LOCAL'"; echo "NODE0_ARGS_S='${NODE0_ARGS:-}'"; echo "NODE_ENV_S='${NODE_ENV:-}'"; echo "NODE0_ENV_S='${NODE0_ENV:-}'"
@@ -72,7 +83,7 @@ start)
     echo "cxl_swmc_commit=$(git -C "$ROOT" rev-parse HEAD)"; echo "cxl_swmc_dirty=$(git -C "$ROOT" status --porcelain | wc -l)"
     echo "host_server=$HOST_SERVER sha256=$(sha256sum "$HOST_SERVER" | cut -d' ' -f1)"
     echo "publish_ms=$T_MS"; echo "server_args=$SA"; echo "node_env=${NODE_ENV:-} node0_env=${NODE0_ENV:-}"
-    echo "node0_args=${NODE0_ARGS:-}"; echo "app_hwcc_bytes=$APP"; echo "layout=$LAYOUT"
+    echo "node0_args=${NODE0_ARGS:-}"; echo "app_hwcc_bytes=$APP"; echo "layout=$LAYOUT"; echo "host_path_map=${HSUB# }"
     for k in "${!NODE[@]}"; do
       info=$(rx "$k" "uname -r; sha256sum $V/bin/recsys-server $V/cfg/cxl_region.yaml \$(ls $V/lib/libmegalon-objapi.so $V/lib/libmegalon.so $V/cfg/megalon.yaml 2>/dev/null) | cut -c1-64; nproc" | tr '\n' ' ')
       [ -n "$info" ] || { echo "node$k info empty" >&2; exit 4; }
