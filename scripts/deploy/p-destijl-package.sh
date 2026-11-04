@@ -270,7 +270,11 @@ if [ -n "${TOOLS_FROM:-}" ]; then   # re-package with the guest tools of an earl
   TC=$(python3 -I -c 'import json,sys; r=json.load(open(sys.argv[1])); assert r["cxl_swmc_dirty_files"]==0; print(r["cxl_swmc_commit"])' "$TR") ||
     { echo "STOP: $TR has no clean cxl_swmc_commit"; exit 1; }
   # de_stijl_test embeds its build path (not reproducible): reuse the earlier binary if its sources are unchanged
-  git -C "$SW" diff --quiet "$TC" -- systems/destijl/lib systems/common &&
+  # proc_stats.h (server-side stats collector) and the Host tests are not de_stijl_test sources (same rule as
+  # p-destijl-bundle.sh, 2026-11-05 per-step RCA export); de_stijl_test must not include proc_stats.h
+  grep -rlqE '#include *"proc_stats\.h"' "$SW/systems/destijl/lib" 2>/dev/null &&
+    { echo "STOP: systems/destijl/lib includes proc_stats.h: it is a de_stijl_test source again"; exit 1; }
+  git -C "$SW" diff --quiet "$TC" -- systems/destijl/lib systems/common ':(exclude)systems/common/proc_stats.h' ':(exclude)systems/common/tests' &&
     [ -z "$(git -C "$SW" status --porcelain -- systems/destijl/lib systems/common)" ] ||
     { echo "STOP: systems/destijl/lib or systems/common changed since $TC ($TOOLS_FROM)"; exit 1; }
   cp "$TOOLS_FROM/tools/de_stijl_test" "$OUT/tools/de_stijl_test"
