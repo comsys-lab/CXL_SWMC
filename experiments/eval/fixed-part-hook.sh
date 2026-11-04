@@ -19,8 +19,18 @@ set -uo pipefail
 PH=${1:?pre|post|check} SYS=${2:?sys} PART=${3:?part}
 : "${FIXED_SPEC:?}" "${NODES:?}" "${RECV_MODE:?}"
 SSH="ssh -o BatchMode=yes -o ConnectTimeout=8"
-RPK='^(recv_mode|ipoll|spin_us|watch_us|s_min_us|s_max_us|idle_spin_us|idle_sleep_us)$'
-DET=- RECV=- RP= BASE=${FIXED_RECVP_BASE:-}
+RPK='^(recv_mode|ipoll|spin_us|watch_us|s_min_us|s_max_us|idle_spin_us|idle_sleep_us|fault_poll)$'
+# fault_poll (De Stijl cxl_shm only, 0644, read at every fault; fault_poll exploration 2026-11-05): a base item may carry a
+# system prefix "<pop|ds>:<k>=<v>" (e.g. ds:fault_poll=0): it belongs to that system's base only (Popcorn's cxl_shm has
+# no fault_poll parameter); unprefixed items are every system's base as before
+DET=- RECV=- RP= BASE=
+for x in ${FIXED_RECVP_BASE//,/ }; do
+  case $x in
+    *:*) [ "${x%%:*}" = "${SYS%%@*}" ] && BASE+="${x#*:},";;
+    *) BASE+="$x,";;
+  esac
+done
+BASE=${BASE%,}
 if [ "$PH" != check ]; then
   found=0
   for t in $FIXED_SPEC; do

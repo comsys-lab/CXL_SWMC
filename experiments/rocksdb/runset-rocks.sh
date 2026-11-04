@@ -67,7 +67,8 @@ POP_REGION=$(abs "$POP_REGION") POP_C=$(abs "$POP_C") DS_REGION=$(abs "$DS_REGIO
 #                     order, the first = the warm part at the base): the pop / ds cell is ONE lifetime of fixed-rate parts
 #                     (pilot-run.sh KIND=parts), no SLO search, no pmax; exactly one mix; ROCKS_BLOCK ABL
 #   ROCKS_FIXED_RECVP tokens <sys>/<part>/<k>=<v>[,<k>=<v>...] (k: recv_mode poll|sleep|adaptive, ipoll, spin_us,
-#                     watch_us, s_min_us, s_max_us, idle_spin_us, idle_sleep_us): written before the part on every VM,
+#                     watch_us, s_min_us, s_max_us, idle_spin_us, idle_sleep_us; fault_poll 0|1 for ds parts whose base
+#                     has ds:fault_poll=<the ROCKS_DS_RECV_EXTRA value>): written before the part on every VM,
 #                     restored after it (experiments/eval/fixed-part-hook.sh via part-hook.sh; recv_mode last)
 #   ROCKS_FIXED_RECVP_BASE <k>=<v>,... = the lifetime's receiver state (recv_mode = RECV_MODE, ipoll = RECV_IPOLL),
 #                     checked on every VM before the parts, before each variant part and after each part
@@ -77,8 +78,14 @@ if [ -n "$FX$FXR$FXB" ]; then
   [ "$ROCKS_BLOCK" = ABL ] || die "ROCKS_FIXED needs ROCKS_BLOCK ABL (evidence names apart from the SLO blocks)"
   [ "$(wc -w <<< "$ROCKS_MIXES")" = 1 ] || die "ROCKS_FIXED: exactly one mix in ROCKS_MIXES"
   [ "${ROCKS_PMAX:-0}" = 0 ] || die "ROCKS_FIXED: ROCKS_PMAX must be 0 (no SLO part)"
-  RPKRE='(recv_mode=(poll|sleep|adaptive)|(ipoll|spin_us|watch_us|s_min_us|s_max_us|idle_spin_us|idle_sleep_us)=[0-9]+)'
-  [[ $FXB =~ ^$RPKRE(,$RPKRE)*$ ]] && [[ ,$FXB, == *,recv_mode=$RECV_MODE,* ]] || die "bad ROCKS_FIXED_RECVP_BASE ($FXB; recv_mode must be RECV_MODE $RECV_MODE)"
+  RPKRE='(recv_mode=(poll|sleep|adaptive)|(ipoll|spin_us|watch_us|s_min_us|s_max_us|idle_spin_us|idle_sleep_us)=[0-9]+|fault_poll=[01])'
+  # base items may carry a system prefix (ds:fault_poll=0: De Stijl's base only; fixed-part-hook.sh); fault_poll is ds-only
+  BPKRE="((pop|ds):)?$RPKRE"
+  [[ $FXB =~ ^$BPKRE(,$BPKRE)*$ ]] && [[ ,$FXB, == *,recv_mode=$RECV_MODE,* ]] || die "bad ROCKS_FIXED_RECVP_BASE ($FXB; recv_mode must be RECV_MODE $RECV_MODE)"
+  [[ ,$FXB, != *,fault_poll=* && ,$FXB, != *,pop:fault_poll=* ]] || die "ROCKS_FIXED_RECVP_BASE: fault_poll only as ds:fault_poll=<0|1> (Popcorn's cxl_shm has none)"
+  fpb=$(sed -n 's/.*ds:fault_poll=\([01]\).*/\1/p' <<< "$FXB")
+  [ -z "$fpb" ] || [[ " ${ROCKS_DS_RECV_EXTRA:-} " == *" fault_poll=$fpb "* ]] \
+    || die "ROCKS_FIXED_RECVP_BASE ds:fault_poll=$fpb != ROCKS_DS_RECV_EXTRA fault_poll (the load value is the base)"
   [ -z "${POP_RECV_MODE:-}" ] || [ "$POP_RECV_MODE" = "$RECV_MODE" ] || die "ROCKS_FIXED: POP_RECV_MODE != RECV_MODE (one base)"
   [ -z "${RECV_IPOLL:-}" ] || [[ ,$FXB, == *,ipoll=$RECV_IPOLL,* ]] || die "ROCKS_FIXED_RECVP_BASE ipoll != RECV_IPOLL $RECV_IPOLL"
   for x in watch_us=${RECV_WATCH_US:-} s_max_us=${RECV_S_MAX_US:-}; do
@@ -96,7 +103,7 @@ if [ -n "$FX$FXR$FXB" ]; then
     IFS=/ read -r fs fp fkv <<< "$t"
     [[ " ${FXP[$fs]:-} " == *" $fp "* ]] || die "ROCKS_FIXED_RECVP $t: no ROCKS_FIXED part $fp for $fs"
     [ "$fp" != "$(set -- ${FXP[$fs]}; echo "$1")" ] || die "ROCKS_FIXED_RECVP $t: the first (warm) part runs at the base"
-    for x in ${fkv//,/ }; do [[ ,$FXB, == *,${x%%=*}=* ]] || die "ROCKS_FIXED_RECVP $t: ${x%%=*} not in ROCKS_FIXED_RECVP_BASE"; done
+    for x in ${fkv//,/ }; do [[ ,$FXB, == *,${x%%=*}=* || ,$FXB, == *,$fs:${x%%=*}=* ]] || die "ROCKS_FIXED_RECVP $t: ${x%%=*} not in ROCKS_FIXED_RECVP_BASE (for $fs)"; done
   done
 fi
 EXPN=${ROCKS_EXPERIMENT:-de-stijl-evaluation-run1}
