@@ -304,10 +304,12 @@ class Cell:
         return None, None, "none"
 
 
-def choose_l1(cells, override):
+def choose_l1(cells, override, sweep_only=False):
     """L1 per (workload, mix, N): fixed-phase step of the cell if present; else the rate override (--l1) or
     the lowest max under SLO (total offered req/s) among the group's systems, falling back to the lowest measured
-    rate when some system has none (doc §2, outline 'Motivation'); the cell's nearest measured step is used."""
+    rate when some system has none (doc §2, outline 'Motivation'); the cell's nearest measured step is used.
+    sweep_only (--l1-sweep): ignore fixed steps and take the nearest sweep (non-fixed) step of every cell, so all
+    systems and mixes are compared at one sweep rate (paper Fig. 2b at 10 req/s, user 2026-11-05)."""
     groups = {}
     for c in cells:
         groups.setdefault(c.group, []).append(c)
@@ -335,10 +337,15 @@ def choose_l1(cells, override):
                     top = max(c.steps[n]["offered_x"] for n in fx)
                     c.pm, c.pm_rate = sorted(n for n in fx if c.steps[n]["offered_x"] == top), top
                 continue
-            if fx:
+            if fx and not sweep_only:
                 top = max(c.steps[n]["offered_x"] for n in fx)
                 c.l1 = sorted(n for n in fx if c.steps[n]["offered_x"] == top)
                 c.l1_src, c.l1_rate = "fixed step", top
+            elif sweep_only and rate is not None:
+                sw = [k for k in c.steps if c.steps[k]["phase"] not in FIXED_PHASES]
+                if sw:
+                    n = min(sw, key=lambda k: (abs(c.steps[k]["offered_x"] - rate), c.steps[k]["phase"] == "overload", k))
+                    c.l1, c.l1_src, c.l1_rate = [n], f"nearest sweep step to {rate:g} ({src})", rate
             elif rate is not None and c.steps:
                 n = min(c.steps, key=lambda k: (abs(c.steps[k]["offered_x"] - rate), c.steps[k]["phase"] == "overload", k))
                 c.l1, c.l1_src, c.l1_rate = [n], f"nearest step to {rate:g} ({src})", rate
@@ -782,7 +789,7 @@ def us(v):
     return v / 1e3 if v is not None else None
 
 
-def extract(roots, out_dir, systems, override):
+def extract(roots, out_dir, systems, override, sweep_only=False):
     cells = []
     for root, part in find_parts(roots):
         ci = cell_of(root, part)
@@ -795,7 +802,7 @@ def extract(roots, out_dir, systems, override):
         cells.append(c)
     if not cells:
         sys.exit("eval3_extract: no parts found")
-    choose_l1(cells, override)
+    choose_l1(cells, override, sweep_only)
     nmeas = {}
     for c in cells:
         k = (c.root, c.life)
@@ -892,12 +899,14 @@ def main():
     ap.add_argument("--out", required=True)
     ap.add_argument("--systems", default="hw,pop,mg,mgoff,ds")
     ap.add_argument("--l1", default="", help="L1 total offered rate per mix, e.g. u50=21.6,u10=108 (overrides auto)")
+    ap.add_argument("--l1-sweep", action="store_true",
+                    help="L1 = nearest sweep step to the --l1 / auto rate in every cell (fixed steps ignored)")
     a = ap.parse_args()
     override = {}
     for tok in filter(None, a.l1.split(",")):
         k, _, v = tok.partition("=")
         override[k] = float(v)
-    extract(a.dirs, a.out, set(a.systems.split(",")), override)
+    extract(a.dirs, a.out, set(a.systems.split(",")), override, a.l1_sweep)
 
 
 if __name__ == "__main__":
