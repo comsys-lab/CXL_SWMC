@@ -311,10 +311,14 @@ case $V7 in 0) ;; 1)
   ;; *) echo "SEQUENCE STOP: bad V7 ($V7)"; exit 2;; esac
 v7_lgc() {  # <rate>: v7 loadgen options (appended to LGC; later --opt values win)
   [ "$V7" = 1 ] || return 0
+  # no --opt seq_base / wrap here: session.sh measure appends seq_base=<last update seq> and wrap=1 itself and refuses
+  # both from the caller (exit 2, "seq_base/wrap are set by session.sh"; same fix as 4447b2f53 for the v6 LGC)
   LGC=(--opt samples=$V7_SAMPLES --opt queries=$V7_SAMPLES --opt quantiles=$D/dist_quantile.txt --fixed update=$1 --mix query=1
-       --x-stream query --opt prequential=1 --opt update_rate=$1 --opt query_window_s=$V7_W_S --opt wrap=1)
+       --x-stream query --opt prequential=1 --opt update_rate=$1 --opt query_window_s=$V7_W_S)
 }
-v7_stale() { echo "$V7_STALE_DIR/$(basename "$E")-$1-n$2.stl"; }   # <lifetime name> <node>: guest path (unique per block)
+# <lifetime name> <node>: guest path, unique per evidence dir: the server creates it exclusively (FATAL "cannot create
+# (exists?)"), and basename E alone ("block", "probe") repeats over retries (v<N>) and runs (rs-h1 v4: probe-mg-u50-fix-n0)
+v7_stale() { echo "$V7_STALE_DIR/$(basename "$(dirname "$E")")-$(basename "$E")-$1-n$2.stl"; }
 v7_post() {  # <sys> <rate> <part dir>: fetch both stale logs (guest v7_stale paths), then v7_metrics.py
   [ "$V7" = 1 ] || return 0
   local k f
