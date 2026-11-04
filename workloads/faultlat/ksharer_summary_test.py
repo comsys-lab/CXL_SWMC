@@ -49,14 +49,16 @@ def main():
     os.mkdir(sd)
     for j in range(4):
         status(os.path.join(sd, f"status-flk-k2-idle-pre-vm{j}.txt"),
-               {"ds.inv_wait_spins": 10, "ds.inv_self_remove_retries": 3, "ds.protocol_error": 0, "dmesg_bad": 2})
+               {"ds.inv_wait_spins": 10, "ds.inv_self_remove_retries": 3, "ds.inv_self_remove_atomic": 100,
+                "ds.protocol_error": 0, "dmesg_bad": 2})
         status(os.path.join(sd, f"status-flk-k2-idle-post-vm{j}.txt"),
-               {"ds.inv_wait_spins": 10 + 7 * j, "ds.inv_self_remove_retries": 3 + j, "ds.protocol_error": 0,
-                "dmesg_bad": 2})
+               {"ds.inv_wait_spins": 10 + 7 * j, "ds.inv_self_remove_retries": 3 + j, "ds.inv_self_remove_atomic": 105,
+                "ds.protocol_error": 0, "dmesg_bad": 2})
     out = os.path.join(t, "out.csv")
     common = ["--dir", d, "--system", "ds", "--build", "11", "--knobs", "on", "--n", "4", "--k", "2", "--mode", "idle",
               "--csv", out, "--evidence", "recovery/x"]
-    run(common + ["--status-dir", sd, "--status-pre", "flk-k2-idle-pre", "--status-post", "flk-k2-idle-post"])
+    run(common + ["--status-dir", sd, "--status-pre", "flk-k2-idle-pre", "--status-post", "flk-k2-idle-post",
+                  "--ple-exits", "1234", "--kvm-exits", "5678"])
     rows = list(csv.DictReader(open(out)))
     assert len(rows) == 1, rows
     r = rows[0]
@@ -65,6 +67,7 @@ def main():
     assert r["write_p50_us"] == "101.00" and r["write_p99_us"] == "199.00", r
     assert r["inv_wait_p50_us"] == "50.50" and r["inv_wait_p99_us"] == "99.50", r
     assert r["inv_wait_spins_delta"] == str(7 * (0 + 1 + 2 + 3)) and r["inv_self_remove_retries_delta"] == "6", r
+    assert r["inv_self_remove_atomic_delta"] == "20" and r["ple_exits_delta"] == "1234" and r["kvm_exits_delta"] == "5678", r
     assert r["bad_samples"] == "1" and r["tx_per_write_mean"] == "1.005" and r["errors"] == "0", r
     assert r["k"] == "2" and r["n"] == "4" and r["build"] == "11" and r["knobs"] == "on", r
     # second row appends under the same header; Popcorn: no ds counters -> empty columns

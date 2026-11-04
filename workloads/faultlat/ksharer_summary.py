@@ -3,7 +3,8 @@
 
 Usage: ksharer_summary.py --dir <writer step dir> --system S --build B --knobs K --n N --mode M --k K
                           [--status-dir D --status-pre TAG --status-post TAG --nodes N]
-                          [--counters inv_wait_spins,inv_self_remove_retries] [--evidence E] --csv <out.csv>
+                          [--counters inv_wait_spins,inv_self_remove_retries,inv_self_remove_atomic]
+                          [--ple-exits X] [--kvm-exits X] [--evidence E] --csv <out.csv>
 
 Reads the node-0 writer raw files <dir>/k<k>_<mode>_r<r>_write.csv (faultlat access --thread-stat; pass column 0 =
 the write step) of every round r, pools all samples of the cell and appends one row to --csv (header written when the
@@ -15,6 +16,8 @@ file is new or empty; an existing file must carry the same header):
   <counter>_delta                    sum over the N nodes of the De Stijl counter ds.<counter> between the status
                                      snapshots TAG pre and post (p-*-shm.sh status: <status-dir>/status-<TAG>-vm<j>.txt);
                                      empty when the counter is absent (Popcorn, De Stijl build 10)
+  ple_exits_delta / kvm_exits_delta  given by the caller (Host-side KVM PAUSE-loop exits / all exits of the N VMs
+                                     over the cell; "unavailable" when the Host had no counter)
   bad_samples                        samples whose write_faults delta is not 1 (no fault or two faults in one access)
   tx_per_write_mean                  mean write_transactions delta (1 = one round per write; > 1 = NACK retries)
   errors                             sum of the error counter deltas (swmc transaction_error_count, send_drop_count,
@@ -29,7 +32,8 @@ import re
 import sys
 
 HEADER = ["system", "build", "knobs", "k", "n", "write_p50_us", "write_p99_us", "inv_wait_p50_us", "inv_wait_p99_us",
-          "inv_wait_spins_delta", "inv_self_remove_retries_delta", "mode", "samples", "rounds", "bad_samples",
+          "inv_wait_spins_delta", "inv_self_remove_retries_delta", "inv_self_remove_atomic_delta", "ple_exits_delta",
+          "kvm_exits_delta", "mode", "samples", "rounds", "bad_samples",
           "tx_per_write_mean", "inv_wait_mean_us", "write_mean_us", "errors", "evidence"]
 ERRS = ["swmc.transaction_error_count", "swmc.send_drop_count", "swmc.late_response_count", "ds.protocol_error",
         "ds.tx_timeout"]
@@ -76,7 +80,9 @@ def main(argv=None):
     ap.add_argument("--status-pre")
     ap.add_argument("--status-post")
     ap.add_argument("--nodes", type=int)
-    ap.add_argument("--counters", default="inv_wait_spins,inv_self_remove_retries")
+    ap.add_argument("--counters", default="inv_wait_spins,inv_self_remove_retries,inv_self_remove_atomic")
+    ap.add_argument("--ple-exits", default="")
+    ap.add_argument("--kvm-exits", default="")
     ap.add_argument("--evidence", default="")
     a = ap.parse_args(argv)
     pat = re.compile(r"^k%d_%s_r(\d+)_write\.csv$" % (a.k, re.escape(a.mode)))
@@ -123,6 +129,8 @@ def main(argv=None):
            "inv_wait_p50_us": us(pct(wait, 0.50)), "inv_wait_p99_us": us(pct(wait, 0.99)),
            "inv_wait_spins_delta": cnt.get("inv_wait_spins", ""),
            "inv_self_remove_retries_delta": cnt.get("inv_self_remove_retries", ""),
+           "inv_self_remove_atomic_delta": cnt.get("inv_self_remove_atomic", ""),
+           "ple_exits_delta": a.ple_exits, "kvm_exits_delta": a.kvm_exits,
            "mode": a.mode, "samples": len(lat), "rounds": len(files), "bad_samples": bad,
            "tx_per_write_mean": "%.3f" % (sum(tx) / len(tx)), "inv_wait_mean_us": us(sum(wait) / len(wait)),
            "write_mean_us": us(sum(lat) / len(lat)), "errors": errors, "evidence": a.evidence}
