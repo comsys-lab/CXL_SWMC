@@ -13,6 +13,7 @@
 //   faultlat access --op read|write|rw [--pages N] [--page-offset P] [--stride S]
 //                   [--passes K] [--shuffle] [--cpu C] [--out F] [--raw F]
 //                   [--pattern X] [--expect X] [--acct 0|1] [--staleness-us T]
+//                   [--thread-stat KEY[,KEY...]] [--gap-us G]
 //   faultlat pingpong --role R --nonce X [--nodes N] [--iters N] [--page-offset P]
 //                   [--cpu C] [--out F] [--raw F]
 //   faultlat contend --node K --nodes N --run-id X --threads T --pages H --page-offset P --read-pct R
@@ -39,6 +40,7 @@
 #include <algorithm>
 #include <atomic>
 #include <memory>
+#include <cctype>
 #include <cerrno>
 #include <cstdarg>
 #include <cinttypes>
@@ -127,6 +129,9 @@ struct Args {
   uint64_t churn_us = 0;  // contend: churn thread period (0 = off)
   int acct = 1;         // access/pingpong: register the Popcorn swmc_acct area (build 9); 0 = do not
   std::string inject;  // test only: stale|corrupt|lost|stall|sigbus:N (node 0, thread 0, N-th write)
+  // access (ksharer): per-access deltas of these /proc/thread-self/swmc keys, read outside the timed interval
+  std::vector<std::string> thread_stat;
+  uint64_t gap_us = 0;  // access: busy-wait G us between the end of one access and the start of the next (0 = none)
 };
 
 uint64_t parse_num(const char *s, const char *what) {
@@ -192,10 +197,29 @@ Args parse_args(int argc, char **argv) {
     else if (k == "--inject") a.inject = val("--inject");
     else if (k == "--max-ops") a.max_ops = parse_num(val("--max-ops"), "--max-ops");
     else if (k == "--churn-us") a.churn_us = parse_num(val("--churn-us"), "--churn-us");
+    else if (k == "--gap-us") a.gap_us = parse_num(val("--gap-us"), "--gap-us");
+    else if (k == "--thread-stat") {
+      std::string s = val("--thread-stat");
+      size_t p = 0;
+      while (p <= s.size()) {
+        size_t q = s.find(',', p);
+        if (q == std::string::npos) q = s.size();
+        std::string key = s.substr(p, q - p);
+        if (key.empty() || !std::all_of(key.begin(), key.end(), [](char c) { return isalnum((unsigned char)c) || c == '_'; }))
+          die("--thread-stat: bad key '%s' (comma-separated /proc/thread-self/swmc names)", key.c_str());
+        if (std::find(a.thread_stat.begin(), a.thread_stat.end(), key) != a.thread_stat.end())
+          die("--thread-stat: key '%s' given twice", key.c_str());
+        a.thread_stat.push_back(key);
+        p = q + 1;
+      }
+      if (a.thread_stat.size() > 16) die("--thread-stat: at most 16 keys");
+    }
     else die("unknown option %s", k.c_str());
   }
   if (a.stride == 0 || a.pages == 0 || a.passes < 1) die("--pages, --stride, --passes must be > 0");
   if (a.staleness_us && a.cmd != "access") die("--staleness-us applies to access only");
+  if ((!a.thread_stat.empty() || a.gap_us) && a.cmd != "access") die("--thread-stat / --gap-us apply to access only");
+  if (a.gap_us > 1000000) die("--gap-us must be <= 1000000");
   return a;
 }
 
@@ -247,6 +271,61 @@ std::map<std::string, uint64_t> read_thread_swmc() {
   while (f >> k >> v) m[k] = v;
   return m;
 }
+
+// access --thread-stat: the selected keys of /proc/thread-self/swmc, read before and after every access (outside the
+// timed interval), so each sample gets the kernel's own per-fault values (e.g. write_msg_wait_ns = the INV/ACK wait of
+// that write fault). The file is opened once by the measuring thread (the fd stays bound to that thread) and re-read
+// from offset 0 (seq_file restarts at 0). FAULTLAT_THREAD_STAT_PATH replaces the path (Host tests only).
+struct ThreadStatReader {
+  int fd = -1;
+  std::string path;
+  std::vector<std::string> keys;
+  std::vector<char> buf = std::vector<char>(16384);
+  void open_keys(const std::vector<std::string> &k) {
+    keys = k;
+    const char *e = getenv("FAULTLAT_THREAD_STAT_PATH");
+    path = e && *e ? e : "/proc/thread-self/swmc";
+    fd = open(path.c_str(), O_RDONLY | O_CLOEXEC);
+    if (fd < 0) die("--thread-stat: open %s: %s (kernel without per-thread swmc counters?)", path.c_str(), strerror(errno));
+    std::vector<uint64_t> v(keys.size());
+    sample(v.data(), true);
+  }
+  // out[i] = value of keys[i]; a key missing from the file stops the step (checked on the first read)
+  void sample(uint64_t *out, bool check = false) {
+    size_t len = 0;
+    for (;;) {
+      if (len == buf.size()) buf.resize(buf.size() * 2);
+      ssize_t n = pread(fd, buf.data() + len, buf.size() - len, off_t(len));
+      if (n < 0) die("--thread-stat: read %s: %s", path.c_str(), strerror(errno));
+      if (n == 0) break;
+      len += size_t(n);
+    }
+    std::vector<bool> seen(keys.size(), false);
+    size_t p = 0;
+    while (p < len) {
+      size_t eol = p;
+      while (eol < len && buf[eol] != '\n') eol++;
+      size_t sp = p;
+      while (sp < eol && buf[sp] != ' ') sp++;
+      for (size_t i = 0; i < keys.size(); i++) {
+        if (keys[i].size() == sp - p && !memcmp(keys[i].data(), buf.data() + p, sp - p)) {
+          uint64_t v = 0;
+          for (size_t c = sp + 1; c < eol && buf[c] >= '0' && buf[c] <= '9'; c++) v = v * 10 + uint64_t(buf[c] - '0');
+          out[i] = v;
+          seen[i] = true;
+          break;
+        }
+      }
+      p = eol + 1;
+    }
+    if (check)
+      for (size_t i = 0; i < keys.size(); i++)
+        if (!seen[i]) die("--thread-stat: key %s not in %s", keys[i].c_str(), path.c_str());
+  }
+  ~ThreadStatReader() {
+    if (fd >= 0) close(fd);
+  }
+};
 
 std::string read_instr_enabled() {
   std::ifstream f("/sys/kernel/swmc/instr/enabled");
@@ -411,6 +490,24 @@ void write_raw(const std::string &path, const std::vector<std::vector<uint64_t>>
   fclose(f);
 }
 
+// access --thread-stat: raw samples with one extra column per key (per-access delta); ts[step][key][index]
+void write_raw_ts(const std::string &path, const std::vector<std::vector<uint64_t>> &passes,
+                  const std::vector<std::string> &keys, const std::vector<std::vector<std::vector<uint64_t>>> &ts) {
+  if (path.empty()) return;
+  FILE *f = fopen(path.c_str(), "w");
+  if (!f) die("open %s: %s", path.c_str(), strerror(errno));
+  fprintf(f, "pass,index,ns");
+  for (auto &k : keys) fprintf(f, ",%s", k.c_str());
+  fprintf(f, "\n");
+  for (size_t p = 0; p < passes.size(); p++)
+    for (size_t i = 0; i < passes[p].size(); i++) {
+      fprintf(f, "%zu,%zu,%" PRIu64, p, i, passes[p][i]);
+      for (size_t k = 0; k < keys.size(); k++) fprintf(f, ",%" PRIu64, ts[p][k][i]);
+      fprintf(f, "\n");
+    }
+  fclose(f);
+}
+
 FILE *open_out(const std::string &path) {
   if (path.empty()) return stdout;
   FILE *f = fopen(path.c_str(), "w");
@@ -533,6 +630,13 @@ int cmd_access(const Args &a) {
     die("de_stijl_set_staleness(T=%" PRIu64 " us) on the window: %s", a.staleness_us, strerror(errno));
   AcctView acct;
   acct.start(a.acct != 0);
+  // --thread-stat: opened after pin_cpu by this (the measuring) thread
+  ThreadStatReader tsr;
+  const size_t nk = a.thread_stat.size();
+  if (nk) tsr.open_keys(a.thread_stat);
+  std::vector<uint64_t> ts0(nk), ts1(nk);
+  const uint64_t gap_ns = a.gap_us * 1000;
+  uint64_t next_start = 0;  // --gap-us: earliest start of the next access (end of the previous one + gap)
 
   std::vector<uint64_t> order(a.pages);
   for (uint64_t i = 0; i < a.pages; i++) order[i] = i * a.stride;
@@ -542,6 +646,9 @@ int cmd_access(const Args &a) {
   std::vector<std::vector<uint64_t>> lat(nsteps, std::vector<uint64_t>(a.pages));
   std::vector<long> faults(nsteps);
   std::vector<std::string> names(nsteps);
+  // ts[step][key][i] = per-access delta of thread-stat key (only with --thread-stat)
+  std::vector<std::vector<std::vector<uint64_t>>> ts(
+      nk ? nsteps : 0, std::vector<std::vector<uint64_t>>(nk, std::vector<uint64_t>(a.pages)));
   volatile uint64_t sink = 0;
   // Data check (--pattern / --expect): writes store X ^ page index in the first and last word of the page;
   // reads compare both words with the expected value.
@@ -556,6 +663,10 @@ int cmd_access(const Args &a) {
       volatile uint64_t *w = reinterpret_cast<volatile uint64_t *>(m.base + order[i] * kPage);
       volatile uint64_t *wl = w + kPage / sizeof(uint64_t) - 1;
       const uint64_t page = a.page_offset + order[i];
+      if (nk) tsr.sample(ts0.data());
+      if (gap_ns)
+        while (now_ns() < next_start) {
+        }
       uint64_t t0 = now_ns(), v = 0, vl = 0;
       if (write) {
         if (a.has_pattern) {
@@ -569,7 +680,13 @@ int cmd_access(const Args &a) {
         if (a.has_expect) vl = *wl;
         sink = sink + v;
       }
-      lat[st][i] = now_ns() - t0;
+      const uint64_t t1 = now_ns();
+      lat[st][i] = t1 - t0;
+      next_start = t1 + gap_ns;
+      if (nk) {
+        tsr.sample(ts1.data());
+        for (size_t k = 0; k < nk; k++) ts[st][k][i] = ts1[k] - ts0[k];
+      }
       if (!write && a.has_expect) {
         checked++;
         if (v != (a.expect ^ page) || vl != (a.expect ^ page)) {
@@ -602,12 +719,30 @@ int cmd_access(const Args &a) {
                ", \"first_mismatch\": \"%s\"},\n",
             a.has_pattern ? std::to_string(a.pattern).c_str() : "null",
             a.has_expect ? std::to_string(a.expect).c_str() : "null", checked, mismatches, first_bad.c_str());
+  if (nk || gap_ns) {
+    // ksharer: per-step summaries of the per-access thread-stat deltas (names ending in _ns are durations in ns,
+    // the others counts; the summary fields keep the _ns suffix of json_summary)
+    fprintf(f, "  \"ksharer\": {\"gap_us\": %" PRIu64 ", \"thread_stat_path\": \"%s\", \"keys\": [", a.gap_us,
+            nk ? tsr.path.c_str() : "");
+    for (size_t k = 0; k < nk; k++) fprintf(f, "%s\"%s\"", k ? ", " : "", a.thread_stat[k].c_str());
+    fprintf(f, "], \"steps\": {\n");
+    for (size_t st = 0; nk && st < nsteps; st++) {
+      fprintf(f, "   \"%s\": {\n", names[st].c_str());
+      for (size_t k = 0; k < nk; k++) {
+        json_summary(f, a.thread_stat[k].c_str(), ts[st][k]);
+        fprintf(f, "%s\n", k + 1 < nk ? "," : "");
+      }
+      fprintf(f, "   }%s\n", st + 1 < nsteps ? "," : "");
+    }
+    fprintf(f, "  }},\n");
+  }
   json_sysfs(f, sys_before, sys_after);
   fprintf(f, ",\n");
   acct.json(f);
   fprintf(f, "\n}\n");
   if (f != stdout) fclose(f);
-  write_raw(a.raw, lat);
+  if (nk) write_raw_ts(a.raw, lat, a.thread_stat, ts);
+  else write_raw(a.raw, lat);
   munmap(m.base, m.len);
   close(m.fd);
   if (mismatches) {

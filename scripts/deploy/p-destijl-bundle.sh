@@ -4,7 +4,7 @@
 # bundle: the candidate XMLs fix the Host images dir /var/lib/libvirt/images/destijl-<n>-vm<k>-v<v> and p-destijl-deploy.sh
 # install never overwrites an existing one (the guest rebuilds the initramfs on every prepare), and the bundle's rollback
 # XML must equal the VM's current `virsh dumpxml --inactive`. Host-local only: no virsh, no ssh, no sudo.
-#   p-destijl-bundle.sh [--dry-run] [--build 7|8|9|10] [--rollback <popcorn bundle dir>] [--topo 2|8] [--xml-src <dir>] [--version <v>]
+#   p-destijl-bundle.sh [--dry-run] [--build 7|8|9|10|11] [--rollback <popcorn bundle dir>] [--topo 2|8] [--xml-src <dir>] [--version <v>]
 # --build 7 (default, unchanged): see "Fixed inputs (build 7)" below.
 # --build 8 (fault-latency breakdown port, d529ac9d9, user decision 2026-11-02 for blocks D, B2+C, E): SOURCE_TAG =
 #   rel/destijl-8; MANIFEST.txt must say "status: COMPLETE" (workspaces/eval3/build8/finish-build8.sh) and System.map must
@@ -25,6 +25,11 @@
 #   of build 10, so tools.sha256 can never equal build 9's -> new guest tools dir GT=/home/comsys/destijl-10 (the
 #   destijl-9 dir is not reused); later build-10 bundles must match the first one's tools.sha256. MANIFEST
 #   dirty_sha256 may be empty or "none" (both = clean; p-destijl-package.sh).
+# --build 11 (build 10 + INV/ACK wait knobs /sys/kernel/swmc/destijl/inv_poll_backoff_max, inv_ack_atomic_and; branch
+#   destijl-invack, tag rel/destijl-11): the build-10 rules with KTREE = workspaces/ds-invack/kernel, staged module
+#   version 13.4 (the INV/ACK change is in kernel/swmc, not in cxl_shm; change KOVER here if build 11 bumps cxl_shm)
+#   and a new guest tools dir GT=/home/comsys/destijl-11. A De Stijl build-11 deploy needs the verifier PASS marker
+#   (workspaces/ds-invack/VERIFIER-PASS); the chains check it, this script does not.
 # --topo 2 (default): cxl_vm0/1; rollback XML = <rollback bundle>/vm<k>/candidate-normal.xml (what the VMs run after a
 #   Popcorn deploy from that bundle). --xml-src overrides it (a dir with vm<k>/candidate-normal.xml or
 #   cxl_vm<k>.after-define.xml).
@@ -56,7 +61,7 @@ while [ $# -gt 0 ]; do
     --topo) TOPO=${2:?}; shift;;
     --xml-src) XSRC=${2:?}; shift;;
     --version) V=${2:?}; shift;;
-    *) sed -n '2,38p' "$0"; exit 2;;
+    *) sed -n '2,43p' "$0"; exit 2;;
   esac; shift
 done
 stop() { echo "BUNDLE STOP: $*"; exit 1; }
@@ -68,11 +73,13 @@ case $n in
      KTREE=$ROOT/workspaces/destijl-v2/build9 KOVER=13.3;;
   10) B=$ROOT/builds/destijl/10 SOURCE_TAG=rel/destijl-10 TOOLS_FROM=$ROOT/builds/destijl/7/deploy-v1
       KTREE=$ROOT/workspaces/destijl-v2/build10 KOVER=13.4;;
-  *) stop "--build must be 7, 8, 9 or 10";;
+  11) B=$ROOT/builds/destijl/11 SOURCE_TAG=rel/destijl-11 TOOLS_FROM=$ROOT/builds/destijl/7/deploy-v1
+      KTREE=$ROOT/workspaces/ds-invack/kernel KOVER=13.4;;
+  *) stop "--build must be 7, 8, 9, 10 or 11";;
 esac
-# build 9 / 10 rule: own guest script and destijl.env LOAD_DEFAULTS (new tools set); builds 7/8: none (unchanged)
+# build 9 / 10 / 11 rule: own guest script and destijl.env LOAD_DEFAULTS (new tools set); builds 7/8: none (unchanged)
 GUEST_SRC= ENV_EXTRA=
-if [ "$n" = 9 ] || [ "$n" = 10 ]; then GUEST_SRC=$SW/scripts/deploy/p-destijl-guest-adaptive.sh ENV_EXTRA='LOAD_DEFAULTS="fault_poll=0"'; fi
+if [ "$n" = 9 ] || [ "$n" = 10 ] || [ "$n" = 11 ]; then GUEST_SRC=$SW/scripts/deploy/p-destijl-guest-adaptive.sh ENV_EXTRA='LOAD_DEFAULTS="fault_poll=0"'; fi
 # test hook (dry runs only): a stand-in build dir / source tag, for the build-8 path before build 8 is finished
 if [ $DRY = 1 ] && [ -n "${BUNDLE_TEST_BUILD_DIR:-}" ]; then
   B=$(readlink -f "$BUNDLE_TEST_BUILD_DIR"); SOURCE_TAG=${BUNDLE_TEST_SOURCE_TAG:-$SOURCE_TAG}
@@ -135,7 +142,7 @@ if [ "$n" = 8 ]; then
   grep -q ' swmc_instr_breakdown_key$' "$B/System.map" || stop "build 8 System.map has no swmc_instr_breakdown_key"
   [ "$(sh_ "$B/System.map")" = "$(art System.map)" ] || stop "System.map changed since the MANIFEST"
 fi
-if [ "$n" = 9 ] || [ "$n" = 10 ]; then
+if [ "$n" = 9 ] || [ "$n" = 10 ] || [ "$n" = 11 ]; then
   [ "$(mf status)" = COMPLETE ] || stop "build $n MANIFEST status '$(mf status)'"
   for s in swmc_instr_breakdown_key ds_rx_mark_empty; do
     grep -q " $s\$" "$B/System.map" || stop "build $n System.map has no $s"; done

@@ -179,6 +179,26 @@ on windows of `PPAGES` pages (default 256):
 `pingpong --nodes N --role r` works for any N >= 2 (N = 2 is the old
 ping-pong).
 
+## Write-fault INV/ACK wait vs k sharers (ksharer.sh)
+
+`access --thread-stat KEY[,KEY...]` reads the listed `/proc/thread-self/swmc` counters before and after every
+access (outside the timed interval; the fd is opened once by the measuring thread and re-read from offset 0) and
+stores the per-access deltas: raw CSV columns `pass,index,ns,<KEY>...`, per-step summaries in the JSON object
+`ksharer.steps.<step>.<KEY>` (summary fields keep the `_ns` suffix; keys without `_ns` are counts). A key missing
+from the file stops the step. `access --gap-us G` busy-waits until G us after the end of the previous access before
+the next one starts (0 = back to back); the thread-stat reads lie inside the gap. Both are access-only; without
+them the output is unchanged. `FAULTLAT_THREAD_STAT_PATH` replaces the proc path (Host tests only).
+
+`ksharer.sh <run-id> <base-page> <k> <mode> [--execute]` (env NODE_HOSTS, FL_BIN, RUNSH, CXL_REGION_CONFIG; PAGES
+2560, ROUNDS 4, GAP_US 0): per round a fresh window; nodes 1..k read it at once (S on k nodes), then node 0 writes
+every page once (write-on-I with k S holders) with `--thread-stat` (write_faults, write_transactions,
+write_msg_wait_ns, write_fault_ns, sm_faults, sm_fault_ns, nack_retries) and `--gap-us GAP_US`. INV/ACK wait of a
+write = its `write_msg_wait_ns` delta (Popcorn: request round send -> last response; De Stijl: INV produce + directory
+poll until all holders acknowledged + waits inside the directory acquire). `ksharer_summary.py` pools the rounds of a
+(k, mode) cell into one CSV row (write / INV-wait p50 p99 in us, De Stijl counter deltas from p-*-shm.sh status
+snapshots, error deltas). Host tests: `python3 -I ksharer_summary_test.py` (no build) and `ksharer_test.sh <faultlat
+binary>` (sparse-file device, fixed stat file).
+
 ## Knobs worth sweeping (Popcorn kernels; root, so grant-gated)
 
 - `/sys/kernel/swmc/page_coherence/acquire_flush` (1/0): requester flush on
