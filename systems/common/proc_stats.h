@@ -17,9 +17,12 @@
 //   sys.<dir>.<file>                         every single-integer file in configured sysfs dirs (e.g. Popcorn counters;
 //                                            <dir> = path below /sys/kernel/ with '.' for '/', e.g. swmc.page_coherence)
 //   sys.<dir>.<file>.<name>                  files of "name value" lines in those dirs (e.g. Popcorn instr/ histograms)
+//   sys.<dir>.<file>.<name>.b<i>             "<name>_log2 v0 v1 .." lines (all integers) in those files: one key per
+//                                            log2 bucket i (e.g. cxl_shm recv_adaptive r_sleep_found_us_log2)
 //   sys.swmc.destijl.<name>                  De Stijl v2 counters (/sys/kernel/swmc/destijl), only when that directory
 //                                            exists (De Stijl kernels): the fixed list destijl_counters() (a missing
-//                                            file = 0) plus any other rx_* / replica_* file there; pending_now,
+//                                            file = 0) plus any other single-integer rx_* / replica_* / wr_* / srv_* /
+//                                            ack_ph_* / fetch_stale file there; pending_now,
 //                                            lambda_per_s, p95_us, ss_residence_max_us, replica_pages are gauges
 //                                            (stats_delta.py keeps the end value)
 // cpu_ticks are USER_HZ ticks (utime + stime); run_ns / wait_ns are ns from schedstat. Key names never contain '='
@@ -217,14 +220,25 @@ inline std::string text(const Opts &o) {
         kv["sys." + tag + "." + f] = std::strtoull(v.c_str(), nullptr, 10);
         continue;
       }
-      std::istringstream in(v);  // "name value" lines; anything else is skipped
+      std::istringstream in(v);  // "name value" lines and "<name>_log2 v0 v1 .." histogram lines; anything else skipped
       std::string line;
       while (std::getline(in, line)) {
         std::istringstream ls(line);
-        std::string name, val, extra;
-        if (ls >> name >> val && !(ls >> extra) && val.find_first_not_of("0123456789") == std::string::npos &&
-            name.find('=') == std::string::npos)
-          kv["sys." + tag + "." + f + "." + name] = std::strtoull(val.c_str(), nullptr, 10);
+        std::string name, tok;
+        std::vector<std::string> vals;
+        if (!(ls >> name) || name.find('=') != std::string::npos) continue;
+        while (ls >> tok) vals.push_back(tok);
+        bool ints = !vals.empty();
+        for (const std::string &x : vals)
+          if (x.find_first_not_of("0123456789") != std::string::npos) ints = false;
+        if (!ints) continue;
+        const std::string key = "sys." + tag + "." + f + "." + name;
+        if (vals.size() == 1) {
+          kv[key] = std::strtoull(vals[0].c_str(), nullptr, 10);
+        } else if (name.size() > 5 && name.compare(name.size() - 5, 5, "_log2") == 0) {
+          // log2 histogram (e.g. cxl_shm recv_adaptive r_sleep_found_us_log2): one key per bucket, <key>.b<i>
+          for (size_t i = 0; i < vals.size(); i++) kv[key + ".b" + std::to_string(i)] = std::strtoull(vals[i].c_str(), nullptr, 10);
+        }
       }
     }
   }
@@ -237,11 +251,17 @@ inline std::string text(const Opts &o) {
         return std::strtoull(v.c_str(), nullptr, 10);
       };
       for (const std::string &f : destijl_counters()) kv["sys.swmc.destijl." + f] = num(trim(slurp(ds + "/" + f, 256)));
-      for (const std::string &f : dir_entries(ds))
-        if (f.compare(0, 3, "rx_") == 0 || f.compare(0, 8, "replica_") == 0) {
-          const std::string v = trim(slurp(ds + "/" + f, 256));
-          if (!v.empty() && v.find_first_not_of("0123456789") == std::string::npos) kv["sys.swmc.destijl." + f] = num(v);
-        }
+      // single-integer files with these prefixes (rx_*, replica_*, and since 2026-11-05 the writer / server phase
+      // counters wr_* / srv_* / ack_ph_* and fetch_stale: the RocksDB N=4 write-wait RCA needed them per step). Only
+      // prefixed names are opened: inspect / page_digest / histogram files are not read on every snapshot.
+      static const char *const pfx[] = {"rx_", "replica_", "wr_", "srv_", "ack_ph_", "fetch_stale"};
+      for (const std::string &f : dir_entries(ds)) {
+        bool want = false;
+        for (const char *p : pfx) want = want || f.compare(0, std::strlen(p), p) == 0;
+        if (!want) continue;
+        const std::string v = trim(slurp(ds + "/" + f, 256));
+        if (!v.empty() && v.find_first_not_of("0123456789") == std::string::npos) kv["sys.swmc.destijl." + f] = num(v);
+      }
     }
   }
   std::ostringstream out;

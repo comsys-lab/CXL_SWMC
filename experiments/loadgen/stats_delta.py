@@ -10,7 +10,8 @@ begin_wall_ns, end_wall_ns, window_s (loadgen clock: end mono_ns - begin mono_ns
 t_mono_ns delta, if the server emits it), then one column per numeric key (sorted): end - begin, except gauges
 (identity values, flag words, current sizes and maxima: see GAUGE below), which keep the end value; per-operation counts
 op.<op>.n / opt.<op>.n are counters despite the ".n" gauge suffix. Non-numeric keys are ignored.
-A key missing in one snapshot of a pair is left empty for that row.
+A key missing in one snapshot of a pair is left empty for that row. Coherence lifetimes (any sys.cxl_shm.* key) always
+carry the STABLE columns below (empty where the kernel lacks the counter: pop and ds files have the same column set).
 """
 import argparse, csv, os, re, sys
 
@@ -29,7 +30,36 @@ GAUGE_SUFFIX = (".n", "max_ns", ".in_flight_transaction_count", ".enabled",
                 # De Stijl v2 (systems/common/proc_stats.h sys.swmc.destijl.*): current pending count, completion rate,
                 # residence p95 and max, replica pool size ("lambda": the pre-kernel spec name, kept for old snapshots)
                 "swmc.destijl.pending_now", "swmc.destijl.lambda", "swmc.destijl.lambda_per_s", "swmc.destijl.p95_us",
-                "swmc.destijl.ss_residence_max_us", "swmc.destijl.replica_pages")
+                "swmc.destijl.ss_residence_max_us", "swmc.destijl.replica_pages",
+                # cxl_shm adaptive receiver state (/sys/kernel/cxl_shm/recv_adaptive "name value" lines): current values
+                ".recv_adaptive.gap_ewma_us", ".recv_adaptive.timed_sleep_us", ".recv_adaptive.q_warm",
+                ".recv_adaptive.ipoll_live")
+
+# Columns every coherence run (a snapshot with any sys.cxl_shm.* key: Popcorn and De Stijl lifetimes) carries, empty
+# where the kernel lacks the counter, so that pop and ds stats-steps.csv files have the same column set for the per-step
+# write-path breakdown (RocksDB N=4 write-wait RCA, 2026-11-05): De Stijl INV round / inline self write-back / INV
+# serve (last INV, pickup bound) / FETCH serve; cxl_shm per-kind receive counts, receiver wake outcomes and the
+# sleep-found log2 histogram (us; buckets b0..b23). Popcorn's analogues (owner handler, transport, message wait) are
+# the per-thread thr.<comm>.swmc.* counters both kernels export.
+STABLE_DS = ["wr_rounds", "wr_round_ns", "wr_inv_produce_ns", "wr_evict_m_self", "wr_evict_m_self_ns", "wr_evict_m_remote",
+             "wr_evict_m_remote_ns", "wr_poll_once", "wr_poll_once_ns", "wr_acq_hpd_n", "wr_acq_hpd_ns",
+             "srv_inv_count", "srv_inv_h_ns", "srv_inv_revoke_ns", "srv_inv_wb_ns", "srv_inv_last_count",
+             "srv_inv_last_h_ns", "srv_inv_by_poll", "srv_inv_pickup_n", "srv_inv_pickup_bound_ns", "srv_inv_cas_retry",
+             "srv_fetch_sync_count", "srv_fetch_sync_h_ns", "srv_fetch_async_count", "srv_fetch_async_h_ns",
+             "srv_fetch_evict_count", "srv_fetch_evict_h_ns", "inv_sent", "fetch_sent", "ack_sent", "rx_inv", "rx_fetch",
+             "rx_ack", "evict_self_fetch"]
+STABLE_SHM = ["rx_inv_count", "rx_fetch_count", "rx_ack_count", "rx_by_poll_once", "rx_by_fault_poll", "fault_poll_msgs",
+              "r_found_after_timeout", "r_wake_timeout_timed", "r_wake_timeout_cold", "r_wake_timeout_covered",
+              "r_wake_by_writer", "r_wake_by_ipoll", "r_sleep_aborted", "poll_until_stop", "poll_until_wake_r",
+              "req_by_kthread", "rsp_by_kthread", "rsp_by_requester"]
+SLEEP_HIST_BUCKETS = 24
+STABLE = (["sys.swmc.destijl." + k for k in STABLE_DS] + ["sys.cxl_shm." + k for k in STABLE_SHM] +
+          [f"sys.cxl_shm.recv_adaptive.r_sleep_found_us_log2.b{i}" for i in range(SLEEP_HIST_BUCKETS)])
+
+
+def stable_keys(rows):
+    """STABLE when any row has a sys.cxl_shm.* key (a coherence lifetime), else nothing (all-HWcc, Megalon)"""
+    return STABLE if any(k.startswith("sys.cxl_shm.") for _, dv in rows for k in dv) else []
 # MOT1 v6 per-operation namespaces op.<op>.* / opt.<op>.*: the operation count "<prefix>.<op>.n" is a counter
 OP_COUNT = re.compile(r"^opt?\.[^.]+\.n$")
 
@@ -110,7 +140,7 @@ def main():
     rows = deltas(a.run)
     if not rows:
         sys.exit(f"stats_delta: no begin/end snapshot pairs in {a.run}/stats")
-    keys = sorted({k for _, dv in rows for k in dv})
+    keys = sorted({k for _, dv in rows for k in dv} | set(stable_keys(rows)))
     out = a.out or os.path.join(a.run, "stats-steps.csv")
     with open(out, "w", newline="") as f:
         w = csv.writer(f)
