@@ -44,8 +44,10 @@ RSENV+=(SYSTEMS="$RS_SYSTEMS" STREAM_RATES="$RS_POINTS" STREAM_FIX_LEVELS="$RS_F
 BLK=(bash $TREE/experiments/recsys/main-block.sh $E/block)
 plan "rates [$RS_POINTS] systems [$RS_SYSTEMS] fix levels [$RS_FIX_LEVELS] map [${MAP# }] fallback ${RS_FIX_FALLBACK_Q:-none} sep $SEP levels ${LVF:-computed in this run}"
 plan "block: env ${RSENV[*]} ${BLK[*]}"
-plan "then: rs_check.py $E/block --rates '$RS_POINTS' --slo-systems '$RS_SYSTEMS' --fix-systems '$FIXSYS'"
+rs_auc_args "$RS_SYSTEMS"   # run-2 fixed-rate AUC lifetimes (RS_AUC_Q; RS_AUC_ONLY=1: no SLO lifetime)
+plan "then: rs_check.py $E/block --rates '$RS_POINTS' --slo-systems '$SLOSYS' --fix-systems '$FIXSYS' --auc-systems '$AUCSYS' --auc-rates '$AUCRATES'"
 RSPRM=${POP_RECV_MODE:-$RECV_MODE}
+[[ " $RS_SYSTEMS " == *" pop "* ]] || RSPRM=poll   # no Popcorn lifetime (e.g. the hw-only AUC block): no receiver check
 [ "$RSPRM" = poll ] || plan "then: recv_check.py $E/block --mode $RSPRM (RS_PROC_CXL_SHM=${RS_PROC_CXL_SHM:-0})"
 if [ $DRY = 1 ]; then
   block_dry "missing or not empty" env "${RSENV[@]}" bash $TREE/experiments/recsys/main-block.sh @DIR@
@@ -59,7 +61,7 @@ $REG add recsys rs-main $K "$E" $CSHA started "commit $COMMIT"
 log "block start"
 env "${RSENV[@]}" "${BLK[@]}" > "$E/block/sequence.log" 2>&1
 log "block rc $?: $(tail -n 1 "$E/block/sequence.log")"
-python3 -I -B $EVD/rs_check.py "$E/block" --rates "$RS_POINTS" --slo-systems "$RS_SYSTEMS" --fix-systems "$FIXSYS" > /dev/null
+python3 -I -B $EVD/rs_check.py "$E/block" --rates "$RS_POINTS" --slo-systems "$SLOSYS" --fix-systems "$FIXSYS" --auc-systems "$AUCSYS" --auc-rates "$AUCRATES" > /dev/null
 log "check: $(tail -n 1 "$E/block/rs-check.txt")"
 tail -n 1 "$E/block/rs-check.txt" | grep -q "^RSCHECK PASS" || stop "check FAIL (see $E/block/rs-check.txt)"
 if [ "$RSPRM" != poll ]; then  # receive mode of every Popcorn lifetime (e.g. recv-sleep.conf; run 2 adaptive)

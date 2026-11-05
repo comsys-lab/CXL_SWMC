@@ -59,7 +59,8 @@ RSENV+=(REGION=$RS_DS_REGION VM_PLAIN=$RS_DS_VM_PLAIN SYSTEMS=ds STREAM_RATES="$
 BLK=(bash $TREE/experiments/recsys/main-block.sh $E/block)
 plan "rates [$RS_POINTS] system ds, SLO lifetimes only"
 plan "block: env ${RSENV[*]} ${BLK[*]}"
-plan "then: rs_check.py $E/block --rates '$RS_POINTS' --slo-systems ds --fix-systems ''; recv_check.py $E/block --mode $RECV_MODE"
+rs_auc_args ds   # run-2 fixed-rate AUC lifetimes (RS_AUC_Q; RS_AUC_ONLY=1: no SLO lifetime)
+plan "then: rs_check.py $E/block --rates '$RS_POINTS' --slo-systems '$SLOSYS' --fix-systems '' --auc-systems '$AUCSYS' --auc-rates '$AUCRATES'; recv_check.py $E/block --mode $RECV_MODE"
 if [ $DRY = 1 ]; then
   block_dry "missing or not empty" env "${RSENV[@]}" bash $TREE/experiments/recsys/main-block.sh @DIR@
   echo "DRY START OK ($RUNSET run $K): stops here, before the lock"; exit 0
@@ -73,7 +74,7 @@ $REG add recsys rs-ds $K "$E" $CSHA started "commit $COMMIT T=$T us"
 log "block start (T = $T us)"
 env "${RSENV[@]}" "${BLK[@]}" > "$E/block/sequence.log" 2>&1
 log "block rc $?: $(tail -n 1 "$E/block/sequence.log")"
-python3 -I -B $EVD/rs_check.py "$E/block" --rates "$RS_POINTS" --slo-systems ds --fix-systems "" > /dev/null
+python3 -I -B $EVD/rs_check.py "$E/block" --rates "$RS_POINTS" --slo-systems "$SLOSYS" --fix-systems "" --auc-systems "$AUCSYS" --auc-rates "$AUCRATES" > /dev/null
 log "check: $(tail -n 1 "$E/block/rs-check.txt")"
 tail -n 1 "$E/block/rs-check.txt" | grep -q "^RSCHECK PASS" || stop "check FAIL (see $E/block/rs-check.txt)"
 python3 -I -B $EVD/recv_check.py "$E/block" --mode "$RECV_MODE" > /dev/null

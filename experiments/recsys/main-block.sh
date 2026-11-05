@@ -113,6 +113,17 @@
 #   stream-results.tsv files of the rs-main block of the same run, later files win). No confirmed valid pop max = no
 #   step (NOTE). Checks: stream_check.py + check_breakdown.py recorded (a failed check is a NOTE, the slo row stands).
 #   <E>/stream-pmax.tsv: name system rate_sps pmax_q_s appended status source; <lifetime>/pmax/ = part dir.
+# STREAM_AUC="<rate>=<query/s> ..." (run 2 T sweep, user 2026-11-05: fixed-rate AUC, EVAL_RUN and V7=1 only): after the
+#   rate's SLO lifetimes (and fix-only lifetimes), every system of the block gets ONE more lifetime <sys>-u<rate>-auc:
+#   the SLO lifetimes' warm-up part (same command; the update stream is open-loop, so every system enters the next part
+#   at the same update position seq_base, e.g. 11964 at 200 / 23931 at 400 samples/s in run 1), then part auc: loadgen
+#   --mode fixed --rates <query/s> --warmup-s STREAM_AUC_SETTLE_S (30, discarded) --step-warmup-s 5 --step-measure-s
+#   STREAM_AUC_S (300) --drain-s 10, seed SEED + 3 (same seed, rate, seq_base and timing for every system and T = the
+#   same query draws: start = update position at make time + offset, both a function of the schedule and the seed).
+#   Checks: loadgen rc != 0 or a workload finish other than ok = stop (the chain retries the block); stream_check.py and
+#   check_breakdown.py recorded (status, not a stop). v7_post with the AUC row into <E>/auc_part.csv (per-part AUC over
+#   the measured step: auc, logloss, auc_frozen on the same multiset of samples). <E>/stream-auc.tsv: name system
+#   rate_sps auc_q_s seq_base status. STREAM_AUC_ONLY=1: no SLO lifetimes in the block (AUC lifetimes only).
 set -uo pipefail
 E=${1:?evidence dir}
 P=/home/comsys/sungsu/destijl-control X=$(cd "$(dirname "$0")" && pwd)
@@ -175,8 +186,16 @@ elif [ $BLOCK = stream ]; then  # RecSys streaming block (header "BLOCK=stream")
       || { echo "SEQUENCE STOP: bad STREAM_PMAX / STREAM_PMAX_S / STREAM_PMAX_SETTLE_S"; exit 2; }
     [ -z "${STREAM_PMAX_FROM:-}" ] || [ "${STREAM_PMAX:-0}" = 1 ] || { echo "SEQUENCE STOP: STREAM_PMAX_FROM without STREAM_PMAX=1"; exit 2; }
     [ "${STREAM_PMAX:-0}" = 0 ] || [ -f "$X/../eval/pmax_decide.py" ] || { echo "SEQUENCE STOP: missing experiments/eval/pmax_decide.py"; exit 2; }
+    # run-2 fixed-rate AUC lifetimes (header "STREAM_AUC")
+    for m in ${STREAM_AUC:-}; do
+      [[ $m =~ ^[1-9][0-9]*=[0-9]+(\.[0-9]+)?$ ]] && [[ " $STREAM_RATES " == *" ${m%%=*} "* ]] || { echo "SEQUENCE STOP: bad STREAM_AUC entry $m (<rate in STREAM_RATES>=<query/s>)"; exit 2; }
+    done
+    [[ ${STREAM_AUC_S:-300} =~ ^[1-9][0-9]*$ && ${STREAM_AUC_SETTLE_S:-30} =~ ^[1-9][0-9]*$ && ${STREAM_AUC_ONLY:-0} =~ ^[01]$ ]] \
+      || { echo "SEQUENCE STOP: bad STREAM_AUC_S / STREAM_AUC_SETTLE_S / STREAM_AUC_ONLY"; exit 2; }
+    [ -n "${STREAM_AUC:-}" ] || [ "${STREAM_AUC_ONLY:-0}" = 0 ] || { echo "SEQUENCE STOP: STREAM_AUC_ONLY=1 without STREAM_AUC"; exit 2; }
   fi
   [ -n "${EVAL_RUN:-}" ] || [ -z "${STREAM_PMAX:-}${STREAM_PMAX_FROM:-}" ] || { echo "SEQUENCE STOP: STREAM_PMAX needs EVAL_RUN"; exit 2; }
+  [ -n "${EVAL_RUN:-}" ] || [ -z "${STREAM_AUC:-}${STREAM_AUC_ONLY:-}" ] || { echo "SEQUENCE STOP: STREAM_AUC needs EVAL_RUN"; exit 2; }
   EKKO=stream
 else
   : "${EKKO:?}"
@@ -319,7 +338,7 @@ v7_lgc() {  # <rate>: v7 loadgen options (appended to LGC; later --opt values wi
 # <lifetime name> <node>: guest path, unique per evidence dir: the server creates it exclusively (FATAL "cannot create
 # (exists?)"), and basename E alone ("block", "probe") repeats over retries (v<N>) and runs (rs-h1 v4: probe-mg-u50-fix-n0)
 v7_stale() { echo "$V7_STALE_DIR/$(basename "$(dirname "$E")")-$(basename "$E")-$1-n$2.stl"; }
-v7_post() {  # <sys> <rate> <part dir>: fetch both stale logs (guest v7_stale paths), then v7_metrics.py
+v7_post() {  # <sys> <rate> <part dir> [AUC csv, default <E>/auc_run.csv]: fetch both stale logs (guest v7_stale paths), then v7_metrics.py
   [ "$V7" = 1 ] || return 0
   local k f
   for k in 0 1; do
@@ -329,7 +348,7 @@ v7_post() {  # <sys> <rate> <part dir>: fetch both stale logs (guest v7_stale pa
   done
   python3 -I -B $V7T/v7_metrics.py "$3" --stale0 "$3/stale-n0.stl" --stale1 "$3/stale-n1.stl" --frozen "$V7_FROZEN" \
     --trace-n "$(sed -n 's/^trace_samples=//p' "$3/loadgen/recsys.txt")" --steps-out "$3/v7-steps.csv" \
-    --auc-run "$E/auc_run.csv" --system "$1" --update-rate "$2" --T "${DST:-0}" --run "${EVAL_RUN:-1}" > "$3/v7-metrics.txt" 2>&1 \
+    --auc-run "${4:-$E/auc_run.csv}" --system "$1" --update-rate "$2" --T "${DST:-0}" --run "${EVAL_RUN:-1}" > "$3/v7-metrics.txt" 2>&1 \
     || stop "$NAME: v7_metrics.py ($(tail -1 "$3/v7-metrics.txt"))"
   [ ! -f "$3/steps.csv" ] || python3 -I -B $V7T/v7_metrics.py "$3" --stale0 "$3/stale-n0.stl" --stale1 "$3/stale-n1.stl" \
     --merge-steps "$3/steps.csv" > /dev/null 2>&1 || stop "$NAME: v7 steps.csv merge"
@@ -423,6 +442,10 @@ if [ "${STREAM_PMAX:-0}" = 1 ]; then  # run-2 pmax step plan (shown by lib.sh bl
           done;;
     esac
   done
+fi
+if [ -n "${STREAM_AUC:-}" ]; then  # run-2 fixed-rate AUC plan (shown by lib.sh block_dry)
+  [ "$V7" = 1 ] || { echo "SEQUENCE STOP: STREAM_AUC needs V7=1"; exit 2; }
+  echo "BLOCK PLAN: auc lifetimes [$STREAM_AUC] systems [${SYSTEMS:-hw pop}] only=${STREAM_AUC_ONLY:-0}: warm-up then part auc '--mode fixed --rates <q> --warmup-s ${STREAM_AUC_SETTLE_S:-30} --step-warmup-s 5 --step-measure-s ${STREAM_AUC_S:-300} --drain-s 10' seed $((SEED + 3)), AUC rows -> <E>/auc_part.csv"
 fi
 # receiver keys: modes of the pop / ds lifetimes of this block; a non-adaptive one refuses RECV_WATCH_US /
 # RECV_S_MAX_US (dry: BLOCK NOTE, then the evidence-dir check ends the dry start; real: stop below)
@@ -962,6 +985,32 @@ stream_pmax() {  # <sys> <rate>: run-2 pmax part in the current lifetime (header
   printf '%s\t%s\t%s\t%s\t1\t%s\t%s\n' "$NAME" $s $r "$v" "$st" "$f" >> "$E/stream-pmax.tsv"
   echo "$NAME pmax: $v query/s status $st"
 }
+auc_q() {  # <rate>: query rate of the rate's STREAM_AUC entry (empty = no AUC lifetime at this rate)
+  local m
+  for m in ${STREAM_AUC:-}; do [ "${m%%=*}" = "$1" ] && { echo "${m#*=}"; return 0; }; done
+}
+stream_auc() {  # <sys> <rate> <query/s>: AUC lifetime body (header "STREAM_AUC"): warm-up as stream_slo, then part auc
+  local s=$1 r=$2 q=$3 RD=$LS/auc rc fs=$((SEED + 3)) st=ok sb
+  measure "$LS" warmup "${LGC[@]}" --opt seed=$((SEED + 100)) --seed $((SEED + 100)) --mode fixed --rates 1 \
+    --warmup-s 10 --step-warmup-s 0 --step-measure-s 50 --drain-s 10
+  rc=$?; [ $rc = 0 ] || stop "$NAME warm-up rc $rc"
+  sb=$(cat "$LS/seq_base")
+  [ -s "$E/stream-auc.tsv" ] || printf '# name\tsystem\trate_sps\tauc_q_s\tseq_base\tstatus\n' > "$E/stream-auc.tsv"
+  echo "$NAME auc: loadgen seed $fs, $q query/s, seq_base $sb" >> "$E/seeds.txt"
+  measure "$LS" auc "${LGC[@]}" --opt seed=$fs --seed $fs --raw --mode fixed --rates "$q" \
+    --warmup-s "${STREAM_AUC_SETTLE_S:-30}" --step-warmup-s 5 --step-measure-s "${STREAM_AUC_S:-300}" --drain-s 10
+  rc=$?
+  [ $rc = 0 ] || stop "$NAME auc rc $rc"
+  grep -q 'workload_finish":"ok' "$RD/loadgen/summary.json" 2>/dev/null || stop "$NAME auc: loadgen workload finish"
+  python3 $X/stream_check.py "$RD" > "$RD/stream-check.txt" 2>&1
+  python3 $X/check_breakdown.py "$RD" > "$RD/breakdown-check.txt" 2>&1
+  grep -qE '^STREAMCHECK (PASS|NOTE)' "$RD/stream-check.txt" || st="streamcheck:$(grep -m1 '^STREAMCHECK' "$RD/stream-check.txt" | cut -d' ' -f2)"
+  grep -q '^BREAKDOWN PASS' "$RD/breakdown-check.txt" || st="$st,breakdown-fail"
+  v7_post "$s" "$r" "$RD" "$E/auc_part.csv"
+  [ "$st" = ok ] || echo "MAIN NOTE $NAME auc: $st (see $RD)"
+  printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$NAME" $s $r "$q" "$sb" "$st" >> "$E/stream-auc.tsv"
+  echo "$NAME auc: $q query/s seq_base $sb status $st"
+}
 eval_stream_rate() {  # <rate>
   local r=$1 s ord="" defer=0 fixonly=" ${STREAM_FIXONLY:-} "
   for s in $(h1shuffle recsys-stream-$r $(for x in ${SYSTEMS:-hw pop}; do [ $x = mgoff ] || echo $x; done)); do
@@ -980,6 +1029,7 @@ eval_stream_rate() {  # <rate>
     [ "${STREAM_FIX_SEP:-1}" = 0 ] || defer=1
   fi
   for s in $ord; do
+    [ "${STREAM_AUC_ONLY:-0}" = 0 ] || [[ $fixonly == *" $s "* ]] || continue   # AUC lifetimes only (stream_auc_rate)
     echo "$(date -Is) stream u$r system $s"
     if [[ $fixonly == *" $s "* ]]; then
       [ $defer = 1 ] && continue
@@ -998,6 +1048,16 @@ eval_stream_rate() {  # <rate>
   fi
   [ -n "$FIXRATES" ] || { echo "MAIN NOTE u$r: no fixed-load window ($(tail -1 "$E/stream-levels.tsv"); no fallback)"; return 0; }
   for s in $ord; do life_start $s $s-u$r-fix; stream_fix $s $r; life_stop $s; done
+}
+stream_auc_rate() {  # <rate>: the rate's AUC lifetimes (STREAM_AUC), after every SLO / fix lifetime of the rate
+  local r=$1 q s fixonly=" ${STREAM_FIXONLY:-} "
+  q=$(auc_q $r)
+  [ -n "$q" ] || return 0
+  for s in $(h1shuffle recsys-stream-$r $(for x in ${SYSTEMS:-hw pop}; do [ $x = mgoff ] || echo $x; done)); do
+    [[ $fixonly == *" $s "* ]] && continue
+    echo "$(date -Is) stream u$r system $s auc ($q query/s)"
+    life_start $s $s-u$r-auc; stream_auc $s $r $q; life_stop $s
+  done
 }
 h1_entry() {  # <name> <sys> <phase> <part> <steps> <lifetime kind>
   printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$1" "$2" "$H1_MIX" "$3" "$H1_N" "${LS#$E/}/$4" "$5" "$6" >> "$E/h1-runs.tsv"
@@ -1141,7 +1201,8 @@ if [ $BLOCK = stream ]; then  # RecSys streaming driver (header "BLOCK=stream")
     { echo "EVAL_RUN=$EVAL_RUN RS_THREADS=$RS_THREADS REGION=$REGION sha256=$(sha256sum < "$REGION" | cut -c1-64)"
       echo "SYSTEMS=${SYSTEMS:-hw pop} STREAM_FIXONLY=${STREAM_FIXONLY:-} STREAM_FIX_LEVELS=${STREAM_FIX_LEVELS:-} STREAM_FIX_LEVELS_MAP=${STREAM_FIX_LEVELS_MAP:-} STREAM_FIX_FALLBACK=${STREAM_FIX_FALLBACK:-} STREAM_FIX_SEP=${STREAM_FIX_SEP:-1} STREAM_LEVELS=${STREAM_LEVELS:-}"
       echo "STREAM_FIX_S=${STREAM_FIX_S:-60} STREAM_FIX_SETTLE_S=${STREAM_FIX_SETTLE_S:-60} server_args=[$SA] node0_extra=[$N0X]"
-      echo "slo=query:$SLO_PCT:$SLO_MS ($SLO_RULE) max_confirm_probes=$STREAM_CONFIRM_PROBES"; } | tee "$E/eval-params.txt"
+      echo "slo=query:$SLO_PCT:$SLO_MS ($SLO_RULE) max_confirm_probes=$STREAM_CONFIRM_PROBES"
+      [ -z "${STREAM_AUC:-}" ] || echo "STREAM_AUC=[$STREAM_AUC] STREAM_AUC_S=${STREAM_AUC_S:-300} STREAM_AUC_SETTLE_S=${STREAM_AUC_SETTLE_S:-30} STREAM_AUC_ONLY=${STREAM_AUC_ONLY:-0} seed=$((SEED + 3))"; } | tee "$E/eval-params.txt"
   fi
   { echo "# RecSys streaming block: per rate (in STREAM_RATES order) one lifetime per system, order shuffle(seed recsys-stream-<rate>)"
     for r in $STREAM_RATES; do echo "u$r: $(h1shuffle recsys-stream-$r ${SYSTEMS:-hw pop})"; done; } | tee "$E/order.txt"
@@ -1150,7 +1211,7 @@ if [ $BLOCK = stream ]; then  # RecSys streaming driver (header "BLOCK=stream")
     LGC=(--opt samples=$D/$UPD_FILE --opt queries=$D/$QRY_FILE
          --opt quantiles=$D/dist_quantile.txt --fixed update=$r --mix query=1 --x-stream query)
     v7_lgc $r
-    if [ -n "${EVAL_RUN:-}" ]; then eval_stream_rate $r; continue; fi
+    if [ -n "${EVAL_RUN:-}" ]; then eval_stream_rate $r; stream_auc_rate $r; continue; fi
     for s in $(h1shuffle recsys-stream-$r ${SYSTEMS:-hw pop}); do
       echo "$(date -Is) stream u$r$lab system $s"
       life_start $s $s-u$r; stream_slo $s $r; life_stop $s

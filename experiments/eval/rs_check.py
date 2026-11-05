@@ -6,7 +6,10 @@ FAIL (exit 1): a planned SLO lifetime has no stream-results.tsv row or its loadg
   lifetime (fix-systems x rates) has no stream-fix.tsv row, unless stream-levels.tsv records that the rate has no
   fixed-load window; no "SEQUENCE DONE" in sequence.log.
 WARN: an SLO row with valid=0 (update rate not sustained at or below the result), an unconfirmed SLO search, a fixed
-  window with valid != 1. Last line "RSCHECK PASS|FAIL (<n> warnings)"; output also written to <block>/rs-check.txt.
+  window with valid != 1.
+--auc-systems "hw" --auc-rates "200 400" (run-2 fixed-rate AUC lifetimes, main-block.sh STREAM_AUC): FAIL = a planned
+  AUC lifetime without a stream-auc.tsv row, without its loadgen summary, or without its auc_part.csv row
+  (system, update_rate); WARN = status != ok (stream_check / breakdown). Last line "RSCHECK PASS|FAIL (<n> warnings)"; output also written to <block>/rs-check.txt.
 """
 import argparse
 import csv
@@ -26,6 +29,8 @@ def main():
     ap.add_argument("--rates", required=True)
     ap.add_argument("--slo-systems", default="")
     ap.add_argument("--fix-systems", default="")
+    ap.add_argument("--auc-systems", default="")
+    ap.add_argument("--auc-rates", default="")
     a = ap.parse_args()
     B, out, nf, nw = a.block, [], 0, 0
 
@@ -61,6 +66,17 @@ def main():
             res("F", bool(w) or nowin, f"FIX {s} u{rate}: {len(w)} windows" + (" (no levels at this rate)" if nowin else ""))
             for x in w:
                 res("W", x[6] == "1", f"FIX {s} u{rate} {x[3]} at {x[4]} q/s valid={x[6] or '?'}")
+    au = {(r[1], r[2]): r for r in tsv(os.path.join(B, "stream-auc.tsv"))}
+    ap_ = os.path.join(B, "auc_part.csv")
+    ar = {(r["system"], r["update_rate"]) for r in csv.DictReader(open(ap_))} if os.path.isfile(ap_) else set()
+    for rate in a.auc_rates.split():
+        for s in a.auc_systems.split():
+            r = au.get((s, rate))
+            res("F", r is not None and os.path.isfile(os.path.join(B, f"{s}-u{rate}-auc", "auc", "loadgen", "summary.json")),
+                f"AUC {s} u{rate} present")
+            res("F", (s, rate) in ar, f"AUC {s} u{rate} auc_part.csv row")
+            if r:
+                res("W", r[5] == "ok", f"AUC {s} u{rate} at {r[3]} q/s seq_base {r[4]} status {r[5]}")
     out.append(f"RSCHECK {'FAIL' if nf else 'PASS'} ({nf} failures, {nw} warnings)")
     open(os.path.join(B, "rs-check.txt"), "w").write("\n".join(out) + "\n")
     print("\n".join(out))

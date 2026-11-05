@@ -39,6 +39,7 @@ unset POP_RECV_MODE POP_ADAPT_KO RECV_IPOLL RECV_WATCH_US RECV_S_MAX_US REQUIRE_
 unset RS_V7 RS_V7_IMAGE RS_V7_DENSE RS_V7_IMAGE_HOST RS_V7_DENSE_HOST RS_V7_LR RS_V7_ACC_INIT RS_V7_TRAIN_BATCH RS_V7_TRAIN_THREADS RS_V7_W_S \
   RS_V7_STALE_SAMPLE RS_V7_STALE_DIR RS_V7_SAMPLES RS_V7_FROZEN   # v7 keys come only from the conf
 unset RS_PMAX RS_PMAX_FROM RS_PMAX_S RS_PMAX_SETTLE_S   # run-2 RecSys pmax step keys (rs_env), only from the conf
+unset RS_AUC_Q RS_AUC_S RS_AUC_SETTLE_S RS_AUC_ONLY     # run-2 RecSys fixed-rate AUC lifetimes (rs_env), only from the conf
 CONFSH=$(python3 -I -B "$EVD/evalconf.py" shell ${EVAL_CONF:+--conf "$EVAL_CONF"}) || { echo "RUNSET STOP: ${EVAL_CONF:-eval.conf} does not parse"; exit 2; }
 eval "$CONFSH"
 export EVAL_CONF   # absolute path of the config (evalconf.py shell); pins-vdb.sh (sourced by the hook) reads the same file
@@ -198,6 +199,31 @@ rs_env() {
        [ -z "$fs" ] || RSENV+=("STREAM_PMAX_FROM=${fs# }")
        plan "pmax step: pop / ds lifetimes append one fixed window at Popcorn's max under the SLO (pop: own slo row; ds: pop rows of [${fs# }] from [${RS_PMAX_FROM:-}])";;
     *) die "bad RS_PMAX (${RS_PMAX}: 0 or 1)";; esac
+  # run-2 fixed-rate AUC lifetimes (T sweep, user 2026-11-05; main-block.sh STREAM_AUC): RS_AUC_Q "<rate>=<query/s> ..."
+  # (one fixed query rate per update rate, shared by every system), RS_AUC_S / RS_AUC_SETTLE_S, RS_AUC_ONLY 0 | 1
+  # (1 = no SLO lifetimes in the block, AUC lifetimes only)
+  if [ -n "${RS_AUC_Q:-}" ]; then
+    [ "${RS_V7:-0}" = 1 ] || die "RS_AUC_Q needs RS_V7=1"
+    local m
+    for m in $RS_AUC_Q; do
+      [[ $m =~ ^[1-9][0-9]*=[0-9]+(\.[0-9]+)?$ ]] || die "bad RS_AUC_Q entry $m (<rate>=<query/s>)"
+      [[ " $RS_POINTS " == *" ${m%%=*} "* ]] || die "RS_AUC_Q rate ${m%%=*} not in RS_POINTS"
+    done
+    [[ ${RS_AUC_S:-300} =~ ^[1-9][0-9]*$ && ${RS_AUC_SETTLE_S:-30} =~ ^[1-9][0-9]*$ && ${RS_AUC_ONLY:-0} =~ ^[01]$ ]] \
+      || die "bad RS_AUC_S / RS_AUC_SETTLE_S / RS_AUC_ONLY"
+    RSENV+=("STREAM_AUC=$RS_AUC_Q" STREAM_AUC_S=${RS_AUC_S:-300} STREAM_AUC_SETTLE_S=${RS_AUC_SETTLE_S:-30} STREAM_AUC_ONLY=${RS_AUC_ONLY:-0})
+    plan "fixed-rate AUC lifetimes: [$RS_AUC_Q] (rate=query/s), warm-up as the SLO lifetimes, then ${RS_AUC_SETTLE_S:-30} s settle + 5 s + ${RS_AUC_S:-300} s measured, seed SEED + 3$([ "${RS_AUC_ONLY:-0}" = 1 ] && echo '; AUC lifetimes only (no SLO lifetime)')"
+  elif [ -n "${RS_AUC_S:-}${RS_AUC_SETTLE_S:-}${RS_AUC_ONLY:-}" ]; then die "RS_AUC_S / RS_AUC_SETTLE_S / RS_AUC_ONLY without RS_AUC_Q"
+  fi
+}
+# rs_check.py arguments of a RecSys block: AUCSYS (systems with AUC lifetimes; empty without RS_AUC_Q), SLOSYS (the SLO
+# systems, empty with RS_AUC_ONLY=1) and AUCRATES (rates of RS_AUC_Q)
+rs_auc_args() {  # <systems of the block>
+  AUCSYS= AUCRATES= SLOSYS=$1
+  [ -n "${RS_AUC_Q:-}" ] || return 0
+  AUCSYS=$1 AUCRATES=$(for m in $RS_AUC_Q; do printf '%s ' "${m%%=*}"; done)
+  AUCRATES=${AUCRATES% }
+  [ "${RS_AUC_ONLY:-0}" = 0 ] || SLOSYS=
 }
 rs_checks() {  # static checks shared by the RecSys drivers
   case $RS_SLO_PCT:$RS_SLO_MS:$RS_RAMP_START in 95:100:1|95:400:1) ;;
@@ -235,7 +261,7 @@ block_dry() {
   # eval3: the block's L1 / pending lines are shown (h2n-block.sh H2N_L1, @MAIN_T@); the check uses the last 3 lines;
   # damon-policy-exploration: also the block's DAMON plan line (H2N_DS_DAMON_AT / _EXTRA / _WARMUP / _REGIONS);
   # run-2 §6: the fixed warmup plan line (H2N_WARMUP)
-  echo "$out" | grep -E '^BLOCK (PLAN: L1 |PLAN: DAMON |PLAN: pmax |PLAN: receiver |PLAN: fixed warmup |DRY NOTE|NOTE)' | while IFS= read -r l; do plan "block dry: $l"; done
+  echo "$out" | grep -E '^BLOCK (PLAN: L1 |PLAN: DAMON |PLAN: pmax |PLAN: auc |PLAN: receiver|PLAN: fixed warmup |DRY NOTE|NOTE)' | while IFS= read -r l; do plan "block dry: $l"; done
   out=$(echo "$out" | tail -n 3)
   if [[ "$out" == *"$want"* ]]; then plan "block dry start reached its evidence-dir check: $(echo "$out" | grep -m1 "$want")"
   else die "block dry start did not reach the evidence-dir check: $out"; fi
