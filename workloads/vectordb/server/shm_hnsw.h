@@ -136,9 +136,19 @@ struct GraphParams {
   uint64_t per_chunk() const { return chunk_bytes / vrec_bytes(); }  // N elements per group
   uint64_t groups() const { return (capacity + per_chunk() - 1) / per_chunk(); }
   uint64_t vchunk_bytes() const { return per_chunk() * vrec_bytes(); }
-  uint64_t upper_group_bytes() const {  // expected upper levels per element 1/(M-1); 4x margin
-    return (per_chunk() * 4 / (M - 1) + 64) * links_bytes();
+  // Small groups (page-sized chunks, experiment megalon-page-granularity: --chunk-bytes 4096 = 4 sq8 records per
+  // group): the 4x-margin formula below would reserve 65 upper-level blocks (8.3 KiB with M 16) for ~0.27 expected
+  // levels, so groups of at most kSmallGroupElems elements reserve kSmallGroupBlocks blocks instead (M 16, 4 records:
+  // 1 KiB, link chunk 4 x 192 + 1,024 = 1,792 B). P(levels of 4 elements > 8) ~ 220 x 16^-9 ~ 3e-9 per group
+  // (P(level >= l) = M^-l), i.e. ~0.03 groups expected in 13.5M; an overflow is reported by insert() ("upper-level arena of the group full")
+  // and by the relayout tool, never silently. Larger groups (every layout before this experiment, e.g. the 32 MiB
+  // chunks) keep the original formula; describe() marks small-group layouts (layout.h), so their hash differs.
+  static constexpr uint64_t kSmallGroupElems = 16, kSmallGroupBlocks = 8;
+  bool small_groups() const { return per_chunk() <= kSmallGroupElems; }
+  uint64_t upper_group_blocks() const {  // expected upper levels per element 1/(M-1); 4x margin
+    return small_groups() ? kSmallGroupBlocks : per_chunk() * 4 / (M - 1) + 64;
   }
+  uint64_t upper_group_bytes() const { return upper_group_blocks() * links_bytes(); }
   uint64_t lchunk_bytes() const { return per_chunk() * links0_bytes() + upper_group_bytes(); }
 };
 

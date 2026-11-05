@@ -32,8 +32,16 @@ struct Params {
            " dim=" + std::to_string(g.dim) + " M=" + std::to_string(g.M) + " efc=" + std::to_string(g.ef_construction) +
            " capacity=" + std::to_string(g.capacity) + " chunk_bytes=" + std::to_string(g.chunk_bytes) + " max_writes=" + std::to_string(max_writes) +
            " max_ids=" + std::to_string(max_ids) + " dlog_chunk=" + std::to_string(dlog_chunk) +
-           " max_deletes=" + std::to_string(max_deletes) + (g.is_sq8() ? " vec=sq8" : "");  // fp32: text unchanged
+           " max_deletes=" + std::to_string(max_deletes) + (g.is_sq8() ? " vec=sq8" : "") +  // fp32: text unchanged
+           (g.small_groups() ? " upper_blocks=" + std::to_string(g.upper_group_blocks()) : "");  // large groups: unchanged
   }
+  // HWcc objseq array (unused since vdb build 10, stays 0): kept in the layout when it is small (every layout before
+  // the page-granularity experiment: <= a few thousand objects, so their layout hash and offsets are unchanged); a
+  // layout with more than kObjseqAlwaysObjects objects (4 KiB pages: 27M objects = 216 MB of the 256 MiB HWcc budget)
+  // gets it only with --trace-dir (trace = true; every node and --print-app-bytes must pass the same --trace-dir).
+  static constexpr uint64_t kObjseqAlwaysObjects = 1ull << 20;
+  bool trace = false;  // --trace-dir given (not part of describe(): it only adds the objseq field, which is hashed)
+  bool has_objseq() const { return trace || trace_objects() <= kObjseqAlwaysObjects; }
 };
 
 // E1 visibility of a record for snapshot s with the stale-header guard (shm_hnsw.h): -1 = header rejected (canary,
@@ -100,7 +108,7 @@ struct HwccLayout {
     // measurement (vdb-server --trace-dir, Megalon only; plain never touches them, nor does Megalon without trace):
     // wsec = write sections completed by all nodes; objseq[o] = wsec value of the last write section on object o
     off_wsec = L.add("wsec", 64);
-    off_objseq = L.add("objseq", (p.trace_objects() * 8 + 63) / 64 * 64);
+    off_objseq = p.has_objseq() ? L.add("objseq", (p.trace_objects() * 8 + 63) / 64 * 64) : 0;  // 0: no objseq field
     if (p.g.is_sq8()) off_sq8 = L.add("sq8", sizeof(Sq8Line) + (uint64_t(p.g.dim) * 8 + 63) / 64 * 64);
   }
 };
@@ -119,7 +127,7 @@ struct Hwcc {
         applied(reinterpret_cast<uint64_t *>(app + h.off_applied)),
         segs(reinterpret_cast<SegLines *>(app + h.off_segs)),
         wsec(reinterpret_cast<uint64_t *>(app + h.off_wsec)),
-        objseq(reinterpret_cast<uint64_t *>(app + h.off_objseq)),
+        objseq(h.off_objseq ? reinterpret_cast<uint64_t *>(app + h.off_objseq) : nullptr),
         sq8(h.off_sq8 ? reinterpret_cast<Sq8Line *>(app + h.off_sq8) : nullptr) {}
   float *sq8_params() const { return reinterpret_cast<float *>(sq8 + 1); }
 };

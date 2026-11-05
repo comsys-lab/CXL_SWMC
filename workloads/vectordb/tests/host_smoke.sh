@@ -7,6 +7,7 @@
 #             --pool-a = rows of pool_a.fbin); index built with <build>/bin/vdb-build-index into the scratch dir.
 # env: CPUS (default 16-31: Host node1), SEGMENTS (4), CHUNK (1048576), RATES (100,300), MIX (update=1,search=19),
 #      INDEX_BUILDER (default <build>/bin/vdb-build-index), DEVICE_SIZE (bytes, default 2 GiB), VEC_FORMAT (fp32 | sq8),
+#      IMAGE (chunks | packed: init image format, default chunks; packed needs a vdb-build-index with the image arg),
 #      BACKEND (plain | megalon: <build> from build-megalon.sh; Megalon config from systems/megalon/vectordb-2vm.yaml
 #      with object_arena_size ARENA (default 512MB); node 0 MEGALON_REINIT=1), TRACE (1 = --trace-dir <scratch>,
 #      default 1; 0 = none), OPCOH (fake | megalon | none: run tests/opcoh_check.py in that mode; VDB_OPCOH_FAKE=1 in
@@ -30,6 +31,7 @@ VF=${VEC_FORMAT:-fp32}   # fp32 | sq8 (--vec-format; the index is built in the s
 PARAMS="--backend $BACKEND --nodes 2 --segments $SEG --chunk-bytes $CHUNK --max-ids $MAXIDS --max-writes 200000 --max-deletes 200000 --dlog-chunk 256"
 [ "$VF" = fp32 ] || PARAMS="$PARAMS --vec-format $VF"
 VFARG=(); [ "$VF" = fp32 ] || VFARG=("$VF")
+[ "${IMAGE:-chunks}" = chunks ] || VFARG=("$VF" "$IMAGE")  # IMAGE=packed: packed init image (build_index arg 12)
 taskset -c "$CPUS" "${INDEX_BUILDER:-$B/bin/vdb-build-index}" "$D/pool_a.fbin" "$S/init" "$SEG" "$MAXIDS" 16 128 0 8 20261015 "$CHUNK" ${VFARG[@]+"${VFARG[@]}"} > "$S/index.log" 2>&1
 truncate -s "$DEVSZ" "$S/device.img"
 # PREFILL=1 (plain backend; run-2 slot zeroing check): the SWcc part of the device file (from 256 MiB, the default
@@ -48,7 +50,7 @@ fi
 sed -e "s|^device: .*|device: $S/device.img|" -e "s|^device_size: .*|device_size: $DEVSZ|" "$ROOT/config/cxl_region.yaml" > "$S/region.yaml"
 sed -e "s|^object_arena_size: .*|object_arena_size: ${ARENA:-512MB}|" "$ROOT/systems/megalon/vectordb-2vm.yaml" > "$S/megalon.yaml"
 # shellcheck disable=SC2086
-APP=$("$B/bin/vdb-server" $PARAMS --print-app-bytes)
+APP=$("$B/bin/vdb-server" $PARAMS $([ "$TRACE" = 1 ] && echo --trace-dir "$S") --print-app-bytes)  # objseq: layout.h has_objseq
 RID=0x$(printf '%x' $(( (RANDOM << 16 | RANDOM) | 1 )))
 PIDS=()
 cleanup() { for p in "${PIDS[@]}"; do kill -TERM "$p" 2>/dev/null || true; done; wait 2>/dev/null || true; }
@@ -108,7 +110,7 @@ m = re.search(r"wsec at device offset (\d+), objseq at (\d+) \((\d+) objects\)",
 w, o, n = map(int, m.groups())
 dev = np.memmap(S + "/device.img", dtype=np.uint64, mode="r")
 wsec, objseq = int(dev[w // 8]), dev[o // 8:o // 8 + n]
-print(f"hwcc trace lines: wsec={wsec} objseq nonzero={int((objseq != 0).sum())}/{n} max={int(objseq.max())}")
+print(f"hwcc trace lines: wsec={wsec} objseq nonzero={int((objseq != 0).sum())}/{n} max={int(objseq.max()) if n else 0}")  # n 0: layout without objseq
 expect_on = be == "megalon" and tr == "1"
 if (wsec != 0) != expect_on or objseq.any():
     sys.exit("hwcc trace lines: unexpected (wsec " + ("should be written" if expect_on else "must stay 0") + ", objseq must stay 0)")

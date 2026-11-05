@@ -202,6 +202,54 @@ inline bool thread_run_delay(uint64_t *rq) {
   *rq = delay;
   return true;
 }
+// Resident memory of this process from /proc/self/status (bytes): VmRSS and RssAnon (private anonymous memory, where
+// Megalon keeps its per-node object index; the device mapping is file/shared memory and does not count there).
+struct Rss {
+  uint64_t rss = 0, anon = 0;
+};
+inline Rss proc_rss() {
+  Rss r;
+  std::ifstream f("/proc/self/status");
+  std::string k;
+  uint64_t v;
+  while (f >> k) {
+    if (k == "VmRSS:" && f >> v) r.rss = v << 10;
+    else if (k == "RssAnon:" && f >> v) r.anon = v << 10;
+  }
+  return r;
+}
+
+// Packed init image (experiment megalon-page-granularity; manifest line "image packed"): per segment two files,
+// seg-<s>-v.bin = the vector chunks of groups 0 .. G-1 back to back, group g at offset g x vchunk_bytes (the last group
+// holds its used records only, so the size is (G - 1) x vchunk_bytes + used bytes of group G - 1) and seg-<s>-l.bin =
+// whole link chunks, group g at g x lchunk_bytes (size G x lchunk_bytes); G = ceil(count / per_chunk). The bytes are
+// those of the per-chunk files (seg-<s>-v<g>.bin / -l<g>.bin), which stay the default format. Groups are copied in
+// order, so the reader is sequential (one buffered stream per file).
+class ImageStream {
+ public:
+  ImageStream(const std::string &path, uint64_t want) : path_(path) {
+    f_ = std::fopen(path.c_str(), "rb");
+    if (!f_) throw std::runtime_error(path + ": missing");
+    std::setvbuf(f_, nullptr, _IOFBF, size_t(8) << 20);
+    if (std::fseek(f_, 0, SEEK_END) != 0 || uint64_t(std::ftell(f_)) != want || std::fseek(f_, 0, SEEK_SET) != 0)
+      throw std::runtime_error(path + ": size != " + std::to_string(want) + " (packed image)");
+  }
+  ~ImageStream() {
+    if (f_) std::fclose(f_);
+  }
+  // bytes [off, off + n): off must be the current position (groups in order)
+  void read(uint8_t *dst, uint64_t off, uint64_t n) {
+    if (off != pos_) throw std::runtime_error(path_ + ": out-of-order read");
+    if (std::fread(dst, 1, n, f_) != n) throw std::runtime_error("short read " + path_);
+    pos_ += n;
+  }
+
+ private:
+  std::string path_;
+  FILE *f_ = nullptr;
+  uint64_t pos_ = 0;
+};
+
 inline uint64_t thread_cpu_ns() {
   timespec ts;
   clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts);
@@ -327,12 +375,12 @@ class Server {
       be_->set_trace(o_.trace_dir.empty() ? nullptr : h_->wsec, o_.node, (o_.trace_max_mb << 20) / sizeof(TraceRec),
                      tsc_khz_);
     {  // trace lines' device offsets (Host tests check that they stay 0 without --trace-dir; objseq is unused since
-       // vdb build 10 and must stay 0)
+       // vdb build 10 and must stay 0; a large layout without --trace-dir has no objseq field: "at 0 (0 objects)")
       const uint64_t app = uint64_t(cxl::hwcc::app_base(r_, map_) - map_);
       std::fprintf(stderr, "vdb-server: trace %s (%s), wsec at device offset %lu, objseq at %lu (%lu objects)\n",
                    o_.trace_dir.empty() ? "off" : "on", Be::kLayoutTag[0] ? "megalon" : "plain: unused",
-                   (unsigned long)(app + lay.off_wsec), (unsigned long)(app + lay.off_objseq),
-                   (unsigned long)p_.trace_objects());
+                   (unsigned long)(app + lay.off_wsec), (unsigned long)(lay.off_objseq ? app + lay.off_objseq : 0),
+                   (unsigned long)(lay.off_objseq ? p_.trace_objects() : 0));
     }
     be_->thread_init(0);  // main thread: prepare (object creation, initial copy) and warm-up
     for (uint32_t s = 0; s < p_.segments; s++) g_.push_back(std::make_unique<Graph>(p_.g, be_->mem(s, &h_->segs[s].meta)));
@@ -403,6 +451,7 @@ class Server {
     o << "\nstale_header_rejects=" << st_.stale_header_rejects << "\nstale_link_rejects=" << st_.stale_link_rejects
       << "\nsearches_with_stale_header=" << st_.searches_with_stale_header << "\nzeroed_unused_bytes=" << zeroed_bytes_
       << "\nzeroed_unused_ms=" << zeroed_ns_ / 1000000;
+    init_stats(o);
     {  // write path (DESIGN.md §17): done is read before accepted, so backlog >= 0
       const uint64_t done = st_.write_jobs_done.load(), acc = st_.write_jobs_accepted.load();
       o << "\nwriter_threads=" << o_.writer_threads << "\nwrite_jobs_accepted=" << acc << "\nwrite_jobs_done=" << done
@@ -486,11 +535,71 @@ class Server {
                  (unsigned long)(zeroed_bytes_ >> 20), zeroed_ns_ / 1e9, where);
   }
 
+  // init dir image format: packed (manifest line "image packed", ImageStream) or per-chunk files (every earlier dir)
+  bool packed_image() const {
+    std::ifstream man(o_.init_dir + "/manifest.txt");
+    std::string line;
+    while (std::getline(man, line))
+      if (line == "image packed") return true;
+    return false;
+  }
+  // Copy segment s's initial images (count records) into its chunks; returns the bytes copied.
+  uint64_t copy_images(uint32_t s, uint64_t count, bool packed) {
+    const uint64_t N = p_.g.per_chunk(), vr = p_.g.vrec_bytes(), vc = p_.g.vchunk_bytes(), lc = p_.g.lchunk_bytes();
+    const uint64_t groups = (count + N - 1) / N;
+    const std::string b = o_.init_dir + "/seg-" + std::to_string(s);
+    uint64_t bytes = 0;
+    if (!packed) {
+      for (uint64_t g = 0; g < groups; g++) {
+        const uint64_t vb = std::min(N, count - g * N) * vr;
+        be_->write_chunk(Chunk::kVec, s, g, 0, vb, [&](uint8_t *dst) { read_file(b + "-v" + std::to_string(g) + ".bin", dst, vb); });
+        be_->write_chunk(Chunk::kLink, s, g, 0, lc, [&](uint8_t *dst) { read_file(b + "-l" + std::to_string(g) + ".bin", dst, lc); });
+        bytes += vb + lc;
+      }
+      return bytes;
+    }
+    try {
+      ImageStream v(b + "-v.bin", groups ? (groups - 1) * vc + (count - (groups - 1) * N) * vr : 0);
+      ImageStream l(b + "-l.bin", groups * lc);
+      for (uint64_t g = 0; g < groups; g++) {
+        const uint64_t vb = std::min(N, count - g * N) * vr;
+        be_->write_chunk(Chunk::kVec, s, g, 0, vb, [&](uint8_t *dst) { v.read(dst, g * vc, vb); });
+        be_->write_chunk(Chunk::kLink, s, g, 0, lc, [&](uint8_t *dst) { l.read(dst, g * lc, lc); });
+        bytes += vb + lc;
+      }
+    } catch (const std::exception &e) {
+      die(e.what());
+    }
+    return bytes;
+  }
+
+  // Init / load breakdown (experiment megalon-page-granularity; stats keys init.*, log lines "vdb-server: INIT ..."):
+  // create = Megalon ObjectCreate of every object (node 0; plain: nothing), image = initial image copy (node 0),
+  // zero = preload zeroing (zeroed_ns_), check = ObjectLookup of every object (every node), warmup = the warm-up reads
+  // after check (every node). Resident memory (proc_rss) around create (node 0) and check (every node):
+  // index_bytes = RssAnon growth across create on node 0 and across check on the other nodes (where the replicated
+  // Megalon index is filled by log replay); create / image / check on other nodes stay 0.
+  struct InitTimes {
+    uint64_t create_ns = 0, image_ns = 0, image_bytes = 0, check_ns = 0, warmup_ns = 0, warmup_bytes = 0;
+    Rss before_create, after_create, before_check, after_check;
+    bool packed = false;
+    uint64_t index_bytes(uint32_t node) const {
+      const Rss &a = node == 0 ? before_create : before_check, &b = node == 0 ? after_create : after_check;
+      return b.anon > a.anon ? b.anon - a.anon : 0;
+    }
+  };
+
   void load_initial() {
     for (uint32_t s = 0; s < p_.segments; s++) Graph::init_empty(&h_->segs[s].meta);
     const uint64_t t0 = now_ns();
     std::string err;
+    it_.before_create = proc_rss();
     if (!be_->create_objects(&err)) die(err);
+    it_.create_ns = now_ns() - t0;
+    it_.after_create = proc_rss();
+    std::fprintf(stderr, "vdb-server: INIT create_objects %.1f s, rss %lu -> %lu MiB, rss_anon %lu -> %lu MiB\n",
+                 it_.create_ns / 1e9, (unsigned long)(it_.before_create.rss >> 20), (unsigned long)(it_.after_create.rss >> 20),
+                 (unsigned long)(it_.before_create.anon >> 20), (unsigned long)(it_.after_create.anon >> 20));
     if (p_.g.is_sq8()) {
       if (!o_.init_dir.empty()) check_manifest();
       publish_sq8();
@@ -503,17 +612,16 @@ class Server {
       return;
     }
     check_manifest();
+    it_.packed = packed_image();
     std::ifstream f(o_.init_dir + "/segments.txt");
     uint64_t s, count, epl, ucur, total = 0;
     uint32_t seen = 0;
     while (f >> s >> count >> epl >> ucur) {
       if (s >= p_.segments || count > p_.g.capacity || ucur > p_.g.upper_group_bytes()) die("bad segments.txt");
-      const uint64_t N = p_.g.per_chunk();
-      for (uint64_t g = 0; !o_.preloaded && g * N < count; g++) {
-        const std::string b = o_.init_dir + "/seg-" + std::to_string(s);
-        const uint64_t vb = std::min(N, count - g * N) * p_.g.vrec_bytes(), lb = p_.g.lchunk_bytes();
-        be_->write_chunk(Chunk::kVec, uint32_t(s), g, 0, vb, [&](uint8_t *dst) { read_file(b + "-v" + std::to_string(g) + ".bin", dst, vb); });
-        be_->write_chunk(Chunk::kLink, uint32_t(s), g, 0, lb, [&](uint8_t *dst) { read_file(b + "-l" + std::to_string(g) + ".bin", dst, lb); });
+      if (!o_.preloaded) {
+        const uint64_t c0 = now_ns();
+        it_.image_bytes += copy_images(uint32_t(s), count, it_.packed);
+        it_.image_ns += now_ns() - c0;
       }
       if (!o_.preloaded) {  // --preloaded: --preload-only zeroed them before coherence was enabled
         const uint64_t z0 = now_ns();
@@ -528,6 +636,8 @@ class Server {
       seen++;
     }
     if (seen != p_.segments) die("segments.txt lists " + std::to_string(seen) + " segments");
+    std::fprintf(stderr, "vdb-server: INIT image copy %.1f s, %lu MiB (%s image), zeroing %.1f s\n", it_.image_ns / 1e9,
+                 (unsigned long)(it_.image_bytes >> 20), it_.packed ? "packed" : "per-chunk", zeroed_ns_ / 1e9);
     std::fprintf(stderr, "vdb-server: %s %lu initial records in %u segments (%.1f s)\n",
                  o_.preloaded ? "published preloaded" : "loaded", (unsigned long)total, seen, (now_ns() - t0) / 1e9);
     if (!o_.preloaded) zero_report("load");
@@ -551,18 +661,12 @@ class Server {
     be_ = std::make_unique<Be>(r_, map_, p_);
     if (!be_->fits(&err)) die(err);
     const uint64_t t0 = now_ns();
+    const bool packed = packed_image();
     std::ifstream f(o_.init_dir + "/segments.txt");
     uint64_t s, count, epl, ucur, total = 0, bytes = 0;
     while (f >> s >> count >> epl >> ucur) {
       if (s >= p_.segments || count > p_.g.capacity) die("bad segments.txt");
-      const uint64_t N = p_.g.per_chunk();
-      for (uint64_t g = 0; g * N < count; g++) {
-        const std::string b = o_.init_dir + "/seg-" + std::to_string(s);
-        const uint64_t vb = std::min(N, count - g * N) * p_.g.vrec_bytes(), lb = p_.g.lchunk_bytes();
-        be_->write_chunk(Chunk::kVec, uint32_t(s), g, 0, vb, [&](uint8_t *dst) { read_file(b + "-v" + std::to_string(g) + ".bin", dst, vb); });
-        be_->write_chunk(Chunk::kLink, uint32_t(s), g, 0, lb, [&](uint8_t *dst) { read_file(b + "-l" + std::to_string(g) + ".bin", dst, lb); });
-        bytes += vb + lb;
-      }
+      bytes += copy_images(uint32_t(s), count, packed);
       const uint64_t z0 = now_ns();  // never-written slot capacity (zero_unused), timed separately
       zeroed_bytes_ += zero_unused(uint32_t(s), count);
       zeroed_ns_ += now_ns() - z0;
@@ -583,9 +687,16 @@ class Server {
   // Megalon: every node first checks every object (ids and sizes; node 0 created them before publishing `loaded`),
   // and the warm-up reads go through read sections.
   void warm_up() {
-    const uint64_t t0 = now_ns();
+    uint64_t t0 = now_ns();
     std::string err;
+    it_.before_check = proc_rss();
     if (!be_->check_objects(&err)) die(err);
+    it_.check_ns = now_ns() - t0;
+    it_.after_check = proc_rss();
+    std::fprintf(stderr, "vdb-server: INIT check_objects %.1f s, rss %lu -> %lu MiB, rss_anon %lu -> %lu MiB\n",
+                 it_.check_ns / 1e9, (unsigned long)(it_.before_check.rss >> 20), (unsigned long)(it_.after_check.rss >> 20),
+                 (unsigned long)(it_.before_check.anon >> 20), (unsigned long)(it_.after_check.anon >> 20));
+    t0 = now_ns();
     uint64_t bytes = 0, sum = 0;
     for (uint32_t s = 0; s < p_.segments; s++) {
       const uint64_t n = load_acquire(&h_->segs[s].meta.count), N = p_.g.per_chunk();
@@ -602,8 +713,23 @@ class Server {
         }
       }
     }
+    it_.warmup_ns = now_ns() - t0, it_.warmup_bytes = bytes;
     std::fprintf(stderr, "vdb-server: warm-up read %lu MiB in %.1f s (%lu)\n", (unsigned long)(bytes >> 20),
-                 (now_ns() - t0) / 1e9, (unsigned long)(sum & 1));
+                 it_.warmup_ns / 1e9, (unsigned long)(sum & 1));
+    std::fprintf(stderr, "vdb-server: INIT node %u create_s=%.3f image_s=%.3f zero_s=%.3f check_s=%.3f warmup_s=%.3f "
+                 "image=%s index_bytes=%lu\n", o_.node, it_.create_ns / 1e9, it_.image_ns / 1e9, zeroed_ns_ / 1e9,
+                 it_.check_ns / 1e9, it_.warmup_ns / 1e9, o_.node == 0 && !o_.init_dir.empty() ? (it_.packed ? "packed" : "per-chunk") : "none",
+                 (unsigned long)it_.index_bytes(o_.node));
+  }
+  void init_stats(std::ostream &o) const {
+    o << "\ninit.create_ns=" << it_.create_ns << "\ninit.image_ns=" << it_.image_ns << "\ninit.image_bytes=" << it_.image_bytes
+      << "\ninit.image_packed=" << int(it_.packed) << "\ninit.zero_ns=" << zeroed_ns_ << "\ninit.check_ns=" << it_.check_ns
+      << "\ninit.warmup_ns=" << it_.warmup_ns << "\ninit.warmup_bytes=" << it_.warmup_bytes
+      << "\ninit.rss_before_create=" << it_.before_create.rss << "\ninit.rss_after_create=" << it_.after_create.rss
+      << "\ninit.rss_anon_before_create=" << it_.before_create.anon << "\ninit.rss_anon_after_create=" << it_.after_create.anon
+      << "\ninit.rss_before_check=" << it_.before_check.rss << "\ninit.rss_after_check=" << it_.after_check.rss
+      << "\ninit.rss_anon_before_check=" << it_.before_check.anon << "\ninit.rss_anon_after_check=" << it_.after_check.anon
+      << "\ninit.index_bytes=" << it_.index_bytes(o_.node);
   }
 
   // ---------------------------------------------------------------- per-operation time split (opcoh.h)
@@ -1145,6 +1271,7 @@ class Server {
   std::mt19937_64 rng_;     // writer 0: HNSW levels
   std::unique_ptr<uint32_t[]> del_seq_;
   uint64_t zeroed_bytes_ = 0, zeroed_ns_ = 0;  // preload zeroing of the unused slot capacity (node 0, zero_unused)
+  InitTimes it_;                               // init / load breakdown (stats init.*)
   std::vector<uint64_t> dcursor_;
   std::unique_ptr<std::mutex[]> dmu_;
   OpCohSrc oc_;
@@ -1249,6 +1376,7 @@ int main(int argc, char **argv) {
     else usage();
   }
   o.p.derive();
+  o.p.trace = !o.trace_dir.empty();  // HWcc objseq field of large layouts (layout.h has_objseq); also --print-app-bytes
   if (print_bytes) {
     std::printf("%lu\n", (unsigned long)HwccLayout(o.p).L.bytes());
     return 0;

@@ -7,7 +7,10 @@
 // used bytes) and seg-<s>-l<g>.bin (whole link chunk) = byte images the server copies into the chunk objects,
 // manifest.txt (incl. "graph <segments> <dim> <M> <efc> <capacity> <chunk_bytes>").
 // usage: vdb-build-index <pool_a.fbin> <out dir> <segments> <max_ids> [M 16] [efc 128] [rows 0=all] [threads 16]
-//        [seed 20261015] [chunk_bytes 33554432] [vec_format fp32|sq8]
+//        [seed 20261015] [chunk_bytes 33554432] [vec_format fp32|sq8] [image chunks|packed]
+// image packed (experiment megalon-page-granularity, 4 KiB chunks = millions of groups): per segment seg-<s>-v.bin /
+// seg-<s>-l.bin with group g at g x vchunk_bytes / g x lchunk_bytes (server.cc ImageStream) + manifest line
+// "image packed"; same bytes as the per-chunk files (default).
 // sq8 (user decision 2026-10-21): quantizer = per-dimension min / max over ALL indexed pool A rows [0, rows)
 // (deterministic, no sampling; pool B values outside the range clamp at run time), written as sq8.bin (float32
 // min[dim], scale[dim], scale = (max - min) / 255) + manifest lines "vec_format sq8" and "sq8 ..."; the graph is built
@@ -50,6 +53,12 @@ int main(int argc, char **argv) {
     const std::string vf = argv[11];
     if (vf != "fp32" && vf != "sq8") return std::fprintf(stderr, "vec_format must be fp32 or sq8\n"), 2;
     p.g.vec_format = vf == "sq8" ? vdb::kVecSQ8 : vdb::kVecF32;
+  }
+  bool packed = false;  // image format: chunks (per-chunk files, default) | packed (server.cc ImageStream)
+  if (argc > 12) {
+    const std::string f = argv[12];
+    if (f != "chunks" && f != "packed") return std::fprintf(stderr, "image format must be chunks or packed\n"), 2;
+    packed = f == "packed";
   }
   const int fd = open(in.c_str(), O_RDONLY);
   int32_t hdr[2];
@@ -116,7 +125,20 @@ int main(int argc, char **argv) {
       vdb::ShmHnsw::init_empty(&meta);
       std::mt19937_64 rng(seed + s);
       for (uint64_t r = s; r < rows; r += p.segments) g.insert(r, 0, &all[r * p.g.dim], rng);
-      for (uint64_t gi = 0; gi < groups; gi++) {
+      if (packed) {  // seg-<s>-v.bin: group g at g x vchunk_bytes, last group used bytes only; seg-<s>-l.bin: whole chunks
+        const std::string b = out + "/seg-" + std::to_string(s);
+        std::ofstream v(b + "-v.bin", std::ios::binary), l(b + "-l.bin", std::ios::binary);
+        for (uint64_t gi = 0; gi < groups; gi++) {
+          v.write(reinterpret_cast<const char *>(vc[gi].data()),
+                  std::streamsize(gi + 1 < groups ? p.g.vchunk_bytes() : (n - gi * N) * p.g.vrec_bytes()));
+          l.write(reinterpret_cast<const char *>(lc[gi].data()), std::streamsize(p.g.lchunk_bytes()));
+        }
+        if (!v || !l) {
+          std::fprintf(stderr, "segment %u: write error\n", s);
+          std::exit(1);
+        }
+      }
+      for (uint64_t gi = 0; !packed && gi < groups; gi++) {
         const std::string b = out + "/seg-" + std::to_string(s);
         std::ofstream(b + "-v" + std::to_string(gi) + ".bin", std::ios::binary)
             .write(reinterpret_cast<const char *>(vc[gi].data()),
@@ -143,6 +165,7 @@ int main(int argc, char **argv) {
     << p.g.dim << " " << p.g.M << " " << p.g.ef_construction << " " << p.g.capacity << " " << p.g.chunk_bytes
     << "\nper_chunk=" << p.g.per_chunk() << " groups=" << p.g.groups() << " vchunk_bytes=" << p.g.vchunk_bytes()
     << " lchunk_bytes=" << p.g.lchunk_bytes() << "\n";
+  if (packed) m << "image packed\n";  // server.cc packed_image(); absent = per-chunk files
   if (p.g.is_sq8()) {
     std::ofstream(out + "/sq8.bin", std::ios::binary)
         .write(reinterpret_cast<const char *>(sq8.data()), std::streamsize(sq8.size() * sizeof(float)));
