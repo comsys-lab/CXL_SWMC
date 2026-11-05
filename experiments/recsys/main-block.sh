@@ -120,8 +120,8 @@
 #   --mode fixed --rates <query/s> --warmup-s STREAM_AUC_SETTLE_S (30, discarded) --step-warmup-s 5 --step-measure-s
 #   STREAM_AUC_S (300) --drain-s 10, seed SEED + 3 (same seed, rate, seq_base and timing for every system and T = the
 #   same query draws: start = update position at make time + offset, both a function of the schedule and the seed).
-#   Checks: loadgen rc != 0 or a workload finish other than ok = stop (the chain retries the block); stream_check.py and
-#   check_breakdown.py recorded (status, not a stop). v7_post with the AUC row into <E>/auc_part.csv (per-part AUC over
+#   Checks: a workload finish other than ok, loadgen rc > 1 or rc 1 without a note = stop (the chain retries the block);
+#   loadgen rc 1 with a note, stream_check.py and check_breakdown.py are recorded (status, not a stop). v7_post with the AUC row into <E>/auc_part.csv (per-part AUC over
 #   the measured step: auc, logloss, auc_frozen on the same multiset of samples). <E>/stream-auc.tsv: name system
 #   rate_sps auc_q_s seq_base status. STREAM_AUC_ONLY=1: no SLO lifetimes in the block (AUC lifetimes only).
 set -uo pipefail
@@ -1000,12 +1000,18 @@ stream_auc() {  # <sys> <rate> <query/s>: AUC lifetime body (header "STREAM_AUC"
   measure "$LS" auc "${LGC[@]}" --opt seed=$fs --seed $fs --raw --mode fixed --rates "$q" \
     --warmup-s "${STREAM_AUC_SETTLE_S:-30}" --step-warmup-s 5 --step-measure-s "${STREAM_AUC_S:-300}" --drain-s 10
   rc=$?
-  [ $rc = 0 ] || stop "$NAME auc rc $rc"
-  grep -q 'workload_finish":"ok' "$RD/loadgen/summary.json" 2>/dev/null || stop "$NAME auc: loadgen workload finish"
+  grep -q 'workload_finish":"ok' "$RD/loadgen/summary.json" 2>/dev/null || stop "$NAME auc: loadgen workload finish (rc $rc)"
+  if [ $rc = 1 ]; then  # as stream_slo: loadgen rc 1 with a note is a recorded result (status), not a stop
+    local note
+    note=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("note",""))' "$RD/loadgen/summary.json" 2>/dev/null)
+    [ -n "$note" ] || stop "$NAME auc: loadgen rc 1 without a note"
+    st="loadgen-rc1"; echo "MAIN NOTE $NAME auc: $note"
+  elif [ $rc != 0 ]; then stop "$NAME auc rc $rc"; fi
   python3 $X/stream_check.py "$RD" > "$RD/stream-check.txt" 2>&1
   python3 $X/check_breakdown.py "$RD" > "$RD/breakdown-check.txt" 2>&1
-  grep -qE '^STREAMCHECK (PASS|NOTE)' "$RD/stream-check.txt" || st="streamcheck:$(grep -m1 '^STREAMCHECK' "$RD/stream-check.txt" | cut -d' ' -f2)"
+  grep -qE '^STREAMCHECK (PASS|NOTE)' "$RD/stream-check.txt" || st="$st,streamcheck:$(grep -m1 '^STREAMCHECK' "$RD/stream-check.txt" | cut -d' ' -f2)"
   grep -q '^BREAKDOWN PASS' "$RD/breakdown-check.txt" || st="$st,breakdown-fail"
+  st=${st#ok,}
   v7_post "$s" "$r" "$RD" "$E/auc_part.csv"
   [ "$st" = ok ] || echo "MAIN NOTE $NAME auc: $st (see $RD)"
   printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$NAME" $s $r "$q" "$sb" "$st" >> "$E/stream-auc.tsv"
