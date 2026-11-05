@@ -440,7 +440,7 @@ if [ $HASDS = 1 ]; then
   [ "$REPL" != all ] || { [[ $RPOOL =~ ^[1-9][0-9]*$ ]] && [ "$RPOOL" -ge 1073741824 ]; } \
     || { echo "SEQUENCE STOP: DS_REPLICA_MODE=all needs DS_REPLICA_POOL_BYTES >= 1073741824 (got '$RPOOL')"; exit 2; }
   [ -z "$RPOOL" ] || [ "$REPL" = all ] || { echo "SEQUENCE STOP: DS_REPLICA_POOL_BYTES without DS_REPLICA_MODE=all"; exit 2; }
-  [ "$REPL" = off ] || echo "BLOCK PLAN: De Stijl replica_mode $REPL on both VMs, pool per VM = min($RPOOL, MemAvailable - 4 GiB) (1 MiB floor, >= 1 GiB) at every ds lifetime start, after the cxl_shm load and before the preload; read back (ds-replica-<name>.txt); counters before the teardown (replica_pool_full must stay 0); back to off + previous pool after the teardown"
+  [ "$REPL" = off ] || echo "BLOCK PLAN: replica: De Stijl replica_mode $REPL on both VMs, pool per VM = min($RPOOL, MemAvailable - 4 GiB) (1 MiB floor, >= 1 GiB) at every ds lifetime start, after the cxl_shm load and before the preload; read back (ds-replica-<name>.txt); counters before the teardown (replica_pool_full must stay 0); back to off + previous pool after the teardown"
   [ -f "$DS_C/p-destijl-shm.sh" ] && [ "$(sha256sum < "$DS_C/packet.sha256" | cut -d' ' -f1)" = "$DS_BUNDLE_SHA" ] \
     && (cd "$DS_C" && sha256sum -c --quiet packet.sha256) || { echo "SEQUENCE STOP: DS_C is not the verified De Stijl bundle"; exit 2; }
   cmp -s "$REGION" "$DS_C/tools/cxl_region.yaml" || { echo "SEQUENCE STOP: REGION differs from the De Stijl bundle's region config"; exit 2; }
