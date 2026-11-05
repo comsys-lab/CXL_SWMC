@@ -771,6 +771,7 @@ class Server {
   }
   void opc_end(const OpCohSrc::Start &s, OpAcc *a) {
     if (!oc_.end(s, a)) st_.opc_read_errors++;
+    if constexpr (std::is_same_v<Be, MegalonBackend>) be_->lookup_hist_tick();  // shim v4 only; <= 1 copy per ms
   }
 
   static void read_file(const std::string &path, uint8_t *dst, uint64_t n) {

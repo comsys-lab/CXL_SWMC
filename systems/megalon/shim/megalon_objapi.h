@@ -10,7 +10,10 @@
 
 namespace mshim {
 
-constexpr uint32_t kApiVersion = 3;  // 2: thread_coh (MOT1 v6 Fig 2/3a); 3: thread_anchor (Megalon build >= 75)
+// 2: thread_coh (MOT1 v6 Fig 2/3a); 3: thread_anchor (Megalon build >= 75); 4: lookup_hist (Megalon build >= 79,
+// experiment megalon-page-granularity). A shim built against a Megalon without GetObjectLookupHist reports version 3
+// (build-shim.sh defines MSHIM_LOOKUP_HIST only when libmegalon.so exports it).
+constexpr uint32_t kApiVersion = 4;
 
 struct Obj {  // mirrors rackobj::ObjectHandle
   uint8_t *ptr;
@@ -102,6 +105,19 @@ struct AnchorSnap {
 // stale 1, concur+meta 4, spin 1. These k do NOT hold for read sections of RO objects, (C) notification retries,
 // events timed in unsampled sections under MEGALON_COH_EVENTS=always, KV creates (admit path), and sections with NR
 // replay or retries (extra anchors/version reads) — verifier 2026-10-17; do not use them as a correction.
+// v4 (Megalon build >= 79): index-lookup latency histogram of the CALLING thread since reg() (mirrors
+// rackobj::ObjectLookupHist). Only timed lookups are binned: the sampled read sections' first GetAnchor
+// (AnchorSnap.read_lookup_ns_sampled) and the timed write sections' GetAnchor (write_lookup_ns); log2 bins of TSC
+// cycles, bin i lower edge lo_ns[i] in ns (bin 0 from 0), counts exact, sums in ns.
+struct LookupHist {
+  static constexpr int kBins = 32;
+  uint64_t tsc_khz;                      // 0: timers off / not yet known
+  uint64_t read_samples, write_samples;  // = sum of read[] / write[]
+  uint64_t read_sum_ns, write_sum_ns;
+  uint64_t read[kBins], write[kBins];
+  uint64_t lo_ns[kBins];
+};
+static_assert(sizeof(LookupHist) == (5 + 3 * 32) * 8, "LookupHist layout is fixed (v4)");
 static_assert(sizeof(CohSnap) == 29 * 8, "CohSnap layout is fixed (v2)");
 static_assert(sizeof(AnchorSnap) == 16 * 8, "AnchorSnap layout is fixed (v3)");
 
@@ -120,6 +136,7 @@ struct Api {
   void (*stats)(Stats *s);
   void (*thread_coh)(CohSnap *s);  // v2; nullptr in a v1 shim
   void (*thread_anchor)(AnchorSnap *s);  // v3; absent (version < 3) in older shims: check version >= 3 first
+  void (*lookup_hist)(LookupHist *s);    // v4; absent (version < 4) in older shims: check version >= 4 first
 };
 
 }  // namespace mshim

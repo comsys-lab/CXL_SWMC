@@ -14,7 +14,8 @@ int main(int argc, char **argv) {
   const mshim::Api *a = fn();
   size_t node = a->node_id();
   printf("node %zu version %u info '%s' thread_coh %p\n", node, a->version, a->info, (void *)a->thread_coh);
-  if (a->version != 3 || !a->thread_coh || !a->thread_anchor) return 2;
+  if (a->version < 3 || a->version > 4 || !a->thread_coh || !a->thread_anchor) return 2;
+  if (a->version >= 4 && !a->lookup_hist) return 2;  // v4: Megalon build >= 79
   a->reg(1);
   uint64_t id = 0x5157000 + node;
   if (a->create(id, 4096 + 64) != 0) return 3;

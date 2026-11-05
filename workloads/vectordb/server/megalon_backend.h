@@ -75,6 +75,10 @@ inline void (*megalon_thread_coh(const MegalonApi *api))(mshim::CohSnap *) {
 inline void (*megalon_thread_anchor(const MegalonApi *api))(mshim::AnchorSnap *) {
   return api && api->version >= 3 ? api->thread_anchor : nullptr;
 }
+// lookup_hist of a loaded API (nullptr below version 4, i.e. Megalon builds <= 78).
+inline void (*megalon_lookup_hist(const MegalonApi *api))(mshim::LookupHist *) {
+  return api && api->version >= 4 ? api->lookup_hist : nullptr;
+}
 
 // [va, va + len) must be covered by mappings of `path` (Megalon's mapping of the device at map_va).
 inline bool mapped_by(uint64_t va, uint64_t len, const std::string &path, std::string *err) {
@@ -180,6 +184,11 @@ struct alignas(64) MegTimers {
                kWrStartNs, kWrBodyNs, kWrEndNs, kN };
   enum : int { kRoleMain, kRoleWriter, kRoleSearch, kRoleOther, kRoles };
   std::atomic<uint64_t> v[kN] = {};
+  // Megalon index-lookup histogram of the thread (shim v4 lookup_hist; cumulative since reg(); last copy taken by
+  // MegalonBackend::lookup_hist_tick): [0] read_samples [1] write_samples [2] read_sum_ns [3] write_sum_ns,
+  // [4 + i] read bin i, [4 + kBins + i] write bin i
+  static constexpr int kLh = 4 + 2 * mshim::LookupHist::kBins;
+  std::atomic<uint64_t> lh[kLh] = {};
   std::atomic<int> role{kRoleOther};
   TraceBuf tb;  // trace only (owner thread appends; dumped after the run)
   void add(int k, uint64_t d) { v[k].store(v[k].load(std::memory_order_relaxed) + d, std::memory_order_relaxed); }
@@ -197,7 +206,7 @@ class MegalonBackend {
   static constexpr const char *kLayoutTag = " backend=megalon";
 
   MegalonBackend(const cxl::region &, uint8_t *, const Params &p, const MegalonApi *api)
-      : p_(p), api_(api), coh_(megalon_thread_coh(api)) {
+      : p_(p), api_(api), coh_(megalon_thread_coh(api)), lh_(megalon_lookup_hist(api)) {
     dlog_chunks_ = p.dlog_chunks();
   }
   bool fits(std::string *err) const {
@@ -418,6 +427,27 @@ class MegalonBackend {
       const std::vector<uint64_t> rs = timers(r);
       for (int k = 0; k < MegTimers::kN; k++) o << "\nmegt." << roles[r] << names[k] << "=" << rs[k];
     }
+    // index-lookup histogram (lookup_hist_tick): lookup_hist.<role>.{read,write}_{samples,sum_ns}, .read.bNN,
+    // .write.bNN (counts per log2 bin, cumulative), lookup_hist.lo_ns.bNN = bin lower edge in ns; api 0 = absent
+    o << "\nlookup_hist.api=" << (lh_ ? 4 : 0);
+    if (lh_) {
+      constexpr int B = mshim::LookupHist::kBins;
+      std::lock_guard<std::mutex> g(tmu_);
+      o << "\nlookup_hist.tsc_khz=" << lh_tsc_khz_;
+      for (int i = 0; i < B; i++) o << "\nlookup_hist.lo_ns.b" << (i < 10 ? "0" : "") << i << "=" << lh_lo_ns_[i];
+      static const char *const lr[MegTimers::kRoles + 1] = {"", "main.", "writer.", "search.", "other."};
+      for (int r = -1; r < MegTimers::kRoles; r++) {
+        uint64_t s[MegTimers::kLh] = {};
+        for (const MegTimers *t : tblocks_)
+          if (r < 0 || t->role.load() == r)
+            for (int k = 0; k < MegTimers::kLh; k++) s[k] += t->lh[k].load(std::memory_order_relaxed);
+        const std::string p = std::string("\nlookup_hist.") + lr[r + 1];
+        o << p << "read_samples=" << s[0] << p << "write_samples=" << s[1] << p << "read_sum_ns=" << s[2] << p
+          << "write_sum_ns=" << s[3];
+        for (int i = 0; i < B; i++) o << p << "read.b" << (i < 10 ? "0" : "") << i << "=" << s[4 + i];
+        for (int i = 0; i < B; i++) o << p << "write.b" << (i < 10 ? "0" : "") << i << "=" << s[4 + B + i];
+      }
+    }
     if (wsec_) {
       uint64_t recs = 0, dropped = 0;
       {
@@ -454,6 +484,33 @@ class MegalonBackend {
     trace_cost_ns_ = (mono_ns() - a) / n;
   }
   bool tracing() const { return wsec_ != nullptr; }
+  // Index-lookup histogram (experiment megalon-page-granularity; shim v4, Megalon >= 79; a no-op otherwise): the
+  // calling worker thread copies its cumulative Megalon histogram into its counter block at most once per ms (called
+  // after every operation section, server.cc opc_end; one rdtsc otherwise). stats() sums the blocks per role
+  // (keys lookup_hist.*; cumulative, so stats deltas give per-step histograms). The copy lags the thread's last
+  // lookups by < 1 ms of its own work.
+  void lookup_hist_tick() const {
+    if (!lh_ || !tsc_khz_) return;
+    thread_local uint64_t next = 0;
+    const uint64_t t = __rdtsc();
+    if (t < next) return;
+    next = t + tsc_khz_;  // 1 ms
+    mshim::LookupHist h{};
+    lh_(&h);
+    MegTimers &m = tm();
+    const uint64_t x[4] = {h.read_samples, h.write_samples, h.read_sum_ns, h.write_sum_ns};
+    for (int i = 0; i < 4; i++) m.lh[i].store(x[i], std::memory_order_relaxed);
+    for (int i = 0; i < mshim::LookupHist::kBins; i++) {
+      m.lh[4 + i].store(h.read[i], std::memory_order_relaxed);
+      m.lh[4 + mshim::LookupHist::kBins + i].store(h.write[i], std::memory_order_relaxed);
+    }
+    if (!lh_lo_set_.load(std::memory_order_acquire)) {
+      std::lock_guard<std::mutex> g(tmu_);
+      for (int i = 0; i < mshim::LookupHist::kBins; i++) lh_lo_ns_[i] = h.lo_ns[i];
+      lh_tsc_khz_ = h.tsc_khz;
+      lh_lo_set_.store(h.tsc_khz != 0, std::memory_order_release);
+    }
+  }
   // node<K>.vdbtrace.bin (format: TraceFileHdr, then per thread TraceThreadHdr + records)
   bool dump_trace(const std::string &path, std::string *err) const {
     if (!wsec_) return true;
@@ -567,6 +624,9 @@ class MegalonBackend {
   const MegalonApi *api_;
   void (*coh_)(mshim::CohSnap *) = nullptr;
   uint64_t dlog_chunks_;
+  void (*lh_)(mshim::LookupHist *) = nullptr;           // shim v4 lookup_hist (nullptr: Megalon <= 78)
+  mutable uint64_t lh_lo_ns_[mshim::LookupHist::kBins] = {}, lh_tsc_khz_ = 0;  // bin edges (under tmu_)
+  mutable std::atomic<bool> lh_lo_set_{false};
   uint64_t *wsec_ = nullptr;  // HWcc: write sections completed by all nodes (trace only)
   uint32_t node_ = 0, clock_ns_ = 0, tsc_khz_ = 0;
   uint64_t max_chunks_ = 0, trace_cost_ns_ = 0;

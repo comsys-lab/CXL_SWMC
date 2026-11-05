@@ -100,13 +100,31 @@ void thread_anchor(mshim::AnchorSnap *s) {
   for (size_t i = 0; i < 6; i++) s->reserved[i] = t.reserved[i];  // [0] write_sampled (build >= 76)
 }
 
+#ifdef MSHIM_LOOKUP_HIST
+// v4 (build 79): the calling thread's index-lookup latency histogram
+void lookup_hist(mshim::LookupHist *s) {
+  static_assert(sizeof(mshim::LookupHist) == sizeof(rackobj::ObjectLookupHist), "LookupHist != ObjectLookupHist");
+  static_assert(mshim::LookupHist::kBins == rackobj::ObjectLookupHist::kBins, "LookupHist bins");
+  rackobj::ObjectLookupHist t{};
+  rackobj::GetObjectLookupHist(&t);
+  *s = mshim::LookupHist{};
+  s->tsc_khz = t.tsc_khz;
+  s->read_samples = t.read_samples, s->write_samples = t.write_samples;
+  s->read_sum_ns = t.read_sum_ns, s->write_sum_ns = t.write_sum_ns;
+  for (int i = 0; i < mshim::LookupHist::kBins; i++) s->read[i] = t.read[i], s->write[i] = t.write[i], s->lo_ns[i] = t.lo_ns[i];
+}
+constexpr uint32_t kVersion = mshim::kApiVersion;
+#else
+constexpr void (*lookup_hist)(mshim::LookupHist *) = nullptr;
+constexpr uint32_t kVersion = 3;  // Megalon without GetObjectLookupHist (build <= 78)
+#endif
+
 #ifndef MSHIM_INFO
 #define MSHIM_INFO "unknown"
 #endif
 
-const mshim::Api kApi{mshim::kApiVersion, MSHIM_INFO, node_id, reg, unreg, create, lookup,
-                      read_start, read_end, write_start, write_end, stats, thread_coh,
-                      thread_anchor};
+const mshim::Api kApi{kVersion,   MSHIM_INFO, node_id,     reg,          unreg,  create,     lookup, read_start,
+                      read_end,   write_start, write_end,  stats,        thread_coh, thread_anchor, lookup_hist};
 
 }  // namespace
 
