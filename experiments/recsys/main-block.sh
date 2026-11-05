@@ -124,6 +124,8 @@
 #   loadgen rc 1 with a note, stream_check.py and check_breakdown.py are recorded (status, not a stop). v7_post with the AUC row into <E>/auc_part.csv (per-part AUC over
 #   the measured step: auc, logloss, auc_frozen on the same multiset of samples). <E>/stream-auc.tsv: name system
 #   rate_sps auc_q_s seq_base status. STREAM_AUC_ONLY=1: no SLO lifetimes in the block (AUC lifetimes only).
+# De Stijl replica_mode (run 2 widening 2026-11-06, T = 1000 ms accuracy + staleness): DS_REPLICA_MODE off | all,
+#   DS_REPLICA_POOL_BYTES (cap); see the De Stijl block below and ds-replica.sh. Unset / off = no replica step.
 set -uo pipefail
 E=${1:?evidence dir}
 P=/home/comsys/sungsu/destijl-control X=$(cd "$(dirname "$0")" && pwd)
@@ -365,6 +367,7 @@ OWNER="RECSYS-$BLOCK-$(basename "$E")"; [ $BLOCK = h1 ] && OWNER="H1-recsys-$H1M
 # s_max_us written after ipoll, read back; unset = 200 / 200); adaptive lifetimes add --proc-sysfs /sys/kernel/cxl_shm
 # --proc-kthread cxl_ipoll (per-step adaptive counters, idle-poller CPU apart from cxl_recv) and write recv-post-<name>.txt
 . "$X/../eval/recv-mode.sh"
+. "$X/ds-replica.sh"   # replica_set / replica_post (De Stijl replica_mode all lifetimes only)
 [[ $RECV_MODE =~ ^(poll|idle|sleep|adaptive)$ ]] || { echo "SEQUENCE STOP: bad RECV_MODE"; exit 2; }
 PRM=${POP_RECV_MODE:-$RECV_MODE} IPOLL=${RECV_IPOLL:-} POPSV=- DSFP=0
 [[ $IPOLL =~ ^[01]?$ ]] || { echo "SEQUENCE STOP: bad RECV_IPOLL"; exit 2; }
@@ -415,7 +418,7 @@ POP_BUILD=${POP_BUILD:-10} POP_BUNDLE_SHA=${POP_BUNDLE_SHA:-626f6a0eb265553aaa6e
 # ENV:CXL_SYSTEM=ds ENV:CXL_DESTIJL_T_US=<T>). REGION must be the De Stijl region config (config/cxl_region-destijl.yaml;
 # the guest copies are checked against DS_GT/cxl_region.yaml at every load). L1 / L2 fix tokens need confirmed hw and
 # pop results (eval_levels_compute): a ds block uses numeric STREAM_FIX_LEVELS.
-KEXP=$K8 DST=0 HASDS=0
+KEXP=$K8 DST=0 HASDS=0 REPL=off RPOOL= REPL_SET=0
 [[ " ${SYSTEMS:-} " != *" ds "* ]] || HASDS=1
 if [ $HASDS = 1 ]; then
   [[ " ${SYSTEMS:-} " != *" pop "* ]] || { echo "SEQUENCE STOP: pop and ds need different guest kernels: separate blocks"; exit 2; }
@@ -428,6 +431,16 @@ if [ $HASDS = 1 ]; then
   # cxl_shm load of every ds lifetime, read back after the enable (recv-mode-<name>.txt), mismatch = stop
   [[ ${DS_RECV_EXTRA:-} =~ ^(((idle_sleep_us|idle_spin_us)=[0-9]+|fault_poll=[01])( |$))*$ ]] || { echo "SEQUENCE STOP: bad DS_RECV_EXTRA (${DS_RECV_EXTRA:-})"; exit 2; }
   [[ " ${DS_RECV_EXTRA:-} " != *" fault_poll=1 "* ]] || DSFP=1
+  # DS_REPLICA_MODE off | all (optional, runset-rs-ds.sh RS_DS_REPLICA_MODE; unset / off = no replica step at all, as
+  # before) and DS_REPLICA_POOL_BYTES (pool cap, required with all): ds-replica.sh replica_set after the cxl_shm load and
+  # before the preload (the kernel refuses a change once a managed VMA exists), replica counters before the teardown,
+  # back to off + the previous pool after the teardown (and in the EXIT trap after a cleanup teardown)
+  REPL=${DS_REPLICA_MODE:-off} RPOOL=${DS_REPLICA_POOL_BYTES:-}
+  [[ $REPL =~ ^(off|all)$ ]] || { echo "SEQUENCE STOP: bad DS_REPLICA_MODE ($REPL: off | all)"; exit 2; }
+  [ "$REPL" != all ] || { [[ $RPOOL =~ ^[1-9][0-9]*$ ]] && [ "$RPOOL" -ge 1073741824 ]; } \
+    || { echo "SEQUENCE STOP: DS_REPLICA_MODE=all needs DS_REPLICA_POOL_BYTES >= 1073741824 (got '$RPOOL')"; exit 2; }
+  [ -z "$RPOOL" ] || [ "$REPL" = all ] || { echo "SEQUENCE STOP: DS_REPLICA_POOL_BYTES without DS_REPLICA_MODE=all"; exit 2; }
+  [ "$REPL" = off ] || echo "BLOCK PLAN: De Stijl replica_mode $REPL on both VMs, pool per VM = min($RPOOL, MemAvailable - 4 GiB) (1 MiB floor, >= 1 GiB) at every ds lifetime start, after the cxl_shm load and before the preload; read back (ds-replica-<name>.txt); counters before the teardown (replica_pool_full must stay 0); back to off + previous pool after the teardown"
   [ -f "$DS_C/p-destijl-shm.sh" ] && [ "$(sha256sum < "$DS_C/packet.sha256" | cut -d' ' -f1)" = "$DS_BUNDLE_SHA" ] \
     && (cd "$DS_C" && sha256sum -c --quiet packet.sha256) || { echo "SEQUENCE STOP: DS_C is not the verified De Stijl bundle"; exit 2; }
   cmp -s "$REGION" "$DS_C/tools/cxl_region.yaml" || { echo "SEQUENCE STOP: REGION differs from the De Stijl bundle's region config"; exit 2; }
@@ -522,6 +535,11 @@ dax_root_all() {  # both VMs, always; fresh per-check file per VM; DAXOK=1 only 
 finish() {
   trap '' INT TERM HUP  # the rollback itself is not interruptible
   stop_servers; shm_cleanup
+  if [ "$REPL_SET" = 1 ]; then  # a stopped replica_mode all lifetime: off + previous pool, only after a teardown PASS
+    if grep -q "teardown PASS" "$SHMR/steps.log" 2>/dev/null; then
+      replica_set "${NAME:-cleanup}" off || echo "$(date -Is) ROLLBACK FAIL: replica_mode not off / pool not restored on a VM (see ds-replica-${NAME:-cleanup}.txt)" | tee -a "$E/rollback.out"
+    else echo "$(date -Is) ROLLBACK NOTE: replica_mode left as set (cxl_shm not torn down; the De Stijl rollback reboot clears it)" | tee -a "$E/rollback.out"; fi
+  fi
   local procs_ok=1
   servers_gone || procs_ok=0
   [ $procs_ok = 1 ] || echo "$(date -Is) ROLLBACK FAIL: a recsys-server process survived on a VM (procs != 0; see $E/rollback.out)" | tee -a "$E/rollback.out"
@@ -617,6 +635,10 @@ ds_setup() {  # De Stijl v2 cycle (protocol=destijl, init_state=shared; as pop_s
   env "${PS[@]}" bash $SHMS precheck || stop "ds shm precheck"
   local ip m p i t ph
   for ph in load chown; do env "${PS[@]}" bash $SHMS $ph || stop "ds shm $ph"; done
+  if [ "$REPL" != off ]; then  # before the preload / enable: no managed VMA may exist (EBUSY otherwise)
+    REPL_SET=1; replica_set "$NAME" $REPL || stop "replica_mode $REPL / pool on a VM (see ds-replica-$NAME.txt)"
+    echo "$(date -Is) $NAME: replica_mode $REPL, pool vm0 $(cat "$E/ds-replica-pool-$NAME-vm0") vm1 $(cat "$E/ds-replica-pool-$NAME-vm1") bytes (cap $RPOOL)"
+  fi
   for ip in "${IPS[@]}"; do  # the server's region config must equal the module parameters' one
     [ "$($SSH comsys@$ip "test -f $VM_PLAIN/cfg/cxl_region.yaml && test -f $DS_GT/cxl_region.yaml && sha256sum $VM_PLAIN/cfg/cxl_region.yaml $DS_GT/cxl_region.yaml | cut -d' ' -f1 | sort -u | wc -l" < /dev/null)" = 1 ] \
       || stop "region config missing or different on $ip (De Stijl tools)"
@@ -686,10 +708,16 @@ life_stop() {  # <sys>: session stop, final checks, page MSI teardown (pop)
   if [ $s = pop ] || [ $s = ds ]; then
     recv_post "$NAME"   # receiver / idle-poller CPU after the run (recv-post-<name>.txt; recv-mode.sh)
     env "${PS[@]}" STATUS_TAG=post bash $SHMS status
+    if [ $s = ds ] && [ "$REPL" != off ]; then  # a full pool maps CXL directly (mixed run; recv_check fails it too)
+      replica_post "$NAME" || echo "MAIN NOTE $NAME: replica pool full or counters unreadable on a VM (ds-replica-$NAME.txt)"
+    fi
     servers_gone || stop "servers left (page MSI teardown not attempted)"
     dax_free pre-teardown || stop "/dev/dax0.0 in use before the cxl_shm teardown"
     env "${PS[@]}" bash $SHMS teardown || stop "shm teardown"
     grep -q "teardown PASS" "$SHMR/steps.log" || stop "no teardown PASS"
+    if [ $s = ds ] && [ "$REPL" != off ]; then
+      replica_set "$NAME" off || stop "replica_mode back to off / pool restore (see ds-replica-$NAME.txt)"; REPL_SET=0
+    fi
   fi
   servers_gone || stop "servers left after $NAME"
 }
