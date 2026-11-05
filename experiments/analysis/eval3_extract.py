@@ -313,7 +313,7 @@ def rule_hit(rate, want):
     return rate is not None and want is not None and abs(rate - want) <= 0.01 * want
 
 
-def choose_l1(cells, override, fixed_rule=None):
+def choose_l1(cells, override, fixed_rule=None, sweep_only=False):
     """L1 per (workload, mix, N): fixed-phase step of the cell if present; else the rate override (--l1) or
     the lowest max under SLO (total offered req/s) among the group's systems, falling back to the lowest measured
     rate when some system has none (doc §2, outline 'Motivation'); the cell's nearest measured step is used.
@@ -321,7 +321,9 @@ def choose_l1(cells, override, fixed_rule=None):
     that have one): a fixed step at that total rate (within 1 %) is labelled l1_src "fixed L1 (<mix> rule)" (a
     fixed-only lifetime's part l1, eval-run2-vdb-l1fix.conf, or an appended l1 step); a pmax part at that rate (pop:
     its own max = the rule's rate) gets an extra fig-flushed-lines-l1.csv row "fixed L1 (<mix> rule; pmax step)"
-    (c.l1r) without becoming L1 elsewhere (its steps keep sel PMAX)."""
+    (c.l1r) without becoming L1 elsewhere (its steps keep sel PMAX).
+    sweep_only (--l1-sweep): ignore fixed steps and take the nearest sweep (non-fixed) step of every cell, so all
+    systems and mixes are compared at one sweep rate (paper Fig. 2b at 10 req/s, user 2026-11-05)."""
     fixed_rule = fixed_rule or {}
     groups = {}
     for c in cells:
@@ -353,12 +355,17 @@ def choose_l1(cells, override, fixed_rule=None):
                     if rule_hit(top, want):
                         c.l1r, c.l1r_src = list(c.pm), f"fixed L1 ({g[1]} rule; pmax step)"
                 continue
-            if fx:
+            if fx and not sweep_only:
                 top = max(c.steps[n]["offered_x"] for n in fx)
                 c.l1 = sorted(n for n in fx if c.steps[n]["offered_x"] == top)
                 c.l1_src, c.l1_rate = "fixed step", top
                 if rule_hit(top, want):
                     c.l1_src = f"fixed L1 ({g[1]} rule)"
+            elif sweep_only and rate is not None:
+                sw = [k for k in c.steps if c.steps[k]["phase"] not in FIXED_PHASES]
+                if sw:
+                    n = min(sw, key=lambda k: (abs(c.steps[k]["offered_x"] - rate), c.steps[k]["phase"] == "overload", k))
+                    c.l1, c.l1_src, c.l1_rate = [n], f"nearest sweep step to {rate:g} ({src})", rate
             elif rate is not None and c.steps:
                 n = min(c.steps, key=lambda k: (abs(c.steps[k]["offered_x"] - rate), c.steps[k]["phase"] == "overload", k))
                 c.l1, c.l1_src, c.l1_rate = [n], f"nearest step to {rate:g} ({src})", rate
@@ -802,7 +809,7 @@ def us(v):
     return v / 1e3 if v is not None else None
 
 
-def extract(roots, out_dir, systems, override, fixed_rule=None):
+def extract(roots, out_dir, systems, override, fixed_rule=None, sweep_only=False):
     cells = []
     for root, part in find_parts(roots):
         ci = cell_of(root, part)
@@ -815,7 +822,7 @@ def extract(roots, out_dir, systems, override, fixed_rule=None):
         cells.append(c)
     if not cells:
         sys.exit("eval3_extract: no parts found")
-    choose_l1(cells, override, fixed_rule)
+    choose_l1(cells, override, fixed_rule, sweep_only)
     nmeas = {}
     for c in cells:
         k = (c.root, c.life)
@@ -919,13 +926,15 @@ def main():
     ap.add_argument("--l1", default="", help="L1 total offered rate per mix, e.g. u50=21.6,u10=108 (overrides auto)")
     ap.add_argument("--l1-fixed", default="", help="fixed L1 rule rate (total offered req/s) per mix, e.g. u90=474: "
                     "fixed steps at that rate get l1_src 'fixed L1 (<mix> rule)' (pmax parts: '...; pmax step')")
+    ap.add_argument("--l1-sweep", action="store_true",
+                    help="L1 = nearest sweep step to the --l1 / auto rate in every cell (fixed steps ignored)")
     a = ap.parse_args()
     override, fixed_rule = {}, {}
     for arg, d in ((a.l1, override), (a.l1_fixed, fixed_rule)):
         for tok in filter(None, arg.split(",")):
             k, _, v = tok.partition("=")
             d[k] = float(v)
-    extract(a.dirs, a.out, set(a.systems.split(",")), override, fixed_rule)
+    extract(a.dirs, a.out, set(a.systems.split(",")), override, fixed_rule, a.l1_sweep)
 
 
 if __name__ == "__main__":
