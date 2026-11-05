@@ -18,6 +18,11 @@
 #   Megalon (only when a lifetime is mg / mgoff): MEG_BUILD VMEG MEG_CFG MEG_LIB MG_MAXD, MG_CAPACITY (optional,
 #   conf VDB_MG_CAPACITY: h1 = --max-ids 28000000 without --init-capacity, the fp32 28M cap, unset = h1 as before;
 #   x = the plain layout values --max-ids X_MAXIDS --init-capacity X_INIT_CAP, for the 54M SQ8 set),
+#   MG_SERVER_EXTRA (optional, conf H2N_MG_SERVER_EXTRA; experiment megalon-page-granularity): only
+#   "--chunk-bytes <n>" (n a power of two, 4096 .. 33554432), appended to the Megalon server arguments (4 KiB-page
+#   objects: --chunk-bytes 4096 with the c4k init image and YAML); unset = the 32 MiB default chunk as before,
+#   H2N_READY_TIMEOUT (optional, seconds 600 .. 5400, default 5400): run.sh READY_TIMEOUT per node (the init time cap
+#   of a lifetime; a lifetime that does not reach READY stops the block, node logs hold the init lines so far),
 #   H2N_SLO_PART (loadgen SLO part arguments), H2N_OPCOH_STRICT (0 | 1), H2N_CXLBW (0 | 1), H2N_HOSTCPU (0 | 1)
 #   De Stijl v2 (only when a lifetime is ds; systems/destijl/system.yaml): DS_C (bundle dir with p-destijl-shm.sh and
 #   packet.sha256), DS_BUNDLE_SHA (sha256 of that packet.sha256), DS_K (guest release -ds-destijl-<n>: every VM of the
@@ -389,6 +394,13 @@ VF=${H2N_VEC_FORMAT:-fp32} EF=${H2N_EF:-32} MGCAP=${MG_CAPACITY:-h1}
 [[ $VF =~ ^(fp32|sq8)$ ]] && [[ $EF =~ ^[1-9][0-9]*$ ]] || die "bad H2N_VEC_FORMAT / H2N_EF ($VF, $EF)"
 [[ $NA =~ ^[1-9][0-9]*$ ]] || die "bad X_NA ($NA)"
 [[ $MGCAP =~ ^(h1|x)$ ]] || die "bad MG_CAPACITY ($MGCAP: h1 | x)"
+MGX=${MG_SERVER_EXTRA:-} RDYT=${H2N_READY_TIMEOUT:-5400}
+if [ -n "$MGX" ]; then
+  [[ $MGX =~ ^--chunk-bytes\ ([1-9][0-9]*)$ ]] || die "bad MG_SERVER_EXTRA ($MGX: only --chunk-bytes <n>)"
+  cbx=${BASH_REMATCH[1]}
+  [ "$cbx" -ge 4096 ] && [ "$cbx" -le 33554432 ] && [ $((cbx & (cbx - 1))) = 0 ] || die "MG_SERVER_EXTRA --chunk-bytes $cbx (power of two, 4096 .. 33554432)"
+fi
+[[ $RDYT =~ ^[1-9][0-9]*$ ]] && [ "$RDYT" -ge 600 ] && [ "$RDYT" -le 5400 ] || die "bad H2N_READY_TIMEOUT ($RDYT: 600 .. 5400 s)"
 # H2N_SEARCH_THREADS (ef-bandwidth, 2026-10-28): search threads per VM instead of vCPU - 1 (core scaling at the
 # application level, the VM keeps its vCPUs); 1 .. vCPU - 1. Unset = vCPU - 1 as every run before.
 ST=${H2N_SEARCH_THREADS:-$((VCPU - 1))}
@@ -430,6 +442,7 @@ if [ $HASMG = 1 ]; then
     h1) MGSA="--backend megalon $COMMON_SA --max-writes 2097152 --max-ids 28000000 --max-deletes $MG_MAXD";;
     x)  MGSA="--backend megalon $COMMON_SA --max-writes 2097152 --max-ids $X_MAXIDS --max-deletes $MG_MAXD --init-capacity $X_INIT_CAP";;
   esac
+  MGSA+=${MGX:+ $MGX}   # MG_SERVER_EXTRA (c4k: --chunk-bytes 4096); unset = unchanged
   MGOK=1
   for f in "$MEG_BUILD/bin/vdb-server" "$MEG_BUILD/manifest.txt" "$MEG_CFG" "$MEG_LIB/manifest.txt"; do
     [ -f "$f" ] || { MGOK=0; pending "Megalon input missing for N = $N: $f (megalon-n agent)"; }
@@ -467,6 +480,7 @@ OWNER=eval-h2n-n$N-run$EVAL_RUN
 echo "BLOCK PLAN: vec_format=$VF ef=$EF init=$INIT host_image=$HOST_IMAGE"
 echo "BLOCK PLAN: h2n vdb N=$N vcpu/VM=$VCPU threads $ST+1 nodes=[${IPS[*]}] lifetimes=[${LIVES[*]}] app=$APP mg_app=$MGAPP ring=$RING cxlbw=$CXLBW hostcpu=$HOSTCPU opcoh_strict=$STRICT"
 echo "BLOCK PLAN: server_args plain=[$SA]${MGSA:+ megalon=[$MGSA]}"
+[ -z "$MGX" ] && [ "$RDYT" = 5400 ] || echo "BLOCK PLAN: megalon-page: ready_timeout_s=$RDYT megalon_extra=[$MGX] mg_app=$MGAPP megalon=[$MGSA]"
 [ $DSKER = 0 ] || echo "BLOCK PLAN: destijl release=$DS_K bundle=$DS_C guest_tools=$DS_GT region=$REGION T=$DST us recv_mode=$RECV_MODE (node env CXL_SYSTEM=ds CXL_DESTIJL_T_US=<T>; ds:<mix>:t<T> overrides T) replica_mode=$REPL pool_bytes=${RPOOL:--}${DAMONP:+ damon=[$DAMONP] damon_guest_sha256=$(sha256sum < "$EV/ds-damon-guest.sh" | cut -c1-64)}"
 [ "$REPL" != damon ] || echo "BLOCK PLAN: DAMON at=$DXAT range=$DXRANGE start_keys=[$DXSTART] regions_capture=$DXREG warmup=[${DXWARM:-none}]${DXWARM:+ warm_parts=[$DXWPARTS] nogate=[$DXWNOGATE]}$([ "$DXAT" = enable ] || echo " hook_sha256=$(sha256sum < "$EV/damonx-hook.sh" | cut -c1-64)")"
 [ $L1ON = 0 ] || echo "BLOCK PLAN: L1 step on hw/pop/ds lifetimes: --mode fixed --rates <L1> ${L1W}s warm-up + ${L1M}s + ${L1D}s drain; L1 from mg-<mix>-n$N rows of [${L1FROM:-} + this block]; no mg max -> L1 = ramp start $L1START, no step"
@@ -601,7 +615,8 @@ gate() { bash "$HG" check "$E/gate-$1.txt" > /dev/null || stop "h3 gate ($1; see
 { echo "# h2n block $OWNER: vdb N=$N vcpu/VM=$VCPU lifetimes [${LIVES[*]}] seed=$SEED recv_mode=$RECV_MODE"
   echo "nodes=${IPS[*]} domains=${DOMS[*]} server_args=[$SA] megalon_args=[$MGSA] app_hwcc=$APP mg_app_hwcc=$MGAPP ring=$RING region_sha256=$(sha256sum < "$REGION" | cut -c1-64)"
   echo "host_server=$HOSTSRV sha256=$(sha256sum < "$HOSTSRV" | cut -c1-64) loadgen=$LOADGEN sha256=$(sha256sum < "$LOADGEN" | cut -c1-64)"
-  [ $HASMG = 1 ] && echo "megalon_build=$MEG_BUILD lib=$MEG_LIB cfg=$MEG_CFG sha256=$(sha256sum < "$MEG_CFG" | cut -c1-64) vmeg=$VMEG mg_max_deletes=$MG_MAXD"
+  [ $HASMG = 1 ] && echo "megalon_build=$MEG_BUILD lib=$MEG_LIB cfg=$MEG_CFG sha256=$(sha256sum < "$MEG_CFG" | cut -c1-64) vmeg=$VMEG mg_max_deletes=$MG_MAXD mg_extra=[$MGX]"
+  [ "$RDYT" = 5400 ] || echo "ready_timeout_s=$RDYT (H2N_READY_TIMEOUT)"
   echo "writes=$X_WRITES sha256=$(sha256sum < "$X_WRITES" | cut -c1-64) max_deletes=$X_MAXD"
   echo "slo_part=[$H2N_SLO_PART]"
   echo "receiver: pop_recv_mode=$PRM pop_adapt_ko=${POP_ADAPT_KO:--} pop_adapt_ko_sha256=$([ -f "${POP_ADAPT_KO:-}" ] && sha256sum < "$POP_ADAPT_KO" | cut -c1-64 || echo -) pop_srcversion=$POPSV ds_recv_mode=$RECV_MODE ds_extra=[$DSRX] ds_fault_poll=$DSFP ipoll=${IPOLL:-default} $(recv_wsm_desc) readback_sha256=$(sha256sum < "$RB" | cut -c1-64)"
@@ -910,7 +925,7 @@ vdb_life() {  # <sys> <mix> [r<j> | t<T us>]
     log "$name: fixed warmup [$FWARM] (${FWDUR} s), parts [$PARTSV]"
   fi
   local LG=(--opt data=$X_DATA --opt writes=$X_WRITES --opt k=10 --mix "update=$U,search=$((100 - U))" "${SLOARG[@]}" --x-stream search --raw)
-  local RE=(V=$VPLAIN HOST_SERVER=$HOSTSRV LOADGEN=$LOADGEN INIT=$INIT READY_TIMEOUT=5400 RUN_KIND=measurement TRACE=0 STATS_OP=10
+  local RE=(V=$VPLAIN HOST_SERVER=$HOSTSRV LOADGEN=$LOADGEN INIT=$INIT READY_TIMEOUT=$RDYT RUN_KIND=measurement TRACE=0 STATS_OP=10
     "PARTS=$PARTSV" H1_MEASURE_RUN=1 MEASURE_PART_DIR=$MEASURE_PART_DIR "PART_ARGS_slo=$PSLO" PART_SEED_slo=$SEED "${L1X[@]}"
     "PART_GATE_CMD=bash $HG check" "${DXE[@]}" "${PMX[@]}")   # between parts: the N-VM gate (run.sh part hook), never the 2-VM h1-gate.sh
   case $s in
@@ -1053,7 +1068,7 @@ vdb_fixed_life() {  # <sys> <mix>
   fk=$(fkey $s $mix) parts=${FPARTS[$(fkey $s $mix)]}
   R=$E/$name
   local LG=(--opt data=$X_DATA --opt writes=$X_WRITES --opt k=10 --mix "update=$U,search=$((100 - U))" --x-stream search --raw)
-  local RE=(V=$VPLAIN HOST_SERVER=$HOSTSRV LOADGEN=$LOADGEN INIT=$INIT READY_TIMEOUT=5400 RUN_KIND=measurement TRACE=0 STATS_OP=10
+  local RE=(V=$VPLAIN HOST_SERVER=$HOSTSRV LOADGEN=$LOADGEN INIT=$INIT READY_TIMEOUT=$RDYT RUN_KIND=measurement TRACE=0 STATS_OP=10
     "PARTS=$parts" H1_MEASURE_RUN=1 MEASURE_PART_DIR=$MEASURE_PART_DIR "PART_GATE_CMD=bash $HG check"
     "PART_PRE_CMD=bash $EV/fixed-part-hook.sh pre $fk" "PART_POST_CMD=bash $EV/fixed-part-hook.sh post $fk")
   for t in $FIXED; do
