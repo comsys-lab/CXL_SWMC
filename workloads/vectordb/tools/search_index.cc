@@ -8,6 +8,8 @@
 // usage: vdb-search-index <init dir> <queries.fbin> <gt.bin> <nq> <ef list, e.g. 64,96,128> [threads 16] [k 10]
 //        [nseg: load and search only segments 0..nseg-1 (records with id % segments < nseg); the GT must be built for
 //        the same subset (static_gt.py --subset-mod segments --subset-lt nseg); default all]
+// Reads both init image formats: per-chunk files (default) and packed (manifest line "image packed"; seg-<s>-v.bin /
+// seg-<s>-l.bin, group g at g x vchunk_bytes / g x lchunk_bytes, server.cc ImageStream; one buffer per file).
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -67,6 +69,7 @@ int main(int argc, char **argv) {
 
   vdb::GraphParams g;
   uint32_t segments = 0;
+  bool packed = false;
   {
     std::ifstream man(dir + "/manifest.txt");
     bool ok = false;
@@ -77,6 +80,7 @@ int main(int argc, char **argv) {
         ok = bool(is);
       }
       if (line == "vec_format sq8") g.vec_format = vdb::kVecSQ8;
+      if (line == "image packed") packed = true;
     }
     if (!ok) die("no graph line in " + dir + "/manifest.txt");
   }
@@ -130,7 +134,23 @@ int main(int argc, char **argv) {
       vdb::GraphMeta &m = metas[s];
       m.count = count, m.ep_level = r.second[1], m.upper_cur = r.second[2];
       CountAcc::Mem mem{&m, {}, {}};
-      for (uint64_t gi = 0; gi < g.groups(); gi++) {
+      if (packed) {  // group g at g x vchunk_bytes / g x lchunk_bytes of one buffer per file
+        const uint64_t G = (count + N - 1) / N;
+        const uint64_t vb = G ? (G - 1) * g.vchunk_bytes() + (count - (G - 1) * N) * g.vrec_bytes() : 0,
+                       lb = G * g.lchunk_bytes();
+        keep.emplace_back(new uint8_t[vb]);
+        uint8_t *vp = keep.back().get();
+        read_file(dir + "/seg-" + std::to_string(s) + "-v.bin", vp, vb);
+        keep.emplace_back(new uint8_t[lb]);
+        uint8_t *lp = keep.back().get();
+        read_file(dir + "/seg-" + std::to_string(s) + "-l.bin", lp, lb);
+        for (uint64_t gi = 0; gi < g.groups(); gi++) {
+          mem.vec.push_back(gi < G ? vp + gi * g.vchunk_bytes() : nullptr);
+          mem.link.push_back(gi < G ? lp + gi * g.lchunk_bytes() : nullptr);
+        }
+        bytes += vb + lb;
+      }
+      for (uint64_t gi = 0; !packed && gi < g.groups(); gi++) {
         if (gi * N >= count) {
           mem.vec.push_back(nullptr), mem.link.push_back(nullptr);
           continue;
@@ -148,6 +168,8 @@ int main(int argc, char **argv) {
       total += count;
     }
   }
+  std::printf("image %s, chunk_bytes %lu, per_chunk %lu\n", packed ? "packed" : "per-chunk", (unsigned long)g.chunk_bytes,
+              (unsigned long)g.per_chunk());
   std::printf("index %s: %s, segments 0..%u of %u, %lu records, vrec_bytes %lu, links0_bytes %lu, loaded %.1f GiB in %.0f s\n",
               dir.c_str(), g.is_sq8() ? "sq8" : "fp32", nseg - 1, segments, (unsigned long)total, (unsigned long)g.vrec_bytes(),
               (unsigned long)g.links0_bytes(), bytes / double(1ull << 30),

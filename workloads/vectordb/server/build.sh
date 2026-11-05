@@ -16,6 +16,7 @@ ar rcs "$OUT/obj/libdestijl.a" "$OUT/obj/de_stijl.o"
 c++ "${FLAGS[@]}" -DCXL_REGION_DESTIJL -I"$DSL" "$HERE/server.cc" -o "$OUT/bin/vdb-server" -L"$OUT/obj" -ldestijl
 c++ "${FLAGS[@]}" "$HERE/../tools/build_index.cc" -o "$OUT/bin/vdb-build-index"
 c++ "${FLAGS[@]}" "$HERE/../tools/search_index.cc" -o "$OUT/bin/vdb-search-index"   # Host check tool (not installed on guests)
+c++ "${FLAGS[@]}" "$HERE/../tools/relayout_c4k.cc" -o "$OUT/bin/vdb-relayout-c4k"   # Host tool: 4 KiB-page packed image
 { echo "# vdb-server build (CXL_SWMC/workloads/vectordb/server/build.sh)"; echo "date=$(date -Is)"
   echo "source_commit=$(git -C "$HERE" rev-parse HEAD) dirty=$(git -C "$HERE" status --porcelain -- "$HERE/.." "$ROOT/systems/common" "$ROOT/experiments/loadgen" "$ROOT/systems/megalon/shim" "$ROOT/systems/popcorn_new/include" "$DSL" | wc -l)"
   echo "source_dirty_files=$(git -C "$HERE" status --porcelain -- "$HERE/.." "$ROOT/systems/common" "$ROOT/experiments/loadgen" "$ROOT/systems/megalon/shim" "$ROOT/systems/popcorn_new/include" "$DSL" | awk '{print $2}' | tr '\n' ' ')"
