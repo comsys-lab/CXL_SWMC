@@ -396,6 +396,7 @@ class Server {
     dmu_.reset(new std::mutex[p_.nr_nodes]);
     rng_.seed(o_.seed * 1000003 + o_.node);
 
+    it_.before_load = proc_rss();  // init breakdown: baseline of index_bytes (InitTimes)
     if (o_.node == 0) load_initial();
     store_release(&h_->nodes[o_.node].loaded, o_.run_id);
     if (!cxl::hwcc::poll_until(
@@ -576,17 +577,16 @@ class Server {
   // Init / load breakdown (experiment megalon-page-granularity; stats keys init.*, log lines "vdb-server: INIT ..."):
   // create = Megalon ObjectCreate of every object (node 0; plain: nothing), image = initial image copy (node 0),
   // zero = preload zeroing (zeroed_ns_), check = ObjectLookup of every object (every node), warmup = the warm-up reads
-  // after check (every node). Resident memory (proc_rss) around create (node 0) and check (every node):
-  // index_bytes = RssAnon growth across create on node 0 and across check on the other nodes (where the replicated
-  // Megalon index is filled by log replay); create / image / check on other nodes stay 0.
+  // after check (every node). Resident memory (proc_rss): before_load = every node right before node 0's load /
+  // the wait for every node's `loaded` (Megalon initialised, no object yet), around create (node 0) and check (every
+  // node). index_bytes = RssAnon(after check) - RssAnon(before_load) on every node: node 0 fills its Megalon index in
+  // ObjectCreate, the other nodes by log replay while they wait for node 0 (so their growth is not inside check).
+  // create / image on other nodes stay 0.
   struct InitTimes {
     uint64_t create_ns = 0, image_ns = 0, image_bytes = 0, check_ns = 0, warmup_ns = 0, warmup_bytes = 0;
-    Rss before_create, after_create, before_check, after_check;
+    Rss before_load, before_create, after_create, before_check, after_check;
     bool packed = false;
-    uint64_t index_bytes(uint32_t node) const {
-      const Rss &a = node == 0 ? before_create : before_check, &b = node == 0 ? after_create : after_check;
-      return b.anon > a.anon ? b.anon - a.anon : 0;
-    }
+    uint64_t index_bytes() const { return after_check.anon > before_load.anon ? after_check.anon - before_load.anon : 0; }
   };
 
   void load_initial() {
@@ -719,17 +719,18 @@ class Server {
     std::fprintf(stderr, "vdb-server: INIT node %u create_s=%.3f image_s=%.3f zero_s=%.3f check_s=%.3f warmup_s=%.3f "
                  "image=%s index_bytes=%lu\n", o_.node, it_.create_ns / 1e9, it_.image_ns / 1e9, zeroed_ns_ / 1e9,
                  it_.check_ns / 1e9, it_.warmup_ns / 1e9, o_.node == 0 && !o_.init_dir.empty() ? (it_.packed ? "packed" : "per-chunk") : "none",
-                 (unsigned long)it_.index_bytes(o_.node));
+                 (unsigned long)it_.index_bytes());
   }
   void init_stats(std::ostream &o) const {
     o << "\ninit.create_ns=" << it_.create_ns << "\ninit.image_ns=" << it_.image_ns << "\ninit.image_bytes=" << it_.image_bytes
       << "\ninit.image_packed=" << int(it_.packed) << "\ninit.zero_ns=" << zeroed_ns_ << "\ninit.check_ns=" << it_.check_ns
       << "\ninit.warmup_ns=" << it_.warmup_ns << "\ninit.warmup_bytes=" << it_.warmup_bytes
+      << "\ninit.rss_before_load=" << it_.before_load.rss << "\ninit.rss_anon_before_load=" << it_.before_load.anon
       << "\ninit.rss_before_create=" << it_.before_create.rss << "\ninit.rss_after_create=" << it_.after_create.rss
       << "\ninit.rss_anon_before_create=" << it_.before_create.anon << "\ninit.rss_anon_after_create=" << it_.after_create.anon
       << "\ninit.rss_before_check=" << it_.before_check.rss << "\ninit.rss_after_check=" << it_.after_check.rss
       << "\ninit.rss_anon_before_check=" << it_.before_check.anon << "\ninit.rss_anon_after_check=" << it_.after_check.anon
-      << "\ninit.index_bytes=" << it_.index_bytes(o_.node);
+      << "\ninit.index_bytes=" << it_.index_bytes();
   }
 
   // ---------------------------------------------------------------- per-operation time split (opcoh.h)
