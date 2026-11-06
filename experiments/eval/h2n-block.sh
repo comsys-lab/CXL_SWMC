@@ -242,6 +242,15 @@ DSRX=${H2N_DS_RECV_EXTRA:-}
   || die "bad H2N_DS_RECV_EXTRA ($DSRX: 'idle_sleep_us=<n> idle_spin_us=<n> fault_poll=<0|1>', any subset)"
 DSFP=0; [[ " $DSRX " != *" fault_poll=1 "* ]] || DSFP=1   # adaptive ds lifetimes: fault_poll checked at this value
 [ -z "$DSRX" ] || [ $HASDS = 1 ] || echo "BLOCK NOTE: H2N_DS_RECV_EXTRA applies to ds lifetimes only (none in this block)"
+# flat-directory-reference (2026-11-07): H2N_DS_BPD_MODE=flat (De Stijl build 12, cxl_shm 13.5) adds bpd_mode=flat to
+# the cxl_shm load of every ds lifetime and requires H2N_DS_REGION = the bundle's tools/cxl_region.yaml (byte-equal; the
+# flat block needs the 128 MiB msg_ring of config/cxl_region-destijl-flat.yaml); per lifetime on every VM: status pre =
+# param bpd_mode flat + "registered: bpd_mode flat" + layout bpd_mode flat (pre and post), flat only, status post
+# (checked after the teardown): bpd_evict = bpd_evict_m = bpd_insert = 0, protocol_error = tx_timeout = 0 and the bpd_flat_acquire delta summed over
+# the VMs > 0 (E/ds-flat-<name>.txt); a miss stops the block. Unset / sets = unchanged.
+DSBPD=${H2N_DS_BPD_MODE:-}
+[[ $DSBPD =~ ^(sets|flat)?$ ]] || die "bad H2N_DS_BPD_MODE ($DSBPD: sets | flat)"
+[ -z "$DSBPD" ] || [ $HASDS = 1 ] || die "H2N_DS_BPD_MODE needs ds lifetimes"
 [ $HAST = 0 ] || [ -z "${H2N_FIXED:-}" ] || die "ds:<mix>:t<T> lifetimes are SLO lifetimes (not with H2N_FIXED)"
 if [ $DSKER = 1 ]; then
   [ $HASPOP = 0 ] || die "pop and ds lifetimes need different guest kernels: run them in separate blocks"
@@ -355,6 +364,11 @@ fi
 if [ $DSKER = 1 ]; then  # the De Stijl bundle instead of the Popcorn one (no pop lifetime in a ds block)
   [ -f "$REGION" ] && [ -f "$DS_C/p-destijl-shm.sh" ] && [ "$(sha256sum < "$DS_C/packet.sha256" | cut -c1-64)" = "$DS_BUNDLE_SHA" ] \
     && (cd "$DS_C" && sha256sum -c --quiet packet.sha256) || die "REGION ($REGION) or the De Stijl bundle ($DS_C) does not verify"
+  # De Stijl region == the bundle's region (verifier review build 12 M1): msg_ring always (silent when equal), whole file
+  # with H2N_DS_BPD_MODE (the app area sits below msg_ring: server and module must read the same file)
+  [ "$(grep -E '^msg_ring:' "$REGION" | cut -d'#' -f1 | tr -d ' ')" = "$(grep -E '^msg_ring:' "$DS_C/tools/cxl_region.yaml" | cut -d'#' -f1 | tr -d ' ')" ] \
+    || die "REGION ($REGION) msg_ring differs from the De Stijl bundle's tools/cxl_region.yaml"
+  [ -z "$DSBPD" ] || cmp -s "$REGION" "$DS_C/tools/cxl_region.yaml" || die "H2N_DS_BPD_MODE: REGION ($REGION) != $DS_C/tools/cxl_region.yaml"
 else
 [ -f "$REGION" ] && [ "$(sha256sum < "$C8/packet.sha256" | cut -c1-64)" = "$POP_BUNDLE_SHA" ] \
   && (cd "$C8" && sha256sum -c --quiet packet.sha256) || die "REGION or the Popcorn bundle ($C8) does not verify"
@@ -482,6 +496,7 @@ echo "BLOCK PLAN: h2n vdb N=$N vcpu/VM=$VCPU threads $ST+1 nodes=[${IPS[*]}] lif
 echo "BLOCK PLAN: server_args plain=[$SA]${MGSA:+ megalon=[$MGSA]}"
 [ -z "$MGX" ] && [ "$RDYT" = 5400 ] || echo "BLOCK PLAN: megalon-page: ready_timeout_s=$RDYT megalon_extra=[$MGX] mg_app=$MGAPP megalon=[$MGSA]"
 [ $DSKER = 0 ] || echo "BLOCK PLAN: destijl release=$DS_K bundle=$DS_C guest_tools=$DS_GT region=$REGION T=$DST us recv_mode=$RECV_MODE (node env CXL_SYSTEM=ds CXL_DESTIJL_T_US=<T>; ds:<mix>:t<T> overrides T) replica_mode=$REPL pool_bytes=${RPOOL:--}${DAMONP:+ damon=[$DAMONP] damon_guest_sha256=$(sha256sum < "$EV/ds-damon-guest.sh" | cut -c1-64)}"
+[ -z "$DSBPD" ] || echo "BLOCK PLAN: destijl bpd_mode=$DSBPD (cxl_shm load bpd_mode=$DSBPD; region == bundle region $(sha256sum < "$REGION" | cut -c1-16); checks pre + post: param/registered/layout bpd_mode $DSBPD$([ "$DSBPD" = flat ] && echo '; post: bpd_evict=bpd_evict_m=bpd_insert=protocol_error=tx_timeout=0, sum bpd_flat_acquire delta > 0'))"
 [ "$REPL" != damon ] || echo "BLOCK PLAN: DAMON at=$DXAT range=$DXRANGE start_keys=[$DXSTART] regions_capture=$DXREG warmup=[${DXWARM:-none}]${DXWARM:+ warm_parts=[$DXWPARTS] nogate=[$DXWNOGATE]}$([ "$DXAT" = enable ] || echo " hook_sha256=$(sha256sum < "$EV/damonx-hook.sh" | cut -c1-64)")"
 [ $L1ON = 0 ] || echo "BLOCK PLAN: L1 step on hw/pop/ds lifetimes: --mode fixed --rates <L1> ${L1W}s warm-up + ${L1M}s + ${L1D}s drain; L1 from mg-<mix>-n$N rows of [${L1FROM:-} + this block]; no mg max -> L1 = ramp start $L1START, no step"
 [ -z "$FWARM" ] || echo "BLOCK PLAN: fixed warmup (H2N_WARMUP) on hw/pop/ds SLO lifetimes: [$FWARM] parts=[$FWPARTS] nogate=[$FWNOGATE] duration_s=$FWDUR (no end condition; mg: none)"
@@ -621,6 +636,7 @@ gate() { bash "$HG" check "$E/gate-$1.txt" > /dev/null || stop "h3 gate ($1; see
   echo "slo_part=[$H2N_SLO_PART]"
   echo "receiver: pop_recv_mode=$PRM pop_adapt_ko=${POP_ADAPT_KO:--} pop_adapt_ko_sha256=$([ -f "${POP_ADAPT_KO:-}" ] && sha256sum < "$POP_ADAPT_KO" | cut -c1-64 || echo -) pop_srcversion=$POPSV ds_recv_mode=$RECV_MODE ds_extra=[$DSRX] ds_fault_poll=$DSFP ipoll=${IPOLL:-default} $(recv_wsm_desc) readback_sha256=$(sha256sum < "$RB" | cut -c1-64)"
   [ $DSKER = 0 ] || echo "destijl: bundle=$DS_C bundle_sha=$DS_BUNDLE_SHA release=$DS_K guest_tools=$DS_GT region=$REGION t_us=$DST recv_mode=$RECV_MODE replica_mode=$REPL replica_pool_bytes=${RPOOL:--}${DAMONP:+ damon=[$DAMONP] damon_guest_sha256=$(sha256sum < "$EV/ds-damon-guest.sh" | cut -c1-64)}"
+  [ -z "$DSBPD" ] || echo "destijl_bpd_mode=$DSBPD region_sha256=$(sha256sum < "$REGION" | cut -c1-64) bundle_region_sha256=$(sha256sum < "$DS_C/tools/cxl_region.yaml" | cut -c1-64)"
   [ "$REPL" != damon ] || echo "damon: at=$DXAT range=$DXRANGE start_keys=[$DXSTART] regions_capture=$DXREG warmup=[$DXWARM] warm_parts=[$DXWPARTS]$([ "$DXAT" = enable ] || echo " hook_sha256=$(sha256sum < "$EV/damonx-hook.sh" | cut -c1-64)")"
   [ $L1ON = 0 ] || echo "l1: from=[$L1FROM] warmup_s=$L1W measure_s=$L1M drain_s=$L1D ramp_start=$L1START"
   [ $PMON = 0 ] || echo "pmax: from=[$PMFROM] warmup_s=$PMW measure_s=$PMM drain_s=$PMD decide_sha256=$(sha256sum < "$EV/pmax_decide.py" | cut -c1-64)"
@@ -685,7 +701,7 @@ pop_down() {
 # Same order and checks as pop_up: precheck, load (+ state running on every node), chown, region check, preload
 # through a plain mapping (node 0), enable (syscall 470, protocol destijl), recv_mode, status.
 ds_up() {  # <name>
-  DSP=(K=$DS_K GT=$DS_GT C=$DS_C R=$E/dsshm-$1 INIT_STATE=shared "LOAD_EXTRA=recv_mode=$RECV_MODE${DSRX:+ ${DSRX% }}")
+  DSP=(K=$DS_K GT=$DS_GT C=$DS_C R=$E/dsshm-$1 INIT_STATE=shared "LOAD_EXTRA=recv_mode=$RECV_MODE${DSRX:+ ${DSRX% }}${DSBPD:+ bpd_mode=$DSBPD}")
   [ $OWNED = root ] || { dax_owner root || stop "dax0.0 back to root before De Stijl"; OWNED=root; }
   servers_gone || stop "a server runs before the De Stijl load"
   env "${DSP[@]}" bash $DS_C/p-destijl-shm.sh precheck >> "$E/block.log" 2>&1 || stop "ds shm precheck"
@@ -707,6 +723,7 @@ ds_up() {  # <name>
   env "${DSP[@]}" bash $DS_C/p-destijl-shm.sh enable >> "$E/block.log" 2>&1 || stop "ds enable gate"
   recv_apply ds "$1" "$RECV_MODE"
   env "${DSP[@]}" STATUS_TAG=pre bash $DS_C/p-destijl-shm.sh status >> "$E/block.log" 2>&1 || stop "ds status pre"
+  [ -z "$DSBPD" ] || bpd_check "$1" pre || stop "ds bpd_mode $DSBPD check pre ($E/ds-flat-$1.txt)"
   if [ "$REPL" = damon ] && [ "$DXAT" = ready ]; then  # damonx-hook.sh starts the kdamond after READY; sampler from now
     DAMON_SET=1; damon_sampler_start "$1" 0
     log "$1: DAMON at READY (damonx-hook.sh, range $DXRANGE, keys [$DXSTART], warmup [${DXWARM:-none}]); sampler on (ds-damon-$1.txt)"
@@ -735,7 +752,28 @@ ds_down() {  # <name>
   dax_unused pre-teardown || stop "/dev/dax0.0 in use before the cxl_shm (destijl) teardown"
   env "${DSP[@]}" bash $DS_C/p-destijl-shm.sh teardown >> "$E/block.log" 2>&1 || stop "ds shm teardown"
   if [ "$REPL" != off ]; then replica_set "$1" off || stop "replica_mode back to off / pool bound restore (see ds-replica-$1.txt)"; REPL_SET=0; fi
+  [ -z "$DSBPD" ] || bpd_check "$1" post || stop "ds bpd_mode $DSBPD check post ($E/ds-flat-$1.txt)"
 }
+bpd_check() {  # <name> <pre|post>: H2N_DS_BPD_MODE checks on E/dsshm-<name>/status-<tag>-vm<i>.txt (header above)
+  local i f v pre=0 post=0 bad=
+  for i in "${!IPS[@]}"; do
+    f=$E/dsshm-$1/status-$2-vm$i.txt
+    grep -qx "param.bpd_mode=$DSBPD" "$f" || bad+=" vm$i:param"
+    grep -qx "ds.registered: bpd_mode $DSBPD" "$f" || bad+=" vm$i:registered"
+    grep -qx "cxl_shm.layout: bpd_mode $DSBPD" "$f" || bad+=" vm$i:layout"
+    if [ "$2" = post ] && [ "$DSBPD" = flat ]; then
+      for v in bpd_evict bpd_evict_m bpd_insert protocol_error tx_timeout; do grep -qx "ds.$v=0" "$f" || bad+=" vm$i:$v=$(sed -n "s/^ds\.$v=//p" "$f")"; done
+      post=$((post + $(sed -n 's/^ds\.bpd_flat_acquire=\([0-9]*\)$/\1/p' "$f" | head -1)0 / 10))
+      pre=$((pre + $(sed -n 's/^ds\.bpd_flat_acquire=\([0-9]*\)$/\1/p' "$E/dsshm-$1/status-pre-vm$i.txt" | head -1)0 / 10))
+    fi
+    echo "$(date -Is) $1 $2 vm$i: $(grep -E '^(param\.bpd_mode|ds\.(bpd_[a-z_]+|protocol_error|tx_timeout|inv_sent|fetch_sent)|cxl_shm\.layout: (bpd_bytes|total|bpd_mode)|ds\.registered: bpd_mode)' "$f" | tr '\n' ' ')" >> "$E/ds-flat-$1.txt"
+  done
+  if [ "$2" = post ] && [ "$DSBPD" = flat ]; then
+    echo "$(date -Is) $1 post: bpd_flat_acquire delta (sum over VMs) $((post - pre))" >> "$E/ds-flat-$1.txt"
+    [ $((post - pre)) -gt 0 ] || bad+=" bpd_flat_acquire_delta=$((post - pre))"
+  fi
+  [ -z "$bad" ] || { echo "$(date -Is) $1 $2 FAIL:$bad" >> "$E/ds-flat-$1.txt"; log "$1 bpd_mode $DSBPD $2 FAIL:$bad"; return 1; }
+  log "$1 bpd_mode $DSBPD $2 PASS ($E/ds-flat-$1.txt)"; }
 # ---- DAMON (H2N_DS_REPLICA_MODE=damon): ds-damon-guest.sh streamed to every VM as root (sudo -n sh -s) ---------------
 damon_cmd() {  # <name> <tag> <stats|stop>: on every VM; output lines in E/ds-damon-<name>.txt; 1 when a VM fails
   local ip out rc=0

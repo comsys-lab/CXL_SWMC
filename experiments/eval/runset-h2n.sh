@@ -36,7 +36,9 @@ unset H2N_PINS H2N_VEC_FORMAT H2N_EF H2N_INIT H2N_HOST_IMAGE H2N_REPEATS H2N_LOA
   H2N_ACCURACY_EXPORT H2N_DS_RECV_EXTRA H2N_DS_DAMON \
   H2N_DS_DAMON_EXTRA H2N_DS_DAMON_AT H2N_DS_DAMON_WARMUP H2N_DS_DAMON_REGIONS H2N_WARMUP \
   H2N_PMAX H2N_PMAX_FROM H2N_PMAX_WARMUP_S H2N_PMAX_MEASURE_S H2N_PMAX_DRAIN_S \
-  H2N_MG_SERVER_EXTRA H2N_READY_TIMEOUT   # optional conf keys: never inherited from the environment
+  H2N_MG_SERVER_EXTRA H2N_READY_TIMEOUT H2N_DS_BPD_MODE   # optional conf keys: never inherited from the environment
+# flat-directory-reference key (2026-11-07; absent = unchanged): H2N_DS_BPD_MODE (sets | flat; De Stijl build 12
+# bpd_mode load parameter + region / counter checks, h2n-block.sh header); a flat conf sets H2N_DS_REGION explicitly
 # megalon-page-granularity keys (2026-11-06; absent = unchanged): H2N_MG_SERVER_EXTRA ("--chunk-bytes <n>", passed as
 # MG_SERVER_EXTRA with mg lifetimes; 4 KiB-page objects) and H2N_READY_TIMEOUT (run.sh READY_TIMEOUT s, the init cap):
 # h2n-block.sh header
@@ -205,6 +207,8 @@ for g in "${PMG[@]}"; do PMFROM_A+="${PMFROM_A:+ }$(ab "$g")"; done
 [ "${H2N_PMAX:-0}" = 0 ] || plan "pmax step: pop / ds lifetimes append loadgen --mode fixed --rates <Popcorn's max of the cell> (pop: its own slo part; ds: pop rows of [${PMFROM_A:-}])"
 [ $HASMG = 0 ] || BENV+=(MEG_BUILD=$MGB VMEG=$MGV MEG_CFG=$MGC MEG_LIB=$MGL MG_MAXD=$MGD MG_CAPACITY=$VDB_MG_CAPACITY)
 [ $HASMG = 0 ] || [ -z "${H2N_MG_SERVER_EXTRA:-}" ] || { BENV+=("MG_SERVER_EXTRA=$H2N_MG_SERVER_EXTRA"); plan "Megalon server extra [$H2N_MG_SERVER_EXTRA]"; }
+[ -z "${H2N_DS_BPD_MODE:-}" ] || { [ -n "${H2N_DS_REGION:-}" ] || die "H2N_DS_BPD_MODE needs an explicit H2N_DS_REGION"
+  BENV+=(H2N_DS_BPD_MODE=$H2N_DS_BPD_MODE); plan "De Stijl bpd_mode ${H2N_DS_BPD_MODE} (cxl_shm load; region ${DSR:-})"; }
 [ -z "${H2N_READY_TIMEOUT:-}" ] || { BENV+=(H2N_READY_TIMEOUT=$H2N_READY_TIMEOUT); plan "ready timeout $H2N_READY_TIMEOUT s per node (init cap)"; }
 [ -z "${H2N_FIXED_RECVP:-}" ] || plan "receiver parameters per fixed part (run-2 receiver ablation): [$H2N_FIXED_RECVP] base [${H2N_FIXED_RECVP_BASE:-}]"
 for x in H2N_VEC_FORMAT H2N_EF H2N_INIT H2N_HOST_IMAGE H2N_SEARCH_THREADS H2N_FIXED H2N_FIXED_RECVP H2N_FIXED_RECVP_BASE H2N_NODE_ENV_EXTRA H2N_ALLOW_DETAIL \

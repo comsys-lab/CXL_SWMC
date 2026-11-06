@@ -4,7 +4,7 @@
 # bundle: the candidate XMLs fix the Host images dir /var/lib/libvirt/images/destijl-<n>-vm<k>-v<v> and p-destijl-deploy.sh
 # install never overwrites an existing one (the guest rebuilds the initramfs on every prepare), and the bundle's rollback
 # XML must equal the VM's current `virsh dumpxml --inactive`. Host-local only: no virsh, no ssh, no sudo.
-#   p-destijl-bundle.sh [--dry-run] [--build 7|8|9|10|11] [--rollback <popcorn bundle dir>] [--topo 2|8] [--xml-src <dir>] [--version <v>]
+#   p-destijl-bundle.sh [--dry-run] [--build 7|8|9|10|11|12] [--rollback <popcorn bundle dir>] [--topo 2|8] [--xml-src <dir>] [--version <v>]
 # --build 7 (default, unchanged): see "Fixed inputs (build 7)" below.
 # --build 8 (fault-latency breakdown port, d529ac9d9, user decision 2026-11-02 for blocks D, B2+C, E): SOURCE_TAG =
 #   rel/destijl-8; MANIFEST.txt must say "status: COMPLETE" (workspaces/eval3/build8/finish-build8.sh) and System.map must
@@ -75,11 +75,27 @@ case $n in
       KTREE=$ROOT/workspaces/destijl-v2/build10 KOVER=13.4;;
   11) B=$ROOT/builds/destijl/11 SOURCE_TAG=rel/destijl-11 TOOLS_FROM=$ROOT/builds/destijl/7/deploy-v1
       KTREE=$ROOT/workspaces/ds-invack/kernel KOVER=13.4;;
-  *) stop "--build must be 7, 8, 9, 10 or 11";;
+  12) B=$ROOT/builds/destijl/12 SOURCE_TAG=rel/destijl-12 TOOLS_FROM=$ROOT/builds/destijl/7/deploy-v1
+      KTREE=$ROOT/workspaces/flat-directory/src KOVER=13.5;;
+  *) stop "--build must be 7, 8, 9, 10, 11 or 12";;
 esac
 # build 9 / 10 / 11 rule: own guest script and destijl.env LOAD_DEFAULTS (new tools set); builds 7/8: none (unchanged)
-GUEST_SRC= ENV_EXTRA=
+GUEST_SRC= ENV_EXTRA= REGION_SRC=
 if [ "$n" = 9 ] || [ "$n" = 10 ] || [ "$n" = 11 ]; then GUEST_SRC=$SW/scripts/deploy/p-destijl-guest-adaptive.sh ENV_EXTRA='LOAD_DEFAULTS="fault_poll=0"'; fi
+# --build 12 (build 10 + flat base page directory, cxl_shm 13.5, rel/destijl-12 2788a32af; experiment
+#   flat-directory-reference): the build-10 rules with KTREE = workspaces/flat-directory/src, staged module version 13.5
+#   with parameter bpd_mode, guest script scripts/deploy/p-destijl-guest-flat.sh (load accepts bpd_mode=sets|flat),
+#   LOAD_DEFAULTS="fault_poll=0 bpd_mode=flat", region config/cxl_region-destijl-flat.yaml (REGION_SRC: tools/
+#   cxl_region.yaml + PARAMS*; cxl_region.yaml leaves the byte-identity set), guest tools dir /home/comsys/destijl-12.
+#   The build dir has no stage/ yet: the first real bundle runs p-destijl-package.sh's own stage step (modules_install
+#   signs with the build's key, depmod), which refuses while MEASUREMENT.lock exists; the dry run checks the unsigned
+#   build output cxl_shm/cxl_shm.ko instead and says so.
+if [ "$n" = 12 ]; then
+  GUEST_SRC=$SW/scripts/deploy/p-destijl-guest-flat.sh ENV_EXTRA='LOAD_DEFAULTS="fault_poll=0 bpd_mode=flat"'
+  REGION_SRC=$SW/config/cxl_region-destijl-flat.yaml
+  test -f "$REGION_SRC" || stop "no $REGION_SRC"
+  git -C "$SW" ls-files --error-unmatch config/cxl_region-destijl-flat.yaml > /dev/null 2>&1 || stop "$REGION_SRC is not tracked in $SW"
+fi
 # test hook (dry runs only): a stand-in build dir / source tag, for the build-8 path before build 8 is finished
 if [ $DRY = 1 ] && [ -n "${BUNDLE_TEST_BUILD_DIR:-}" ]; then
   B=$(readlink -f "$BUNDLE_TEST_BUILD_DIR"); SOURCE_TAG=${BUNDLE_TEST_SOURCE_TAG:-$SOURCE_TAG}
@@ -89,6 +105,7 @@ GT=/home/comsys/destijl-$n
 # tools of TOOLS_FROM that must be byte-identical (destijl.env: only for the same build; else equal except K / KO_SHA)
 SAME=(faultlat run.sh cxl_region.yaml p-destijl-guest.sh ds-replica-check.sh de_stijl_test)
 [ -z "$GUEST_SRC" ] || SAME=(faultlat run.sh cxl_region.yaml ds-replica-check.sh de_stijl_test)
+[ -z "$REGION_SRC" ] || SAME=(faultlat run.sh ds-replica-check.sh de_stijl_test)
 [ "$(dirname "$TOOLS_FROM")" = "$B" ] && SAME+=(destijl.env tools.sha256)
 case $TOPO in
   2) VMS="0 1";;
@@ -142,13 +159,25 @@ if [ "$n" = 8 ]; then
   grep -q ' swmc_instr_breakdown_key$' "$B/System.map" || stop "build 8 System.map has no swmc_instr_breakdown_key"
   [ "$(sh_ "$B/System.map")" = "$(art System.map)" ] || stop "System.map changed since the MANIFEST"
 fi
-if [ "$n" = 9 ] || [ "$n" = 10 ] || [ "$n" = 11 ]; then
-  [ "$(mf status)" = COMPLETE ] || stop "build $n MANIFEST status '$(mf status)'"
+if [ "$n" = 9 ] || [ "$n" = 10 ] || [ "$n" = 11 ] || [ "$n" = 12 ]; then
+  if [ "$n" = 12 ]; then  # MANIFEST says "BUILT, NOT STAGED" until the first real bundle stages it (package stage step)
+    [[ "$(mf status)" == BUILT* || "$(mf status)" == COMPLETE ]] || stop "build $n MANIFEST status '$(mf status)'"
+    grep -q ' bpd_flat_acquire_show$' "$B/System.map" || stop "build 12 System.map has no bpd_flat_acquire_show"
+  else
+    [ "$(mf status)" = COMPLETE ] || stop "build $n MANIFEST status '$(mf status)'"
+  fi
   for s in swmc_instr_breakdown_key ds_rx_mark_empty; do
     grep -q " $s\$" "$B/System.map" || stop "build $n System.map has no $s"; done
   [ "$(sh_ "$B/System.map")" = "$(art System.map)" ] || stop "System.map changed since the MANIFEST"
   SKO=$B/stage/lib/modules/$K/updates/cxl_shm.ko
+  if [ "$n" = 12 ] && [ ! -e "$B/stage" ]; then
+    [ ! -e "$ROOT/workspaces/MEASUREMENT.lock" ] || [ $DRY = 1 ] ||
+      stop "build 12 has no stage/ and MEASUREMENT.lock exists: p-destijl-package.sh would run modules_install (run without the lock)"
+    echo "NOTE: build 12 has no stage/: p-destijl-package.sh stages it (modules_install, signed with the build's key, depmod); checking the unsigned build output instead"
+    SKO=$B/cxl_shm/cxl_shm.ko
+  fi
   test -f "$SKO" || stop "no staged $SKO"
+  [ "$n" != 12 ] || modinfo -F parm "$SKO" | grep -q '^bpd_mode:' || stop "$SKO has no bpd_mode parameter"
   [ "$(modinfo -F version "$SKO")" = "$KOVER" ] || stop "staged cxl_shm.ko is not version $KOVER"
   [ "$(modinfo -F vermagic "$SKO" | cut -d' ' -f1)" = "$K" ] || stop "staged cxl_shm.ko vermagic is not $K"
   modinfo -F parm "$SKO" | grep -q '^fault_poll:' || stop "staged cxl_shm.ko has no fault_poll parameter"
@@ -159,7 +188,13 @@ fi
 [ "$(sh_ "$BZ")" = "$BZ_SHA" ] || stop "bzImage changed"
 [ "$(sh_ "$B/.config")" = "$(mf config_sha256)" ] || stop ".config changed"
 [ "$(sh_ "$B/cxl_shm/cxl_shm.ko")" = "$(art cxl_shm/cxl_shm.ko)" ] || stop "cxl_shm.ko changed"
-test -f "$B/stage/lib/modules/$K/updates/cxl_shm.ko" || stop "no stage (packaging would compile/install modules)"
+if [ "$n" = 12 ]; then
+  grep -qF 'bpd_mode=(sets|flat)' "$GUEST_SRC" || stop "$GUEST_SRC does not accept bpd_mode"
+  # the region must hold the flat block: msg_ring of REGION_SRC = [134217728, 134217728] (128 MiB, cxl_region-destijl-flat.yaml)
+  [ "$(grep -E '^msg_ring:' "$REGION_SRC" | cut -d'#' -f1 | tr -d ' ')" = 'msg_ring:[134217728,134217728]' ] || stop "$REGION_SRC msg_ring is not [134217728, 134217728]"
+else
+  test -f "$B/stage/lib/modules/$K/updates/cxl_shm.ko" || stop "no stage (packaging would compile/install modules)"
+fi
 [ "$(git -C "$KTREE" rev-parse "$SOURCE_TAG^{commit}")" = "$(git -C "$KTREE" rev-parse "$(mf source_commit)^{commit}")" ] ||
   stop "$SOURCE_TAG != build source commit"
 [ -z "$(git -C "$KTREE" status --porcelain -- msg_layer_module)" ] || stop "$KTREE/msg_layer_module not clean"
@@ -187,6 +222,7 @@ FIRST_TOOLS=$(find "$B" -maxdepth 3 -path "$B/deploy-v*/tools/tools.sha256" 2>/d
 PKG=(env XML_SRC="$XSRC" VMS="$VMS" KTREE="$KTREE" SOURCE_TAG="$SOURCE_TAG" FAULTLAT_BUILD="$FAULTLAT_BUILD"
      TOOLS_FROM="$TOOLS_FROM" bash "$SW/scripts/ctl/build-wrap.sh" bash "$SW/scripts/deploy/p-destijl-package.sh" "$n" "$V")
 [ -z "$GUEST_SRC" ] || PKG=(env GUEST_SRC="$GUEST_SRC" ENV_EXTRA="$ENV_EXTRA" "${PKG[@]:1}")
+[ -z "$REGION_SRC" ] || PKG=(env REGION_SRC="$REGION_SRC" "${PKG[@]:1}")
 denv() {  # deploy environment (sourceable)
   echo "# De Stijl build $n bundle deploy-v$V: deploy environment for p-destijl-deploy.sh / p-destijl-shm.sh"
   echo "C=$OUT"; echo "V=$V"; echo "K=$K"; echo "PRE_K=$PRE_K"; echo "BZ=$BZ"; echo "BZ_SHA=$BZ_SHA"; echo "GT=$GT"
@@ -206,6 +242,7 @@ if [ $DRY = 1 ]; then
   echo "rollback bundle $RB (packet $RB_PKT), PRE_K $PRE_K"
   echo "would run: ${PKG[*]}"
   [ -z "$GUEST_SRC" ] || echo "build $n rule: tools/p-destijl-guest.sh = $GUEST_SRC ($(sh_ "$GUEST_SRC" | cut -c1-12)), destijl.env + $ENV_EXTRA, KTREE $KTREE"
+  [ -z "$REGION_SRC" ] || echo "build $n rule: tools/cxl_region.yaml = $REGION_SRC ($(sh_ "$REGION_SRC" | cut -c1-12)), destijl.env PARAMS* from it, staged module $KOVER with bpd_mode"
   denv
   echo "BUNDLE DRY PASS (topo $TOPO, deploy-v$V, nothing written under $B)"
   exit 0
@@ -220,8 +257,15 @@ for f in "${SAME[@]}"; do
 done
 if [ -n "$GUEST_SRC" ]; then   # build 9 rule: own guest script, destijl.env = TOOLS_FROM's except K, KO_SHA + ENV_EXTRA
   cmp -s "$OUT/tools/p-destijl-guest.sh" "$GUEST_SRC" || stop "tools/p-destijl-guest.sh != $GUEST_SRC"
-  diff -q <(grep -vE '^(K|KO_SHA|LOAD_DEFAULTS)=' "$OUT/tools/destijl.env") <(grep -vE '^(K|KO_SHA|LOAD_DEFAULTS)=' "$TOOLS_FROM/tools/destijl.env") > /dev/null ||
-    stop "tools/destijl.env differs from $TOOLS_FROM beyond K / KO_SHA / LOAD_DEFAULTS"
+  XE='^(K|KO_SHA|LOAD_DEFAULTS)='; [ -z "$REGION_SRC" ] || XE='^(K|KO_SHA|LOAD_DEFAULTS|PARAMS|PARAMS_N[0-9])='
+  diff -q <(grep -vE "$XE" "$OUT/tools/destijl.env") <(grep -vE "$XE" "$TOOLS_FROM/tools/destijl.env") > /dev/null ||
+    stop "tools/destijl.env differs from $TOOLS_FROM beyond K / KO_SHA / LOAD_DEFAULTS${REGION_SRC:+ / PARAMS*}"
+  if [ -n "$REGION_SRC" ]; then   # build 12: region, PARAMS from it, staged (signed) module 13.5 with bpd_mode
+    cmp -s "$OUT/tools/cxl_region.yaml" "$REGION_SRC" || stop "tools/cxl_region.yaml != $REGION_SRC"
+    grep -q '^PARAMS="protocol=destijl .*ring_offset=134217728 ring_size=134217728 ' "$OUT/tools/destijl.env" || stop "tools/destijl.env PARAMS are not from the flat region (ring 128 MiB at 128 MiB)"
+    SKO=$B/stage/lib/modules/$K/updates/cxl_shm.ko
+    [ "$(modinfo -F version "$SKO")" = "$KOVER" ] && modinfo -F parm "$SKO" | grep -q '^bpd_mode:' || stop "staged $SKO is not $KOVER with bpd_mode"
+  fi
   grep -qx "K=$K" "$OUT/tools/destijl.env" || stop "tools/destijl.env K is not $K"
   grep -qxF "$ENV_EXTRA" "$OUT/tools/destijl.env" || stop "tools/destijl.env lacks $ENV_EXTRA"
   [ -z "$FIRST_TOOLS" ] || cmp -s "$OUT/tools/tools.sha256" "$FIRST_TOOLS" ||

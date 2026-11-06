@@ -1,0 +1,35 @@
+# Shared CXL region layout for De Stijl build 12 with the FLAT base page directory (cxl_shm protocol=destijl
+# bpd_mode=flat; experiment flat-directory-reference, reports/experiments/flat-directory-reference.md).
+# Identical to config/cxl_region-destijl.yaml except msg_ring, which here is 128 MiB instead of 16 MiB: the De Stijl
+# HWcc block with header page + HPD + flat BPD (one u32 entry per 4 KiB page of the SWcc range, bpd[p], no sets,
+# no eviction) + per-host message rings (FETCH / INV / ACK). Block layout: reports/design/DS2-protocol-spec.md §1 and
+# cxl_shm.c ds_layout_compute (every part PAGE_ALIGNed).
+# Arithmetic (device 103060340736 B observed; swcc = [268435456, device end) = 102791905280 B = 25095680 pages):
+#   header      4096 B
+#   HPD         ceil(25095680 / 512) = 49016 entries x 4 B = 196064 -> 196608 B
+#   flat BPD    25095680 pages x 4 B = 100382720 -> 100384768 B (95.7 MiB; all 25161216 device pages would be
+#               100644864 B)
+#   rings       N = 8 x 3 rings x PAGE_ALIGN(128 + 2048 slots x 64 B) = 24 x 135168 = 3244032 B
+#   total       103829504 B (99.0 MiB) for N = 8, ring_slots 2048
+# msg_ring = 128 MiB (2 MiB aligned): 30388224 B = 29.0 MiB free at N = 8 (29 % above the need), enough for every device page (+256 KiB) or
+# ring_slots 4096 (+3.1 MiB). The block must end at the end of hwcc, so hwcc_size stays 256 MiB and swcc is
+# unchanged; hwcc_alloc shrinks from 240 MiB to 128 MiB (system + app; vdb app need ~0.9 MiB).
+# App-offset implication: the app area sits directly below msg_ring, so with this file the app area starts at
+# 134217728 - CXL_APP_HWCC_BYTES instead of 251658240 - CXL_APP_HWCC_BYTES: a workload binary must read THIS file
+# (CXL_REGION_CONFIG) on every node; never mix it with cxl_region-destijl.yaml in one live region.
+# The cxl_shm params come from this file as for cxl_region-destijl.yaml (faultlat params --protocol destijl), plus
+# bpd_mode=flat on every node (header flag DS_FLAG_BPD_FLAT: a node with another mode does not join).
+# Sizes/offsets in bytes; "auto" means derived (see systems/common/cxl_region.h).
+device: /dev/dax0.0
+map_va: 0x600000000000    # fixed VA of the whole-device mapping, identical on every node (raw pointers in shared data)
+device_size: auto          # /sys/bus/dax/devices/<dev>/size (observed 103060340736)
+align: 2097152             # 2 MiB; must be a multiple of 4096
+hwcc_offset: 0
+hwcc_size: 268435456       # 256 MiB HW-coherent budget, shared by system, workload and message ring
+msg_ring: [134217728, 134217728]  # last 128 MiB of hwcc: De Stijl CCD with flat BPD + rings (bpd_mode=flat)
+# Workload control state ("app") sits directly below msg_ring; its size is the workload's computed need for
+# the run, passed as $CXL_APP_HWCC_BYTES (not set here). Systems allocate only the rest (cxl_region.h
+# hwcc_alloc = hwcc - app - msg_ring = at most 134217728 B here). Rules: docs/hwcc-contract.md.
+swcc_offset: auto          # align_up(hwcc_offset + hwcc_size, align)
+swcc_size: auto            # up to device end, stopping at the first reserved range above swcc_offset
+reserved: []               # e.g. [[100931731456, 2147483648]] to exclude a range from all systems

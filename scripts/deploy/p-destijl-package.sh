@@ -59,6 +59,10 @@ OUT=$B/deploy-v$v
 ST=$B/stage
 DEP=$SW/scripts/deploy
 REG=$SW/config/cxl_region-destijl.yaml
+# REGION_SRC=<region yaml> (build 12 on, set by p-destijl-bundle.sh; unset = unchanged output): tools/cxl_region.yaml and
+#   the PARAMS* lines of destijl.env come from that file; with TOOLS_FROM of another build, cxl_region.yaml and the
+#   PARAMS / PARAMS_N<m> lines are then exempt from the byte-identity checks (MANAGED_* stay checked: same swcc range)
+if [ -n "${REGION_SRC:-}" ]; then REG=$(readlink -f "$REGION_SRC"); test -f "$REG" || { echo "STOP: no region $REG"; exit 1; }; fi
 XML_SRC=${XML_SRC:-$ROOT/builds/popcorn_new/12/deploy-v1}
 DEV_SIZE=103060340736   # observed /sys/bus/dax/devices/dax0.0/size on the guests
 WRAP="bash $SW/scripts/ctl/build-wrap.sh"   # node 1, or the session CPUs while MEASUREMENT.lock exists
@@ -251,6 +255,7 @@ if [ -n "${TOOLS_FROM:-}" ]; then   # re-package with the guest tools of an earl
   (cd "$TOOLS_FROM/tools" && sha256sum --quiet -c tools.sha256) || { echo "STOP: $TOOLS_FROM/tools fails its tools.sha256"; exit 1; }
   SAMEF=(faultlat run.sh cxl_region.yaml p-destijl-guest.sh ds-replica-check.sh)
   [ -z "${GUEST_SRC:-}" ] || SAMEF=(faultlat run.sh cxl_region.yaml ds-replica-check.sh)
+  [ -z "${REGION_SRC:-}" ] || SAMEF=(faultlat run.sh ds-replica-check.sh)
   for f in "${SAMEF[@]}"; do
     cmp -s "$OUT/tools/$f" "$TOOLS_FROM/tools/$f" || { echo "STOP: tools/$f differs from $TOOLS_FROM"; exit 1; }
   done
@@ -262,7 +267,9 @@ if [ -n "${TOOLS_FROM:-}" ]; then   # re-package with the guest tools of an earl
       { echo "STOP: tools/destijl.env differs from $TOOLS_FROM beyond K / KO_SHA"; exit 1; }
     XB=" (other build: destijl.env K/KO_SHA of build $n)"
   else   # build 9 on: also the guest script (GUEST_SRC) and the ENV_EXTRA lines are this build's
-    XRE="^(K|KO_SHA"; for x in "${EXN[@]}"; do XRE+="|$x"; done; XRE+=")="
+    XRE="^(K|KO_SHA"; for x in "${EXN[@]}"; do XRE+="|$x"; done
+    [ -z "${REGION_SRC:-}" ] || XRE+="|PARAMS|PARAMS_N[0-9]"
+    XRE+=")="
     diff -q <(grep -vE "$XRE" "$OUT/tools/destijl.env") <(grep -vE "$XRE" "$TOOLS_FROM/tools/destijl.env") > /dev/null ||
       { echo "STOP: tools/destijl.env differs from $TOOLS_FROM beyond K / KO_SHA / ENV_EXTRA"; exit 1; }
     XB=" (other build: destijl.env K/KO_SHA${EXN[*]:+ + ${EXN[*]}} of build $n; p-destijl-guest.sh = ${GUEST_SRC:-scripts/deploy/p-destijl-guest.sh})"
