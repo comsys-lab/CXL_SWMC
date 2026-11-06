@@ -21,6 +21,8 @@ INFO="$PREFIX megalon=$(sed -n 's/^build_id=//p' "$MB/manifest.txt")/$(sed -n 's
 [ -n "$MNODES" ] && [ "$MNODES" != 2 ] && INFO="$INFO/nodes$MNODES"
 # API v4 (lookup_hist) only when this Megalon build exports GetObjectLookupHist (build >= 79); else the v3 table
 HIST=(); nm -D "$MB/ship/lib/libmegalon.so" | grep GetObjectLookupHist > /dev/null && HIST=(-DMSHIM_LOOKUP_HIST)  # no grep -q: SIGPIPE
+# API v5 (wmeta_counts) only when the build also exports GetWmetaCounts (build >= 80); else v4 / v3 as above
+[ ${#HIST[@]} -gt 0 ] && nm -D "$MB/ship/lib/libmegalon.so" | grep GetWmetaCounts > /dev/null && HIST+=(-DMSHIM_WMETA_COUNTS)
 c++ -std=c++17 -O2 -g -fPIC -shared -Wall -Wextra -I"$HERE" -I"$MSRC/include" -DMSHIM_INFO="\"$INFO\"" ${HIST[@]+"${HIST[@]}"} \
     "$HERE/megalon_objapi.cc" -o "$OUT/lib/libmegalon-objapi.so" -L"$OUT/lib" -lmegalon \
     -Wl,--enable-new-dtags,-rpath,'$ORIGIN',--no-undefined,--no-as-needed

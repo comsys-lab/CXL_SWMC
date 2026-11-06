@@ -113,8 +113,23 @@ void lookup_hist(mshim::LookupHist *s) {
   s->read_sum_ns = t.read_sum_ns, s->write_sum_ns = t.write_sum_ns;
   for (int i = 0; i < mshim::LookupHist::kBins; i++) s->read[i] = t.read[i], s->write[i] = t.write[i], s->lo_ns[i] = t.lo_ns[i];
 }
+#ifdef MSHIM_WMETA_COUNTS
+// v5 (build 80): record-pool counters (cluster-wide; the teardown line's reclaim / allocate counts)
+void wmeta_counts(mshim::WmetaCounts *s) {
+  static_assert(sizeof(mshim::WmetaCounts) == sizeof(rackobj::WmetaCounts), "WmetaCounts != rackobj::WmetaCounts");
+  rackobj::WmetaCounts t{};
+  rackobj::GetWmetaCounts(&t);
+  *s = mshim::WmetaCounts{};
+  s->reclaim_count = t.reclaim_count, s->allocate_count = t.allocate_count;
+  s->records_in_use = t.records_in_use, s->record_slots = t.record_slots, s->dyn_wmeta = t.dyn_wmeta;
+}
 constexpr uint32_t kVersion = mshim::kApiVersion;
 #else
+constexpr void (*wmeta_counts)(mshim::WmetaCounts *) = nullptr;
+constexpr uint32_t kVersion = 4;  // Megalon without GetWmetaCounts (build 79)
+#endif
+#else
+constexpr void (*wmeta_counts)(mshim::WmetaCounts *) = nullptr;
 constexpr void (*lookup_hist)(mshim::LookupHist *) = nullptr;
 constexpr uint32_t kVersion = 3;  // Megalon without GetObjectLookupHist (build <= 78)
 #endif
@@ -124,7 +139,8 @@ constexpr uint32_t kVersion = 3;  // Megalon without GetObjectLookupHist (build 
 #endif
 
 const mshim::Api kApi{kVersion,   MSHIM_INFO, node_id,     reg,          unreg,  create,     lookup, read_start,
-                      read_end,   write_start, write_end,  stats,        thread_coh, thread_anchor, lookup_hist};
+                      read_end,   write_start, write_end,  stats,        thread_coh, thread_anchor, lookup_hist,
+                      wmeta_counts};
 
 }  // namespace
 

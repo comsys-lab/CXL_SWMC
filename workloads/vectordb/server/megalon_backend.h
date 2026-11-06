@@ -79,6 +79,10 @@ inline void (*megalon_thread_anchor(const MegalonApi *api))(mshim::AnchorSnap *)
 inline void (*megalon_lookup_hist(const MegalonApi *api))(mshim::LookupHist *) {
   return api && api->version >= 4 ? api->lookup_hist : nullptr;
 }
+// wmeta_counts of a loaded API (nullptr below version 5, i.e. Megalon builds <= 79).
+inline void (*megalon_wmeta_counts(const MegalonApi *api))(mshim::WmetaCounts *) {
+  return api && api->version >= 5 ? api->wmeta_counts : nullptr;
+}
 
 // [va, va + len) must be covered by mappings of `path` (Megalon's mapping of the device at map_va).
 inline bool mapped_by(uint64_t va, uint64_t len, const std::string &path, std::string *err) {
@@ -206,7 +210,7 @@ class MegalonBackend {
   static constexpr const char *kLayoutTag = " backend=megalon";
 
   MegalonBackend(const cxl::region &, uint8_t *, const Params &p, const MegalonApi *api)
-      : p_(p), api_(api), coh_(megalon_thread_coh(api)), lh_(megalon_lookup_hist(api)) {
+      : p_(p), api_(api), coh_(megalon_thread_coh(api)), lh_(megalon_lookup_hist(api)), wc_(megalon_wmeta_counts(api)) {
     dlog_chunks_ = p.dlog_chunks();
   }
   bool fits(std::string *err) const {
@@ -417,6 +421,16 @@ class MegalonBackend {
       << "\nmegalon.flushes=" << s.flushes << "\nmegalon.flush_bytes=" << s.flush_bytes
       << "\nmegalon.replay_flushes=" << s.replay_flushes << "\nmegalon.replay_flush_bytes=" << s.replay_flush_bytes
       << "\nmegt.sample=" << kSample << "\nmegt.clock_ns=" << clock_ns_ << "\nmegt.thread_coh=" << (coh_ ? 1 : 0);
+    // shim v5 (Megalon build >= 80): coherence-record pool counters = Megalon's teardown "reclaim count / allocate
+    // count" (cluster-wide SCR counters: every node reports the same value; never sum over nodes), cumulative since
+    // the SCR was initialised; absent (no keys) with an older shim
+    if (wc_) {
+      mshim::WmetaCounts w{};
+      wc_(&w);
+      o << "\nmegalon.reclaim_count=" << w.reclaim_count << "\nmegalon.allocate_count=" << w.allocate_count
+        << "\nmegalon.records_in_use=" << w.records_in_use << "\nmegalon.record_slots=" << w.record_slots
+        << "\nmegalon.dyn_wmeta=" << w.dyn_wmeta;
+    }
     static const char *const names[MegTimers::kN] = {"rd_sampled", "rd_start_ns", "rd_body_ns", "rd_end_ns",
                                                       "rd_retries", "rd_failed_timed", "rd_failed_ns", "wr_sections",
                                                       "wr_start_ns", "wr_body_ns", "wr_end_ns"};
@@ -627,6 +641,7 @@ class MegalonBackend {
   void (*lh_)(mshim::LookupHist *) = nullptr;           // shim v4 lookup_hist (nullptr: Megalon <= 78)
   mutable uint64_t lh_lo_ns_[mshim::LookupHist::kBins] = {}, lh_tsc_khz_ = 0;  // bin edges (under tmu_)
   mutable std::atomic<bool> lh_lo_set_{false};
+  void (*wc_)(mshim::WmetaCounts *) = nullptr;  // shim v5 wmeta_counts (nullptr: Megalon <= 79)
   uint64_t *wsec_ = nullptr;  // HWcc: write sections completed by all nodes (trace only)
   uint32_t node_ = 0, clock_ns_ = 0, tsc_khz_ = 0;
   uint64_t max_chunks_ = 0, trace_cost_ns_ = 0;

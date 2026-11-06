@@ -12,8 +12,9 @@ namespace mshim {
 
 // 2: thread_coh (MOT1 v6 Fig 2/3a); 3: thread_anchor (Megalon build >= 75); 4: lookup_hist (Megalon build >= 79,
 // experiment megalon-page-granularity). A shim built against a Megalon without GetObjectLookupHist reports version 3
-// (build-shim.sh defines MSHIM_LOOKUP_HIST only when libmegalon.so exports it).
-constexpr uint32_t kApiVersion = 4;
+// (build-shim.sh defines MSHIM_LOOKUP_HIST only when libmegalon.so exports it). 5: wmeta_counts (Megalon build >= 80,
+// GetWmetaCounts; MSHIM_WMETA_COUNTS, set only together with MSHIM_LOOKUP_HIST).
+constexpr uint32_t kApiVersion = 5;
 
 struct Obj {  // mirrors rackobj::ObjectHandle
   uint8_t *ptr;
@@ -118,6 +119,14 @@ struct LookupHist {
   uint64_t lo_ns[kBins];
 };
 static_assert(sizeof(LookupHist) == (5 + 3 * 32) * 8, "LookupHist layout is fixed (v4)");
+// v5 (Megalon build >= 80): coherence-record pool counters (mirrors rackobj::WmetaCounts) = the values of Megalon's
+// teardown line "seqlock alloc ratio ... reclaim count: R, allocate count: A", readable at any time. The counters are
+// shared by every node (SCR): each node reads the same cluster-wide value; do not sum over nodes. Cumulative.
+struct WmetaCounts {
+  uint64_t reclaim_count, allocate_count, records_in_use, record_slots, dyn_wmeta;
+  uint64_t reserved[3];
+};
+static_assert(sizeof(WmetaCounts) == 8 * 8, "WmetaCounts layout is fixed (v5)");
 static_assert(sizeof(CohSnap) == 29 * 8, "CohSnap layout is fixed (v2)");
 static_assert(sizeof(AnchorSnap) == 16 * 8, "AnchorSnap layout is fixed (v3)");
 
@@ -137,6 +146,7 @@ struct Api {
   void (*thread_coh)(CohSnap *s);  // v2; nullptr in a v1 shim
   void (*thread_anchor)(AnchorSnap *s);  // v3; absent (version < 3) in older shims: check version >= 3 first
   void (*lookup_hist)(LookupHist *s);    // v4; absent (version < 4) in older shims: check version >= 4 first
+  void (*wmeta_counts)(WmetaCounts *s);  // v5; absent (version < 5) in older shims: check version >= 5 first
 };
 
 }  // namespace mshim

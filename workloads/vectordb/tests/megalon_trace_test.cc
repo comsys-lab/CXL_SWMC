@@ -69,7 +69,8 @@ const MegalonApi kApi = {mshim::kApiVersion,
                            s->check_sample = 64;
                          },
                          [](mshim::AnchorSnap *s) { *s = g_an; },
-                         nullptr};  // lookup_hist: v4 only (this fake table is v3)
+                         nullptr,   // lookup_hist: v4 only (this fake table is v3)
+                         nullptr};  // wmeta_counts: v5 only
 
 int fails = 0;
 #define CHECK(c)                                                                 \
