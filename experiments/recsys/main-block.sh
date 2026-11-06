@@ -126,6 +126,8 @@
 #   rate_sps auc_q_s seq_base status. STREAM_AUC_ONLY=1: no SLO lifetimes in the block (AUC lifetimes only).
 # De Stijl replica_mode (run 2 widening 2026-11-06, T = 1000 ms accuracy + staleness): DS_REPLICA_MODE off | all,
 #   DS_REPLICA_POOL_BYTES (cap); see the De Stijl block below and ds-replica.sh. Unset / off = no replica step.
+#   Torn rows (user 2026-11-07): every ds lifetime passes TORN_POLICY "system=ds T_us=<T> replica_mode=<m>" to
+#   session.sh; torn rows are allowed (reported, torn_rows.py) only with T > 0 and replica_mode on.
 set -uo pipefail
 E=${1:?evidence dir}
 P=/home/comsys/sungsu/destijl-control X=$(cd "$(dirname "$0")" && pwd)
@@ -440,6 +442,10 @@ if [ $HASDS = 1 ]; then
   [ "$REPL" != all ] || { [[ $RPOOL =~ ^[1-9][0-9]*$ ]] && [ "$RPOOL" -ge 1073741824 ]; } \
     || { echo "SEQUENCE STOP: DS_REPLICA_MODE=all needs DS_REPLICA_POOL_BYTES >= 1073741824 (got '$RPOOL')"; exit 2; }
   [ -z "$RPOOL" ] || [ "$REPL" = all ] || { echo "SEQUENCE STOP: DS_REPLICA_POOL_BYTES without DS_REPLICA_MODE=all"; exit 2; }
+  # torn rows (user 2026-11-07, option a; session.sh TORN_POLICY, torn_rows.py): allowed only with T > 0 and replica on
+  if [ "$DST" != 0 ] && [ "$REPL" != off ]; then
+    echo "BLOCK PLAN: torn rows: allowed in the ds lifetimes (T = $DST us, replica_mode $REPL): reported per step / measurement / lifetime (torn.txt, torn-steps.csv, torn-lifetime.txt, <E>/torn-rows.csv via rs_check.py INFO), not an invariant"
+  else echo "BLOCK PLAN: torn rows: zero-torn invariant in the ds lifetimes (T = $DST us, replica_mode $REPL)"; fi
   [ "$REPL" = off ] || echo "BLOCK PLAN: replica: De Stijl replica_mode $REPL on both VMs, pool per VM = min($RPOOL, MemAvailable - 4 GiB) (1 MiB floor, >= 1 GiB) at every ds lifetime start, after the cxl_shm load and before the preload; read back (ds-replica-<name>.txt); counters before the teardown (replica_pool_full must stay 0); back to off + previous pool after the teardown"
   [ -f "$DS_C/p-destijl-shm.sh" ] && [ "$(sha256sum < "$DS_C/packet.sha256" | cut -d' ' -f1)" = "$DS_BUNDLE_SHA" ] \
     && (cd "$DS_C" && sha256sum -c --quiet packet.sha256) || { echo "SEQUENCE STOP: DS_C is not the verified De Stijl bundle"; exit 2; }
@@ -687,7 +693,7 @@ life_start() {  # <sys> <name>: prepare + session start of one server lifetime -
          SE=(SYSTEM=Popcorn-$PRM V=$VM_PLAIN HOST_SERVER=$HOST_PLAIN "SERVER_ARGS=$SA" NODE0_ARGS=--preloaded "NODE_ENV=ENV:XTIMEOUT=$XT");;
     ds) dax_root; ds_setup
         SE=(SYSTEM=DeStijl-$RECV_MODE-T$DST V=$VM_PLAIN HOST_SERVER=$HOST_PLAIN "SERVER_ARGS=$SA" NODE0_ARGS=--preloaded
-            "NODE_ENV=ENV:XTIMEOUT=$XT ENV:CXL_SYSTEM=ds ENV:CXL_DESTIJL_T_US=$DST");;
+            "NODE_ENV=ENV:XTIMEOUT=$XT ENV:CXL_SYSTEM=ds ENV:CXL_DESTIJL_T_US=$DST" "TORN_POLICY=system=ds T_us=$DST replica_mode=$REPL");;
   esac
   [ -z "$N0X" ] || SE+=("NODE0_ARGS=$(case $s in pop|ds) echo "--preloaded ";; esac)$N0X$V7N0")   # BLOCK=stream (later value wins in env)
   [ "$V7" != 1 ] || SE+=("HOST_PATH_MAP=$V7_HOST_PATH_MAP")   # Host-side server calls read the Host image copy

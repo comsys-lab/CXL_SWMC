@@ -7,8 +7,13 @@
 #                                                idle check (no queued query, counters still), Host build check, stats
 #                                                snapshots before/after, one loadgen run into <S>/<name>/ (manifest.txt,
 #                                                loadgen/, steps.csv, stats-steps.csv, breakdown.csv, slo.png), window
-#                                                invariants (torn_rows, misses, update_misses, bad_requests deltas = 0)
-#   session.sh stop    <S>                       stop both servers, collect node logs, final invariants from the logs
+#                                                invariants (torn_rows, misses, update_misses, bad_requests deltas = 0),
+#                                                torn.txt + torn-steps.csv (torn rows / serving lookups; torn_rows.py)
+#   session.sh stop    <S>                       stop both servers, collect node logs, final invariants from the logs,
+#                                                torn-lifetime.txt
+# Torn rows (user 2026-11-07): start env TORN_POLICY "system=ds T_us=<n> replica_mode=<m>" (main-block.sh, De Stijl
+#   lifetimes); torn_rows.py allow decides: T > 0 and replica_mode on = torn rows allowed (reported, no invariant); any
+#   other token or none = torn_rows 0 is an invariant; a token inconsistent with SYSTEM / NODE_ENV = exit 2.
 # Update seqs continue over the lifetime: measurement i gets --opt seq_base=<last update seq of i-1> --opt wrap=1, so
 # the updater replays the trace on from where the previous measurement stopped (recsys plugin; never restarts at 1).
 # env (start): SYSTEM, V (guest install dir), HOST_SERVER (Host recsys-server of the same build, --print-app-bytes),
@@ -53,6 +58,14 @@ start)
   # only --publish-ms is owned by T_MS; --publish-frac (Ekko operating point, main-block v6) belongs to SERVER_ARGS
   case " $SERVER_ARGS " in *" --publish-ms "*|*" --publish-ms="*) echo "SERVER_ARGS must not set --publish-ms; use T_MS"; exit 2;; esac
   [ -e "$S" ] && { echo "refusing: $S exists"; exit 3; }
+  # torn-row policy (user 2026-11-07, torn_rows.py): TORN_POLICY "system=ds T_us=<n> replica_mode=<m>" (main-block.sh,
+  # De Stijl lifetimes) allows torn rows only for T > 0 with replica_mode on; everything else keeps torn_rows = 0
+  TA=
+  if [ -n "${TORN_POLICY:-}" ]; then
+    tp=$(python3 -I -B "$HERE/torn_rows.py" allow --system "$SYSTEM" --node-env "${NODE_ENV:-}" --policy "$TORN_POLICY"); trc=$?
+    echo "$tp"
+    case $trc in 0) TA=$TORN_POLICY;; 1) ;; *) exit 2;; esac
+  fi
   mkdir -p "$S" || exit 3
   SA="$SERVER_ARGS --publish-ms $T_MS"
   if [ "$LOCAL" = 1 ]; then read -r -a NODE <<< "${NODES:-127.0.0.1 127.0.0.1}"; else read -r -a NODE <<< "${NODES:-192.168.122.100 192.168.122.101}"; fi
@@ -76,6 +89,7 @@ start)
   { echo "SYSTEM='$SYSTEM'"; echo "V='$V'"; echo "HOST_SERVER='$HOST_SERVER'"; echo "T_MS='$T_MS'"; echo "SA='$SA'"
     echo "RID='$RID'"; echo "GRUN='$GRUN'"; echo "APP='$APP'"; echo "NODES_S='${NODE[*]}'"; echo "PORTS_S='${PORTS[*]}'"
     echo "LOCAL='$LOCAL'"; echo "NODE0_ARGS_S='${NODE0_ARGS:-}'"; echo "NODE_ENV_S='${NODE_ENV:-}'"; echo "NODE0_ENV_S='${NODE0_ENV:-}'"
+    echo "TORN_ALLOW_S='$TA'"
   } > "$S/session.env"
   echo 0 > "$S/seq_base"
   { echo "# recsys session (CXL_SWMC/experiments/recsys/session.sh): one server lifetime, several measurements"
@@ -83,7 +97,8 @@ start)
     echo "cxl_swmc_commit=$(git -C "$ROOT" rev-parse HEAD)"; echo "cxl_swmc_dirty=$(git -C "$ROOT" status --porcelain | wc -l)"
     echo "host_server=$HOST_SERVER sha256=$(sha256sum "$HOST_SERVER" | cut -d' ' -f1)"
     echo "publish_ms=$T_MS"; echo "server_args=$SA"; echo "node_env=${NODE_ENV:-} node0_env=${NODE0_ENV:-}"
-    echo "node0_args=${NODE0_ARGS:-}"; echo "app_hwcc_bytes=$APP"; echo "layout=$LAYOUT"; echo "host_path_map=${HSUB# }"
+    echo "node0_args=${NODE0_ARGS:-}"; echo "torn_rows_policy=$([ -n "$TA" ] && echo "allowed ($TA)" || echo "zero${TORN_POLICY:+ ($TORN_POLICY)}")"
+    echo "app_hwcc_bytes=$APP"; echo "layout=$LAYOUT"; echo "host_path_map=${HSUB# }"
     for k in "${!NODE[@]}"; do
       info=$(rx "$k" "uname -r; sha256sum $V/bin/recsys-server $V/cfg/cxl_region.yaml \$(ls $V/lib/libmegalon-objapi.so $V/lib/libmegalon.so $V/cfg/megalon.yaml 2>/dev/null) | cut -c1-64; nproc" | tr '\n' ' ')
       [ -n "$info" ] || { echo "node$k info empty" >&2; exit 4; }
@@ -200,24 +215,23 @@ measure)
   NEXT=$(kvget "$M/loadgen/recsys.txt" last_update_seq)
   [[ $NEXT =~ ^[0-9]+$ ]] && [ "$NEXT" -ge "$SEQB" ] || { echo "no last_update_seq in $M/loadgen/recsys.txt"; exit 4; }
   echo "$NEXT" > "$S/seq_base"
-  # window invariants from the server counters (cumulative, so deltas over this measurement)
-  INV=0
-  for k in "${!NODE[@]}"; do
-    for key in torn_rows misses update_misses bad_requests; do
-      kvnum va "$M/pre-t$k.txt" $key; kvnum vb "$M/post-t$k.txt" $key
-      d=$((vb - va))
-      echo "node$k ${key}_delta=$d" >> "$M/invariants.txt"
-      [ "$d" = 0 ] || INV=1
-    done
-  done
+  # window invariants from the server counters (cumulative, so deltas over this measurement): torn_rows.py window writes
+  # invariants.txt (torn_rows / misses / update_misses / bad_requests deltas; a torn delta under the allowed policy is
+  # tagged "allowed" and is no violation) and torn.txt (torn_rows, serving lookups, torn_frac per node and total)
+  INV=0 TORN_ALLOW_S=${TORN_ALLOW_S:-}
+  tw=$(python3 -I -B "$HERE/torn_rows.py" window "$M" --nodes ${#NODE[@]} --allow "$TORN_ALLOW_S"); trc=$?
+  [ $trc != 5 ] || { echo "$tw" | grep -m1 '^STATS MISSING'; exit 5; }
+  echo "$tw" | tail -1 | sed "s/^/measurement $NAME: /"
+  [ $trc = 0 ] || INV=1
   echo "end=$(date -Is) loadgen_rc=$LG host_check_after=$HC invariants=$([ $INV = 0 ] && echo ok || echo VIOLATED) next_seq_base=$NEXT" >> "$M/manifest.txt"
   if [ -s "$M/loadgen/steps.jsonl" ] && [ -s "$M/loadgen/summary.json" ]; then
     [ ! -d "$M/loadgen/stats" ] || python3 "$ROOT/experiments/loadgen/stats_delta.py" "$M/loadgen" --out "$M/stats-steps.csv" > /dev/null 2>&1 || true
     python3 "$ROOT/experiments/loadgen/export_csv.py" --out "$M/steps.csv" "$M/loadgen=$SYSTEM" > /dev/null 2>&1 || true
     [ ! -d "$M/loadgen/stats" ] || python3 "$HERE/breakdown.py" "$M" --out "$M/breakdown.csv" > "$M/breakdown.log" 2>&1 || true
     python3 "$ROOT/experiments/loadgen/plot_slo.py" --out "$M/slo.png" "$M/loadgen=$SYSTEM" > "$M/slo-points.txt" 2>&1 || true
+    [ ! -s "$M/stats-steps.csv" ] || python3 -I -B "$HERE/torn_rows.py" steps "$M" > /dev/null 2>&1 || true   # torn-steps.csv
   fi
-  [ $INV = 0 ] || { echo "measurement $NAME: invariant violated ($(grep -v '_delta=0$' "$M/invariants.txt" | tr '\n' ' '))"; exit 4; }
+  [ $INV = 0 ] || { echo "measurement $NAME: invariant violated ($(grep -v '_delta=0$' "$M/invariants.txt" | grep -v ' allowed$' | tr '\n' ' '))"; exit 4; }
   [ $HC = 0 ] || { echo "measurement $NAME: Host build during the measurement"; exit 3; }
   [ "$LG" = 0 ] || { echo "measurement $NAME: loadgen rc=$LG"; exit 1; }
   echo "measurement $NAME: OK -> $M";;
@@ -235,9 +249,12 @@ stop)
     L=$S/node$k.log
     grep -q "recsys-server: stopping" "$L" 2>/dev/null || { echo "node$k: no clean stop" | tee -a "$S/final-check.txt"; RC=4; }
     for kv in torn_rows=0 misses=0 update_misses=0 bad_requests=0; do
+      [ "$kv" != torn_rows=0 ] || [ -z "${TORN_ALLOW_S:-}" ] || continue   # allowed policy: reported below, no check
       grep -q "^$kv\$" "$L" 2>/dev/null || { echo "node$k: $kv violated" | tee -a "$S/final-check.txt"; RC=4; }
     done
   done
+  python3 -I -B "$HERE/torn_rows.py" lifetime "$S" > /dev/null 2>&1 || true   # torn-lifetime.txt (torn rows / lookups)
+  [ -z "${TORN_ALLOW_S:-}" ] || echo "torn rows allowed ($TORN_ALLOW_S): $(grep '^total ' "$S/torn-lifetime.txt" 2>/dev/null)" | tee -a "$S/final-check.txt"
   grep -h "^flush_overruns=\|^published_seq=\|^samples=\|^rows_written=\|^flushes=\|^queries=\|^mem.vm_hwm_kb=" "$S"/node*.log > "$S/final-counters.txt" 2>/dev/null
   echo "stopped=$(date -Is) stop_rc=$RC" >> "$S/session-manifest.txt"
   [ $RC = 0 ] && echo "session $(basename "$S"): stopped, final checks ok" || echo "session $(basename "$S"): stop rc=$RC"

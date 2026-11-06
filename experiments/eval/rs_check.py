@@ -10,11 +10,17 @@ WARN: an SLO row with valid=0 (update rate not sustained at or below the result)
 --auc-systems "hw" --auc-rates "200 400" (run-2 fixed-rate AUC lifetimes, main-block.sh STREAM_AUC): FAIL = a planned
   AUC lifetime without a stream-auc.tsv row, without its loadgen summary, or without its auc_part.csv row
   (system, update_rate); WARN = status != ok (stream_check / breakdown). Last line "RSCHECK PASS|FAIL (<n> warnings)"; output also written to <block>/rs-check.txt.
+Torn rows (user 2026-11-07; experiments/recsys/torn_rows.py block): <block>/torn-rows.csv (per step / measured part /
+  lifetime: torn_rows, serving lookups, torn_frac); one INFO line per lifetime (not counted); FAIL = torn rows in a
+  lifetime whose policy is zero (anything but De Stijl T > 0 with replica_mode on).
 """
 import argparse
 import csv
 import os
 import sys
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "recsys"))
+import torn_rows  # noqa: E402
 
 
 def tsv(p):
@@ -38,6 +44,8 @@ def main():
         nonlocal nf, nw
         if ok:
             out.append(f"OK   {msg}")
+        elif kind == "I":
+            out.append(f"INFO {msg}")
         elif kind == "F":
             nf += 1
             out.append(f"FAIL {msg}")
@@ -77,6 +85,14 @@ def main():
             res("F", (s, rate) in ar, f"AUC {s} u{rate} auc_part.csv row")
             if r:
                 res("W", r[5] == "ok", f"AUC {s} u{rate} at {r[3]} q/s seq_base {r[4]} status {r[5]}")
+    _, lts = torn_rows.block(B)
+    for name, pol, t, n, f in lts:
+        msg = (f"torn rows {name}: policy {pol}, torn_rows {torn_rows.fmt(t)} / serving lookups {torn_rows.fmt(n)} "
+               f"= torn_frac {torn_rows.fmt(f)} (torn-rows.csv)")
+        if t and pol == "zero":
+            res("F", False, msg + " - zero-torn invariant")
+        else:
+            res("I", False, msg)
     out.append(f"RSCHECK {'FAIL' if nf else 'PASS'} ({nf} failures, {nw} warnings)")
     open(os.path.join(B, "rs-check.txt"), "w").write("\n".join(out) + "\n")
     print("\n".join(out))
