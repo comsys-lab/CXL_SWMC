@@ -28,7 +28,9 @@ $(_mgm $_n)  ${!_b}/manifest.txt
 done
 if [ -n "${H2N_DS_C:-}" ]; then
   DSR=${H2N_DS_REGION:-$(cd "$EVD/../.." && pwd)/config/cxl_region-destijl.yaml}
+  DSR_SHA=2271c5285b3406e65c2ad2edad614ab713616e0eacc8ab03cdbfb985612dc2ac   # config/cxl_region-destijl.yaml
+  case $DSR in */cxl_region-destijl-flat.yaml) DSR_SHA=e74e47ea69b7a2305a9506ffacd44984382d5477f43c8fda3d7d673080562446;; esac  # flat BPD region (build 12)
   PIN_SHA256+="
 $H2N_DS_BUNDLE_SHA  $H2N_DS_C/packet.sha256
-2271c5285b3406e65c2ad2edad614ab713616e0eacc8ab03cdbfb985612dc2ac  $DSR"
+$DSR_SHA  $DSR"
 fi
