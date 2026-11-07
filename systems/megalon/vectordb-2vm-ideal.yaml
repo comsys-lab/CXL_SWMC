@@ -29,7 +29,9 @@ node_id: 0                      # overridden by MEGALON_NODE_ID (vdb-server sets
 region_config: ""               # $CXL_REGION_CONFIG
 reinit: false                   # node 0: MEGALON_REINIT=1
 attach_mprotect: true
-stuck_timeout_ms: 10000
+stuck_timeout_ms: 300000         # run 1 (2026-11-08) aborted at init with 10000: node 1 stalled > 10 s near log entry
+                                 # 231.7M (NR replica HashMap growth 2^27 -> 2^28 at 117.4M entries, once per init);
+                                 # a watchdog only (no effect unless a peer stops advancing the log)
 log_sync_interval_us: 100
 nr_log_size: 64MB
 attach_timeout_s: 600
