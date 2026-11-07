@@ -1,0 +1,36 @@
+# Shared CXL region layout for Popcorn build 14 with the FLAT coherence directory (cxl_shm 14.0-dir directory=flat;
+# experiment popcorn-directory-reference, reports/experiments/popcorn-directory-reference.md; protocol
+# workspaces/popcorn-directory/SPEC.md). Identical to config/cxl_region-ring2m.yaml (the region of every run-2 Popcorn
+# cell) except msg_ring, which here is the last 128 MiB of hwcc instead of the last 2 MiB: the Popcorn system block =
+# [unused margin][directory: header page + one u32 per 4 KiB managed page][the run-2 2 MiB message ring].
+# The cxl_shm ring parameters stay those of the run-2 Popcorn cells (ring_offset 266338304, ring_size 2097152 = the
+# LAST 2 MiB of msg_ring, so ring slots / capacity per N are unchanged); the directory ends exactly at ring_offset
+# (cxl_shm requires dir_offset + dir_bytes == ring_offset). Bundle tools (popcorn.env PARAMS*, DIR_OFFSET) are derived
+# from this file by scripts/deploy/p-popcorn-dir-package.sh; `faultlat params` reports msg_ring as the ring, so the
+# guest script p-popcorn-guest-dir.sh checks ring = last 2 MiB of msg_ring and directory = [dir_offset, ring_offset).
+# Arithmetic (device 103060340736 B observed; swcc = [268435456, device end) = 102791905280 B = 25095680 pages):
+#   directory   4096 (header) + PAGE_ALIGN(25095680 x 4 = 100382720) = 4096 + 100384768 = 100388864 B (95.7 MiB)
+#   ring        2097152 B at 266338304 (= ring2m msg_ring; 4096 / 1024 / 256 slots per window at N = 2 / 4 / 8)
+#   dir_offset  266338304 - 100388864 = 165949440 (0x9e43000, 4 KiB aligned)
+#   block used  [165949440, 268435456) = 102486016 B (97.7 MiB)
+# msg_ring = 128 MiB (2 MiB aligned) at 134217728: margin [134217728, 165949440) = 31731712 B = 30.3 MiB unused (31 %
+# above the need), enough for a directory over every device page (+262144 B) or a ring of up to 32 MiB. The block
+# must end at the end of hwcc, so hwcc_size stays 256 MiB and swcc (the managed range) is unchanged; hwcc_alloc
+# shrinks from 254 MiB to 128 MiB (system + app; vdb app need ~0.9 MiB).
+# App-offset implication: the app area sits directly below msg_ring, so with this file the app area starts at
+# 134217728 - CXL_APP_HWCC_BYTES instead of 266338304 - CXL_APP_HWCC_BYTES: a workload binary must read THIS file
+# (CXL_REGION_CONFIG) on every node (own guest install dir); never mix it with cxl_region-ring2m.yaml in one live region.
+# Sizes/offsets in bytes; "auto" means derived (see systems/common/cxl_region.h).
+device: /dev/dax0.0
+map_va: 0x600000000000    # fixed VA of the whole-device mapping, identical on every node (raw pointers in shared data)
+device_size: auto          # /sys/bus/dax/devices/<dev>/size (observed 103060340736)
+align: 2097152             # 2 MiB; must be a multiple of 4096
+hwcc_offset: 0
+hwcc_size: 268435456       # 256 MiB HW-coherent budget, shared by system, workload and message ring
+msg_ring: [134217728, 134217728]  # last 128 MiB of hwcc: Popcorn directory (directory=flat) + 2 MiB ring at the tail
+# Workload control state ("app") sits directly below msg_ring; its size is the workload's computed need for
+# the run, passed as $CXL_APP_HWCC_BYTES (not set here). Systems allocate only the rest (cxl_region.h
+# hwcc_alloc = hwcc - app - msg_ring = at most 134217728 B here). Rules: docs/hwcc-contract.md.
+swcc_offset: auto          # align_up(hwcc_offset + hwcc_size, align)
+swcc_size: auto            # up to device end, stopping at the first reserved range above swcc_offset
+reserved: []               # e.g. [[100931731456, 2147483648]] to exclude a range from all systems
