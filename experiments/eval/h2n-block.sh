@@ -20,7 +20,15 @@
 #   x = the plain layout values --max-ids X_MAXIDS --init-capacity X_INIT_CAP, for the 54M SQ8 set),
 #   MG_SERVER_EXTRA (optional, conf H2N_MG_SERVER_EXTRA; experiment megalon-page-granularity): only
 #   "--chunk-bytes <n>" (n a power of two, 4096 .. 33554432), appended to the Megalon server arguments (4 KiB-page
-#   objects: --chunk-bytes 4096 with the c4k init image and YAML); unset = the 32 MiB default chunk as before,
+#   objects: --chunk-bytes 4096 with the c4k init image and YAML); unset = the 32 MiB default chunk as before;
+#   experiment megalon-ideal-record also takes exactly "--chunk-bytes <n> --object-layout element --init-chunk-bytes
+#   <m>" (element objects: n a multiple of 64 = one record per vector object, m = the chunk size the init image was
+#   built for, a power of two 4096 .. 33554432; the server checks the rest at --print-app-bytes); the element layout
+#   needs Megalon's SCR (logical_scr_size of MEG_CFG + 14,848 B) + the Megalon app bytes + msg_ring <= hwcc_size of the
+#   Megalon region (checked on the Host before the lock),
+#   MG_REGION (optional, conf H2N_MG_REGION; experiment megalon-ideal-record): region file installed as
+#   cfg/cxl_region.yaml of the Megalon guest dir (VMEG) instead of REGION; REGION stays the plain install's region and
+#   the Popcorn ring check's input. Only with the element layout. Unset = REGION as before,
 #   H2N_READY_TIMEOUT (optional, seconds 600 .. 5400, default 5400): run.sh READY_TIMEOUT per node (the init time cap
 #   of a lifetime; a lifetime that does not reach READY stops the block, node logs hold the init lines so far),
 #   H2N_SLO_PART (loadgen SLO part arguments), H2N_OPCOH_STRICT (0 | 1), H2N_CXLBW (0 | 1), H2N_HOSTCPU (0 | 1)
@@ -434,10 +442,21 @@ VF=${H2N_VEC_FORMAT:-fp32} EF=${H2N_EF:-32} MGCAP=${MG_CAPACITY:-h1}
 [[ $NA =~ ^[1-9][0-9]*$ ]] || die "bad X_NA ($NA)"
 [[ $MGCAP =~ ^(h1|x)$ ]] || die "bad MG_CAPACITY ($MGCAP: h1 | x)"
 MGX=${MG_SERVER_EXTRA:-} RDYT=${H2N_READY_TIMEOUT:-5400}
+MGEL=0 MGREG=${MG_REGION:-$REGION}   # megalon-ideal-record: element objects, Megalon region (header); unset = unchanged
 if [ -n "$MGX" ]; then
-  [[ $MGX =~ ^--chunk-bytes\ ([1-9][0-9]*)$ ]] || die "bad MG_SERVER_EXTRA ($MGX: only --chunk-bytes <n>)"
+  if [[ $MGX =~ ^--chunk-bytes\ ([1-9][0-9]*)\ --object-layout\ element\ --init-chunk-bytes\ ([1-9][0-9]*)$ ]]; then
+    cbx=${BASH_REMATCH[1]} icbx=${BASH_REMATCH[2]} MGEL=1
+    [ $((cbx % 64)) = 0 ] && [ "$cbx" -le 33554432 ] || die "MG_SERVER_EXTRA element --chunk-bytes $cbx (a multiple of 64, <= 33554432)"
+    [ "$icbx" -ge 4096 ] && [ "$icbx" -le 33554432 ] && [ $((icbx & (icbx - 1))) = 0 ] || die "MG_SERVER_EXTRA --init-chunk-bytes $icbx (power of two, 4096 .. 33554432)"
+  else
+  [[ $MGX =~ ^--chunk-bytes\ ([1-9][0-9]*)$ ]] || die "bad MG_SERVER_EXTRA ($MGX: only --chunk-bytes <n>, or --chunk-bytes <n> --object-layout element --init-chunk-bytes <m>)"
   cbx=${BASH_REMATCH[1]}
   [ "$cbx" -ge 4096 ] && [ "$cbx" -le 33554432 ] && [ $((cbx & (cbx - 1))) = 0 ] || die "MG_SERVER_EXTRA --chunk-bytes $cbx (power of two, 4096 .. 33554432)"
+  fi
+fi
+if [ -n "${MG_REGION:-}" ]; then
+  [ $MGEL = 1 ] || die "MG_REGION ($MG_REGION) only with the element layout (MG_SERVER_EXTRA ... --object-layout element ...)"
+  [ -f "$MG_REGION" ] || die "missing MG_REGION $MG_REGION"
 fi
 [[ $RDYT =~ ^[1-9][0-9]*$ ]] && [ "$RDYT" -ge 600 ] && [ "$RDYT" -le 5400 ] || die "bad H2N_READY_TIMEOUT ($RDYT: 600 .. 5400 s)"
 # H2N_SEARCH_THREADS (ef-bandwidth, 2026-10-28): search threads per VM instead of vCPU - 1 (core scaling at the
@@ -495,6 +514,16 @@ if [ $HASMG = 1 ]; then
     done
     # shellcheck disable=SC2086
     MGAPP=$("$MEG_BUILD/bin/vdb-server" $MGSA --print-app-bytes) || die "print-app-bytes (Megalon, --nodes $N)"
+    if [ $MGEL = 1 ]; then  # element layout: Megalon SCR + app + msg_ring must fit the Megalon region's hwcc (header)
+      MGSCR=$(sed -n 's/^logical_scr_size: *\([0-9][0-9]*\)MB.*/\1/p' "$MEG_CFG")
+      MGHW=$(sed -n 's/^hwcc_size: *\([0-9][0-9]*\).*/\1/p' "$MGREG")
+      MGRING=$(grep -E '^msg_ring:' "$MGREG" | sed 's/.*,[[:space:]]*\([0-9]*\)\].*/\1/')
+      [[ $MGSCR =~ ^[1-9][0-9]*$ ]] && [[ $MGHW =~ ^[1-9][0-9]*$ ]] && [[ ${MGRING:-0} =~ ^[0-9]+$ ]] \
+        || die "element layout: logical_scr_size (MB) of $MEG_CFG or hwcc_size / msg_ring of $MGREG unreadable"
+      MGSCR=$((MGSCR * 1048576 + 14848))
+      [ $((MGSCR + MGAPP + ${MGRING:-0})) -le "$MGHW" ] \
+        || die "element layout: Megalon SCR $MGSCR B + app $MGAPP B + ring ${MGRING:-0} B > hwcc_size $MGHW B of $MGREG"
+    fi
     VM=${VMEG#/home/comsys/}
     MGINSTALL="$VM/bin/vdb-server $MEG_BUILD/bin/vdb-server
 $VM/bin/vdb-node.sh $TREE/scripts/guest/vdb-node.sh
@@ -505,7 +534,7 @@ $VM/lib/libtbbmalloc.so.2 $MEG_BUILD/lib/libtbbmalloc.so.2
 $VM/lib/libhwloc.so.15 $MEG_BUILD/lib/libhwloc.so.15
 $VM/lib/libatomic.so.1 $MEG_BUILD/lib/libatomic.so.1
 $VM/cfg/megalon.yaml $MEG_CFG
-$VM/cfg/cxl_region.yaml $REGION"
+$VM/cfg/cxl_region.yaml $MGREG"
   fi
 fi
 SAMPLER=$EV/cxl-bw-sampler.sh   # copy of workspaces/cxl-bw/cxl-bw-sampler.sh (perf CXL CM PMU, 1 s, until unlock)
@@ -520,6 +549,7 @@ echo "BLOCK PLAN: vec_format=$VF ef=$EF init=$INIT host_image=$HOST_IMAGE"
 echo "BLOCK PLAN: h2n vdb N=$N vcpu/VM=$VCPU threads $ST+1 nodes=[${IPS[*]}] lifetimes=[${LIVES[*]}] app=$APP mg_app=$MGAPP ring=$RING cxlbw=$CXLBW hostcpu=$HOSTCPU opcoh_strict=$STRICT"
 echo "BLOCK PLAN: server_args plain=[$SA]${MGSA:+ megalon=[$MGSA]}"
 [ -z "$MGX" ] && [ "$RDYT" = 5400 ] || echo "BLOCK PLAN: megalon-page: ready_timeout_s=$RDYT megalon_extra=[$MGX] mg_app=$MGAPP megalon=[$MGSA]"
+[ $MGEL = 0 ] || echo "BLOCK PLAN: megalon-ideal: object_layout=element mg_region=$MGREG region_sha256=$(sha256sum < "$MGREG" | cut -c1-16) hwcc_size=${MGHW:--} scr=${MGSCR:--} mg_app=$MGAPP ring=${MGRING:--} (fits)"
 [ $DSKER = 0 ] || echo "BLOCK PLAN: destijl release=$DS_K bundle=$DS_C guest_tools=$DS_GT region=$REGION T=$DST us recv_mode=$RECV_MODE (node env CXL_SYSTEM=ds CXL_DESTIJL_T_US=<T>; ds:<mix>:t<T> overrides T) replica_mode=$REPL pool_bytes=${RPOOL:--}${DAMONP:+ damon=[$DAMONP] damon_guest_sha256=$(sha256sum < "$EV/ds-damon-guest.sh" | cut -c1-64)}"
 [ -z "$PDIR" ] || echo "BLOCK PLAN: popcorn directory=$PDIR (cxl_shm load directory=$PDIR$([ "$PDIR" = flat ] && echo " dir_offset=$PDOFF"); region == bundle region $(sha256sum < "$REGION" | cut -c1-16); checks pre: release $K8, module 14.0-dir, param directory, dir_flat; post: transaction_error=send_drop=late_response=0, sum requests_sent delta > 0$([ "$PDIR" = flat ] && [ "$N" -ge 3 ] && echo ', sum zero_msg_read_fault delta > 0'); counters E/pop-dir-<name>.txt)"
 [ -z "$DSBPD" ] || echo "BLOCK PLAN: destijl bpd_mode=$DSBPD (cxl_shm load bpd_mode=$DSBPD; region == bundle region $(sha256sum < "$REGION" | cut -c1-16); checks pre + post: param/registered/layout bpd_mode $DSBPD$([ "$DSBPD" = flat ] && echo '; post: bpd_evict=bpd_evict_m=bpd_insert=protocol_error=tx_timeout=0, sum bpd_flat_acquire delta > 0'))"
@@ -658,6 +688,7 @@ gate() { bash "$HG" check "$E/gate-$1.txt" > /dev/null || stop "h3 gate ($1; see
   echo "host_server=$HOSTSRV sha256=$(sha256sum < "$HOSTSRV" | cut -c1-64) loadgen=$LOADGEN sha256=$(sha256sum < "$LOADGEN" | cut -c1-64)"
   [ $HASMG = 1 ] && echo "megalon_build=$MEG_BUILD lib=$MEG_LIB cfg=$MEG_CFG sha256=$(sha256sum < "$MEG_CFG" | cut -c1-64) vmeg=$VMEG mg_max_deletes=$MG_MAXD mg_extra=[$MGX]"
   [ "$RDYT" = 5400 ] || echo "ready_timeout_s=$RDYT (H2N_READY_TIMEOUT)"
+  [ $MGEL = 0 ] || echo "megalon_ideal: object_layout=element mg_region=$MGREG mg_region_sha256=$(sha256sum < "$MGREG" | cut -c1-64) hwcc_size=${MGHW:--} scr=${MGSCR:--} mg_app_hwcc=$MGAPP mg_ring=${MGRING:--}"
   echo "writes=$X_WRITES sha256=$(sha256sum < "$X_WRITES" | cut -c1-64) max_deletes=$X_MAXD"
   echo "slo_part=[$H2N_SLO_PART]"
   echo "receiver: pop_recv_mode=$PRM pop_adapt_ko=${POP_ADAPT_KO:--} pop_adapt_ko_sha256=$([ -f "${POP_ADAPT_KO:-}" ] && sha256sum < "$POP_ADAPT_KO" | cut -c1-64 || echo -) pop_srcversion=$POPSV ds_recv_mode=$RECV_MODE ds_extra=[$DSRX] ds_fault_poll=$DSFP ipoll=${IPOLL:-default} $(recv_wsm_desc) readback_sha256=$(sha256sum < "$RB" | cut -c1-64)"

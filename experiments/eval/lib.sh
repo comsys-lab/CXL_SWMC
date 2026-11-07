@@ -263,7 +263,8 @@ block_dry() {
   # run-2 §6: the fixed warmup plan line (H2N_WARMUP); RecSys De Stijl replica_mode (main-block.sh "PLAN: replica: ")
   # megalon-page-granularity: the block's "PLAN: megalon-page: " line (H2N_MG_SERVER_EXTRA / H2N_READY_TIMEOUT set only)
   # RecSys torn rows (user 2026-11-07): main-block.sh "PLAN: torn rows: " (ds lifetimes: allowed or zero-torn invariant)
-  echo "$out" | grep -E '^BLOCK (PLAN: L1 |PLAN: DAMON |PLAN: pmax |PLAN: auc |PLAN: receiver|PLAN: fixed warmup |PLAN: replica: |PLAN: torn rows: |PLAN: megalon-page: |DRY NOTE|NOTE)' | while IFS= read -r l; do plan "block dry: $l"; done
+  # megalon-ideal-record: the block's "PLAN: megalon-ideal: " line (element layout only)
+  echo "$out" | grep -E '^BLOCK (PLAN: L1 |PLAN: DAMON |PLAN: pmax |PLAN: auc |PLAN: receiver|PLAN: fixed warmup |PLAN: replica: |PLAN: torn rows: |PLAN: megalon-page: |PLAN: megalon-ideal: |DRY NOTE|NOTE)' | while IFS= read -r l; do plan "block dry: $l"; done
   out=$(echo "$out" | tail -n 3)
   if [[ "$out" == *"$want"* ]]; then plan "block dry start reached its evidence-dir check: $(echo "$out" | grep -m1 "$want")"
   else die "block dry start did not reach the evidence-dir check: $out"; fi

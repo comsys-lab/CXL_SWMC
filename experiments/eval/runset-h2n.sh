@@ -36,7 +36,10 @@ unset H2N_PINS H2N_VEC_FORMAT H2N_EF H2N_INIT H2N_HOST_IMAGE H2N_REPEATS H2N_LOA
   H2N_ACCURACY_EXPORT H2N_DS_RECV_EXTRA H2N_DS_DAMON \
   H2N_DS_DAMON_EXTRA H2N_DS_DAMON_AT H2N_DS_DAMON_WARMUP H2N_DS_DAMON_REGIONS H2N_WARMUP \
   H2N_PMAX H2N_PMAX_FROM H2N_PMAX_WARMUP_S H2N_PMAX_MEASURE_S H2N_PMAX_DRAIN_S \
-  H2N_MG_SERVER_EXTRA H2N_READY_TIMEOUT H2N_DS_BPD_MODE H2N_POP_DIR   # optional conf keys: never inherited from the environment
+  H2N_MG_SERVER_EXTRA H2N_READY_TIMEOUT H2N_DS_BPD_MODE H2N_POP_DIR H2N_MG_REGION   # optional conf keys: never inherited from the environment
+# megalon-ideal-record key (2026-11-08; absent = unchanged): H2N_MG_REGION (region file of the Megalon guest install
+# only, passed as MG_REGION with mg lifetimes; element objects, H2N_MG_SERVER_EXTRA "... --object-layout element ...";
+# REGION stays the plain install's region and the Popcorn ring check's input): h2n-block.sh header
 # popcorn-directory-reference key (2026-11-07; absent = unchanged): H2N_POP_DIR (none | flat; Popcorn build 14 bundle,
 # cxl_shm directory= / dir_offset load parameters + identity / counter checks, h2n-block.sh header); REGION = the bundle's
 # tools/cxl_region.yaml (config/cxl_region-popcorn-dir.yaml)
@@ -210,6 +213,8 @@ for g in "${PMG[@]}"; do PMFROM_A+="${PMFROM_A:+ }$(ab "$g")"; done
 [ "${H2N_PMAX:-0}" = 0 ] || plan "pmax step: pop / ds lifetimes append loadgen --mode fixed --rates <Popcorn's max of the cell> (pop: its own slo part; ds: pop rows of [${PMFROM_A:-}])"
 [ $HASMG = 0 ] || BENV+=(MEG_BUILD=$MGB VMEG=$MGV MEG_CFG=$MGC MEG_LIB=$MGL MG_MAXD=$MGD MG_CAPACITY=$VDB_MG_CAPACITY)
 [ $HASMG = 0 ] || [ -z "${H2N_MG_SERVER_EXTRA:-}" ] || { BENV+=("MG_SERVER_EXTRA=$H2N_MG_SERVER_EXTRA"); plan "Megalon server extra [$H2N_MG_SERVER_EXTRA]"; }
+[ $HASMG = 0 ] || [ -z "${H2N_MG_REGION:-}" ] || { need_files "$H2N_MG_REGION"; BENV+=(MG_REGION=$H2N_MG_REGION)
+  plan "Megalon region $H2N_MG_REGION (Megalon guest install cfg/cxl_region.yaml only; REGION $REGION stays for the plain install and the Popcorn ring check)"; }
 [ -z "${H2N_DS_BPD_MODE:-}" ] || { [ -n "${H2N_DS_REGION:-}" ] || die "H2N_DS_BPD_MODE needs an explicit H2N_DS_REGION"
   BENV+=(H2N_DS_BPD_MODE=$H2N_DS_BPD_MODE); plan "De Stijl bpd_mode ${H2N_DS_BPD_MODE} (cxl_shm load; region ${DSR:-})"; }
 [ -z "${H2N_POP_DIR:-}" ] || { BENV+=(H2N_POP_DIR=$H2N_POP_DIR); plan "Popcorn directory=${H2N_POP_DIR} (cxl_shm load; bundle $POP_C, region $REGION)"; }
