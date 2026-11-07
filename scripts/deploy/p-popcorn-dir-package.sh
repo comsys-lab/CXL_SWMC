@@ -15,7 +15,11 @@
 #       Refused while workspaces/MEASUREMENT.lock exists (the stage step compiles nothing but runs make).
 #   builds/popcorn_new/14-dir/deploy-v<V>/
 #     modules.tar modules-manifest.json kernel.config prepare-guest.sh sanitize-initrd.py verify-module-payload.py
-#     verify-initrd.py preparation.sha256          guest install set (l-vanilla scripts, as build 13)
+#     verify-initrd.py verify-installed-modules.py preparation.sha256
+#                                                  guest install set (l-vanilla scripts as build 13, except prepare-guest.sh
+#                                                  and verify-installed-modules.py = the ds-* copies that also accept an
+#                                                  installed, verified /lib/modules/<K14>: cxl_vm0's disk keeps it after
+#                                                  N = 2 and every VM8 overlay inherits it; C2 2026-11-07)
 #     tools/{faultlat,run.sh,cxl_region.yaml,p-popcorn-guest.sh,popcorn.env,tools.sha256}
 #       faultlat + run.sh = builds/popcorn_new/13/deploy-v2/tools (byte-identical); cxl_region.yaml =
 #       config/cxl_region-popcorn-dir.yaml; p-popcorn-guest.sh = scripts/deploy/p-popcorn-guest-dir.sh; popcorn.env:
@@ -24,7 +28,7 @@
 #       LOAD_DEFAULTS="directory=flat dir_offset=<DIR_OFFSET>"
 #     vm<k>/{rollback-inactive.xml,candidate-normal.xml,candidate-restricted.xml,xml.sha256}  (images
 #       /var/lib/libvirt/images/popcorn-14-vm<k>-v<V>)
-#     p-popcorn-deploy.sh (repo), p-popcorn-shm.sh (= scripts/deploy/p-popcorn-shm-dir.sh), smoke.sh, smoke-n.sh,
+#     p-popcorn-deploy.sh (= scripts/deploy/p-popcorn-deploy-dir.sh: re-run rules), p-popcorn-shm.sh (= scripts/deploy/p-popcorn-shm-dir.sh), smoke.sh, smoke-n.sh,
 #     vm-console.py, p-popcorn-xml.py, params-layout.txt, deploy-env.sh, signatures.txt, package-record.json, packet.sha256
 # Output line: "BUNDLE PASS <dir> packet <sha256>" / "BUNDLE DRY PASS (topo T, deploy-vV, nothing written ...)".
 set -euo pipefail
@@ -80,7 +84,8 @@ modinfo -F parm "$BKO" | grep -q '^directory:' && modinfo -F parm "$BKO" | grep 
 [ "$("${MK[@]}" -s -C "$KS" O="$B" LOCALVERSION="$LV" kernelrelease)" = "$K" ] || stop "kernelrelease differs"
 [ "$(sh_ "$REG")" = "$REG_SHA" ] || stop "$REG changed (re-pin REG_SHA)"
 git -C "$SW" ls-files --error-unmatch config/cxl_region-popcorn-dir.yaml > /dev/null 2>&1 || stop "$REG is not tracked in $SW"
-for f in p-popcorn-guest-dir.sh p-popcorn-shm-dir.sh p-popcorn-deploy.sh; do bash -n "$DEP/$f" || stop "bash -n $f"; done
+for f in p-popcorn-guest-dir.sh p-popcorn-shm-dir.sh p-popcorn-deploy-dir.sh ds-prepare-guest.sh; do bash -n "$DEP/$f" || stop "bash -n $f"; done
+python3 -I -c 'import ast,sys; ast.parse(open(sys.argv[1]).read())' "$DEP/ds-verify-installed-modules.py" || stop "ds-verify-installed-modules.py does not parse"
 (cd "$B13" && sha256sum --quiet -c packet.sha256) && [ "$(sh_ "$B13/packet.sha256")" = "$B13_PKT" ] || stop "$B13 packet"
 (cd "$R2" && sha256sum --quiet -c packet.sha256) && [ "$(sh_ "$R2/packet.sha256")" = "$R2_PKT" ] || stop "$R2 packet"
 declare -A XS=()
@@ -126,6 +131,7 @@ if [ "$DRY" = 1 ]; then
   echo "plan: topo $TOPO VMs [$VMS] -> $OUT (GT $GT, images /var/lib/libvirt/images/popcorn-14-vm<k>-v$V)"
   for k in $VMS; do echo "  vm$k rollback XML ${XS[$k]} ($(sh_ "${XS[$k]}" | cut -c1-12))"; done
   echo "  tools: faultlat/run.sh $B13/tools, region $REG ($(cut -c1-12 <<< "$REG_SHA")), guest $DEP/p-popcorn-guest-dir.sh, shm $DEP/p-popcorn-shm-dir.sh, KO_VERSION $KOV"
+  echo "  deploy: p-popcorn-deploy.sh = $DEP/p-popcorn-deploy-dir.sh (re-run rules), prepare-guest.sh = ds-prepare-guest.sh, verify-installed-modules.py = ds-verify-installed-modules.py"
   echo "BUNDLE DRY PASS (topo $TOPO, deploy-v$V, nothing written under $MB)"; exit 0
 fi
 SCR=$(mktemp -d "${TMPDIR:-/tmp}/popcorn14-package.XXXXXX"); trap 'rm -rf "$SCR"' EXIT
@@ -175,11 +181,13 @@ manifest = {'release': release, 'archive_sha256': sha(out / 'modules.tar'), 'con
                                     f'({fp}), vermagic {release}: PASS; updates/cxl_shm.ko payload == builds/popcorn_new/14-dir output\n')
 print(f'{len(mods)} modules signed and verified; cxl_shm {mods["updates/cxl_shm.ko"]}')
 PY
-cp "$DEP/l-vanilla-prepare-guest.sh" "$OUT/prepare-guest.sh"
+cp "$DEP/ds-prepare-guest.sh" "$OUT/prepare-guest.sh"   # l-vanilla copy + re-deploy of an installed release
+cp "$DEP/ds-verify-installed-modules.py" "$OUT/verify-installed-modules.py"
 cp "$DEP/l-vanilla-sanitize-initrd.py" "$OUT/sanitize-initrd.py"
 cp "$DEP/l-vanilla-verify-module-payload.py" "$OUT/verify-module-payload.py"
 cp "$DEP/l-vanilla-verify-initrd.py" "$OUT/verify-initrd.py"
-(cd "$OUT" && sha256sum modules-manifest.json kernel.config prepare-guest.sh sanitize-initrd.py verify-module-payload.py verify-initrd.py > preparation.sha256)
+(cd "$OUT" && sha256sum modules-manifest.json kernel.config prepare-guest.sh sanitize-initrd.py verify-module-payload.py \
+  verify-initrd.py verify-installed-modules.py > preparation.sha256)
 (cd "$OUT" && python3 -I verify-module-payload.py)
 cp "$B13/tools/faultlat" "$B13/tools/run.sh" "$OUT/tools/"
 cp "$REG" "$OUT/tools/cxl_region.yaml"
@@ -198,7 +206,8 @@ for k in $VMS; do
   python3 -I "$DEP/p-popcorn-xml.py" "${XS[$k]}" "/var/lib/libvirt/images/popcorn-14-vm$k-v$V" "$K" "$OUT/vm$k"
   (cd "$OUT/vm$k" && sha256sum rollback-inactive.xml candidate-normal.xml candidate-restricted.xml > xml.sha256)
 done
-cp "$DEP/p-popcorn-deploy.sh" "$DEP/vm-console.py" "$DEP/p-popcorn-xml.py" "$SW/workloads/faultlat/smoke.sh" "$SW/workloads/faultlat/smoke-n.sh" "$OUT/"
+cp "$DEP/p-popcorn-deploy-dir.sh" "$OUT/p-popcorn-deploy.sh"
+cp "$DEP/vm-console.py" "$DEP/p-popcorn-xml.py" "$SW/workloads/faultlat/smoke.sh" "$SW/workloads/faultlat/smoke-n.sh" "$OUT/"
 cp "$DEP/p-popcorn-shm-dir.sh" "$OUT/p-popcorn-shm.sh"
 for f in "$OUT"/*.sh "$OUT"/tools/*.sh; do bash -n "$f" || stop "bash -n $f"; done
 BZ=$B/arch/x86/boot/bzImage

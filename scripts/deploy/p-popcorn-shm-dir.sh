@@ -130,6 +130,13 @@ MODVER=; [ "$PBUILD" -ge 13 ] && MODVER=$PBUILD.0   # cxl_shm MODULE_VERSION of 
 # module 14.0-dir (directory=none|flat), kernel instr/build stays 13 (SWMC_INSTR_BUILD unchanged, instr format of 13);
 # only build 14 is accepted (no 13.x node can join: same_build checks every node). The N = 2 smoke also runs
 # smoke-n.sh (smoke.sh assumes init_state=invalid; directory=flat needs init_state=shared).
+# Build numbers (decided from the build-14 source b5d99cd3c, 2026-11-07): PBUILD = 14 = the release build (selects the
+# feature gates "build >= <n>": every >= 13 expectation applies); IBUILD = 13 = the instrumentation format build that
+# the kernel reports: /sys/kernel/swmc/instr/build and the per-thread "instr_build" line of /proc/thread-self/swmc both
+# print SWMC_INSTR_BUILD (include/swmc/swmc_instr.h:85 = 13, popcorn_msi.c build_show, fs/proc/base.c:3122), which
+# build 14 did not change (no instr / task-stats file changed: 75 per-thread lines as build 13). Every check that
+# compares a REPORTED build (same_build, instr-check swmc.build.<n>, per-thread instr_build, the plan comment) uses
+# IBUILD; module identity uses MODVER 14.0-dir; release identity uses K (-ds-popcorn-new-14).
 IBUILD=$PBUILD
 if [ "$PBUILD" = 14 ]; then MODVER=14.0-dir IBUILD=13
 else echo "p-popcorn-shm-dir.sh is the Popcorn build-14 script (release $K)"; exit 2; fi
@@ -180,7 +187,7 @@ plan)
   for p in "${ph[@]}"; do
     echo "## $p"
     if [ -n "$MODVER" ] && [[ $p =~ ^(precheck|load)$ ]]; then
-      for k in "${ALL[@]}"; do echo "ssh comsys@${IP[$k]} 'cat /sys/kernel/swmc/instr/build; modinfo -F version /lib/modules/$K/updates/cxl_shm.ko'  # == $PBUILD $MODVER"; done
+      for k in "${ALL[@]}"; do echo "ssh comsys@${IP[$k]} 'cat /sys/kernel/swmc/instr/build; modinfo -F version /lib/modules/$K/updates/cxl_shm.ko'  # == $IBUILD $MODVER"; done
     fi
     case $p in
       precheck) for k in "${ALL[@]}"; do echo "ssh comsys@${IP[$k]} 'uname -r; cd $GT && sha256sum --quiet -c tools.sha256'"; g "$k" status; done ;;
@@ -322,8 +329,8 @@ instr-check)
         { log "STOP: build-11 instr files (detail 0, sample_shift, phase_samples) missing on vm$k"; exit 1; }
     fi
     if [ "$PBUILD" -ge 12 ]; then
-      grep -qx "swmc.build.$PBUILD" "$R/instr-before-vm$k.txt" && grep -qx "swmc.serve_fetch.revoke_samples [0-9]*" "$R/instr-before-vm$k.txt" ||
-        { log "STOP: build-12 instr files (build $PBUILD, revoke_samples) missing on vm$k"; exit 1; }
+      grep -qx "swmc.build.$IBUILD" "$R/instr-before-vm$k.txt" && grep -qx "swmc.serve_fetch.revoke_samples [0-9]*" "$R/instr-before-vm$k.txt" ||
+        { log "STOP: build-12 instr files (instr/build $IBUILD, revoke_samples) missing on vm$k"; exit 1; }
     fi
     if [ "$PBUILD" -ge 13 ]; then
       grep -qx "swmc.breakdown.1" "$R/instr-before-vm$k.txt" && grep -qx "swmc.serve_fetch.meta_ns [0-9]*" "$R/instr-before-vm$k.txt" &&
@@ -364,10 +371,10 @@ if area is not None:
     print('@acct_mode %o' % (ast.st_mode & 0o777))
     print('@acct_area ' + ' '.join(str(x) for x in area))
 PY
-    python3 -I - "$R/thread-swmc-vm$k.txt" "$SWMC_LINES" "$PBUILD" <<'PY' || { log "STOP: per-thread file check failed on vm$k"; exit 1; }
+    python3 -I - "$R/thread-swmc-vm$k.txt" "$SWMC_LINES" "$PBUILD" "$IBUILD" <<'PY' || { log "STOP: per-thread file check failed on vm$k"; exit 1; }
 import re, sys
 t = open(sys.argv[1]).read().splitlines()
-nlines, pbuild = sys.argv[2], int(sys.argv[3])
+nlines, pbuild, ibuild = sys.argv[2], int(sys.argv[3]), int(sys.argv[4])   # release build (gates), reported instr build
 h = dict(re.findall(r'(\w+)=(\d+)', t[0]))
 extra = {l.split(' ', 1)[0][1:]: l.split(' ', 1)[1] for l in t[1:] if l.startswith('@')}
 kv = dict(l.split(' ') for l in t[1:] if not l.startswith('@'))
@@ -384,7 +391,7 @@ assert all(re.fullmatch(r'[a-z0-9_]+', k) and v.isdigit() for k, v in kv.items()
 assert int(kv['read_faults']) >= 1 and int(kv['wp_faults']) >= 1 and int(kv['write_faults']) >= 1, kv
 assert int(kv['fault_errors']) == 0, kv
 if pbuild >= 13:   # breakdown keys (instr/breakdown default 1) and the build marker of this kernel
-    assert int(kv['instr_build']) == pbuild and kv['instr_breakdown'] == '1', kv
+    assert int(kv['instr_build']) == ibuild and kv['instr_breakdown'] == '1', kv
     assert int(kv['breakdown_faults']) >= 1, kv
     print('build-13 keys OK: instr_build=%s instr_breakdown=%s breakdown_faults=%s' % (
         kv['instr_build'], kv['instr_breakdown'], kv['breakdown_faults']))
