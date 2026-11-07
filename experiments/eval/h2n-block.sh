@@ -251,6 +251,24 @@ DSFP=0; [[ " $DSRX " != *" fault_poll=1 "* ]] || DSFP=1   # adaptive ds lifetime
 DSBPD=${H2N_DS_BPD_MODE:-}
 [[ $DSBPD =~ ^(sets|flat)?$ ]] || die "bad H2N_DS_BPD_MODE ($DSBPD: sets | flat)"
 [ -z "$DSBPD" ] || [ $HASDS = 1 ] || die "H2N_DS_BPD_MODE needs ds lifetimes"
+# popcorn-directory-reference (2026-11-07): H2N_POP_DIR=none|flat (Popcorn build 14 bundle, cxl_shm 14.0-dir; required
+# with that bundle, refused with any other) adds "directory=<mode> dir_offset=<DIR_OFFSET of C8/tools/popcorn.env>" to the
+# cxl_shm load of every pop lifetime and requires REGION == C8/tools/cxl_region.yaml (byte-equal: the app area sits below
+# the 128 MiB msg_ring of config/cxl_region-popcorn-dir.yaml). Per pop lifetime on every VM (E/pop-dir-<name>.txt):
+# pre (after the enable, before the measurement; a miss stops the block = the cell fails): release K8 (-14), loaded
+# module version 14.0-dir, param.directory=<mode>, param.dir_offset (flat), swmc.dir_flat = 1 (flat) / 0 (none);
+# post (after the teardown, from status pre / post): the same identity lines, deltas transaction_error_count =
+# send_drop_count = late_response_count = 0 on every VM, requests_sent_count delta (sum over VMs) > 0, flat:
+# zero_msg_read_fault_count delta (sum) > 0 at N >= 3 (N = 2: recorded only; with two nodes a reader at I always finds
+# the writer as owner). Recorded per VM and summed: requests_sent_count transaction_count remote_request_count
+# zero_msg_read/write_fault_count dir_cas_retry_count dir_commit_retry_count dir_owner_reappeared_count dir_reserve_count
+# dir_stale_target_count dir_stale_self_owner_count nack_retry_count and total retries = nack_retry +
+# dir_commit_retry + dir_owner_reappeared. Unset = unchanged (and a build-13 bundle as before).
+PDIR=${H2N_POP_DIR:-}
+[[ $PDIR =~ ^(none|flat)?$ ]] || die "bad H2N_POP_DIR ($PDIR: none | flat)"
+[ -z "$PDIR" ] || [ $HASPOP = 1 ] || die "H2N_POP_DIR needs pop lifetimes"
+[ -n "$PDIR" ] || [[ $K8 != *-ds-popcorn-new-14 ]] || die "K8=$K8 (Popcorn build 14 bundle) needs H2N_POP_DIR"
+[ -z "$PDIR" ] || [[ $K8 == *-ds-popcorn-new-14 ]] || die "H2N_POP_DIR needs the Popcorn build 14 bundle (K8=$K8)"
 [ $HAST = 0 ] || [ -z "${H2N_FIXED:-}" ] || die "ds:<mix>:t<T> lifetimes are SLO lifetimes (not with H2N_FIXED)"
 if [ $DSKER = 1 ]; then
   [ $HASPOP = 0 ] || die "pop and ds lifetimes need different guest kernels: run them in separate blocks"
@@ -372,6 +390,13 @@ if [ $DSKER = 1 ]; then  # the De Stijl bundle instead of the Popcorn one (no po
 else
 [ -f "$REGION" ] && [ "$(sha256sum < "$C8/packet.sha256" | cut -c1-64)" = "$POP_BUNDLE_SHA" ] \
   && (cd "$C8" && sha256sum -c --quiet packet.sha256) || die "REGION or the Popcorn bundle ($C8) does not verify"
+fi
+PDOFF=-
+if [ -n "$PDIR" ]; then  # Popcorn build 14 bundle: region, directory offset, module version (header above)
+  cmp -s "$REGION" "$C8/tools/cxl_region.yaml" || die "H2N_POP_DIR: REGION ($REGION) != $C8/tools/cxl_region.yaml"
+  PDOFF=$(sed -n 's/^DIR_OFFSET=\([0-9][0-9]*\)$/\1/p' "$C8/tools/popcorn.env")
+  [ -n "$PDOFF" ] && grep -qx 'KO_VERSION=14.0-dir' "$C8/tools/popcorn.env" || die "H2N_POP_DIR: $C8/tools/popcorn.env has no DIR_OFFSET / KO_VERSION=14.0-dir"
+  grep -qF 'directory=(none|flat)' "$C8/tools/p-popcorn-guest.sh" || die "H2N_POP_DIR: $C8/tools/p-popcorn-guest.sh does not accept directory="
 fi
 POPSV=-
 if [ $HASPOP = 1 ]; then
@@ -496,6 +521,7 @@ echo "BLOCK PLAN: h2n vdb N=$N vcpu/VM=$VCPU threads $ST+1 nodes=[${IPS[*]}] lif
 echo "BLOCK PLAN: server_args plain=[$SA]${MGSA:+ megalon=[$MGSA]}"
 [ -z "$MGX" ] && [ "$RDYT" = 5400 ] || echo "BLOCK PLAN: megalon-page: ready_timeout_s=$RDYT megalon_extra=[$MGX] mg_app=$MGAPP megalon=[$MGSA]"
 [ $DSKER = 0 ] || echo "BLOCK PLAN: destijl release=$DS_K bundle=$DS_C guest_tools=$DS_GT region=$REGION T=$DST us recv_mode=$RECV_MODE (node env CXL_SYSTEM=ds CXL_DESTIJL_T_US=<T>; ds:<mix>:t<T> overrides T) replica_mode=$REPL pool_bytes=${RPOOL:--}${DAMONP:+ damon=[$DAMONP] damon_guest_sha256=$(sha256sum < "$EV/ds-damon-guest.sh" | cut -c1-64)}"
+[ -z "$PDIR" ] || echo "BLOCK PLAN: popcorn directory=$PDIR (cxl_shm load directory=$PDIR$([ "$PDIR" = flat ] && echo " dir_offset=$PDOFF"); region == bundle region $(sha256sum < "$REGION" | cut -c1-16); checks pre: release $K8, module 14.0-dir, param directory, dir_flat; post: transaction_error=send_drop=late_response=0, sum requests_sent delta > 0$([ "$PDIR" = flat ] && [ "$N" -ge 3 ] && echo ', sum zero_msg_read_fault delta > 0'); counters E/pop-dir-<name>.txt)"
 [ -z "$DSBPD" ] || echo "BLOCK PLAN: destijl bpd_mode=$DSBPD (cxl_shm load bpd_mode=$DSBPD; region == bundle region $(sha256sum < "$REGION" | cut -c1-16); checks pre + post: param/registered/layout bpd_mode $DSBPD$([ "$DSBPD" = flat ] && echo '; post: bpd_evict=bpd_evict_m=bpd_insert=protocol_error=tx_timeout=0, sum bpd_flat_acquire delta > 0'))"
 [ "$REPL" != damon ] || echo "BLOCK PLAN: DAMON at=$DXAT range=$DXRANGE start_keys=[$DXSTART] regions_capture=$DXREG warmup=[${DXWARM:-none}]${DXWARM:+ warm_parts=[$DXWPARTS] nogate=[$DXWNOGATE]}$([ "$DXAT" = enable ] || echo " hook_sha256=$(sha256sum < "$EV/damonx-hook.sh" | cut -c1-64)")"
 [ $L1ON = 0 ] || echo "BLOCK PLAN: L1 step on hw/pop/ds lifetimes: --mode fixed --rates <L1> ${L1W}s warm-up + ${L1M}s + ${L1D}s drain; L1 from mg-<mix>-n$N rows of [${L1FROM:-} + this block]; no mg max -> L1 = ramp start $L1START, no step"
@@ -636,6 +662,7 @@ gate() { bash "$HG" check "$E/gate-$1.txt" > /dev/null || stop "h3 gate ($1; see
   echo "slo_part=[$H2N_SLO_PART]"
   echo "receiver: pop_recv_mode=$PRM pop_adapt_ko=${POP_ADAPT_KO:--} pop_adapt_ko_sha256=$([ -f "${POP_ADAPT_KO:-}" ] && sha256sum < "$POP_ADAPT_KO" | cut -c1-64 || echo -) pop_srcversion=$POPSV ds_recv_mode=$RECV_MODE ds_extra=[$DSRX] ds_fault_poll=$DSFP ipoll=${IPOLL:-default} $(recv_wsm_desc) readback_sha256=$(sha256sum < "$RB" | cut -c1-64)"
   [ $DSKER = 0 ] || echo "destijl: bundle=$DS_C bundle_sha=$DS_BUNDLE_SHA release=$DS_K guest_tools=$DS_GT region=$REGION t_us=$DST recv_mode=$RECV_MODE replica_mode=$REPL replica_pool_bytes=${RPOOL:--}${DAMONP:+ damon=[$DAMONP] damon_guest_sha256=$(sha256sum < "$EV/ds-damon-guest.sh" | cut -c1-64)}"
+  [ -z "$PDIR" ] || echo "popcorn_directory=$PDIR dir_offset=$PDOFF region_sha256=$(sha256sum < "$REGION" | cut -c1-64) bundle_region_sha256=$(sha256sum < "$C8/tools/cxl_region.yaml" | cut -c1-64)"
   [ -z "$DSBPD" ] || echo "destijl_bpd_mode=$DSBPD region_sha256=$(sha256sum < "$REGION" | cut -c1-64) bundle_region_sha256=$(sha256sum < "$DS_C/tools/cxl_region.yaml" | cut -c1-64)"
   [ "$REPL" != damon ] || echo "damon: at=$DXAT range=$DXRANGE start_keys=[$DXSTART] regions_capture=$DXREG warmup=[$DXWARM] warm_parts=[$DXWPARTS]$([ "$DXAT" = enable ] || echo " hook_sha256=$(sha256sum < "$EV/damonx-hook.sh" | cut -c1-64)")"
   [ $L1ON = 0 ] || echo "l1: from=[$L1FROM] warmup_s=$L1W measure_s=$L1M drain_s=$L1D ramp_start=$L1START"
@@ -671,6 +698,7 @@ OWNED=root
 # ---- Popcorn cxl_shm cycle (P-popcorn-deploy §6a, init_state=shared) on the N guests -------------------------------
 pop_up() {  # <name>
   PS=(K=$K8 GT=$GT8 C=$C8 R=$E/shm-$1 INIT_STATE=shared)
+  [ -z "$PDIR" ] || PS+=("LOAD_EXTRA=directory=$PDIR$([ "$PDIR" = flat ] && echo " dir_offset=$PDOFF")")
   [ $OWNED = root ] || { dax_owner root || stop "dax0.0 back to root before Popcorn"; OWNED=root; }
   servers_gone || stop "a server runs before the Popcorn load"
   env "${PS[@]}" bash $C8/p-popcorn-shm.sh precheck >> "$E/block.log" 2>&1 || stop "shm precheck"
@@ -689,6 +717,7 @@ pop_up() {  # <name>
   env "${PS[@]}" bash $C8/p-popcorn-shm.sh enable >> "$E/block.log" 2>&1 || stop "enable gate"
   recv_apply pop "$1" "$PRM"
   env "${PS[@]}" STATUS_TAG=pre bash $C8/p-popcorn-shm.sh status >> "$E/block.log" 2>&1 || stop "status pre"
+  [ -z "$PDIR" ] || pop_dir_check "$1" pre || stop "Popcorn directory=$PDIR check pre ($E/pop-dir-$1.txt)"
 }
 pop_down() {
   recv_post "$1"
@@ -696,7 +725,40 @@ pop_down() {
   servers_gone || stop "servers left (Popcorn teardown not attempted)"
   dax_unused pre-teardown || stop "/dev/dax0.0 in use before the cxl_shm teardown"
   env "${PS[@]}" bash $C8/p-popcorn-shm.sh teardown >> "$E/block.log" 2>&1 || stop "shm teardown"
+  [ -z "$PDIR" ] || pop_dir_check "$1" post || stop "Popcorn directory=$PDIR check post ($E/pop-dir-$1.txt)"
 }
+PDCNT="requests_sent_count transaction_count remote_request_count zero_msg_read_fault_count zero_msg_write_fault_count dir_cas_retry_count dir_commit_retry_count dir_owner_reappeared_count dir_reserve_count dir_stale_target_count dir_stale_self_owner_count nack_retry_count transaction_error_count send_drop_count late_response_count"
+pop_dir_check() {  # <name> <pre|post>: H2N_POP_DIR checks on E/shm-<name>/{load,status-<tag>}-vm<i>.txt (header above)
+  local i f l c v x bad= line; declare -A S=()
+  for i in "${!IPS[@]}"; do
+    f=$E/shm-$1/status-$2-vm$i.txt l=$E/shm-$1/load-vm$i.txt
+    grep -qx "release=$K8 loaded=1" "$f" 2>/dev/null || bad+=" vm$i:release/loaded"
+    grep -qx 'version=14.0-dir' "$l" 2>/dev/null || bad+=" vm$i:module-version"
+    grep -qx "param.directory=$PDIR" "$f" 2>/dev/null || bad+=" vm$i:param.directory"
+    grep -qx "swmc.dir_flat=$([ "$PDIR" = flat ] && echo 1 || echo 0)" "$f" 2>/dev/null || bad+=" vm$i:dir_flat"
+    [ "$PDIR" != flat ] || grep -qx "param.dir_offset=$PDOFF" "$f" 2>/dev/null || bad+=" vm$i:param.dir_offset"
+    if [ "$2" = post ]; then
+      line="vm$i deltas:"
+      for c in $PDCNT; do
+        v=$(sed -n "s/^swmc\.$c=\([0-9]*\)$/\1/p" "$f" | head -1) x=$(sed -n "s/^swmc\.$c=\([0-9]*\)$/\1/p" "$E/shm-$1/status-pre-vm$i.txt" | head -1)
+        [ -n "$v" ] && [ -n "$x" ] || { bad+=" vm$i:$c-missing"; continue; }
+        line+=" $c=$((v - x))"; S[$c]=$(( ${S[$c]:-0} + v - x ))
+      done
+      for c in transaction_error_count send_drop_count late_response_count; do
+        [[ " $line " == *" $c=0 "* ]] || bad+=" vm$i:$c!=0"; done
+      echo "$(date -Is) $1 post $line" >> "$E/pop-dir-$1.txt"
+    fi
+    echo "$(date -Is) $1 $2 vm$i: $(grep -hE '^(release=|version=|param\.(directory|dir_offset|nr_nodes|init_state|recv_mode)=|swmc\.dir_flat=)' "$f" "$l" 2>/dev/null | tr '\n' ' ')" >> "$E/pop-dir-$1.txt"
+  done
+  if [ "$2" = post ]; then
+    line="sum over $N VMs:"; for c in $PDCNT; do line+=" $c=${S[$c]:-0}"; done
+    line+=" total_retries=$(( ${S[nack_retry_count]:-0} + ${S[dir_commit_retry_count]:-0} + ${S[dir_owner_reappeared_count]:-0} ))"
+    echo "$(date -Is) $1 post $line" >> "$E/pop-dir-$1.txt"
+    [ "${S[requests_sent_count]:-0}" -gt 0 ] || bad+=" requests_sent_delta=${S[requests_sent_count]:-0}"
+    if [ "$PDIR" = flat ] && [ "$N" -ge 3 ]; then [ "${S[zero_msg_read_fault_count]:-0}" -gt 0 ] || bad+=" zero_msg_read_fault_delta=0"; fi
+  fi
+  [ -z "$bad" ] || { echo "$(date -Is) $1 $2 FAIL:$bad" >> "$E/pop-dir-$1.txt"; log "$1 popcorn directory=$PDIR $2 FAIL:$bad"; return 1; }
+  log "$1 popcorn directory=$PDIR $2 PASS ($E/pop-dir-$1.txt)"; }
 # ---- De Stijl v2 cxl_shm cycle (protocol=destijl, init_state=shared; systems/destijl/system.yaml) on the N guests ------
 # Same order and checks as pop_up: precheck, load (+ state running on every node), chown, region check, preload
 # through a plain mapping (node 0), enable (syscall 470, protocol destijl), recv_mode, status.
