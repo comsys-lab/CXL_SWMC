@@ -10,6 +10,12 @@
 // the server uses that mapping for the HWcc app range and never maps the device itself.
 // Object API: the shared shim systems/megalon/shim (libmegalon-objapi.so, megalon_objapi.h; since vdb build 10;
 // earlier builds used this directory's megalon_api.h / libvdb-megalon.so, still used by workloads/lmdb).
+// Element layout (experiment megalon-ideal-record, --object-layout element, GraphParams::elem_objects): per segment s
+// and slot i a vector object (kind 1, vrec_bytes), a level-0 link object (kind 4, links0_bytes) and an upper-link
+// object (kind 5): loaded element of level L >= 1: L x links_bytes; loaded level 0: none; insert slot (i >= the init
+// count): upper_group_bytes (8 blocks = 1 KiB). Node 0 creates a segment's element objects while it copies the init
+// image (server.cc load_elements, header level from the image), every node learns the levels in check_elem_objects by
+// reading each loaded header from its vector object. Delete-log objects as in the chunk layout.
 #pragma once
 
 #include <dlfcn.h>
@@ -17,7 +23,9 @@
 #include <x86intrin.h>
 
 #include <atomic>
+#include <cerrno>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <memory>
@@ -193,6 +201,11 @@ struct alignas(64) MegTimers {
   // [4 + i] read bin i, [4 + kBins + i] write bin i
   static constexpr int kLh = 4 + 2 * mshim::LookupHist::kBins;
   std::atomic<uint64_t> lh[kLh] = {};
+  // Per object kind read-section counters (element layout only; MegalonBackend "per-kind counters"): kind = object id
+  // bits 44-47 (1 vector, 2 link chunk, 3 delete log, 4 level-0 links, 5 upper links)
+  static constexpr int kKinds = 6;
+  enum : int { kKcSections, kKcFails, kKcSampled, kKcStaleS, kKcConcurS, kKcN };
+  std::atomic<uint64_t> kc[kKinds][kKcN] = {};
   std::atomic<int> role{kRoleOther};
   TraceBuf tb;  // trace only (owner thread appends; dumped after the run)
   void add(int k, uint64_t d) { v[k].store(v[k].load(std::memory_order_relaxed) + d, std::memory_order_relaxed); }
@@ -212,8 +225,17 @@ class MegalonBackend {
   MegalonBackend(const cxl::region &, uint8_t *, const Params &p, const MegalonApi *api)
       : p_(p), api_(api), coh_(megalon_thread_coh(api)), lh_(megalon_lookup_hist(api)), wc_(megalon_wmeta_counts(api)) {
     dlog_chunks_ = p.dlog_chunks();
+    // per-kind counters: element layout only (chunk layouts: no extra work, no megk.* keys)
+    kind_stats_ = p.g.elem_objects;
+    const char *kx = getenv("VDB_MEG_KIND_EXACT");
+    kind_exact_ = kind_stats_ && kx && std::string(kx) == "1";
   }
   bool fits(std::string *err) const {
+    if (p_.g.elem_objects && p_.g.per_chunk() != 1) {
+      *err = "megalon: --object-layout element needs one element per group (per_chunk " + std::to_string(p_.g.per_chunk()) +
+             "; --chunk-bytes in [vrec, 2 vrec), vrec " + std::to_string(p_.g.vrec_bytes()) + ")";
+      return false;
+    }
     if (p_.g.vrec_bytes() % 64 || p_.g.links0_bytes() % 64 || p_.g.links_bytes() % 64) {
       *err = "megalon: records and link blocks must be whole cache lines (dim % 16 == 0)";
       return false;
@@ -241,31 +263,111 @@ class MegalonBackend {
   static uint64_t vec_id(uint32_t s, uint64_t g) { return id(1, s, g); }
   static uint64_t link_id(uint32_t s, uint64_t g) { return id(2, s, g); }
   static uint64_t dlog_id(uint32_t node, uint64_t c) { return id(3, node, c); }
+  // element layout (slot i = group i, per_chunk 1): vector object = vec_id(s, i)
+  static uint64_t l0_id(uint32_t s, uint64_t i) { return id(4, s, i); }
+  static uint64_t up_id(uint32_t s, uint64_t i) { return id(5, s, i); }
   uint64_t chunk_id(Chunk k, uint32_t s, uint64_t g) const { return k == Chunk::kVec ? vec_id(s, g) : link_id(s, g); }
 
+  // ---- element layout: level of slot i of segment s (loaded: 0..8 from its header; kInsertSlot: i >= init count)
+  static constexpr uint8_t kInsertSlot = 0xff;
+  uint8_t elem_level(uint32_t s, uint64_t i) const {
+    return s < elem_lv_.size() && i < elem_lv_[s].size() ? elem_lv_[s][i] : kInsertSlot;
+  }
+  // bytes of the upper-link object of a slot of level lv (0 = no object)
+  uint64_t upper_obj_bytes(uint8_t lv) const {
+    return lv == kInsertSlot ? p_.g.upper_group_bytes() : uint64_t(lv) * p_.g.links_bytes();
+  }
+  bool elem_levels_known() const { return !elem_lv_.empty(); }
+  uint64_t object_size(uint64_t id) const {  // 0: no such object
+    size_t got = 0;
+    return api_->lookup(id, &got) == 0 ? got : 0;
+  }
+  // node 0 load: create slot i's objects (lv = its level, or kInsertSlot) and record the level
+  bool create_elem(uint32_t s, uint64_t i, uint8_t lv, std::string *err) const {
+    if (elem_lv_.size() != p_.segments) elem_lv_.resize(p_.segments);
+    if (lv != kInsertSlot) {
+      if (i != elem_lv_[s].size()) return *err = "create_elem: loaded slots out of order", false;
+      elem_lv_[s].push_back(lv);
+    }
+    const uint64_t ub = upper_obj_bytes(lv);
+    return create_one(vec_id(s, i), p_.g.vrec_bytes(), err) && create_one(l0_id(s, i), p_.g.links0_bytes(), err) &&
+           (!ub || create_one(up_id(s, i), ub, err));
+  }
+
   template <class F> void for_each_object(F f) const {  // f(id, size)
-    for (uint32_t s = 0; s < p_.segments; s++)
-      for (uint64_t g = 0; g < p_.g.groups(); g++) {
-        f(vec_id(s, g), p_.g.vchunk_bytes());
-        f(link_id(s, g), p_.g.lchunk_bytes());
-      }
+    if (p_.g.elem_objects) {  // insert-slot sizes for slots whose level is not known (yet)
+      for (uint32_t s = 0; s < p_.segments; s++)
+        for (uint64_t i = 0; i < p_.g.capacity; i++) {
+          f(vec_id(s, i), p_.g.vrec_bytes());
+          f(l0_id(s, i), p_.g.links0_bytes());
+          if (const uint64_t ub = upper_obj_bytes(elem_level(s, i))) f(up_id(s, i), ub);
+        }
+    } else {
+      for (uint32_t s = 0; s < p_.segments; s++)
+        for (uint64_t g = 0; g < p_.g.groups(); g++) {
+          f(vec_id(s, g), p_.g.vchunk_bytes());
+          f(link_id(s, g), p_.g.lchunk_bytes());
+        }
+    }
+    for_each_dlog(f);
+  }
+  template <class F> void for_each_dlog(F f) const {
     for (uint32_t u = 0; u < p_.nr_nodes; u++)
       for (uint64_t c = 0; c < dlog_chunks_; c++) f(dlog_id(u, c), uint64_t(p_.dlog_chunk) * sizeof(DlogEntry));
   }
-  bool create_objects(std::string *err) const {  // node 0, prepare
+  // node 0, prepare. Element layout: the delete-log objects only (the loader creates the element objects).
+  bool create_objects(std::string *err) const {
     bool ok = true;
-    for_each_object([&](uint64_t id, uint64_t size) {
-      if (!ok) return;
-      int rc = api_->create(id, size);
-      if (rc != 0) {
-        *err = "ObjectCreate(" + hex(id) + ", " + std::to_string(size) + ") = " + std::to_string(rc) +
-               " (-12 ENOMEM: object_arena_size too small; -17 EEXIST: stale objects, run with MEGALON_REINIT=1)";
-        ok = false;
-      }
-    });
+    auto one = [&](uint64_t id, uint64_t size) { ok = ok && create_one(id, size, err); };
+    if (p_.g.elem_objects) for_each_dlog(one);
+    else for_each_object(one);
     return ok;
   }
-  bool check_objects(std::string *err) const {  // every node, after node 0 published its load
+  // Element layout, every node after node 0 published its load (counts[s] = segment s's loaded elements): every slot
+  // has its vector and level-0 object; a loaded slot's header (read from its vector object) passes the stale-header
+  // guard and its upper object is level x links_bytes (absent for level 0); an insert slot's upper object is
+  // upper_group_bytes. Records the levels (node 0: must equal the levels it loaded). Then the delete-log objects.
+  bool check_elem_objects(const std::vector<uint64_t> &counts, std::string *err) const {
+    if (elem_lv_.size() != p_.segments) elem_lv_.resize(p_.segments);
+    auto size_is = [&](uint64_t id, uint64_t want) {
+      size_t got = 0;
+      const int rc = api_->lookup(id, &got);
+      if (want ? rc == 0 && got == want : rc == -ENOENT) return true;
+      *err = "ObjectLookup(" + hex(id) + ") = " + std::to_string(rc) + " size " + std::to_string(got) + ", want " +
+             (want ? std::to_string(want) : std::string("no object (-ENOENT)"));
+      return false;
+    };
+    for (uint32_t s = 0; s < p_.segments; s++) {
+      const uint64_t n = counts[s];
+      std::vector<uint8_t> &lv = elem_lv_[s];
+      const bool known = lv.size() == n;  // node 0 (loaded them); other nodes learn them here
+      if (!known) lv.assign(n, 0);
+      for (uint64_t i = 0; i < p_.g.capacity; i++) {
+        if (!size_is(vec_id(s, i), p_.g.vrec_bytes()) || !size_is(l0_id(s, i), p_.g.links0_bytes())) return false;
+        uint8_t l = kInsertSlot;
+        if (i < n) {
+          ElemHeader h;
+          read_bytes(vec_id(s, i), 0, sizeof(h), &h);
+          if (!elem_header_ok(h, p_.g)) {
+            *err = "loaded element " + std::to_string(i) + " of segment " + std::to_string(s) + " fails the header guard";
+            return false;
+          }
+          l = uint8_t(h.level);
+          if (known && lv[i] != l) {
+            *err = "element " + std::to_string(i) + " of segment " + std::to_string(s) + ": header level " +
+                   std::to_string(l) + " != loaded level " + std::to_string(lv[i]);
+            return false;
+          }
+          lv[i] = l;
+        }
+        if (!size_is(up_id(s, i), upper_obj_bytes(l))) return false;
+      }
+    }
+    bool ok = true;
+    for_each_dlog([&](uint64_t id, uint64_t size) { ok = ok && size_is(id, size); });
+    return ok;
+  }
+  bool check_objects(std::string *err) const {  // every node, after node 0 published its load (chunk layout)
     bool ok = true;
     for_each_object([&](uint64_t id, uint64_t size) {
       size_t got = 0;
@@ -295,8 +397,10 @@ class MegalonBackend {
     thread_local uint64_t rs = 0x9e3779b97f4a7c15ull ^ uint64_t(reinterpret_cast<uintptr_t>(&rs));
     rs ^= rs << 13, rs ^= rs >> 7, rs ^= rs << 17;  // xorshift64
     const bool timed = (rs >> 32 & (kSample - 1)) == 0;
+    const uint32_t kind = uint32_t(id >> 44 & 0xf) < MegTimers::kKinds ? uint32_t(id >> 44 & 0xf) : 0;
+    const bool ksnap = kind_stats_ && coh_ && (timed || kind_exact_);  // per-kind stale/concur on this section
     mshim::CohSnap c0;
-    if (wsec_ && coh_) coh_(&c0);
+    if (coh_ && (wsec_ || ksnap)) coh_(&c0);
     uint32_t fails = 0;
     uint64_t seq = 0;
     for (;;) {
@@ -313,6 +417,7 @@ class MegalonBackend {
         const bool ok = api_->read_end(&h);
         if (timed) account_read(t0, t1, t2, ok);
         if (ok) {
+          if (kind_stats_) account_kind(kind, fails, ksnap, c0);
           if (wsec_) trace_read(id, e, seq, fails, c0);
           return;
         }
@@ -322,6 +427,7 @@ class MegalonBackend {
         const bool ok = api_->read_end(&h);
         if (timed) account_read(t0, t1, t2, ok);
         if (ok) {
+          if (kind_stats_) account_kind(kind, fails, ksnap, c0);
           if (wsec_) trace_read(id, e, seq, fails, c0);
           return r;
         }
@@ -366,6 +472,10 @@ class MegalonBackend {
         },
         e);
   }
+  // read section copying [off, off + len) of object id into dst
+  void read_bytes(uint64_t id, uint64_t off, uint64_t len, void *dst) const {
+    read(id, off, len, [&](const uint8_t *src) { std::memcpy(dst, src, len); });
+  }
   static void check_lines(uint64_t id, uint64_t off, uint64_t len, size_t size) {
     if (off % 64 || off + len > size || (len % 64 && off + len != size))
       megalon_fatal("write of [" + std::to_string(off) + ", +" + std::to_string(len) + ") in object " + hex(id) +
@@ -402,6 +512,25 @@ class MegalonBackend {
   std::string usage() const {
     uint64_t objs = 0, bytes = 0;
     for_each_object([&](uint64_t, uint64_t sz) { objs++, bytes += (sz + 63) / 64 * 64; });
+    if (p_.g.elem_objects) {  // per kind; before the load every slot counts as an insert slot (levels=pending)
+      uint64_t loaded = 0, up_loaded = 0, up_bytes_loaded = 0, ins = 0;
+      for (uint32_t s = 0; s < p_.segments; s++) {
+        const uint64_t n = s < elem_lv_.size() ? elem_lv_[s].size() : 0;
+        loaded += n, ins += p_.g.capacity - n;
+        for (uint64_t i = 0; i < n; i++)
+          if (elem_lv_[s][i]) up_loaded++, up_bytes_loaded += upper_obj_bytes(elem_lv_[s][i]);
+      }
+      return "megalon objects=" + std::to_string(objs) + " object_bytes=" + std::to_string(bytes) +
+             " layout=element levels=" + (elem_levels_known() ? "loaded" : "pending") + " segments=" +
+             std::to_string(p_.segments) + " slots=" + std::to_string(uint64_t(p_.segments) * p_.g.capacity) +
+             " loaded=" + std::to_string(loaded) + " insert_slots=" + std::to_string(ins) + " vec_obj=" +
+             std::to_string(p_.g.vrec_bytes()) + " l0_obj=" + std::to_string(p_.g.links0_bytes()) +
+             " upper_objs_loaded=" + std::to_string(up_loaded) + " upper_bytes_loaded=" + std::to_string(up_bytes_loaded) +
+             " upper_obj_insert=" + std::to_string(p_.g.upper_group_bytes()) + " dlog_chunks_per_node=" +
+             std::to_string(dlog_chunks_) + " dlog_chunk_bytes=" + std::to_string(uint64_t(p_.dlog_chunk) * sizeof(DlogEntry)) +
+             " kind_stats=" + (kind_exact_ ? "exact" : "sampled") + " shim_api=" + std::to_string(api_->version) +
+             " thread_coh=" + (coh_ ? "yes" : "no") + " shim=" + api_->info;
+    }
     return "megalon objects=" + std::to_string(objs) + " object_bytes=" + std::to_string(bytes) + " segments=" +
            std::to_string(p_.segments) + " groups=" + std::to_string(p_.g.groups()) + " per_chunk=" +
            std::to_string(p_.g.per_chunk()) + " vchunk=" + std::to_string(p_.g.vchunk_bytes()) + " lchunk=" +
@@ -460,6 +589,28 @@ class MegalonBackend {
           << "write_sum_ns=" << s[3];
         for (int i = 0; i < B; i++) o << p << "read.b" << (i < 10 ? "0" : "") << i << "=" << s[4 + i];
         for (int i = 0; i < B; i++) o << p << "write.b" << (i < 10 ? "0" : "") << i << "=" << s[4 + B + i];
+      }
+    }
+    // per object kind (element layout only): megk.[<role>.]<kind>.<field>, cumulative since start (stats deltas give
+    // per-step values). sections / rd_fails (read_end false = (B)+(C)) exact; coh_sampled = read sections bracketed by
+    // thread_coh (the wrapper's timed 1 in megt.sample, or all with megk.exact=1), stale_sampled / concur_sampled =
+    // CohSnap (A) / (B) events in those sections. Per-kind estimate: opt.<op>.meg.stale_cnt x stale_sampled[kind] /
+    // sum over kinds of stale_sampled (or stale_sampled x sections / coh_sampled per kind)
+    if (kind_stats_) {
+      static const char *const kn[MegTimers::kKinds] = {"other", "vec", "link", "dlog", "l0", "upper"};
+      static const char *const fn[MegTimers::kKcN] = {"sections", "rd_fails", "coh_sampled", "stale_sampled",
+                                                      "concur_sampled"};
+      static const char *const lr[MegTimers::kRoles + 1] = {"", "main.", "writer.", "search.", "other."};
+      o << "\nmegk.exact=" << int(kind_exact_) << "\nmegk.thread_coh=" << (coh_ ? 1 : 0);
+      std::lock_guard<std::mutex> g(tmu_);
+      for (int r = -1; r < MegTimers::kRoles; r++) {
+        uint64_t s[MegTimers::kKinds][MegTimers::kKcN] = {};
+        for (const MegTimers *t : tblocks_)
+          if (r < 0 || t->role.load() == r)
+            for (int k = 0; k < MegTimers::kKinds; k++)
+              for (int f = 0; f < MegTimers::kKcN; f++) s[k][f] += t->kc[k][f].load(std::memory_order_relaxed);
+        for (int k = 1; k < MegTimers::kKinds; k++)
+          for (int f = 0; f < MegTimers::kKcN; f++) o << "\nmegk." << lr[r + 1] << kn[k] << "." << fn[f] << "=" << s[k][f];
       }
     }
     if (wsec_) {
@@ -555,6 +706,10 @@ class MegalonBackend {
   // dense index of an object id (for_each_object order: vec/link per segment group, then delete-log chunks per node)
   uint64_t obj_index(uint64_t id) const {
     const uint64_t kind = id >> 44 & 0xf, a = id >> 24 & 0xfffff, b = id & 0xffffff;
+    if (p_.g.elem_objects) {  // element layout: vector, level-0, upper per slot, then delete-log chunks
+      if (kind == 1 || kind == 4 || kind == 5) return (a * p_.g.groups() + b) * 3 + (kind == 1 ? 0 : kind == 4 ? 1 : 2);
+      return uint64_t(p_.segments) * p_.g.groups() * 3 + a * dlog_chunks_ + b;
+    }
     if (kind == 1 || kind == 2) return (a * p_.g.groups() + b) * 2 + (kind - 1);
     return uint64_t(p_.segments) * p_.g.groups() * 2 + a * dlog_chunks_ + b;
   }
@@ -564,6 +719,28 @@ class MegalonBackend {
     char b[24];
     std::snprintf(b, sizeof(b), "%#lx", (unsigned long)x);
     return b;
+  }
+  bool create_one(uint64_t id, uint64_t size, std::string *err) const {
+    const int rc = api_->create(id, size);
+    if (rc == 0) return true;
+    *err = "ObjectCreate(" + hex(id) + ", " + std::to_string(size) + ") = " + std::to_string(rc) +
+           " (-12 ENOMEM: object_arena_size too small; -17 EEXIST: stale objects, run with MEGALON_REINIT=1)";
+    return false;
+  }
+  // accepted read section of an object of kind k (element layout): exact section / failure counts; with snap, the
+  // CohSnap (A) / (B) deltas since c0 (taken before the first attempt)
+  void account_kind(uint32_t k, uint32_t fails, bool snap, const mshim::CohSnap &c0) const {
+    MegTimers &t = tm();
+    std::atomic<uint64_t> *c = t.kc[k];
+    auto add = [](std::atomic<uint64_t> &a, uint64_t d) { a.store(a.load(std::memory_order_relaxed) + d, std::memory_order_relaxed); };
+    add(c[MegTimers::kKcSections], 1);
+    if (fails) add(c[MegTimers::kKcFails], fails);
+    if (!snap) return;
+    mshim::CohSnap c1;
+    coh_(&c1);
+    add(c[MegTimers::kKcSampled], 1);
+    if (c1.stale_cnt != c0.stale_cnt) add(c[MegTimers::kKcStaleS], c1.stale_cnt - c0.stale_cnt);
+    if (c1.concur_cnt != c0.concur_cnt) add(c[MegTimers::kKcConcurS], c1.concur_cnt - c0.concur_cnt);
   }
   void account_read(uint64_t t0, uint64_t t1, uint64_t t2, bool ok) const {
     const uint64_t t3 = mono_ns();
@@ -642,6 +819,8 @@ class MegalonBackend {
   mutable uint64_t lh_lo_ns_[mshim::LookupHist::kBins] = {}, lh_tsc_khz_ = 0;  // bin edges (under tmu_)
   mutable std::atomic<bool> lh_lo_set_{false};
   void (*wc_)(mshim::WmetaCounts *) = nullptr;  // shim v5 wmeta_counts (nullptr: Megalon <= 79)
+  bool kind_stats_ = false, kind_exact_ = false;  // per-kind counters (element layout); VDB_MEG_KIND_EXACT=1
+  mutable std::vector<std::vector<uint8_t>> elem_lv_;  // element layout: per segment the loaded slots' levels (main thread)
   uint64_t *wsec_ = nullptr;  // HWcc: write sections completed by all nodes (trace only)
   uint32_t node_ = 0, clock_ns_ = 0, tsc_khz_ = 0;
   uint64_t max_chunks_ = 0, trace_cost_ns_ = 0;
@@ -660,6 +839,7 @@ class MegalonAcc {
     l0_ = p.links0_bytes();
     upper_base_ = N_ * l0_;
     sq8_ = p.is_sq8();
+    elem_ = p.elem_objects;
   }
   GraphMeta *meta() const { return m_.meta; }
   float dot(const float *q, uint32_t i) const {  // in place on the object (sq8: decoded in registers)
@@ -690,13 +870,13 @@ class MegalonAcc {
   const uint32_t *links(uint32_t i, int level, uint64_t uo, uint32_t *tmp) const { return links_mut(i, level, uo, tmp); }
   uint32_t *links_mut(uint32_t i, int level, uint64_t uo, uint32_t *tmp) const {
     const uint64_t n = lbytes(level);
-    m_.be->read(lid(i), loff(i, level, uo), n,
+    m_.be->read(lid(i, level), loff(i, level, uo), n,
                 [&](const uint8_t *src) { validation_copy([&] { std::memcpy(tmp, src, n); }); }, link_elem(i % N_, level));
     return tmp;
   }
   void commit_links(uint32_t i, int level, uint64_t uo, const uint32_t *p) const {
     const uint64_t n = lbytes(level);
-    m_.be->write(lid(i), loff(i, level, uo), n, [&](uint8_t *dst) { std::memcpy(dst, p, n); }, link_elem(i % N_, level));
+    m_.be->write(lid(i, level), loff(i, level, uo), n, [&](uint8_t *dst) { std::memcpy(dst, p, n); }, link_elem(i % N_, level));
     t_mod_bytes += n;
   }
   void write_elem(uint32_t i, const ElemHeader &h, const uint8_t *v, uint64_t upper_bytes) const {
@@ -706,14 +886,24 @@ class MegalonAcc {
       if (vrec_ > sizeof(ElemHeader) + p_.vec_bytes())
         std::memset(dst + sizeof(ElemHeader) + p_.vec_bytes(), 0, vrec_ - sizeof(ElemHeader) - p_.vec_bytes());
     }, velem(i));
+    if (elem_) {  // element layout: level-0 object whole, upper object [upper_off, + upper_bytes) (upper_off 0)
+      m_.be->write(MegalonBackend::l0_id(m_.seg, i), 0, l0_, [&](uint8_t *dst) { std::memset(dst, 0, l0_); },
+                   link_elem(0, 0));
+      if (upper_bytes)
+        m_.be->write(MegalonBackend::up_id(m_.seg, i), h.upper_off, upper_bytes,
+                     [&](uint8_t *dst) { std::memset(dst, 0, upper_bytes); },
+                     link_elem(0, 1, uint32_t(upper_bytes / p_.links_bytes())));
+      t_mod_bytes += vrec_ + l0_ + upper_bytes;
+      return;
+    }
     const uint64_t l0off = (i % N_) * l0_, uoff = upper_base_ + h.upper_off;
     m_.be->write_obj(
-        lid(i),
+        lid(i, 0),
         [&](uint8_t *base, size_t size) {
-          MegalonBackend::check_lines(lid(i), l0off, l0_, size);
+          MegalonBackend::check_lines(lid(i, 0), l0off, l0_, size);
           std::memset(base + l0off, 0, l0_);
           if (upper_bytes) {
-            MegalonBackend::check_lines(lid(i), uoff, upper_bytes, size);
+            MegalonBackend::check_lines(lid(i, 0), uoff, upper_bytes, size);
             std::memset(base + uoff, 0, upper_bytes);
           }
         },
@@ -724,17 +914,23 @@ class MegalonAcc {
 
  private:
   uint64_t vid(uint32_t i) const { return MegalonBackend::vec_id(m_.seg, i / N_); }
-  uint64_t lid(uint32_t i) const { return MegalonBackend::link_id(m_.seg, i / N_); }
+  // link block of slot i at `level`: chunk layout = the group's link chunk; element layout = the slot's level-0 object
+  // (level 0) or upper object (level > 0, blocks from the header's upper_off = 0)
+  uint64_t lid(uint32_t i, int level) const {
+    if (elem_) return level ? MegalonBackend::up_id(m_.seg, i) : MegalonBackend::l0_id(m_.seg, i);
+    return MegalonBackend::link_id(m_.seg, i / N_);
+  }
   uint64_t voff(uint32_t i) const { return (i % N_) * vrec_; }
   Elem velem(uint32_t i) const { return Elem{uint32_t(i % N_), 1}; }
   uint64_t lbytes(int level) const { return level ? p_.links_bytes() : l0_; }
   uint64_t loff(uint32_t i, int level, uint64_t uo) const {
+    if (elem_) return level == 0 ? 0 : uo + uint64_t(level - 1) * p_.links_bytes();
     return level == 0 ? (i % N_) * l0_ : upper_base_ + uo + uint64_t(level - 1) * p_.links_bytes();
   }
   GraphParams p_;
   Mem m_;
   uint64_t N_, vrec_, l0_, upper_base_;
-  bool sq8_ = false;
+  bool sq8_ = false, elem_ = false;
 };
 
 }  // namespace vdb

@@ -150,12 +150,20 @@ struct GraphParams {
   }
   uint64_t upper_group_bytes() const { return upper_group_blocks() * links_bytes(); }
   uint64_t lchunk_bytes() const { return per_chunk() * links0_bytes() + upper_group_bytes(); }
+  // Element objects (experiment megalon-ideal-record, Megalon backend only; vdb-server --object-layout element): one
+  // group per element (per_chunk 1, e.g. --chunk-bytes 832 with sq8) and, instead of one link chunk per group, two
+  // objects per element: its level-0 link block (links0_bytes) and its upper-level link blocks (upper_off = 0 inside
+  // that object; loaded elements: exactly level x links_bytes, none for level 0; insert slots: upper_group_bytes =
+  // 8 blocks, so HNSW still draws the level at insert time and an insert above 8 levels fails as before). The graph
+  // algorithm is unchanged (per_chunk 1: upper_cur restarts at 0 for every element). describe() marks the layout.
+  bool elem_objects = false;
 };
 
 // Canary and upper-arena bounds of a header (shm_hnsw.h "Stale-header guard"); an all-zero line fails the canary.
 inline bool elem_header_ok(const ElemHeader &h, const GraphParams &p) {
   if (h.check != elem_check(h.ext_id, h.ins_seq, h.level)) return false;
   if (h.level == 0) return true;
+  if (p.elem_objects && h.upper_off != 0) return false;  // element layout: upper blocks start at 0 in their object
   const uint64_t ub = p.upper_group_bytes();
   return h.upper_off <= ub && uint64_t(h.level) * p.links_bytes() <= ub - h.upper_off;
 }

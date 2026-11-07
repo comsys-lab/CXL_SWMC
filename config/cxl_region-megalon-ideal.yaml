@@ -1,0 +1,23 @@
+# Shared CXL region layout for "Megalon ideal (reference)" only (experiment megalon-ideal-record; user 2026-11-08:
+# the 256 MiB HWcc budget is lifted for this reference, shown apart from every other system). Copy of
+# config/cxl_region-ring2m.yaml with a larger hwcc_size; msg_ring stays the last 2 MiB of hwcc. Never use it for
+# another system or cell.
+# hwcc need (systems/megalon/vectordb-2vm-ideal.yaml): Megalon SCR footprint 520 MiB records + 14,848 B = 545,275,904
+# B + vdb app 274,432 B (vdb-server --print-app-bytes, element layout, no trace) + msg_ring 2,097,152 B = 547,647,488 B
+# -> 528 MiB = 553,648,128 B (2 MiB aligned; margin 6,000,640 B). swcc = 103,060,340,736 - 553,648,128 =
+# 102,506,692,608 B holds the 59GB object arena + NR log + slot data (63,428,935,680 B).
+# No sharing trace with this layout (objseq would need 172M x 8 B of hwcc).
+# Sizes/offsets in bytes; "auto" means derived (see systems/common/cxl_region.h).
+device: /dev/dax0.0
+map_va: 0x600000000000    # fixed VA of the whole-device mapping, identical on every node (raw pointers in shared data)
+device_size: auto          # /sys/bus/dax/devices/<dev>/size (observed 103060340736)
+align: 2097152             # 2 MiB; must be a multiple of 4096
+hwcc_offset: 0
+hwcc_size: 553648128       # 528 MiB: Megalon SCR (record pool sized to the object count) + app + message ring
+msg_ring: [551550976, 2097152]  # last 2 MiB of hwcc (as cxl_region-ring2m.yaml)
+# Workload control state ("app") sits directly below msg_ring; its size is the workload's computed need for
+# the run, passed as $CXL_APP_HWCC_BYTES (not set here). Systems allocate only the rest (cxl_region.h
+# hwcc_alloc = hwcc - app - msg_ring = at most 551550976 B here). Rules: docs/hwcc-contract.md.
+swcc_offset: auto          # align_up(hwcc_offset + hwcc_size, align)
+swcc_size: auto            # up to device end, stopping at the first reserved range above swcc_offset
+reserved: []               # e.g. [[100931731456, 2147483648]] to exclude a range from all systems

@@ -26,14 +26,18 @@ struct Params {
   uint64_t dlog_chunks() const { return (max_deletes + dlog_chunk - 1) / dlog_chunk; }  // per node
   // measurement (trace): one slot per coherence object of the Megalon backend (vector + link chunk per segment
   // group, delete-log chunks per node), sized identically for every backend
-  uint64_t trace_objects() const { return uint64_t(segments) * g.groups() * 2 + uint64_t(nr_nodes) * dlog_chunks(); }
+  // (element layout, GraphParams::elem_objects: vector + level-0 + upper object per slot)
+  uint64_t trace_objects() const {
+    return uint64_t(segments) * g.groups() * (g.elem_objects ? 3 : 2) + uint64_t(nr_nodes) * dlog_chunks();
+  }
   std::string describe() const {
     return "nr_nodes=" + std::to_string(nr_nodes) + " segments=" + std::to_string(segments) +
            " dim=" + std::to_string(g.dim) + " M=" + std::to_string(g.M) + " efc=" + std::to_string(g.ef_construction) +
            " capacity=" + std::to_string(g.capacity) + " chunk_bytes=" + std::to_string(g.chunk_bytes) + " max_writes=" + std::to_string(max_writes) +
            " max_ids=" + std::to_string(max_ids) + " dlog_chunk=" + std::to_string(dlog_chunk) +
            " max_deletes=" + std::to_string(max_deletes) + (g.is_sq8() ? " vec=sq8" : "") +  // fp32: text unchanged
-           (g.small_groups() ? " upper_blocks=" + std::to_string(g.upper_group_blocks()) : "");  // large groups: unchanged
+           (g.small_groups() ? " upper_blocks=" + std::to_string(g.upper_group_blocks()) : "") +  // large groups: unchanged
+           (g.elem_objects ? " objects=element" : "");  // chunk layouts: text unchanged
   }
   // HWcc objseq array (unused since vdb build 10, stays 0): kept in the layout when it is small (every layout before
   // the page-granularity experiment: <= a few thousand objects, so their layout hash and offsets are unchanged); a

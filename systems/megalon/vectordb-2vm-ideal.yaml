@@ -1,0 +1,50 @@
+# Megalon config for the vectordb Megalon backend with element objects ("Megalon ideal (reference)", experiment
+# megalon-ideal-record, reports/experiments/megalon-ideal-record.md), 2 VMs. Copy of vectordb-2vm-c4k.yaml; only
+# logical_scr_size and object_arena_size differ. Region: config/cxl_region-megalon-ideal.yaml (hwcc 528 MiB).
+# vdb-server --chunk-bytes 832 --object-layout element --init-chunk-bytes 4096 --vec-format sq8 (c4k image), run-2
+# parameters (57.4M ids, 32 segments, capacity 1,793,750 per segment, 2 x 1M deletes):
+#   slots 32 x 1,793,750 = 57,400,000 (54,000,000 loaded + 3,400,000 insert slots)
+#   objects = 57.4M vector (832 B) + 57.4M level-0 (192 B) + 3,375,119 upper of loaded elements with level >= 1
+#             (3,600,157 blocks x 128 B; image-c4k verify) + 3,400,000 insert-slot upper (1,024 B) + 512 delete-log
+#             (262,144 B) = 121,575,631 objects, object_bytes 62,854,237,824 B = 58.54 GiB
+#             (tests/page_layout_test.cc section 3; vdb-server prints them in its "INIT ... element objects" lines)
+# object_arena_size 59GB = 63,350,767,616 B (margin 496,529,792 B).
+# Coherence-record pool (DYN_WMETA with objects, c3.cc RecordCount): logical_scr_size / 4 B; reclaim starts above
+# WMETA_WATERMARK 90 % (c3.cc threshold = slots x 90 / 100), ReserveWmeta refuses above 95 %. Need: every object
+# gets at most one record (first write; at init all but the 3.4M insert-slot upper and 512 delete-log objects) ->
+# records >= ceil(121,575,631 / 0.9) = 135,084,035 -> x 4 B = 540,336,140 B = 515.3 MiB. 520MB = 136,314,880 records,
+# threshold 122,683,392 >= 121,575,631 objects (margin 1,107,761), so reclaim never starts (cell check: reclaim_count 0).
+# SCR footprint = 520 MiB + 14,848 B (counters, bitmaps, NR log header, ObjectShared; megalon-page run log), taken
+# from hwcc_alloc (hwcc - app - msg_ring; cxl_port.cc refuses to run when it does not fit).
+# Known costs of this object count (not limits of the config): init log appends = 121.6M creates + ~118.2M first
+# writes = ~239.8M entries on nr_log_size 64MB = 524,288 x 128 B (~457 wraps; node 1 replays while node 0 loads,
+# stuck_timeout_ms 10000); per-node DRAM: NR replica HashMap 2^28 buckets x 81 B = 21.7 GB (+10.9 GB while it grows),
+# wmeta-rev map 2^28 x 33 B = 8.9 GB, local seq map 136.3M x 36 B = 4.9 GB -> ~35.5 GB per node (VM RAM 96 GB).
+# Everything else as run 2 (methodology: same Megalon configuration).
+mount_directory: /mydata        # required by the config parser; unused
+key_space: 10000
+slots: 10240
+logical_scr_size: 520MB
+node_id: 0                      # overridden by MEGALON_NODE_ID (vdb-server sets it from --node)
+region_config: ""               # $CXL_REGION_CONFIG
+reinit: false                   # node 0: MEGALON_REINIT=1
+attach_mprotect: true
+stuck_timeout_ms: 10000
+log_sync_interval_us: 100
+nr_log_size: 64MB
+attach_timeout_s: 600
+start_barrier_timeout_s: 600
+object_arena_size: 59GB
+object_align: 64
+object_max_count: 65536         # hwcc flavor only (static records); unused by the megalon flavor
+replicate: false
+flush: false
+evict: false
+partition_ratio: 0.0
+excluded_files:
+excluded_directories:
+  - /usr
+  - /proc
+  - /etc
+  - /dev
+  - /sys

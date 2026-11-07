@@ -81,6 +81,9 @@ struct Opts {
   // size). Chunk images are chunk-relative and per_chunk / lchunk do not depend on the capacity, so a larger run
   // capacity only adds groups. 0 = the run capacity (every earlier build).
   uint64_t init_capacity = 0;
+  // --init-chunk-bytes B (element layout only, experiment megalon-ideal-record): the init dir was built for chunk size B
+  // (e.g. the 4 KiB-page c4k image: 4096); node 0 cuts its groups into element objects. 0 = --chunk-bytes.
+  uint64_t init_chunk_bytes = 0;
   // Writer threads of this node (--writer-threads, default 1 = every run before the update-rate sweep). With N > 1
   // the node's writes are taken from one queue by N threads (DESIGN.md §17): segment writes stay serialised by the
   // segment's HWcc rwlock, an update's delete and insert stay on one thread in that order, the node's delete log is
@@ -477,6 +480,7 @@ class Server {
 
  private:
   uint64_t init_capacity() const { return o_.init_capacity ? o_.init_capacity : p_.g.capacity; }
+  uint64_t init_chunk() const { return o_.init_chunk_bytes ? o_.init_chunk_bytes : p_.g.chunk_bytes; }
 
   // ---------------------------------------------------------------- initial segments (prepare, node 0, unmeasured)
   // init_dir: segments.txt ("<s> <count> <ep_level> <upper_cur>"), per group g < ceil(count / per_chunk):
@@ -484,11 +488,13 @@ class Server {
   // parameters. Images are copied into the chunk objects as is (offsets are chunk-relative).
   // init dir parameter check (load_initial, preload): the "graph ..." line must match; an sq8 dir has the line
   // "vec_format sq8" (fp32 dirs, i.e. every dir before SQ8, have none) and it must match --vec-format
-  void check_manifest() const {
-    std::ifstream man(o_.init_dir + "/manifest.txt");
+  // (element layout: the chunk size the dir was built for, --init-chunk-bytes)
+  void check_manifest() const { check_manifest(o_.init_dir); }
+  void check_manifest(const std::string &dir) const {
+    std::ifstream man(dir + "/manifest.txt");
     std::string line, want = "graph " + std::to_string(p_.segments) + " " + std::to_string(p_.g.dim) + " " +
                              std::to_string(p_.g.M) + " " + std::to_string(p_.g.ef_construction) + " " +
-                             std::to_string(init_capacity()) + " " + std::to_string(p_.g.chunk_bytes);
+                             std::to_string(init_capacity()) + " " + std::to_string(init_chunk());
     bool ok = false, sq8 = false;
     while (std::getline(man, line)) ok = ok || line == want, sq8 = sq8 || line == "vec_format sq8";
     if (!ok) die("init_dir manifest does not contain '" + want + "' (built for other parameters)");
@@ -537,8 +543,9 @@ class Server {
   }
 
   // init dir image format: packed (manifest line "image packed", ImageStream) or per-chunk files (every earlier dir)
-  bool packed_image() const {
-    std::ifstream man(o_.init_dir + "/manifest.txt");
+  bool packed_image() const { return packed_image(o_.init_dir); }
+  bool packed_image(const std::string &dir) const {
+    std::ifstream man(dir + "/manifest.txt");
     std::string line;
     while (std::getline(man, line))
       if (line == "image packed") return true;
@@ -574,6 +581,202 @@ class Server {
     return bytes;
   }
 
+  // ---------------------------------------------------------------- element layout (Megalon, --object-layout element)
+  // Experiment megalon-ideal-record. The init image is any init dir (built for --init-chunk-bytes; the run uses the
+  // 4 KiB-page packed c4k image); no new image. Node 0 cuts each source group into its elements' objects: element j
+  // of group g (slot i = g N + j, N = source per_chunk) gets
+  //   vector object  = v[j vrec, + vrec)           (header upper_off rewritten to 0 when level >= 1: the element's upper
+  //                                                  blocks start at 0 of its own object; the canary excludes upper_off)
+  //   level-0 object = l[j links0, + links0)
+  //   upper object   = l[N links0 + upper_off, + level x links_bytes)   (level >= 1 only)
+  // Every source header must pass the source layout's stale-header guard and have level <= upper_group_blocks (8);
+  // anything else stops the load (FATAL). The source layout = this run's parameters with chunk_bytes = init_chunk().
+  struct ElemView {
+    uint64_t i;
+    ElemHeader h;           // source header (as in the image)
+    const uint8_t *v, *l0, *up;  // source vector record, level-0 block, upper blocks (nullptr for level 0)
+  };
+  GraphParams src_params() const {
+    GraphParams s = p_.g;
+    s.chunk_bytes = init_chunk(), s.elem_objects = false, s.capacity = init_capacity();
+    return s;
+  }
+  // f(const std::vector<ElemView> &) once per source group, in slot order (views valid during the call)
+  template <class F> void stream_elements(const std::string &dir, uint32_t s, uint64_t count, bool packed, F f) {
+    const GraphParams src = src_params();
+    const uint64_t N = src.per_chunk(), vr = src.vrec_bytes(), vc = src.vchunk_bytes(), lc = src.lchunk_bytes();
+    const uint64_t l0 = src.links0_bytes(), groups = (count + N - 1) / N;
+    if (vr != p_.g.vrec_bytes() || l0 != p_.g.links0_bytes()) die("element layout: source record / link sizes differ");
+    const std::string b = dir + "/seg-" + std::to_string(s);
+    std::vector<uint8_t> vbuf(vc), lbuf(lc);
+    std::vector<ElemView> ev;
+    try {
+      std::unique_ptr<ImageStream> vs, ls;
+      if (packed) {
+        vs = std::make_unique<ImageStream>(b + "-v.bin", groups ? (groups - 1) * vc + (count - (groups - 1) * N) * vr : 0);
+        ls = std::make_unique<ImageStream>(b + "-l.bin", groups * lc);
+      }
+      for (uint64_t g = 0; g < groups; g++) {
+        const uint64_t used = std::min(N, count - g * N), vb = used * vr;
+        if (packed) {
+          vs->read(vbuf.data(), g * vc, vb);
+          ls->read(lbuf.data(), g * lc, lc);
+        } else {
+          read_file(b + "-v" + std::to_string(g) + ".bin", vbuf.data(), vb);
+          read_file(b + "-l" + std::to_string(g) + ".bin", lbuf.data(), lc);
+        }
+        ev.clear();
+        for (uint64_t j = 0; j < used; j++) {
+          ElemView e;
+          e.i = g * N + j;
+          std::memcpy(&e.h, vbuf.data() + j * vr, sizeof(e.h));
+          if (!elem_header_ok(e.h, src) || e.h.level > p_.g.upper_group_blocks())
+            die("element layout: init image segment " + std::to_string(s) + " element " + std::to_string(e.i) +
+                ": header fails the guard or has more than " + std::to_string(p_.g.upper_group_blocks()) +
+                " upper levels (level " + std::to_string(e.h.level) + ", upper_off " + std::to_string(e.h.upper_off) + ")");
+          e.v = vbuf.data() + j * vr;
+          e.l0 = lbuf.data() + j * l0;
+          e.up = e.h.level ? lbuf.data() + N * l0 + e.h.upper_off : nullptr;
+          ev.push_back(e);
+        }
+        f(ev);
+      }
+    } catch (const std::exception &e) {
+      die(e.what());
+    }
+  }
+  // the vector record as stored in the element layout (upper_off 0 for level >= 1)
+  static void elem_record(const ElemView &e, uint8_t *dst, uint64_t vr) {
+    std::memcpy(dst, e.v, vr);
+    if (e.h.level) {
+      ElemHeader h = e.h;
+      h.upper_off = 0;
+      std::memcpy(dst, &h, sizeof(h));
+    }
+  }
+  // node 0: create + copy segment s's loaded elements; returns the bytes copied (create time -> it_.create_ns)
+  uint64_t load_elements(uint32_t s, uint64_t count, bool packed) {
+    uint64_t bytes = 0;
+    if constexpr (std::is_same_v<Be, MegalonBackend>) {
+      const uint64_t vr = p_.g.vrec_bytes(), l0 = p_.g.links0_bytes(), lb = p_.g.links_bytes();
+      std::string err;
+      stream_elements(o_.init_dir, s, count, packed, [&](const std::vector<ElemView> &ev) {
+        const uint64_t t0 = now_ns();
+        for (const ElemView &e : ev)
+          if (!be_->create_elem(s, e.i, uint8_t(e.h.level), &err)) die(err);
+        const uint64_t t1 = now_ns();
+        it_.create_ns += t1 - t0;
+        for (const ElemView &e : ev) {
+          be_->write(MegalonBackend::vec_id(s, e.i), 0, vr, [&](uint8_t *dst) { elem_record(e, dst, vr); });
+          be_->write(MegalonBackend::l0_id(s, e.i), 0, l0, [&](uint8_t *dst) { std::memcpy(dst, e.l0, l0); });
+          const uint64_t ub = uint64_t(e.h.level) * lb;
+          if (ub) be_->write(MegalonBackend::up_id(s, e.i), 0, ub, [&](uint8_t *dst) { std::memcpy(dst, e.up, ub); });
+          bytes += vr + l0 + ub;
+        }
+        it_.image_ns += now_ns() - t1;
+      });
+    }
+    return bytes;
+  }
+  // node 0: create the insert slots [count, capacity) of segment s (upper object upper_group_bytes, never written
+  // until an insert) and zero their vector and level-0 objects (preload zeroing); create time -> it_.create_ns
+  uint64_t zero_unused_elem(uint32_t s, uint64_t count) {
+    uint64_t bytes = 0;
+    if constexpr (std::is_same_v<Be, MegalonBackend>) {
+      const uint64_t vr = p_.g.vrec_bytes(), l0 = p_.g.links0_bytes(), cap = p_.g.capacity;
+      std::string err;
+      for (uint64_t a = count; a < cap; a += 4096) {
+        const uint64_t e = std::min(cap, a + 4096), t0 = now_ns();
+        for (uint64_t i = a; i < e; i++)
+          if (!be_->create_elem(s, i, MegalonBackend::kInsertSlot, &err)) die(err);
+        const uint64_t t1 = now_ns();
+        it_.create_ns += t1 - t0;
+        for (uint64_t i = a; i < e; i++) {
+          be_->write(MegalonBackend::vec_id(s, i), 0, vr, [&](uint8_t *dst) { std::memset(dst, 0, vr); });
+          be_->write(MegalonBackend::l0_id(s, i), 0, l0, [&](uint8_t *dst) { std::memset(dst, 0, l0); });
+          bytes += vr + l0;
+        }
+        zeroed_ns_ += now_ns() - t1;
+      }
+    }
+    return bytes;
+  }
+  // Host / pilot check (env VDB_VERIFY_INIT=<init dir>, any node, after warm-up; element layout only): re-reads the
+  // image and compares every loaded element's vector object (header upper_off 0 for level >= 1), level-0 object and
+  // upper object with the source bytes through read sections; every device header passes the run's stale-header guard;
+  // upper objects: level x links_bytes (none for level 0); insert slots: upper object upper_group_bytes, vector and
+  // level-0 objects zero; segment counts and entry points = segments.txt. FATAL on any difference.
+  void verify_init(const std::string &dir) {
+    if constexpr (std::is_same_v<Be, MegalonBackend>) {
+      const uint64_t t0 = now_ns(), vr = p_.g.vrec_bytes(), l0 = p_.g.links0_bytes(), lb = p_.g.links_bytes();
+      check_manifest(dir);
+      const bool packed = packed_image(dir);
+      std::ifstream f(dir + "/segments.txt");
+      uint64_t s, count, epl, ucur, elems = 0, bad = 0, ups = 0, up_blocks = 0, ins = 0, bytes = 0, seen = 0;
+      std::vector<uint8_t> got(std::max(vr, p_.g.upper_group_bytes())), want(vr);
+      auto rd = [&](uint64_t id, uint64_t len) {
+        be_->read(id, 0, len, [&](const uint8_t *src) { std::memcpy(got.data(), src, len); });
+        bytes += len;
+      };
+      auto fail = [&](const std::string &m) {
+        if (bad++ < 10) std::fprintf(stderr, "vdb-server: VERIFY INIT mismatch: %s\n", m.c_str());
+      };
+      while (f >> s >> count >> epl >> ucur) {
+        seen++;
+        const GraphMeta &m = h_->segs[s].meta;
+        if (load_acquire(&m.count) != count || m.ep_level != epl) fail("segment " + std::to_string(s) + " count / entry point");
+        stream_elements(dir, uint32_t(s), count, packed, [&](const std::vector<ElemView> &ev) {
+          for (const ElemView &e : ev) {
+            const std::string where = "segment " + std::to_string(s) + " element " + std::to_string(e.i);
+            elems++;
+            rd(MegalonBackend::vec_id(uint32_t(s), e.i), vr);
+            elem_record(e, want.data(), vr);
+            if (std::memcmp(got.data(), want.data(), vr)) fail(where + ": vector object");
+            ElemHeader dh;
+            std::memcpy(&dh, got.data(), sizeof(dh));
+            if (!elem_header_ok(dh, p_.g)) fail(where + ": device header fails the guard");
+            rd(MegalonBackend::l0_id(uint32_t(s), e.i), l0);
+            if (std::memcmp(got.data(), e.l0, l0)) fail(where + ": level-0 object");
+            const uint64_t ub = uint64_t(e.h.level) * lb, sz = be_->object_size(MegalonBackend::up_id(uint32_t(s), e.i));
+            if (sz != ub) fail(where + ": upper object size " + std::to_string(sz) + " != " + std::to_string(ub));
+            else if (ub) {
+              rd(MegalonBackend::up_id(uint32_t(s), e.i), ub);
+              if (std::memcmp(got.data(), e.up, ub)) fail(where + ": upper object");
+              ups++, up_blocks += e.h.level;
+            }
+          }
+        });
+        for (uint64_t i = count; i < p_.g.capacity; i++) {
+          ins++;
+          const std::string where = "segment " + std::to_string(s) + " insert slot " + std::to_string(i);
+          if (be_->object_size(MegalonBackend::up_id(uint32_t(s), i)) != p_.g.upper_group_bytes()) fail(where + ": upper object size");
+          rd(MegalonBackend::vec_id(uint32_t(s), i), vr);
+          for (uint64_t x = 0; x < vr; x++)
+            if (got[x]) { fail(where + ": vector object not zero"); break; }
+          rd(MegalonBackend::l0_id(uint32_t(s), i), l0);
+          for (uint64_t x = 0; x < l0; x++)
+            if (got[x]) { fail(where + ": level-0 object not zero"); break; }
+        }
+      }
+      if (seen != p_.segments) fail("segments.txt lists " + std::to_string(seen) + " segments");
+      std::fprintf(stderr, "vdb-server: VERIFY INIT %s node %u: %lu elements (vector + level-0 objects byte-equal), %lu upper "
+                   "objects / %lu blocks byte-equal, %lu insert slots (upper %lu B, vector + level-0 zero), %lu MiB read, "
+                   "%lu mismatches, %.1f s\n", bad ? "FAIL" : "PASS", o_.node, (unsigned long)elems, (unsigned long)ups,
+                   (unsigned long)up_blocks, (unsigned long)ins, (unsigned long)p_.g.upper_group_bytes(),
+                   (unsigned long)(bytes >> 20), (unsigned long)bad, (now_ns() - t0) / 1e9);
+      if (bad) die("VERIFY INIT failed");
+    } else {
+      (void)dir;
+      die("VDB_VERIFY_INIT: element layout (Megalon backend) only");
+    }
+  }
+
+  void elem_init_report() const {
+    std::fprintf(stderr, "vdb-server: INIT element objects created in the load: create %.1f s (total incl. delete logs), "
+                 "image copy %.1f s, zeroing %.1f s; %s\n", it_.create_ns / 1e9, it_.image_ns / 1e9, zeroed_ns_ / 1e9,
+                 be_->usage().c_str());
+  }
+
   // Init / load breakdown (experiment megalon-page-granularity; stats keys init.*, log lines "vdb-server: INIT ..."):
   // create = Megalon ObjectCreate of every object (node 0; plain: nothing), image = initial image copy (node 0),
   // zero = preload zeroing (zeroed_ns_), check = ObjectLookup of every object (every node), warmup = the warm-up reads
@@ -604,10 +807,12 @@ class Server {
       if (!o_.init_dir.empty()) check_manifest();
       publish_sq8();
     }
+    const bool elem = p_.g.elem_objects;  // element layout: creates happen in the load (create_ns accumulates)
     if (o_.init_dir.empty()) {  // no initial records: every slot is unused
       const uint64_t z0 = now_ns();
-      for (uint32_t s = 0; s < p_.segments; s++) zeroed_bytes_ += zero_unused(s, 0);
-      zeroed_ns_ += now_ns() - z0;
+      for (uint32_t s = 0; s < p_.segments; s++) zeroed_bytes_ += elem ? zero_unused_elem(s, 0) : zero_unused(s, 0);
+      if (!elem) zeroed_ns_ += now_ns() - z0;
+      if (elem) elem_init_report();
       zero_report("load, no init dir");
       return;
     }
@@ -617,7 +822,19 @@ class Server {
     uint64_t s, count, epl, ucur, total = 0;
     uint32_t seen = 0;
     while (f >> s >> count >> epl >> ucur) {
-      if (s >= p_.segments || count > p_.g.capacity || ucur > p_.g.upper_group_bytes()) die("bad segments.txt");
+      if (s >= p_.segments || count > p_.g.capacity || ucur > (elem ? src_params() : p_.g).upper_group_bytes())
+        die("bad segments.txt");
+      if (elem) {  // segments in file order; slots of a segment in order (create_elem)
+        it_.image_bytes += load_elements(uint32_t(s), count, it_.packed);
+        zeroed_bytes_ += zero_unused_elem(uint32_t(s), count);
+        GraphMeta &m = h_->segs[s].meta;
+        m.upper_cur = 0;  // one element per group: the next insert starts a new (empty) upper object
+        m.ep_level = epl;
+        store_release(&m.count, count);
+        total += count;
+        seen++;
+        continue;
+      }
       if (!o_.preloaded) {
         const uint64_t c0 = now_ns();
         it_.image_bytes += copy_images(uint32_t(s), count, it_.packed);
@@ -636,6 +853,7 @@ class Server {
       seen++;
     }
     if (seen != p_.segments) die("segments.txt lists " + std::to_string(seen) + " segments");
+    if (elem) elem_init_report();
     std::fprintf(stderr, "vdb-server: INIT image copy %.1f s, %lu MiB (%s image), zeroing %.1f s\n", it_.image_ns / 1e9,
                  (unsigned long)(it_.image_bytes >> 20), it_.packed ? "packed" : "per-chunk", zeroed_ns_ / 1e9);
     std::fprintf(stderr, "vdb-server: %s %lu initial records in %u segments (%.1f s)\n",
@@ -690,7 +908,15 @@ class Server {
     uint64_t t0 = now_ns();
     std::string err;
     it_.before_check = proc_rss();
-    if (!be_->check_objects(&err)) die(err);
+    bool elem_done = false;
+    if constexpr (std::is_same_v<Be, MegalonBackend>)
+      if (p_.g.elem_objects) {
+        std::vector<uint64_t> counts(p_.segments);
+        for (uint32_t s = 0; s < p_.segments; s++) counts[s] = load_acquire(&h_->segs[s].meta.count);
+        if (!be_->check_elem_objects(counts, &err)) die(err);
+        elem_done = true;
+      }
+    if (!elem_done && !be_->check_objects(&err)) die(err);
     it_.check_ns = now_ns() - t0;
     it_.after_check = proc_rss();
     std::fprintf(stderr, "vdb-server: INIT check_objects %.1f s, rss %lu -> %lu MiB, rss_anon %lu -> %lu MiB\n",
@@ -698,7 +924,26 @@ class Server {
                  (unsigned long)(it_.before_check.anon >> 20), (unsigned long)(it_.after_check.anon >> 20));
     t0 = now_ns();
     uint64_t bytes = 0, sum = 0;
-    for (uint32_t s = 0; s < p_.segments; s++) {
+    if constexpr (std::is_same_v<Be, MegalonBackend>)
+      if (p_.g.elem_objects) {  // every loaded element's objects: vector, level-0, upper (level >= 1)
+        auto rd = [&](uint64_t id, uint64_t len) {
+          sum += be_->read(id, 0, len, [&](const uint8_t *c) {
+            uint64_t x = 0;
+            for (uint64_t o = 0; o < len; o += 64) x += c[o];
+            return x;
+          });
+          bytes += len;
+        };
+        for (uint32_t s = 0; s < p_.segments; s++) {
+          const uint64_t n = load_acquire(&h_->segs[s].meta.count);
+          for (uint64_t i = 0; i < n; i++) {
+            rd(MegalonBackend::vec_id(s, i), p_.g.vrec_bytes());
+            rd(MegalonBackend::l0_id(s, i), p_.g.links0_bytes());
+            if (const uint64_t ub = be_->upper_obj_bytes(be_->elem_level(s, i))) rd(MegalonBackend::up_id(s, i), ub);
+          }
+        }
+      }
+    for (uint32_t s = 0; s < p_.segments && !p_.g.elem_objects; s++) {
       const uint64_t n = load_acquire(&h_->segs[s].meta.count), N = p_.g.per_chunk();
       for (uint64_t g = 0; g * N < n; g++) {
         const uint64_t vb = std::min(N, n - g * N) * p_.g.vrec_bytes();
@@ -720,6 +965,10 @@ class Server {
                  "image=%s index_bytes=%lu\n", o_.node, it_.create_ns / 1e9, it_.image_ns / 1e9, zeroed_ns_ / 1e9,
                  it_.check_ns / 1e9, it_.warmup_ns / 1e9, o_.node == 0 && !o_.init_dir.empty() ? (it_.packed ? "packed" : "per-chunk") : "none",
                  (unsigned long)it_.index_bytes());
+    if (p_.g.elem_objects) {  // every node: object totals once the levels are known (node 0 printed them after the load)
+      std::fprintf(stderr, "vdb-server: INIT node %u element objects checked: %s\n", o_.node, be_->usage().c_str());
+      if (const char *vd = getenv("VDB_VERIFY_INIT"); vd && *vd) verify_init(vd);
+    }
   }
   void init_stats(std::ostream &o) const {
     o << "\ninit.create_ns=" << it_.create_ns << "\ninit.image_ns=" << it_.image_ns << "\ninit.image_bytes=" << it_.image_bytes
@@ -1316,6 +1565,9 @@ void usage() {
                "  [--op-coh on|off] per-operation time split block in every search/update response (default on; DESIGN.md §15)\n"
                "  [--writer-threads N] writer threads of this node (default 1; plain backend only for N > 1; DESIGN.md §17)\n"
                "  [--init-capacity C] init dir built for C elements per segment (<= capacity; default the capacity; §17)\n"
+               "  [--object-layout chunk|element] Megalon objects: per group chunks (default) or per element vector /\n"
+               "     level-0 / upper-link objects (needs --chunk-bytes = one record; experiment megalon-ideal-record)\n"
+               "  [--init-chunk-bytes B] element layout: init dir built for chunk size B (default --chunk-bytes)\n"
                "  [--vec-format fp32|sq8] stored vectors (default fp32; sq8 = 8-bit scalar quantization, init dir built\n"
                "     with vdb-build-index ... sq8; node 0 publishes its sq8.bin in HWcc; part of the layout hash)\n"
                "--backend megalon: Megalon (RACKOBJ_CONFIG, object_arena_size > 0) maps the device; MEGALON_NODE_ID and\n"
@@ -1365,6 +1617,12 @@ int main(int argc, char **argv) {
     else if (a == "--trace-max-mb") o.trace_max_mb = std::stoull(v());
     else if (a == "--writer-threads") o.writer_threads = std::stoul(v());
     else if (a == "--init-capacity") o.init_capacity = std::stoull(v());
+    else if (a == "--init-chunk-bytes") o.init_chunk_bytes = std::stoull(v());
+    else if (a == "--object-layout") {
+      const std::string x = v();
+      if (x != "chunk" && x != "element") usage();
+      o.p.g.elem_objects = x == "element";
+    }
     else if (a == "--vec-format") {
       const std::string x = v();
       if (x != "fp32" && x != "sq8") usage();
@@ -1387,6 +1645,16 @@ int main(int argc, char **argv) {
   if (o.init_capacity > o.p.g.capacity) {
     std::fprintf(stderr, "vdb-server: --init-capacity %lu exceeds the run capacity %lu\n", (unsigned long)o.init_capacity,
                  (unsigned long)o.p.g.capacity);
+    return 2;
+  }
+  if (o.p.g.elem_objects && (o.backend != "megalon" || o.p.g.per_chunk() != 1)) {
+    std::fprintf(stderr, "vdb-server: --object-layout element needs --backend megalon and one record per group (--chunk-bytes "
+                 "%lu with this vector format; per_chunk now %lu)\n", (unsigned long)o.p.g.vrec_bytes(),
+                 (unsigned long)o.p.g.per_chunk());
+    return 2;
+  }
+  if (o.init_chunk_bytes && !o.p.g.elem_objects && o.init_chunk_bytes != o.p.g.chunk_bytes) {
+    std::fprintf(stderr, "vdb-server: --init-chunk-bytes != --chunk-bytes needs --object-layout element\n");
     return 2;
   }
   if (o.writer_threads < 1 || o.writer_threads > 16 || (o.writer_threads > 1 && o.backend != "plain")) {

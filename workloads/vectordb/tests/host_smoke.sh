@@ -18,6 +18,11 @@
 #      stand-in for the SLO search) then part "fix" (--warmup-s SETTLE_S [3] settle, then RATES2 [default RATES]) with
 #      --opt w_start = the slo part's next_w and seeds SEED / SEED+1; outputs <scratch>/<part>/loadgen; opcoh_check per
 #      part with OPCOH_PARTS (closure over both parts); E1 check per part.
+#      Element layout (experiment megalon-ideal-record): INDEX_CHUNK (chunk size of the built index, default CHUNK),
+#      SERVER_EXTRA (appended to the server parameters, e.g. "--object-layout element --init-chunk-bytes 4096"),
+#      REGION_SRC (region yaml to copy, default config/cxl_region.yaml), MEG_CFG (Megalon yaml to copy, default
+#      systems/megalon/vectordb-2vm.yaml), VERIFY_INIT=1 (both nodes VDB_VERIFY_INIT=<scratch>/init: every loaded
+#      object compared with the image after warm-up; "VERIFY INIT PASS" required in both node logs).
 set -euo pipefail
 B=$(cd "$1" && pwd) LG=$2 D=$(cd "$3" && pwd) S=$4
 HERE=$(cd "$(dirname "$0")" && pwd); ROOT=$(cd "$HERE/../../.." && pwd)
@@ -30,9 +35,10 @@ MAXIDS=$((NA + NB))
 VF=${VEC_FORMAT:-fp32}   # fp32 | sq8 (--vec-format; the index is built in the same format)
 PARAMS="--backend $BACKEND --nodes 2 --segments $SEG --chunk-bytes $CHUNK --max-ids $MAXIDS --max-writes 200000 --max-deletes 200000 --dlog-chunk 256"
 [ "$VF" = fp32 ] || PARAMS="$PARAMS --vec-format $VF"
+[ -z "${SERVER_EXTRA:-}" ] || PARAMS="$PARAMS $SERVER_EXTRA"
 VFARG=(); [ "$VF" = fp32 ] || VFARG=("$VF")
 [ "${IMAGE:-chunks}" = chunks ] || VFARG=("$VF" "$IMAGE")  # IMAGE=packed: packed init image (build_index arg 12)
-taskset -c "$CPUS" "${INDEX_BUILDER:-$B/bin/vdb-build-index}" "$D/pool_a.fbin" "$S/init" "$SEG" "$MAXIDS" 16 128 0 8 20261015 "$CHUNK" ${VFARG[@]+"${VFARG[@]}"} > "$S/index.log" 2>&1
+taskset -c "$CPUS" "${INDEX_BUILDER:-$B/bin/vdb-build-index}" "$D/pool_a.fbin" "$S/init" "$SEG" "$MAXIDS" 16 128 0 8 20261015 "${INDEX_CHUNK:-$CHUNK}" ${VFARG[@]+"${VFARG[@]}"} > "$S/index.log" 2>&1
 truncate -s "$DEVSZ" "$S/device.img"
 # PREFILL=1 (plain backend; run-2 slot zeroing check): the SWcc part of the device file (from 256 MiB, the default
 # hwcc_size) starts as random bytes (= data of an earlier experiment); after the run the last slot of every segment
@@ -47,8 +53,8 @@ with open(f, "r+b") as d:
     for o in range(off, n, step): d.write(rng.integers(0, 256, min(step, n - o), dtype=np.uint8).tobytes())
 PY
 fi
-sed -e "s|^device: .*|device: $S/device.img|" -e "s|^device_size: .*|device_size: $DEVSZ|" "$ROOT/config/cxl_region.yaml" > "$S/region.yaml"
-sed -e "s|^object_arena_size: .*|object_arena_size: ${ARENA:-512MB}|" "$ROOT/systems/megalon/vectordb-2vm.yaml" > "$S/megalon.yaml"
+sed -e "s|^device: .*|device: $S/device.img|" -e "s|^device_size: .*|device_size: $DEVSZ|" "${REGION_SRC:-$ROOT/config/cxl_region.yaml}" > "$S/region.yaml"
+sed -e "s|^object_arena_size: .*|object_arena_size: ${ARENA:-512MB}|" "${MEG_CFG:-$ROOT/systems/megalon/vectordb-2vm.yaml}" > "$S/megalon.yaml"
 # shellcheck disable=SC2086
 APP=$("$B/bin/vdb-server" $PARAMS $([ "$TRACE" = 1 ] && echo --trace-dir "$S") --print-app-bytes)  # objseq: layout.h has_objseq
 RID=0x$(printf '%x' $(( (RANDOM << 16 | RANDOM) | 1 )))
@@ -58,6 +64,7 @@ trap cleanup EXIT
 for k in 0 1; do
   EXTRA=""; [ "$k" = 0 ] && EXTRA="--init-dir $S/init"
   XE=(); [ "$BACKEND" = megalon ] && XE=(RACKOBJ_CONFIG="$S/megalon.yaml") && [ "$k" = 0 ] && XE+=(MEGALON_REINIT=1)
+  [ "${VERIFY_INIT:-0}" = 1 ] && XE+=(VDB_VERIFY_INIT="$S/init")
   # shellcheck disable=SC2086
   env ${XE[@]+"${XE[@]}"} CXL_REGION_CONFIG=$S/region.yaml CXL_APP_HWCC_BYTES=$APP taskset -c "$CPUS" "$B/bin/vdb-server" --node $k --run-id "$RID" \
     $PARAMS --port $((19300 + k)) --search-threads 4 $([ "$TRACE" = 1 ] && echo --trace-dir "$S") $EXTRA > "$S/node$k.log" 2>&1 &
@@ -116,6 +123,9 @@ if (wsec != 0) != expect_on or objseq.any():
     sys.exit("hwcc trace lines: unexpected (wsec " + ("should be written" if expect_on else "must stay 0") + ", objseq must stay 0)")
 PY
 RC=$LGRC
+if [ "${VERIFY_INIT:-0}" = 1 ]; then
+  for k in 0 1; do grep -h "VERIFY INIT PASS" "$S/node$k.log" || { echo "node$k: no VERIFY INIT PASS"; RC=1; }; done
+fi
 for k in 0 1; do sed -n '/vdb-server: stopping/,$p' "$S/node$k.log" | grep -E "^(stale_header_rejects|stale_link_rejects|searches_with_stale_header|zeroed_unused_bytes|zeroed_unused_ms)=" | tr '\n' ' '; echo; done
 grep -h "ZEROED UNUSED" "$S/node0.log" || { echo "no ZEROED UNUSED line"; RC=1; }
 if [ "${PREFILL:-0}" = 1 ]; then
