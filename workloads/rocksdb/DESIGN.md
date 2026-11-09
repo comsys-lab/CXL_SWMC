@@ -189,3 +189,23 @@ Decision: G1 (user, 2026-10-18).
   NODE0_ENV, install.sh MEG_CFG, precheck.sh EXPECT_MEG_SHA); conf experiments/rocksdb/eval-run2-rocks-mg.conf.
 - VM sizing: object_arena_size 90 GiB (config/megalon-2vm.yaml, as the vector DB), 512 arena blocks + 45,000 file
   extents per node (plain backend: 48,501 extents per node; image 26,992 extents per node at 54M keys).
+
+## 11. megalon-record (2026-11-10; reports/experiments/rocksdb-megalon-record.md)
+- Selected by `--mg-mem-object-bytes 1152 --mg-file-object-bytes 4096` (default 1 MiB each = the block objects of §7: same
+  ids, create order, sections and stats text). The two sides are independent; record objects use kinds 2 and 3 of the id.
+- Blocks and extents stay the 1 MiB pool units of §6 (reuse and deferred free unchanged). A block holds 910 slots of 1,152 B
+  (the 576 B tail has no object and is never handed out); an extent holds 256 slices of 4 KiB. Node 0 creates all objects in
+  index order, so a unit's objects are contiguous (bump allocator, no inline header). Setup keeps one base address per unit
+  and checks the first, last and every 64th object against base + slot x size; a violation is a fatal setup error.
+- patches/0003: arena slot mode (cxl::BlockSource::SlotBytes / SlotsPerBlock): each memtable allocation takes a whole slot
+  under the arena lock, bypassing ConcurrentArena's per-core shards. The largest entry is 1,139 B (1 + 32 + 2 + 1,008 +
+  12 x 8). Skiplist heads and splices take a slot each. rdb.arena_slot_cross counts allocations above one slot; a
+  remote read crossing a slot end other than the 5-byte varint probe counts in rdb.mem_read_cross_slot. Both must be 0
+  (tests/host_test.sh, experiments/rocksdb/check-run.py).
+- Files: a span crossing slices takes one section per slice for remote reads and for FS Append; owner-local reads stay
+  section free (§7).
+- Stats (record mode only): rdb.objects, rdb.arena_slot_*, megalon.record_slots, megalon.reclaim_count, allocate_count,
+  records_in_use. builds/megalon/78 has no counter getter (API v3), so the three record counters are read from Megalon's
+  SharedCounters at hwcc + 4 KiB (layout of commit 18ba703107f5, guarded by the shim's build id; other builds report "na").
+- Harness: experiments/rocksdb/eval-run2-rocks-mg-record.conf, optional key ROCKS_MG_SERVER_EXTRA (empty for every other
+  conf), ROCKS_BLOCK=MGRECORD.
