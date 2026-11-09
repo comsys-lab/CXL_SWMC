@@ -30,7 +30,8 @@
 #   cxl_shm) on the all-HWcc guest kernel and region (POP_K, POP_REGION, dax0.0 chowned to comsys as for hw), with the
 #   Megalon server build of that N: ROCKS_MG_BUILD_N<N> (build.sh with builds/megalon/<b>-n<N>; lib/ shipped),
 #   ROCKS_MG_CFG_N<N> (Megalon config, object_arena_size >= N x (512 + extents) MiB), ROCKS_MG_EXTENTS_N<N> (file extents
-#   per node). ROCKS_SYSTEMS may then contain mg; ROCKS_BLOCK may be MG. ROCKS_EXPERIMENT (optional): the
+#   per node). ROCKS_SYSTEMS may then contain mg; ROCKS_BLOCK may be MG or MGRECORD (ROCKS_MG_SERVER_EXTRA, optional: extra
+#   rocksdb-server options of the mg cells, megalon-record object sizes). ROCKS_EXPERIMENT (optional): the
 #   state/EXPERIMENTS.md block a real run requires approved/running (default de-stijl-evaluation-run1).
 set -uo pipefail
 P=/home/comsys/sungsu/destijl-control
@@ -46,7 +47,7 @@ KEYS="ROCKS_BLOCK ROCKS_TOPO ROCKS_NODES ROCKS_MIXES ROCKS_SYSTEMS ROCKS_SLO_MS 
   ROCKS_BUILD ROCKS_LOADGEN_BUILD ROCKS_SLO_EXTRA RECV_MODE EXPECT_DAX_UUID RESULTS_ROOT EVIDENCE_PREFIX ROCKS_GUEST_PREFIX
   POP_REGION POP_C POP_BUNDLE_SHA POP_K POP_GT DS_REGION DS_C DS_BUNDLE_SHA DS_K DS_GT"
 OPTKEYS="ROCKS_DS_RECV_EXTRA ROCKS_EXPERIMENT ROCKS_MG_BUILD_N2 ROCKS_MG_BUILD_N4 ROCKS_MG_BUILD_N8 ROCKS_MG_CFG_N2
-  ROCKS_MG_CFG_N4 ROCKS_MG_CFG_N8 ROCKS_MG_EXTENTS_N2 ROCKS_MG_EXTENTS_N4 ROCKS_MG_EXTENTS_N8
+  ROCKS_MG_CFG_N4 ROCKS_MG_CFG_N8 ROCKS_MG_EXTENTS_N2 ROCKS_MG_EXTENTS_N4 ROCKS_MG_EXTENTS_N8 ROCKS_MG_SERVER_EXTRA
   POP_RECV_MODE POP_ADAPT_KO RECV_IPOLL RECV_WATCH_US RECV_S_MAX_US ROCKS_PMAX ROCKS_PMAX_FROM ROCKS_PMAX_MEASURE_S
   REQUIRE_ADAPTIVE REQUIRE_SLEEP2050
   ROCKS_FIXED ROCKS_FIXED_RECVP ROCKS_FIXED_RECVP_BASE"
@@ -61,7 +62,7 @@ for k in $KEYS; do [ -n "${!k:-}" ] || die "conf key $k empty"; done
 abs() { case $1 in /*) echo "$1";; *) echo "$P/$1";; esac; }
 ROCKS_BUILD=$(abs "$ROCKS_BUILD") ROCKS_LOADGEN_BUILD=$(abs "$ROCKS_LOADGEN_BUILD") RESULTS_ROOT=$(abs "$RESULTS_ROOT")
 POP_REGION=$(abs "$POP_REGION") POP_C=$(abs "$POP_C") DS_REGION=$(abs "$DS_REGION") DS_C=$(abs "$DS_C")
-[[ $ROCKS_BLOCK =~ ^([DE](200)?|MG|ABL)$ ]] || die "ROCKS_BLOCK D | E | D200 | E200 | MG | ABL"
+[[ $ROCKS_BLOCK =~ ^([DE](200)?|MG|MGRECORD|ABL)$ ]] || die "ROCKS_BLOCK D | E | D200 | E200 | MG | MGRECORD | ABL"
 # Receiver-ablation lifetimes (run 2, 2026-11-04; optional, unset = every cell is one SLO search as before):
 #   ROCKS_FIXED       tokens <sys>/<part>/-/-/<rates>/<step warm-up s>/<measure s>/<drain s> (sys pop | ds; per system in
 #                     order, the first = the warm part at the base): the pop / ds cell is ONE lifetime of fixed-rate parts
@@ -147,6 +148,9 @@ case $PHASE in
       MG_BUILD=$(abs "${!kb}") MEG_CFG=$(abs "${!kc}") MG_EXTENTS=${!kx}
       [[ $MG_EXTENTS =~ ^[1-9][0-9]*$ ]] || die "bad $kx"
       [ -f "$MG_BUILD/manifest.txt" ] && [ -f "$MEG_CFG" ] || die "$kb ($MG_BUILD) or $kc ($MEG_CFG) missing"
+      # megalon-record (optional, empty = block MG): extra rocksdb-server options for the mg cells (pilot-run.sh appends them)
+      [[ ${ROCKS_MG_SERVER_EXTRA:-} =~ ^(--mg-(mem|file)-object-bytes\ [1-9][0-9]*(\ |$))*$ ]] || die "bad ROCKS_MG_SERVER_EXTRA"
+      export MG_SERVER_EXTRA=${ROCKS_MG_SERVER_EXTRA:-}
       ROCKS_BUILD=$MG_BUILD;;
   *) die "phase hwpop | ds | mg";;
 esac

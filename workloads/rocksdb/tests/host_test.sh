@@ -13,7 +13,10 @@
 #        env: CPUS0 / CPUS1 / CPUSL (node0 / node1 / loadgen CPU lists), RATES, STEP_S, UPDATE_RATIO, WBMB,
 #             BACKEND=megalon (the build must carry lib/libmegalon-objapi.so; MEG_EXTENTS file extents per node),
 #             REGION_GB (sparse region file size, 8; 96 with MEG_EXTENTS=45000 = the VM object count, eval run2),
-#             READY_S (server READY wait in s, 600; the full-size 27M keys/node image needs longer)
+#             READY_S (server READY wait in s, 600; the full-size 27M keys/node image needs longer),
+#             megalon-record: MEG_MEM_OBJ / MEG_FILE_OBJ (object bytes, e.g. 1152 / 4096), MEG_YAML (Megalon config, default
+#             config/megalon-2vm.yaml; MEG_KEEP_ARENA=1 keeps its object_arena_size), ARENA_BLOCKS (256), REGION_BYTES
+#             (exact region size, overrides REGION_GB), RING2M=1 (msg_ring of config/cxl_region-ring2m.yaml)
 set -uo pipefail
 WD=$1; B=$(cd "$2" && pwd); LG=$(cd "$3" && pwd); N=${4:-200000}
 HERE=$(cd "$(dirname "$0")" && pwd); W=$(cd "$HERE/.." && pwd)
@@ -24,30 +27,40 @@ RESULT=0
 fail() { echo "STEP FAIL: $*"; RESULT=1; }
 rid() { printf '0x%x' $(( $(date +%s%N) & 0xffffffffff | 1 )); }
 RGB=${REGION_GB:-8}; [[ $RGB =~ ^[1-9][0-9]*$ ]] || { echo "bad REGION_GB"; exit 2; }
-truncate -s ${RGB}G region.img
+RBYTES=${REGION_BYTES:-$(( RGB << 30 ))}; [[ $RBYTES =~ ^[1-9][0-9]*$ ]] || { echo "bad REGION_BYTES"; exit 2; }
+RING="[268300288, 135168]"; [ "${RING2M:-0}" = 1 ] && RING="[266338304, 2097152]"
+truncate -s "$RBYTES" region.img
 cat > region.yaml <<EOF
 # Host test region: copy of CXL_SWMC/config/cxl_region.yaml with a sparse file standing in for the device
 device: $WD/region.img
 map_va: 0x600000000000
-device_size: $(( RGB << 30 ))
+device_size: $RBYTES
 align: 2097152
 hwcc_offset: 0
 hwcc_size: 268435456
-msg_ring: [268300288, 135168]
+msg_ring: $RING
 swcc_offset: auto
 swcc_size: auto
 reserved: []
 EOF
 BACKEND=${BACKEND:-plain}
-SP=(--keys $N --arena-blocks 256)
-BE=(); ENV0=()
+AB=${ARENA_BLOCKS:-256}
+SP=(--keys $N --arena-blocks $AB)
+BE=(); ENV0=(); XOBJ=0
 if [ "$BACKEND" = megalon ]; then
   EXT=${MEG_EXTENTS:-1024}
   SP+=(--file-extents $EXT --backend megalon)
-  sed -e "s/^object_arena_size: .*/object_arena_size: $(( (2 * (256 + EXT) + 64) / 1024 + 1 ))GB/" "$W/config/megalon-2vm.yaml" > megalon.yaml
+  MY=${MEG_YAML:-$W/config/megalon-2vm.yaml}
+  if [ "${MEG_KEEP_ARENA:-0}" = 1 ]; then cp "$MY" megalon.yaml
+  else sed -e "s/^object_arena_size: .*/object_arena_size: $(( (2 * (AB + EXT) + 64) / 1024 + 1 ))GB/" "$MY" > megalon.yaml; fi
   export RACKOBJ_CONFIG=$WD/megalon.yaml
   ENV0=(MEGALON_REINIT=1)
+  [ -z "${MEG_MEM_OBJ:-}" ] || SP+=(--mg-mem-object-bytes "$MEG_MEM_OBJ")
+  [ -z "${MEG_FILE_OBJ:-}" ] || SP+=(--mg-file-object-bytes "$MEG_FILE_OBJ")
+  [ -z "${MEG_MEM_OBJ:-}${MEG_FILE_OBJ:-}" ] || \
+    XOBJ=$(( 2 * (AB * (1048576 / ${MEG_MEM_OBJ:-1048576}) + EXT * (1048576 / ${MEG_FILE_OBJ:-1048576})) ))
 fi
+export EXPECT_OBJECTS=$XOBJ
 export CXL_APP_HWCC_BYTES=$("$B/bin/rocksdb-server" --print-app-bytes "${SP[@]}")
 echo "keys=$N app_bytes=$CXL_APP_HWCC_BYTES build=$B loadgen=$LG"
 grep -E '^(source|rocksdb_version|patch|sha256)' "$B/manifest.txt"
@@ -55,12 +68,14 @@ grep -E '^(source|rocksdb_version|patch|sha256)' "$B/manifest.txt"
 R=$(rid)
 P=(--nodes 2 --run-id "$R" --region "$WD/region.yaml" --threads 4 --write-buffer-mb ${WBMB:-4} --prepare-threads 2 "${SP[@]}")
 env "${ENV0[@]}" taskset -c "$C0" "$B/bin/rocksdb-server" --node 0 --port 17200 --local-dir "$WD/local0" "${P[@]}" > srv0.log 2>&1 &
+SRV0=$!
 taskset -c "$C1" "$B/bin/rocksdb-server" --node 1 --port 17201 --local-dir "$WD/local1" "${P[@]}" > srv1.log 2>&1 &
+SRV1=$!
 for _ in $(seq $(( ${READY_S:-600} * 2 ))); do grep -q READY srv0.log && grep -q READY srv1.log && break
   grep -q FATAL srv0.log srv1.log && break; sleep 0.5; done
 grep -h "rocksdb-server: \(node\|IMAGE\|primary\|READY\|FATAL\)" srv0.log srv1.log
 if ! grep -q READY srv0.log || ! grep -q READY srv1.log; then
-  fail "servers not READY"; tail -5 srv0.log srv1.log; pkill -x rocksdb-server
+  fail "servers not READY"; tail -5 srv0.log srv1.log; kill $SRV0 $SRV1 2>/dev/null
   echo "HOST TEST FAIL"; exit 1
 fi
 
@@ -79,7 +94,7 @@ for port in 17200 17201; do
   python3 -I "$CTL" 127.0.0.1:$port stats > stats.$port.txt || fail "stats $port"
 done
 python3 -I - stats.17200.txt stats.17201.txt <<'PY' || fail "stats check"
-import sys
+import os, sys
 bad = []
 for f in sys.argv[1:]:
     s = dict(l.split("=", 1) for l in open(f).read().splitlines() if "=" in l)
@@ -92,6 +107,20 @@ for f in sys.argv[1:]:
         if g(k): bad.append(f"{f}: {k}={g(k)}")
     for k in ("desc_installs", r + ".mem_hits", r + ".sst_hits", r + ".catchups", "gc.checked"):
         if not g(k): bad.append(f"{f}: {k}=0 (path not exercised)")
+    if "rdb.arena_slot_allocs" in s:  # megalon-record: no entry across a slot, objects, sections, record counters
+        print(f, " ".join(f"{k}={s.get(k)}" for k in ("rdb.objects", "megalon.created", "rdb.arena_slot_allocs", "rdb.arena_slot_cross",
+              "rdb.arena_slot_max_bytes", "rdb.mem_read_cross_slot", "rdb.mem_write_sections", "rdb.mem_read_sections",
+              "rdb.file_write_sections", "rdb.file_read_sections", "rdb.read_retries", "rdb.mem_read_tail_clamps",
+              "megalon.record_slots", "megalon.reclaim_count", "megalon.allocate_count", "megalon.records_in_use")))
+        for k in ("rdb.arena_slot_cross", "rdb.mem_read_cross_slot"):
+            if g(k): bad.append(f"{f}: {k}={g(k)}")
+        for k in ("rdb.arena_slot_allocs", "rdb.mem_write_sections", "rdb.mem_read_sections", "rdb.file_write_sections",
+                  "rdb.file_read_sections", "megalon.record_slots", "megalon.allocate_count"):
+            if not g(k): bad.append(f"{f}: {k}=0 (path not exercised)")
+        if g("rdb.arena_slot_max_bytes") > g("rdb.mem_object_bytes"): bad.append(f"{f}: an allocation exceeds the slot")
+        want = int(os.environ.get("EXPECT_OBJECTS", "0"))
+        if want and (g("rdb.objects") != want or g("megalon.created") != want):
+            bad.append(f"{f}: objects {g('rdb.objects')} / created {g('megalon.created')} != {want}")
 print("stats:", "OK" if not bad else "BAD " + "; ".join(bad))
 sys.exit(1 if bad else 0)
 PY
@@ -114,7 +143,7 @@ print("opsplit:", "OK" if not bad else "BAD " + "; ".join(bad),
       " ".join(f"{r['step']}:{r['op']}:n={r['ops[measured]']}:T={r['T_us_per_op[measured]']}us" for r in rows))
 sys.exit(1 if bad else 0)
 PY
-pkill -x rocksdb-server; sleep 2
+kill $SRV0 $SRV1 2>/dev/null; sleep 2
 for k in 0 1; do
   L=srv$k.log
   v() { sed -n "s/^$1=//p" "$L" | tail -1; }

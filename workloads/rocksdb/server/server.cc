@@ -350,6 +350,8 @@ void usage() {
                "--backend megalon: Megalon (RACKOBJ_CONFIG, object_arena_size >= 2 x (arena_blocks + file_extents) MiB,\n"
                "  --file-extents explicit) maps the device; MEGALON_NODE_ID / MEGALON_RUN_ID / CXL_REGION_CONFIG default to\n"
                "  --node / --run-id / --region; at most 32 threads open sections (keep --prepare-threads small).\n"
+               "  [--mg-mem-object-bytes B (1048576)] [--mg-file-object-bytes B (1048576)]: Megalon object per memtable slot /\n"
+               "  file slice (megalon-record: 1152 / 4096); the defaults are one object per arena block / file extent.\n"
                "All nodes need identical --nodes/--keys/--epoch-slots/--max-files/--max-ext/--arena-blocks/--file-extents\n"
                "(checked through the HWcc layout hash). CXL_APP_HWCC_BYTES must be at least the app layout size:\n"
                "rocksdb-server --print-app-bytes [params].\n");
@@ -388,6 +390,8 @@ int main(int argc, char **argv) {
     else if (a == "--start-timeout-ms") o.n.start_timeout_ms = std::stoull(v());
     else if (a == "--backend") o.n.backend = v();
     else if (a == "--megalon-lib") o.n.megalon_lib = v();
+    else if (a == "--mg-mem-object-bytes") o.n.mg_mem_object_bytes = std::stoull(v());
+    else if (a == "--mg-file-object-bytes") o.n.mg_file_object_bytes = std::stoull(v());
     else if (a == "--print-app-bytes") print_bytes = true;
     else usage();
   }
@@ -396,6 +400,7 @@ int main(int argc, char **argv) {
     return 0;
   }
   if (o.n.run_id == 0 || o.n.p.keys == 0 || (o.n.backend != "plain" && o.n.backend != "megalon")) usage();
+  if (o.n.backend != "megalon" && (o.n.mg_mem_object_bytes != kUnit || o.n.mg_file_object_bytes != kUnit)) usage();
   if (o.n.backend == "megalon") megalon_env(o.n, argv[0]);
   signal(SIGPIPE, SIG_IGN);
   signal(SIGTERM, [](int) { g_stop = 1; });

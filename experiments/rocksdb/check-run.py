@@ -57,7 +57,9 @@ def main():
         views = sorted({m.group(1) for m in (re.match(r"^(remote\d+)\.gets$", x) for x in s) if m})
         if len(views) != a.nodes - 1:
             bad.append(f"node{k}: {len(views)} remote views, expected {a.nodes - 1}")
-        keys = ["remote_errors", "get_errors", "update_errors", "get_retry_limit"] + \
+        # rdb.arena_slot_cross / rdb.mem_read_cross_slot: megalon-record only (absent = 0 for every other backend)
+        keys = ["remote_errors", "get_errors", "update_errors", "get_retry_limit",
+                "rdb.arena_slot_cross", "rdb.mem_read_cross_slot"] + \
                [v + x for v in views for x in (".errors", ".catchup_errors")]
         for x in keys:
             if num(s, x):

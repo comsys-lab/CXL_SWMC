@@ -1,0 +1,35 @@
+# Megalon config for the RocksDB megalon-record backend (reports/experiments/rocksdb-megalon-record.md), 2 VMs. Same file on
+# both VMs; node id, run id and region config come from rocksdb-server. Objects: one per memtable slot (1,152 B) and per
+# file slice (4 KiB): 2 x (512 x 910 + 45000 x 256) = 23,971,840 objects = 95,445,319,680 B (88.9 GiB).
+mount_directory: /mydata        # required by the config parser; unused
+key_space: 10000
+slots: 10240
+# 256 MB HWcc budget, as systems/megalon/recsys-2vm.yaml: 245 MiB / 4 B = 64,225,280 coherence records (objects enabled:
+# Megalon deviation R1). Fit in config/cxl_region-ring2m.yaml: PROGRESS.md / the Host test log ("SCR footprint").
+logical_scr_size: 245MB
+node_id: 0                      # overridden by MEGALON_NODE_ID (rocksdb-server sets it from --node)
+region_config: ""               # $CXL_REGION_CONFIG
+reinit: false                   # node 0: MEGALON_REINIT=1
+attach_mprotect: true
+stuck_timeout_ms: 600000        # 10 min, as recsys-2vm.yaml: node 1's NR replica HashMap rehashes during node 0's creates
+                                # (doubling at 2^24 x 7/8 = 14.7M objects here) while the NR log is full; the port's stuck
+                                # peer check must outlast that, it only exists to turn a dead peer into an abort
+log_sync_interval_us: 100
+nr_log_size: 64MB               # as recsys-2vm.yaml (134M creates passed through a 64 MiB log with this timeout)
+attach_timeout_s: 7200          # node 0 creates every object first (estimate ~4 min for 24M on the VMs)
+start_barrier_timeout_s: 7200
+object_arena_size: 95GB         # GiB in Megalon; the SWcc of /dev/dax0.0 is 95.73 GiB, the LNR arena also holds the NR log
+                                # and the 10,240 slots; >= 95,445,319,680 B of objects. Form NN[GM]B is read by the harness
+object_align: 64
+object_max_count: 65536         # hwcc flavor only (static records); unused by the megalon flavor
+replicate: false
+flush: false
+evict: false
+partition_ratio: 0.0
+excluded_files:
+excluded_directories:
+  - /usr
+  - /proc
+  - /etc
+  - /dev
+  - /sys

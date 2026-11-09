@@ -93,7 +93,8 @@ case "$SYS" in
   Megalon)  # Object SWcc, user level (eval run2; workloads/rocksdb DESIGN.md §7): no cxl_shm cycle; /dev/dax0.0 owned by
             # comsys (v1-block.sh, as all-HWcc); objects = 1 MiB arena blocks + 1 MiB file extents (explicit count)
             [ "$FILE_EXTENTS" != 0 ] || stop "SYS=Megalon needs FILE_EXTENTS (Megalon's object_arena_size >= N x (arena blocks + extents) MiB)"
-            export SYSTEM=Megalon SERVER_ARGS="$SA --backend megalon" NODE_ENV="ENV:RACKOBJ_CONFIG=$V/cfg/megalon.yaml" \
+            # MG_SERVER_EXTRA (runset-rocks.sh ROCKS_MG_SERVER_EXTRA, megalon-record object sizes; unset = block MG)
+            export SYSTEM=Megalon SERVER_ARGS="$SA --backend megalon${MG_SERVER_EXTRA:+ $MG_SERVER_EXTRA}" NODE_ENV="ENV:RACKOBJ_CONFIG=$V/cfg/megalon.yaml" \
               NODE0_ENV="ENV:MEGALON_REINIT=1"
             [ -f "$BUILD/lib/libmegalon-objapi.so" ] || stop "BUILD $BUILD has no lib/libmegalon-objapi.so (build.sh with a Megalon build dir)"
             # MEG_CFG = the Host copy v1-block.sh installed as cfg/megalon.yaml: its object arena must hold every node's

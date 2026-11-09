@@ -64,6 +64,8 @@ struct NodeOpts {
   uint64_t max_manifest_kb = 0;    // 0 = max_ext / 2 MiB; Host stress tests only (forces MANIFEST rollovers)
   std::string backend = "plain";   // plain | megalon
   std::string megalon_lib;         // default <exe dir>/../lib/libmegalon-objapi.so
+  uint64_t mg_mem_object_bytes = kUnit;   // Megalon object per memtable slot; 1 MiB = one object per arena block
+  uint64_t mg_file_object_bytes = kUnit;  // Megalon object per file slice; 1 MiB = one object per file extent
 };
 
 // G1 (DESIGN.md §5): drop an entry when another node's DB holds the key with a higher stamp.
@@ -95,12 +97,16 @@ class StaleFilter final : public rdb::CompactionFilter {
 
 class ArenaSource final : public rdb::cxl::BlockSource {
  public:
-  explicit ArenaSource(Shared *sh) : sh_(sh) {}
+  ArenaSource(Shared *sh, size_t slot_bytes, size_t slots_per_block)
+      : sh_(sh), slot_bytes_(slot_bytes), slots_per_block_(slots_per_block) {}
   char *Get(size_t bytes) override { return bytes > kUnit ? nullptr : sh_->get_block(); }
   void Put(const std::vector<char *> &blocks, uint64_t) override { sh_->retire_blocks(blocks); }
+  size_t SlotBytes() const override { return slot_bytes_; }
+  size_t SlotsPerBlock() const override { return slots_per_block_; }
 
  private:
   Shared *sh_;
+  const size_t slot_bytes_, slots_per_block_;  // arena slot mode (0 = off)
 };
 
 class Node {
@@ -120,7 +126,8 @@ class Node {
       if (api->node_id() != o_.node) die("megalon node id " + std::to_string(api->node_id()) + " != --node");
       if (!mapped_by(r_.map_va, r_.device_size, r_.device, &err)) die(err);
       map_ = reinterpret_cast<uint8_t *>(r_.map_va);
-      be_ = std::make_unique<MegalonBackend>(api);
+      if (!MegalonBackend::valid_sizes(o_.mg_mem_object_bytes, o_.mg_file_object_bytes, &err)) die(err);
+      be_ = std::make_unique<MegalonBackend>(api, o_.mg_mem_object_bytes, o_.mg_file_object_bytes);
       meg = static_cast<MegalonBackend *>(be_.get());
     } else {
       be_ = std::make_unique<PlainBackend>();
@@ -151,7 +158,8 @@ class Node {
                  (unsigned long)lay.L.hash(), plan_.describe().c_str(), be_->name());
     fs_ = std::make_shared<CxlFs>(rdb::FileSystem::Default(), sh_.get());
     env_ = rdb::NewCompositeEnv(fs_);
-    arena_ = std::make_unique<ArenaSource>(sh_.get());
+    arena_ = std::make_unique<ArenaSource>(sh_.get(), meg ? meg->arena_slot_bytes() : 0,
+                                           meg ? meg->arena_slots_per_block() : 0);
     views_.assign(p_.nr_nodes, nullptr);
     install_hooks();
     open_primary(who);

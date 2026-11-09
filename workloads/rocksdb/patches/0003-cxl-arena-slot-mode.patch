@@ -1,0 +1,149 @@
+
+--- a/include/rocksdb/cxl.h
++++ b/include/rocksdb/cxl.h
+@@ -31,8 +31,23 @@
+   virtual char* Get(size_t bytes) = 0;
+   // All blocks of one arena at its destruction; owner = the memtable id (0 if never set).
+   virtual void Put(const std::vector<char*>& blocks, uint64_t owner) = 0;
++  // Arena slot mode (per-entry coherence objects, patches/0003): SlotBytes() > 0 makes the arena hand out whole slots
++  // of that size, SlotsPerBlock() of them from the start of each block, so one allocation never shares or crosses an
++  // object. 0 = ordinary arena allocation.
++  virtual size_t SlotBytes() const { return 0; }
++  virtual size_t SlotsPerBlock() const { return 0; }
+ };
+ 
++// Process-wide counters of the arena slot mode. cross = allocations larger than one slot, i.e. that would span
++// objects (must stay 0 in a run); max_bytes = largest allocation seen.
++struct ArenaSlotCounters {
++  std::atomic<uint64_t> allocs{0}, cross{0}, max_bytes{0};
++};
++inline ArenaSlotCounters& GetArenaSlotCounters() {
++  static ArenaSlotCounters c;
++  return c;
++}
++
+ struct MemtableInfo {
+   uint64_t id;       // MemTable::GetID()
+   const void* head;  // skiplist head node (nullptr: not a skiplist memtable)
+
+--- a/memory/arena.cc
++++ b/memory/arena.cc
+@@ -48,6 +48,16 @@
+     alloc_bytes_remaining_ = 0;
+     aligned_alloc_ptr_ = nullptr;
+     unaligned_alloc_ptr_ = nullptr;
++    // CXL: arena slot mode, when the source asks for it
++    cxl_slot_bytes_ = cxl_source_->SlotBytes();
++    cxl_slots_per_block_ = cxl_source_->SlotsPerBlock();
++    if (cxl_slot_bytes_ != 0 &&
++        (cxl_slots_per_block_ == 0 || cxl_slot_bytes_ % kAlignUnit != 0 ||
++         cxl_slot_bytes_ * cxl_slots_per_block_ > kBlockSize)) {
++      fprintf(stderr, "CXL arena: bad slot mode (%zu B x %zu, block %zu)\n",
++              cxl_slot_bytes_, cxl_slots_per_block_, kBlockSize);
++      abort();
++    }
+   } else {
+     alloc_bytes_remaining_ = sizeof(inline_block_);
+     blocks_memory_ += alloc_bytes_remaining_;
+@@ -157,6 +167,36 @@
+   return result;
+ }
+ 
++// CXL: whole slots from the start of the current block. The unused tail of a
++// block (block size modulo slot size) is never handed out: it is not covered
++// by an object.
++char* Arena::AllocateCxlSlot(size_t bytes) {
++  cxl::ArenaSlotCounters& c = cxl::GetArenaSlotCounters();
++  c.allocs.fetch_add(1, std::memory_order_relaxed);
++  uint64_t seen = c.max_bytes.load(std::memory_order_relaxed);
++  while (seen < bytes && !c.max_bytes.compare_exchange_weak(
++                             seen, bytes, std::memory_order_relaxed)) {
++  }
++  const size_t n = bytes == 0 ? 1 : (bytes + cxl_slot_bytes_ - 1) / cxl_slot_bytes_;
++  if (n > 1) {
++    c.cross.fetch_add(1, std::memory_order_relaxed);
++    if (n > cxl_slots_per_block_) {
++      fprintf(stderr, "CXL arena: allocation of %zu B exceeds a block of slots\n",
++              bytes);
++      abort();
++    }
++  }
++  if (n > cxl_slots_left_) {
++    cxl_slot_ptr_ = AllocateNewBlock(kBlockSize);
++    cxl_slots_left_ = cxl_slots_per_block_;
++  }
++  char* result = cxl_slot_ptr_;
++  cxl_slot_ptr_ += n * cxl_slot_bytes_;
++  cxl_slots_left_ -= n;
++  alloc_bytes_remaining_ = cxl_slots_left_ * cxl_slot_bytes_;
++  return result;
++}
++
+ char* Arena::AllocateNewBlock(size_t block_bytes) {
+   if (cxl_source_ != nullptr) {
+     char* b = cxl_source_->Get(block_bytes);
+
+--- a/memory/arena.h
++++ b/memory/arena.h
+@@ -90,6 +90,11 @@
+   // CXL: owner id passed to the block source at destruction (memtable id).
+   void SetCxlOwner(uint64_t owner) { cxl_owner_ = owner; }
+ 
++  // CXL: arena slot mode (cxl::BlockSource::SlotBytes() > 0). Every allocation
++  // takes whole slots from the current block; see cxl::ArenaSlotCounters.
++  bool CxlSlotMode() const { return cxl_slot_bytes_ != 0; }
++  char* AllocateCxlSlot(size_t bytes);
++
+   // check and adjust the block_size so that the return value is
+   //  1. in the range of [kMinBlockSize, kMaxBlockSize].
+   //  2. the multiple of align unit.
+@@ -127,6 +132,11 @@
+   cxl::BlockSource* cxl_source_ = nullptr;
+   std::vector<char*> cxl_blocks_;
+   uint64_t cxl_owner_ = 0;
++  // CXL: arena slot mode (0 = off)
++  size_t cxl_slot_bytes_ = 0;
++  size_t cxl_slots_per_block_ = 0;
++  size_t cxl_slots_left_ = 0;
++  char* cxl_slot_ptr_ = nullptr;
+   // Non-owned
+   AllocTracker* tracker_;
+ };
+
+--- a/memory/concurrent_arena.h
++++ b/memory/concurrent_arena.h
+@@ -55,12 +55,18 @@
+   void SetCxlOwner(uint64_t owner) { arena_.SetCxlOwner(owner); }
+ 
+   char* Allocate(size_t bytes) override {
++    if (arena_.CxlSlotMode()) {
++      return AllocateCxlSlot(bytes);  // CXL: no per-core shards
++    }
+     return AllocateImpl(bytes, false /*force_arena*/,
+                         [this, bytes]() { return arena_.Allocate(bytes); });
+   }
+ 
+   char* AllocateAligned(size_t bytes, size_t huge_page_size = 0,
+                         Logger* logger = nullptr) override {
++    if (arena_.CxlSlotMode()) {
++      return AllocateCxlSlot(bytes);  // CXL: no per-core shards
++    }
+     size_t rounded_up = ((bytes - 1) | (sizeof(void*) - 1)) + 1;
+     assert(rounded_up >= bytes && rounded_up < bytes + sizeof(void*) &&
+            (rounded_up % sizeof(void*)) == 0);
+@@ -121,6 +127,15 @@
+ 
+   Shard* Repick();
+ 
++  // CXL: arena slot mode: every allocation under the arena lock, so that a
++  // shard never carves an entry out of a chunk spanning several slots.
++  char* AllocateCxlSlot(size_t bytes) {
++    std::lock_guard<SpinMutex> lock(arena_mutex_);
++    char* rv = arena_.AllocateCxlSlot(bytes);
++    Fixup();
++    return rv;
++  }
++
+   size_t ShardAllocatedAndUnused() const {
+     size_t total = 0;
+     for (size_t i = 0; i < shards_.Size(); ++i) {
