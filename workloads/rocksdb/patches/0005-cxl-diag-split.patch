@@ -1,0 +1,95 @@
+--- a/db/memtable.cc
++++ b/db/memtable.cc
+@@ -1129,6 +1129,8 @@
+   //  value_size   : varint32 of value.size()
+   //  value bytes  : char[value.size()]
+   //  checksum     : char[moptions_.protection_bytes_per_key]
++  cxl::DiagSplitScope cxl_add_diag(cxl::GetDiagCounters().memtable_add,
++                                   cxl::GetDiagCounters().memtable_add_rdb);  // CXL diagnostic (patches/0005)
+   uint32_t key_size = static_cast<uint32_t>(key.size());
+   uint32_t val_size = static_cast<uint32_t>(value.size());
+   uint32_t internal_key_size = key_size + 8;
+@@ -1178,12 +1180,22 @@
+     if (table == table_ && insert_with_hint_prefix_extractor_ != nullptr &&
+         insert_with_hint_prefix_extractor_->InDomain(key_slice)) {
+       Slice prefix = insert_with_hint_prefix_extractor_->Transform(key_slice);
+-      bool res = table->InsertKeyWithHint(handle, &insert_hints_[prefix]);
++      bool res;
++      {
++        cxl::DiagSplitScope cxl_ins_diag(cxl::GetDiagCounters().skiplist_insert,
++                                         cxl::GetDiagCounters().skiplist_insert_rdb);  // CXL diagnostic
++        res = table->InsertKeyWithHint(handle, &insert_hints_[prefix]);
++      }
+       if (UNLIKELY(!res)) {
+         return Status::TryAgain("key+seq exists");
+       }
+     } else {
+-      bool res = table->InsertKey(handle);
++      bool res;
++      {
++        cxl::DiagSplitScope cxl_ins_diag(cxl::GetDiagCounters().skiplist_insert,
++                                         cxl::GetDiagCounters().skiplist_insert_rdb);  // CXL diagnostic
++        res = table->InsertKey(handle);
++      }
+       if (UNLIKELY(!res)) {
+         return Status::TryAgain("key+seq exists");
+       }
+@@ -1213,9 +1225,13 @@
+     assert(post_process_info == nullptr);
+     UpdateFlushState();
+   } else {
+-    bool res = (hint == nullptr)
+-                   ? table->InsertKeyConcurrently(handle)
+-                   : table->InsertKeyWithHintConcurrently(handle, hint);
++    bool res;
++    {
++      cxl::DiagSplitScope cxl_ins_diag(cxl::GetDiagCounters().skiplist_insert,
++                                       cxl::GetDiagCounters().skiplist_insert_rdb);  // CXL diagnostic (patches/0005)
++      res = (hint == nullptr) ? table->InsertKeyConcurrently(handle)
++                              : table->InsertKeyWithHintConcurrently(handle, hint);
++    }
+     if (UNLIKELY(!res)) {
+       return Status::TryAgain("key+seq exists");
+     }
+--- a/include/rocksdb/cxl.h
++++ b/include/rocksdb/cxl.h
+@@ -77,11 +77,39 @@
+   // DBImpl::PreprocessWrite, write leader: DB mutex acquisition of the flush-scheduling block, and the whole block
+   // (DB mutex, WaitForPendingWrites, ScheduleFlushes = SwitchMemtable); the write-buffer-manager flush block
+   DiagTimer flush_mutex_wait, schedule_flushes, wbm_flush;
++  // patches/0005: MemTable::Add wall time (every call) and the same minus the coherence-backend section time spent
++  // inside it (DiagSectionNs delta: the backend's write_start + write_end); the skiplist insert inside Add
++  // (InsertKey* / InsertKeyConcurrently: search + link, incl. its link sections) and the same minus section time
++  DiagTimer memtable_add, memtable_add_rdb, skiplist_insert, skiplist_insert_rdb;
+ };
+ inline DiagCounters& GetDiagCounters() {
+   static DiagCounters c;
+   return c;
+ }
++// patches/0005: ns the calling thread spent inside the coherence backend's section begin / end calls (the backend adds
++// to it; RocksDB only reads deltas)
++inline uint64_t& DiagSectionNs() {
++  thread_local uint64_t ns = 0;
++  return ns;
++}
++// patches/0005: times a scope into `all` (wall) and `rdb` (wall minus the section time inside it)
++class DiagSplitScope {
++ public:
++  DiagSplitScope(DiagTimer& all, DiagTimer& rdb)
++      : all_(all), rdb_(rdb), t0_(DiagNowNs()), s0_(DiagSectionNs()) {}
++  ~DiagSplitScope() {
++    const uint64_t d = DiagNowNs() - t0_, s = DiagSectionNs() - s0_;
++    all_.Add(d);
++    rdb_.Add(d > s ? d - s : 0);
++  }
++  DiagSplitScope(const DiagSplitScope&) = delete;
++  DiagSplitScope& operator=(const DiagSplitScope&) = delete;
++
++ private:
++  DiagTimer& all_;
++  DiagTimer& rdb_;
++  const uint64_t t0_, s0_;
++};
+ 
+ struct MemtableInfo {
+   uint64_t id;       // MemTable::GetID()

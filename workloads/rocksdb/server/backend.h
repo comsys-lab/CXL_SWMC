@@ -197,12 +197,12 @@ class MegalonBackend final : public Backend {
   // Megalon allows a fixed number of thread registrations per process; every thread that opens a section
   // registers once (lazily: RocksDB's background threads too).
   void thread_init() override {
-    thread_local bool done = false;
-    if (done) return;
+    int &my = my_tid();
+    if (my >= 0) return;
     const int tid = next_tid_.fetch_add(1);
     if (tid >= kMaxThreads) backend_fatal("megalon: more than 32 threads open sections (NR registration limit)");
     api_->reg(tid);
-    done = true;
+    my = tid;
   }
 
   // node 0 creates every object of every node (index order, kind blocks then extents); the others only look up
@@ -275,10 +275,15 @@ class MegalonBackend final : public Backend {
       const size_t at = off - s * file_obj_, take = std::min<size_t>(n, file_obj_ - at);
       uint8_t *obj = extent(node, j) + s * file_obj_;
       mshim::Obj h;
+      SecDiag &sd = sd_[my_tid()];
+      const uint64_t t0 = diag_now();
       if (api_->write_start(obj_id(1, node, j, s), &h) != 0 || h.ptr != obj)
         backend_fatal("ObjectWriteStart(extent " + std::to_string(j) + ")");
+      sd.start(sd.file_ws, sd.file_ws_100us, sd.file_ws_1ms, diag_now() - t0);
       std::memcpy(h.ptr + at, in, take);
+      const uint64_t t1 = diag_now();
       api_->write_end(&h);
+      sd.file_we.Add(diag_now() - t1);
       file_writes_.fetch_add(1, std::memory_order_relaxed);
       in += take, off += take, n -= take;
     }
@@ -332,6 +337,7 @@ class MegalonBackend final : public Backend {
       << "\nrdb.mem_read_tail_clamps=" << tail_clamps_.load()
       << "\nrdb.megalon_threads=" << next_tid_.load() << "\nshim=" << api_->info << "\n";
     if (record_) record_stats(o);
+    diag_stats(o);
     return o.str();
   }
 
@@ -423,12 +429,68 @@ class MegalonBackend final : public Backend {
     thread_init();
     thread_local mshim::Obj tok;  // sections never nest (rocksdb/cxl.h), so one per thread
     const uint64_t s = uint64_t(static_cast<const uint8_t *>(addr) - block(me_, i)) / mem_obj_;
+    const uint64_t t0 = diag_now();
     if (api_->write_start(obj_id(0, me_, i, s), &tok) != 0 || tok.ptr != block(me_, i) + s * mem_obj_)
       backend_fatal("ObjectWriteStart(block " + std::to_string(i) + ")");
+    const uint64_t d = diag_now() - t0;
+    SecDiag &sd = sd_[my_tid()];
+    sd.start(sd.mem_ws, sd.mem_ws_100us, sd.mem_ws_1ms, d);
+    ROCKSDB_NAMESPACE::cxl::DiagSectionNs() += d;  // patches/0005: excluded from memtable_add_rdb / skiplist_insert_rdb
     mem_writes_.fetch_add(1, std::memory_order_relaxed);
     return &tok;
   }
-  void mem_write_end(void *tok) { api_->write_end(static_cast<mshim::Obj *>(tok)); }
+  void mem_write_end(void *tok) {
+    const uint64_t t0 = diag_now();
+    api_->write_end(static_cast<mshim::Obj *>(tok));
+    const uint64_t d = diag_now() - t0;
+    sd_[my_tid()].mem_we.Add(d);
+    ROCKSDB_NAMESPACE::cxl::DiagSectionNs() += d;
+  }
+
+  // Diagnostic section timers (builds/rocksdb/11; DESIGN.md section 12): every write_start / write_end of a memtable
+  // (mem_*) or file (file_*) write section, unsampled; one slot per registered Megalon thread (written by that thread
+  // only, the stats reader sums and resets the maxima). ws = write_start (object acquire), we = write_end (flush +
+  // unlock); ws_100us / ws_1ms = write_starts longer than 100 us / 1 ms.
+  struct alignas(64) SecDiag {
+    using T = ROCKSDB_NAMESPACE::cxl::DiagTimer;
+    T mem_ws, mem_we, file_ws, file_we;
+    std::atomic<uint64_t> mem_ws_100us{0}, mem_ws_1ms{0}, file_ws_100us{0}, file_ws_1ms{0};
+    static void start(T &t, std::atomic<uint64_t> &c100, std::atomic<uint64_t> &c1m, uint64_t d) {
+      t.Add(d);
+      if (d > 100000) c100.fetch_add(1, std::memory_order_relaxed);
+      if (d > 1000000) c1m.fetch_add(1, std::memory_order_relaxed);
+    }
+  };
+  static uint64_t diag_now() { return ROCKSDB_NAMESPACE::cxl::DiagNowNs(); }
+  static int &my_tid() {
+    thread_local int tid = -1;
+    return tid;
+  }
+  void diag_stats(std::ostringstream &o) const {
+    auto timer = [&](const char *name, SecDiag::T SecDiag::*m) {
+      uint64_t c = 0, ns = 0, mx = 0;
+      for (auto &s : sd_) {
+        SecDiag::T &t = s.*m;
+        c += t.count.load(std::memory_order_relaxed), ns += t.ns.load(std::memory_order_relaxed);
+        mx = std::max(mx, t.TakeMax());
+      }
+      o << "diag." << name << "_count=" << c << "\ndiag." << name << "_ns=" << ns << "\ndiag." << name << "_max_ns=" << mx
+        << "\n";
+    };
+    auto count = [&](const char *name, std::atomic<uint64_t> SecDiag::*m) {
+      uint64_t c = 0;
+      for (auto &s : sd_) c += (s.*m).load(std::memory_order_relaxed);
+      o << "diag." << name << "_count=" << c << "\n";
+    };
+    timer("mg_mem_wstart", &SecDiag::mem_ws);
+    timer("mg_mem_wend", &SecDiag::mem_we);
+    count("mg_mem_wstart_gt100us", &SecDiag::mem_ws_100us);
+    count("mg_mem_wstart_gt1ms", &SecDiag::mem_ws_1ms);
+    timer("mg_file_wstart", &SecDiag::file_ws);
+    timer("mg_file_wend", &SecDiag::file_we);
+    count("mg_file_wstart_gt100us", &SecDiag::file_ws_100us);
+    count("mg_file_wstart_gt1ms", &SecDiag::file_ws_1ms);
+  }
 
   static inline MegalonBackend *self_ = nullptr;
   const mshim::Api *api_;
@@ -442,6 +504,7 @@ class MegalonBackend final : public Backend {
   std::atomic<int> next_tid_{0};
   std::atomic<uint64_t> mem_writes_{0}, mem_reads_{0}, file_writes_{0}, file_reads_{0}, retries_{0}, tail_clamps_{0};
   std::atomic<uint64_t> read_cross_{0};
+  mutable SecDiag sd_[kMaxThreads];  // diagnostic section timers (stats() resets their maxima)
 };
 
 }  // namespace rdbw

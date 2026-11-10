@@ -237,3 +237,21 @@ previous stats read (the window of the maxima).
   0.2-0.3 us at 9 us service time; per get about 4 calls (~0.1 us); the patches/0004 timers are on rare paths (contended slot
   lock, new block, memtable switch).
 - Conf: experiments/rocksdb/eval-run2-rocks-mg-record-diag.conf (ROCKS_BLOCK=MGRDIAG, u50 only, guest dir rocksdb10-run2).
+- builds/rocksdb/11 (2026-11-11): the build-10 run showed memtable insert time per Put rising from ~12 us to 0.4-7 ms after
+  the overload step, while Megalon's own (1 in 64 sampled) write-section time stayed 2-18 us. Added, every call, unsampled:
+  backend section timers (one slot per registered Megalon thread, summed): mg_mem_wstart / mg_mem_wend (api write_start =
+  object acquire, write_end = whole-object flush + unlock, of every memtable write section), mg_file_wstart / mg_file_wend
+  (the same for the file write sections = FS Append / SST slices, flush and compaction threads), and the counts
+  mg_{mem,file}_wstart_gt100us_count / _gt1ms_count. patches/0005: memtable_add (MemTable::Add wall), memtable_add_rdb (the
+  same minus the memtable section time spent inside it: rocksdb/cxl.h DiagSectionNs, a thread-local sum the backend adds
+  write_start + write_end to), skiplist_insert (InsertKey* / InsertKeyConcurrently inside Add: search + link incl. the
+  link sections) and skiplist_insert_rdb (minus section time). Sections per Put = rdb.mem_write_sections / updates. Cost:
+  4 more clock reads per section and 4 per Add. Conf eval-run2-rocks-mg-record-diag2.conf (ROCKS_BLOCK=MGRDIAG2, guest dir
+  rocksdb11-run2). What write_start can wait for (Megalon 18ba703107f5, lib/object_store.cc WriteStart): GetAnchor (NR
+  replica sync to the log tail: combiner lock, replay of the other node's log entries), SwitchRW when the object has no
+  record (record reservation, critical-path reclaim of a victim record through an NR log op, InvalidateSwitchToRWShared
+  log op; an NR append waits in advance_head while the log is full until the slowest replica consumes), write_seq_start
+  (write_seqlock_begin spins, uncounted, while the record's lock bit is held, by any writer or reclaimer of that record
+  on either node; it returns false when the record was freed, as does a pending NR notification, and WriteStart retries
+  from GetAnchor). Exact counts already
+  exported: megalon.write_retry, megalon.switch_rw, megalon.reclaim_count / allocate_count.

@@ -128,6 +128,23 @@ for f in sys.argv[1:]:
             if g("diag.put_ns") > g("update_ns"): bad.append(f"{f}: diag.put_ns > update_ns")
             if not g("diag.memtable_ns") or not g("diag.slot_new_block_count") or not g("diag.schedule_flushes_count"):
                 bad.append(f"{f}: diag memtable / slot_new_block / schedule_flushes not exercised")
+        if "diag.mg_mem_wstart_count" in s:  # builds/rocksdb/11+: section timers and the MemTable::Add split
+            for side, sec in (("mem", "rdb.mem_write_sections"), ("file", "rdb.file_write_sections")):
+                c = g(f"diag.mg_{side}_wstart_count")
+                if c != g(sec): bad.append(f"{f}: diag.mg_{side}_wstart_count {c} != {sec} {g(sec)}")
+                if not 0 <= c - g(f"diag.mg_{side}_wend_count") <= 32: bad.append(f"{f}: mg_{side} wend count vs wstart")
+                if not g(f"diag.mg_{side}_wstart_gt1ms_count") <= g(f"diag.mg_{side}_wstart_gt100us_count") <= c:
+                    bad.append(f"{f}: mg_{side}_wstart threshold counts inconsistent")
+                if not g(f"diag.mg_{side}_wstart_ns") or not g(f"diag.mg_{side}_wend_ns"):
+                    bad.append(f"{f}: mg_{side} section timers zero")
+            if not g("diag.memtable_add_count") or g("diag.skiplist_insert_count") != g("diag.memtable_add_count"):
+                bad.append(f"{f}: diag memtable_add / skiplist_insert counts")
+            if g("diag.memtable_add_count") < g("diag.put_count"): bad.append(f"{f}: memtable_add_count < put_count")
+            if g("diag.memtable_add_rdb_ns") > g("diag.memtable_add_ns") or g("diag.skiplist_insert_ns") > g("diag.memtable_add_ns") \
+               or g("diag.skiplist_insert_rdb_ns") > g("diag.skiplist_insert_ns"):
+                bad.append(f"{f}: memtable_add / skiplist_insert split inconsistent")
+            if g("diag.memtable_add_ns") - g("diag.memtable_add_rdb_ns") > g("diag.mg_mem_wstart_ns") + g("diag.mg_mem_wend_ns"):
+                bad.append(f"{f}: section time inside Add exceeds all memtable section time")
         want = int(os.environ.get("EXPECT_OBJECTS", "0"))
         if want and (g("rdb.objects") != want or g("megalon.created") != want):
             bad.append(f"{f}: objects {g('rdb.objects')} / created {g('megalon.created')} != {want}")

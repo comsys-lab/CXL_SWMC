@@ -253,6 +253,12 @@ class Server {
     rdb("flush_mutex_wait", dc.flush_mutex_wait);  // (f) write leader: DB mutex wait before ScheduleFlushes
     rdb("schedule_flushes", dc.schedule_flushes);  // (f) write leader: WaitForPendingWrites + ScheduleFlushes (switch)
     rdb("wbm_flush", dc.wbm_flush);                // (f) write leader: write-buffer-manager flush block
+    // builds/rocksdb/11 (patches/0005): MemTable::Add wall, and minus the backend section time inside it (diag.mg_mem_*
+    // in the backend stats); the skiplist insert (search + link) inside Add, the same two ways
+    rdb("memtable_add", dc.memtable_add);
+    rdb("memtable_add_rdb", dc.memtable_add_rdb);
+    rdb("skiplist_insert", dc.skiplist_insert);
+    rdb("skiplist_insert_rdb", dc.skiplist_insert_rdb);
   }
 
  private:
