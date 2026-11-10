@@ -314,6 +314,18 @@ class MegalonBackend {
       << "\nmegalon.flushes=" << s.flushes << "\nmegalon.flush_bytes=" << s.flush_bytes
       << "\nmegalon.replay_flushes=" << s.replay_flushes << "\nmegalon.replay_flush_bytes=" << s.replay_flush_bytes
       << "\n";
+    // shim v5 (Megalon build >= 80, GetWmetaCounts): coherence-record pool counters = Megalon's teardown "reclaim
+    // count / allocate count" (cluster-wide SCR counters: every node reports the same value; never sum over nodes),
+    // readable at any time, so they include the background record manager's reclaims (not only the critical path).
+    // reclaim_count / allocate_count are cumulative since the SCR was initialised (stats_delta.py: per-step deltas);
+    // records_in_use / record_slots / dyn_wmeta are current values (gauges). No keys with an older shim (v2..v4).
+    if (api_->version >= 5 && api_->wmeta_counts) {
+      mshim::WmetaCounts w{};
+      api_->wmeta_counts(&w);
+      o << "megalon.pool.reclaim_count=" << w.reclaim_count << "\nmegalon.pool.allocate_count=" << w.allocate_count
+        << "\nmegalon.pool.records_in_use=" << w.records_in_use << "\nmegalon.pool.record_slots=" << w.record_slots
+        << "\nmegalon.pool.dyn_wmeta=" << w.dyn_wmeta << "\n";
+    }
     // per role: exact counts, sampled times and the estimate (sampled × total / sampled), see MegThr
     uint64_t v[kRoles][10] = {};
     {

@@ -19,7 +19,10 @@ FNAME = re.compile(r"^step(\d+)-(begin|end)-t(\d+)\.txt$")
 # keys reported as their end value (not differenced)
 GAUGE_EXACT = {"node", "write_queue", "search_queue", "megt.sample",
                # run 2 vector DB (builds/vdb/23+): bytes / time of the unused-slot zeroing at preload (one-time values)
-               "zeroed_unused_bytes", "zeroed_unused_ms"}
+               "zeroed_unused_bytes", "zeroed_unused_ms",
+               # recsys Megalon (shim v5, builds/recsys-megalon/17+): current record-pool values (cluster-wide);
+               # megalon.pool.reclaim_count / allocate_count stay counters (per-step deltas)
+               "megalon.pool.records_in_use", "megalon.pool.record_slots", "megalon.pool.dyn_wmeta"}
 GAUGE_SUFFIX = (".n", "max_ns", ".in_flight_transaction_count", ".enabled",
                 # identity values of the MOT1 v6 per-operation stats (sampling factor, TSC rate, thread counts)
                 "check_sample", "tsc_hz", ".threads", "_threads", ".version", ".meg_coh",

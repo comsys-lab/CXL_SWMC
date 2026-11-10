@@ -886,7 +886,14 @@ stream_slo() {  # <sys> <rate>
   sc=$(grep -m1 '^STREAMCHECK' "$RD/stream-check.txt")
   case "$sc" in "STREAMCHECK PASS"*|"STREAMCHECK NOTE"*) ;; *) stop "$NAME: ${sc:-stream_check.py failed}";; esac
   python3 $X/check_breakdown.py "$RD" > "$RD/breakdown-check.txt" 2>&1
-  grep -q "^BREAKDOWN PASS" "$RD/breakdown-check.txt" || stop "$NAME: $(cat "$RD/breakdown-check.txt")"
+  # same tolerance as stream_fix: an SLO search in which no query completed in any step has no breakdown row; it is a
+  # result (recorded, valid=0 via stream_check) when stream_check.py marks every step invalid (Megalon below 1 q/s)
+  if ! grep -q "^BREAKDOWN PASS" "$RD/breakdown-check.txt"; then
+    grep -q "no breakdown row with queries > 0" "$RD/breakdown-check.txt" && [ -s "$RD/stream-check.csv" ] \
+      && ! awk -F, 'NR > 1 && $5 == "True"' "$RD/stream-check.csv" | grep -q . \
+      || stop "$NAME: $(cat "$RD/breakdown-check.txt")"
+    echo "$NAME slo: no completed query in any step, all steps invalid: recorded, not a stop" | tee -a "$RD/breakdown-check.txt"
+  fi
   v7_post "$s" "$r" "$RD"
   python3 -I -c 'import json,sys
 s=json.load(open(sys.argv[1])); c=s.get("confirm",{})

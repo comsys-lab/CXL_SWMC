@@ -45,7 +45,9 @@ block() {  # <dir name> <rates> <systems> <fix-only> <levels>: one main-block.sh
   "${B[@]}" "$E/$d" > "$E/$d/sequence.log" 2>&1
   log "block $d rc $?: $(tail -n 1 "$E/$d/sequence.log")"
   local slo=""; [[ " $fo " == *" mg "* ]] || [[ " $sys " != *" mg "* ]] || slo=mg
-  python3 -I -B $EVD/rs_check.py "$E/$d" --rates "$rates" --slo-systems "$slo" --fix-systems "$sys" > /dev/null
+  # fixed windows only when the block has levels (RS_MG_MGOFF=0 "slo" block: SLO lifetime only, no fix windows)
+  local fx=""; [ -z "$lv" ] || fx=$sys
+  python3 -I -B $EVD/rs_check.py "$E/$d" --rates "$rates" --slo-systems "$slo" --fix-systems "$fx" > /dev/null
   log "check $d: $(tail -n 1 "$E/$d/rs-check.txt")"
   tail -n 1 "$E/$d/rs-check.txt" | grep -q "^RSCHECK PASS" || stop "check $d FAIL (see $E/$d/rs-check.txt)"
 }
