@@ -30,6 +30,8 @@
 #include "rocksdb/env.h"
 #include "rocksdb/filter_policy.h"
 #include "rocksdb/options.h"
+#include "rocksdb/perf_context.h"
+#include "rocksdb/perf_level.h"
 #include "rocksdb/sst_file_writer.h"
 #include "rocksdb/statistics.h"
 #include "rocksdb/table.h"
@@ -228,12 +230,31 @@ class Node {
   }
   // Stamp and insert of one key are ordered per node by a local key stripe, so this node's DB (RocksDB sequence
   // order) never holds a lower stamp above a higher one for the same key; across nodes the highest stamp wins.
-  uint64_t put(const std::string &key, const void *v, uint32_t len, rdb::Status *st) {
+  // Diagnostic timers of one put (ns, CLOCK_MONOTONIC; RocksDB perf context deltas at PerfLevel kEnableWait, which
+  // times only waits: JoinBatchGroup / AwaitState slow path, memtable insert, write controller delay).
+  struct PutDiag {
+    uint64_t stripe_ns = 0, stamp_ns = 0, put_ns = 0, wt_wait_ns = 0, memtable_ns = 0, delay_ns = 0;
+  };
+  uint64_t put(const std::string &key, const void *v, uint32_t len, rdb::Status *st, PutDiag *d) {
     rdb::WriteOptions wo;
     wo.disableWAL = true;
+    const uint64_t t0 = now_ns();
     std::lock_guard<std::mutex> g(stripes_[std::hash<std::string>()(key) % kStripes]);
+    const uint64_t t1 = now_ns();
     const uint64_t stamp = cxl::hwcc::fetch_add(h_->stamp, uint64_t(1)) + 1;
-    *st = db_->Put(wo, key, make_stored(stamp, v, len));
+    const rdb::PerfContext *pc = rdb::get_perf_context();
+    const uint64_t w0 = pc->write_thread_wait_nanos, m0 = pc->write_memtable_time, y0 = pc->write_delay_time;
+    const rdb::PerfLevel pl = rdb::GetPerfLevel();
+    rdb::SetPerfLevel(rdb::PerfLevel::kEnableWait);
+    const uint64_t t2 = now_ns();
+    *st = db_->Put(wo, key, make_stored(stamp, v, len));  // put_ns includes building the stored value (1 KiB copy)
+    d->put_ns = now_ns() - t2;
+    rdb::SetPerfLevel(pl);
+    d->stripe_ns = t1 - t0;
+    d->stamp_ns = t2 - t1;
+    d->wt_wait_ns = pc->write_thread_wait_nanos - w0;
+    d->memtable_ns = pc->write_memtable_time - m0;
+    d->delay_ns = pc->write_delay_time - y0;
     return stamp;
   }
 

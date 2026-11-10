@@ -209,3 +209,31 @@ Decision: G1 (user, 2026-10-18).
   SharedCounters at hwcc + 4 KiB (layout of commit 18ba703107f5, guarded by the shim's build id; other builds report "na").
 - Harness: experiments/rocksdb/eval-run2-rocks-mg-record.conf, optional key ROCKS_MG_SERVER_EXTRA (empty for every other
   conf), ROCKS_BLOCK=MGRECORD.
+
+## 12. Diagnostic timers (2026-11-10, branch rocksdb-diag, builds/rocksdb/10; diagnostic, not a result)
+Purpose: where request time goes in the megalon-record u50 stall (queue grows to ~63k with idle guest CPUs, updates 1-2 ms).
+Counters only: the server's control flow, locks and RocksDB options are those of build 9. Clock: CLOCK_MONOTONIC throughout
+(now_ns, steady_clock in patches/0004, RocksDB's perf timers). Every timer X is exported as diag.X_count, diag.X_ns (counters:
+per-step deltas in stats-steps.csv) and diag.X_max_ns (largest single event since the previous stats read, reset by the read;
+a gauge by its max_ns suffix, so per step when loadgen is the only stats reader). diag.reset_window_max_ns = ns since the
+previous stats read (the window of the maxima).
+- Server, per worker (summed; max over workers): queue_wait (enqueue in the reader thread to dequeue), pop_idle (end of the
+  previous reply to dequeue: time a worker had no job), reply (Conn::reply total: per-connection lock + blocking writes) with
+  diag.reply_lock_ns / reply_lock_max_ns (lock acquisition alone, count = reply_count), stripe_wait (4,096-stripe key lock in
+  an update), stamp (HWcc stamp fetch_add), put (db_->Put wall time incl. building the 1 KiB stored value).
+- RocksDB perf context around each Put at PerfLevel kEnableWait (wait timers only; restored after the Put): wt_wait
+  (write_thread_wait_nanos: JoinBatchGroup / AwaitState slow path, counted only for Puts that waited), memtable
+  (write_memtable_time: memtable insert incl. arena allocation and Megalon write sections), write_delay (write_delay_time:
+  write controller delay or stop, counted only for delayed Puts).
+- patches/0004 (process-wide atomics in rocksdb/cxl.h DiagCounters): slot_lock_wait (arena slot SpinMutex in
+  ConcurrentArena::AllocateCxlSlot, timed and counted only when the first try_lock fails; all acquisitions =
+  rdb.arena_slot_allocs), slot_new_block (AllocateNewBlock = BlockSource::Get inside that lock), flush_mutex_wait (write
+  leader's DB mutex acquisition in PreprocessWrite before ScheduleFlushes), schedule_flushes (that whole block:
+  WaitForPendingWrites + ScheduleFlushes = SwitchMemtable), wbm_flush (the write-buffer-manager flush block).
+- Tickers already covering stalls: STALL_MICROS (rocksdb.ticker.<id>, write controller delays incl. stops), plus the
+  properties actual-delayed-write-rate and is-write-stopped; added WRITE_DONE_BY_SELF / WRITE_DONE_BY_OTHER (leader vs
+  follower Puts). DB_MUTEX_WAIT_MICROS needs StatsLevel kAll (not enabled: it times every DB mutex lock).
+- Cost per update: about 8 clock_gettime calls (vDSO) and 16 relaxed atomic adds on the worker's own cache line, about
+  0.2-0.3 us at 9 us service time; per get about 4 calls (~0.1 us); the patches/0004 timers are on rare paths (contended slot
+  lock, new block, memtable switch).
+- Conf: experiments/rocksdb/eval-run2-rocks-mg-record-diag.conf (ROCKS_BLOCK=MGRDIAG, u50 only, guest dir rocksdb10-run2).

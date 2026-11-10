@@ -30,7 +30,7 @@
 #   cxl_shm) on the all-HWcc guest kernel and region (POP_K, POP_REGION, dax0.0 chowned to comsys as for hw), with the
 #   Megalon server build of that N: ROCKS_MG_BUILD_N<N> (build.sh with builds/megalon/<b>-n<N>; lib/ shipped),
 #   ROCKS_MG_CFG_N<N> (Megalon config, object_arena_size >= N x (512 + extents) MiB), ROCKS_MG_EXTENTS_N<N> (file extents
-#   per node). ROCKS_SYSTEMS may then contain mg; ROCKS_BLOCK may be MG or MGRECORD (ROCKS_MG_SERVER_EXTRA, optional: extra
+#   per node). ROCKS_SYSTEMS may then contain mg; ROCKS_BLOCK may be MG, MGRECORD or MGRDIAG (diagnostic timers build, not a result) (ROCKS_MG_SERVER_EXTRA, optional: extra
 #   rocksdb-server options of the mg cells, megalon-record object sizes). ROCKS_EXPERIMENT (optional): the
 #   state/EXPERIMENTS.md block a real run requires approved/running (default de-stijl-evaluation-run1).
 set -uo pipefail
@@ -62,7 +62,7 @@ for k in $KEYS; do [ -n "${!k:-}" ] || die "conf key $k empty"; done
 abs() { case $1 in /*) echo "$1";; *) echo "$P/$1";; esac; }
 ROCKS_BUILD=$(abs "$ROCKS_BUILD") ROCKS_LOADGEN_BUILD=$(abs "$ROCKS_LOADGEN_BUILD") RESULTS_ROOT=$(abs "$RESULTS_ROOT")
 POP_REGION=$(abs "$POP_REGION") POP_C=$(abs "$POP_C") DS_REGION=$(abs "$DS_REGION") DS_C=$(abs "$DS_C")
-[[ $ROCKS_BLOCK =~ ^([DE](200)?|MG|MGRECORD|ABL)$ ]] || die "ROCKS_BLOCK D | E | D200 | E200 | MG | MGRECORD | ABL"
+[[ $ROCKS_BLOCK =~ ^([DE](200)?|MG|MGRECORD|MGRDIAG|ABL)$ ]] || die "ROCKS_BLOCK D | E | D200 | E200 | MG | MGRECORD | MGRDIAG | ABL"
 # Receiver-ablation lifetimes (run 2, 2026-11-04; optional, unset = every cell is one SLO search as before):
 #   ROCKS_FIXED       tokens <sys>/<part>/-/-/<rates>/<step warm-up s>/<measure s>/<drain s> (sys pop | ds; per system in
 #                     order, the first = the warm part at the base): the pop / ds cell is ONE lifetime of fixed-rate parts

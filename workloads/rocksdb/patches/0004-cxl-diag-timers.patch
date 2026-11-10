@@ -1,0 +1,125 @@
+--- a/db/db_impl/db_impl_write.cc
++++ b/db/db_impl/db_impl_write.cc
+@@ -17,6 +17,7 @@
+ #include "db/event_helpers.h"
+ #include "db/wide/wide_columns_helper.h"
+ #include "file/filename.h"
++#include "rocksdb/cxl.h"
+ #include "logging/logging.h"
+ #include "memtable/wbwi_memtable.h"
+ #include "monitoring/perf_context_imp.h"
+@@ -2132,9 +2133,13 @@
+     // thread is writing to another DB with the same write buffer, they may also
+     // be flushed. We may end up with flushing much more DBs than needed. It's
+     // suboptimal but still correct.
+-    InstrumentedMutexLock l(&mutex_);
+-    WaitForPendingWrites();
+-    status = HandleWriteBufferManagerFlush(write_context);
++    const uint64_t cxl_t0 = cxl::DiagNowNs();  // CXL diagnostic (patches/0004)
++    {
++      InstrumentedMutexLock l(&mutex_);
++      WaitForPendingWrites();
++      status = HandleWriteBufferManagerFlush(write_context);
++    }
++    cxl::GetDiagCounters().wbm_flush.Add(cxl::DiagNowNs() - cxl_t0);
+   }
+ 
+   if (UNLIKELY(status.ok() && !trim_history_scheduler_.Empty())) {
+@@ -2143,9 +2148,14 @@
+   }
+ 
+   if (UNLIKELY(status.ok() && !flush_scheduler_.Empty())) {
+-    InstrumentedMutexLock l(&mutex_);
+-    WaitForPendingWrites();
+-    status = ScheduleFlushes(write_context);
++    const uint64_t cxl_t0 = cxl::DiagNowNs();  // CXL diagnostic (patches/0004)
++    {
++      InstrumentedMutexLock l(&mutex_);
++      cxl::GetDiagCounters().flush_mutex_wait.Add(cxl::DiagNowNs() - cxl_t0);
++      WaitForPendingWrites();
++      status = ScheduleFlushes(write_context);
++    }
++    cxl::GetDiagCounters().schedule_flushes.Add(cxl::DiagNowNs() - cxl_t0);
+   }
+ 
+   PERF_TIMER_STOP(write_scheduling_flushes_compactions_time);
+--- a/include/rocksdb/cxl.h
++++ b/include/rocksdb/cxl.h
+@@ -12,6 +12,7 @@
+ #pragma once
+ 
+ #include <atomic>
++#include <chrono>
+ #include <cstddef>
+ #include <cstdint>
+ #include <cstring>
+@@ -48,6 +49,40 @@
+   return c;
+ }
+ 
++// ---- diagnostic timers (patches/0004): counters only, no behaviour change ----
++// Clock: steady_clock (CLOCK_MONOTONIC, as the server's now_ns). DiagTimer = event count, total ns, and the largest
++// single event since the last TakeMax() (the server resets it at every stats read: a per-step max).
++inline uint64_t DiagNowNs() {
++  return uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
++                      std::chrono::steady_clock::now().time_since_epoch())
++                      .count());
++}
++struct DiagTimer {
++  std::atomic<uint64_t> count{0}, ns{0}, max_ns{0};
++  void Add(uint64_t d) {
++    count.fetch_add(1, std::memory_order_relaxed);
++    ns.fetch_add(d, std::memory_order_relaxed);
++    uint64_t m = max_ns.load(std::memory_order_relaxed);
++    while (d > m && !max_ns.compare_exchange_weak(m, d, std::memory_order_relaxed)) {
++    }
++  }
++  uint64_t TakeMax() { return max_ns.exchange(0, std::memory_order_relaxed); }
++};
++struct DiagCounters {
++  // ConcurrentArena::AllocateCxlSlot (arena slot mode): wait for the arena SpinMutex, counted only when the first
++  // try_lock fails (all acquisitions = ArenaSlotCounters::allocs)
++  DiagTimer slot_lock_wait;
++  // Arena::AllocateCxlSlot: AllocateNewBlock (BlockSource::Get) of a new block, inside the slot lock
++  DiagTimer slot_new_block;
++  // DBImpl::PreprocessWrite, write leader: DB mutex acquisition of the flush-scheduling block, and the whole block
++  // (DB mutex, WaitForPendingWrites, ScheduleFlushes = SwitchMemtable); the write-buffer-manager flush block
++  DiagTimer flush_mutex_wait, schedule_flushes, wbm_flush;
++};
++inline DiagCounters& GetDiagCounters() {
++  static DiagCounters c;
++  return c;
++}
++
+ struct MemtableInfo {
+   uint64_t id;       // MemTable::GetID()
+   const void* head;  // skiplist head node (nullptr: not a skiplist memtable)
+--- a/memory/arena.cc
++++ b/memory/arena.cc
+@@ -187,7 +187,9 @@
+     }
+   }
+   if (n > cxl_slots_left_) {
++    const uint64_t t0 = cxl::DiagNowNs();  // CXL diagnostic (patches/0004)
+     cxl_slot_ptr_ = AllocateNewBlock(kBlockSize);
++    cxl::GetDiagCounters().slot_new_block.Add(cxl::DiagNowNs() - t0);
+     cxl_slots_left_ = cxl_slots_per_block_;
+   }
+   char* result = cxl_slot_ptr_;
+--- a/memory/concurrent_arena.h
++++ b/memory/concurrent_arena.h
+@@ -130,7 +130,13 @@
+   // CXL: arena slot mode: every allocation under the arena lock, so that a
+   // shard never carves an entry out of a chunk spanning several slots.
+   char* AllocateCxlSlot(size_t bytes) {
+-    std::lock_guard<SpinMutex> lock(arena_mutex_);
++    // CXL diagnostic (patches/0004): time the wait only when the lock is taken
++    if (!arena_mutex_.try_lock()) {
++      const uint64_t t0 = cxl::DiagNowNs();
++      arena_mutex_.lock();
++      cxl::GetDiagCounters().slot_lock_wait.Add(cxl::DiagNowNs() - t0);
++    }
++    std::lock_guard<SpinMutex> lock(arena_mutex_, std::adopt_lock);
+     char* rv = arena_.AllocateCxlSlot(bytes);
+     Fixup();
+     return rv;

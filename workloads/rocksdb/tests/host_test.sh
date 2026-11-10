@@ -118,6 +118,16 @@ for f in sys.argv[1:]:
                   "rdb.file_read_sections", "megalon.record_slots", "megalon.allocate_count"):
             if not g(k): bad.append(f"{f}: {k}=0 (path not exercised)")
         if g("rdb.arena_slot_max_bytes") > g("rdb.mem_object_bytes"): bad.append(f"{f}: an allocation exceeds the slot")
+        if "diag.put_count" in s:  # diagnostic timers (builds/rocksdb/10+, DESIGN.md section 12): present and consistent
+            print(f, " ".join(f"{k}={s.get(k)}" for k in sorted(s) if k.startswith("diag.")))
+            if g("diag.put_count") != g("updates") + g("update_errors"): bad.append(f"{f}: diag.put_count != updates")
+            if g("diag.stripe_wait_count") != g("diag.put_count"): bad.append(f"{f}: diag.stripe_wait_count != put_count")
+            if g("diag.queue_wait_count") < g("gets") + g("updates"): bad.append(f"{f}: diag.queue_wait_count < gets + updates")
+            if g("diag.reply_count") < g("gets") + g("updates"): bad.append(f"{f}: diag.reply_count < gets + updates")
+            if g("diag.reply_lock_ns") > g("diag.reply_ns"): bad.append(f"{f}: diag.reply_lock_ns > reply_ns")
+            if g("diag.put_ns") > g("update_ns"): bad.append(f"{f}: diag.put_ns > update_ns")
+            if not g("diag.memtable_ns") or not g("diag.slot_new_block_count") or not g("diag.schedule_flushes_count"):
+                bad.append(f"{f}: diag memtable / slot_new_block / schedule_flushes not exercised")
         want = int(os.environ.get("EXPECT_OBJECTS", "0"))
         if want and (g("rdb.objects") != want or g("megalon.created") != want):
             bad.append(f"{f}: objects {g('rdb.objects')} / created {g('megalon.created')} != {want}")
