@@ -143,7 +143,9 @@
 #   --rates 0, no queries) for STREAM_SETTLE_S s (one window at r + its publication), then stream_slo as today. The
 #   update rate is the loadgen's (--fixed update=<r>, --opt update_rate=<r>; the trainer consumes what arrives), so
 #   the switch needs no server restart. Rate check: the settle part's stream_check accepted_per_s within 10 % of r
-#   (else stop); <E>/one-lifetime.tsv: per rate the switch counters (node 0 after the previous part: publish_window,
+#   (else stop); publisher check at the settle end (node 0: publish_window advanced >= 2 since the switch,
+#   publish_backlog <= 16): failing = one more settle part "settle2" of W s, failing again = "NOTE one-lifetime:
+#   publisher behind at u<r>" in the rate's stream-results.tsv note and one-lifetime.tsv (never a stop); <E>/one-lifetime.tsv: per rate the switch counters (node 0 after the previous part: publish_window,
 #   published_rows, window_distinct, publish_backlog, update_accepted_seq, seq_base), settle start / end, accepted
 #   rates. After the last rate: life_stop of <E>/mg-u<r1> (node logs / final checks there, for the whole lifetime;
 #   torn_rows.py block counts a continuation dir by its measurements). A stop in a later rate ends the block as a
@@ -1259,7 +1261,7 @@ ol_rate() {  # <rate>: the rate's parts in the one mg lifetime (first rate: life
   local r=$1 d prev sw sb t0 t1 rc acc0 accs c pw1
   OL_N=$((OL_N + 1))
   echo "u$r eval order: mg (one lifetime: rate $OL_N of [$STREAM_RATES]$([ $OL_N = 1 ] || echo ", session $OL_NAME0, settle $OLSET s"))" | tee -a "$E/order.txt"
-  [ -s "$E/one-lifetime.tsv" ] || printf '# name\trate_sps\tsession\tswitch_from\tseq_base_at_switch\tpublish_window_at_switch\tpublished_rows_at_switch\twindow_distinct_at_switch\tpublish_backlog_at_switch\tupdate_accepted_seq_at_switch\tsettle_start\tsettle_end\tsettle_s\tpublish_window_after_settle\tsettle_accepted_per_s\tslo_accepted_per_s\trate_check\n' > "$E/one-lifetime.tsv"
+  [ -s "$E/one-lifetime.tsv" ] || printf '# name\trate_sps\tsession\tswitch_from\tseq_base_at_switch\tpublish_window_at_switch\tpublished_rows_at_switch\twindow_distinct_at_switch\tpublish_backlog_at_switch\tupdate_accepted_seq_at_switch\tsettle_start\tsettle_end\tsettle_s\tpublish_window_after_settle\tsettle_accepted_per_s\tslo_accepted_per_s\trate_check\tpublish_backlog_after_settle\tsettle_extended_s\tpublisher_check\n' > "$E/one-lifetime.tsv"
   echo "$(date -Is) stream u$r system mg (one lifetime, rate $OL_N)"
   if [ $OL_N = 1 ]; then   # exactly the per-lifetime sequence of eval_stream_rate (life_start includes pubtrain)
     OL_T0=$(date +%s)
@@ -1267,11 +1269,11 @@ ol_rate() {  # <rate>: the rate's parts in the one mg lifetime (first rate: life
     OL_S0=$LS OL_NAME0=$NAME OL_STALE=$NAME
     stream_slo mg $r
     accs=$(ol_acc "$LS/slo" $r)
-    printf '%s\t%s\t%s\t-\t-\t-\t-\t-\t-\t-\t-\t-\t-\t-\t-\t%s\t%s\n' "$NAME" $r "$OL_NAME0" "${accs% *}" "first rate (pubtrain; slo accepted ${accs#* })" >> "$E/one-lifetime.tsv"
+    printf '%s\t%s\t%s\t-\t-\t-\t-\t-\t-\t-\t-\t-\t-\t-\t-\t%s\t%s\t-\t-\t-\n' "$NAME" $r "$OL_NAME0" "${accs% *}" "first rate (pubtrain; slo accepted ${accs#* })" >> "$E/one-lifetime.tsv"
     return 0
   fi
-  # the server lifetime bound (timeout XT on every node): stop before a rate that cannot finish (settle + 30 min)
-  [ $(( $(date +%s) - OL_T0 + OLSET + 1800 )) -le "$XT" ] || stop "one lifetime: $(( $(date +%s) - OL_T0 )) s of XT $XT s used; no room for u$r (settle $OLSET s + 1800 s)"
+  # the server lifetime bound (timeout XT on every node): stop before a rate that cannot finish (settle + W + 30 min)
+  [ $(( $(date +%s) - OL_T0 + OLSET + PUBW + 1800 )) -le "$XT" ] || stop "one lifetime: $(( $(date +%s) - OL_T0 )) s of XT $XT s used; no room for u$r (settle $OLSET s + $PUBW s + 1800 s)"
   prev=$LS d=$E/mg-u$r sw=$LS/slo/post-t0.txt
   [ ! -e "$d" ] || stop "one lifetime: $d exists"
   mkdir "$d" && cp "$OL_S0/session.env" "$OL_S0/session-manifest.txt" "$d/" && cp "$prev/seq_base" "$d/seq_base" || stop "one lifetime: continuation dir $d"
@@ -1295,17 +1297,43 @@ ol_rate() {  # <rate>: the rate's parts in the one mg lifetime (first rate: life
   { echo "settle_start=$t0"; echo "settle_end=$t1"; echo "settle_publish_window_after=$pw1"; echo "settle_accepted_per_s=${acc0% *} check=${acc0#* }"; } >> "$d/one-lifetime.txt"
   echo "$(date -Is) $NAME: settle done (publish_window $(ol_kv "$sw" publish_window) -> $pw1, accepted ${acc0% *} samples/s, rate check ${acc0#* })"
   if [ "${acc0#* }" != PASS ]; then
-    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t-\tFAIL settle\n' "$NAME" $r "$OL_NAME0" "$(basename "$prev")" "$sb" \
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t-\tFAIL settle\t-\t-\t-\n' "$NAME" $r "$OL_NAME0" "$(basename "$prev")" "$sb" \
       "$(ol_kv "$sw" publish_window)" "$(ol_kv "$sw" published_rows)" "$(ol_kv "$sw" window_distinct)" "$(ol_kv "$sw" publish_backlog)" \
       "$(ol_kv "$sw" update_accepted_seq)" "$t0" "$t1" $OLSET "$pw1" "${acc0% *}" >> "$E/one-lifetime.tsv"
     stop "$NAME: the update stream is not at $r samples/s after the switch (settle accepted ${acc0% *}/s; $LS/settle/stream-check.csv)"
   fi
+  # publisher check (verifier MED-2): node 0 at the settle end has published >= 2 windows since the switch and its
+  # publish_backlog (rows due but not yet written) is <= OL_BACKLOG_MAX. Never a stop (a stop costs the reload):
+  # failing once = one more settle part "settle2" of W s, then re-check; failing again = NOTE in this rate's
+  # stream-results.tsv note column and one-lifetime.tsv, and the rate goes on
+  local pw0 bl1 ext=0 pch
+  pw0=$(ol_kv "$sw" publish_window) bl1=$(ol_kv "$LS/settle/post-t0.txt" publish_backlog)
+  if ! ol_pubok "$pw0" "$pw1" "$bl1"; then
+    echo "$(date -Is) $NAME: publisher check failed after the settle (publish_window $pw0 -> $pw1, publish_backlog $bl1): settle extended by $PUBW s"
+    measure "$LS" settle2 "${LGC[@]}" --opt seed=$((SEED + 102)) --seed $((SEED + 102)) --mode fixed --rates 0 \
+      --warmup-s 0 --step-warmup-s 0 --step-measure-s $PUBW --drain-s 2
+    rc=$?; [ $rc = 0 ] || stop "$NAME settle2 rc $rc"
+    ext=$PUBW t1=$(date -Is) pw1=$(ol_kv "$LS/settle2/post-t0.txt" publish_window) bl1=$(ol_kv "$LS/settle2/post-t0.txt" publish_backlog)
+  fi
+  if ol_pubok "$pw0" "$pw1" "$bl1"; then pch=PASS; else pch="NOTE one-lifetime: publisher behind at u$r (publish_window $pw0 -> $pw1, publish_backlog $bl1 > $OL_BACKLOG_MAX or < 2 windows, settle $OLSET + $ext s)"; fi
+  { echo "settle_extended_s=$ext"; echo "settle_end_final=$t1"; echo "publish_window_after_settle_final=$pw1"; echo "publish_backlog_after_settle=$bl1"; echo "publisher_check=$pch"; } >> "$d/one-lifetime.txt"
+  [ "$pch" = PASS ] || echo "MAIN NOTE $NAME: $pch"
   stream_slo mg $r   # warmup + pub_after (publishing started long before) + slo, as every lifetime
+  if [ "$pch" != PASS ]; then   # this rate's results row (written by stream_slo): append the NOTE to column 12 (note)
+    awk -F'\t' -v OFS='\t' -v n="$NAME" -v t="$pch" '!/^#/ && $1 == n { $12 = ($12 == "" ? t : $12 "; " t) } { print }' \
+      "$E/stream-results.tsv" > "$E/stream-results.tsv.ol" && mv "$E/stream-results.tsv.ol" "$E/stream-results.tsv" || stop "$NAME: results note"
+  fi
   accs=$(ol_acc "$LS/slo" $r)
-  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$NAME" $r "$OL_NAME0" "$(basename "$prev")" "$sb" \
-    "$(ol_kv "$sw" publish_window)" "$(ol_kv "$sw" published_rows)" "$(ol_kv "$sw" window_distinct)" "$(ol_kv "$sw" publish_backlog)" \
-    "$(ol_kv "$sw" update_accepted_seq)" "$t0" "$t1" $OLSET "$pw1" "${acc0% *}" "${accs% *}" "PASS settle (slo accepted ${accs#* })" >> "$E/one-lifetime.tsv"
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$NAME" $r "$OL_NAME0" "$(basename "$prev")" "$sb" \
+    "$pw0" "$(ol_kv "$sw" published_rows)" "$(ol_kv "$sw" window_distinct)" "$(ol_kv "$sw" publish_backlog)" \
+    "$(ol_kv "$sw" update_accepted_seq)" "$t0" "$t1" $OLSET "$pw1" "${acc0% *}" "${accs% *}" "PASS settle (slo accepted ${accs#* })" \
+    "$bl1" "$ext" "$pch" >> "$E/one-lifetime.tsv"
 }
+# publisher check bound: publish_backlog <= 16 rows (conf-free constant; normal lifetimes keep the publisher on its even
+# schedule, the gauge then holds at most a few rows due within one stats read)
+OL_BACKLOG_MAX=16
+ol_pubok() {  # <publish_window at the switch> <at the settle end> <publish_backlog at the settle end>: 0 = publisher keeps up
+  [[ $1 =~ ^[0-9]+$ && $2 =~ ^[0-9]+$ && $3 =~ ^[0-9]+$ ]] && [ $(( $2 - $1 )) -ge 2 ] && [ "$3" -le $OL_BACKLOG_MAX ]; }
 ol_end() {  # after the last rate: stop the one lifetime (session dir of the first rate)
   local d
   [ -n "$OL_S0" ] || return 0
