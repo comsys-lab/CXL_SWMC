@@ -24,6 +24,7 @@
 #include <thread>
 #include <vector>
 
+#include "drain.h"
 #include "frame.h"
 #include "slo_search.h"
 #include "workload.h"
@@ -74,6 +75,7 @@ struct Config {
   uint32_t max_steps = 20;
   double warmup_s = 10, warmup_rate = 0;  // run-start warmup (rate 0 = first step's rate)
   double step_warmup_s = 3, step_measure_s = 15, drain_s = 5;
+  double drain_full_s = 0;  // > 0: full drain + clean-start rule (drain.h, user 2026-11-12); 0 = the old drain
   double confirm_s = 30;
   double confirm_warmup_s = -1;  // warmup before each confirm repeat; < 0 = step_warmup_s (main 2026-10-21)
   uint32_t confirm_reps = 3;
@@ -121,6 +123,10 @@ void usage() {
                "  --start R --factor F --precision P --max-steps N   SLO search (defaults -, 1.5, 0.05, 20)\n"
                "  --warmup-s S --warmup-rate R          run-start warmup (default 10 s at the first rate)\n"
                "  --step-warmup-s S --step-measure-s S --drain-s S  (defaults 3, 15, 5)\n"
+               "  --drain-full-s S                      after each step wait until no request of any stream is\n"
+               "                                        outstanding (at most S s, replaces --drain-s); a step that\n"
+               "                                        starts with requests outstanding is not judged and is run\n"
+               "                                        once more (default 0 = off)\n"
                "  --confirm-s S --confirm-reps N        SLO mode: repeats at the found rate (30 s x 3)\n"
                "  --confirm-precision P --max-confirm-probes N   SLO mode: after a failed confirm, bisect with full\n"
                "                                        confirms between the highest confirmed pass and the lowest\n"
@@ -207,6 +213,7 @@ Config parse(int argc, char **argv) {
     else if (a == "--step-warmup-s") c.step_warmup_s = std::atof(need(i).c_str());
     else if (a == "--step-measure-s") c.step_measure_s = std::atof(need(i).c_str());
     else if (a == "--drain-s") c.drain_s = std::atof(need(i).c_str());
+    else if (a == "--drain-full-s") c.drain_full_s = std::atof(need(i).c_str());
     else if (a == "--confirm-s") c.confirm_s = std::atof(need(i).c_str());
     else if (a == "--confirm-warmup-s") c.confirm_warmup_s = std::atof(need(i).c_str());
     else if (a == "--confirm-reps") c.confirm_reps = std::stoul(need(i));
@@ -271,6 +278,7 @@ Config parse(int argc, char **argv) {
   for (double f : c.start_fail)
     if (!(f > 1)) die("bad --start-fail-steps factor (> 1)");
   if (!c.start_fail.empty() && c.ramp_knee) die("--start-fail-steps is not used with --ramp-knee");
+  if (!(c.drain_full_s >= 0)) die("bad --drain-full-s (>= 0)");
   return c;
 }
 
@@ -328,6 +336,12 @@ struct StepResult {
   bool nonlatency_fail = false;
   uint32_t step_no = 0;
   std::vector<double> slo_lat;
+  // --drain-full-s (drain.h); recorded in steps.jsonl only when the option is on
+  bool contaminated = false;  // requests were outstanding when the step started
+  bool judged = true;         // false: contaminated first attempt, not a search decision point (re-run follows)
+  int64_t rerun_of = -1;      // a re-run: step number of the unjudged attempt
+  uint64_t outstanding_at_start = 0, outstanding_after_drain = 0;
+  double drain_wait_s = 0;
 };
 
 class Engine {
@@ -603,13 +617,28 @@ class Engine {
     return v.empty() ? 0 : t / v.size();
   }
 
+  // Every search phase calls step(); with --drain-full-s a contaminated first attempt (drain.h) is logged as phase
+  // "contaminated" and the same step is run once more, so the callers only ever see the judged result.
   StepResult step(const char *phase, double x, double warmup_s, double measure_s, bool slo_abort = true) {
+    int64_t first = -1;
+    return clean_step([&](bool rerun) {
+      StepResult r = step_once(phase, x, warmup_s, measure_s, slo_abort, rerun, rerun ? first : -1);
+      if (!rerun) first = r.step_no;
+      return r;
+    });
+  }
+
+  StepResult step_once(const char *phase_in, double x, double warmup_s, double measure_s, bool slo_abort, bool rerun,
+                       int64_t rerun_of) {
     const size_t S = specs_.size();
     std::vector<double> rate = stream_rates(x);
     double total = 0;
     for (double v : rate) total += v;
     slow_.store(0);
     const uint64_t out_base = outstanding_.load();  // leftovers of earlier steps (timed out) do not count here
+    // --drain-full-s: clean-start check before the warmup (always judged with the option off)
+    const bool judged = step_judged(c_.drain_full_s, out_base, rerun, measure_s > 0);
+    const char *phase = judged ? phase_in : "contaminated";
     const double slo_rate = slo_idx_ != 0xff ? rate[slo_idx_] : 0;
     const double allowed_slow = (1 - c_.slo_pct / 100) * slo_rate * measure_s;
     const uint64_t queue_cap = uint64_t(std::max(1000.0, total * c_.abort_queue_s));
@@ -704,8 +733,13 @@ class Engine {
       snap.join();
       if (snap_begun.load()) snapshot_all("end", phase, x);
     }
-    const uint64_t drain_until = send_end + uint64_t(c_.drain_s * 1e9);
-    while (outstanding_.load() > out_base && now_ns() < drain_until) usleep(1000);
+    // default: wait while outstanding > out_base, at most --drain-s (unchanged); --drain-full-s S: until 0, at most S
+    const DrainResult dr = drain_step(
+        send_end, c_.drain_s, c_.drain_full_s, out_base, [&] { return outstanding_.load(); }, [] { return now_ns(); },
+        [] { usleep(1000); });
+    res.drain_wait_s = dr.wait_s, res.outstanding_after_drain = dr.outstanding_after;
+    res.outstanding_at_start = out_base, res.contaminated = c_.drain_full_s > 0 && out_base > 0;
+    res.judged = judged, res.rerun_of = rerun_of;
 
     // statistics over measured requests
     const uint64_t we_eff = std::min(we, send_end);  // an aborted step's window ends when sending stopped
@@ -763,6 +797,11 @@ class Engine {
       pass = false, why = "p" + fmt(c_.slo_pct) + " " + fmt(res.s[slo_idx_].pslo) + " ms > SLO";
     res.pass = pass && measure_s > 0;
     res.reason = why;
+    if (!judged) {  // --drain-full-s: neither a pass nor a fail; step() runs it once more
+      res.pass = false;
+      res.reason = "contaminated: " + std::to_string(out_base) + " outstanding at step start (" + phase_in +
+                   "; not judged, re-run)";
+    }
     res.nonlatency_fail |= res.saturated || res.exhausted;
     res.step_no = step_no_;
     if (keep_slo_lat_ && slo_idx_ != 0xff) res.slo_lat = lat[slo_idx_];  // same multiset (nth_element only reorders)
@@ -843,7 +882,13 @@ class Engine {
         << ",\"pslo_ms\":" << fmt(st.pslo) << ",\"max_ms\":" << fmt(st.max) << ",\"lag_p99_us\":" << fmt(st.lag_p99_us)
         << ",\"lag_max_us\":" << fmt(st.lag_max_us) << ",\"p95_ms\":" << fmt(st.p95) << "}";
     }
-    o << "}}";
+    o << "}";
+    if (c_.drain_full_s > 0)  // opt-in keys only, appended after "streams" (steps.jsonl of earlier callers unchanged)
+      o << ",\"contaminated\":" << (r.contaminated ? "true" : "false") << ",\"judged\":" << (r.judged ? "true" : "false")
+        << ",\"rerun_of\":" << (r.rerun_of >= 0 ? std::to_string(r.rerun_of) : std::string("null"))
+        << ",\"outstanding_at_start\":" << r.outstanding_at_start << ",\"drain_wait_s\":" << fmt(r.drain_wait_s)
+        << ",\"outstanding_after_drain\":" << r.outstanding_after_drain;
+    o << "}";
     std::fprintf(steps_, "%s\n", o.str().c_str());
     std::fflush(steps_);
     std::fprintf(stderr, "[%s] step %u x=%.1f -> %s%s%s\n", phase, step_no_, x,
@@ -854,6 +899,12 @@ class Engine {
       std::fprintf(stderr, "        %s achieved %.1f/s p50 %.3f p99 %.3f p%s(SLO) %.3f ms, lag p99 %.0f us\n",
                    specs_[slo_idx_].name.c_str(), st.achieved, st.p50, st.p99, fmt(c_.slo_pct).c_str(), st.pslo,
                    st.lag_p99_us);
+    }
+    if (c_.drain_full_s > 0) {
+      std::fprintf(stderr, "        drain %.1f s, outstanding at start %llu, after drain %llu%s\n", r.drain_wait_s,
+                   (unsigned long long)r.outstanding_at_start, (unsigned long long)r.outstanding_after_drain,
+                   r.contaminated ? (r.judged ? " (contaminated re-run, judged)" : " (contaminated, re-run follows)") : "");
+      n_contaminated_ += r.contaminated, n_reruns_ += r.rerun_of >= 0;
     }
     steps_log_.push_back({phase, xval(r), r.pass, r.lag_flag});
   }
@@ -905,6 +956,7 @@ class Engine {
       for (double f : c_.start_fail) sf += (sf.empty() ? "" : ",") + fmt(f);
       m << "overload_base=" << c_.overload_base << " start_fail_steps=" << (sf.empty() ? "none" : sf) << "\n";
     }
+    if (c_.drain_full_s > 0) m << "drain_full_s=" << c_.drain_full_s << "\n";  // opt-in key only
     for (auto &kv : c_.mix) m << "mix." << kv.first << "=" << kv.second << "\n";
     for (auto &kv : c_.fixed) m << "fixed." << kv.first << "=" << kv.second << "\n";
   }
@@ -1032,7 +1084,11 @@ class Engine {
     }
     uint32_t lag_pass = 0;
     for (auto &st : steps_log_) lag_pass += st.pass && st.lag;
-    s << ",\"passing_steps_with_send_lag\":" << lag_pass << ",\"workload_finish\":\"" << (ok ? "ok" : err) << "\"}\n";
+    s << ",\"passing_steps_with_send_lag\":" << lag_pass << ",\"workload_finish\":\"" << (ok ? "ok" : err) << "\"";
+    if (c_.drain_full_s > 0)  // opt-in keys only
+      s << ",\"drain_full\":{\"cap_s\":" << fmt(c_.drain_full_s) << ",\"contaminated_steps\":" << n_contaminated_
+        << ",\"reruns\":" << n_reruns_ << "}";
+    s << "}\n";
     s.close();
     std::fclose(steps_);
     std::fprintf(stderr, "loadgen: done%s%s -> %s\n", note.empty() ? "" : ": ", note.c_str(), c_.out.c_str());
@@ -1064,6 +1120,7 @@ class Engine {
   uint8_t slo_idx_ = 0xff;  // fixed in setup() before receivers start
   double slo_ns_ = 0;
   uint32_t step_no_ = 0;
+  uint32_t n_contaminated_ = 0, n_reruns_ = 0;  // --drain-full-s
   FILE *steps_ = nullptr;
   std::vector<StepLog> steps_log_;
   std::vector<StepResult> confirm_;  // repeats of the confirm at the result best_

@@ -252,6 +252,19 @@ if [ -n "${STREAM_SLO_TOL:-}" ]; then
   SSTOL=$STREAM_SLO_TOL
   echo "BLOCK PLAN: slo search: --tol $SSTOL (STREAM_SLO_TOL; default 0.02)"
 fi
+#   STREAM_DRAIN_FULL_S (user 2026-11-12 "harness에 drain을 넣어야 할거같아"; lib.sh rs_env from the conf's RS_DRAIN_FULL_S):
+#     loadgen --drain-full-s of the BLOCK=stream SLO search (stream_slo) only, whole seconds in [1, 600]; unset / empty
+#     = not passed (every earlier run: a step drains at most --drain-s 5 s, the next step may start on a backlog).
+#     Set: after each step loadgen waits until no request is outstanding (at most S s); a step that still starts on a
+#     backlog is not judged and is run once more (experiments/loadgen/README.md "Full drain"). Recommended 120.
+SSDRAIN=()
+if [ -n "${STREAM_DRAIN_FULL_S:-}" ]; then
+  [ $BLOCK = stream ] && [ -n "${EVAL_RUN:-}" ] || { echo "SEQUENCE STOP: STREAM_DRAIN_FULL_S needs BLOCK=stream and EVAL_RUN"; exit 2; }
+  [[ $STREAM_DRAIN_FULL_S =~ ^[1-9][0-9]*$ ]] && [ "$STREAM_DRAIN_FULL_S" -le 600 ] \
+    || { echo "SEQUENCE STOP: STREAM_DRAIN_FULL_S must be whole seconds in [1, 600] (got $STREAM_DRAIN_FULL_S)"; exit 2; }
+  SSDRAIN=(--drain-full-s "$STREAM_DRAIN_FULL_S")
+  echo "BLOCK PLAN: slo search: --drain-full-s $STREAM_DRAIN_FULL_S (STREAM_DRAIN_FULL_S; default not passed)"
+fi
 # Publication period T (H1 v0.6.9, user decision 2026-10-18 "T=1로 바로 가는게 좋아보여"): RS_T_MS = the updater's
 # --publish-ms. Default 60000 (every earlier block, unchanged). BLOCK=h1 requires it explicitly (pins-recsys.sh).
 # The Ekko operating point is defined at the reference T = 60 s and is an UPDATE SAMPLE RATE: EKKO_FRAC60 of all rows
@@ -1014,7 +1027,7 @@ stream_slo() {  # <sys> <rate>
   pub_after "$LS/warmup"   # windowed publication: SLO search >= PUBLISH_AFTER_S after publishing started
   measure "$LS" slo "${LGC[@]}" --opt seed=$SEED --seed $SEED --slo query:$SLO_PCT:$SLO_MS --raw --tol $SSTOL \
     --mode slo --start 1 --factor 1.5 --precision 0.02 --confirm-precision 0.01 --max-confirm-probes $STREAM_CONFIRM_PROBES --confirm-step-down 0.05 \
-    --max-steps 40 --min-step-queries 100 --ramp-knee 2
+    --max-steps 40 --min-step-queries 100 --ramp-knee 2 ${SSDRAIN[@]+"${SSDRAIN[@]}"}
   rc=$?
   grep -q 'workload_finish":"ok' "$RD/loadgen/summary.json" 2>/dev/null || stop "$NAME slo: loadgen workload finish (rc $rc)"
   if [ $rc = 1 ]; then
@@ -1498,6 +1511,7 @@ if [ $BLOCK = stream ]; then  # RecSys streaming driver (header "BLOCK=stream")
       echo "slo=query:$SLO_PCT:$SLO_MS ($SLO_RULE) max_confirm_probes=$STREAM_CONFIRM_PROBES"
       [ -z "${STREAM_AUC:-}" ] || echo "STREAM_AUC=[$STREAM_AUC] STREAM_AUC_S=${STREAM_AUC_S:-300} STREAM_AUC_SETTLE_S=${STREAM_AUC_SETTLE_S:-30} STREAM_AUC_ONLY=${STREAM_AUC_ONLY:-0} seed=$((SEED + 3))"
       [ -z "${STREAM_SLO_TOL:-}" ] || echo "slo_tol=$SSTOL (STREAM_SLO_TOL: loadgen --tol of the SLO search; unset = 0.02)"
+      [ -z "${STREAM_DRAIN_FULL_S:-}" ] || echo "slo_drain_full_s=$STREAM_DRAIN_FULL_S (STREAM_DRAIN_FULL_S: loadgen --drain-full-s of the SLO search; unset = not passed)"
       [ "$ONEL" = 0 ] || echo "one_lifetime=1 settle_s=$OLSET (STREAM_ONE_LIFETIME: rates [$STREAM_RATES] in one mg lifetime; later rates: settle part seed $((SEED + 101)), XT $XT s)"; } | tee "$E/eval-params.txt"
   fi
   { echo "# RecSys streaming block: per rate (in STREAM_RATES order) one lifetime per system, order shuffle(seed recsys-stream-<rate>)"

@@ -11,6 +11,8 @@ Columns (stable; new columns are only ever appended):
   confirmed max offered rate under the SLO, lowest failed offered rate above it; same on every row of the run)
   ... (appended last, 2026-10-21) confirm_rule, result_majority_offered, result_majority_complete,
   result_pooled_offered, result_pooled_complete (loadgen --confirm-rule; empty for older runs; see RULES)
+  ... (appended last, 2026-11-12) drain_wait_s, outstanding_after_drain, outstanding_at_start, contaminated, judged,
+  rerun_of (loadgen --drain-full-s; empty for runs without it; see DRAIN)
 Step-level (same value on every stream row of a step):
   search_per_s, update_per_s     achieved rate of stream "search" / "update" (empty if the run has no such stream)
   total_ops_per_s                sum of the achieved rates of all streams (an update counts as one operation)
@@ -91,6 +93,10 @@ BRACKET = ["bracket_lo_offered", "bracket_hi_offered"]
 # not follow would have needed a probe that was never run (its offered value is then its state at that point)
 RULES = ["confirm_rule", "result_majority_offered", "result_majority_complete", "result_pooled_offered",
          "result_pooled_complete"]
+# appended last (2026-11-12, loadgen --drain-full-s; empty when the run did not use it): drain_wait_s (send end -> drain
+# end), outstanding_after_drain, outstanding_at_start, contaminated (requests outstanding at step start), judged (false =
+# contaminated first attempt, phase "contaminated", not a search decision), rerun_of (a re-run: step of that attempt)
+DRAIN = ["drain_wait_s", "outstanding_after_drain", "outstanding_at_start", "contaminated", "judged", "rerun_of"]
 SEARCH_PHASES = ("ramp", "bisect", "confirm")
 
 
@@ -282,7 +288,7 @@ def main():
             if os.path.exists(os.path.join(run, "manifest.txt")) else 0
         runs.append((run, label or os.path.basename(run.rstrip("/")), per_step, ntgt))
     nodes = max([2] + [r[3] for r in runs] + [max(t) + 1 for r in runs for t in r[2].values()])
-    cols = BASE + STEP + [f"n{k}_{c}" for k in range(nodes) for c in NODE] + RUNSLO + BRACKET + RULES
+    cols = BASE + STEP + [f"n{k}_{c}" for k in range(nodes) for c in NODE] + RUNSLO + BRACKET + RULES + DRAIN
     with open(a.out, "w", newline="") as f:
         w = csv.writer(f)
         w.writerow(cols)
@@ -315,11 +321,13 @@ def main():
                 for k in range(nodes):
                     m = nm.get(k, {})
                     node_cols += [blank(m.get(c)) for c in NODE]
+                drain = [blank(s.get(c)) for c in DRAIN]
                 for name, x in st.items():
                     w.writerow([label, s["step"], s["phase"], s["measure_s"], s["pass"], s["aborted"], s["reason"], name,
                                 x["offered"], x["achieved"], x["sent"], x["done"], x["errors"], x["timeouts"],
                                 x["p50_ms"], x["p90_ms"], x["p99_ms"], x["p999_ms"], x["pslo_ms"], x["max_ms"],
-                                x["lag_p99_us"], best] + step_cols + node_cols + slo + [x.get("p95_ms", "")] + brk)
+                                x["lag_p99_us"], best] + step_cols + node_cols + slo + [x.get("p95_ms", "")] + brk
+                               + drain)
     print(f"-> {a.out}")
 
 

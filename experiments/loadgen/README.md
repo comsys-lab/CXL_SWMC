@@ -101,6 +101,28 @@ the bisection the knee, the first failing ramp step a point past it; afterwards 
 in full and never changing the result. Typical cost: about 8-12 steps × ~20 s +
 confirm ≈ 4-6 min per (system, configuration). `--mode fixed --rates r1,r2,...` measures given rates.
 
+## Full drain and clean start (`--drain-full-s S`, default 0 = off)
+Default (every run before 2026-11-12): after a step stops sending, the engine waits at most `--drain-s` (5 s) for
+the step's own requests; the next step then starts while the server may still work through the backlog, and that
+step measures the backlog, not its own rate (e.g. a 7.65 q/s bisect step after a 28.3 q/s ramp step: sent 13,
+done 0, p95 inf). With `--drain-full-s S` (S > 0; recommended 120 for RecSys stream searches):
+- drain: after every step the engine waits until no request of any stream (including leftovers of earlier steps) is
+  outstanding, at most S seconds (`--drain-s` is then not used);
+- clean start: a step that starts with requests outstanding (the previous drain hit the cap) is "contaminated".
+  Its first attempt is logged with phase `contaminated` (the original phase in `reason`), `pass` false, `judged`
+  false, and is never seen by the search (neither a pass nor a fail; not in the knee bracket, not plotted); its own
+  drain is the wait. The same step (phase, rate, lengths) is then run once more; this re-run is judged as before even
+  if it is contaminated again (`contaminated` true, `judged` true, `rerun_of` = step of the attempt).
+- records, only with the option (earlier outputs stay byte-for-byte the same in layout): steps.jsonl keys after
+  `streams`: `contaminated`, `judged`, `rerun_of` (null if not a re-run), `outstanding_at_start`, `drain_wait_s`
+  (send end -> drain end), `outstanding_after_drain`; manifest line `drain_full_s=S`; summary.json `drain_full`
+  {`cap_s`, `contaminated_steps`, `reruns`}. `export_csv.py` appends the six steps.jsonl keys as the last columns
+  (empty for runs without the option).
+- requests that complete during the longer drain count with their real latency (with the default they would be
+  +inf after `--drain-s`); a step whose drain hits the cap still counts the rest as +inf.
+- code `drain.h` (drain_step, step_judged, clean_step); unit test `test/drain_test.cc` (default-off identity with the
+  old drain loop, full drain, contaminated re-run, search decisions on a fake backlog).
+
 ## Outputs (`--out DIR`, must not exist)
 `manifest.txt` (all parameters, workload description), `steps.jsonl` (one JSON per step: offered/achieved,
 p50/p90/p95/p99/p99.9/SLO percentile (`pslo_ms`)/max, errors, timeouts, send lag, pass/abort reason, per stream;

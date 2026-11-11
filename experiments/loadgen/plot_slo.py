@@ -45,7 +45,7 @@ def main():
         stream = a.stream or summ.get("slo", {}).get("stream") or next(iter(steps[-1]["streams"]))
         slo_ms = summ.get("slo", {}).get("ms", slo_ms)
         pts = sorted((s["x"], num(s["streams"][stream][a.metric]), s["pass"], s["phase"])
-                     for s in steps if s["phase"] != "warmup" and s["measure_s"] > 0)
+                     for s in steps if s["phase"] not in ("warmup", "contaminated") and s["measure_s"] > 0)
         c = f"C{i}"
         curve = [(x, min(y, 1e6)) for x, y, _, ph in pts if ph != "confirm"]  # confirm repeats: markers only
         ax.plot([x for x, _ in curve], [y for _, y in curve], "-", color=c, alpha=0.4)

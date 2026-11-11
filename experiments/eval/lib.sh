@@ -43,6 +43,7 @@ unset RS_AUC_Q RS_AUC_S RS_AUC_SETTLE_S RS_AUC_ONLY     # run-2 RecSys fixed-rat
 unset RS_PUBLISH_WINDOW_S RS_PUBLISH_WARMUP RS_PUBLISH_AFTER_S RS_PUBLISH_DRAM_ROWS   # windowed publication (rs_env), only from the conf
 unset RS_CHUNK_PAIRS CHUNK_PAIRS   # serving split (rs_env -> main-block.sh CHUNK_PAIRS), only from the conf
 unset RS_SLO_TOL STREAM_SLO_TOL   # SLO-search loadgen --tol (rs_env -> main-block.sh STREAM_SLO_TOL), only from the conf
+unset RS_DRAIN_FULL_S STREAM_DRAIN_FULL_S   # SLO-search loadgen --drain-full-s (rs_env -> STREAM_DRAIN_FULL_S), only from the conf
 CONFSH=$(python3 -I -B "$EVD/evalconf.py" shell ${EVAL_CONF:+--conf "$EVAL_CONF"}) || { echo "RUNSET STOP: ${EVAL_CONF:-eval.conf} does not parse"; exit 2; }
 eval "$CONFSH"
 export EVAL_CONF   # absolute path of the config (evalconf.py shell); pins-vdb.sh (sourced by the hook) reads the same file
@@ -186,6 +187,13 @@ rs_env() {
     [[ $RS_SLO_TOL =~ ^0?\.[0-9]+$ ]] && awk -v t="$RS_SLO_TOL" 'BEGIN { exit !(t > 0 && t <= 0.2) }' || die "bad RS_SLO_TOL ($RS_SLO_TOL: (0, 0.2])"
     RSENV+=(STREAM_SLO_TOL=$RS_SLO_TOL)
     plan "SLO search loadgen --tol $RS_SLO_TOL (RS_SLO_TOL; default 0.02)"
+  fi
+  # RS_DRAIN_FULL_S (user 2026-11-12; optional, every RecSys run set): loadgen --drain-full-s of the stream SLO search
+  # (main-block.sh STREAM_DRAIN_FULL_S, whole seconds in [1, 600], recommended 120); unset / empty = not passed (old drain)
+  if [ -n "${RS_DRAIN_FULL_S:-}" ]; then
+    [[ $RS_DRAIN_FULL_S =~ ^[1-9][0-9]*$ ]] && [ "$RS_DRAIN_FULL_S" -le 600 ] || die "bad RS_DRAIN_FULL_S ($RS_DRAIN_FULL_S: [1, 600] s)"
+    RSENV+=(STREAM_DRAIN_FULL_S=$RS_DRAIN_FULL_S)
+    plan "SLO search loadgen --drain-full-s $RS_DRAIN_FULL_S (RS_DRAIN_FULL_S; default not passed)"
   fi
   local v; for v in PRETOUCH_DIR MEASURE_ENV_DIR MEASURE_PART_DIR; do [ -z "${!v:-}" ] || RSENV+=("$v=${!v}"); done
   # RecSys v7 (RS_V7=1; workloads/recsys/DESIGN.md §10.6): RS_V7_<X> -> main-block.sh V7_<X>; @USER@ values = not
