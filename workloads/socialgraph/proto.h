@@ -27,6 +27,8 @@ constexpr uint16_t kStatusOk = 0;
 constexpr uint16_t kStatusNotFound = 1;  // node / link absent or deleted
 constexpr uint16_t kStatusFull = 2;      // no slack slot / pool block left (write rejected)
 constexpr uint16_t kStatusBad = 3;       // malformed request
+constexpr uint16_t kStatusBusy = 4;      // a record read gave up after the retry bound (kept changing / failed its
+                                         // guard); added in part 3 (server/graph_ops.h)
 
 struct __attribute__((packed)) RespHead {
   uint16_t op, status, flags, pad;

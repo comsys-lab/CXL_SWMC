@@ -45,6 +45,24 @@ Feed query (getlinklist id1 limit 50 newest first + multiget of the neighbour no
 countlink, getlink (multiget of id2s), addlink / updatelink / deletelink / addnode / updatenode / deletenode.
 Responses carry RespHead (status, server time, records touched) and, optionally, the vectordb OpCoh block.
 
-## 4. Open (server, part 3)
-Read/write protocol on the shared bytes (per record version as a seqlock or publish order), the staleness log, the
-commit-time clock and what a reader does with a torn record are part 3 decisions, not fixed by the layout.
+## 4. Server (part 3: server/{backend.h, mmap_backend.h, graph_ops.h, stale_log.h, opwin.h, server.cc})
+- Process per VM, frame.h transport; connection threads queue reads to the query threads (online CPUs - 1, i.e. 3 at
+  4 vCPU) and writes to the VM's single writer thread (arrival order); stats answered inline (key=value text: op.<op>.*
+  counts / server ns, seq.* retries, write lag, alloc.*, stale.*, opt.<op>.* window counters, proc_stats.h counters).
+- Backend seam (backend.h): Server<Be> / GraphOps<Be> call be.read(kind, idx, f) / be.write(kind, idx, f) /
+  write_range per record (node slot, primary adjacency block, ovf block); plain = MmapBackend (All HWcc, Popcorn,
+  De Stijl: same code, region config + kernel differ; De Stijl T applied to the whole image). Megalon (part 5) adds a
+  class with read / write sections per record object or per 36 MiB chunk (layout.h for_each_record_object / chunk_of).
+- Record protocol (graph_ops.h): seqlock on the record version word (node: NodeSlot.version; list: AdjHeader.version
+  covers the primary block and its ovf segments). Writer: atomic fetch_or of bit 63 (= "odd" writing state, also the
+  write-ownership access), write, commit_ns, release store of version + 1. Versions keep the LinkBench meaning (node 1
+  at load, list 0, +1 per write). Reader: acquire load, retry on bit 63, copy, acquire fence, re-load, retry on change.
+  Extra guards against a page replica mixing ages: node check word in NodeSlot.pad (0 = image record, only with
+  commit_ns 0); adjacency bounds / ovf owner id1 checks. 64 spins, then yields, give-up after --retry-ms (2000) with
+  kStatusBusy. Writers of different VMs exclude each other with HWcc stripe locks (app range); slack slots and pool
+  blocks by index mod N (owned_by), private cursors.
+- Staleness logs (stale_log.h): 1 in --stale-every (1000) record reads -> stale-reads-n<k>.bin, every commit ->
+  stale-commits-n<k>.bin (rid, version, CLOCK_REALTIME ns) under --stale-dir; joined by tools/sg_stale_join.py with the
+  Host clock-offset log of the RecSys T-sweep (workspaces/clock-offset-log-v1.py format).
+- Image: --copy-image FILE (node 0, plain mapping, no HWcc access; header page written last), --verify [--image FILE]
+  (header, layout hash, sampled records, byte comparison with the file). Serving attaches to the copied image.
