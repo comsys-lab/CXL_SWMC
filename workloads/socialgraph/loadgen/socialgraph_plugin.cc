@@ -11,8 +11,9 @@
 // rule as layout.h owned_by for slack slots / pool blocks), so every record has one writer; addnode: uniform VM.
 // write_route=random: uniform VM for every write.
 //
-// Options: rw=R (required; 100 or 470 in the experiment), image=PATH (graph.img, mapped read-only: header checked,
-//   node count / id base taken from it, id2 choices from the build-time adjacency, below), gen=PATH (gen.json of the
+// Options: rw=R (required; 100 or 470 in the experiment), image=PATH (graph.img, read once at init: header checked,
+//   node count / id base taken from it, build-time adjacency copied to a private ~1 GB table for the id2 choices
+//   below; the file is unmapped before the run), gen=PATH (gen.json of the
 //   image: nodes, id_base, limit, read_zipf and fisher_yates_perm_seed must match), nodes=N id_base=B (without image;
 //   defaults image build 1: 3072626 / 1), seed=N (20261111), limit=50, read_perm_seed, write_perm_seed, read_zipf=0.8,
 //   getnode_zipf=0.625, wlink_zipf=0.741, wnode_zipf=0.606, write_route=owner|random, coh_read_every=16 (log the
@@ -95,10 +96,6 @@ bool json_num(const std::string &txt, const std::string &key, std::string *out) 
 
 class SocialGraph : public loadgen::Workload {
  public:
-  ~SocialGraph() override {
-    if (img_) munmap(img_, img_bytes_);
-  }
-
   bool init(const loadgen::Options &o, uint32_t targets, std::string *err) override {
     auto get = [&](const char *k, const std::string &d) {
       auto it = o.find(k);
@@ -135,7 +132,7 @@ class SocialGraph : public loadgen::Workload {
     image_ = get("image", "");
     if (!image_.empty()) {
       if (!map_image(err)) return false;
-      kp.n = h_->n_orig, id_base_ = h_->id_base;
+      kp.n = hdr_.n_orig, id_base_ = hdr_.id_base;
       if (!get("nodes", "").empty() && std::stoull(get("nodes", "")) != kp.n) return *err = "nodes != image n_orig", false;
       if (!get("id_base", "").empty() && std::stoull(get("id_base", "")) != id_base_)
         return *err = "id_base != image id_base", false;
@@ -313,8 +310,8 @@ class SocialGraph : public loadgen::Workload {
                  (unsigned long)fo, fo ? double(feed_rows_.load()) / double(fo) : 0.0,
                  fo ? double(feed_records_.load()) / double(fo) : 0.0, (unsigned long)feed_missing_.load(),
                  (unsigned long)getlink_rows_.load());
-    std::fprintf(t, "id2_from_image=%lu id2_uniform=%lu id2_no_image=%lu\n", (unsigned long)id2_img_,
-                 (unsigned long)id2_uni_, (unsigned long)id2_noimg_);
+    std::fprintf(t, "id2_from_image=%lu id2_uniform=%lu id2_no_image=%lu image_links=%zu image_load_ms=%.0f\n",
+                 (unsigned long)id2_img_, (unsigned long)id2_uni_, (unsigned long)id2_noimg_, csr_id2_.size(), csr_ms_);
     std::fprintf(t, "wseq_mismatch=%lu bad_responses=%lu first_bad=%s\n", (unsigned long)wseq_mismatch_.load(),
                  (unsigned long)bad_total(), first_bad_.c_str());
     std::fprintf(t, "write_records=%zu write_record_bytes=%zu coh_records=%zu coh_record_bytes=%zu coh_dropped=%lu\n",
@@ -413,53 +410,48 @@ class SocialGraph : public loadgen::Workload {
   // uniform node id.
   uint32_t pick_id2(uint32_t slot, double pexist) {
     if (sgl::u01(rng_) < pexist) {
-      if (!img_) {
+      if (csr_off_.empty()) {
         id2_noimg_++;
       } else {
-        uint32_t id2;
-        if (existing_id2(slot, &id2)) return id2_img_++, id2;
+        const uint64_t a = csr_off_[slot], n = csr_off_[slot + 1] - a;
+        if (n) return id2_img_++, csr_id2_[a + uint64_t((unsigned __int128)rng_() * n >> 64)];
       }
     }
     id2_uni_++;
     return uint32_t(id_of(keys_.uniform(rng_)));
   }
-  bool existing_id2(uint32_t slot, uint32_t *id2) {
-    sg::View v(img_);
-    if (!v.has_adj(slot)) return false;
-    const sg::AdjHeader *a = v.adj(slot);
-    if (a->used == 0) return false;
-    uint64_t k = uint64_t((unsigned __int128)rng_() * a->used >> 64);
-    uint32_t seg = a->head;
-    for (uint64_t guard = 0; seg != sg::kSegNone && guard <= h_->ovf_blocks() + 1; guard++) {
-      const sg::EdgeSlot *s;
-      uint32_t start, cap, next;
-      if (seg == sg::kSegInline) {
-        s = a->inline_slots(), start = a->start, cap = a->cap, next = a->next;
-      } else {
-        if (seg >= h_->ovf_blocks()) return false;
-        const sg::OvfBlock *ob = v.ovf(seg);
-        s = ob->slot, start = ob->h.start, cap = ob->h.cap, next = ob->h.next;
-      }
-      const uint32_t n = cap > start ? cap - start : 0;
-      if (k < n) return *id2 = s[start + k].id2, true;
-      k -= n, seg = next;
-    }
-    return false;
-  }
 
+  // Map the image read-only, check its header and copy the build-time adjacency (every occupied slot of every list,
+  // newest first) into a private CSR (~1 GB for Orkut), then unmap: make() never touches the file (no page-cache
+  // misses on the scheduling thread, which would show up as send lag).
   bool map_image(std::string *err) {
+    const uint64_t t0 = clk(CLOCK_MONOTONIC);
     int fd = ::open(image_.c_str(), O_RDONLY);
     struct stat st;
     if (fd < 0 || fstat(fd, &st) != 0) return *err = "cannot open image " + image_, false;
-    sg::ImageHeader hh;
-    if (pread(fd, &hh, sizeof(hh), 0) != ssize_t(sizeof(hh))) return ::close(fd), *err = "short image header", false;
-    const std::string bad = sg::check_header(hh, uint64_t(st.st_size));
+    if (pread(fd, &hdr_, sizeof(hdr_), 0) != ssize_t(sizeof(hdr_))) return ::close(fd), *err = "short image header", false;
+    const std::string bad = sg::check_header(hdr_, uint64_t(st.st_size));
     if (!bad.empty()) return ::close(fd), *err = "image header: " + bad, false;
     void *m = mmap(nullptr, size_t(st.st_size), PROT_READ, MAP_SHARED, fd, 0);
     ::close(fd);
     if (m == MAP_FAILED) return *err = "cannot map " + image_, false;
-    img_ = static_cast<uint8_t *>(m), img_bytes_ = size_t(st.st_size);
-    h_ = reinterpret_cast<const sg::ImageHeader *>(img_);
+    madvise(m, size_t(st.st_size), MADV_SEQUENTIAL);
+    sg::View v(m);
+    const uint64_t n = hdr_.n_orig;
+    csr_off_.assign(n + 1, 0);
+    csr_id2_.reserve(hdr_.n_links);
+    for (uint64_t s = 0; s < n; s++) {
+      csr_off_[s] = csr_id2_.size();
+      sg::walk_links(v, s, [&](const sg::EdgeSlot &e) { return csr_id2_.push_back(e.id2), true; });
+    }
+    csr_off_[n] = csr_id2_.size();
+    munmap(m, size_t(st.st_size));
+    if (csr_id2_.size() != hdr_.n_links)
+      return *err = "image adjacency: " + std::to_string(csr_id2_.size()) + " slots != n_links " +
+                    std::to_string(hdr_.n_links), false;
+    csr_ms_ = double(clk(CLOCK_MONOTONIC) - t0) / 1e6;
+    std::fprintf(stderr, "socialgraph: image adjacency %lu links of %lu nodes loaded in %.0f ms\n",
+                 (unsigned long)csr_id2_.size(), (unsigned long)n, csr_ms_);
     return true;
   }
 
@@ -539,9 +531,10 @@ class SocialGraph : public loadgen::Workload {
   uint16_t limit_ = 50;
   std::string route_, image_, gen_;
   std::mt19937_64 rng_;
-  uint8_t *img_ = nullptr;
-  size_t img_bytes_ = 0;
-  const sg::ImageHeader *h_ = nullptr;
+  sg::ImageHeader hdr_{};
+  std::vector<uint64_t> csr_off_;  // build-time adjacency (image=): slot -> [off[s], off[s+1]) in csr_id2_
+  std::vector<uint32_t> csr_id2_;
+  double csr_ms_ = 0;
   // make() thread only
   uint64_t made_[sgl::kStreams] = {}, wmade_[sgl::kWriteOps] = {}, id2_img_ = 0, id2_uni_ = 0, id2_noimg_ = 0;
   std::vector<uint32_t> next_wseq_;
