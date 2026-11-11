@@ -18,7 +18,8 @@
 // Writers: one writer thread per VM. Mutual exclusion between VMs' writers on the same record: HWcc stripe locks
 // (Locks, in the region's HWcc app range), striped by record id. Node slack slots and overflow pool blocks are
 // allocated by index mod N (layout.h owned_by): writer w scans only its own indices (private cursor, no shared
-// counter; a slot / block in use from an earlier run on the same region is skipped).
+// counter; a slot / block in use from an earlier run on the same region is skipped). --write-route range (layout.h
+// Route::kRange): each writer owns a contiguous range of the slack slots and of the pool blocks instead.
 // addlink only to original ids (slot < n_orig, as LinkBench); an addlink of an existing (id1, type, id2) updates it
 // (LinkBench addLink), a deleted one is revived.
 #pragma once
@@ -104,11 +105,21 @@ struct ListHead {  // consistent copy of a list header (version without kWriting
 template <class Be>
 class GraphOps {
  public:
-  GraphOps(Be &be, const Locks *locks, StaleLog *sl, uint32_t node, uint32_t n_writers, uint64_t retry_ns)
-      : be_(be), h_(be.header()), locks_(locks), sl_(sl), node_(node), nw_(n_writers ? n_writers : 1), retry_ns_(retry_ns) {
-    node_cur_ = first_owned(h_.n_orig);
-    ovf_cur_ = first_owned(h_.ovf_built);
+  GraphOps(Be &be, const Locks *locks, StaleLog *sl, uint32_t node, uint32_t n_writers, uint64_t retry_ns,
+           Route route = Route::kMod)
+      : be_(be), h_(be.header()), locks_(locks), sl_(sl), node_(node), nw_(n_writers ? n_writers : 1), retry_ns_(retry_ns),
+        route_(route) {
+    if (route_ == Route::kMod) {  // indices with index % N == node, stride N
+      step_ = nw_;
+      node_cur_ = first_owned(h_.n_orig), node_end_ = h_.n_nodes();
+      ovf_cur_ = first_owned(h_.ovf_built), ovf_end_ = h_.ovf_blocks();
+    } else {  // contiguous range of this writer inside the slack slots / the pool blocks, stride 1
+      step_ = 1;
+      span_range(h_.n_orig, h_.node_slack, node_, nw_, &node_cur_, &node_end_);
+      span_range(h_.ovf_built, h_.ovf_pool, node_, nw_, &ovf_cur_, &ovf_end_);
+    }
   }
+  Route route() const { return route_; }
   const ImageHeader &header() const { return h_; }
   uint64_t slot_of(uint64_t id) const {
     return id >= h_.id_base && id - h_.id_base < h_.n_nodes() ? id - h_.id_base : h_.n_nodes();
@@ -255,8 +266,8 @@ class GraphOps {
     return kStatusOk;
   }
 
-  uint64_t pool_left() const { return ovf_cur_ < h_.ovf_blocks() ? (h_.ovf_blocks() - ovf_cur_ + nw_ - 1) / nw_ : 0; }
-  uint64_t slack_left() const { return node_cur_ < h_.n_nodes() ? (h_.n_nodes() - node_cur_ + nw_ - 1) / nw_ : 0; }
+  uint64_t pool_left() const { return ovf_cur_ < ovf_end_ ? (ovf_end_ - ovf_cur_ + step_ - 1) / step_ : 0; }
+  uint64_t slack_left() const { return node_cur_ < node_end_ ? (node_end_ - node_cur_ + step_ - 1) / step_ : 0; }
 
  private:
   uint64_t first_owned(uint64_t from) const {
@@ -336,9 +347,9 @@ class GraphOps {
   }
 
   uint64_t alloc_node() {
-    while (node_cur_ < h_.n_nodes()) {
+    while (node_cur_ < node_end_) {
       const uint64_t s = node_cur_;
-      node_cur_ += nw_;
+      node_cur_ += step_;
       const bool free = be_.read(ObjKind::kNode, s, [&](const uint8_t *p) {
         const NodeSlot *n = reinterpret_cast<const NodeSlot *>(p);
         return __atomic_load_n(&n->flags, __ATOMIC_ACQUIRE) == 0;
@@ -348,9 +359,9 @@ class GraphOps {
     return h_.n_nodes();
   }
   uint32_t alloc_ovf() {
-    while (ovf_cur_ < h_.ovf_blocks()) {
+    while (ovf_cur_ < ovf_end_) {
       const uint64_t b = ovf_cur_;
-      ovf_cur_ += nw_;
+      ovf_cur_ += step_;
       const bool free = be_.read(ObjKind::kOvf, b, [&](const uint8_t *p) {
         return reinterpret_cast<const OvfBlock *>(p)->h.id1 == 0;
       });
@@ -472,7 +483,10 @@ class GraphOps {
   StaleLog *sl_;
   uint32_t node_, nw_;
   uint64_t retry_ns_;
+  Route route_;
+  uint64_t step_ = 1;                    // cursor stride: N (mod route) or 1 (range route)
   uint64_t node_cur_ = 0, ovf_cur_ = 0;  // writer's private allocation cursors (owned indices)
+  uint64_t node_end_ = 0, ovf_end_ = 0;  // end of the owned indices (exclusive)
 };
 
 }  // namespace sg

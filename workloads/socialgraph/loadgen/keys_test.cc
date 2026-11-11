@@ -251,6 +251,23 @@ static void test_small(const sgl::KeyGen &g) {
     for (uint64_t x : c) worst = std::max(worst, std::fabs(double(x) / N - 1.0 / nt));
     check(worst <= 0.01, "owner routing over %u VMs (link writes): max |share - 1/N| = %.4f (<= 0.01)", nt, worst);
   }
+  // write_route=range (layout.h slot_owner): load balance of link writes and node updates over contiguous id ranges
+  // (Zipf ranks over a uniform permutation, so ranges get ~1/N each; reported, bound 0.02)
+  for (uint32_t nt : {2u, 4u, 8u}) {
+    std::vector<uint64_t> cl(nt, 0), cn(nt, 0);
+    std::mt19937_64 r(100 + nt);
+    for (uint64_t i = 0; i < N; i++) {
+      cl[sg::slot_owner(sg::Route::kRange, g.link_write(r), g.params().n, 0, nt)]++;
+      cn[sg::slot_owner(sg::Route::kRange, g.node_update(r), g.params().n, 0, nt)]++;
+    }
+    double wl = 0, wn = 0;
+    for (uint32_t k = 0; k < nt; k++) {
+      wl = std::max(wl, std::fabs(double(cl[k]) / N - 1.0 / nt));
+      wn = std::max(wn, std::fabs(double(cn[k]) / N - 1.0 / nt));
+    }
+    check(wl <= 0.02 && wn <= 0.02, "range routing over %u VMs: max |share - 1/N| link writes %.4f, node updates %.4f (<= 0.02)",
+          nt, wl, wn);
+  }
 }
 
 int main(int argc, char **argv) {

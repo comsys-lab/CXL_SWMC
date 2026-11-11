@@ -72,6 +72,7 @@ struct Opts {
   bool verify = false, op_coh = true, warmup = true;
   std::string backend = "plain", megalon_lib, object_layout = "chunk";  // Megalon: --backend megalon
   uint64_t chunk_bytes = kChunkBytes;
+  Route route = Route::kMod;  // --write-route mod|range (layout.h; must match the loadgen's write_route)
 };
 
 // HWcc app layout (same calls on every node; hash checked by app_init)
@@ -357,7 +358,9 @@ class Server {
     }
     if (!o_.stale_dir.empty() && !sl_.open(o_.stale_dir, o_.node, o_.stale_every, &err)) die(err);
     ops_ = std::make_unique<GraphOps<Be>>(*be_, &locks_, sl_.on() ? &sl_ : nullptr, o_.node, o_.nodes,
-                                          o_.retry_ms * 1000000ull);
+                                          o_.retry_ms * 1000000ull, o_.route);
+    std::fprintf(stderr, "sg-server: write route %s (slack slots %lu, pool blocks %lu owned by this writer)\n",
+                 route_name(o_.route), (unsigned long)ops_->slack_left(), (unsigned long)ops_->pool_left());
     std::fprintf(stderr, "sg-server: node %u/%u run %#lx\nsg-server: region %s\nsg-server: app layout %lu B (hash "
                  "%016lx), image at swcc+%lu: %lu B, layout hash %016lx, %lu nodes (%lu original), %lu links, %lu ovf "
                  "blocks (%lu pool); backend %s\n", o_.node, o_.nodes, (unsigned long)o_.run_id,
@@ -396,7 +399,8 @@ class Server {
 
   std::string stats_text() {
     std::ostringstream o;
-    o << "node=" << o_.node << "\nnodes=" << o_.nodes << "\nbackend=" << Be::kName << "\nquery_threads=" << nq_;
+    o << "node=" << o_.node << "\nnodes=" << o_.nodes << "\nbackend=" << Be::kName << "\nquery_threads=" << nq_
+      << "\nwrite_route=" << route_name(o_.route);
     for (int i = 0; i < kIxN; i++) {
       const OpStats &s = st_.op[i];
       const std::string p = std::string("\nop.") + kIxName[i] + ".";
@@ -768,6 +772,7 @@ void usage() {
                "  [--image-offset B (0; from swcc start)] [--query-threads Q (online CPUs - 1)] [--retry-ms M (2000)]\n"
                "  [--stale-dir DIR] [--stale-every E (1000)] [--flush-ms M (1000)] [--op-coh on|off] [--warmup on|off]\n"
                "  [--lock-stripes S (16384)] [--start-timeout-ms T]\n"
+               "  [--write-route mod|range (mod)]   slack slot / pool block ownership (layout.h; = loadgen write_route)\n"
                "  --copy-image FILE   node 0: copy the image into the region (plain mapping, no HWcc) and exit\n"
                "  --verify [--image FILE]   check the image in the region (header, layout hash, records; bytes vs FILE)\n"
                "  --print-app-bytes   value for CXL_APP_HWCC_BYTES (same --nodes / --lock-stripes on every node)\n"
@@ -844,6 +849,7 @@ int main(int argc, char **argv) {
     else if (a == "--object-layout") o.object_layout = v();
     else if (a == "--chunk-bytes") o.chunk_bytes = std::stoull(v());
     else if (a == "--print-megalon-objects") print_meg = true;
+    else if (a == "--write-route") { if (!parse_route(v(), &o.route)) usage(); }
     else usage();
   }
   if (o.lock_stripes == 0) usage();

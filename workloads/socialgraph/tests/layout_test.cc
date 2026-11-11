@@ -195,6 +195,31 @@ int main(int argc, char **argv) {
     uint64_t c = walk_links(v, 0, [&](const EdgeSlot &x) { if (!first) first = x.id2 ? x.id2 : 1; return true; });
     CHECK(first == 999 && c == 302);
   }
+  {  // write routes (layout.h): owners of every span index; range spans partition [first, first + count) in order
+    for (uint32_t n : {1u, 2u, 3u, 4u, 8u}) {
+      for (uint64_t cnt : {0ull, 1ull, 7ull, 64ull, 1001ull}) {
+        uint64_t prev_end = 100;
+        for (uint32_t w = 0; w < n; w++) {
+          uint64_t b = 0, e = 0;
+          span_range(100, cnt, w, n, &b, &e);
+          CHECK(b == prev_end && e >= b && e <= 100 + cnt);
+          for (uint64_t i = b; i < e; i++) CHECK(span_owner(Route::kRange, i, 100, cnt, n) == w);
+          prev_end = e;
+        }
+        CHECK(prev_end == 100 + cnt);
+        for (uint64_t i = 100; i < 100 + cnt; i++) CHECK(span_owner(Route::kMod, i, 100, cnt, n) == i % n);
+      }
+    }
+    // slot_owner: original and slack slots are separate spans (range), plain % N (mod)
+    CHECK(slot_owner(Route::kRange, 0, 10, 4, 2) == 0 && slot_owner(Route::kRange, 4, 10, 4, 2) == 0 &&
+          slot_owner(Route::kRange, 5, 10, 4, 2) == 1 && slot_owner(Route::kRange, 9, 10, 4, 2) == 1 &&
+          slot_owner(Route::kRange, 10, 10, 4, 2) == 0 && slot_owner(Route::kRange, 12, 10, 4, 2) == 1);
+    CHECK(slot_owner(Route::kMod, 12, 10, 4, 2) == 0 && slot_owner(Route::kMod, 9, 10, 4, 4) == 1);
+    CHECK(pool_owner(Route::kRange, 50, 50, 10, 4) == 0 && pool_owner(Route::kRange, 59, 50, 10, 4) == 3);
+    Route r = Route::kMod;
+    CHECK(parse_route("range", &r) && r == Route::kRange && parse_route("mod", &r) && r == Route::kMod &&
+          !parse_route("owner", &r) && std::string(route_name(Route::kRange)) == "range");
+  }
   munmap(m, sb.st_size);
   close(fd);
   printf("layout_test: image %lld bytes, %llu record objects, %llu chunks (8 KiB), %llu links, straddle %llu: %s\n",

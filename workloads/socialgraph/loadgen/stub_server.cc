@@ -1,7 +1,7 @@
 // Protocol stub for the socialgraph loadgen plugin (Host loopback test only; not the real server). Checks every request
 // against proto.h (sizes, caps, id ranges, feed limit, owner routing, per-target w_seq = previous + 1) and answers with
 // well-formed responses (RespHead + body + an OpCoh block on every OK response).
-// usage: sg-loadgen-stub <port> <target index> <n targets> <n_orig> <id_base> <seconds>
+// usage: sg-loadgen-stub <port> <target index> <n targets> <n_orig> <id_base> <seconds> [mod|range (write route, mod)]
 // After <seconds> prints counters (key=value) and exits; exit code 0 iff no request violated the protocol.
 #include <netinet/in.h>
 #include <netinet/tcp.h>
@@ -25,6 +25,7 @@
 
 static uint32_t g_target, g_targets;
 static uint64_t g_n, g_base;
+static sg::Route g_route = sg::Route::kMod;  // expected write route (layout.h slot_owner)
 static std::atomic<uint64_t> g_req[32], g_bad{0}, g_wseq_bad{0}, g_owner_bad{0}, g_writes{0};
 static std::mutex g_wmu;
 static uint32_t g_last_wseq = 0;
@@ -139,7 +140,7 @@ static uint16_t handle(uint16_t op, const std::vector<uint8_t> &p, Out *o) {
       if (p.size() != hs + dl || dl > cap) bad("write data_len");
       if ((op == sg::kOpDeleteLink || op == sg::kOpDeleteNode) && dl) bad("delete with data");
       if (op == sg::kOpAddNode ? id != 0 : !id_ok(id)) bad("write id");
-      if (op != sg::kOpAddNode && (id - g_base) % g_targets != g_target) g_owner_bad.fetch_add(1);
+      if (op != sg::kOpAddNode && sg::slot_owner(g_route, id - g_base, g_n, 0, g_targets) != g_target) g_owner_bad.fetch_add(1);
       {
         std::lock_guard<std::mutex> g(g_wmu);
         if (wseq != g_last_wseq + 1) g_wseq_bad.fetch_add(1);
@@ -166,7 +167,9 @@ static uint16_t handle(uint16_t op, const std::vector<uint8_t> &p, Out *o) {
 }
 
 int main(int argc, char **argv) {
-  if (argc != 7) return std::fprintf(stderr, "usage: sg-loadgen-stub <port> <target> <targets> <n_orig> <id_base> <seconds>\n"), 2;
+  if (argc != 7 && argc != 8)
+    return std::fprintf(stderr, "usage: sg-loadgen-stub <port> <target> <targets> <n_orig> <id_base> <seconds> [mod|range]\n"), 2;
+  if (argc == 8 && !sg::parse_route(argv[7], &g_route)) return std::fprintf(stderr, "route mod|range\n"), 2;
   const int port = std::atoi(argv[1]);
   g_target = uint32_t(std::atoi(argv[2])), g_targets = uint32_t(std::atoi(argv[3]));
   g_n = std::strtoull(argv[4], nullptr, 10), g_base = std::strtoull(argv[5], nullptr, 10);

@@ -286,8 +286,42 @@ inline uint64_t chunk_of(const ImageHeader &h, uint64_t chunk_bytes, uint64_t of
   return ~0ull;
 }
 
-// Node slack slot / pool block ownership for N writers (one writer per VM): writer w owns the slots and blocks with
-// index % n == w, so no shared allocation counter is needed (the server keeps a private cursor per writer).
-inline bool owned_by(uint64_t idx, uint32_t writer, uint32_t n_writers) { return idx % n_writers == writer; }
+// Write routing / ownership for N writers (one writer per VM). The loadgen sends every keyed write of node slot s to
+// the VM slot_owner(s) (socialgraph_plugin.cc write_route), and each server allocates node slack slots and overflow
+// pool blocks only among the indices it owns, so no shared allocation counter is needed (private cursor per writer).
+//   kMod   (default, "mod"): owner = index % N (original slots, slack slots and pool blocks alike).
+//   kRange ("range"): contiguous ranges, separately for the original slots [0, n_orig), the slack slots
+//          [n_orig, n_nodes) and the pool blocks [ovf_built, ovf_blocks): owner = (index - first) / ceil(count / N).
+//          A 4 KiB page of node slots (32 slots) and the packed primary blocks of contiguous id1 then mostly have one
+//          writer VM (TAO shards by id). Built overflow blocks belong to their list (= the list owner's writer).
+// Both sides must use the same route (sg-block.sh passes SG_WRITE_ROUTE to both).
+enum class Route : uint32_t { kMod = 0, kRange = 1 };
+inline const char *route_name(Route r) { return r == Route::kRange ? "range" : "mod"; }
+inline bool parse_route(const std::string &s, Route *r) {
+  if (s == "mod") return *r = Route::kMod, true;
+  if (s == "range") return *r = Route::kRange, true;
+  return false;
+}
+// owner of idx inside [first, first + count) (range route) or idx % n (mod route)
+inline uint32_t span_owner(Route r, uint64_t idx, uint64_t first, uint64_t count, uint32_t n) {
+  if (n <= 1) return 0;
+  if (r == Route::kMod) return uint32_t(idx % n);
+  const uint64_t per = (count + n - 1) / n;
+  return per ? uint32_t((idx - first) / per) : 0;
+}
+// [begin, end) of writer w's indices inside [first, first + count) for the range route
+inline void span_range(uint64_t first, uint64_t count, uint32_t w, uint32_t n, uint64_t *b, uint64_t *e) {
+  const uint64_t per = n <= 1 ? count : (count + n - 1) / n;
+  const uint64_t lo = uint64_t(w) * per, hi = uint64_t(w + 1) * per;
+  *b = first + (lo < count ? lo : count), *e = first + (hi < count ? hi : count);
+}
+// node slot owner: original slots and slack slots are separate spans
+inline uint32_t slot_owner(Route r, uint64_t slot, uint64_t n_orig, uint64_t node_slack, uint32_t n) {
+  return slot < n_orig ? span_owner(r, slot, 0, n_orig, n) : span_owner(r, slot, n_orig, node_slack, n);
+}
+inline uint32_t pool_owner(Route r, uint64_t blk, uint64_t ovf_built, uint64_t ovf_pool, uint32_t n) {
+  return span_owner(r, blk, ovf_built, ovf_pool, n);
+}
+inline bool owned_by(uint64_t idx, uint32_t writer, uint32_t n_writers) { return idx % n_writers == writer; }  // mod route
 
 }  // namespace sg

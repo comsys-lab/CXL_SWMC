@@ -7,16 +7,19 @@
 // The read:write mix is BY REQUEST: --mix "$(sg-loadgen-mix <rw>)" gives each stream its share of all requests
 // (writes = 1/(rw+1), scaling with the load as the vector DB updates). --opt rw=<rw> must name the same ratio; finish()
 // compares the requests made with it (sg.txt mix_max_abs_pp, mix_ok: every op within 0.5 percentage points).
-// Read target: uniform VM. Write target (write_route=owner, default): node slot % N (the VM owning the record, same
-// rule as layout.h owned_by for slack slots / pool blocks), so every record has one writer; addnode: uniform VM.
-// write_route=random: uniform VM for every write.
+// Read target: uniform VM. Write target of a keyed write = the VM owning its node slot (layout.h slot_owner, the same
+// route the servers get with --write-route), so every record has one writer; addnode: uniform VM.
+//   write_route=mod (default; "owner" = old name): owner = slot % N.
+//   write_route=range: contiguous slot ranges per VM, owner = slot / ceil(n_orig / N) (TAO shards by id: a 4 KiB page
+//     of node slots and the packed lists of contiguous id1 mostly have one writer VM).
+//   write_route=random: uniform VM for every write (no single writer per record).
 //
 // Options: rw=R (required; 100 or 470 in the experiment), image=PATH (graph.img, read once at init: header checked,
 //   node count / id base taken from it, build-time adjacency copied to a private ~1 GB table for the id2 choices
 //   below; the file is unmapped before the run), gen=PATH (gen.json of the
 //   image: nodes, id_base, limit, read_zipf and fisher_yates_perm_seed must match), nodes=N id_base=B (without image;
 //   defaults image build 1: 3072626 / 1), seed=N (20261111), limit=50, read_perm_seed, write_perm_seed, read_zipf=0.8,
-//   getnode_zipf=0.625, wlink_zipf=0.741, wnode_zipf=0.606, write_route=owner|random, coh_read_every=16 (log the
+//   getnode_zipf=0.625, wlink_zipf=0.741, wnode_zipf=0.606, write_route=mod|range|random, coh_read_every=16 (log the
 //   OpCoh block of 1 in K OK read responses; every write's), coh_max=8000000 (records kept).
 // id2 (LinkBench ID2Chooser pExist: getlink 0.5, updatelink 0.9, deletelink 0.9, addlink 0.05): with probability
 //   pExist a uniformly chosen slot of id1's build-time list (needs image=), else a uniform node id (a link that almost
@@ -117,8 +120,9 @@ class SocialGraph : public loadgen::Workload {
     seed_ = std::stoull(get("seed", "20261111"));
     rng_.seed(seed_);
     limit_ = uint16_t(std::stoul(get("limit", "50")));
-    route_ = get("write_route", "owner");
-    if (route_ != "owner" && route_ != "random") return *err = "write_route owner|random", false;
+    route_ = get("write_route", "mod");
+    if (route_ == "owner") route_ = "mod";
+    if (route_ != "mod" && route_ != "range" && route_ != "random") return *err = "write_route mod|range|random", false;
     coh_read_every_ = std::max<uint64_t>(1, std::stoull(get("coh_read_every", "16")));
     coh_max_ = std::stoull(get("coh_max", "8000000"));
     sgl::KeyParams kp;
@@ -378,7 +382,8 @@ class SocialGraph : public loadgen::Workload {
       case sgl::kDeleteNode: slot = keys_.node_delete(rng_); break;
       default: keyed = false; break;  // addnode
     }
-    if (keyed && route_ == "owner") r->target = slot % targets_;
+    if (keyed && route_ != "random")  // slot < n_orig (keyed writes address original nodes only)
+      r->target = sg::slot_owner(route_ == "range" ? sg::Route::kRange : sg::Route::kMod, slot, n_, 0, targets_);
     else r->target = targets_ == 1 ? 0 : uint32_t((unsigned __int128)rng_() * targets_ >> 64);
     const uint32_t wseq = ++next_wseq_[r->target];
     if (w <= sgl::kDeleteLink) {

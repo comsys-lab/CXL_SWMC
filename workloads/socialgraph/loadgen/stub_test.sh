@@ -1,6 +1,7 @@
 #!/bin/bash
 # Protocol test of the socialgraph loadgen plugin against two stub servers on Host loopback (own processes only).
 # Run A: rw=100, image= + gen= (id2 from the build-time adjacency), --stats-op 20. Run B: rw=470, no image.
+# Run C: rw=100, no image, write_route=range (stubs check the range owner).
 # Each: --mode fixed, 2 rates, --slo feed:99:10; then checks loadgen rc, sg.txt (mix_ok=1, bad_responses=0,
 # wseq_mismatch=0, id2 source) and the stubs' exit codes (protocol violations, owner routing, w_seq order).
 # usage: stub_test.sh <build dir> <out dir (new)> [graph.img gen.json]
@@ -16,8 +17,8 @@ run() {  # <name> <rw> <port0> [opts...]
   local name=$1 rw=$2 p0=$3; shift 3
   local d=$OUT/$name p1=$((p0 + 1))
   mkdir "$d"
-  "${PIN[@]}" --physcpubind="$CPU_S0" "$B/bin/sg-loadgen-stub" "$p0" 0 2 $N_ORIG $BASE 45 > "$d/stub0.txt" 2>&1 & local s0=$!
-  "${PIN[@]}" --physcpubind="$CPU_S1" "$B/bin/sg-loadgen-stub" "$p1" 1 2 $N_ORIG $BASE 45 > "$d/stub1.txt" 2>&1 & local s1=$!
+  "${PIN[@]}" --physcpubind="$CPU_S0" "$B/bin/sg-loadgen-stub" "$p0" 0 2 $N_ORIG $BASE 45 ${ROUTE:-} > "$d/stub0.txt" 2>&1 & local s0=$!
+  "${PIN[@]}" --physcpubind="$CPU_S1" "$B/bin/sg-loadgen-stub" "$p1" 1 2 $N_ORIG $BASE 45 ${ROUTE:-} > "$d/stub1.txt" 2>&1 & local s1=$!
   sleep 1
   "${PIN[@]}" --physcpubind="$CPU_LG" "$B/loadgen" --workload socialgraph --target 127.0.0.1:$p0,127.0.0.1:$p1 \
     --out "$d/loadgen" --mode fixed --rates 10000,40000 --mix "$("$B/bin/sg-loadgen-mix" "$rw")" --slo feed:99:10 \
@@ -37,5 +38,8 @@ grep -q '^resp.feed .* busy=[1-9]' "$OUT/A/loadgen/sg.txt" || FAIL=1  # stub ans
 [ -z "$IMG" ] || ls "$OUT"/A/loadgen/stats/*.txt > /dev/null 2>&1 || FAIL=1
 run B 470 19341
 grep -q '^id2_from_image=0 .* id2_no_image=[1-9]' "$OUT/B/loadgen/sg.txt" || FAIL=1
+# Run C: write_route=range (stubs check owner = slot / ceil(n_orig / 2), layout.h slot_owner)
+ROUTE=range run C 100 19351 --opt write_route=range
+grep -rqs 'write_route=range' "$OUT/C" || { echo "C: write_route=range not in the plugin description"; FAIL=1; }
 [ $FAIL -eq 0 ] && echo "STUB TEST PASS" || echo "STUB TEST FAIL"
 exit $FAIL

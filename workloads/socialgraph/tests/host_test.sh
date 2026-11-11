@@ -9,11 +9,11 @@
 #   5. sg-seqlock-stress: writer process vs reader process on a copy of the image, SECONDS (default 5)
 #   6. tests/stale_join_test.py (synthetic logs)
 # usage: host_test.sh <build dir (bin/sg-*)> <scratch dir (must not exist)>
-# env: CPUS (default 16-31: Host node 1), SECONDS_STRESS (5), PORT0 (19400)
+# env: CPUS (default 16-31: Host node 1), SECONDS_STRESS (5), PORT0 (19400), ROUTE (mod | range: sg-server --write-route)
 set -euo pipefail
 B=$(cd "$1" && pwd) S=$2
 HERE=$(cd "$(dirname "$0")" && pwd); WL=$(cd "$HERE/.." && pwd); ROOT=$(cd "$WL/../.." && pwd)
-CPUS=${CPUS:-16-31} P0=${PORT0:-19400} SECS=${SECONDS_STRESS:-5}
+CPUS=${CPUS:-16-31} P0=${PORT0:-19400} SECS=${SECONDS_STRESS:-5} ROUTE=${ROUTE:-mod}
 [ -e "$S" ] && { echo "refusing: $S exists"; exit 2; }
 mkdir -p "$S/img" "$S/run"
 S=$(cd "$S" && pwd)
@@ -61,13 +61,17 @@ cleanup() { for p in "${PIDS[@]}"; do kill -TERM "$p" 2>/dev/null || true; done;
 trap cleanup EXIT
 for k in 0 1; do
   taskset -c "$CPUS" "$B/bin/sg-server" --node $k --nodes $NODES --run-id "$RID" --port $((P0 + k)) --query-threads 3 \
-    --stale-dir "$S/run" --stale-every 1 --flush-ms 200 > "$S/node$k.log" 2>&1 &
+    --stale-dir "$S/run" --stale-every 1 --flush-ms 200 --write-route "$ROUTE" > "$S/node$k.log" 2>&1 &
   PIDS+=($!)
 done
 for k in 0 1; do
   for _ in $(seq 120); do grep -q "sg-server: READY" "$S/node$k.log" && break; grep -q FATAL "$S/node$k.log" && { cat "$S/node$k.log"; exit 1; }; sleep 0.5; done
   grep -q "sg-server: READY" "$S/node$k.log" || { echo "node$k not READY"; cat "$S/node$k.log"; exit 1; }
+  # 64 slack slots / 64 pool blocks over 2 writers: 32 each under either route
+  grep -q "^sg-server: write route $ROUTE (slack slots 32, pool blocks 32 owned by this writer)" "$S/node$k.log" \
+    || { echo "node$k: write route line"; grep "write route" "$S/node$k.log"; exit 1; }
 done
+echo "write route $ROUTE: both servers own 32 slack slots + 32 pool blocks"
 taskset -c "$CPUS" "$B/bin/sg-client" selftest 127.0.0.1:$P0 127.0.0.1:$((P0 + 1)) 1 1500 | tee "$S/selftest.log"
 grep -q "selftest PASS" "$S/selftest.log"
 "$B/bin/sg-client" stats 127.0.0.1:$P0 > "$S/stats0.txt"
