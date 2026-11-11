@@ -135,7 +135,9 @@ def load_dir(d):
     return reads, commits
 
 
-def run(d, clock=None, vms=None, windows=None, t_ms=None):
+def prepare(d, clock=None, vms=None):
+    """-> (reads, commits, err_ms, corrected, nodes): entries in Host time (experiments/socialgraph/sg_steps.py joins
+    them once per measured step window; run() below once over all windows)"""
     reads, commits = load_dir(d)
     if not reads and not commits:
         raise SystemExit(f"sg_stale_join: no stale-*.bin files in {d}")
@@ -162,8 +164,13 @@ def run(d, clock=None, vms=None, windows=None, t_ms=None):
 
     R = [(rid, v, host(k, t)) for k, es in reads.items() for rid, v, t in es]
     C = [(rid, v, host(k, t)) for k, es in commits.items() for rid, v, t in es]
+    return R, C, err_ms, corrected, sorted(set(reads) | set(commits))
+
+
+def run(d, clock=None, vms=None, windows=None, t_ms=None):
+    R, C, err_ms, corrected, nodes = prepare(d, clock, vms)
     out = summarize(join(R, C, windows), err_ms, corrected, t_ms)
-    out["nodes"] = sorted(set(reads) | set(commits))
+    out["nodes"] = nodes
     out["commits"] = len(C)
     return out
 
