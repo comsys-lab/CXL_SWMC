@@ -32,10 +32,12 @@ IPS=(); for k in $(seq 0 $((N - 1))); do IPS+=(192.168.122.$((100 + k))); done
 sha() { sha256sum < "$1" | cut -c1-64; }
 PB=$(ab "$SG_PLAIN_BUILD")
 # "<guest path below /home/comsys> <Host file>" lines per install dir
+gdir() { echo "${1#/home/comsys/}"; }   # conf guest dirs are absolute (/home/comsys/sg4); the lines are below /home/comsys
 files_plain() {  # <guest dir> <region file>
+  set -- "$(gdir "$1")" "$2"
   printf '%s %s\n' "$1/bin/sg-server" "$PB/bin/sg-server" "$1/bin/sg-node.sh" "$TREE/scripts/guest/sg-node.sh" "$1/cfg/cxl_region.yaml" "$2"; }
 files_meg() {  # <guest dir> <build> <yaml>
-  local f; printf '%s %s\n' "$1/bin/sg-server" "$2/bin/sg-server" "$1/bin/sg-node.sh" "$TREE/scripts/guest/sg-node.sh" \
+  local f; set -- "$(gdir "$1")" "$2" "$3"; printf '%s %s\n' "$1/bin/sg-server" "$2/bin/sg-server" "$1/bin/sg-node.sh" "$TREE/scripts/guest/sg-node.sh" \
     "$1/cfg/cxl_region.yaml" "$(ab "$REGION")" "$1/cfg/megalon.yaml" "$3"
   for f in libmegalon-objapi.so libmegalon.so libtbb.so.12 libtbbmalloc.so.2 libhwloc.so.15 libatomic.so.1; do printf '%s %s\n' "$1/lib/$f" "$2/lib/$f"; done; }
 ALL=$(files_plain "$SG_VPLAIN" "$(ab "$REGION")"; files_plain "$SG_DS_VPLAIN" "$(ab "$SG_DS_REGION")")
