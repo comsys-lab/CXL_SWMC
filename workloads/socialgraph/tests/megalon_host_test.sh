@@ -11,7 +11,8 @@
 # env: CPUS (taskset list, default 18-23,50-55), LAYOUTS ("record chunk:8192 chunk:33554432"), IMAGE (default: the
 #      synthetic graph of tests/host_test.sh), MEG_CFG (Megalon yaml, default systems/megalon/socialgraph-2vm.yaml),
 #      ARENA (object_arena_size, default 1GB), DEVSZ (device file bytes, default 2415919104), STRESS_S (5),
-#      SELFTEST (1; 0 = skip selftest and stress: init + DRAM only), PORT0 (19500), DEVDIR (device file dir, default
+#      SELFTEST (1; 0 = skip the selftest, which needs the synthetic hub's free id2 range), STRESS (1; 0 = skip the
+#      stress), PORT0 (19500), DEVDIR (device file dir, default
 #      the scratch dir), READY_S (seconds to wait for READY, default 300)
 set -euo pipefail
 B=$(cd "$1" && pwd) G=$(cd "$2" && pwd) S=$3
@@ -65,6 +66,8 @@ for spec in $LAYOUTS; do
   for n in 0 1; do grep -E "^(VmHWM|VmRSS|RssAnon|RssFile|RssShmem)" "/proc/${PIDS[$n]}/status" > "$T/node$n.mem"; done
   if [ "${SELFTEST:-1}" = 1 ]; then
     "${RUN[@]}" "$B/bin/sg-client" selftest 127.0.0.1:$PA 127.0.0.1:$PB 1 1500 > "$T/selftest.log" 2>&1 || { cat "$T/selftest.log"; exit 1; }
+  fi
+  if [ "${STRESS:-1}" = 1 ]; then
     "${RUN[@]}" "$B/bin/sg-client" stress 127.0.0.1:$PA 127.0.0.1:$PB 1 3 "$SECS" > "$T/stress.log" 2>&1 || { cat "$T/stress.log"; exit 1; }
     if [ "$L" = chunk ]; then  # the highest-degree list whose primary block is split by a chunk boundary, if any
       SPLIT=$(python3 -I - "$IMG" "$CB" <<'PY'
