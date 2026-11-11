@@ -329,6 +329,7 @@ R=$E/$NAME
 for k in "${!IPS[@]}"; do  # clean stop, no bad frame / protocol errors, staleness log written, op coherence state recorded
   L=$R/node$k.log
   grep -q "sg-server: stopping" $L || stop "$NAME node$k: no clean stop"
+  grep -q "^sg-server: write route $WR " $L || stop "$NAME node$k: server write route != $WR (loadgen write_route=$WR)"
   grep -qx "bad_frames=0" $L && grep -qx "stale.write_errors=0" $L || stop "$NAME node$k: bad frames / staleness log errors"
   { grep -qx "opcoh.read_errors=0" $L && grep -qx "opcoh.register_errors=0" $L; } || stop "$NAME node$k: opcoh errors"
   [ $S != ds ] || [ "$DST" = 0 ] || grep -q "^sg-server: de stijl staleness T=$DST us on the image" $L || stop "$NAME node$k: staleness T=$DST not applied"
