@@ -337,8 +337,14 @@ for k in "${!IPS[@]}"; do  # clean stop, no bad frame / protocol errors, stalene
 done
 RP=$R/slo
 [ -s $RP/loadgen/summary.json ] || stop "$NAME: no loadgen output"
-{ grep -qx "mix_ok=1" $RP/loadgen/sg.txt && grep -qx "bad_responses=0" $RP/loadgen/sg.txt && grep -qx "wseq_mismatch=0" $RP/loadgen/sg.txt; } \
-  || stop "$NAME: loadgen sg.txt mix / protocol check (see $RP/loadgen/sg.txt)"
+# sg.txt: mix_ok on its own line (1 = every op within 0.5 pp, -1 = fewer than 100k requests: not judged); wseq_mismatch and
+# bad_responses share one line ("wseq_mismatch=N bad_responses=N first_bad=...") -> match them as fields, not whole lines
+MIXOK=$(sed -n 's/^mix_ok=//p' $RP/loadgen/sg.txt)
+if [ "$MIXOK" = -1 ] && [ -n "${SG_FIXED_RATE:-}" ]; then
+  echo "$(date -Is) NOTE $NAME: mix not judged (< 100k requests in the fixed smoke window; sg.txt mix_max_abs_pp $(sed -n 's/^mix_max_abs_pp=//p' $RP/loadgen/sg.txt))"
+elif [ "$MIXOK" != 1 ]; then stop "$NAME: loadgen sg.txt mix_ok=$MIXOK (see $RP/loadgen/sg.txt)"; fi
+{ grep -qE '(^| )bad_responses=0( |$)' $RP/loadgen/sg.txt && grep -qE '(^| )wseq_mismatch=0( |$)' $RP/loadgen/sg.txt; } \
+  || stop "$NAME: loadgen sg.txt protocol check (see $RP/loadgen/sg.txt)"
 grep -q 'workload_finish":"ok' $RP/loadgen/summary.json || stop "$NAME: loadgen workload finish"
 note=$(python3 -I -c 'import json,sys; print(json.load(open(sys.argv[1]))["note"])' $RP/loadgen/summary.json 2>/dev/null)
 if [ -n "$note" ]; then

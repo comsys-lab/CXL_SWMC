@@ -226,7 +226,9 @@ class SocialGraph : public loadgen::Workload {
     if (is_write(r.op)) {
       const sg::WriteResp *wr = nullptr;
       sg::WriteResp w{};
-      if (bl >= sizeof(w)) {
+      // the server sends a WriteResp only with status Ok (server.cc write path); a not-found / busy write's body is just
+      // the OpCoh block (finish() appends it to every response), which must not be read as a WriteResp
+      if (h.status == sg::kStatusOk && bl >= sizeof(w)) {
         std::memcpy(&w, b, sizeof(w));
         wr = &w;
         if (w.w_seq != uint32_t(r.seq)) wseq_mismatch_.fetch_add(1);
