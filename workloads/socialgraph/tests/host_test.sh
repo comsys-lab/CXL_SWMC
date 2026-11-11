@@ -80,8 +80,11 @@ python3 -I "$WL/tools/sg_stale_join.py" --dir "$S/run" --json "$S/stale.json" > 
 python3 -I - "$S/stale.json" <<'PY'
 import json, sys
 s = json.load(open(sys.argv[1]))
-assert s["reads"] > 100 and s["commits"] >= 300 and s["nodes"] == [0, 1] and s["commit_order_errors"] == 0, s
-print(f"run staleness logs: {s['reads']} sampled reads, {s['commits']} commits, stale {s['stale']} (HW coherent file)")
+a = s["all"]  # top level = node-slot records, "list" = adjacency lists, "all" = both
+assert a["reads"] > 100 and s["commits"] >= 300 and s["nodes"] == [0, 1] and s["commit_order_errors"] == 0, s
+assert a["reads"] == s["reads"] + s["list"]["reads"] and a["stale"] == s["stale"] + s["list"]["stale"], s
+print(f"run staleness logs: {a['reads']} sampled reads (node {s['reads']}, list {s['list']['reads']}), {s['commits']} commits, "
+      f"stale {a['stale']} (HW coherent file)")
 PY
 # 5. seqlock stress on a copy of the image
 cp "$IMG" "$S/stress.img"

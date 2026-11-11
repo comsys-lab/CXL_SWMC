@@ -11,12 +11,15 @@
 #   SEED, REGION, C8 K8 GT8 RECV_MODE POP_BUNDLE_SHA, PRETOUCH_DIR MEASURE_ENV_DIR MEASURE_PART_DIR, EXPECT_DAX_UUID,
 #   VPLAIN (guest install of the plain build), PLAIN_BUILD, LOADGEN_BUILD, IMAGE_HOST (graph.img on the Host, also read by
 #   the loadgen), GEN_HOST (its gen.json), IMAGE_GUEST (graph.img on vm0's disk), SG_SLO_PART (loadgen SLO arguments,
-#   without --slo), SG_SLO (feed:99:10), SG_READY_TIMEOUT (s), SG_STALE_EVERY, SG_CXLBW (0 | 1);
+#   without --slo), SG_SLO (feed:99:10), SG_READY_TIMEOUT (s), SG_STALE_EVERY, SG_CXLBW (0 | 1),
+#   SG_START_FALLBACK (0 | 1) + SG_START_FALLBACK_RATE (100), SG_WRITE_ROUTE (mod | range);
 #   pmax (pop / ds): SG_PMAX (0 | 1), SG_PMAX_FROM (ds: pop results files, globs), SG_PMAX_WARMUP_S/_MEASURE_S/_DRAIN_S;
 #   De Stijl (ds): DS_C DS_BUNDLE_SHA DS_K DS_GT DS_REGION DS_T_US (T in us; the doc's T = 1000 ms -> 1000000), DS_RECV_EXTRA;
 #   Megalon (mgc = 32 MiB chunks, mgr = one object per record): MEG_BUILD (builds/socialgraph-megalon/1-n<N>), MEG_LIB,
 #   MEG_CFG (systems/megalon/socialgraph-<N>vm[-record].yaml), VMEG (guest install of the Megalon build), MEG_LAYOUT
 #   (record | chunk), MEG_CHUNK_BYTES (33554432).
+# Max RPS under SLO (doc §2) = sg-results.tsv confirm_x_mean (= max_feed_rps_under_slo when confirmed): completed feed
+#   queries / s summed over the VMs (loadgen --x-stream feed), NOT max_offered_x_pass (total offered requests / s).
 # Outputs: E/sg-results.tsv (one row), E/<sys>-<mix>-n<N>/ (sg-run.sh run dir: slo/, pmax/, stale/, clock-offset.tsv),
 #   E/<name>/steps.csv (sg_steps.py: the doc's §2 columns), E/<name>/stale.json (whole-search join), E/block.log, ...
 set -uo pipefail
@@ -50,6 +53,12 @@ PMON=${SG_PMAX:-0} PMFROM=${SG_PMAX_FROM:-} PMW=${SG_PMAX_WARMUP_S:-15} PMM=${SG
 [[ $PMON =~ ^[01]$ ]] && [[ $PMW =~ ^[0-9]+$ ]] && [[ $PMM =~ ^[1-9][0-9]*$ ]] && [[ $PMD =~ ^[0-9]+$ ]] || die "bad SG_PMAX*"
 FIXR=${SG_FIXED_RATE:-}
 [ -z "$FIXR" ] || { [[ $FIXR =~ ^[1-9][0-9]*$ ]] && [[ ${SG_FIXED_S:-60} =~ ^[1-9][0-9]*$ ]]; } || die "bad SG_FIXED_RATE / SG_FIXED_S"
+# SG_START_FALLBACK (methodology pending the user; default 0 = off): slo ramp failing at --start -> rerun once from
+# SG_START_FALLBACK_RATE (100). SG_WRITE_ROUTE (pending; default mod): loadgen write_route and sg-server --write-route
+# (mod: owner = slot % N; range: contiguous slot ranges per VM, layout.h slot_owner); always the same value on both sides.
+SFB=${SG_START_FALLBACK:-0} SFBR=${SG_START_FALLBACK_RATE:-100} WR=${SG_WRITE_ROUTE:-mod}
+[[ $SFB =~ ^[01]$ ]] && [[ $SFBR =~ ^[1-9][0-9]*$ ]] || die "bad SG_START_FALLBACK / SG_START_FALLBACK_RATE"
+[[ $WR =~ ^(mod|range)$ ]] || die "bad SG_WRITE_ROUTE $WR (mod | range)"
 CXLBW=${SG_CXLBW:-0} RDYT=${SG_READY_TIMEOUT:-900} STE=${SG_STALE_EVERY:-1000}
 [[ $CXLBW =~ ^[01]$ ]] && [[ $RDYT =~ ^[1-9][0-9]*$ ]] && [[ $STE =~ ^[1-9][0-9]*$ ]] || die "bad SG_CXLBW / SG_READY_TIMEOUT / SG_STALE_EVERY"
 KEXP=$K8 DST=0 DSRX=${DS_RECV_EXTRA:-} DSFP=0
@@ -86,7 +95,7 @@ for f in "$HOSTSRV" "$LOADGEN" "$MIXB" "$IMAGE_HOST" "$GEN_HOST" "$EX/sg-run.sh"
   "$TREE/scripts/guest/sg-node.sh" "$TREE/workloads/socialgraph/tools/sg_stale_join.py"; do [ -e "$f" ] || die "missing $f"; done
 LMIX=$("$MIXB" "$RW") || die "sg-loadgen-mix $RW"
 # server arguments (plain: one per VM, 3 query threads + 1 writer at 4 vCPU = online CPUs - 1)
-SA="--nodes $N --query-threads $((VCPU - 1)) --start-timeout-ms $((RDYT * 1000))"
+SA="--nodes $N --query-threads $((VCPU - 1)) --start-timeout-ms $((RDYT * 1000)) --write-route $WR"
 APP=$("$HOSTSRV" $SA --print-app-bytes) || die "print-app-bytes ($HOSTSRV, --nodes $N)"
 RING=$(grep -E '^msg_ring:' "$REGION" | sed 's/.*,[[:space:]]*\([0-9]*\)\].*/\1/')
 [ $((APP + ${RING:-0})) -lt 268435456 ] || die "app HWcc $APP B + ring $RING B exceed the 256 MiB HWcc budget"
@@ -213,6 +222,7 @@ gate() { bash "$HG" check "$E/gate-$1.txt" > /dev/null || stop "h3 gate ($1; see
   echo "image_host=$IMAGE_HOST bytes=$(stat -c %s "$IMAGE_HOST") gen=$GEN_HOST sha256=$(sha256sum < "$GEN_HOST" | cut -c1-64) image_guest=$IMAGE_GUEST"
   [[ $S != mg* ]] || echo "megalon_build=$MEG_BUILD lib=$MEG_LIB cfg=$MEG_CFG sha256=$(sha256sum < "$MEG_CFG" | cut -c1-64) vmeg=$VMEG layout=$MEG_LAYOUT"
   echo "slo=$SG_SLO slo_part=[$SG_SLO_PART] mix=[$LMIX] stale_every=$STE pmax=$PMON from=[$PMFROM]"
+  echo "start_fallback=$SFB start_fallback_rate=$SFBR write_route=$WR (loadgen --opt write_route + sg-server --write-route)"
   echo "receiver: pop_recv_mode=$PRM pop_adapt_ko=${POP_ADAPT_KO:--} pop_srcversion=$POPSV ds_recv_mode=$RECV_MODE ds_extra=[$DSRX] ipoll=${IPOLL:-default} $(recv_wsm_desc)"
   [ $S != ds ] || echo "destijl: bundle=$DS_C bundle_sha=$DS_BUNDLE_SHA release=$DS_K guest_tools=$DS_GT region=$REGION t_us=$DST"
   for d in "${DOMS[@]}"; do x=$(virsh -c qemu:///system dumpxml --inactive "$d" 2>/dev/null); echo "vm_xml_sha256.$d=$(printf '%s' "$x" | sha256sum | cut -c1-64)"; done
@@ -291,7 +301,8 @@ sys_down() {
   esac
 }
 # ---- the lifetime
-LGA=(--mix "$LMIX" --opt rw=$RW --opt image=$IMAGE_HOST --opt gen=$GEN_HOST --opt seed=$SEED --seed $SEED --x-stream feed --raw)
+# --x-stream feed: the search's x (and summary confirm_x_mean = max RPS under SLO) is completed feed queries / s
+LGA=(--mix "$LMIX" --opt rw=$RW --opt image=$IMAGE_HOST --opt gen=$GEN_HOST --opt seed=$SEED --opt write_route=$WR --seed $SEED --x-stream feed --raw)
 PARTSV=slo PMX=() SLOARGS="--slo $SG_SLO $SG_SLO_PART"
 if [ -n "$FIXR" ]; then  # smoke: one fixed rate instead of the SLO search (part name stays slo; no pmax step)
   SLOARGS="--slo $SG_SLO --mode fixed --rates $FIXR --warmup-s 10 --step-warmup-s 3 --step-measure-s ${SG_FIXED_S:-60} --drain-s 5"
@@ -305,7 +316,7 @@ elif [ $PMON = 1 ] && [[ $S =~ ^(pop|ds)$ ]]; then
 fi
 RE=(SYSTEM=$SYSL V=$V HOST_SERVER=$SRV LOADGEN=$LOADGEN "SERVER_ARGS=${MGSA:-$SA}" "NODE0_ARGS=$NODE0_ARGS" "NODE_ENV=$NENV" "NODE0_ENV=$N0ENV"
   "NODES=${IPS[*]}" READY_TIMEOUT=$RDYT STATS_OP=20 STALE_EVERY=$STE "PARTS=$PARTSV" H1_MEASURE_RUN=1 MEASURE_PART_DIR=$MEASURE_PART_DIR
-  "PART_ARGS_slo=$SLOARGS" "PART_GATE_CMD=bash $HG check" "${PMX[@]}")
+  "PART_ARGS_slo=$SLOARGS" "PART_GATE_CMD=bash $HG check" START_FALLBACK=$SFB START_FALLBACK_RATE=$SFBR "${PMX[@]}")
 gate $NAME; sys_up
 servers_gone || stop "an sg-server runs before $NAME"
 log "$NAME: sg-run.sh parts [$PARTSV] ($SYSL, $MIX, N=$N)"
@@ -339,20 +350,26 @@ elif [ $rc != 0 ]; then
   [ "$src" = 0 ] && [ "$PARTSV" != slo ] || stop "$NAME: sg-run.sh rc $rc"
   log "$NAME NOTE: pmax part rc != 0 (the SLO row stands; see $R/pmax)"
 fi
-# staleness over the whole search (stale.json) and the per-step CSV of the doc (§2 columns)
+# staleness over the whole search (stale.json: top level + pass = node-slot records; "list" = adjacency lists with the
+# straddled-page caveat; "all"; --system flags hw / pop within-error ages as clock noise) and the per-step CSV (§2 columns)
 TMS=$(python3 -I -c 'import sys; print(int(sys.argv[1]) / 1000.0)' "$DST")
 python3 -I -B $TREE/workloads/socialgraph/tools/sg_stale_join.py --dir $R/stale --clock $R/clock-offset.tsv \
-  $(for k in "${!IPS[@]}"; do printf -- '--vm %s=%s ' $k ${IPS[$k]}; done) --t-ms $TMS --json $R/stale.json > /dev/null 2> $R/stale.err \
+  $(for k in "${!IPS[@]}"; do printf -- '--vm %s=%s ' $k ${IPS[$k]}; done) --t-ms $TMS --system $S --json $R/stale.json > /dev/null 2> $R/stale.err \
   || log "$NAME NOTE: stale join failed (see $R/stale.err)"
 python3 -I -B $EX/sg_steps.py steps --run-dir $R --system $S --nodes $N --mix $MIX --run $EVAL_RUN --t-ms $TMS $(for k in "${!IPS[@]}"; do printf -- '--vm %s=%s ' $k ${IPS[$k]}; done) \
   ${CXLBW:+$([ $CXLBW = 1 ] && echo "--cxlbw $E/cxlbw")} --out $R/steps.csv > $R/steps.log 2>&1 || log "$NAME NOTE: sg_steps.py failed (see $R/steps.log)"
-printf '# name\tsystem\tmix\tnodes\tvcpus_per_vm\tmax_offered_x_pass\tconfirm_x_mean\tconfirmed\tnote\trun_dir\tstale_pass\n' > "$E/sg-results.tsv"
+# sg-results.tsv: MAX RPS UNDER SLO (doc §2) = confirm_x_mean = completed feed queries / s summed over the VMs at the
+# confirmed knee (loadgen --x-stream feed), repeated as max_feed_rps_under_slo (empty unless confirmed);
+# max_offered_x_pass = total offered requests / s (all streams) of that step. Columns 1-11 keep their order (pmax-rate reads 6, 8).
+printf '# name\tsystem\tmix\tnodes\tvcpus_per_vm\tmax_offered_x_pass\tconfirm_x_mean\tconfirmed\tnote\trun_dir\tstale_pass\tmax_feed_rps_under_slo\tstart_rate\n' > "$E/sg-results.tsv"
 python3 -I -c 'import json,sys
 s=json.load(open(sys.argv[1])); c=s.get("confirm",{}); f=lambda v: "" if v is None else str(v)
 try: st=json.load(open(sys.argv[7])).get("pass","")
 except Exception: st=""
-print("\t".join(sys.argv[2:7] + [f(s.get("max_offered_x_pass")), f(c.get("x_mean")), f(s.get("confirmed")), s.get("note",""), sys.argv[2] + "/slo", f(st)]))' \
-  $RP/loadgen/summary.json "$NAME" $S $MIX $N $VCPU $R/stale.json >> "$E/sg-results.tsv"
+mx=c.get("x_mean") if s.get("confirmed") else None
+print("\t".join(sys.argv[2:7] + [f(s.get("max_offered_x_pass")), f(c.get("x_mean")), f(s.get("confirmed")), s.get("note",""), sys.argv[2] + "/slo", f(st), f(mx), sys.argv[8]]))' \
+  $RP/loadgen/summary.json "$NAME" $S $MIX $N $VCPU $R/stale.json "$(sed -n 's/^slo_start_rate=//p' $R/manifest.txt | tail -n 1)" >> "$E/sg-results.tsv"
+log "$NAME: max RPS under SLO (feed completions/s, confirm_x_mean) = $(grep -v '^#' "$E/sg-results.tsv" | cut -f12) (confirmed $(grep -v '^#' "$E/sg-results.tsv" | cut -f8))"
 dmesg_check $NAME || stop "$NAME: dmesg check"
 [ $OWNED = root ] || { dax_owner root || stop "dax0.0 back to root"; OWNED=root; }
 log "== PT pretouch check (end)"

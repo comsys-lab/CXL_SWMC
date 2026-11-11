@@ -15,7 +15,9 @@
 #   READY_TIMEOUT (s, default 600), STATS_OP (20 = proto.h kOpStats; 0 = off), STALE_EVERY (1000: 1 in 1000 records read),
 #   CLOCK_PERIOD_S (30), PART_GATE_CMD (word-split command, called with a gate file before every later part, when
 #   H1_MEASURE_RUN=1), PART_RATE_CMD (word-split, called with the part name; its stdout replaces @RATE@ in PART_ARGS_<p>;
-#   "skip" = part skipped), H1_MEASURE_RUN (1 = loadgen inside measure.slice through scripts/host/measure-run.sh).
+#   "skip" = part skipped), H1_MEASURE_RUN (1 = loadgen inside measure.slice through scripts/host/measure-run.sh),
+#   START_FALLBACK (0 default | 1: when the slo part fails at its --start rate, rerun it once with --start
+#   START_FALLBACK_RATE (100); first attempt kept as slo-start<rate>/; manifest part_slo_start_fallback= / slo_start_rate=).
 # Rules as vectordb/run.sh: a part whose loadgen rc != 0 stops the lifetime unless its note is the SLO search's
 # "confirm failed at three rates" or (slo part) "the start rate already violates the SLO"; exit 1 if any part rc != 0.
 set -euo pipefail
@@ -91,6 +93,22 @@ CONFIRM_NOTE="confirm failed at three rates; the knee is noisy (longer --confirm
 START_NOTE="the start rate already violates the SLO; lower --start"
 LGL=(); [ "${H1_MEASURE_RUN:-0}" = 1 ] && LGL=(bash "$ROOT/scripts/host/measure-run.sh" --)
 echo "loadgen_launcher=${LGL[*]:-direct}" >> "$RUN/manifest.txt"
+START_FALLBACK=${START_FALLBACK:-0} START_FALLBACK_RATE=${START_FALLBACK_RATE:-100} FB_DIR=
+[[ $START_FALLBACK =~ ^[01]$ ]] && [[ $START_FALLBACK_RATE =~ ^[1-9][0-9]*(\.[0-9]+)?$ ]] || { echo "bad START_FALLBACK / START_FALLBACK_RATE"; exit 2; }
+echo "start_fallback=$START_FALLBACK start_fallback_rate=$START_FALLBACK_RATE" >> "$RUN/manifest.txt"
+start_of() { local i; for i in "${!PA[@]}"; do [ "${PA[$i]}" != --start ] || { echo "${PA[$((i + 1))]:--}"; return; }; done; echo -; }
+run_part() {  # one loadgen invocation of part $p into $PR (PA = its arguments; "$@" = the common loadgen args) -> rc
+  mkdir "$PR"
+  echo "part_$p=start $(date -Is) args=${PA[*]}" >> "$RUN/manifest.txt"
+  cpu_snap before "$PR/guest-cpu.txt"
+  set +e
+  "${LGL[@]}" numactl --physcpubind="$LG_CPUS" --membind=1 "$LOADGEN" --workload socialgraph --target "$TARGETS" --out "$PR/loadgen" \
+    "${LG_STATS[@]}" "$@" "${PA[@]}" 2>&1 | tee "$PR/loadgen.log"
+  rc=${PIPESTATUS[0]}
+  set -e
+  cpu_snap after "$PR/guest-cpu.txt"
+  echo "part_${p}_loadgen_rc=$rc end=$(date -Is)" >> "$RUN/manifest.txt"
+}
 LG=0 PREV=
 for p in $PARTS; do
   [[ $p =~ ^[a-z0-9]+$ ]] || { echo "bad part name $p"; false; }
@@ -105,19 +123,29 @@ for p in $PARTS; do
   if [ -n "$PREV" ] && [ "${H1_MEASURE_RUN:-0}" = 1 ] && [ -n "${PART_GATE_CMD:-}" ]; then
     $PART_GATE_CMD "$OUT/gate-$NAME-$p.txt" || { echo "part $p: gate failed (see $OUT/gate-$NAME-$p.txt)"; false; }
   fi
-  PR=$RUN/$p; mkdir "$PR"
-  echo "part_$p=start $(date -Is) args=${PA[*]}" >> "$RUN/manifest.txt"
-  cpu_snap before "$PR/guest-cpu.txt"
-  set +e
-  "${LGL[@]}" numactl --physcpubind="$LG_CPUS" --membind=1 "$LOADGEN" --workload socialgraph --target "$TARGETS" --out "$PR/loadgen" \
-    "${LG_STATS[@]}" "$@" "${PA[@]}" 2>&1 | tee "$PR/loadgen.log"
-  rc=${PIPESTATUS[0]}
-  set -e
-  cpu_snap after "$PR/guest-cpu.txt"
-  echo "part_${p}_loadgen_rc=$rc end=$(date -Is)" >> "$RUN/manifest.txt"
+  PR=$RUN/$p
+  [ "$p" != slo ] || echo "slo_start_rate=$(start_of)" >> "$RUN/manifest.txt"
+  run_part "$@"
+  note=
+  [ $rc = 0 ] || note=$(python3 -I -c 'import json,sys; print(json.load(open(sys.argv[1])).get("note", ""))' "$PR/loadgen/summary.json" 2>/dev/null || true)
+  if [ $rc != 0 ] && [ "$p" = slo ] && [ "$START_FALLBACK" = 1 ] && [ -z "$FB_DIR" ] && [ "$note" = "$START_NOTE" ] && [ "$(start_of)" != - ]; then
+    # START_FALLBACK (default off, methodology pending the user): the ramp failed at its start rate -> this part is rerun
+    # ONCE in the same server lifetime from START_FALLBACK_RATE; the first attempt stays as slo-start<rate>/ (kept, own
+    # stats-steps.csv), the rerun is slo/ (the part every consumer reads); both recorded in manifest.txt
+    s0=$(start_of) FB_DIR=slo-start$(start_of)
+    mv "$PR" "$RUN/$FB_DIR"
+    for i in "${!PA[@]}"; do [ "${PA[$i]}" != --start ] || PA[$((i + 1))]=$START_FALLBACK_RATE; done
+    echo "part_slo_start_fallback=$(date -Is) start=$s0 failed (note: $note): first attempt moved to $FB_DIR/, rerun once with --start $START_FALLBACK_RATE (START_FALLBACK=1)" >> "$RUN/manifest.txt"
+    echo "slo_start_rate=$START_FALLBACK_RATE" >> "$RUN/manifest.txt"
+    if [ "${H1_MEASURE_RUN:-0}" = 1 ] && [ -n "${PART_GATE_CMD:-}" ]; then
+      $PART_GATE_CMD "$OUT/gate-$NAME-slo-fallback.txt" || { echo "part slo fallback: gate failed (see $OUT/gate-$NAME-slo-fallback.txt)"; false; }
+    fi
+    run_part "$@"
+    note=
+    [ $rc = 0 ] || note=$(python3 -I -c 'import json,sys; print(json.load(open(sys.argv[1])).get("note", ""))' "$PR/loadgen/summary.json" 2>/dev/null || true)
+  fi
   if [ $rc != 0 ]; then
     LG=$rc
-    note=$(python3 -I -c 'import json,sys; print(json.load(open(sys.argv[1])).get("note", ""))' "$PR/loadgen/summary.json" 2>/dev/null || true)
     [ "$note" = "$CONFIRM_NOTE" ] || { [ "$p" = slo ] && [ "$note" = "$START_NOTE" ]; } || { echo "part $p: loadgen rc=$rc ($note): lifetime stopped"; break; }
   fi
   PREV=$p
@@ -127,7 +155,7 @@ collect
 clock_stop
 host_check after
 echo "end=$(date -Is) loadgen_rc=$LG" >> "$RUN/manifest.txt"
-for p in $PARTS; do
+for p in $PARTS $FB_DIR; do
   [ -s "$RUN/$p/loadgen/steps.jsonl" ] || continue
   [ ! -d "$RUN/$p/loadgen/stats" ] || python3 -I "$ROOT/experiments/loadgen/stats_delta.py" "$RUN/$p/loadgen" --out "$RUN/$p/stats-steps.csv" || true
 done

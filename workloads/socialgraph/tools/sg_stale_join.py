@@ -20,16 +20,34 @@ Formulas
                 version newer than the one read); stale iff c exists and t_h(c) <= t_h(read); age = t_h(read) - t_h(c),
                 0 for a fresh read (versions are committed in increasing order per record, so no newer version was
                 committed before the read when c was not)
-  stale_frac    stale reads / reads; stale_age_{p50,p99,max}_ms over the stale reads (nearest rank; RecSys convention),
-                stale_age_p99_all_ms over all reads (fresh = 0)
+  stale_frac    stale reads / reads
+  stale_age_p50_ms, stale_age_p99_ms, stale_age_max_ms   over the STALE reads only (nearest rank; RecSys convention)
+  stale_age_p99_all_ms   p99 over ALL reads (fresh reads count as age 0)
   offset_err_ms bound of the clock correction error between two VMs: the two largest per-VM max(rtt_ms / 2) (0 uncorrected)
+  stale_within_err       stale reads with age <= offset_err_ms (indistinguishable from clock error);
+                stale_beyond_err = stale - stale_within_err. With --system hw | pop (coherent: no read can be stale)
+                clock_noise_flag = 1 and the within-error ages are clock noise, not staleness (doc §2)
   pass          with --t-ms T: stale_age_max_ms <= T + offset_err_ms
-usage: python3 -I sg_stale_join.py --dir D [--clock TSV ...] [--vm K=IP ...] [--windows TSV] [--t-ms T] [--json OUT]
+Record kinds (rid >> 40, server backend.h): 1 node slot, 2 adjacency list. The top-level fields (and pass) are over
+NODE-SLOT records only: a 128 B node slot never straddles a page, whereas 48 % of primary adjacency blocks straddle a
+4 KiB page, so on a De Stijl replica a list header and a slot page of different ages can pass the seqlock and the version
+read does not date every byte of the list. "list" holds the adjacency-list summary (reported with that caveat, no pass),
+"all" the summary over every record (doc §2 "Observed staleness"; verifier M3).
+usage: python3 -I sg_stale_join.py --dir D [--clock TSV ...] [--vm K=IP ...] [--windows TSV] [--t-ms T] [--system S]
+       [--json OUT]
 """
 import argparse, bisect, csv, glob, json, math, os, struct, sys
 
 HDR = struct.Struct("<8sIIQQ")
 ENT = struct.Struct("<QQQ")
+KIND_NODE, KIND_LIST = 1, 2  # server/backend.h kRidNode / kRidList (rid = kind << 40 | slot)
+COHERENT = ("hw", "pop")     # systems whose stale ages within the clock error are clock noise (doc §2)
+LIST_CAVEAT = ("adjacency lists: a header and a straddled slot page of a De Stijl replica can be of different ages "
+               "(48 % of primary blocks straddle a 4 KiB page); not used for the pass")
+
+
+def kind_of(rid):
+    return rid >> 40
 
 
 def read_log(path, magic):
@@ -72,7 +90,8 @@ def pct(xs, p):  # nearest rank on a sorted list
 
 
 def join(reads, commits, windows=None):
-    """reads / commits: [(rid, version, t_host_ns)] -> dict of counts and ages (ns)"""
+    """reads / commits: [(rid, version, t_host_ns)] -> dict of counts and ages (ns) over all records, plus "kinds":
+    {kind: {reads, stale, ages}} per record kind (rid >> 40). Commits match reads by rid, so kinds never mix."""
     by = {}
     for rid, v, t in commits:
         by.setdefault(rid, []).append((v, t))
@@ -95,10 +114,13 @@ def join(reads, commits, windows=None):
 
     n = stale = 0
     ages = []
+    kinds = {}
     for rid, v, t in reads:
         if not measured(t):
             continue
         n += 1
+        k = kinds.setdefault(kind_of(rid), {"reads": 0, "stale": 0, "ages": []})
+        k["reads"] += 1
         if rid not in idx:
             continue
         vs, ts = idx[rid]
@@ -106,18 +128,33 @@ def join(reads, commits, windows=None):
         if i < len(vs) and ts[i] <= t:
             stale += 1
             ages.append(t - ts[i])
+            k["stale"] += 1
+            k["ages"].append(t - ts[i])
     ages.sort()
-    return dict(reads=n, stale=stale, ages=ages, commit_order_errors=order_errors)
+    for k in kinds.values():
+        k["ages"].sort()
+    return dict(reads=n, stale=stale, ages=ages, commit_order_errors=order_errors, kinds=kinds)
 
 
-def summarize(j, err_ms, corrected, t_ms=None):
+def summarize(j, err_ms, corrected, t_ms=None, kind=None, system=None):
+    """summary of join() result j over every record (kind None) or one record kind (KIND_NODE / KIND_LIST).
+    stale_age_p50/p99/max_ms over the stale reads only (RecSys convention); stale_age_p99_all_ms over all reads."""
+    if kind is not None:
+        s = j.get("kinds", {}).get(kind, {"reads": 0, "stale": 0, "ages": []})
+        j = dict(s, commit_order_errors=j["commit_order_errors"])
     ages = j["ages"]
     all_ages = [0] * (j["reads"] - j["stale"]) + ages  # sorted: zeros first
     ms = lambda x: None if x is None else x / 1e6
+    within = bisect.bisect_right(ages, err_ms * 1e6)  # stale ages <= the clock-correction error bound
     out = dict(reads=j["reads"], stale=j["stale"], stale_frac=(j["stale"] / j["reads"]) if j["reads"] else None,
                stale_age_p50_ms=ms(pct(ages, 50)), stale_age_p99_ms=ms(pct(ages, 99)),
                stale_age_max_ms=ms(ages[-1]) if ages else 0.0, stale_age_p99_all_ms=ms(pct(all_ages, 99)),
+               stale_age_p99_over="stale reads only (RecSys convention); stale_age_p99_all_ms over all reads",
+               stale_within_err=within, stale_beyond_err=j["stale"] - within,
                clock_corrected=int(corrected), offset_err_ms=err_ms, commit_order_errors=j["commit_order_errors"])
+    if system is not None:
+        out["system"] = system
+        out["clock_noise_flag"] = int(system in COHERENT)  # 1: within-error stale ages are clock noise
     if t_ms is not None:
         out["t_ms"] = t_ms
         out["pass"] = int(out["stale_age_max_ms"] <= t_ms + err_ms)
@@ -167,9 +204,15 @@ def prepare(d, clock=None, vms=None):
     return R, C, err_ms, corrected, sorted(set(reads) | set(commits))
 
 
-def run(d, clock=None, vms=None, windows=None, t_ms=None):
+def run(d, clock=None, vms=None, windows=None, t_ms=None, system=None):
+    """top level = node-slot records (pass included); "list" = adjacency lists (caveat, no pass); "all" = every record"""
     R, C, err_ms, corrected, nodes = prepare(d, clock, vms)
-    out = summarize(join(R, C, windows), err_ms, corrected, t_ms)
+    j = join(R, C, windows)
+    out = summarize(j, err_ms, corrected, t_ms, kind=KIND_NODE, system=system)
+    out["records"] = "node slots (kind 1)"
+    out["list"] = summarize(j, err_ms, corrected, None, kind=KIND_LIST, system=system)
+    out["list"]["caveat"] = LIST_CAVEAT
+    out["all"] = summarize(j, err_ms, corrected, None, system=system)
     out["nodes"] = nodes
     out["commits"] = len(C)
     return out
@@ -182,6 +225,7 @@ def main():
     ap.add_argument("--vm", action="append", default=[], help="K=IP")
     ap.add_argument("--windows")
     ap.add_argument("--t-ms", type=float)
+    ap.add_argument("--system", help="hw | pop | ds | mgc | mgr (hw / pop: within-error ages flagged as clock noise)")
     ap.add_argument("--json")
     a = ap.parse_args()
     vms = {int(x.split("=", 1)[0]): x.split("=", 1)[1] for x in a.vm}
@@ -192,7 +236,7 @@ def main():
             f = line.split()
             if len(f) >= 2 and f[0].isdigit():
                 win.append((int(f[0]), int(f[1])))
-    out = run(a.dir, a.clock, vms, win, a.t_ms)
+    out = run(a.dir, a.clock, vms, win, a.t_ms, a.system)
     txt = json.dumps(out, indent=1, sort_keys=True)
     if a.json:
         with open(a.json, "w") as f:
