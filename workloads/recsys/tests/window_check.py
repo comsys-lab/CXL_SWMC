@@ -38,6 +38,8 @@ def main():
     a.add_argument("--region")
     a.add_argument("--swcc-offset", type=int)
     a.add_argument("--late-tol-s", type=float, default=0.05)
+    # catch-up test (publisher slowed down): no timing bound, but every list complete, lists in FIFO order, never early
+    a.add_argument("--catchup", action="store_true")
     o = a.parse_args()
     fails = []
     U = collections.defaultdict(dict)        # win -> gslot -> max seq
@@ -60,6 +62,7 @@ def main():
     late_all = []
     nonempty = 0
     last_pub = {}
+    prev_end = 0      # time of the last publish of the previous non-empty list (FIFO)
     for w in sorted(B):
         bound, n, b = B[w]
         rows = U.get(w, {})
@@ -93,10 +96,13 @@ def main():
         # wall-clock seconds: a row due just before a second boundary and written a little late lands in the next
         # second, so a second may hold up to b + (rows of late_tol_s) publishes
         cap = b + -(-b * int(o.late_tol_s * 1000) // 1000)
-        if max(per_s.values()) > cap:
+        if not o.catchup and max(per_s.values()) > cap:
             fails.append(f"window {w}: a second holds {max(per_s.values())} publishes > budget {b} (+ {cap - b} late)")
-        if max(late) <= o.late_tol_s and pl[-1][3] >= bound + W + int(o.late_tol_s * 1e9):
+        if not o.catchup and max(late) <= o.late_tol_s and pl[-1][3] >= bound + W + int(o.late_tol_s * 1e9):
             fails.append(f"window {w}: last publish after the window end")
+        if pl[0][3] < prev_end:
+            fails.append(f"window {w}: list published before the previous list finished (not FIFO)")
+        prev_end = pl[-1][3]
         late.sort()
         late_all += late
         print(f"window {w}: distinct={n} budget={b}/s published={len(pl)} seconds_used={len(per_s)} "
@@ -109,8 +115,13 @@ def main():
         p99 = late_all[min(len(late_all) - 1, int(0.99 * len(late_all)))]
         print(f"lateness over {len(late_all)} publishes: p50 {late_all[len(late_all) // 2]:.4f} s p99 {p99:.4f} s "
               f"max {late_all[-1]:.4f} s")
-        if p99 > o.late_tol_s:
+        if not o.catchup and p99 > o.late_tol_s:
             fails.append(f"publish lateness p99 {p99:.3f} s > {o.late_tol_s} s")
+        if o.catchup:
+            nl = sum(1 for x in late_all if x > 1.0)
+            print(f"catch-up: {nl} publishes more than 1 s behind schedule")
+            if not nl:
+                fails.append("catch-up: the publisher never fell behind (no publish > 1 s late)")
     extra = set(P) - set(B)
     if extra:
         fails.append(f"publishes of windows without a boundary line: {sorted(extra)}")

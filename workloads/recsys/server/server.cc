@@ -121,6 +121,7 @@ struct Opts {
   uint32_t publish_window_s = 0;  // --publish-window-s W
   uint64_t dram_rows_cap = 0;     // --publish-dram-rows N: DRAM copy capacity in rows (0 = min(total rows, 48M))
   std::string publish_trace;      // --publish-trace FILE: text log of every DRAM update / publish (Host tests only)
+  uint64_t publish_test_delay_ns = 0;  // --publish-test-row-delay-ns N: busy-wait per published row (Host catch-up test only)
 };
 
 struct Conn {
@@ -198,6 +199,9 @@ struct Stats {
   std::atomic<uint64_t> published_rows{0}, publish_sections{0}, publish_lag_ns_sum{0}, publish_lag_n{0},
       publish_lag_ns_max{0}, publish_backlog{0}, publish_queued{0}, window_distinct{0}, publish_window{0},
       publish_carryover{0}, dram_updates{0}, train_dram_hits{0}, publish_start_ns{0};
+  // publish lag histogram: kLagBuckets buckets of W / 64 each (0 .. 2 W) + one overflow bucket (p50 per step from deltas)
+  static constexpr int kLagBuckets = 128;
+  std::atomic<uint64_t> publish_lag_hist[kLagBuckets + 1] = {};
   OpAcc op_publish;
   OpAcc op_query, op_row_update;  // MOT1 v6 Fig 2 (optime.h)
   std::atomic<uint32_t> coh_pc_threads{0}, coh_mg_threads{0};
@@ -1313,6 +1317,7 @@ class Server {
                  o_.publish_window_s, (unsigned long)U, (unsigned long)cap, unsigned(p_.slot_bytes), (unsigned long)slots,
                  dram_index_bytes_ / 1048576.0);
   }
+  uint64_t lag_bucket_ns() const { return std::max<uint64_t>(1, uint64_t(o_.publish_window_s) * 1000000000ull / 64); }
   static uint64_t dram_hash(uint64_t gslot) { return mix64(gslot ^ 0xd7a3c0b1e5ull); }
   int64_t dram_find(const DramMap &m, uint64_t gslot) const {
     const uint64_t want = gslot + 1;
@@ -1519,6 +1524,11 @@ class Server {
     ot.end(&st_.op_publish, 1);
     const uint64_t lag = t > t_upd ? t - t_upd : 0;
     st_.publish_lag_ns_sum += lag, st_.publish_lag_n++;
+    st_.publish_lag_hist[std::min<uint64_t>(Stats::kLagBuckets, lag / lag_bucket_ns())].fetch_add(1, std::memory_order_relaxed);
+    if (o_.publish_test_delay_ns) {  // Host catch-up test only: a slow publisher
+      const uint64_t until = now_ns() + o_.publish_test_delay_ns;
+      while (now_ns() < until) _mm_pause();
+    }
     uint64_t mx = st_.publish_lag_ns_max.load();
     while (lag > mx && !st_.publish_lag_ns_max.compare_exchange_weak(mx, lag)) {
     }
@@ -1545,7 +1555,8 @@ class Server {
       << "\npublish_lag_ns_count=" << st_.publish_lag_n << "\npublish_lag_ns_max=" << st_.publish_lag_ns_max.exchange(0)
       << "\ndram_rows=" << rows << "\ndram_capacity=" << dram_cap_ << "\ndram_index_bytes=" << dram_index_bytes_
       << "\ndram_bytes=" << dram_index_bytes_ + rows * (p_.slot_bytes + 16) << "\ndram_updates=" << st_.dram_updates
-      << "\ntrain_dram_hits=" << st_.train_dram_hits;
+      << "\ntrain_dram_hits=" << st_.train_dram_hits << "\npublish_lag_hist_bucket_ns=" << lag_bucket_ns();
+    for (int i = 0; i <= Stats::kLagBuckets; i++) o << "\npublish_lag_hist.b" << i << "=" << st_.publish_lag_hist[i];
     if (trace_f_) {
       std::lock_guard<std::mutex> g(trace_mu_);
       std::fflush(trace_f_);
@@ -1919,6 +1930,7 @@ int main(int argc, char **argv) {
     else if (a == "--publish-window-s") o.publish_window_s = std::stoul(v());
     else if (a == "--publish-dram-rows") o.dram_rows_cap = std::stoull(v());
     else if (a == "--publish-trace") o.publish_trace = v();
+    else if (a == "--publish-test-row-delay-ns") o.publish_test_delay_ns = std::stoull(v());
     else if (a == "--dim") o.p.dim = std::stoul(v());
     else if (a == "--row-cap") o.p.row_cap = std::stoull(v()), row_cap_set = true;
     else if (a == "--row-div") o.p.row_div = std::stoull(v());
@@ -1962,8 +1974,8 @@ int main(int argc, char **argv) {
     std::fprintf(stderr, "recsys-server: --publish-window-s / --publish-dram-rows / --publish-trace need --update-mode train\n");
     return 2;
   }
-  if (!o.publish_window_s && (o.dram_rows_cap || !o.publish_trace.empty())) {
-    std::fprintf(stderr, "recsys-server: --publish-dram-rows / --publish-trace need --publish-window-s > 0\n");
+  if (!o.publish_window_s && (o.dram_rows_cap || !o.publish_trace.empty() || o.publish_test_delay_ns)) {
+    std::fprintf(stderr, "recsys-server: --publish-dram-rows / --publish-trace / --publish-test-row-delay-ns need --publish-window-s > 0\n");
     return 2;
   }
   if (!o.image.empty() && !o.train) {  // the v6 writer (make_slot) would overwrite v7 records with synthetic v6 rows

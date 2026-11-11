@@ -9,7 +9,8 @@
 # the last published records. Also checks the stats keys of the window mode and torn_rows / update_misses 0.
 # usage: window_host_test.sh <server build dir> <loadgen build dir> <work dir (new)> [plain|megalon]
 # env: PW (3), TRAIN_S (14), ROW_CAP (20000), PORT (27600), UPD_RATE (200), Q_RATE (2), MG_RPO (1), LG_CPUS (22-23),
-#      V7_DATA (workspaces/recsys-data). Run pinned to the Host session CPU set (nice 19, ionice idle).
+#      V7_DATA (workspaces/recsys-data), DELAY_NS (0; > 0 = catch-up test: --publish-test-row-delay-ns, the publisher
+#      falls behind; window_check.py --catchup), DRAIN_MAX_S (180). Run pinned to the Host session CPU set (nice 19, ionice idle).
 set -uo pipefail
 B=$(cd "$1" && pwd); LGB=$(cd "$2" && pwd); WD=$3; BACKEND=${4:-plain}
 HERE=$(cd "$(dirname "$0")" && pwd); W=$(cd "$HERE/.." && pwd); ROOT=$(cd "$W/../.." && pwd); X=$ROOT/experiments/recsys
@@ -24,7 +25,7 @@ python3 -I -B "$HERE/make_test_image.py" --out "$WD/emb.img" --row-cap $ROW_CAP 
 SA="--nodes 2 --row-cap $ROW_CAP --row-div 1 --serve-threads 4 --update-threads 2 --load-threads 4 --verify-rows 1
  --start-timeout-ms 900000 --update-mode train --image $WD/emb.img --model-dense $DATA/v7-ckpt-fp16/dense.bin
  --lr 0.0004 --acc-init -1 --train-batch 8 --train-threads 2 --stale-sample 1 --stale-log $WD/stale-n1.stl
- --publish-window-s $PW --publish-trace $WD/trace-n1.txt"
+ --publish-window-s $PW --publish-trace $WD/trace-n1.txt$([ "${DELAY_NS:-0}" = 0 ] || echo " --publish-test-row-delay-ns $DELAY_NS")"
 SA=$(echo $SA)
 swcc_need=$("$B/bin/recsys-server" $SA --print-layout | sed -n 's/.* swcc_bytes=\([0-9]*\).*/\1/p')
 [ -n "$swcc_need" ] || { echo "HOST TEST FAIL: print-layout"; exit 1; }
@@ -88,7 +89,14 @@ assert int(x["publish_started"])==1 and int(x["dram_rows"])>0 and int(x["publish
 print("stats-steps.csv node 0: published_rows(delta)=%s window_distinct=%s publish_backlog=%s dram_rows=%s" % (x["published_rows"], x["window_distinct"], x["publish_backlog"], x["dram_rows"]))' \
   "$S/train/stats-steps.csv" || bad "stats-steps.csv window columns"
 sleep $((3 * PW + 2))   # the lists of the last windows with updates drain (no updates now)
-python3 "$X/stats_snap.py" 127.0.0.1:$PORT "$WD/final-n0.txt" > /dev/null || bad "stats node 0"
+# catch-up (DELAY_NS > 0): the slow publisher may still hold queued rows; wait until none is queued (bounded)
+for i in $(seq 1 $(( ${DRAIN_MAX_S:-180} / 2 ))); do
+  python3 "$X/stats_snap.py" 127.0.0.1:$PORT "$WD/final-n0.txt" > /dev/null || bad "stats node 0"
+  [ "$(sed -n 's/^publish_queued=//p' "$WD/final-n0.txt")" = 0 ] && break
+  [ $i = 1 ] && echo "catch-up: $(grep -h '^publish_queued=\|^publish_backlog=\|^publish_carryover_rows=' "$WD/final-n0.txt" | tr '\n' ' ')"
+  sleep 2
+done
+sleep $((PW + 1)); python3 "$X/stats_snap.py" 127.0.0.1:$PORT "$WD/final-n0.txt" > /dev/null || bad "stats node 0"
 SESSION_LOCAL=1 bash "$X/session.sh" stop "$S"; rc=$?
 [ $rc = 0 ] || bad "stop rc $rc"
 kv() { sed -n "s/^$1=//p" "$2" | tail -1; }
@@ -106,6 +114,11 @@ grep -q "^recsys-server: publishing started" "$S/node0.log" || bad "no 'publishi
 grep -h "^recsys-server: publish window\|^recsys-server: publishing started\|^recsys-server: windowed" "$S/node0.log"
 grep -h "^published_rows=\|^dram_rows=\|^dram_bytes=\|^dram_updates=\|^train_dram_hits=\|^rows_written=\|^publish_lag_ns_sum=\|^publish_lag_ns_count=\|^publish_sections=\|^megalon.write_sections=" "$S/node0.log"
 CK=(--trace "$WD/trace-n0.txt" --W "$PW" --image "$WD/emb.img" --stale1 "$WD/stale-n1.stl")
+if [ "${DELAY_NS:-0}" != 0 ]; then
+  CK+=(--catchup)
+  c=$(sed -n 's/^publish_carryover_rows=//p' "$WD/final-n0.txt"); [ "${c:-0}" -gt 0 ] || bad "catch-up: no row carried over (publisher never fell behind)"
+  echo "catch-up: publish_carryover_rows=$c (rows still queued when a later list arrived)"
+fi
 if [ "$BACKEND" = plain ]; then
   off=$(sed -n 's/.*plain swcc_offset=\([0-9]*\).*/\1/p' "$S/node0.log" | head -1)
   [ -n "$off" ] || bad "no swcc_offset in node0.log"
