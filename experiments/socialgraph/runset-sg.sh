@@ -79,7 +79,8 @@ case $S in
       [[ $SG_DS_K == *-ds-destijl-7 ]] && plan "SG_DS_* are the build-7 placeholders (a chain resolves them to the build-10 bundle)";;
   mgc|mgr)
     x() { local v=SG_MG_$1_N$N; echo "${!v:-}"; }
-    if [ $S = mgr ]; then CFG=$SG_MG_CFG_REC_N2 VM=$SG_VMEG_REC_N2 LAY=record; else CFG=$(x CFG) VM=$(x VMEG) LAY=chunk; fi
+    vv=SG_VMEG_N$N   # guest dir keys are SG_VMEG_N<N> in socialgraph.conf (not SG_MG_VMEG_N<N>)
+    if [ $S = mgr ]; then CFG=$SG_MG_CFG_REC_N2 VM=$SG_VMEG_REC_N2 LAY=record; else CFG=$(x CFG) VM=${!vv:-} LAY=chunk; fi
     BENV+=(MEG_BUILD=$(ab "$(x BUILD)") MEG_LIB=$(ab "$(x LIB)") MEG_CFG=$(ab "$CFG") VMEG=$VM MEG_LAYOUT=$LAY MEG_CHUNK_BYTES=$SG_MG_CHUNK_BYTES);;
 esac
 n=${VER:-1}; NAMEB=$EVIDENCE_NAME; NAMEB=${NAMEB//\{SYS\}/$S}; NAMEB=${NAMEB//\{MIX\}/$MIX}; NAMEB=${NAMEB//\{N\}/$N}; NAMEB=${NAMEB//\{RUN\}/$K}
