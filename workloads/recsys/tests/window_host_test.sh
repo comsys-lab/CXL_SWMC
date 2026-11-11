@@ -91,9 +91,9 @@ print("stats-steps.csv node 0: published_rows(delta)=%s window_distinct=%s publi
 sleep $((3 * PW + 2))   # the lists of the last windows with updates drain (no updates now)
 # catch-up (DELAY_NS > 0): the slow publisher may still hold queued rows; wait until none is queued (bounded)
 for i in $(seq 1 $(( ${DRAIN_MAX_S:-180} / 2 ))); do
-  python3 "$X/stats_snap.py" 127.0.0.1:$PORT "$WD/final-n0.txt" > /dev/null || bad "stats node 0"
-  [ "$(sed -n 's/^publish_queued=//p' "$WD/final-n0.txt")" = 0 ] && break
-  [ $i = 1 ] && echo "catch-up: $(grep -h '^publish_queued=\|^publish_backlog=\|^publish_carryover_rows=' "$WD/final-n0.txt" | tr '\n' ' ')"
+  python3 "$X/stats_snap.py" 127.0.0.1:$PORT "$WD/drain-$i-n0.txt" > /dev/null || bad "stats node 0 (drain $i)"
+  [ "$(sed -n 's/^publish_queued=//p' "$WD/drain-$i-n0.txt")" = 0 ] && break
+  [ $i = 1 ] && echo "catch-up: $(grep -h '^publish_queued=\|^publish_backlog=\|^publish_carryover_rows=' "$WD/drain-$i-n0.txt" | tr '\n' ' ')"
   sleep 2
 done
 sleep $((PW + 1)); python3 "$X/stats_snap.py" 127.0.0.1:$PORT "$WD/final-n0.txt" > /dev/null || bad "stats node 0"

@@ -148,10 +148,13 @@ def main():
             node_inval = delta(b1, e1, 'sys.swmc.instr.serve.unmap_ns') + delta(b1, e1, 'sys.swmc.instr.serve.mkclean_ns')
             r['node1_tlb_irqs_per_query'] = round(delta(b1, e1, 'irq.TLB') / q, 2) if q else ''
             r['node1_recv_cpu_ticks'] = sum_prefix(b1, e1, 'kthr.cxl_recv', '.cpu_ticks')
-            u = 'thr.rs-update.swmc.'
-            r['upd_sm_wpu_fault_ms'] = round((delta(b0, e0, u + 'sm_fault_ns') + delta(b0, e0, u + 'wpu_fault_ns')) / 1e6, 3)
-            r['upd_is_fault_ms'] = round(delta(b0, e0, u + 'is_fault_ns') / 1e6, 3)
-            r['upd_row_update_C_ms'] = round(op_c_window(b0, e0, 'row_update') / 1e6, 3)
+            # windowed publication (server --publish-window-s > 0): the shared-memory writes are made by the publisher
+            # thread rs-publish (op.publish), so the updater columns add it; absent keys count 0 (earlier runs unchanged)
+            us = ('thr.rs-update.swmc.', 'thr.rs-publish.swmc.')
+            r['upd_sm_wpu_fault_ms'] = round(sum(delta(b0, e0, u + 'sm_fault_ns') + delta(b0, e0, u + 'wpu_fault_ns') for u in us) / 1e6, 3)
+            r['upd_is_fault_ms'] = round(sum(delta(b0, e0, u + 'is_fault_ns') for u in us) / 1e6, 3)
+            pub_c = op_c_window(b0, e0, 'publish') if 'op.publish.n' in e0 else 0
+            r['upd_row_update_C_ms'] = round((op_c_window(b0, e0, 'row_update') + pub_c) / 1e6, 3)
             r['node0_recv_cpu_ticks'] = sum_prefix(b0, e0, 'kthr.cxl_recv', '.cpu_ticks')
         elif kind == 'megalon':
             def est(b, e, role):  # estimates from window deltas of the raw counters (backend.h MegThr)
@@ -191,7 +194,7 @@ def main():
         r['upd_samples'] = delta(b0, e0, 'samples')
         r['upd_rows_written'] = delta(b0, e0, 'rows_written')
         r['upd_rows_per_s'] = round(r['upd_rows_written'] / win_s, 1) if win_s else ''
-        r['upd_busy_ms'] = round(delta(b0, e0, 'thr.rs-update.run_ns') / 1e6, 3)
+        r['upd_busy_ms'] = round((delta(b0, e0, 'thr.rs-update.run_ns') + delta(b0, e0, 'thr.rs-publish.run_ns')) / 1e6, 3)
         r['upd_flush_overruns'] = delta(b0, e0, 'flush_overruns')
         for o, b, e, ep in (('query', b1, e1, epath), ('row_update', b0, e0, e0p)):  # MOT1 v6 Fig 2 (optime.h)
             n = delta(b, e, f'op.{o}.n')
