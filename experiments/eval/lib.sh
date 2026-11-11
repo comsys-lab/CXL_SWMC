@@ -41,6 +41,7 @@ unset RS_V7 RS_V7_IMAGE RS_V7_DENSE RS_V7_IMAGE_HOST RS_V7_DENSE_HOST RS_V7_LR R
 unset RS_PMAX RS_PMAX_FROM RS_PMAX_S RS_PMAX_SETTLE_S   # run-2 RecSys pmax step keys (rs_env), only from the conf
 unset RS_AUC_Q RS_AUC_S RS_AUC_SETTLE_S RS_AUC_ONLY     # run-2 RecSys fixed-rate AUC lifetimes (rs_env), only from the conf
 unset RS_PUBLISH_WINDOW_S RS_PUBLISH_WARMUP RS_PUBLISH_AFTER_S RS_PUBLISH_DRAM_ROWS   # windowed publication (rs_env), only from the conf
+unset RS_CHUNK_PAIRS CHUNK_PAIRS   # serving split (rs_env -> main-block.sh CHUNK_PAIRS), only from the conf
 CONFSH=$(python3 -I -B "$EVD/evalconf.py" shell ${EVAL_CONF:+--conf "$EVAL_CONF"}) || { echo "RUNSET STOP: ${EVAL_CONF:-eval.conf} does not parse"; exit 2; }
 eval "$CONFSH"
 export EVAL_CONF   # absolute path of the config (evalconf.py shell); pins-vdb.sh (sourced by the hook) reads the same file
@@ -134,6 +135,7 @@ manifest() {  # written into E at the real start
     echo "popcorn bundle $POP_C packet_sha256=$(sha256sum < "$POP_C/packet.sha256" | cut -c1-64) (expected $POP_BUNDLE_SHA)"
     echo "PRETOUCH_DIR=${PRETOUCH_DIR:-} MEASURE_ENV_DIR=${MEASURE_ENV_DIR:-} MEASURE_PART_DIR=${MEASURE_PART_DIR:-}"
     [ "$WL" != recsys ] || echo "EVAL_RS_LEAN=${EVAL_RS_LEAN:-0} (1 = confirm probes capped at 3)"
+    [ "$WL" != recsys ] || [ -z "${RS_CHUNK_PAIRS:-}" ] || echo "serving split: --chunk-pairs $RS_CHUNK_PAIRS on every node (RS_CHUNK_PAIRS)"
   } > "$E/eval-manifest.txt"
 }
 # receiver keys of the conf for the blocks (recv-mode.sh): RECVENV = POP_RECV_MODE / POP_ADAPT_KO / RECV_IPOLL /
@@ -200,6 +202,13 @@ rs_env() {
        [ -z "${RS_PUBLISH_DRAM_ROWS:-}" ] || RSENV+=(PUBLISH_DRAM_ROWS=$RS_PUBLISH_DRAM_ROWS)
        plan "windowed publication: W ${RS_PUBLISH_WINDOW_S} s, training-only first window ${RS_PUBLISH_WARMUP:-1}, SLO search >= ${RS_PUBLISH_AFTER_S:-60} s after publishing started, DRAM rows ${RS_PUBLISH_DRAM_ROWS:-default}";;
   esac
+  # serving split (reports/experiments/recsys-serving-split.md; main-block.sh CHUNK_PAIRS): RS_CHUNK_PAIRS N = server
+  # --chunk-pairs N on every node (700 = one serving thread per query); unset / empty = not passed (adaptive split)
+  if [ -n "${RS_CHUNK_PAIRS:-}" ]; then
+    [[ $RS_CHUNK_PAIRS =~ ^[1-9][0-9]*$ ]] || die "bad RS_CHUNK_PAIRS ($RS_CHUNK_PAIRS: pairs per serving task, >= 1)"
+    RSENV+=(CHUNK_PAIRS=$RS_CHUNK_PAIRS)
+    plan "serving split: --chunk-pairs $RS_CHUNK_PAIRS on every node (RS_CHUNK_PAIRS)"
+  else plan "serving split: server default (--chunk-pairs not passed: adaptive split over the serving threads)"; fi
   # run-2 pmax step (main-block.sh STREAM_PMAX): RS_PMAX 0 | 1, RS_PMAX_FROM = stream-results.tsv globs of the rs-main
   # block whose pop rows a ds block uses ({RUN} = this run k; relative = project root), RS_PMAX_S / RS_PMAX_SETTLE_S
   case ${RS_PMAX:-0} in 0) [ -z "${RS_PMAX_FROM:-}" ] || die "RS_PMAX_FROM without RS_PMAX=1";;
@@ -278,7 +287,9 @@ block_dry() {
   # megalon-page-granularity: the block's "PLAN: megalon-page: " line (H2N_MG_SERVER_EXTRA / H2N_READY_TIMEOUT set only)
   # RecSys torn rows (user 2026-11-07): main-block.sh "PLAN: torn rows: " (ds lifetimes: allowed or zero-torn invariant)
   # megalon-ideal-record: the block's "PLAN: megalon-ideal: " line (element layout only)
-  echo "$out" | grep -E '^BLOCK (PLAN: L1 |PLAN: DAMON |PLAN: pmax |PLAN: auc |PLAN: receiver|PLAN: fixed warmup |PLAN: replica: |PLAN: torn rows: |PLAN: megalon-page: |PLAN: megalon-ideal: |PLAN: windowed publication |DRY NOTE|NOTE)' | while IFS= read -r l; do plan "block dry: $l"; done
+  # recsys-serving-split: main-block.sh "PLAN: serving split: " (CHUNK_PAIRS set) and "PLAN: server args: " (BLOCK=stream);
+  # De Stijl build 13: "PLAN: wait assist: " (DS_WAIT_ASSIST set)
+  echo "$out" | grep -E '^BLOCK (PLAN: L1 |PLAN: DAMON |PLAN: pmax |PLAN: auc |PLAN: receiver|PLAN: fixed warmup |PLAN: replica: |PLAN: torn rows: |PLAN: megalon-page: |PLAN: megalon-ideal: |PLAN: windowed publication |PLAN: serving split: |PLAN: server args: |PLAN: wait assist: |DRY NOTE|NOTE)' | while IFS= read -r l; do plan "block dry: $l"; done
   out=$(echo "$out" | tail -n 3)
   if [[ "$out" == *"$want"* ]]; then plan "block dry start reached its evidence-dir check: $(echo "$out" | grep -m1 "$want")"
   else die "block dry start did not reach the evidence-dir check: $out"; fi

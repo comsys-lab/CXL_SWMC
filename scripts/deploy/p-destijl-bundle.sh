@@ -4,7 +4,7 @@
 # bundle: the candidate XMLs fix the Host images dir /var/lib/libvirt/images/destijl-<n>-vm<k>-v<v> and p-destijl-deploy.sh
 # install never overwrites an existing one (the guest rebuilds the initramfs on every prepare), and the bundle's rollback
 # XML must equal the VM's current `virsh dumpxml --inactive`. Host-local only: no virsh, no ssh, no sudo.
-#   p-destijl-bundle.sh [--dry-run] [--build 7|8|9|10|11|12] [--rollback <popcorn bundle dir>] [--topo 2|8] [--xml-src <dir>] [--version <v>]
+#   p-destijl-bundle.sh [--dry-run] [--build 7|8|9|10|11|12|13] [--rollback <popcorn bundle dir>] [--topo 2|8] [--xml-src <dir>] [--version <v>]
 # --build 7 (default, unchanged): see "Fixed inputs (build 7)" below.
 # --build 8 (fault-latency breakdown port, d529ac9d9, user decision 2026-11-02 for blocks D, B2+C, E): SOURCE_TAG =
 #   rel/destijl-8; MANIFEST.txt must say "status: COMPLETE" (workspaces/eval3/build8/finish-build8.sh) and System.map must
@@ -77,11 +77,20 @@ case $n in
       KTREE=$ROOT/workspaces/ds-invack/kernel KOVER=13.4;;
   12) B=$ROOT/builds/destijl/12 SOURCE_TAG=rel/destijl-12 TOOLS_FROM=$ROOT/builds/destijl/7/deploy-v1
       KTREE=$ROOT/workspaces/flat-directory/src KOVER=13.5;;
-  *) stop "--build must be 7, 8, 9, 10, 11 or 12";;
+  13) B=$ROOT/builds/destijl/13 SOURCE_TAG=rel/destijl-13 TOOLS_FROM=$ROOT/builds/destijl/7/deploy-v1
+      KTREE=$ROOT/workspaces/ds-waitassist/src KOVER=13.6;;
+  *) stop "--build must be 7, 8, 9, 10, 11, 12 or 13";;
 esac
-# build 9 / 10 / 11 rule: own guest script and destijl.env LOAD_DEFAULTS (new tools set); builds 7/8: none (unchanged)
+# build 9 / 10 / 11 / 13 rule: own guest script and destijl.env LOAD_DEFAULTS (new tools set); builds 7/8: none (unchanged)
+# --build 13 (build 10 + wait assist, kernel switch /sys/kernel/swmc/destijl/wait_assist default 0, cxl_shm 13.6 with
+#   ops.poll_one, branch ds-waitassist, tag rel/destijl-13; workspaces/ds-waitassist/DESIGN.md): the build-10 rules
+#   (guest script p-destijl-guest-adaptive.sh, LOAD_DEFAULTS="fault_poll=0", region config/cxl_region-destijl.yaml) with
+#   KTREE = workspaces/ds-waitassist/src, staged module version 13.6, System.map holding ds_wait_assist, and a new guest
+#   tools dir GT=/home/comsys/destijl-13. Like build 12, the build dir may have no stage/ yet: the first real bundle runs
+#   p-destijl-package.sh's stage step (refused while MEASUREMENT.lock exists); the dry run checks the unsigned
+#   cxl_shm/cxl_shm.ko instead and says so. The switch is written by the harness (main-block.sh DS_WAIT_ASSIST), not here.
 GUEST_SRC= ENV_EXTRA= REGION_SRC=
-if [ "$n" = 9 ] || [ "$n" = 10 ] || [ "$n" = 11 ]; then GUEST_SRC=$SW/scripts/deploy/p-destijl-guest-adaptive.sh ENV_EXTRA='LOAD_DEFAULTS="fault_poll=0"'; fi
+if [ "$n" = 9 ] || [ "$n" = 10 ] || [ "$n" = 11 ] || [ "$n" = 13 ]; then GUEST_SRC=$SW/scripts/deploy/p-destijl-guest-adaptive.sh ENV_EXTRA='LOAD_DEFAULTS="fault_poll=0"'; fi
 # --build 12 (build 10 + flat base page directory, cxl_shm 13.5, rel/destijl-12 2788a32af; experiment
 #   flat-directory-reference): the build-10 rules with KTREE = workspaces/flat-directory/src, staged module version 13.5
 #   with parameter bpd_mode, guest script scripts/deploy/p-destijl-guest-flat.sh (load accepts bpd_mode=sets|flat),
@@ -159,10 +168,11 @@ if [ "$n" = 8 ]; then
   grep -q ' swmc_instr_breakdown_key$' "$B/System.map" || stop "build 8 System.map has no swmc_instr_breakdown_key"
   [ "$(sh_ "$B/System.map")" = "$(art System.map)" ] || stop "System.map changed since the MANIFEST"
 fi
-if [ "$n" = 9 ] || [ "$n" = 10 ] || [ "$n" = 11 ] || [ "$n" = 12 ]; then
-  if [ "$n" = 12 ]; then  # MANIFEST says "BUILT, NOT STAGED" until the first real bundle stages it (package stage step)
+if [ "$n" = 9 ] || [ "$n" = 10 ] || [ "$n" = 11 ] || [ "$n" = 12 ] || [ "$n" = 13 ]; then
+  if [ "$n" = 12 ] || [ "$n" = 13 ]; then  # MANIFEST says "BUILT, NOT STAGED" until the first real bundle stages it (package stage step)
     [[ "$(mf status)" == BUILT* || "$(mf status)" == COMPLETE ]] || stop "build $n MANIFEST status '$(mf status)'"
-    grep -q ' bpd_flat_acquire_show$' "$B/System.map" || stop "build 12 System.map has no bpd_flat_acquire_show"
+    [ "$n" != 12 ] || grep -q ' bpd_flat_acquire_show$' "$B/System.map" || stop "build 12 System.map has no bpd_flat_acquire_show"
+    [ "$n" != 13 ] || grep -q ' ds_wait_assist$' "$B/System.map" || stop "build 13 System.map has no ds_wait_assist (wait assist switch)"
   else
     [ "$(mf status)" = COMPLETE ] || stop "build $n MANIFEST status '$(mf status)'"
   fi
@@ -170,10 +180,10 @@ if [ "$n" = 9 ] || [ "$n" = 10 ] || [ "$n" = 11 ] || [ "$n" = 12 ]; then
     grep -q " $s\$" "$B/System.map" || stop "build $n System.map has no $s"; done
   [ "$(sh_ "$B/System.map")" = "$(art System.map)" ] || stop "System.map changed since the MANIFEST"
   SKO=$B/stage/lib/modules/$K/updates/cxl_shm.ko
-  if [ "$n" = 12 ] && [ ! -e "$B/stage" ]; then
+  if { [ "$n" = 12 ] || [ "$n" = 13 ]; } && [ ! -e "$B/stage" ]; then
     [ ! -e "$ROOT/workspaces/MEASUREMENT.lock" ] || [ $DRY = 1 ] ||
-      stop "build 12 has no stage/ and MEASUREMENT.lock exists: p-destijl-package.sh would run modules_install (run without the lock)"
-    echo "NOTE: build 12 has no stage/: p-destijl-package.sh stages it (modules_install, signed with the build's key, depmod); checking the unsigned build output instead"
+      stop "build $n has no stage/ and MEASUREMENT.lock exists: p-destijl-package.sh would run modules_install (run without the lock)"
+    echo "NOTE: build $n has no stage/: p-destijl-package.sh stages it (modules_install, signed with the build's key, depmod); checking the unsigned build output instead"
     SKO=$B/cxl_shm/cxl_shm.ko
   fi
   test -f "$SKO" || stop "no staged $SKO"
@@ -192,6 +202,8 @@ if [ "$n" = 12 ]; then
   grep -qF 'bpd_mode=(sets|flat)' "$GUEST_SRC" || stop "$GUEST_SRC does not accept bpd_mode"
   # the region must hold the flat block: msg_ring of REGION_SRC = [134217728, 134217728] (128 MiB, cxl_region-destijl-flat.yaml)
   [ "$(grep -E '^msg_ring:' "$REGION_SRC" | cut -d'#' -f1 | tr -d ' ')" = 'msg_ring:[134217728,134217728]' ] || stop "$REGION_SRC msg_ring is not [134217728, 134217728]"
+elif [ "$n" = 13 ]; then
+  :   # build 13: stage/ reused if present, else made by p-destijl-package.sh (checked above); no flat region
 else
   test -f "$B/stage/lib/modules/$K/updates/cxl_shm.ko" || stop "no stage (packaging would compile/install modules)"
 fi
@@ -265,6 +277,10 @@ if [ -n "$GUEST_SRC" ]; then   # build 9 rule: own guest script, destijl.env = T
     grep -q '^PARAMS="protocol=destijl .*ring_offset=134217728 ring_size=134217728 ' "$OUT/tools/destijl.env" || stop "tools/destijl.env PARAMS are not from the flat region (ring 128 MiB at 128 MiB)"
     SKO=$B/stage/lib/modules/$K/updates/cxl_shm.ko
     [ "$(modinfo -F version "$SKO")" = "$KOVER" ] && modinfo -F parm "$SKO" | grep -q '^bpd_mode:' || stop "staged $SKO is not $KOVER with bpd_mode"
+  fi
+  if [ "$n" = 13 ]; then   # build 13: the staged (signed) module is 13.6 (ops.poll_one for the kernel wait assist)
+    SKO=$B/stage/lib/modules/$K/updates/cxl_shm.ko
+    [ "$(modinfo -F version "$SKO")" = "$KOVER" ] || stop "staged $SKO is not $KOVER"
   fi
   grep -qx "K=$K" "$OUT/tools/destijl.env" || stop "tools/destijl.env K is not $K"
   grep -qxF "$ENV_EXTRA" "$OUT/tools/destijl.env" || stop "tools/destijl.env lacks $ENV_EXTRA"

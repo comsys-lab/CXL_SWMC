@@ -128,6 +128,11 @@
 #   DS_REPLICA_POOL_BYTES (cap); see the De Stijl block below and ds-replica.sh. Unset / off = no replica step.
 #   Torn rows (user 2026-11-07): every ds lifetime passes TORN_POLICY "system=ds T_us=<T> replica_mode=<m>" to
 #   session.sh; torn rows are allowed (reported, torn_rows.py) only with T > 0 and replica_mode on.
+# Serving split (reports/experiments/recsys-serving-split.md): CHUNK_PAIRS N (BLOCK=stream; lib.sh rs_env from the conf's
+#   RS_CHUNK_PAIRS) appends --chunk-pairs N to the server args of every node; unset / empty = not passed = the server's
+#   adaptive split (every earlier run, args byte for byte). BLOCK=stream prints "BLOCK PLAN: server args: <args>".
+# De Stijl wait assist (build >= 13, kernel switch /sys/kernel/swmc/destijl/wait_assist): DS_WAIT_ASSIST 0 | 1
+#   (runset-rs-ds.sh RS_DS_WAIT_ASSIST); unset / empty = no step (every earlier run). See the De Stijl block below.
 set -uo pipefail
 E=${1:?evidence dir}
 P=/home/comsys/sungsu/destijl-control X=$(cd "$(dirname "$0")" && pwd)
@@ -355,6 +360,16 @@ if [ "$PUBW" != 0 ]; then
   echo "BLOCK PLAN: windowed publication W=$PUBW s (dram rows ${PUBLISH_DRAM_ROWS:-default}); warmup=$PUBWU: part pubtrain = updates only $((PUBW + PUBSL)) s, then publish_started=1, SLO search >= $PUBAFT s after publishing started"
 elif [ -n "${PUBLISH_DRAM_ROWS:-}" ]; then echo "SEQUENCE STOP: PUBLISH_DRAM_ROWS without PUBLISH_WINDOW_S"; exit 2
 fi
+# ---- serving split (reports/experiments/recsys-serving-split.md): CHUNK_PAIRS N = server --chunk-pairs N on every node
+# (700 = the largest query of tools/dist_quantile.txt: one serving thread per query); unset / empty = not passed
+CHUNKP=${CHUNK_PAIRS:-}
+if [ -n "$CHUNKP" ]; then
+  [ $BLOCK = stream ] || { echo "SEQUENCE STOP: CHUNK_PAIRS needs BLOCK=stream"; exit 2; }
+  [[ $CHUNKP =~ ^[1-9][0-9]*$ ]] || { echo "SEQUENCE STOP: bad CHUNK_PAIRS ($CHUNKP: pairs per serving task, >= 1)"; exit 2; }
+  SA="$SA --chunk-pairs $CHUNKP"
+  echo "BLOCK PLAN: serving split: --chunk-pairs $CHUNKP on every node (queries of up to $CHUNKP pairs = one serving thread each)"
+fi
+[ $BLOCK != stream ] || echo "BLOCK PLAN: server args: $SA"
 pub_train() {  # every lifetime (life_start, BLOCK=stream): first window = training only (no queries, no publish)
   [ "$PUBW" != 0 ] && [ "$PUBWU" = 1 ] || return 0
   local rc ps
@@ -464,7 +479,7 @@ POP_BUILD=${POP_BUILD:-10} POP_BUNDLE_SHA=${POP_BUNDLE_SHA:-626f6a0eb265553aaa6e
 # ENV:CXL_SYSTEM=ds ENV:CXL_DESTIJL_T_US=<T>). REGION must be the De Stijl region config (config/cxl_region-destijl.yaml;
 # the guest copies are checked against DS_GT/cxl_region.yaml at every load). L1 / L2 fix tokens need confirmed hw and
 # pop results (eval_levels_compute): a ds block uses numeric STREAM_FIX_LEVELS.
-KEXP=$K8 DST=0 HASDS=0 REPL=off RPOOL= REPL_SET=0
+KEXP=$K8 DST=0 HASDS=0 REPL=off RPOOL= REPL_SET=0 WA= WA_SET=0
 [[ " ${SYSTEMS:-} " != *" ds "* ]] || HASDS=1
 if [ $HASDS = 1 ]; then
   [[ " ${SYSTEMS:-} " != *" pop "* ]] || { echo "SEQUENCE STOP: pop and ds need different guest kernels: separate blocks"; exit 2; }
@@ -491,6 +506,13 @@ if [ $HASDS = 1 ]; then
     echo "BLOCK PLAN: torn rows: allowed in the ds lifetimes (T = $DST us, replica_mode $REPL): reported per step / measurement / lifetime (torn.txt, torn-steps.csv, torn-lifetime.txt, <E>/torn-rows.csv via rs_check.py INFO), not an invariant"
   else echo "BLOCK PLAN: torn rows: zero-torn invariant in the ds lifetimes (T = $DST us, replica_mode $REPL)"; fi
   [ "$REPL" = off ] || echo "BLOCK PLAN: replica: De Stijl replica_mode $REPL on both VMs, pool per VM = min($RPOOL, MemAvailable - 4 GiB) (1 MiB floor, >= 1 GiB) at every ds lifetime start, after the cxl_shm load and before the preload; read back (ds-replica-<name>.txt); counters before the teardown (replica_pool_full must stay 0); back to off + previous pool after the teardown"
+  # DS_WAIT_ASSIST 0 | 1 (optional, runset-rs-ds.sh RS_DS_WAIT_ASSIST; unset / empty = no step at all, as before): the
+  # De Stijl build-13 kernel switch /sys/kernel/swmc/destijl/wait_assist, written on both VMs after the enable (recv_apply)
+  # and read back (ds-wait-assist-<name>.txt; mismatch or a missing switch = stop), read back again before the teardown,
+  # back to 0 + read back after the teardown (and in the EXIT trap after a stopped lifetime)
+  WA=${DS_WAIT_ASSIST:-}
+  [[ $WA =~ ^[01]?$ ]] || { echo "SEQUENCE STOP: bad DS_WAIT_ASSIST ($WA: 0 | 1)"; exit 2; }
+  [ -z "$WA" ] || echo "BLOCK PLAN: wait assist: /sys/kernel/swmc/destijl/wait_assist=$WA on both VMs at every ds lifetime, written after the enable, read back after the enable and before the teardown (ds-wait-assist-<name>.txt); back to 0 after the teardown"
   [ -f "$DS_C/p-destijl-shm.sh" ] && [ "$(sha256sum < "$DS_C/packet.sha256" | cut -d' ' -f1)" = "$DS_BUNDLE_SHA" ] \
     && (cd "$DS_C" && sha256sum -c --quiet packet.sha256) || { echo "SEQUENCE STOP: DS_C is not the verified De Stijl bundle"; exit 2; }
   cmp -s "$REGION" "$DS_C/tools/cxl_region.yaml" || { echo "SEQUENCE STOP: REGION differs from the De Stijl bundle's region config"; exit 2; }
@@ -589,6 +611,10 @@ finish() {
     if grep -q "teardown PASS" "$SHMR/steps.log" 2>/dev/null; then
       replica_set "${NAME:-cleanup}" off || echo "$(date -Is) ROLLBACK FAIL: replica_mode not off / pool not restored on a VM (see ds-replica-${NAME:-cleanup}.txt)" | tee -a "$E/rollback.out"
     else echo "$(date -Is) ROLLBACK NOTE: replica_mode left as set (cxl_shm not torn down; the De Stijl rollback reboot clears it)" | tee -a "$E/rollback.out"; fi
+  fi
+  if [ "$WA_SET" = 1 ]; then  # a stopped wait-assist lifetime: the kernel switch back to 0 (runtime switch, any module state)
+    wa_write "${NAME:-cleanup}" 0 exit-trap && echo "$(date -Is) rollback: wait_assist 0 on both VMs" | tee -a "$E/rollback.out" \
+      || echo "$(date -Is) ROLLBACK FAIL: wait_assist not back to 0 on a VM (see ds-wait-assist-${NAME:-cleanup}.txt; the De Stijl rollback reboot clears it)" | tee -a "$E/rollback.out"
   fi
   local procs_ok=1
   servers_gone || procs_ok=0
@@ -702,8 +728,29 @@ ds_setup() {  # De Stijl v2 cycle (protocol=destijl, init_state=shared; as pop_s
   { grep -q "PRELOAD DONE" "$E/preload-$NAME.log" && servers_gone; } || stop "preload"
   env "${PS[@]}" bash $SHMS enable || stop "ds enable gate"
   recv_apply ds "$NAME" "$RECV_MODE"   # recv-mode.sh: mode, protocol destijl, DSRX applied, adaptive checks
+  if [ -n "$WA" ]; then  # build 13 wait assist: after the enable, before the status snapshot and the session start
+    wa_read "$NAME" 0 before-write || stop "wait_assist is not 0 before the write on a VM (see ds-wait-assist-$NAME.txt)"
+    WA_SET=1; wa_write "$NAME" "$WA" after-enable || stop "wait_assist=$WA not set / read back on a VM (see ds-wait-assist-$NAME.txt)"
+    echo "$(date -Is) $NAME: wait_assist $WA on both VMs (read back)"
+  fi
   env "${PS[@]}" STATUS_TAG=pre bash $SHMS status || stop "ds status pre"
 }
+WAF=/sys/kernel/swmc/destijl/wait_assist
+wa_read() {  # <name> <want> <tag>: both VMs read back wait_assist == want (one line per VM in ds-wait-assist-<name>.txt)
+  local ip v rc=0
+  for ip in "${IPS[@]}"; do
+    v=$($SSH comsys@$ip "cat $WAF" < /dev/null 2>/dev/null)
+    echo "$(date -Is) $3 $ip wait_assist=${v:-missing} want=$2" >> "$E/ds-wait-assist-$1.txt"
+    [ "$v" = "$2" ] || rc=1
+  done
+  return $rc; }
+wa_write() {  # <name> <0|1> <tag>: write the switch on both VMs (guest sudo tee), then wa_read
+  local ip
+  for ip in "${IPS[@]}"; do
+    $SSH comsys@$ip "test -e $WAF && echo $2 | sudo -n tee $WAF > /dev/null" < /dev/null >> "$E/ds-wait-assist-$1.txt" 2>&1 \
+      || { echo "$(date -Is) $3 $ip write wait_assist=$2 FAILED (switch missing or sudo refused)" >> "$E/ds-wait-assist-$1.txt"; return 1; }
+  done
+  wa_read "$1" "$2" "$3"; }
 h1_lockchk() {  # BLOCK=h1: the parent lock must still name owner=H1-main (checked at block start and before every lifetime)
   [ $BLOCK = h1 ] || return 0
   grep -q "^owner=H1-main " "$LOCKF" 2>/dev/null || stop "lock $LOCKF not held by H1-main ($(cat "$LOCKF" 2>/dev/null))"
@@ -762,10 +809,16 @@ life_stop() {  # <sys>: session stop, final checks, page MSI teardown (pop)
     if [ $s = ds ] && [ "$REPL" != off ]; then  # a full pool maps CXL directly (mixed run; recv_check fails it too)
       replica_post "$NAME" || echo "MAIN NOTE $NAME: replica pool full or counters unreadable on a VM (ds-replica-$NAME.txt)"
     fi
+    if [ $s = ds ] && [ -n "$WA" ]; then  # the switch held for the whole lifetime
+      wa_read "$NAME" "$WA" pre-teardown || stop "wait_assist is not $WA before the teardown on a VM (see ds-wait-assist-$NAME.txt)"
+    fi
     servers_gone || stop "servers left (page MSI teardown not attempted)"
     dax_free pre-teardown || stop "/dev/dax0.0 in use before the cxl_shm teardown"
     env "${PS[@]}" bash $SHMS teardown || stop "shm teardown"
     grep -q "teardown PASS" "$SHMR/steps.log" || stop "no teardown PASS"
+    if [ $s = ds ] && [ -n "$WA" ]; then
+      wa_write "$NAME" 0 post-teardown || stop "wait_assist back to 0 (see ds-wait-assist-$NAME.txt)"; WA_SET=0
+    fi
     if [ $s = ds ] && [ "$REPL" != off ]; then
       replica_set "$NAME" off || stop "replica_mode back to off / pool restore (see ds-replica-$NAME.txt)"; REPL_SET=0
     fi

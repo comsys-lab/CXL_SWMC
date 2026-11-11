@@ -24,6 +24,10 @@
 #                     T = 1000 ms accuracy + staleness). Needs a bundle built with CONFIG_SWMC_DE_STIJL_REPL=y.
 #   RS_DS_REPLICA_POOL_BYTES  pool cap with all (required, >= 1 GiB): per VM pool = min(cap, MemAvailable - 4 GiB)
 #                     at each lifetime start; recv_check.py then runs with --replica-mode all (pool full = FAIL)
+#   RS_DS_WAIT_ASSIST optional 0 | 1 (empty = no step, plans unchanged): De Stijl build >= 13 kernel switch
+#                     /sys/kernel/swmc/destijl/wait_assist, written on both VMs after the enable of every ds lifetime,
+#                     read back after the enable and before the teardown, 0 after the teardown (main-block.sh
+#                     DS_WAIT_ASSIST; block/ds-wait-assist-<name>.txt). Needs a build >= 13 bundle (RS_DS_K -ds-destijl-<n>).
 # After the block: rs_check.py (SLO ds at every rate, no fixed windows) and recv_check.py --mode RECV_MODE (De Stijl
 # lifetime rules: protocol destijl, tx_timeout / protocol_error deltas 0, per-step sys.swmc.destijl.* columns).
 # Layout: E/eval-manifest.txt, E/eval-state.txt, E/block/ (stream-results.tsv, ds-u<R>/slo, dsshm-ds-u<R>/, rs-check.txt,
@@ -31,7 +35,7 @@
 # usage: runset-rs-ds.sh <k> [--dry] [--v N]   (lib.sh)
 RUNSET=rs-ds WL=recsys
 unset RS_DS_C RS_DS_BUNDLE_SHA RS_DS_K RS_DS_GT RS_DS_REGION RS_DS_VM_PLAIN RS_DS_T_US RS_DS_RECV_EXTRA \
-  RS_DS_REPLICA_MODE RS_DS_REPLICA_POOL_BYTES DS_REPLICA_MODE DS_REPLICA_POOL_BYTES
+  RS_DS_REPLICA_MODE RS_DS_REPLICA_POOL_BYTES DS_REPLICA_MODE DS_REPLICA_POOL_BYTES RS_DS_WAIT_ASSIST DS_WAIT_ASSIST
 . "$(dirname "$0")/lib.sh"
 RSRX=${RS_DS_RECV_EXTRA:-}
 [[ $RSRX =~ ^(((idle_sleep_us|idle_spin_us)=[0-9]+|fault_poll=[01])( |$))*$ ]] || die "bad RS_DS_RECV_EXTRA ($RSRX: 'idle_sleep_us=<n> idle_spin_us=<n> fault_poll=<0|1>')"
@@ -67,6 +71,13 @@ esac
 plan "De Stijl: bundle $RS_DS_C release $RS_DS_K guest tools $RS_DS_GT region $RS_DS_REGION guest dir $RS_DS_VM_PLAIN T=$T us recv_mode $RECV_MODE"
 [ "$RSREPL" = off ] || plan "De Stijl replica_mode $RSREPL, pool cap $RSRPOOL bytes (per VM min(cap, MemAvailable - 4 GiB) at each lifetime start; back to off after every ds lifetime); recv_check.py --replica-mode $RSREPL"
 RCX=(); [ "$RSREPL" = off ] || RCX=(--replica-mode "$RSREPL")
+RSWA=${RS_DS_WAIT_ASSIST:-}
+if [ -n "$RSWA" ]; then
+  [[ $RSWA =~ ^[01]$ ]] || die "bad RS_DS_WAIT_ASSIST ($RSWA: 0 | 1)"
+  _dsn=${RS_DS_K##*-ds-destijl-}
+  [[ $_dsn =~ ^[0-9]+$ ]] && [ "$_dsn" -ge 13 ] || die "RS_DS_WAIT_ASSIST needs De Stijl build >= 13 (RS_DS_K=$RS_DS_K)"
+  plan "De Stijl wait assist: /sys/kernel/swmc/destijl/wait_assist=$RSWA on both VMs for every ds lifetime (after the enable, read back; 0 after the teardown)"
+fi
 need_env
 lock_free
 evidence_dir
@@ -75,6 +86,7 @@ RSENV+=(REGION=$RS_DS_REGION VM_PLAIN=$RS_DS_VM_PLAIN SYSTEMS=ds STREAM_RATES="$
   DS_C=$RS_DS_C DS_BUNDLE_SHA=$RS_DS_BUNDLE_SHA DS_K=$RS_DS_K DS_GT=$RS_DS_GT RS_DS_T_US=$T)   # later assignments win in env
 [ -z "$RSRX" ] || { RSENV+=("DS_RECV_EXTRA=$RSRX"); plan "De Stijl receiver parameters: $RSRX (cxl_shm load, checked after the enable)"; }
 [ "$RSREPL" = off ] || RSENV+=("DS_REPLICA_MODE=$RSREPL" "DS_REPLICA_POOL_BYTES=$RSRPOOL")
+[ -z "$RSWA" ] || RSENV+=("DS_WAIT_ASSIST=$RSWA")
 BLK=(bash $TREE/experiments/recsys/main-block.sh $E/block)
 plan "rates [$RS_POINTS] system ds, SLO lifetimes only"
 plan "block: env ${RSENV[*]} ${BLK[*]}"
@@ -90,6 +102,7 @@ stop() { log "SEQUENCE STOP $*"; $REG add recsys rs-ds $K "$E" $CSHA stopped "$*
 manifest "$RS_PLAIN_BUILD" "$(dirname "$RS_LOADGEN")"
 echo "destijl bundle $RS_DS_C packet_sha256=$RS_DS_BUNDLE_SHA release=$RS_DS_K gt=$RS_DS_GT region_sha256=$(sha256sum < "$RS_DS_REGION" | cut -c1-64) guest_dir=$RS_DS_VM_PLAIN t_us=$T" >> "$E/eval-manifest.txt"
 [ "$RSREPL" = off ] || echo "destijl replica_mode=$RSREPL replica_pool_cap_bytes=$RSRPOOL (per VM pool: block/ds-replica-pool-<name>-vm<i>)" >> "$E/eval-manifest.txt"
+[ -z "$RSWA" ] || echo "destijl wait_assist=$RSWA (both VMs, every ds lifetime; readbacks: block/ds-wait-assist-<name>.txt)" >> "$E/eval-manifest.txt"
 $REG add recsys rs-ds $K "$E" $CSHA started "commit $COMMIT T=$T us"
 log "block start (T = $T us)"
 env "${RSENV[@]}" "${BLK[@]}" > "$E/block/sequence.log" 2>&1
