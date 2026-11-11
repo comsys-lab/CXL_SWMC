@@ -18,9 +18,12 @@
 # Init: NR log appends = 8,153,605 creates + 8,153,605 first writes = ~16.3M entries on nr_log_size 64MB = 524,288 x
 # 128 B (~31 wraps; node 1 replays while node 0 loads). stuck_timeout_ms 300000 as vectordb-2vm-ideal.yaml (the NR
 # replica HashMap grows once during init, 2^23 -> 2^24 buckets near 7.3M entries; a watchdog only).
-# Per-node DRAM (estimate with the vectordb-2vm-ideal.yaml rule; measured on the Host, see PROGRESS part 5): NR
-# replica HashMap 2^24 buckets x 81 B = 1.36 GB (+0.68 GB while it grows), wmeta-rev map 2^24 x 33 B = 0.55 GB, local
-# seq map 16.8M x 36 B = 0.60 GB, private header + adj_index 33 MB -> ~2.5 GB per node (VM RAM 96 GB).
+# Per-node DRAM (estimate with the vectordb-2vm-ideal.yaml rule): NR replica HashMap 2^24 buckets x 81 B = 1.36 GB
+# (+0.68 GB while it grows), wmeta-rev map 2^24 x 33 B = 0.55 GB, local seq map 16.8M x 36 B = 0.60 GB, private header
+# + adj_index 33 MB -> ~2.5 GB per node. Measured (Host two-process file region, image build 1, sg-server READY;
+# builds/socialgraph-megalon/1-n2/test/full-record): RssAnon node 0 2,491,020 kB, node 1 2,522,972 kB (= 2.4 GiB);
+# node 0 also maps the image file during its load (page cache, 10.7 GB, reclaimable). VM RAM 96 GB: fits.
+# Init on the Host: load 8,153,605 objects in 58.9 s (create 20.9 s), warm-up 6.1-6.5 s per node.
 mount_directory: /mydata        # required by the config parser; unused
 key_space: 10000
 slots: 10240
