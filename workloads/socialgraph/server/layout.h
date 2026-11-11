@@ -241,7 +241,9 @@ template <class F> uint64_t walk_links(const View &v, uint64_t slot, F &&f) {
 // Record granularity: one object per node slot, per primary adjacency block, per ovf block (built + pool).
 // Data structure granularity: kChunkBytes chunks of each array (adj_index, nodes, adj, ovf), each array chunked from
 // its own start (the last chunk of an array may be short).
-constexpr uint64_t kChunkBytes = 36ull << 20;  // "36 MB" (Motivation H1) taken as 36 MiB
+// 32 MiB = the vector DB Megalon chunk cells (run 2: vdb-server chunk_bytes=33554432, recovery/
+// eval-run2-vdb-mg-u50-n2-r1-v1; the "36 MB" of the experiment text was this setting; part 5 changed it from 36 MiB)
+constexpr uint64_t kChunkBytes = 32ull << 20;
 enum class ObjKind : uint8_t { kNode = 0, kAdj = 1, kOvf = 2, kAdjIndex = 3 };
 struct ObjRef { ObjKind kind; uint64_t idx; uint64_t off; uint64_t bytes; };  // off = image offset
 

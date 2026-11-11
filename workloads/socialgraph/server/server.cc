@@ -9,6 +9,10 @@
 // (backend.h) behind Server<Be>. Record protocol, guards and write allocation: graph_ops.h.
 // HWcc app range (CXL_APP_HWCC_BYTES = sg-server --print-app-bytes ...): app header, per node ready line, writer
 // stripe locks.
+// --backend megalon --object-layout record|chunk (megalon_backend.h): Megalon maps the device when the shim is
+// dlopen()ed (the server never maps it); node 0 creates the objects and loads them from --image FILE, publishes
+// sg.loaded, every node then attaches (private header + adj_index copy, object check) and warms up through read
+// sections. Server logic (graph_ops.h, the threads below) is the same code for every backend.
 // Modes: serve (default); --copy-image FILE (node 0: copy the image into the region through a plain mapping, before
 // coherence is enabled, like the vector DB --preload-only; no HWcc access) and --verify [--image FILE] (header,
 // layout hash, record checks and a byte comparison of sampled records with FILE; read only; no HWcc access).
@@ -42,6 +46,7 @@
 #include "graph_ops.h"
 #include "hwcc_app.h"
 #include "layout.h"
+#include "megalon_backend.h"
 #include "mmap_backend.h"
 #include "opwin.h"
 #include "proc_stats.h"
@@ -65,15 +70,18 @@ struct Opts {
   uint32_t lock_stripes = 16384;
   std::string region, stale_dir, copy_image, verify_image;
   bool verify = false, op_coh = true, warmup = true;
+  std::string backend = "plain", megalon_lib, object_layout = "chunk";  // Megalon: --backend megalon
+  uint64_t chunk_bytes = kChunkBytes;
 };
 
 // HWcc app layout (same calls on every node; hash checked by app_init)
 struct AppLayout {
   cxl::hwcc::layout L;
-  uint64_t off_ready = 0, off_locks = 0;
+  uint64_t off_ready = 0, off_locks = 0, off_loaded = 0;
   AppLayout(uint32_t nodes, uint32_t stripes) {
     off_ready = L.add("sg.ready", 64ull * nodes);
     off_locks = L.add("sg.locks", 64ull * stripes);
+    off_loaded = L.add("sg.loaded", 64);  // Megalon: node 0 loaded every object (run id)
   }
 };
 
@@ -180,12 +188,25 @@ struct Resp {
 template <class Be>
 class Server {
  public:
+  static constexpr bool kMeg = !std::is_same_v<Be, MmapBackend>;
   explicit Server(Opts o) : o_(std::move(o)) {}
 
-  // map the whole device at map_va (plain mapping; a regular file in Host tests)
+  // map the whole device at map_va (plain mapping; a regular file in Host tests). Megalon: loading the shim
+  // initialises Megalon, which maps the whole device at map_va (and waits in its start barrier for every node).
   void map_device() {
     std::string err;
     if (!cxl::region_load(o_.region.empty() ? nullptr : o_.region.c_str(), &r_, &err)) die("region: " + err);
+    if constexpr (kMeg) {
+      cxl::proc::name_thread("megalon-lib");  // threads the library starts inherit this name
+      api_ = megalon_load(o_.megalon_lib, &err);
+      cxl::proc::name_thread("sg-server");
+      if (!api_) die(err);
+      if (api_->node_id() != o_.node) die("megalon node id " + std::to_string(api_->node_id()) + " != --node");
+      if (!megalon_mapped_by(r_.map_va, r_.device_size, r_.device, &err)) die(err);
+      map_ = reinterpret_cast<uint8_t *>(r_.map_va);
+      std::fprintf(stderr, "sg-server: megalon initialised (%s), device mapped by Megalon at map_va\n", api_->info);
+      return;
+    }
     const int fd = int(syscall(SYS_openat, AT_FDCWD, r_.device.c_str(), O_RDWR | O_CLOEXEC));
     if (fd < 0) die("open " + r_.device);
     void *m = mmap(reinterpret_cast<void *>(r_.map_va), r_.device_size, PROT_READ | PROT_WRITE,
@@ -311,7 +332,19 @@ class Server {
     locks_.w = reinterpret_cast<uint64_t *>(app + lay_->off_locks);
     locks_.n = o_.lock_stripes;
     locks_.owner = o_.node + 1;
-    be_ = std::make_unique<Be>(img_, img_avail_);
+    if constexpr (kMeg) {
+      be_ = std::make_unique<Be>(api_, o_.chunk_bytes, o_.node);
+      be_->thread_init(0);
+      uint64_t *loaded = reinterpret_cast<uint64_t *>(app + lay_->off_loaded);
+      if (o_.node == 0) {
+        if (!be_->load(o_.verify_image, &err)) die(err);
+        store_release(loaded, o_.run_id);
+      } else if (!cxl::hwcc::poll_until([&] { return load_acquire(loaded) == o_.run_id; }, o_.start_timeout_ms)) {
+        die("node 0 did not publish its Megalon load in time");
+      }
+    } else {
+      be_ = std::make_unique<Be>(img_, img_avail_);
+    }
     if (!be_->attach(&err)) die(err);
     const ImageHeader &h = be_->header();
     if constexpr (std::is_same_v<Be, MmapBackend>) {
@@ -351,6 +384,7 @@ class Server {
       q = c > 1 ? uint32_t(c - 1) : 1;
     }
     nq_ = q;
+    if (kMeg && q + 2 > 32) die("megalon: at most 32 registered threads per node (main, writer, query threads)");
     std::fprintf(stderr, "sg-server: threads %u query + 1 writer; staleness log %s (1 in %lu reads)\n", q,
                  sl_.on() ? o_.stale_dir.c_str() : "off", (unsigned long)o_.stale_every);
     std::thread([this] { writer(); }).detach();
@@ -398,6 +432,12 @@ class Server {
   // Read every page of the image once (every node, before the start barrier; identical in every system), so that
   // measurements do not include the first touch of shared pages.
   void warm_up() {
+    if constexpr (kMeg) {  // every object once in full through read sections
+      const uint64_t t0 = mono_ns(), x = be_->warm_up();
+      std::fprintf(stderr, "sg-server: warm-up read every Megalon object (%lu B) in %.1f s (%lu)\n",
+                   (unsigned long)be_->header().total_bytes, (mono_ns() - t0) / 1e9, (unsigned long)(x & 1));
+      return;
+    }
     const uint64_t t0 = mono_ns(), n = be_->header().total_bytes;
     uint64_t x = 0;
     const volatile uint8_t *p = img_;
@@ -690,6 +730,7 @@ class Server {
   std::unique_ptr<AppLayout> lay_;
   Locks locks_;
   std::unique_ptr<Be> be_;
+  const mshim::Api *api_ = nullptr;  // Megalon only
   std::unique_ptr<GraphOps<Be>> ops_;
   StaleLog sl_;
   Stats st_;
@@ -709,8 +750,10 @@ volatile sig_atomic_t g_stop = 0;
 template <class Be>
 int run(const Opts &o) {
   Server<Be> s(o);
-  if (!o.copy_image.empty()) return s.copy_image();
-  if (o.verify) return s.verify();
+  if constexpr (std::is_same_v<Be, MmapBackend>) {
+    if (!o.copy_image.empty()) return s.copy_image();
+    if (o.verify) return s.verify();
+  }
   s.start();
   while (!g_stop) usleep(200000);
   s.stop();
@@ -727,15 +770,45 @@ void usage() {
                "  [--lock-stripes S (16384)] [--start-timeout-ms T]\n"
                "  --copy-image FILE   node 0: copy the image into the region (plain mapping, no HWcc) and exit\n"
                "  --verify [--image FILE]   check the image in the region (header, layout hash, records; bytes vs FILE)\n"
-               "  --print-app-bytes   value for CXL_APP_HWCC_BYTES (same --nodes / --lock-stripes on every node)\n");
+               "  --print-app-bytes   value for CXL_APP_HWCC_BYTES (same --nodes / --lock-stripes on every node)\n"
+               "  --backend plain|megalon [--megalon-lib PATH (<exe dir>/../lib/libmegalon-objapi.so)]\n"
+               "     [--object-layout record|chunk (chunk)] [--chunk-bytes B (33554432)] --image FILE (node 0 loads it)\n"
+               "     Megalon (RACKOBJ_CONFIG) maps the device; MEGALON_NODE_ID / MEGALON_RUN_ID default to --node /\n"
+               "     --run-id, CXL_REGION_CONFIG to --region\n"
+               "  --print-megalon-objects --image FILE [--object-layout L] [--chunk-bytes B]   object totals (sizing)\n");
   std::exit(2);
+}
+
+// Object totals of a Megalon layout from the image file's header + adj_index (Megalon config sizing; no Megalon).
+int print_megalon_objects(const Opts &o) {
+  const int fd = open(o.verify_image.c_str(), O_RDONLY | O_CLOEXEC);
+  if (fd < 0) die("open " + o.verify_image);
+  ImageHeader h;
+  if (pread(fd, &h, sizeof h, 0) != ssize_t(sizeof h)) die("short read of the image header");
+  struct stat st;
+  if (fstat(fd, &st) != 0) die("stat");
+  const std::string e = check_header(h, uint64_t(st.st_size));
+  if (!e.empty()) die("image file header: " + e);
+  std::vector<uint8_t> meta(meta_bytes(h));
+  if (pread(fd, meta.data(), meta.size(), 0) != ssize_t(meta.size())) die("short read of adj_index");
+  close(fd);
+  const MegLayout lay = o.object_layout == "record" ? MegLayout::kRecord : MegLayout::kChunk;
+  const MegSizing s = MegalonBackendBase(nullptr, lay, o.chunk_bytes, 0).sizing(View(meta.data()));
+  // Megalon coherence-record pool (DYN_WMETA): one 4 B record per object at most; reclaim starts above 90 %
+  const uint64_t rec_min = (s.objects * 10 + 8) / 9;
+  std::printf("layout=%s chunk_bytes=%lu objects=%lu object_bytes=%lu max_object=%lu meta_bytes=%lu image_bytes=%lu "
+              "scr_records_min=%lu scr_bytes_min=%lu\n", o.object_layout.c_str(), (unsigned long)o.chunk_bytes,
+              (unsigned long)s.objects, (unsigned long)s.object_bytes, (unsigned long)s.max_object,
+              (unsigned long)s.meta_bytes, (unsigned long)h.total_bytes, (unsigned long)rec_min,
+              (unsigned long)(rec_min * 4));
+  return 0;
 }
 
 }  // namespace
 
 int main(int argc, char **argv) {
   Opts o;
-  bool print_bytes = false;
+  bool print_bytes = false, print_meg = false;
   for (int i = 1; i < argc; i++) {
     std::string a = argv[i];
     auto v = [&]() -> std::string {
@@ -766,9 +839,21 @@ int main(int argc, char **argv) {
     else if (a == "--verify") o.verify = true;
     else if (a == "--image") o.verify_image = v();
     else if (a == "--print-app-bytes") print_bytes = true;
+    else if (a == "--backend") o.backend = v();
+    else if (a == "--megalon-lib") o.megalon_lib = v();
+    else if (a == "--object-layout") o.object_layout = v();
+    else if (a == "--chunk-bytes") o.chunk_bytes = std::stoull(v());
+    else if (a == "--print-megalon-objects") print_meg = true;
     else usage();
   }
   if (o.lock_stripes == 0) usage();
+  if (o.backend != "plain" && o.backend != "megalon") usage();
+  if (o.object_layout != "record" && o.object_layout != "chunk") usage();
+  if (o.chunk_bytes < kPage || o.chunk_bytes % kPage) usage();
+  if (print_meg) {
+    if (o.verify_image.empty()) usage();
+    return print_megalon_objects(o);
+  }
   if (print_bytes) {
     if (o.nodes == 0) usage();
     std::printf("%lu\n", (unsigned long)AppLayout(o.nodes, o.lock_stripes).L.bytes());
@@ -779,5 +864,36 @@ int main(int argc, char **argv) {
   signal(SIGPIPE, SIG_IGN);
   signal(SIGTERM, [](int) { g_stop = 1; });
   signal(SIGINT, [](int) { g_stop = 1; });
-  return run<MmapBackend>(o);
+  if (o.backend == "plain") return run<MmapBackend>(o);
+  if (!serve) {
+    std::fprintf(stderr, "sg-server: --copy-image / --verify are for the plain backend\n");
+    return 2;
+  }
+  if (o.node == 0 && o.verify_image.empty()) {
+    std::fprintf(stderr, "sg-server: --backend megalon: node 0 needs --image FILE (the objects are loaded from it)\n");
+    return 2;
+  }
+  // Megalon reads its node id, run id and region config from the environment when its library initialises.
+  auto env = [](const char *k, const std::string &val) {
+    const char *cur = getenv(k);
+    if (cur && *cur && val != cur) {
+      std::fprintf(stderr, "sg-server: %s=%s contradicts the server option (%s)\n", k, cur, val.c_str());
+      std::exit(2);
+    }
+    setenv(k, val.c_str(), 1);
+  };
+  env("MEGALON_NODE_ID", std::to_string(o.node));
+  if (!getenv("MEGALON_RUN_ID") || !*getenv("MEGALON_RUN_ID")) setenv("MEGALON_RUN_ID", std::to_string(o.run_id).c_str(), 1);
+  else if (std::stoull(getenv("MEGALON_RUN_ID"), nullptr, 0) != o.run_id) env("MEGALON_RUN_ID", std::to_string(o.run_id));
+  if (!o.region.empty()) env("CXL_REGION_CONFIG", o.region);
+  if (o.megalon_lib.empty()) {
+    char exe[4096];
+    const ssize_t n = readlink("/proc/self/exe", exe, sizeof(exe) - 1);
+    if (n <= 0) usage();
+    exe[n] = 0;
+    const std::string d(exe);
+    o.megalon_lib = d.substr(0, d.rfind('/')) + "/../lib/libmegalon-objapi.so";
+  }
+  if (o.object_layout == "record") return run<MegalonRecordBackend>(o);
+  return run<MegalonChunkBackend>(o);
 }

@@ -1,0 +1,50 @@
+# Megalon config for the socialgraph Megalon backend, record granularity (sg-server --backend megalon --object-layout
+# record; workloads/socialgraph/server/megalon_backend.h; experiment socialgraph-serving §2: N = 2 only), 2 VMs.
+# Megalon build builds/megalon/78-n2 (sg build builds/socialgraph-megalon/<n>-n2). Region: config/cxl_region-ring2m.yaml
+# (the record pool below fits the 256 MiB hwcc, so the megalon-ideal region with a larger hwcc is not needed).
+# Values as socialgraph-2vm.yaml (run 2) except stuck_timeout_ms.
+# Sizing from image build 1 (builds/socialgraph-image/1; sg-server --print-megalon-objects --image graph.img
+# --object-layout record):
+#   objects = 4,121,202 node slots (128 B; 3,072,626 original + 1,048,576 slack) + 3,072,626 primary adjacency blocks
+#             (64 B .. 4 KiB, 6,238,133,504 B) + 959,776 overflow blocks (4 KiB; 828,704 built + 131,072 pool)
+#             + 1 meta object (header + adj_index, 32,973,712 B; read once at attach) = 8,153,605 objects,
+#   object_bytes 10,729,863,616 B = 9.99 GiB (64 B aligned) -> object_arena_size 11GB = 11,811,160,064 B
+#   (margin 1,081,296,448 B).
+# Coherence-record pool (DYN_WMETA with objects, c3.cc RecordCount = logical_scr_size / 4 B; reclaim starts above
+# 90 %, ReserveWmeta refuses above 95 %): every object takes at most one record (first write; node 0's load writes
+# every object once), so records >= ceil(8,153,605 / 0.9) = 9,059,562 -> x 4 B = 36,238,248 B (34.6 MiB). 64MB
+# (run 2) = 16,777,216 records, reclaim threshold 15,099,494 >= 8,153,605 objects (margin 6,945,889): reclaim never
+# starts. hwcc: SCR 64 MiB + 14,848 B + sg app 1,052,672 B + msg_ring 2 MiB = 70,273,536 B <= 268,435,456 B (ring2m).
+# Init: NR log appends = 8,153,605 creates + 8,153,605 first writes = ~16.3M entries on nr_log_size 64MB = 524,288 x
+# 128 B (~31 wraps; node 1 replays while node 0 loads). stuck_timeout_ms 300000 as vectordb-2vm-ideal.yaml (the NR
+# replica HashMap grows once during init, 2^23 -> 2^24 buckets near 7.3M entries; a watchdog only).
+# Per-node DRAM (estimate with the vectordb-2vm-ideal.yaml rule; measured on the Host, see PROGRESS part 5): NR
+# replica HashMap 2^24 buckets x 81 B = 1.36 GB (+0.68 GB while it grows), wmeta-rev map 2^24 x 33 B = 0.55 GB, local
+# seq map 16.8M x 36 B = 0.60 GB, private header + adj_index 33 MB -> ~2.5 GB per node (VM RAM 96 GB).
+mount_directory: /mydata        # required by the config parser; unused
+key_space: 10000
+slots: 10240
+logical_scr_size: 64MB
+node_id: 0                      # overridden by MEGALON_NODE_ID (sg-server sets it from --node)
+region_config: ""               # $CXL_REGION_CONFIG
+reinit: false                   # node 0: MEGALON_REINIT=1
+attach_mprotect: true
+stuck_timeout_ms: 300000        # watchdog only (vectordb-2vm-ideal.yaml): no effect unless a peer stops advancing the log
+log_sync_interval_us: 100
+nr_log_size: 64MB
+attach_timeout_s: 600
+start_barrier_timeout_s: 600
+object_arena_size: 11GB
+object_align: 64
+object_max_count: 65536         # hwcc flavor only (static records); unused by the megalon flavor
+replicate: false
+flush: false
+evict: false
+partition_ratio: 0.0
+excluded_files:
+excluded_directories:
+  - /usr
+  - /proc
+  - /etc
+  - /dev
+  - /sys

@@ -37,8 +37,9 @@ the region in the guest like the vector DB index image. Same bytes for every sys
 ## 2. Coherence objects (part 5, Megalon)
 - Record granularity: one object per node slot, primary adjacency block, ovf block (built + pool):
   `for_each_record_object`, `record_objects()`.
-- Data structure granularity: 36 MiB chunks of each array, each array chunked from its own start:
-  `for_each_chunk`, `chunk_of`.
+- Data structure granularity: 32 MiB chunks (kChunkBytes = the vector DB Megalon chunk cells of run 2,
+  vdb-server chunk_bytes=33554432; was 36 MiB before part 5) of each array, each array chunked from its own start:
+  `for_each_chunk`, `chunk_of`. adj_index is not a coherence object in either layout (section 5).
 
 ## 3. Requests (proto.h)
 Feed query (getlinklist id1 limit 50 newest first + multiget of the neighbour nodes; the SLO operation), getnode,
@@ -66,3 +67,22 @@ Responses carry RespHead (status, server time, records touched) and, optionally,
   Host clock-offset log of the RecSys T-sweep (workspaces/clock-offset-log-v1.py format).
 - Image: --copy-image FILE (node 0, plain mapping, no HWcc access; header page written last), --verify [--image FILE]
   (header, layout hash, sampled records, byte comparison with the file). Serving attaches to the copied image.
+
+## 5. Megalon backend (part 5: server/megalon_backend.h, server/build-megalon.sh, tests/megalon_host_test.sh)
+- sg-server --backend megalon --object-layout record|chunk [--chunk-bytes B]; the shim (systems/megalon/shim) is
+  dlopen()ed only then and Megalon maps the device. Node 0 (MEGALON_REINIT=1) creates every object and loads it from
+  --image FILE (one write section per object, image order), then publishes the HWcc line sg.loaded; every node then
+  copies the meta object (image header + adj_index, read-only) into private memory, checks every object (lookup),
+  and warms up by reading every object once through read sections. Objects: ids "SG" | kind << 44 | index (node 1,
+  adj 2, ovf 3, chunk 4 = global chunk number of for_each_chunk, meta 5). Configs: systems/megalon/socialgraph-*.yaml.
+- Sections vs the unchanged record protocol (one open section per thread; write sections write whole lines and never
+  read prior bytes): node / ovf reads run f in place in one read section; list reads copy the primary block out (two
+  sections if a chunk boundary splits it), run f on the copy (nested ovf reads are their own sections) and re-read the
+  version word when f made nested reads or the block was split (changed -> f again). Writes copy the record out in a
+  read section, run f on the copy, then write its changed lines in one write section; nested writes publish first,
+  after the enclosing record's header line was published with the writing bit (graph_ops kWriting) set, so readers'
+  version re-check rejects a mix of old header and new overflow block; split records: header line with the writing
+  bit, second part, first part. Unchanged copies (aborted writes) are not written.
+- Counters (stats): megalon.* (Megalon ObjectStats, WmetaCounts with Megalon >= 80), megt.[role.]* (sections, 1 in 64
+  timed read sections: start / body / end ns; write sections: start / body / end ns; rec_copies, adj_validations /
+  _fails, marks, split_records, wr_skipped). Per-op Megalon coherence time (OpCoh "opt.meg_coh") is not wired yet.

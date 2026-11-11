@@ -5,6 +5,8 @@
 //       results agree and that every write made through one server is visible through the other. Exit 0 = PASS.
 //   sg-client stats <host:port>      print the stats text
 //   sg-client feed <host:port> <id1> [limit]
+//   sg-client stress <hostA:port> <hostB:port> <id1> <node id> <seconds>
+//       Writer thread on A vs reader on B: consistent list / node snapshots (see stress()). Exit 0 = PASS.
 #include <arpa/inet.h>
 #include <netdb.h>
 #include <netinet/in.h>
@@ -12,10 +14,13 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
+#include <atomic>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "frame.h"
@@ -239,6 +244,74 @@ int selftest(Client &a, Client &b, uint64_t id1, uint32_t base) {
   return fails ? 1 : 0;
 }
 
+// Concurrent write / read check (two servers, one region): a writer thread on A updates the oldest link of id1 (an
+// overflow-block edge when id1 has overflow segments: a nested write inside the list write) and node `node`; the
+// reader on B checks every read is a consistent snapshot: for the list, (link version - first link version) ==
+// (list version - first list version) (only that link is written, so a list header from before a write combined
+// with the link from after it is detected); for the node, data == "v<version>"; and versions never go back.
+int stress(const std::string &ha, const std::string &hb, uint64_t id1, uint64_t node, double secs) {
+  Client a(ha), b(hb), w(ha);
+  Feed all = feed(b, id1, 1024);
+  CHECK(all.status == kStatusOk && all.rows.size() > 1, "stress: feed of id1");
+  if (fails) return 1;
+  const uint32_t x = all.rows.back().id2;  // oldest live link
+  uint16_t st;
+  auto gl = getlink(b, id1, {x}, &st);
+  CHECK(st == kStatusOk && gl.size() == 1, "stress: getlink of the oldest link");
+  Node n0 = getnode(b, node);
+  CHECK(n0.status == kStatusOk, "stress: getnode");
+  if (fails) return 1;
+  std::vector<uint8_t> q, o;
+  put(q, GetLinkReq{id1, kAssocFriend, 1, 0});
+  put(q, x);
+  b.call(kOpGetLink, q, &o);
+  const uint64_t lv0 = get<GetLinkResp>(o, sizeof(RespHead)).list_version;
+  const uint32_t ev0 = gl[0].version;
+  std::atomic<bool> stop{false};
+  std::atomic<uint64_t> writes{0};
+  std::thread wt([&] {
+    uint64_t nv = n0.r.version;
+    for (uint32_t k = 0; !stop.load(); k++) {
+      uint16_t s;
+      link_write(w, kOpUpdateLink, id1, x, all.rows.back().link_time, std::string(1 + k % 12, char('a' + k % 26)), &s);
+      if (s != kStatusOk) { std::fprintf(stderr, "stress: updatelink st %u\n", s); break; }
+      node_write(w, kOpUpdateNode, node, "v" + std::to_string(nv + 1), &s);
+      if (s != kStatusOk) { std::fprintf(stderr, "stress: updatenode st %u\n", s); break; }
+      nv++;
+      writes++;
+    }
+  });
+  const auto t0 = std::chrono::steady_clock::now();
+  uint64_t reads = 0, bad = 0, last_lv = lv0, last_nv = n0.r.version;
+  while (std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count() < secs) {
+    b.call(kOpGetLink, q, &o);
+    if (head(o).status != kStatusOk) { bad++; break; }
+    const GetLinkResp g = get<GetLinkResp>(o, sizeof(RespHead));
+    const LinkRow r = get<LinkRow>(o, sizeof(RespHead) + sizeof(GetLinkResp));
+    if (g.n != 1 || r.version - ev0 != g.list_version - lv0 || g.list_version < last_lv) {
+      if (bad++ < 5) std::fprintf(stderr, "stress: list v%lu link v%u (start %lu / %u, last %lu)\n",
+                                  (unsigned long)g.list_version, r.version, (unsigned long)lv0, ev0, (unsigned long)last_lv);
+    }
+    last_lv = g.list_version;
+    Node n = getnode(b, node);
+    if (n.status != kStatusOk || (n.r.version != n0.r.version && n.data != "v" + std::to_string(n.r.version)) ||
+        n.r.version < last_nv) {
+      if (bad++ < 5) std::fprintf(stderr, "stress: node v%lu data '%s'\n", (unsigned long)n.r.version, n.data.c_str());
+    }
+    last_nv = n.r.version;
+    reads += 2;
+  }
+  stop = true;
+  wt.join();
+  CHECK(bad == 0, "stress: %lu inconsistent reads", (unsigned long)bad);
+  CHECK(writes > 10 && reads > 10, "stress: too few operations (writes %lu reads %lu)", (unsigned long)writes.load(),
+        (unsigned long)reads);
+  std::printf("sg-client stress %s: %lu write pairs, %lu reads, %lu inconsistent; link %u of id1 %lu, node %lu\n",
+              fails ? "FAIL" : "PASS", (unsigned long)writes.load(), (unsigned long)reads, (unsigned long)bad, x,
+              (unsigned long)id1, (unsigned long)node);
+  return fails ? 1 : 0;
+}
+
 }  // namespace
 
 int main(int argc, char **argv) {
@@ -247,6 +320,8 @@ int main(int argc, char **argv) {
     return 2;
   }
   const std::string cmd = argv[1];
+  if (cmd == "stress" && argc == 7)
+    return stress(argv[2], argv[3], std::stoull(argv[4]), std::stoull(argv[5]), std::stod(argv[6]));
   if (cmd == "selftest" && argc == 6) {
     Client a(argv[2]), b(argv[3]);
     return selftest(a, b, std::stoull(argv[4]), uint32_t(std::stoul(argv[5])));
