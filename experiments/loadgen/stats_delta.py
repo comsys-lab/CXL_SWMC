@@ -27,7 +27,8 @@ GAUGE_EXACT = {"node", "write_queue", "search_queue", "megt.sample",
                # values; publish_lag_ns_max = max since the previous stats read (reset by the read). published_rows,
                # publish_sections, publish_carryover_rows, publish_lag_ns_sum / _count, dram_updates, train_dram_hits
                # stay counters
-               "publish_window_s", "publish_started", "publish_window", "publish_backlog", "publish_queued",
+               "publish_window_s", "publish_started", "publish_start_mono_ns", "publish_window", "publish_backlog",
+               "publish_queued",
                "window_distinct", "publish_lag_ns_max", "dram_rows", "dram_capacity", "dram_index_bytes", "dram_bytes"}
 GAUGE_SUFFIX = (".n", "max_ns", ".in_flight_transaction_count", ".enabled",
                 # identity values of the MOT1 v6 per-operation stats (sampling factor, TSC rate, thread counts)

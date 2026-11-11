@@ -332,6 +332,50 @@ case $V7 in 0) ;; 1)
   V7_HOST_PATH_MAP="$V7_IMAGE=$V7_IMAGE_HOST $V7_DENSE=$V7_DENSE_HOST"
   SA="${SA/--update-mode stream/--update-mode train} --image $V7_IMAGE --model-dense $V7_DENSE --lr $V7_LR --acc-init $V7_ACC_INIT --train-batch $V7_TRAIN_BATCH --train-threads ${V7_TRAIN_THREADS:-0} --stale-sample $V7_STALE_SAMPLE"
   ;; *) echo "SEQUENCE STOP: bad V7 ($V7)"; exit 2;; esac
+# ---- windowed update publication (reports/experiments/recsys-windowed-update.md; V7=1 only; lib.sh rs_env from the
+# conf's RS_PUBLISH_*): PUBLISH_WINDOW_S = W (server --publish-window-s, both nodes; the server enables it on node 0
+# only; unset / 0 = off = per-batch write-through, every earlier run), PUBLISH_DRAM_ROWS (optional, server
+# --publish-dram-rows), PUBLISH_WARMUP 1 (default with W > 0) | 0: every lifetime starts with part "pubtrain" = the
+# update stream alone (loadgen --rates 0: no queries) for W + PUBLISH_TRAIN_SLACK_S (5) s, so the first window is
+# training only; node 0's post-part snapshot must show publish_started=1 (else stop). Every later part keeps the update
+# stream running (seq_base continues), so training goes on while the publisher writes. PUBLISH_AFTER_S (60): the SLO
+# search starts no earlier than this many seconds (server clock: stats_mono_ns - publish_start_mono_ns of node 0's
+# snapshot after the 1 q/s warm-up part) after publishing started; the warm-up part (60 s with updates) normally covers
+# it, a shortfall is slept (logged).
+PUBW=${PUBLISH_WINDOW_S:-0} PUBWU=${PUBLISH_WARMUP:-1} PUBAFT=${PUBLISH_AFTER_S:-60} PUBSL=${PUBLISH_TRAIN_SLACK_S:-5}
+[[ $PUBW =~ ^(0|[1-9][0-9]*)$ && $PUBWU =~ ^[01]$ && $PUBAFT =~ ^(0|[1-9][0-9]*)$ && $PUBSL =~ ^[1-9][0-9]*$ ]] \
+  || { echo "SEQUENCE STOP: bad PUBLISH_WINDOW_S / PUBLISH_WARMUP / PUBLISH_AFTER_S / PUBLISH_TRAIN_SLACK_S"; exit 2; }
+if [ "$PUBW" != 0 ]; then
+  [ "$V7" = 1 ] || { echo "SEQUENCE STOP: PUBLISH_WINDOW_S needs V7=1 (train mode)"; exit 2; }
+  SA="$SA --publish-window-s $PUBW"
+  if [ -n "${PUBLISH_DRAM_ROWS:-}" ]; then
+    [[ $PUBLISH_DRAM_ROWS =~ ^[1-9][0-9]*$ ]] || { echo "SEQUENCE STOP: bad PUBLISH_DRAM_ROWS"; exit 2; }
+    SA="$SA --publish-dram-rows $PUBLISH_DRAM_ROWS"
+  fi
+  echo "BLOCK PLAN: windowed publication W=$PUBW s (dram rows ${PUBLISH_DRAM_ROWS:-default}); warmup=$PUBWU: part pubtrain = updates only $((PUBW + PUBSL)) s, then publish_started=1, SLO search >= $PUBAFT s after publishing started"
+elif [ -n "${PUBLISH_DRAM_ROWS:-}" ]; then echo "SEQUENCE STOP: PUBLISH_DRAM_ROWS without PUBLISH_WINDOW_S"; exit 2
+fi
+pub_train() {  # every lifetime (life_start, BLOCK=stream): first window = training only (no queries, no publish)
+  [ "$PUBW" != 0 ] && [ "$PUBWU" = 1 ] || return 0
+  local rc ps
+  measure "$LS" pubtrain "${LGC[@]}" --opt seed=$((SEED + 101)) --seed $((SEED + 101)) --mode fixed --rates 0 \
+    --warmup-s 0 --step-warmup-s 0 --step-measure-s $((PUBW + PUBSL)) --drain-s 2
+  rc=$?; [ $rc = 0 ] || stop "$NAME pubtrain rc $rc"
+  ps=$(sed -n 's/^publish_started=//p' "$LS/pubtrain/post-t0.txt" 2>/dev/null | tail -1)
+  [ "$ps" = 1 ] || stop "$NAME pubtrain: node 0 publish_started=${ps:-missing} after $((PUBW + PUBSL)) s of updates"
+  echo "$(date -Is) $NAME: publishing started (window $PUBW s; $(grep -m1 '^window_distinct=' "$LS/pubtrain/post-t0.txt"))"
+}
+pub_after() {  # <part dir with post-t0.txt>: sleep until PUBLISH_AFTER_S have passed since publishing started
+  [ "$PUBW" != 0 ] && [ "$PUBWU" = 1 ] || return 0
+  local m s since
+  m=$(sed -n 's/^stats_mono_ns=//p' "$1/post-t0.txt" | tail -1); s=$(sed -n 's/^publish_start_mono_ns=//p' "$1/post-t0.txt" | tail -1)
+  [[ $m =~ ^[0-9]+$ && $s =~ ^[1-9][0-9]*$ ]] || stop "$NAME: node 0 stats_mono_ns / publish_start_mono_ns missing in $1/post-t0.txt"
+  since=$(( (m - s) / 1000000000 ))
+  if [ $since -lt "$PUBAFT" ]; then
+    echo "$(date -Is) $NAME: publishing started ${since} s ago (< $PUBAFT s): sleeping $((PUBAFT - since)) s before the SLO search"
+    sleep $((PUBAFT - since))
+  fi
+}
 v7_lgc() {  # <rate>: v7 loadgen options (appended to LGC; later --opt values win)
   [ "$V7" = 1 ] || return 0
   # no --opt seq_base / wrap here: session.sh measure appends seq_base=<last update seq> and wrap=1 itself and refuses
@@ -703,6 +747,7 @@ life_start() {  # <sys> <name>: prepare + session start of one server lifetime -
   tail -1 "$S.start.out"
   echo "$NAME prepare_wall_s=$(( $(date +%s) - t0 )) (incl. page MSI shm load + preload)" >> "$E/load-times.txt"
   sed "s/^/$NAME /" "$S/load-times.txt" >> "$E/load-times.txt"
+  [ $BLOCK != stream ] || pub_train   # windowed publication: training-only first window (PUBLISH_WINDOW_S > 0)
 }
 life_stop() {  # <sys>: session stop, final checks, page MSI teardown (pop)
   local s=$1 S=$LS
@@ -872,6 +917,7 @@ stream_slo() {  # <sys> <rate>
   measure "$LS" warmup "${LGC[@]}" --opt seed=$((SEED + 100)) --seed $((SEED + 100)) --mode fixed --rates 1 \
     --warmup-s 10 --step-warmup-s 0 --step-measure-s 50 --drain-s 10
   rc=$?; [ $rc = 0 ] || stop "$NAME warm-up rc $rc"
+  pub_after "$LS/warmup"   # windowed publication: SLO search >= PUBLISH_AFTER_S after publishing started
   measure "$LS" slo "${LGC[@]}" --opt seed=$SEED --seed $SEED --slo query:$SLO_PCT:$SLO_MS --raw --tol 0.02 \
     --mode slo --start 1 --factor 1.5 --precision 0.02 --confirm-precision 0.01 --max-confirm-probes $STREAM_CONFIRM_PROBES --confirm-step-down 0.05 \
     --max-steps 40 --min-step-queries 100 --ramp-knee 2
@@ -1039,6 +1085,7 @@ stream_auc() {  # <sys> <rate> <query/s>: AUC lifetime body (header "STREAM_AUC"
   measure "$LS" warmup "${LGC[@]}" --opt seed=$((SEED + 100)) --seed $((SEED + 100)) --mode fixed --rates 1 \
     --warmup-s 10 --step-warmup-s 0 --step-measure-s 50 --drain-s 10
   rc=$?; [ $rc = 0 ] || stop "$NAME warm-up rc $rc"
+  pub_after "$LS/warmup"
   sb=$(cat "$LS/seq_base")
   [ -s "$E/stream-auc.tsv" ] || printf '# name\tsystem\trate_sps\tauc_q_s\tseq_base\tstatus\n' > "$E/stream-auc.tsv"
   echo "$NAME auc: loadgen seed $fs, $q query/s, seq_base $sb" >> "$E/seeds.txt"

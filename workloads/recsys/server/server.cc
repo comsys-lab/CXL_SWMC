@@ -197,7 +197,7 @@ struct Stats {
   // windowed publication (--publish-window-s > 0 only; keys printed only then)
   std::atomic<uint64_t> published_rows{0}, publish_sections{0}, publish_lag_ns_sum{0}, publish_lag_n{0},
       publish_lag_ns_max{0}, publish_backlog{0}, publish_queued{0}, window_distinct{0}, publish_window{0},
-      publish_carryover{0}, dram_updates{0}, train_dram_hits{0};
+      publish_carryover{0}, dram_updates{0}, train_dram_hits{0}, publish_start_ns{0};
   OpAcc op_publish;
   OpAcc op_query, op_row_update;  // MOT1 v6 Fig 2 (optime.h)
   std::atomic<uint32_t> coh_pc_threads{0}, coh_mg_threads{0};
@@ -1460,6 +1460,7 @@ class Server {
         st_.publish_carryover += carry;
         st_.window_distinct = n;
         st_.publish_window = w + 1;
+        if (w == 0) st_.publish_start_ns = boundary;  // the harness waits from here (main-block.sh PUBLISH_AFTER_S)
         if (w == 0)
           std::fprintf(stderr, "recsys-server: publishing started (window 1, W=%lu s): %lu distinct rows of window 0\n",
                        (unsigned long)Ws, (unsigned long)n);
@@ -1536,7 +1537,8 @@ class Server {
     for (auto &m : dm_) rows += m->n.load();
     std::ostringstream o;
     o << "\npublish_window_s=" << o_.publish_window_s << "\npublish_started=" << (st_.publish_window.load() ? 1 : 0)
-      << "\npublish_window=" << st_.publish_window << "\npublished_rows=" << st_.published_rows
+      << "\npublish_start_mono_ns=" << st_.publish_start_ns << "\npublish_window=" << st_.publish_window
+      << "\npublished_rows=" << st_.published_rows
       << "\npublish_sections=" << st_.publish_sections << "\npublish_backlog=" << st_.publish_backlog
       << "\npublish_queued=" << st_.publish_queued << "\nwindow_distinct=" << st_.window_distinct
       << "\npublish_carryover_rows=" << st_.publish_carryover << "\npublish_lag_ns_sum=" << st_.publish_lag_ns_sum

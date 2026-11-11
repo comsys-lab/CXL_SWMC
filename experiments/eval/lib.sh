@@ -40,6 +40,7 @@ unset RS_V7 RS_V7_IMAGE RS_V7_DENSE RS_V7_IMAGE_HOST RS_V7_DENSE_HOST RS_V7_LR R
   RS_V7_STALE_SAMPLE RS_V7_STALE_DIR RS_V7_SAMPLES RS_V7_FROZEN   # v7 keys come only from the conf
 unset RS_PMAX RS_PMAX_FROM RS_PMAX_S RS_PMAX_SETTLE_S   # run-2 RecSys pmax step keys (rs_env), only from the conf
 unset RS_AUC_Q RS_AUC_S RS_AUC_SETTLE_S RS_AUC_ONLY     # run-2 RecSys fixed-rate AUC lifetimes (rs_env), only from the conf
+unset RS_PUBLISH_WINDOW_S RS_PUBLISH_WARMUP RS_PUBLISH_AFTER_S RS_PUBLISH_DRAM_ROWS   # windowed publication (rs_env), only from the conf
 CONFSH=$(python3 -I -B "$EVD/evalconf.py" shell ${EVAL_CONF:+--conf "$EVAL_CONF"}) || { echo "RUNSET STOP: ${EVAL_CONF:-eval.conf} does not parse"; exit 2; }
 eval "$CONFSH"
 export EVAL_CONF   # absolute path of the config (evalconf.py shell); pins-vdb.sh (sourced by the hook) reads the same file
@@ -186,6 +187,19 @@ rs_env() {
     done
     plan "RecSys v7: image ${RS_V7_IMAGE} dense ${RS_V7_DENSE} lr ${RS_V7_LR} acc_init ${RS_V7_ACC_INIT} batch ${RS_V7_TRAIN_BATCH} W ${RS_V7_W_S} s stale 1/${RS_V7_STALE_SAMPLE} rows";;
     *) die "bad RS_V7 (${RS_V7}: 0 or 1)";; esac
+  # windowed update publication (reports/experiments/recsys-windowed-update.md; main-block.sh PUBLISH_*): RS_PUBLISH_WINDOW_S
+  # W (s; unset / 0 = off = per-batch write-through), RS_PUBLISH_WARMUP 1 (default) | 0 (training-only first window
+  # per lifetime), RS_PUBLISH_AFTER_S (60: SLO search this long after publishing started), RS_PUBLISH_DRAM_ROWS (optional)
+  case ${RS_PUBLISH_WINDOW_S:-0} in
+    0) [ -z "${RS_PUBLISH_WARMUP:-}${RS_PUBLISH_AFTER_S:-}${RS_PUBLISH_DRAM_ROWS:-}" ] \
+         || die "RS_PUBLISH_WARMUP / RS_PUBLISH_AFTER_S / RS_PUBLISH_DRAM_ROWS without RS_PUBLISH_WINDOW_S";;
+    *) [[ $RS_PUBLISH_WINDOW_S =~ ^[1-9][0-9]*$ && ${RS_PUBLISH_WARMUP:-1} =~ ^[01]$ && ${RS_PUBLISH_AFTER_S:-60} =~ ^(0|[1-9][0-9]*)$ \
+          && ${RS_PUBLISH_DRAM_ROWS:-1} =~ ^[1-9][0-9]*$ ]] || die "bad RS_PUBLISH_WINDOW_S / _WARMUP / _AFTER_S / _DRAM_ROWS"
+       [ "${RS_V7:-0}" = 1 ] || die "RS_PUBLISH_WINDOW_S needs RS_V7=1"
+       RSENV+=(PUBLISH_WINDOW_S=$RS_PUBLISH_WINDOW_S PUBLISH_WARMUP=${RS_PUBLISH_WARMUP:-1} PUBLISH_AFTER_S=${RS_PUBLISH_AFTER_S:-60})
+       [ -z "${RS_PUBLISH_DRAM_ROWS:-}" ] || RSENV+=(PUBLISH_DRAM_ROWS=$RS_PUBLISH_DRAM_ROWS)
+       plan "windowed publication: W ${RS_PUBLISH_WINDOW_S} s, training-only first window ${RS_PUBLISH_WARMUP:-1}, SLO search >= ${RS_PUBLISH_AFTER_S:-60} s after publishing started, DRAM rows ${RS_PUBLISH_DRAM_ROWS:-default}";;
+  esac
   # run-2 pmax step (main-block.sh STREAM_PMAX): RS_PMAX 0 | 1, RS_PMAX_FROM = stream-results.tsv globs of the rs-main
   # block whose pop rows a ds block uses ({RUN} = this run k; relative = project root), RS_PMAX_S / RS_PMAX_SETTLE_S
   case ${RS_PMAX:-0} in 0) [ -z "${RS_PMAX_FROM:-}" ] || die "RS_PMAX_FROM without RS_PMAX=1";;
