@@ -1,0 +1,33 @@
+# Megalon config for the socialgraph Megalon backend, data structure granularity, 8 VMs (sg-server --nodes 8
+# --backend megalon --object-layout chunk --chunk-bytes 33554432). Needs an 8-node Megalon build (builds/megalon/78-n8;
+# sg build builds/socialgraph-megalon/<n>-n8). Region: config/cxl_region-ring2m.yaml.
+# Same values as socialgraph-2vm.yaml (321 objects, 10,729,863,616 B in the 11GB arena) except nr_log_size, which is
+# 128MB as systems/megalon/vectordb-8vm.yaml (524,288 entries of 256 B: the same entry count as 2 and 4 VMs).
+# hwcc: SCR 64 MiB + 14,848 B + sg app 1,052,672 B (--print-app-bytes --nodes 8) + msg_ring 2 MiB <= 256 MiB.
+mount_directory: /mydata        # required by the config parser; unused
+key_space: 10000
+slots: 10240
+logical_scr_size: 64MB
+node_id: 0                      # overridden by MEGALON_NODE_ID (sg-server sets it from --node)
+region_config: ""               # $CXL_REGION_CONFIG
+reinit: false                   # node 0: MEGALON_REINIT=1
+attach_mprotect: true
+stuck_timeout_ms: 10000
+log_sync_interval_us: 100
+nr_log_size: 128MB
+attach_timeout_s: 600
+start_barrier_timeout_s: 600
+object_arena_size: 11GB
+object_align: 64
+object_max_count: 65536         # hwcc flavor only (static records); unused by the megalon flavor
+replicate: false
+flush: false
+evict: false
+partition_ratio: 0.0
+excluded_files:
+excluded_directories:
+  - /usr
+  - /proc
+  - /etc
+  - /dev
+  - /sys
