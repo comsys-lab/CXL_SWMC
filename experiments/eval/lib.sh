@@ -42,6 +42,7 @@ unset RS_PMAX RS_PMAX_FROM RS_PMAX_S RS_PMAX_SETTLE_S   # run-2 RecSys pmax step
 unset RS_AUC_Q RS_AUC_S RS_AUC_SETTLE_S RS_AUC_ONLY     # run-2 RecSys fixed-rate AUC lifetimes (rs_env), only from the conf
 unset RS_PUBLISH_WINDOW_S RS_PUBLISH_WARMUP RS_PUBLISH_AFTER_S RS_PUBLISH_DRAM_ROWS   # windowed publication (rs_env), only from the conf
 unset RS_CHUNK_PAIRS CHUNK_PAIRS   # serving split (rs_env -> main-block.sh CHUNK_PAIRS), only from the conf
+unset RS_SLO_TOL STREAM_SLO_TOL   # SLO-search loadgen --tol (rs_env -> main-block.sh STREAM_SLO_TOL), only from the conf
 CONFSH=$(python3 -I -B "$EVD/evalconf.py" shell ${EVAL_CONF:+--conf "$EVAL_CONF"}) || { echo "RUNSET STOP: ${EVAL_CONF:-eval.conf} does not parse"; exit 2; }
 eval "$CONFSH"
 export EVAL_CONF   # absolute path of the config (evalconf.py shell); pins-vdb.sh (sourced by the hook) reads the same file
@@ -179,6 +180,13 @@ rs_env() {
   case ${EVAL_RS_LEAN:-0} in 0) ;; 1) RSENV+=(STREAM_CONFIRM_PROBES=3); plan "LEAN: confirm probes capped at 3 (EVAL_RS_LEAN=1)";;
     *) die "bad EVAL_RS_LEAN (${EVAL_RS_LEAN}: 0 or 1)";; esac
   plan "RecSys SLO query p$RS_SLO_PCT <= $RS_SLO_MS ms, max confirm probes $([ "${EVAL_RS_LEAN:-0}" = 1 ] && echo 3 || echo 6)"
+  # RS_SLO_TOL (user 2026-11-11; optional, every RecSys run set: rs-main, rs-ds, rs-h1): loadgen --tol of the stream SLO
+  # search (main-block.sh STREAM_SLO_TOL, (0, 0.2]); unset / empty = not passed = 0.02 (block env unchanged)
+  if [ -n "${RS_SLO_TOL:-}" ]; then
+    [[ $RS_SLO_TOL =~ ^0?\.[0-9]+$ ]] && awk -v t="$RS_SLO_TOL" 'BEGIN { exit !(t > 0 && t <= 0.2) }' || die "bad RS_SLO_TOL ($RS_SLO_TOL: (0, 0.2])"
+    RSENV+=(STREAM_SLO_TOL=$RS_SLO_TOL)
+    plan "SLO search loadgen --tol $RS_SLO_TOL (RS_SLO_TOL; default 0.02)"
+  fi
   local v; for v in PRETOUCH_DIR MEASURE_ENV_DIR MEASURE_PART_DIR; do [ -z "${!v:-}" ] || RSENV+=("$v=${!v}"); done
   # RecSys v7 (RS_V7=1; workloads/recsys/DESIGN.md §10.6): RS_V7_<X> -> main-block.sh V7_<X>; @USER@ values = not
   # decided by the user (dry start plans with the server defaults, a real run stops in the block)
@@ -289,8 +297,8 @@ block_dry() {
   # megalon-ideal-record: the block's "PLAN: megalon-ideal: " line (element layout only)
   # recsys-serving-split: main-block.sh "PLAN: serving split: " (CHUNK_PAIRS set) and "PLAN: server args: " (BLOCK=stream);
   # De Stijl build 13: "PLAN: wait assist: " (DS_WAIT_ASSIST set); Megalon one lifetime: "PLAN: one lifetime: "
-  # (STREAM_ONE_LIFETIME=1 only)
-  echo "$out" | grep -E '^BLOCK (PLAN: L1 |PLAN: DAMON |PLAN: pmax |PLAN: auc |PLAN: receiver|PLAN: fixed warmup |PLAN: replica: |PLAN: torn rows: |PLAN: megalon-page: |PLAN: megalon-ideal: |PLAN: windowed publication |PLAN: serving split: |PLAN: server args: |PLAN: wait assist: |PLAN: one lifetime: |DRY NOTE|NOTE)' | while IFS= read -r l; do plan "block dry: $l"; done
+  # (STREAM_ONE_LIFETIME=1 only); SLO-search tol: "PLAN: slo search: " (STREAM_SLO_TOL set only)
+  echo "$out" | grep -E '^BLOCK (PLAN: L1 |PLAN: DAMON |PLAN: pmax |PLAN: auc |PLAN: receiver|PLAN: fixed warmup |PLAN: replica: |PLAN: torn rows: |PLAN: megalon-page: |PLAN: megalon-ideal: |PLAN: windowed publication |PLAN: serving split: |PLAN: server args: |PLAN: wait assist: |PLAN: one lifetime: |PLAN: slo search: |DRY NOTE|NOTE)' | while IFS= read -r l; do plan "block dry: $l"; done
   out=$(echo "$out" | tail -n 3)
   if [[ "$out" == *"$want"* ]]; then plan "block dry start reached its evidence-dir check: $(echo "$out" | grep -m1 "$want")"
   else die "block dry start did not reach the evidence-dir check: $out"; fi

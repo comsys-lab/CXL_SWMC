@@ -38,7 +38,7 @@ fi
 need_env
 lock_free
 evidence_dir
-rs_env
+rs_env   # incl. the optional conf key RS_SLO_TOL -> STREAM_SLO_TOL (SLO-search loadgen --tol; lib.sh)
 RSENV+=(SYSTEMS="$RS_SYSTEMS" STREAM_RATES="$RS_POINTS" STREAM_FIX_LEVELS="$RS_FIX_LEVELS" STREAM_FIX_LEVELS_MAP="${MAP# }"
   STREAM_FIX_FALLBACK=$RS_FIX_FALLBACK_Q STREAM_FIX_SEP=$SEP STREAM_LEVELS=$LVF)
 BLK=(bash $TREE/experiments/recsys/main-block.sh $E/block)

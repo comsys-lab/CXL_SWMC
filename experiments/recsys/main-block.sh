@@ -241,6 +241,17 @@ if [ -n "${STREAM_SLO_MS:-}${STREAM_CONFIRM_PROBES:-}" ]; then
   case ${STREAM_CONFIRM_PROBES:-6} in 3|6) ;; *) echo "SEQUENCE STOP: STREAM_CONFIRM_PROBES must be 3 or 6"; exit 2;; esac
 fi
 STREAM_CONFIRM_PROBES=${STREAM_CONFIRM_PROBES:-6}
+#   STREAM_SLO_TOL (user 2026-11-11; lib.sh rs_env from the conf's RS_SLO_TOL): loadgen --tol of the BLOCK=stream SLO
+#     search (stream_slo) only, a number in (0, 0.2]; unset = 0.02 (every earlier run). 0.05: a step whose queries all
+#     completed but ~3-6 % finished after the 15 s window no longer fails as "not keeping up". H1_SLO_TOL is separate.
+SSTOL=0.02
+if [ -n "${STREAM_SLO_TOL:-}" ]; then
+  [ $BLOCK = stream ] && [ -n "${EVAL_RUN:-}" ] || { echo "SEQUENCE STOP: STREAM_SLO_TOL needs BLOCK=stream and EVAL_RUN"; exit 2; }
+  [[ $STREAM_SLO_TOL =~ ^0?\.[0-9]+$ ]] && awk -v t="$STREAM_SLO_TOL" 'BEGIN { exit !(t > 0 && t <= 0.2) }' \
+    || { echo "SEQUENCE STOP: STREAM_SLO_TOL must be a number in (0, 0.2] (got $STREAM_SLO_TOL)"; exit 2; }
+  SSTOL=$STREAM_SLO_TOL
+  echo "BLOCK PLAN: slo search: --tol $SSTOL (STREAM_SLO_TOL; default 0.02)"
+fi
 # Publication period T (H1 v0.6.9, user decision 2026-10-18 "T=1로 바로 가는게 좋아보여"): RS_T_MS = the updater's
 # --publish-ms. Default 60000 (every earlier block, unchanged). BLOCK=h1 requires it explicitly (pins-recsys.sh).
 # The Ekko operating point is defined at the reference T = 60 s and is an UPDATE SAMPLE RATE: EKKO_FRAC60 of all rows
@@ -1001,7 +1012,7 @@ stream_slo() {  # <sys> <rate>
     --warmup-s 10 --step-warmup-s 0 --step-measure-s 50 --drain-s 10
   rc=$?; [ $rc = 0 ] || stop "$NAME warm-up rc $rc"
   pub_after "$LS/warmup"   # windowed publication: SLO search >= PUBLISH_AFTER_S after publishing started
-  measure "$LS" slo "${LGC[@]}" --opt seed=$SEED --seed $SEED --slo query:$SLO_PCT:$SLO_MS --raw --tol 0.02 \
+  measure "$LS" slo "${LGC[@]}" --opt seed=$SEED --seed $SEED --slo query:$SLO_PCT:$SLO_MS --raw --tol $SSTOL \
     --mode slo --start 1 --factor 1.5 --precision 0.02 --confirm-precision 0.01 --max-confirm-probes $STREAM_CONFIRM_PROBES --confirm-step-down 0.05 \
     --max-steps 40 --min-step-queries 100 --ramp-knee 2
   rc=$?
@@ -1486,6 +1497,7 @@ if [ $BLOCK = stream ]; then  # RecSys streaming driver (header "BLOCK=stream")
       echo "STREAM_FIX_S=${STREAM_FIX_S:-60} STREAM_FIX_SETTLE_S=${STREAM_FIX_SETTLE_S:-60} server_args=[$SA] node0_extra=[$N0X]"
       echo "slo=query:$SLO_PCT:$SLO_MS ($SLO_RULE) max_confirm_probes=$STREAM_CONFIRM_PROBES"
       [ -z "${STREAM_AUC:-}" ] || echo "STREAM_AUC=[$STREAM_AUC] STREAM_AUC_S=${STREAM_AUC_S:-300} STREAM_AUC_SETTLE_S=${STREAM_AUC_SETTLE_S:-30} STREAM_AUC_ONLY=${STREAM_AUC_ONLY:-0} seed=$((SEED + 3))"
+      [ -z "${STREAM_SLO_TOL:-}" ] || echo "slo_tol=$SSTOL (STREAM_SLO_TOL: loadgen --tol of the SLO search; unset = 0.02)"
       [ "$ONEL" = 0 ] || echo "one_lifetime=1 settle_s=$OLSET (STREAM_ONE_LIFETIME: rates [$STREAM_RATES] in one mg lifetime; later rates: settle part seed $((SEED + 101)), XT $XT s)"; } | tee "$E/eval-params.txt"
   fi
   { echo "# RecSys streaming block: per rate (in STREAM_RATES order) one lifetime per system, order shuffle(seed recsys-stream-<rate>)"

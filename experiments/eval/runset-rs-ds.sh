@@ -83,7 +83,7 @@ fi
 need_env
 lock_free
 evidence_dir
-rs_env
+rs_env   # incl. the optional conf key RS_SLO_TOL -> STREAM_SLO_TOL (SLO-search loadgen --tol; lib.sh)
 RSENV+=(REGION=$RS_DS_REGION VM_PLAIN=$RS_DS_VM_PLAIN SYSTEMS=ds STREAM_RATES="$RS_POINTS" STREAM_FIX_LEVELS= STREAM_FIX_SEP=1
   DS_C=$RS_DS_C DS_BUNDLE_SHA=$RS_DS_BUNDLE_SHA DS_K=$RS_DS_K DS_GT=$RS_DS_GT RS_DS_T_US=$T)   # later assignments win in env
 [ -z "$RSRX" ] || { RSENV+=("DS_RECV_EXTRA=$RSRX"); plan "De Stijl receiver parameters: $RSRX (cxl_shm load, checked after the enable)"; }

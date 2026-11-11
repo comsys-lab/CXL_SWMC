@@ -45,7 +45,7 @@ fi
 need_env
 lock_free
 evidence_dir
-rs_env
+rs_env   # incl. the optional conf key RS_SLO_TOL -> STREAM_SLO_TOL (SLO-search loadgen --tol; lib.sh)
 BASEENV=("${RSENV[@]}")
 block() {  # <dir name> <rates> <systems> <fix-only> <levels>: one main-block.sh call (real) or its dry start
   local d=$1 rates=$2 sys=$3 fo=$4 lv=$5
