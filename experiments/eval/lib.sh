@@ -45,7 +45,7 @@ unset RS_CHUNK_PAIRS CHUNK_PAIRS   # serving split (rs_env -> main-block.sh CHUN
 unset RS_SLO_TOL STREAM_SLO_TOL   # SLO-search loadgen --tol (rs_env -> main-block.sh STREAM_SLO_TOL), only from the conf
 unset RS_DRAIN_FULL_S STREAM_DRAIN_FULL_S   # SLO-search loadgen --drain-full-s (rs_env -> STREAM_DRAIN_FULL_S), only from the conf
 unset RS_DRAIN_FAIL_S STREAM_DRAIN_FAIL_S RS_CONFIRM_RULE STREAM_CONFIRM_RULE RS_CONFIRM_REPS STREAM_CONFIRM_REPS \
-  RS_CONFIRM_S STREAM_CONFIRM_S   # SLO-search loadgen --drain-fail-s / --confirm-rule/-reps/-s (rs_env), only from the conf
+  RS_CONFIRM_S STREAM_CONFIRM_S RS_CONFIRM_FULL STREAM_CONFIRM_FULL   # SLO-search loadgen --drain-fail-s / --confirm-rule/-reps/-s (rs_env), only from the conf
 CONFSH=$(python3 -I -B "$EVD/evalconf.py" shell ${EVAL_CONF:+--conf "$EVAL_CONF"}) || { echo "RUNSET STOP: ${EVAL_CONF:-eval.conf} does not parse"; exit 2; }
 eval "$CONFSH"
 export EVAL_CONF   # absolute path of the config (evalconf.py shell); pins-vdb.sh (sourced by the hook) reads the same file
@@ -221,6 +221,11 @@ rs_env() {
     [[ $RS_CONFIRM_S =~ ^[1-9][0-9]*$ ]] && [ "$RS_CONFIRM_S" -ge 5 ] && [ "$RS_CONFIRM_S" -le 120 ] || die "bad RS_CONFIRM_S ($RS_CONFIRM_S: 5..120 s)"
     RSENV+=(STREAM_CONFIRM_S=$RS_CONFIRM_S)
     plan "SLO search loadgen --confirm-s $RS_CONFIRM_S (RS_CONFIRM_S; default 30)"
+  fi
+  if [ -n "${RS_CONFIRM_FULL:-}" ]; then  # RS_CONFIRM_FULL=1 (user 2026-11-12): loadgen --confirm-full
+    [ "$RS_CONFIRM_FULL" = 1 ] || die "bad RS_CONFIRM_FULL ($RS_CONFIRM_FULL: 1 or unset)"
+    RSENV+=(STREAM_CONFIRM_FULL=1)
+    plan "SLO search loadgen --confirm-full (RS_CONFIRM_FULL; default not passed)"
   fi
   local v; for v in PRETOUCH_DIR MEASURE_ENV_DIR MEASURE_PART_DIR; do [ -z "${!v:-}" ] || RSENV+=("$v=${!v}"); done
   # RecSys v7 (RS_V7=1; workloads/recsys/DESIGN.md §10.6): RS_V7_<X> -> main-block.sh V7_<X>; @USER@ values = not

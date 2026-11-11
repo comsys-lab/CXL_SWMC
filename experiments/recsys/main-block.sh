@@ -272,7 +272,8 @@ fi
 #   STREAM_CONFIRM_RULE   --confirm-rule majority | pooled (target pooled)
 #   STREAM_CONFIRM_REPS   --confirm-reps N, 1..12 (target 6)
 #   STREAM_CONFIRM_S      --confirm-s S, whole seconds 5..120 (target 15)
-for v in STREAM_DRAIN_FAIL_S STREAM_CONFIRM_RULE STREAM_CONFIRM_REPS STREAM_CONFIRM_S; do
+#   STREAM_CONFIRM_FULL   1 = --confirm-full (confirm repeats never stop early on the SLO; target 1)
+for v in STREAM_DRAIN_FAIL_S STREAM_CONFIRM_RULE STREAM_CONFIRM_REPS STREAM_CONFIRM_S STREAM_CONFIRM_FULL; do
   [ -z "${!v:-}" ] || { [ $BLOCK = stream ] && [ -n "${EVAL_RUN:-}" ]; } || { echo "SEQUENCE STOP: $v needs BLOCK=stream and EVAL_RUN"; exit 2; }
 done
 if [ -n "${STREAM_DRAIN_FAIL_S:-}" ]; then
@@ -298,6 +299,11 @@ if [ -n "${STREAM_CONFIRM_S:-}" ]; then
     || { echo "SEQUENCE STOP: STREAM_CONFIRM_S must be whole seconds 5..120 (got $STREAM_CONFIRM_S)"; exit 2; }
   SSDRAIN+=(--confirm-s "$STREAM_CONFIRM_S")
   echo "BLOCK PLAN: slo search: --confirm-s $STREAM_CONFIRM_S (STREAM_CONFIRM_S; default 30)"
+fi
+if [ -n "${STREAM_CONFIRM_FULL:-}" ]; then
+  [ "$STREAM_CONFIRM_FULL" = 1 ] || { echo "SEQUENCE STOP: STREAM_CONFIRM_FULL must be 1 or unset (got $STREAM_CONFIRM_FULL)"; exit 2; }
+  SSDRAIN+=(--confirm-full)
+  echo "BLOCK PLAN: slo search: --confirm-full (STREAM_CONFIRM_FULL; default not passed)"
 fi
 # Publication period T (H1 v0.6.9, user decision 2026-10-18 "T=1로 바로 가는게 좋아보여"): RS_T_MS = the updater's
 # --publish-ms. Default 60000 (every earlier block, unchanged). BLOCK=h1 requires it explicitly (pins-recsys.sh).
@@ -1550,6 +1556,7 @@ if [ $BLOCK = stream ]; then  # RecSys streaming driver (header "BLOCK=stream")
       [ -z "${STREAM_CONFIRM_RULE:-}" ] || echo "slo_confirm_rule=$STREAM_CONFIRM_RULE (STREAM_CONFIRM_RULE: loadgen --confirm-rule; unset = majority)"
       [ -z "${STREAM_CONFIRM_REPS:-}" ] || echo "slo_confirm_reps=$STREAM_CONFIRM_REPS (STREAM_CONFIRM_REPS: loadgen --confirm-reps; unset = 3)"
       [ -z "${STREAM_CONFIRM_S:-}" ] || echo "slo_confirm_s=$STREAM_CONFIRM_S (STREAM_CONFIRM_S: loadgen --confirm-s; unset = 30)"
+      [ -z "${STREAM_CONFIRM_FULL:-}" ] || echo "slo_confirm_full=1 (STREAM_CONFIRM_FULL: loadgen --confirm-full; unset = not passed)"
       [ "$ONEL" = 0 ] || echo "one_lifetime=1 settle_s=$OLSET (STREAM_ONE_LIFETIME: rates [$STREAM_RATES] in one mg lifetime; later rates: settle part seed $((SEED + 101)), XT $XT s)"; } | tee "$E/eval-params.txt"
   fi
   { echo "# RecSys streaming block: per rate (in STREAM_RATES order) one lifetime per system, order shuffle(seed recsys-stream-<rate>)"
