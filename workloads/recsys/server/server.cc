@@ -21,6 +21,8 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cerrno>
+#include <cstdarg>
 #include <chrono>
 #include <condition_variable>
 #include <cstdio>
@@ -112,6 +114,13 @@ struct Opts {
   std::string stale_log;        // --stale-log FILE: (row, seq, CLOCK_REALTIME ns) of sampled rows; node 0 = every
                                 // write, other nodes = every serving lookup of a sampled row
   uint32_t stale_mod = 256;     // --stale-sample N: a row is sampled iff mix64(global row) % N == 0 (same on every node)
+  // ---- windowed publication (reports/experiments/recsys-windowed-update.md; train mode only; 0 = off = write-through,
+  // every earlier run). W > 0: owners update a node-0 DRAM copy of each touched row (first touch copies the record from
+  // shared memory); the distinct rows D_w of wall-clock window w are written to shared memory during window w + 1 by one
+  // publisher thread, ceil(|D_w| / W) rows per second, evenly spaced, each row's latest DRAM value.
+  uint32_t publish_window_s = 0;  // --publish-window-s W
+  uint64_t dram_rows_cap = 0;     // --publish-dram-rows N: DRAM copy capacity in rows (0 = min(total rows, 48M))
+  std::string publish_trace;      // --publish-trace FILE: text log of every DRAM update / publish (Host tests only)
 };
 
 struct Conn {
@@ -185,6 +194,11 @@ struct Stats {
   // CLOCK_THREAD_CPUTIME_ID; updater_cpu_ns = train_cpu_ns + owner_cpu_ns (steps.csv updater_cpu_s_per_s)
   std::atomic<uint64_t> train_samples{0}, train_batches{0}, train_cpu_ns{0}, train_fwd_ns{0}, train_bwd_ns{0},
       owner_cpu_ns{0}, train_lookups{0}, grad_rows{0}, stale_reads_logged{0}, stale_writes_logged{0};
+  // windowed publication (--publish-window-s > 0 only; keys printed only then)
+  std::atomic<uint64_t> published_rows{0}, publish_sections{0}, publish_lag_ns_sum{0}, publish_lag_n{0},
+      publish_lag_ns_max{0}, publish_backlog{0}, publish_queued{0}, window_distinct{0}, publish_window{0},
+      publish_carryover{0}, dram_updates{0}, train_dram_hits{0};
+  OpAcc op_publish;
   OpAcc op_query, op_row_update;  // MOT1 v6 Fig 2 (optime.h)
   std::atomic<uint32_t> coh_pc_threads{0}, coh_mg_threads{0};
 };
@@ -250,8 +264,9 @@ class Server {
       tag += " rows_per_object=" + std::to_string(o_.mg_rows_per_object);
     HwccLayout lay(p_, tag.c_str());
     if constexpr (std::is_same_v<Be, MegalonBackend>) {
-      if (1 + o_.load_threads + o_.update_threads + o_.serve_threads + train_threads() > 32)
-        die("megalon: at most 32 thread registrations per node (main + load + update + serve + train threads)");
+      if (1 + o_.load_threads + o_.update_threads + o_.serve_threads + train_threads() + (win_on() ? 1 : 0) > 32)
+        die("megalon: at most 32 thread registrations per node (main + load + update + serve + train threads"
+            " + publisher)");
       api_ = megalon_load(o_.megalon_lib, &err);
       if (!api_) die(err);
       if (api_->node_id() != o_.node) die("megalon node id != --node");
@@ -288,6 +303,10 @@ class Server {
       if (model_.spec().dim != p_.dim || model_.spec().rank != o_.rank) die("model: dense weights do not match --dim/--rank");
     }
     if (!o_.stale_log.empty()) open_stale_log();
+    if (!o_.publish_trace.empty() && win_on()) {
+      trace_f_ = std::fopen(o_.publish_trace.c_str(), "wx");
+      if (!trace_f_) die("--publish-trace " + o_.publish_trace + ": cannot create (exists?)");
+    }
     std::fprintf(stderr, "recsys-server: v7 %s\n", v7_text(" ").c_str());
     std::fprintf(stderr,
                  "recsys-server: node %u/%u run %#lx %s\nrecsys-server: region %s\nrecsys-server: app layout %lu B "
@@ -318,11 +337,13 @@ class Server {
     for (uint32_t w = 0; w < o_.update_threads; w++) done_seq_[w] = 0;
     uq_.reset(new Queue<std::shared_ptr<UpdJob>>[o_.update_threads]);
     gq_.reset(new Queue<std::shared_ptr<GradJob>>[o_.update_threads]);
+    if (win_on()) dram_init();
     for (uint32_t w = 0; w < o_.update_threads; w++)
       std::thread([this, w] { o_.train ? owner(w) : updater(w); }).detach();
     for (uint32_t i = 0; i < o_.serve_threads; i++) std::thread([this, i] { server(i); }).detach();
     if (o_.train)
       for (uint32_t i = 0; i < train_threads(); i++) std::thread([this, i] { trainer(i); }).detach();
+    if (win_on()) std::thread([this] { publisher(); }).detach();
     std::thread([this] { listen_loop(); }).detach();
     cxl::proc::name_thread("rs-main");
   }
@@ -345,7 +366,7 @@ class Server {
       << "\npublish_rounds=" << st_.publish_rounds << "\nround_rows=" << st_.round_rows
       << "\nround_rows_max_worker=" << st_.round_rows_max << "\nupdate_rate_sustained=" << (st_.flush_overruns ? 0 : 1)
       << "\nupdate_queue_max=" << st_.uq_max << "\naccum_ns=" << tsc_to_ns(st_.accum_cyc)
-      << stream_text() << "\n" << v7_text("\n")
+      << stream_text() << window_text() << "\n" << v7_text("\n")
       << "\nver_stripes=" << p_.ver_stripes << "\ntsc_khz=" << tsc_khz()
       << "\nop.coh_src=pc_threads:" << st_.coh_pc_threads << ",mg_threads:" << st_.coh_mg_threads << "\n" << op_tags()
       << op_text() << "mem.vm_rss_kb=" << status_kb("VmRSS:")
@@ -386,6 +407,8 @@ class Server {
  private:
   // ---------------------------------------------------------------- v7 (DESIGN.md §10.6)
   uint32_t train_threads() const { return o_.train ? (o_.train_threads ? o_.train_threads : o_.update_threads) : 0; }
+  // windowed publication runs on the training node only (node 0; serving nodes never get update samples)
+  bool win_on() const { return o_.train && o_.publish_window_s > 0 && o_.node == 0; }
   std::string v7_text(const char *sep) {
     std::ostringstream o;
     o << "v7.image=" << (o_.image.empty() ? "-" : o_.image) << sep << "v7.model_dense="
@@ -551,6 +574,7 @@ class Server {
     std::ostringstream o;
     st_.op_query.text(o, "query");
     st_.op_row_update.text(o, "row_update");
+    if (win_on()) st_.op_publish.text(o, "publish");  // publisher: one op per row written to shared memory
     return o.str();
   }
   void coh_init() {  // on the worker thread itself, after the backend registered it
@@ -826,6 +850,10 @@ class Server {
       u->job = std::move(j);
     }
     if (o_.train) {  // v7: one training queue in seq order (the ordered update stream); trainers take batches
+      if (win_on() && !win_t0_.load(std::memory_order_relaxed)) {  // window 0 starts at the first update sample
+        uint64_t z = 0;
+        win_t0_.compare_exchange_strong(z, u->t_arr);
+      }
       const uint64_t q = tq_.push_size(u);
       uint64_t m = st_.uq_max.load();
       while (q > m && !st_.uq_max.compare_exchange_weak(m, q)) {
@@ -1069,7 +1097,7 @@ class Server {
           for (uint32_t j = 0; j < p_.hot[k]; j++) {
             const uint64_t row = p_.row_of(k, smp, j);
             looks++;
-            if (lookup(k, Params::key(k, row), acc, tmp.data(), &lc)) ent.push_back(Ent{p_.row_base[k] + row, r * kSparse + k});
+            if (train_lookup(k, Params::key(k, row), acc, tmp.data(), &lc)) ent.push_back(Ent{p_.row_base[k] + row, r * kSparse + k});
             else st_.update_misses++;
           }
         }
@@ -1150,7 +1178,9 @@ class Server {
       const uint64_t c0 = thread_cpu_ns(), t0 = now_ns();
       ot.begin();
       uint64_t sections = 0, bad_key = 0;
-      if constexpr (!Be::kAppSeqlock) {
+      if (win_on()) {
+        bad_key = dram_apply(w, j, wv.data());  // windowed publication: DRAM copy only, no shared-memory write
+      } else if constexpr (!Be::kAppSeqlock) {
         for (size_t i = 0; i < j.rows.size();) {
           const uint32_t k = j.rows[i].k;
           const uint64_t c = be_->chunk_of(k, j.rows[i].gslot - p_.row_base[k]);
@@ -1223,6 +1253,302 @@ class Server {
     uint64_t *f = &h_->nodes[o_.node].published_seq, cur = load_acquire(f);
     while (cur < pub && !cxl::hwcc::cas(f, &cur, pub)) {
     }
+  }
+
+  // ---------------------------------------------------------------- windowed publication (node 0, --publish-window-s W)
+  // reports/experiments/recsys-windowed-update.md. DRAM copy: one DramMap per row owner w (owner(): the rows owner w
+  // updates), written only by owner w (insert = first touch: the whole record, embedding + Adagrad acc + seq + csum,
+  // copied from shared memory; update = row-wise Adagrad on the copy), read by the trainers (forward pass) and the
+  // publisher through a per-entry seqlock. Index: open addressing keyed by the global row index (linear probing, no
+  // deletes, load factor <= 1/2), one u64 per slot = (gslot + 1) << 32 | entry; entries are dense arrays (record,
+  // version, window tag, last update time) mapped MAP_NORESERVE, so only used entries take memory.
+  // Window w = [t0 + w W, t0 + (w + 1) W), t0 = arrival of the first update sample (window 0 = training only). D_w =
+  // entries updated in window w (dedup by the window tag). At the end of w the publisher takes D_w from every owner under
+  // the owner's mutex, which the owner holds for a whole batch, so every row update of w is complete before the
+  // hand-over, and writes them during w + 1: row i of the list (owners interleaved) is due at boundary + i / b s,
+  // b = ceil(|D_w| / W) rows per second (per-second budget, evenly spaced inside each second). Behind schedule: rows are
+  // written as fast as possible in list order, none dropped; a later list is appended after the current one
+  // (publish_backlog = due rows not yet written; publish_carryover_rows = rows still queued when a new list arrives).
+  // Each write = the row's DRAM record at that moment (last write wins) through the backend's row write path (plain:
+  // under the row's stripe like an owner write; Megalon: one write section on the row's object). In this mode the
+  // publisher is the only writer of the tables in shared memory (Megalon: one writer per object holds).
+  struct DramMap {
+    uint64_t mask = 0, cap = 0;
+    std::atomic<uint64_t> *idx = nullptr;   // index slots
+    uint8_t *rec = nullptr;                 // cap x slot_bytes records
+    std::atomic<uint32_t> *ver = nullptr;   // per entry seqlock (odd: owner writing)
+    uint32_t *tag = nullptr;                // 1 + window of the entry's last D_w insertion (0 = none); owner only
+    std::atomic<uint64_t> *t_upd = nullptr; // CLOCK_MONOTONIC ns of the entry's last update
+    std::atomic<uint64_t> n{0};             // entries used
+    std::mutex mu;                          // D_w hand-over
+    uint32_t win = 0;                       // window the owner's updates belong to (advanced by the publisher, under mu)
+    std::vector<uint32_t> d;                // D_win (entries)
+  };
+  static void *anon(uint64_t bytes) {
+    void *p = mmap(nullptr, bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+    if (p == MAP_FAILED) die("windowed publication: mmap " + std::to_string(bytes) + " B");
+    return p;
+  }
+  void dram_init() {
+    if (p_.total_rows >= (1ull << 32) - 1) die("windowed publication: more than 2^32 - 2 rows");
+    const uint64_t U = o_.update_threads;
+    const uint64_t total = o_.dram_rows_cap ? o_.dram_rows_cap : std::min<uint64_t>(p_.total_rows, 48ull << 20);
+    const uint64_t share = (total + U - 1) / U;  // owner() spreads rows evenly; + 25 % + 4096 headroom per owner
+    const uint64_t cap = std::min<uint64_t>(p_.total_rows, share + share / 4 + 4096);
+    uint64_t slots = 1;
+    while (slots < 2 * cap) slots <<= 1;
+    for (uint64_t w = 0; w < U; w++) {
+      auto m = std::make_unique<DramMap>();
+      m->cap = cap, m->mask = slots - 1;
+      m->idx = static_cast<std::atomic<uint64_t> *>(anon(slots * 8));
+      m->rec = static_cast<uint8_t *>(anon(cap * p_.slot_bytes));
+      m->ver = static_cast<std::atomic<uint32_t> *>(anon(cap * 4));
+      m->tag = static_cast<uint32_t *>(anon(cap * 4));
+      m->t_upd = static_cast<std::atomic<uint64_t> *>(anon(cap * 8));
+      dm_.push_back(std::move(m));
+    }
+    dram_cap_ = cap * U, dram_index_bytes_ = slots * 8 * U;
+    std::fprintf(stderr, "recsys-server: windowed publication W=%u s: DRAM copy %lu owners x %lu rows (%u B record + 16 B "
+                         "per row used; index %lu slots x 8 B per owner = %.1f MiB)\n",
+                 o_.publish_window_s, (unsigned long)U, (unsigned long)cap, unsigned(p_.slot_bytes), (unsigned long)slots,
+                 dram_index_bytes_ / 1048576.0);
+  }
+  static uint64_t dram_hash(uint64_t gslot) { return mix64(gslot ^ 0xd7a3c0b1e5ull); }
+  int64_t dram_find(const DramMap &m, uint64_t gslot) const {
+    const uint64_t want = gslot + 1;
+    for (uint64_t i = dram_hash(gslot) & m.mask;; i = (i + 1) & m.mask) {
+      const uint64_t v = m.idx[i].load(std::memory_order_acquire);
+      if (!v) return -1;
+      if (v >> 32 == want) return int64_t(v & 0xffffffffu);
+    }
+  }
+  uint64_t dram_insert(DramMap &m, uint64_t gslot, const uint8_t *src) {  // owner only; src = the shared record copy
+    const uint64_t want = gslot + 1;
+    uint64_t i = dram_hash(gslot) & m.mask;
+    for (uint64_t v; (v = m.idx[i].load(std::memory_order_relaxed)); i = (i + 1) & m.mask)
+      if (v >> 32 == want) return v & 0xffffffffu;
+    const uint64_t e = m.n.load(std::memory_order_relaxed);
+    if (e >= m.cap)
+      die("windowed publication: DRAM copy of an owner full (" + std::to_string(m.cap) + " rows; raise --publish-dram-rows)");
+    std::memcpy(m.rec + e * p_.slot_bytes, src, p_.slot_bytes);
+    m.ver[e].store(0, std::memory_order_relaxed);
+    m.tag[e] = 0;
+    m.t_upd[e].store(0, std::memory_order_relaxed);
+    m.idx[i].store(want << 32 | e, std::memory_order_release);
+    m.n.store(e + 1, std::memory_order_release);
+    return e;
+  }
+  // consistent copy of bytes [off, off + len) of entry e; returns the entry's last update time
+  uint64_t dram_read(const DramMap &m, uint64_t e, uint8_t *dst, uint32_t off, uint32_t len) const {
+    const uint8_t *r = m.rec + e * p_.slot_bytes + off;
+    for (;;) {
+      const uint32_t v1 = m.ver[e].load(std::memory_order_acquire);
+      if (v1 & 1) {
+        _mm_pause();
+        continue;
+      }
+      std::memcpy(dst, r, len);
+      const uint64_t t = m.t_upd[e].load(std::memory_order_relaxed);
+      std::atomic_thread_fence(std::memory_order_acquire);
+      if (m.ver[e].load(std::memory_order_relaxed) == v1) return t;
+    }
+  }
+  // owner w, one gradient batch: update the DRAM copies (first touch copies the shared record), add rows to D_win.
+  // Returns the rows whose shared record holds another key (not updated; counted as update misses like the RMW path).
+  uint64_t dram_apply(uint32_t w, const GradJob &j, float *wv) {
+    DramMap &m = *dm_[w];
+    thread_local std::vector<uint8_t> buf;
+    buf.resize(p_.slot_bytes);
+    uint64_t bad_key = 0, n = 0;
+    std::lock_guard<std::mutex> l(m.mu);
+    const uint64_t now = now_ns();
+    const uint32_t tg = m.win + 1;
+    for (size_t x = 0; x < j.rows.size(); x++) {
+      const Touched &t = j.rows[x];
+      int64_t e = dram_find(m, t.gslot);
+      if (e < 0) {  // first touch: no other writer of this row exists (the publisher writes only rows in the map)
+        be_->read_slot(t.k, t.gslot - p_.row_base[t.k], [&](const uint8_t *src) { std::memcpy(buf.data(), src, p_.slot_bytes); });
+        uint64_t key;
+        std::memcpy(&key, buf.data() + fmt_.key_off, 8);
+        if (key != t.key) {
+          bad_key++;
+          continue;
+        }
+        e = int64_t(dram_insert(m, t.gslot, buf.data()));
+      }
+      uint8_t *rec = m.rec + uint64_t(e) * p_.slot_bytes;
+      const uint32_t v = m.ver[e].load(std::memory_order_relaxed);
+      m.ver[e].store(v + 1, std::memory_order_relaxed);
+      std::atomic_thread_fence(std::memory_order_release);
+      rmw_record(rec, &j.g[x * p_.dim], t.key, j.seq, wv);
+      m.t_upd[e].store(now, std::memory_order_relaxed);
+      m.ver[e].store(v + 2, std::memory_order_release);
+      if (m.tag[e] != tg) {
+        m.tag[e] = tg;
+        m.d.push_back(uint32_t(e));
+      }
+      n++;
+      if (trace_f_) trace("U %u %lu %lu %lu\n", tg - 1, (unsigned long)t.gslot, (unsigned long)j.seq, (unsigned long)now);
+    }
+    st_.dram_updates += n;
+    return bad_key;
+  }
+  // trainer forward lookup: the DRAM copy when the row has one, else the shared record (lookup())
+  bool train_lookup(uint32_t k, uint64_t key, float *acc, float *tmp, LookupCnt *c) {
+    if (!win_on()) return lookup(k, key, acc, tmp, c);
+    const uint64_t r = Params::key_row(key);
+    if (r >= p_.rows[k]) return false;
+    const DramMap &m = *dm_[owner(k, key)];
+    const int64_t e = dram_find(m, p_.row_base[k] + r);
+    if (e < 0) return lookup(k, key, acc, tmp, c);
+    dram_read(m, uint64_t(e), reinterpret_cast<uint8_t *>(tmp), uint32_t(fmt_.emb_off), fmt_.emb_bytes);
+    emb_to_f32(tmp, fmt_.elt, p_.dim, acc, true);
+    st_.train_dram_hits.fetch_add(1, std::memory_order_relaxed);
+    return true;
+  }
+  void trace(const char *fmt, ...) __attribute__((format(printf, 2, 3))) {
+    std::lock_guard<std::mutex> g(trace_mu_);
+    va_list ap;
+    va_start(ap, fmt);
+    std::vfprintf(trace_f_, fmt, ap);
+    va_end(ap);
+  }
+  static void sleep_until_ns(uint64_t t) {
+    timespec ts{time_t(t / 1000000000ull), long(t % 1000000000ull)};
+    while (clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &ts, nullptr) == EINTR) {
+    }
+  }
+  void publisher() {
+    be_->thread_init(int(1 + o_.load_threads + o_.update_threads + o_.serve_threads + train_threads()), kRoleUpdate);
+    cxl::proc::name_thread("rs-publish");
+    coh_init();
+    OpTimer ot(&tcoh_);
+    const uint64_t Ws = o_.publish_window_s, W = Ws * 1000000000ull, U = o_.update_threads;
+    std::vector<uint8_t> buf(p_.slot_bytes);
+    struct Seg {
+      std::vector<uint64_t> rows;  // owner << 32 | entry
+      uint64_t start = 0, b = 0;   // window boundary (ns), rows per second
+      size_t next = 0;
+      uint32_t win = 0;            // the window whose D_w this is
+    };
+    std::deque<Seg> q;
+    uint64_t t0;
+    while (!(t0 = win_t0_.load(std::memory_order_acquire))) sleep_until_ns(now_ns() + 1000000);
+    uint64_t boundary = t0 + W;
+    uint32_t w = 0;
+    std::vector<std::vector<uint32_t>> lists(U);
+    for (;;) {
+      const uint64_t now = now_ns();
+      if (now >= boundary) {  // end of window w: D_w becomes the list published during w + 1
+        size_t mx = 0;
+        for (uint64_t u = 0; u < U; u++) {
+          lists[u].clear();
+          std::lock_guard<std::mutex> l(dm_[u]->mu);
+          lists[u].swap(dm_[u]->d);
+          dm_[u]->win = w + 1;
+          mx = std::max(mx, lists[u].size());
+        }
+        Seg s;
+        s.win = w, s.start = boundary;
+        for (size_t i = 0; i < mx; i++)
+          for (uint64_t u = 0; u < U; u++)
+            if (i < lists[u].size()) s.rows.push_back(u << 32 | lists[u][i]);
+        const uint64_t n = s.rows.size();
+        s.b = (n + Ws - 1) / Ws;
+        uint64_t carry = 0;
+        for (const Seg &x : q) carry += x.rows.size() - x.next;
+        st_.publish_carryover += carry;
+        st_.window_distinct = n;
+        st_.publish_window = w + 1;
+        if (w == 0)
+          std::fprintf(stderr, "recsys-server: publishing started (window 1, W=%lu s): %lu distinct rows of window 0\n",
+                       (unsigned long)Ws, (unsigned long)n);
+        std::fprintf(stderr, "recsys-server: publish window %u: %lu distinct rows of window %u, %lu rows/s, %lu rows carried over\n",
+                     w + 1, (unsigned long)n, w, (unsigned long)s.b, (unsigned long)carry);
+        if (trace_f_) trace("B %u %lu %lu %lu\n", w, (unsigned long)boundary, (unsigned long)n, (unsigned long)s.b);
+        if (n) q.push_back(std::move(s));
+        w++;
+        boundary += W;
+        continue;
+      }
+      uint64_t backlog = 0, queued = 0;
+      for (const Seg &x : q) {
+        queued += x.rows.size() - x.next;
+        if (now < x.start) continue;
+        const uint64_t due = std::min<uint64_t>(x.rows.size(), uint64_t(double(now - x.start) * double(x.b) / 1e9) + 1);
+        if (due > x.next) backlog += due - x.next;
+      }
+      st_.publish_backlog.store(backlog, std::memory_order_relaxed);
+      st_.publish_queued.store(queued, std::memory_order_relaxed);
+      if (q.empty()) {
+        sleep_until_ns(boundary);
+        continue;
+      }
+      Seg &s = q.front();
+      const uint64_t due = s.start + (s.next / s.b) * 1000000000ull + (s.next % s.b) * 1000000000ull / s.b;
+      if (due > now) {
+        sleep_until_ns(std::min(due, boundary));
+        continue;
+      }
+      publish_row(s.rows[s.next], s.win, buf, ot);
+      if (++s.next == s.rows.size()) q.pop_front();
+    }
+  }
+  void publish_row(uint64_t pk, uint32_t win, std::vector<uint8_t> &buf, OpTimer &ot) {
+    const DramMap &m = *dm_[pk >> 32];
+    const uint64_t e = pk & 0xffffffffu;
+    ot.begin();
+    const uint64_t t_upd = dram_read(m, e, buf.data(), 0, p_.slot_bytes);
+    uint64_t key, seq;
+    std::memcpy(&key, buf.data() + fmt_.key_off, 8);
+    std::memcpy(&seq, buf.data() + fmt_.seq_off, 8);
+    const uint32_t k = Params::key_table(key);
+    const uint64_t r = Params::key_row(key);
+    if constexpr (Be::kAppSeqlock) {
+      uint32_t *ver = &h_->ver[p_.stripe(key)];
+      const uint32_t v = lock_stripe(ver);
+      be_->write_slot(k, r, [&](uint8_t *dst) { std::memcpy(dst, buf.data(), p_.slot_bytes); });
+      store_release(ver, v + 2);
+    } else {
+      be_->write_object(k, be_->chunk_of(k, r),
+                        [&](uint8_t *obj) { std::memcpy(obj + be_->row_offset(k, r), buf.data(), p_.slot_bytes); });
+      st_.publish_sections++;
+    }
+    const uint64_t t = now_ns();
+    ot.end(&st_.op_publish, 1);
+    const uint64_t lag = t > t_upd ? t - t_upd : 0;
+    st_.publish_lag_ns_sum += lag, st_.publish_lag_n++;
+    uint64_t mx = st_.publish_lag_ns_max.load();
+    while (lag > mx && !st_.publish_lag_ns_max.compare_exchange_weak(mx, lag)) {
+    }
+    st_.published_rows++;
+    const uint64_t gslot = p_.row_base[k] + r;
+    if (stale_sampled(gslot)) stale_add(gslot, seq, true);  // visible after the write
+    if (trace_f_) {
+      uint32_t cs;
+      std::memcpy(&cs, buf.data() + fmt_.csum_off, 4);
+      trace("P %u %lu %lu %u %lu\n", win, (unsigned long)gslot, (unsigned long)seq, cs, (unsigned long)t);
+    }
+  }
+  std::string window_text() {
+    if (!win_on()) return "";
+    uint64_t rows = 0;
+    for (auto &m : dm_) rows += m->n.load();
+    std::ostringstream o;
+    o << "\npublish_window_s=" << o_.publish_window_s << "\npublish_started=" << (st_.publish_window.load() ? 1 : 0)
+      << "\npublish_window=" << st_.publish_window << "\npublished_rows=" << st_.published_rows
+      << "\npublish_sections=" << st_.publish_sections << "\npublish_backlog=" << st_.publish_backlog
+      << "\npublish_queued=" << st_.publish_queued << "\nwindow_distinct=" << st_.window_distinct
+      << "\npublish_carryover_rows=" << st_.publish_carryover << "\npublish_lag_ns_sum=" << st_.publish_lag_ns_sum
+      << "\npublish_lag_ns_count=" << st_.publish_lag_n << "\npublish_lag_ns_max=" << st_.publish_lag_ns_max.exchange(0)
+      << "\ndram_rows=" << rows << "\ndram_capacity=" << dram_cap_ << "\ndram_index_bytes=" << dram_index_bytes_
+      << "\ndram_bytes=" << dram_index_bytes_ + rows * (p_.slot_bytes + 16) << "\ndram_updates=" << st_.dram_updates
+      << "\ntrain_dram_hits=" << st_.train_dram_hits;
+    if (trace_f_) {
+      std::lock_guard<std::mutex> g(trace_mu_);
+      std::fflush(trace_f_);
+    }
+    return o.str();
   }
 
   // ---------------------------------------------------------------- serving
@@ -1474,6 +1800,12 @@ class Server {
   FILE *stale_f_ = nullptr;
   std::mutex stale_mu_;
   std::vector<std::unique_ptr<StaleBuf>> stale_bufs_;
+  // windowed publication
+  std::vector<std::unique_ptr<DramMap>> dm_;
+  std::atomic<uint64_t> win_t0_{0};
+  uint64_t dram_cap_ = 0, dram_index_bytes_ = 0;
+  FILE *trace_f_ = nullptr;
+  std::mutex trace_mu_;
 };
 
 template <class Be>
@@ -1530,6 +1862,9 @@ void usage() {
                "  v7 (DESIGN.md §10.6): [--image F] [--model-dense F] [--update-mode train] [--train-threads N (= U)]\n"
                "     [--train-batch B (8)] [--lr X (0.004)] [--eps X (1e-8)] [--acc-init X (< 0 = image)]\n"
                "     [--stale-log FILE] [--stale-sample N (256)]   train needs --image and --model-dense\n"
+               "     [--publish-window-s W (0 = off: every row update written through)] [--publish-dram-rows N (0 = min(rows, 48M))]\n"
+               "     [--publish-trace FILE (Host tests)]   W > 0 (node 0): train on a DRAM copy, publish the distinct rows of\n"
+               "     each W-s window during the next window, ceil(n/W) rows/s evenly spaced (reports/experiments/recsys-windowed-update.md)\n"
                "  [--dim D (128)] [--row-cap R (26000000)] [--row-div N (1)] [--ver-stripes S (65536)]\n"
                "  [--multi-hot-div N (1)] [--rank R (512)] [--seed N] [--verify-rows 0|1] [--warm-up 0|1]\n"
                "  [--check-stride N (4096)] [--megalon-time-sample N (0 = off)] [--start-timeout-ms T] [--backend plain|megalon] [--megalon-lib PATH]\n"
@@ -1579,6 +1914,9 @@ int main(int argc, char **argv) {
     else if (a == "--acc-init") o.acc_init = std::stod(v());
     else if (a == "--stale-log") o.stale_log = v();
     else if (a == "--stale-sample") o.stale_mod = std::stoul(v());
+    else if (a == "--publish-window-s") o.publish_window_s = std::stoul(v());
+    else if (a == "--publish-dram-rows") o.dram_rows_cap = std::stoull(v());
+    else if (a == "--publish-trace") o.publish_trace = v();
     else if (a == "--dim") o.p.dim = std::stoul(v());
     else if (a == "--row-cap") o.p.row_cap = std::stoull(v()), row_cap_set = true;
     else if (a == "--row-div") o.p.row_div = std::stoull(v());
@@ -1616,6 +1954,14 @@ int main(int argc, char **argv) {
                   !(o.ada.lr > 0) || o.p.multi_hot_div != 1)) {
     std::fprintf(stderr, "recsys-server: --update-mode train needs --image, --model-dense, --publish-ms 0, "
                          "1 <= --train-batch <= 64, --lr > 0 and --multi-hot-div 1\n");
+    return 2;
+  }
+  if ((o.publish_window_s || o.dram_rows_cap || !o.publish_trace.empty()) && !o.train) {
+    std::fprintf(stderr, "recsys-server: --publish-window-s / --publish-dram-rows / --publish-trace need --update-mode train\n");
+    return 2;
+  }
+  if (!o.publish_window_s && (o.dram_rows_cap || !o.publish_trace.empty())) {
+    std::fprintf(stderr, "recsys-server: --publish-dram-rows / --publish-trace need --publish-window-s > 0\n");
     return 2;
   }
   if (!o.image.empty() && !o.train) {  // the v6 writer (make_slot) would overwrite v7 records with synthetic v6 rows
