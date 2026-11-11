@@ -133,6 +133,21 @@
 #   adaptive split (every earlier run, args byte for byte). BLOCK=stream prints "BLOCK PLAN: server args: <args>".
 # De Stijl wait assist (build >= 13, kernel switch /sys/kernel/swmc/destijl/wait_assist): DS_WAIT_ASSIST 0 | 1
 #   (runset-rs-ds.sh RS_DS_WAIT_ASSIST); unset / empty = no step (every earlier run). See the De Stijl block below.
+# STREAM_ONE_LIFETIME=1 (user 2026-11-11, Megalon only; runset-rs-h1.sh RS_MG_ONE_LIFETIME): ONE mg server lifetime (one
+#   load) for every rate of STREAM_RATES, in order; unset / 0 = one lifetime per rate (every earlier run, unchanged).
+#   Needs BLOCK=stream, EVAL_RUN, SYSTEMS=mg, V7=1, PUBLISH_WINDOW_S W > 0 with PUBLISH_WARMUP=1, no fixed / AUC
+#   windows, and STREAM_SETTLE_S (>= 2 W; 1200 s at W = 600 s). First rate r1: the per-lifetime sequence as above
+#   (life_start = session start + pubtrain, then stream_slo = warmup + pub_after + slo) in session dir <E>/mg-u<r1>.
+#   Each later rate r: continuation dir <E>/mg-u<r> (session.env, session-manifest.txt and seq_base copied: the same
+#   servers, seqs continue), part "settle" = the update stream alone at the new rate (loadgen --fixed update=<r>
+#   --rates 0, no queries) for STREAM_SETTLE_S s (one window at r + its publication), then stream_slo as today. The
+#   update rate is the loadgen's (--fixed update=<r>, --opt update_rate=<r>; the trainer consumes what arrives), so
+#   the switch needs no server restart. Rate check: the settle part's stream_check accepted_per_s within 10 % of r
+#   (else stop); <E>/one-lifetime.tsv: per rate the switch counters (node 0 after the previous part: publish_window,
+#   published_rows, window_distinct, publish_backlog, update_accepted_seq, seq_base), settle start / end, accepted
+#   rates. After the last rate: life_stop of <E>/mg-u<r1> (node logs / final checks there, for the whole lifetime;
+#   torn_rows.py block counts a continuation dir by its measurements). A stop in a later rate ends the block as a
+#   failed lifetime does (the finish trap stops the servers); earlier rates' rows and part dirs stay.
 set -uo pipefail
 E=${1:?evidence dir}
 P=/home/comsys/sungsu/destijl-control X=$(cd "$(dirname "$0")" && pwd)
@@ -360,6 +375,19 @@ if [ "$PUBW" != 0 ]; then
   echo "BLOCK PLAN: windowed publication W=$PUBW s (dram rows ${PUBLISH_DRAM_ROWS:-default}); warmup=$PUBWU: part pubtrain = updates only $((PUBW + PUBSL)) s, then publish_started=1, SLO search >= $PUBAFT s after publishing started"
 elif [ -n "${PUBLISH_DRAM_ROWS:-}" ]; then echo "SEQUENCE STOP: PUBLISH_DRAM_ROWS without PUBLISH_WINDOW_S"; exit 2
 fi
+# ---- one mg lifetime for all rates (header "STREAM_ONE_LIFETIME"); 0 / unset = nothing below is used
+ONEL=${STREAM_ONE_LIFETIME:-0} OLSET=${STREAM_SETTLE_S:-} OL_STALE= OL_N=0 OL_S0= OL_NAME0= OL_T0=0 OL_DIRS=
+case $ONEL in
+  0) [ -z "$OLSET" ] || { echo "SEQUENCE STOP: STREAM_SETTLE_S without STREAM_ONE_LIFETIME=1"; exit 2; };;
+  1) [ $BLOCK = stream ] && [ -n "${EVAL_RUN:-}" ] || { echo "SEQUENCE STOP: STREAM_ONE_LIFETIME=1 needs BLOCK=stream and EVAL_RUN"; exit 2; }
+     [ "${SYSTEMS:-}" = mg ] || { echo "SEQUENCE STOP: STREAM_ONE_LIFETIME=1 is for SYSTEMS=mg only (got '${SYSTEMS:-}')"; exit 2; }
+     [ -z "${STREAM_FIXONLY:-}${STREAM_FIX_LEVELS:-}${STREAM_FIX_LEVELS_MAP:-}${STREAM_LEVELS:-}${STREAM_AUC:-}" ] \
+       || { echo "SEQUENCE STOP: STREAM_ONE_LIFETIME=1 takes no fixed-load / AUC windows (SLO parts only)"; exit 2; }
+     [ "$V7" = 1 ] && [ "$PUBW" != 0 ] && [ "$PUBWU" = 1 ] || { echo "SEQUENCE STOP: STREAM_ONE_LIFETIME=1 needs V7=1, PUBLISH_WINDOW_S > 0 and PUBLISH_WARMUP=1"; exit 2; }
+     [[ $OLSET =~ ^[1-9][0-9]*$ ]] && [ "$OLSET" -ge $((2 * PUBW)) ] || { echo "SEQUENCE STOP: STREAM_ONE_LIFETIME=1 needs STREAM_SETTLE_S >= 2 x PUBLISH_WINDOW_S = $((2 * PUBW)) s (got '$OLSET')"; exit 2; }
+     echo "BLOCK PLAN: one lifetime: rates [$STREAM_RATES] in one mg server lifetime (one load, XT $XT s); first rate: pubtrain $((PUBW + PUBSL)) s + warmup + slo; each later rate: settle $OLSET s at the new rate (update stream only, no queries; accepted rate checked) + warmup + slo";;
+  *) echo "SEQUENCE STOP: bad STREAM_ONE_LIFETIME ($ONEL: 0 | 1)"; exit 2;;
+esac
 # ---- serving split (reports/experiments/recsys-serving-split.md): CHUNK_PAIRS N = server --chunk-pairs N on every node
 # (700 = the largest query of tools/dist_quantile.txt: one serving thread per query); unset / empty = not passed
 CHUNKP=${CHUNK_PAIRS:-}
@@ -405,7 +433,7 @@ v7_post() {  # <sys> <rate> <part dir> [AUC csv, default <E>/auc_run.csv]: fetch
   [ "$V7" = 1 ] || return 0
   local k f
   for k in 0 1; do
-    f=$(v7_stale $NAME $k)
+    f=$(v7_stale ${OL_STALE:-$NAME} $k)   # OL_STALE: the lifetime's name (STREAM_ONE_LIFETIME=1 only; else empty)
     if [ "${SESSION_LOCAL:-0}" = 1 ]; then cp "$f" "$3/stale-n$k.stl"
     else $SSH comsys@${IPS[$k]} "cat $f" < /dev/null > "$3/stale-n$k.stl"; fi || stop "$NAME: stale log n$k"
   done
@@ -1210,6 +1238,82 @@ stream_auc_rate() {  # <rate>: the rate's AUC lifetimes (STREAM_AUC), after ever
     life_start $s $s-u$r-auc; stream_auc $s $r $q; life_stop $s
   done
 }
+# ---- STREAM_ONE_LIFETIME=1 (header): every rate in one mg lifetime; called only when ONEL=1
+ol_kv() { sed -n "s/^$2=//p" "$1" 2>/dev/null | tail -1; }   # <snapshot file> <key>
+ol_acc() {  # <part dir> <rate>: "<accepted_per_s weighted by window_s> <PASS|FAIL>" from stream-check.csv (10 % band)
+  python3 -I - "$1/stream-check.csv" "$2" <<'PY'
+import csv, sys
+r = float(sys.argv[2])
+try:
+    rows = list(csv.DictReader(open(sys.argv[1])))
+except OSError:
+    rows = []
+w = [(float(x["accepted_per_s"]), float(x["window_s"])) for x in rows if x.get("accepted_per_s") and x.get("window_s")]
+off = all(abs(float(x["update_offered"]) - r) <= 1e-6 * r for x in rows) and bool(rows)
+t = sum(b for _, b in w)
+a = sum(x * b for x, b in w) / t if t > 0 else 0.0
+print(f"{a:.3f} {'PASS' if off and t > 0 and 0.9 * r <= a <= 1.1 * r else 'FAIL'}")
+PY
+}
+ol_rate() {  # <rate>: the rate's parts in the one mg lifetime (first rate: life_start; later: continuation dir + settle)
+  local r=$1 d prev sw sb t0 t1 rc acc0 accs c pw1
+  OL_N=$((OL_N + 1))
+  echo "u$r eval order: mg (one lifetime: rate $OL_N of [$STREAM_RATES]$([ $OL_N = 1 ] || echo ", session $OL_NAME0, settle $OLSET s"))" | tee -a "$E/order.txt"
+  [ -s "$E/one-lifetime.tsv" ] || printf '# name\trate_sps\tsession\tswitch_from\tseq_base_at_switch\tpublish_window_at_switch\tpublished_rows_at_switch\twindow_distinct_at_switch\tpublish_backlog_at_switch\tupdate_accepted_seq_at_switch\tsettle_start\tsettle_end\tsettle_s\tpublish_window_after_settle\tsettle_accepted_per_s\tslo_accepted_per_s\trate_check\n' > "$E/one-lifetime.tsv"
+  echo "$(date -Is) stream u$r system mg (one lifetime, rate $OL_N)"
+  if [ $OL_N = 1 ]; then   # exactly the per-lifetime sequence of eval_stream_rate (life_start includes pubtrain)
+    OL_T0=$(date +%s)
+    life_start mg mg-u$r
+    OL_S0=$LS OL_NAME0=$NAME OL_STALE=$NAME
+    stream_slo mg $r
+    accs=$(ol_acc "$LS/slo" $r)
+    printf '%s\t%s\t%s\t-\t-\t-\t-\t-\t-\t-\t-\t-\t-\t-\t-\t%s\t%s\n' "$NAME" $r "$OL_NAME0" "${accs% *}" "first rate (pubtrain; slo accepted ${accs#* })" >> "$E/one-lifetime.tsv"
+    return 0
+  fi
+  # the server lifetime bound (timeout XT on every node): stop before a rate that cannot finish (settle + 30 min)
+  [ $(( $(date +%s) - OL_T0 + OLSET + 1800 )) -le "$XT" ] || stop "one lifetime: $(( $(date +%s) - OL_T0 )) s of XT $XT s used; no room for u$r (settle $OLSET s + 1800 s)"
+  prev=$LS d=$E/mg-u$r sw=$LS/slo/post-t0.txt
+  [ ! -e "$d" ] || stop "one lifetime: $d exists"
+  mkdir "$d" && cp "$OL_S0/session.env" "$OL_S0/session-manifest.txt" "$d/" && cp "$prev/seq_base" "$d/seq_base" || stop "one lifetime: continuation dir $d"
+  sb=$(cat "$d/seq_base")
+  { echo "# continuation of server lifetime $OL_NAME0 (main-block.sh STREAM_ONE_LIFETIME=1): same servers, no new load"
+    echo "session=$OL_S0"; echo "previous_rate_dir=$prev"; echo "rate_sps=$r"; echo "settle_s=$OLSET"
+    echo "copied=session.env session-manifest.txt (snapshot at the switch) seq_base=$sb"
+    echo "lifetime_files=node logs, final-check, torn-lifetime.txt, stopped: in $OL_S0 after the last rate"
+    for c in publish_window published_rows window_distinct publish_backlog publish_queued update_accepted_seq published_seq samples; do
+      echo "switch_$c=$(ol_kv "$sw" $c)"; done; } > "$d/one-lifetime.txt"
+  OL_DIRS="$OL_DIRS $d"
+  LS=$d NAME=mg-u$r
+  t0=$(date -Is)
+  echo "$(date -Is) $NAME: update stream switched to $r samples/s (seq_base $sb, node 0 publish_window $(ol_kv "$sw" publish_window)); settle $OLSET s, no queries"
+  measure "$LS" settle "${LGC[@]}" --opt seed=$((SEED + 101)) --seed $((SEED + 101)) --mode fixed --rates 0 \
+    --warmup-s 0 --step-warmup-s 0 --step-measure-s $OLSET --drain-s 2
+  rc=$?; [ $rc = 0 ] || stop "$NAME settle rc $rc"
+  t1=$(date -Is) pw1=$(ol_kv "$LS/settle/post-t0.txt" publish_window)
+  python3 $X/stream_check.py "$LS/settle" > "$LS/settle/stream-check.txt" 2>&1
+  acc0=$(ol_acc "$LS/settle" $r)
+  { echo "settle_start=$t0"; echo "settle_end=$t1"; echo "settle_publish_window_after=$pw1"; echo "settle_accepted_per_s=${acc0% *} check=${acc0#* }"; } >> "$d/one-lifetime.txt"
+  echo "$(date -Is) $NAME: settle done (publish_window $(ol_kv "$sw" publish_window) -> $pw1, accepted ${acc0% *} samples/s, rate check ${acc0#* })"
+  if [ "${acc0#* }" != PASS ]; then
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t-\tFAIL settle\n' "$NAME" $r "$OL_NAME0" "$(basename "$prev")" "$sb" \
+      "$(ol_kv "$sw" publish_window)" "$(ol_kv "$sw" published_rows)" "$(ol_kv "$sw" window_distinct)" "$(ol_kv "$sw" publish_backlog)" \
+      "$(ol_kv "$sw" update_accepted_seq)" "$t0" "$t1" $OLSET "$pw1" "${acc0% *}" >> "$E/one-lifetime.tsv"
+    stop "$NAME: the update stream is not at $r samples/s after the switch (settle accepted ${acc0% *}/s; $LS/settle/stream-check.csv)"
+  fi
+  stream_slo mg $r   # warmup + pub_after (publishing started long before) + slo, as every lifetime
+  accs=$(ol_acc "$LS/slo" $r)
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$NAME" $r "$OL_NAME0" "$(basename "$prev")" "$sb" \
+    "$(ol_kv "$sw" publish_window)" "$(ol_kv "$sw" published_rows)" "$(ol_kv "$sw" window_distinct)" "$(ol_kv "$sw" publish_backlog)" \
+    "$(ol_kv "$sw" update_accepted_seq)" "$t0" "$t1" $OLSET "$pw1" "${acc0% *}" "${accs% *}" "PASS settle (slo accepted ${accs#* })" >> "$E/one-lifetime.tsv"
+}
+ol_end() {  # after the last rate: stop the one lifetime (session dir of the first rate)
+  local d
+  [ -n "$OL_S0" ] || return 0
+  LS=$OL_S0 NAME=$OL_NAME0
+  life_stop mg
+  for d in $OL_DIRS; do echo "lifetime_stopped=$(cat "$OL_S0/stopped" 2>/dev/null) (session.sh stop of $OL_S0)" >> "$d/one-lifetime.txt"; done
+  echo "$(date -Is) MAIN one lifetime $OL_NAME0 DONE (rates [$STREAM_RATES], $(( $(date +%s) - OL_T0 )) s)"
+}
 h1_entry() {  # <name> <sys> <phase> <part> <steps> <lifetime kind>
   printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$1" "$2" "$H1_MIX" "$3" "$H1_N" "${LS#$E/}/$4" "$5" "$6" >> "$E/h1-runs.tsv"
 }
@@ -1353,7 +1457,8 @@ if [ $BLOCK = stream ]; then  # RecSys streaming driver (header "BLOCK=stream")
       echo "SYSTEMS=${SYSTEMS:-hw pop} STREAM_FIXONLY=${STREAM_FIXONLY:-} STREAM_FIX_LEVELS=${STREAM_FIX_LEVELS:-} STREAM_FIX_LEVELS_MAP=${STREAM_FIX_LEVELS_MAP:-} STREAM_FIX_FALLBACK=${STREAM_FIX_FALLBACK:-} STREAM_FIX_SEP=${STREAM_FIX_SEP:-1} STREAM_LEVELS=${STREAM_LEVELS:-}"
       echo "STREAM_FIX_S=${STREAM_FIX_S:-60} STREAM_FIX_SETTLE_S=${STREAM_FIX_SETTLE_S:-60} server_args=[$SA] node0_extra=[$N0X]"
       echo "slo=query:$SLO_PCT:$SLO_MS ($SLO_RULE) max_confirm_probes=$STREAM_CONFIRM_PROBES"
-      [ -z "${STREAM_AUC:-}" ] || echo "STREAM_AUC=[$STREAM_AUC] STREAM_AUC_S=${STREAM_AUC_S:-300} STREAM_AUC_SETTLE_S=${STREAM_AUC_SETTLE_S:-30} STREAM_AUC_ONLY=${STREAM_AUC_ONLY:-0} seed=$((SEED + 3))"; } | tee "$E/eval-params.txt"
+      [ -z "${STREAM_AUC:-}" ] || echo "STREAM_AUC=[$STREAM_AUC] STREAM_AUC_S=${STREAM_AUC_S:-300} STREAM_AUC_SETTLE_S=${STREAM_AUC_SETTLE_S:-30} STREAM_AUC_ONLY=${STREAM_AUC_ONLY:-0} seed=$((SEED + 3))"
+      [ "$ONEL" = 0 ] || echo "one_lifetime=1 settle_s=$OLSET (STREAM_ONE_LIFETIME: rates [$STREAM_RATES] in one mg lifetime; later rates: settle part seed $((SEED + 101)), XT $XT s)"; } | tee "$E/eval-params.txt"
   fi
   { echo "# RecSys streaming block: per rate (in STREAM_RATES order) one lifetime per system, order shuffle(seed recsys-stream-<rate>)"
     for r in $STREAM_RATES; do echo "u$r: $(h1shuffle recsys-stream-$r ${SYSTEMS:-hw pop})"; done; } | tee "$E/order.txt"
@@ -1362,12 +1467,14 @@ if [ $BLOCK = stream ]; then  # RecSys streaming driver (header "BLOCK=stream")
     LGC=(--opt samples=$D/$UPD_FILE --opt queries=$D/$QRY_FILE
          --opt quantiles=$D/dist_quantile.txt --fixed update=$r --mix query=1 --x-stream query)
     v7_lgc $r
+    if [ "$ONEL" = 1 ]; then ol_rate $r; continue; fi   # STREAM_ONE_LIFETIME=1 only
     if [ -n "${EVAL_RUN:-}" ]; then eval_stream_rate $r; stream_auc_rate $r; continue; fi
     for s in $(h1shuffle recsys-stream-$r ${SYSTEMS:-hw pop}); do
       echo "$(date -Is) stream u$r$lab system $s"
       life_start $s $s-u$r; stream_slo $s $r; life_stop $s
     done
   done
+  [ "$ONEL" = 0 ] || ol_end   # STREAM_ONE_LIFETIME=1: stop the one lifetime after the last rate
   bash $PTG "$PRETOUCH_DIR" "$E/pretouch-gate.txt" || stop "pretouch gate at block end"
   echo "$(date -Is) SEQUENCE DONE $OWNER (stream rates $STREAM_RATES)"
   exit 0

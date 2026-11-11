@@ -12,12 +12,25 @@
 # Layout: E/eval-manifest.txt, E/eval-state.txt, E/mg-decision.tsv, E/{probe,slo,fix}/ (block evidence dirs).
 # Optional conf key RS_MG_MGOFF (default 1; eval3 block C: 0): 0 = no mgoff lifetime (no C_diff): the probe alone is the
 #   Megalon floor at a "fix" rate; a "slo" rate gets the mg SLO lifetime only (no fixed windows).
+# Optional conf keys RS_MG_ONE_LIFETIME (default 0) and RS_MG_SETTLE_S (user 2026-11-11, recsys-windowed-update): 1 =
+#   every rate of RS_MG_POINTS in ONE mg server lifetime (main-block.sh STREAM_ONE_LIFETIME=1 STREAM_SETTLE_S=
+#   RS_MG_SETTLE_S: one load; later rates get a settle part at the new rate before warmup + slo). Needs RS_MG_SLO=always
+#   and RS_MG_MGOFF=0 (one "slo" block with systems [mg]); 0 / unset = one lifetime per rate (block command unchanged).
 # usage: runset-rs-h1.sh <k> [--dry] [--v N]   (lib.sh)
 RUNSET=rs-h1 WL=recsys
-unset RS_MG_MGOFF   # conf key only (never inherited from the environment)
+unset RS_MG_MGOFF RS_MG_ONE_LIFETIME RS_MG_SETTLE_S   # conf keys only (never inherited from the environment)
 . "$(dirname "$0")/lib.sh"
 MGOFF=${RS_MG_MGOFF:-1}
 [[ $MGOFF =~ ^[01]$ ]] || die "bad RS_MG_MGOFF ($MGOFF)"
+ONEL=${RS_MG_ONE_LIFETIME:-0} OLE=()
+case $ONEL in
+  0) [ -z "${RS_MG_SETTLE_S:-}" ] || die "RS_MG_SETTLE_S without RS_MG_ONE_LIFETIME=1";;
+  1) [ "$RS_MG_SLO" = always ] && [ "$MGOFF" = 0 ] || die "RS_MG_ONE_LIFETIME=1 needs RS_MG_SLO=always and RS_MG_MGOFF=0"
+     [[ ${RS_MG_SETTLE_S:-} =~ ^[1-9][0-9]*$ ]] || die "RS_MG_ONE_LIFETIME=1 needs RS_MG_SETTLE_S (s)"
+     OLE=(STREAM_ONE_LIFETIME=1 STREAM_SETTLE_S=$RS_MG_SETTLE_S)
+     plan "mg one lifetime: rates [$RS_MG_POINTS] in one mg server lifetime (one load), settle $RS_MG_SETTLE_S s at each later rate (RS_MG_ONE_LIFETIME=1)";;
+  *) die "bad RS_MG_ONE_LIFETIME ($ONEL: 0 | 1)";;
+esac
 rs_checks
 for r in $RS_MG_POINTS; do [[ $r =~ ^[1-9][0-9]*$ ]] && [ $((r % 50)) = 0 ] || die "bad RS_MG_POINTS rate $r"; done
 case $RS_MG_SLO in auto|always|never) ;; *) die "bad RS_MG_SLO";; esac
@@ -37,7 +50,7 @@ BASEENV=("${RSENV[@]}")
 block() {  # <dir name> <rates> <systems> <fix-only> <levels>: one main-block.sh call (real) or its dry start
   local d=$1 rates=$2 sys=$3 fo=$4 lv=$5
   local B=(env "${BASEENV[@]}" SYSTEMS="$sys" STREAM_RATES="$rates" STREAM_FIXONLY="$fo" STREAM_FIX_LEVELS="$lv"
-           STREAM_FIX_SEP=1 bash $TREE/experiments/recsys/main-block.sh)
+           STREAM_FIX_SEP=1 "${OLE[@]}" bash $TREE/experiments/recsys/main-block.sh)   # OLE empty unless RS_MG_ONE_LIFETIME=1
   plan "block $d: rates [$rates] systems [$sys] fix-only [$fo] levels [$lv]"
   if [ $DRY = 1 ]; then block_dry "missing or not empty" "${B[@]}" @DIR@; return 0; fi
   mkdir "$E/$d" || stop "mkdir $E/$d"

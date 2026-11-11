@@ -288,8 +288,9 @@ block_dry() {
   # RecSys torn rows (user 2026-11-07): main-block.sh "PLAN: torn rows: " (ds lifetimes: allowed or zero-torn invariant)
   # megalon-ideal-record: the block's "PLAN: megalon-ideal: " line (element layout only)
   # recsys-serving-split: main-block.sh "PLAN: serving split: " (CHUNK_PAIRS set) and "PLAN: server args: " (BLOCK=stream);
-  # De Stijl build 13: "PLAN: wait assist: " (DS_WAIT_ASSIST set)
-  echo "$out" | grep -E '^BLOCK (PLAN: L1 |PLAN: DAMON |PLAN: pmax |PLAN: auc |PLAN: receiver|PLAN: fixed warmup |PLAN: replica: |PLAN: torn rows: |PLAN: megalon-page: |PLAN: megalon-ideal: |PLAN: windowed publication |PLAN: serving split: |PLAN: server args: |PLAN: wait assist: |DRY NOTE|NOTE)' | while IFS= read -r l; do plan "block dry: $l"; done
+  # De Stijl build 13: "PLAN: wait assist: " (DS_WAIT_ASSIST set); Megalon one lifetime: "PLAN: one lifetime: "
+  # (STREAM_ONE_LIFETIME=1 only)
+  echo "$out" | grep -E '^BLOCK (PLAN: L1 |PLAN: DAMON |PLAN: pmax |PLAN: auc |PLAN: receiver|PLAN: fixed warmup |PLAN: replica: |PLAN: torn rows: |PLAN: megalon-page: |PLAN: megalon-ideal: |PLAN: windowed publication |PLAN: serving split: |PLAN: server args: |PLAN: wait assist: |PLAN: one lifetime: |DRY NOTE|NOTE)' | while IFS= read -r l; do plan "block dry: $l"; done
   out=$(echo "$out" | tail -n 3)
   if [[ "$out" == *"$want"* ]]; then plan "block dry start reached its evidence-dir check: $(echo "$out" | grep -m1 "$want")"
   else die "block dry start did not reach the evidence-dir check: $out"; fi
