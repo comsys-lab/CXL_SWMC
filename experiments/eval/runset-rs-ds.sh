@@ -28,6 +28,8 @@
 #                     /sys/kernel/swmc/destijl/wait_assist, written on both VMs after the enable of every ds lifetime,
 #                     read back after the enable and before the teardown, 0 after the teardown (main-block.sh
 #                     DS_WAIT_ASSIST; block/ds-wait-assist-<name>.txt). Needs a build >= 13 bundle (RS_DS_K -ds-destijl-<n>).
+#                     Build 13's extra ds.wa_* status keys / sys.swmc.destijl.wa_* columns are ignored by recv_check.py and
+#                     breakdown.py (checked with experiments/eval/wa_cols_fixture.py)
 # After the block: rs_check.py (SLO ds at every rate, no fixed windows) and recv_check.py --mode RECV_MODE (De Stijl
 # lifetime rules: protocol destijl, tx_timeout / protocol_error deltas 0, per-step sys.swmc.destijl.* columns).
 # Layout: E/eval-manifest.txt, E/eval-state.txt, E/block/ (stream-results.tsv, ds-u<R>/slo, dsshm-ds-u<R>/, rs-check.txt,
