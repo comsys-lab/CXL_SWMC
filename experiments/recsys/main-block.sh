@@ -265,6 +265,40 @@ if [ -n "${STREAM_DRAIN_FULL_S:-}" ]; then
   SSDRAIN=(--drain-full-s "$STREAM_DRAIN_FULL_S")
   echo "BLOCK PLAN: slo search: --drain-full-s $STREAM_DRAIN_FULL_S (STREAM_DRAIN_FULL_S; default not passed)"
 fi
+#   More stream SLO-search loadgen options (user 2026-11-12; lib.sh rs_env from the conf's RS_<X>); each unset / empty =
+#     not passed (every earlier run: no drain failure, --confirm-rule majority, session.sh main profile 3 x 30 s):
+#   STREAM_DRAIN_FAIL_S   --drain-fail-s D, seconds in (0, STREAM_DRAIN_FULL_S) (needs it); a step whose full drain
+#                         took > D s fails as a non-latency failure (target 2.0)
+#   STREAM_CONFIRM_RULE   --confirm-rule majority | pooled (target pooled)
+#   STREAM_CONFIRM_REPS   --confirm-reps N, 1..12 (target 6)
+#   STREAM_CONFIRM_S      --confirm-s S, whole seconds 5..120 (target 15)
+for v in STREAM_DRAIN_FAIL_S STREAM_CONFIRM_RULE STREAM_CONFIRM_REPS STREAM_CONFIRM_S; do
+  [ -z "${!v:-}" ] || { [ $BLOCK = stream ] && [ -n "${EVAL_RUN:-}" ]; } || { echo "SEQUENCE STOP: $v needs BLOCK=stream and EVAL_RUN"; exit 2; }
+done
+if [ -n "${STREAM_DRAIN_FAIL_S:-}" ]; then
+  [ -n "${STREAM_DRAIN_FULL_S:-}" ] || { echo "SEQUENCE STOP: STREAM_DRAIN_FAIL_S needs STREAM_DRAIN_FULL_S"; exit 2; }
+  [[ $STREAM_DRAIN_FAIL_S =~ ^[0-9]*\.?[0-9]+$ ]] && awk -v d="$STREAM_DRAIN_FAIL_S" -v f="$STREAM_DRAIN_FULL_S" 'BEGIN { exit !(d > 0 && d < f) }' \
+    || { echo "SEQUENCE STOP: STREAM_DRAIN_FAIL_S must be a number in (0, STREAM_DRAIN_FULL_S) (got $STREAM_DRAIN_FAIL_S)"; exit 2; }
+  SSDRAIN+=(--drain-fail-s "$STREAM_DRAIN_FAIL_S")
+  echo "BLOCK PLAN: slo search: --drain-fail-s $STREAM_DRAIN_FAIL_S (STREAM_DRAIN_FAIL_S; default not passed)"
+fi
+if [ -n "${STREAM_CONFIRM_RULE:-}" ]; then
+  case $STREAM_CONFIRM_RULE in majority|pooled) ;; *) echo "SEQUENCE STOP: STREAM_CONFIRM_RULE must be majority or pooled (got $STREAM_CONFIRM_RULE)"; exit 2;; esac
+  SSDRAIN+=(--confirm-rule "$STREAM_CONFIRM_RULE")
+  echo "BLOCK PLAN: slo search: --confirm-rule $STREAM_CONFIRM_RULE (STREAM_CONFIRM_RULE; default majority)"
+fi
+if [ -n "${STREAM_CONFIRM_REPS:-}" ]; then
+  [[ $STREAM_CONFIRM_REPS =~ ^[1-9][0-9]*$ ]] && [ "$STREAM_CONFIRM_REPS" -le 12 ] \
+    || { echo "SEQUENCE STOP: STREAM_CONFIRM_REPS must be 1..12 (got $STREAM_CONFIRM_REPS)"; exit 2; }
+  SSDRAIN+=(--confirm-reps "$STREAM_CONFIRM_REPS")
+  echo "BLOCK PLAN: slo search: --confirm-reps $STREAM_CONFIRM_REPS (STREAM_CONFIRM_REPS; default 3)"
+fi
+if [ -n "${STREAM_CONFIRM_S:-}" ]; then
+  [[ $STREAM_CONFIRM_S =~ ^[1-9][0-9]*$ ]] && [ "$STREAM_CONFIRM_S" -ge 5 ] && [ "$STREAM_CONFIRM_S" -le 120 ] \
+    || { echo "SEQUENCE STOP: STREAM_CONFIRM_S must be whole seconds 5..120 (got $STREAM_CONFIRM_S)"; exit 2; }
+  SSDRAIN+=(--confirm-s "$STREAM_CONFIRM_S")
+  echo "BLOCK PLAN: slo search: --confirm-s $STREAM_CONFIRM_S (STREAM_CONFIRM_S; default 30)"
+fi
 # Publication period T (H1 v0.6.9, user decision 2026-10-18 "T=1로 바로 가는게 좋아보여"): RS_T_MS = the updater's
 # --publish-ms. Default 60000 (every earlier block, unchanged). BLOCK=h1 requires it explicitly (pins-recsys.sh).
 # The Ekko operating point is defined at the reference T = 60 s and is an UPDATE SAMPLE RATE: EKKO_FRAC60 of all rows
@@ -1512,6 +1546,10 @@ if [ $BLOCK = stream ]; then  # RecSys streaming driver (header "BLOCK=stream")
       [ -z "${STREAM_AUC:-}" ] || echo "STREAM_AUC=[$STREAM_AUC] STREAM_AUC_S=${STREAM_AUC_S:-300} STREAM_AUC_SETTLE_S=${STREAM_AUC_SETTLE_S:-30} STREAM_AUC_ONLY=${STREAM_AUC_ONLY:-0} seed=$((SEED + 3))"
       [ -z "${STREAM_SLO_TOL:-}" ] || echo "slo_tol=$SSTOL (STREAM_SLO_TOL: loadgen --tol of the SLO search; unset = 0.02)"
       [ -z "${STREAM_DRAIN_FULL_S:-}" ] || echo "slo_drain_full_s=$STREAM_DRAIN_FULL_S (STREAM_DRAIN_FULL_S: loadgen --drain-full-s of the SLO search; unset = not passed)"
+      [ -z "${STREAM_DRAIN_FAIL_S:-}" ] || echo "slo_drain_fail_s=$STREAM_DRAIN_FAIL_S (STREAM_DRAIN_FAIL_S: loadgen --drain-fail-s; unset = not passed)"
+      [ -z "${STREAM_CONFIRM_RULE:-}" ] || echo "slo_confirm_rule=$STREAM_CONFIRM_RULE (STREAM_CONFIRM_RULE: loadgen --confirm-rule; unset = majority)"
+      [ -z "${STREAM_CONFIRM_REPS:-}" ] || echo "slo_confirm_reps=$STREAM_CONFIRM_REPS (STREAM_CONFIRM_REPS: loadgen --confirm-reps; unset = 3)"
+      [ -z "${STREAM_CONFIRM_S:-}" ] || echo "slo_confirm_s=$STREAM_CONFIRM_S (STREAM_CONFIRM_S: loadgen --confirm-s; unset = 30)"
       [ "$ONEL" = 0 ] || echo "one_lifetime=1 settle_s=$OLSET (STREAM_ONE_LIFETIME: rates [$STREAM_RATES] in one mg lifetime; later rates: settle part seed $((SEED + 101)), XT $XT s)"; } | tee "$E/eval-params.txt"
   fi
   { echo "# RecSys streaming block: per rate (in STREAM_RATES order) one lifetime per system, order shuffle(seed recsys-stream-<rate>)"

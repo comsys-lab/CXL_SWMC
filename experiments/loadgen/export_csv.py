@@ -12,7 +12,7 @@ Columns (stable; new columns are only ever appended):
   ... (appended last, 2026-10-21) confirm_rule, result_majority_offered, result_majority_complete,
   result_pooled_offered, result_pooled_complete (loadgen --confirm-rule; empty for older runs; see RULES)
   ... (appended last, 2026-11-12) drain_wait_s, outstanding_after_drain, outstanding_at_start, contaminated, judged,
-  rerun_of (loadgen --drain-full-s; empty for runs without it; see DRAIN)
+  rerun_of (loadgen --drain-full-s; empty for runs without it; see DRAIN), drain_fail (--drain-fail-s)
 Step-level (same value on every stream row of a step):
   search_per_s, update_per_s     achieved rate of stream "search" / "update" (empty if the run has no such stream)
   total_ops_per_s                sum of the achieved rates of all streams (an update counts as one operation)
@@ -96,7 +96,9 @@ RULES = ["confirm_rule", "result_majority_offered", "result_majority_complete", 
 # appended last (2026-11-12, loadgen --drain-full-s; empty when the run did not use it): drain_wait_s (send end -> drain
 # end), outstanding_after_drain, outstanding_at_start, contaminated (requests outstanding at step start), judged (false =
 # contaminated first attempt, phase "contaminated", not a search decision), rerun_of (a re-run: step of that attempt)
-DRAIN = ["drain_wait_s", "outstanding_after_drain", "outstanding_at_start", "contaminated", "judged", "rerun_of"]
+# drain_fail (loadgen --drain-fail-s; empty without it): the drain took longer than D s (non-latency failure)
+DRAIN = ["drain_wait_s", "outstanding_after_drain", "outstanding_at_start", "contaminated", "judged", "rerun_of",
+         "drain_fail"]
 SEARCH_PHASES = ("ramp", "bisect", "confirm")
 
 

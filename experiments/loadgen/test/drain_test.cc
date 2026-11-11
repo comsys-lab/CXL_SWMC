@@ -11,6 +11,7 @@
 #include <vector>
 
 #include "drain.h"
+#include "slo_search.h"
 
 using namespace loadgen;
 
@@ -45,8 +46,8 @@ static DrainResult new_drain(Server &s, uint64_t send_end, double drain_s, doubl
 // fake engine step for the search test: offered rate x for 15 s; the server keeps up iff x <= mu; a step passes iff
 // x <= knee and nothing was outstanding at its start (a backlog of an earlier step makes its latencies inf: the bug)
 struct Res {
-  bool pass = false, judged = true, exhausted = false, contaminated = false;
-  double x = 0;
+  bool pass = false, judged = true, exhausted = false, contaminated = false, drain_fail = false;
+  double x = 0, wait_s = 0;
   int64_t rerun_of = -1;
   uint64_t at_start = 0, after = 0;
   int step_no = 0;
@@ -54,6 +55,7 @@ struct Res {
 struct Sim {
   Server s;
   double knee, drain_s, full;
+  double fail_s = 0;  // --drain-fail-s
   int step_no = 0;
   std::vector<Res> log;
   Res once(double x, bool rerun, int64_t rerun_of) {
@@ -65,8 +67,12 @@ struct Sim {
     r.contaminated = full > 0 && out_base > 0;
     s.t += 18000000000ull;  // 3 s warmup + 15 s measure
     s.backlog = std::max(0.0, s.backlog + (x - s.mu) * 18);
+    // latency judgement only (the fake server's latency is fine up to the knee); the drain check below as loadgen.cc
     r.pass = r.judged && out_base == 0 && x <= knee;
-    r.after = new_drain(s, s.t, drain_s, full, out_base).outstanding_after;
+    DrainResult dr = new_drain(s, s.t, drain_s, full, out_base);
+    r.after = dr.outstanding_after, r.wait_s = dr.wait_s;
+    r.drain_fail = drain_failed(full, fail_s, dr.wait_s, true);
+    if (r.drain_fail) r.pass = false;
     log.push_back(r);
     return r;
   }
@@ -221,6 +227,51 @@ int main() {
     size_t judged = 0;
     for (auto &r : on.log) judged += r.judged;
     check(judged == d1.size(), "full drain: decisions == judged steps");
+  }
+  {  // 7. --drain-fail-s: drain longer than D fails the step (non-latency), only with the full drain on
+    check(!drain_failed(0, 1.0, 50, true), "drain-fail: off without --drain-full-s");
+    check(!drain_failed(120, 0, 50, true), "drain-fail: off with D = 0 (default)");
+    check(drain_failed(120, 1.0, 1.5, true) && !drain_failed(120, 1.0, 1.0, true) && !drain_failed(120, 1.0, 0.3, true),
+          "drain-fail: wait 1.5 s > D 1 s fails; 1.0 s and 0.3 s do not");
+    check(!drain_failed(120, 1.0, 5, false), "drain-fail: unmeasured warmup never fails");
+    // fake engine, mu 6/s, knee 7 (latency fine up to 7): x = 6.5 leaves (0.5 x 18) = 9 queued -> 1.5 s drain > 1 s
+    Sim a{Server{}, 7, 5, 120};
+    a.fail_s = 1.0, a.s.mu = 6, a.s.t = 1;
+    Res r = a.step(6.5);
+    check(r.judged && r.drain_fail && !r.pass && std::fabs(r.wait_s - 1.5) < 0.01,
+          "drain-fail: a step whose latency passes but leaves a 1.5 s backlog fails (drain " + std::to_string(r.wait_s) +
+              " s)");
+    Res ok = a.step(5);
+    check(ok.pass && !ok.drain_fail && !ok.contaminated && ok.wait_s == 0, "drain-fail: next step starts clean, passes");
+    Sim b{Server{}, 7, 5, 120};  // same step without --drain-fail-s: passes (today's verdict)
+    b.s.mu = 6, b.s.t = 1;
+    check(b.step(6.5).pass, "drain-fail off: the same step passes");
+  }
+  {  // 8. confirm repeats (6 x 15 s, pooled): every repeat starts clean; pooled fails on a drain-failing repeat
+    Sim c{Server{}, 7, 5, 120};
+    c.fail_s = 1.0, c.s.mu = 6, c.s.t = 1, c.s.backlog = 40;  // a backlog left by an earlier overload step
+    std::vector<RepeatInput> in;
+    for (int k = 0; k < 6; k++) {
+      Res r = c.step(k == 2 ? 6.5 : 5);  // repeat 2 leaves a backlog (a slower phase of the stream)
+      RepeatInput ri;
+      ri.pass = r.pass, ri.nonlatency_fail = r.drain_fail, ri.lat.assign(100, 50.0);  // latencies all within SLO
+      in.push_back(ri);
+    }
+    bool clean = true;
+    for (auto &r : c.log) clean &= r.judged ? r.at_start == 0 || r.rerun_of >= 0 : true;
+    check(c.log.size() == 7 && !c.log[0].judged && clean,
+          "confirm repeats: the contaminated first repeat is re-run, every judged repeat starts clean");
+    ProbeJudgement j = judge_probe(in, 95, 400, 0);
+    check(j.reps == 6 && j.fails == 1 && j.nonlatency_fails == 1 && j.pooled_pslo <= 400 && j.pooled == kVerdictFail &&
+              j.majority == kVerdictPass,
+          "pooled (6 reps): pooled p95 50 <= 400 but one repeat failed the drain -> FAIL; majority 1/6 -> pass");
+    for (auto &r : in) r.nonlatency_fail = false, r.pass = true;
+    ProbeJudgement k = judge_probe(in, 95, 400, 0);
+    check(k.pooled == kVerdictPass && k.majority == kVerdictPass, "pooled (6 reps): no drain failure -> pass");
+    in[4].lat.assign(100, INFINITY), in[4].pass = false;  // latency-only failure of one repeat
+    ProbeJudgement l = judge_probe(in, 95, 400, 0);
+    check(l.pooled == kVerdictFail && l.nonlatency_fails == 0 && l.pooled_pslo > 400,
+          "pooled (6 reps): pooled p95 over the merged set decides latency (1/6 inf at p95 -> fail)");
   }
   if (fails) {
     std::printf("DRAIN TEST FAIL (%d of %d checks)\n", fails, checks);

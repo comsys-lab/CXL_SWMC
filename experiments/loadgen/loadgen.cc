@@ -76,6 +76,7 @@ struct Config {
   double warmup_s = 10, warmup_rate = 0;  // run-start warmup (rate 0 = first step's rate)
   double step_warmup_s = 3, step_measure_s = 15, drain_s = 5;
   double drain_full_s = 0;  // > 0: full drain + clean-start rule (drain.h, user 2026-11-12); 0 = the old drain
+  double drain_fail_s = 0;  // > 0 (with drain_full_s): a step whose full drain took > this fails (non-latency)
   double confirm_s = 30;
   double confirm_warmup_s = -1;  // warmup before each confirm repeat; < 0 = step_warmup_s (main 2026-10-21)
   uint32_t confirm_reps = 3;
@@ -127,6 +128,9 @@ void usage() {
                "                                        outstanding (at most S s, replaces --drain-s); a step that\n"
                "                                        starts with requests outstanding is not judged and is run\n"
                "                                        once more (default 0 = off)\n"
+               "  --drain-fail-s D                      with --drain-full-s: a step (any phase, also each confirm\n"
+               "                                        repeat) whose drain took > D s fails as \"drain > D s (backlog)\",\n"
+               "                                        a non-latency failure (default 0 = off)\n"
                "  --confirm-s S --confirm-reps N        SLO mode: repeats at the found rate (30 s x 3)\n"
                "  --confirm-precision P --max-confirm-probes N   SLO mode: after a failed confirm, bisect with full\n"
                "                                        confirms between the highest confirmed pass and the lowest\n"
@@ -214,6 +218,7 @@ Config parse(int argc, char **argv) {
     else if (a == "--step-measure-s") c.step_measure_s = std::atof(need(i).c_str());
     else if (a == "--drain-s") c.drain_s = std::atof(need(i).c_str());
     else if (a == "--drain-full-s") c.drain_full_s = std::atof(need(i).c_str());
+    else if (a == "--drain-fail-s") c.drain_fail_s = std::atof(need(i).c_str());
     else if (a == "--confirm-s") c.confirm_s = std::atof(need(i).c_str());
     else if (a == "--confirm-warmup-s") c.confirm_warmup_s = std::atof(need(i).c_str());
     else if (a == "--confirm-reps") c.confirm_reps = std::stoul(need(i));
@@ -279,6 +284,9 @@ Config parse(int argc, char **argv) {
     if (!(f > 1)) die("bad --start-fail-steps factor (> 1)");
   if (!c.start_fail.empty() && c.ramp_knee) die("--start-fail-steps is not used with --ramp-knee");
   if (!(c.drain_full_s >= 0)) die("bad --drain-full-s (>= 0)");
+  if (!(c.drain_fail_s >= 0)) die("bad --drain-fail-s (>= 0)");
+  if (c.drain_fail_s > 0 && !(c.drain_full_s > 0)) die("--drain-fail-s needs --drain-full-s");
+  if (c.drain_fail_s > 0 && c.drain_fail_s >= c.drain_full_s) die("--drain-fail-s must be < --drain-full-s");
   return c;
 }
 
@@ -338,6 +346,7 @@ struct StepResult {
   std::vector<double> slo_lat;
   // --drain-full-s (drain.h); recorded in steps.jsonl only when the option is on
   bool contaminated = false;  // requests were outstanding when the step started
+  bool drain_fail = false;    // --drain-fail-s: the drain took longer than D (non-latency failure)
   bool judged = true;         // false: contaminated first attempt, not a search decision point (re-run follows)
   int64_t rerun_of = -1;      // a re-run: step number of the unjudged attempt
   uint64_t outstanding_at_start = 0, outstanding_after_drain = 0;
@@ -406,7 +415,8 @@ class Engine {
         if (s.exhausted) return finish("streams exhausted during ramp");
         search_note(s, "ramp", r);
         const double p = s.s[idx_[c_.slo_stream]].pslo;
-        if (kr.add(r, s.pass, s.saturated, s.behind, p)) { ended = true; break; }
+        // --drain-fail-s: a drain-failing step counts like the SLO stream falling behind (false with the option off)
+        if (kr.add(r, s.pass, s.saturated, s.behind || s.drain_fail, p)) { ended = true; break; }
         // a pass: the usual adaptive step; a fail (low-rate regime or past the knee): x factor
         r *= s.pass ? next_factor(p, prev_pslo) : c_.factor;
         prev_pslo = p;
@@ -793,6 +803,12 @@ class Engine {
       }
       if (st.lag_p99_us > c_.lag_limit_us) res.lag_flag = true;
     }
+    // --drain-fail-s: a backlog left after the step is a non-latency failure (flagged even when another check already
+    // failed, so --confirm-rule pooled never passes a probe with a drain-failing repeat)
+    if (drain_failed(c_.drain_full_s, c_.drain_fail_s, res.drain_wait_s, measure_s > 0)) {
+      res.drain_fail = true, res.nonlatency_fail = true;
+      if (pass) pass = false, why = "drain > " + fmt(c_.drain_fail_s) + " s (backlog)";
+    }
     if (slo_idx_ != 0xff && measure_s > 0 && res.s[slo_idx_].pslo > c_.slo_ms && pass)
       pass = false, why = "p" + fmt(c_.slo_pct) + " " + fmt(res.s[slo_idx_].pslo) + " ms > SLO";
     res.pass = pass && measure_s > 0;
@@ -888,6 +904,7 @@ class Engine {
         << ",\"rerun_of\":" << (r.rerun_of >= 0 ? std::to_string(r.rerun_of) : std::string("null"))
         << ",\"outstanding_at_start\":" << r.outstanding_at_start << ",\"drain_wait_s\":" << fmt(r.drain_wait_s)
         << ",\"outstanding_after_drain\":" << r.outstanding_after_drain;
+    if (c_.drain_fail_s > 0) o << ",\"drain_fail\":" << (r.drain_fail ? "true" : "false");
     o << "}";
     std::fprintf(steps_, "%s\n", o.str().c_str());
     std::fflush(steps_);
@@ -904,7 +921,7 @@ class Engine {
       std::fprintf(stderr, "        drain %.1f s, outstanding at start %llu, after drain %llu%s\n", r.drain_wait_s,
                    (unsigned long long)r.outstanding_at_start, (unsigned long long)r.outstanding_after_drain,
                    r.contaminated ? (r.judged ? " (contaminated re-run, judged)" : " (contaminated, re-run follows)") : "");
-      n_contaminated_ += r.contaminated, n_reruns_ += r.rerun_of >= 0;
+      n_contaminated_ += r.contaminated, n_reruns_ += r.rerun_of >= 0, n_drain_fails_ += r.drain_fail;
     }
     steps_log_.push_back({phase, xval(r), r.pass, r.lag_flag});
   }
@@ -956,7 +973,8 @@ class Engine {
       for (double f : c_.start_fail) sf += (sf.empty() ? "" : ",") + fmt(f);
       m << "overload_base=" << c_.overload_base << " start_fail_steps=" << (sf.empty() ? "none" : sf) << "\n";
     }
-    if (c_.drain_full_s > 0) m << "drain_full_s=" << c_.drain_full_s << "\n";  // opt-in key only
+    if (c_.drain_full_s > 0)  // opt-in keys only
+      m << "drain_full_s=" << c_.drain_full_s << " drain_fail_s=" << c_.drain_fail_s << "\n";
     for (auto &kv : c_.mix) m << "mix." << kv.first << "=" << kv.second << "\n";
     for (auto &kv : c_.fixed) m << "fixed." << kv.first << "=" << kv.second << "\n";
   }
@@ -973,7 +991,8 @@ class Engine {
     };
     std::fprintf(f, "probe,offered_x,role,rep,step,rep_pass,rep_aborted,rep_reason,rep_x,rep_pslo_ms,rep_p99_ms,rep_n,"
                     "fails,nonlatency_fails,pooled_n,pooled_pslo_ms,pooled_p99_ms,verdict_majority,verdict_pooled,"
-                    "rule,probe_pass\n");
+                    "rule,probe_pass%s\n",
+                 c_.drain_full_s > 0 ? ",rep_drain_wait_s,rep_drain_fail,rep_nonlatency_fail,rep_contaminated" : "");
     for (size_t k = 0; k < probes_.size(); k++) {
       const Probe &p = probes_[k];
       for (size_t q = 0; q < p.reps.size(); q++) {
@@ -981,12 +1000,16 @@ class Engine {
         const auto &st = r.s[slo_idx_];
         std::string why = r.reason;
         for (char &ch : why) if (ch == ',' || ch == '"') ch = ';';
-        std::fprintf(f, "%zu,%s,%s,%zu,%u,%d,%d,%s,%s,%s,%s,%llu,%u,%u,%llu,%s,%s,%s,%s,%s,%d\n", k,
+        std::fprintf(f, "%zu,%s,%s,%zu,%u,%d,%d,%s,%s,%s,%s,%llu,%u,%u,%llu,%s,%s,%s,%s,%s,%d", k,
                      num(p.offered).c_str(), p.role.c_str(), q, r.step_no, int(r.pass), int(r.aborted), why.c_str(),
                      num(xval(r)).c_str(), num(st.pslo).c_str(), num(st.p99).c_str(), (unsigned long long)st.sent,
                      p.fails, p.j.nonlatency_fails, (unsigned long long)p.j.n, num(p.j.pooled_pslo).c_str(),
                      num(p.j.pooled_p99).c_str(), verdict_name(p.j.majority), verdict_name(p.j.pooled),
                      c_.confirm_rule.c_str(), int(p.pass));
+        if (c_.drain_full_s > 0)  // opt-in columns, appended after the older ones
+          std::fprintf(f, ",%s,%d,%d,%d", num(r.drain_wait_s).c_str(), int(r.drain_fail), int(r.nonlatency_fail),
+                       int(r.contaminated));
+        std::fprintf(f, "\n");
       }
     }
     std::fclose(f);
@@ -1044,7 +1067,11 @@ class Engine {
           << ",\"nonlatency_fails\":" << p.j.nonlatency_fails << ",\"pooled_n\":" << p.j.n
           << ",\"pooled_pslo_ms\":" << fmt(p.j.pooled_pslo) << ",\"pooled_p99_ms\":" << fmt(p.j.pooled_p99)
           << ",\"verdict_majority\":\"" << verdict_name(p.j.majority) << "\",\"verdict_pooled\":\""
-          << verdict_name(p.j.pooled) << "\"}";
+          << verdict_name(p.j.pooled) << "\"";
+        if (c_.drain_full_s > 0)  // opt-in keys only
+          s << ",\"rep_drain_wait_s\":" << arr([&](const StepResult &r) { return fmt(r.drain_wait_s); })
+            << ",\"rep_drain_fail\":" << arr([&](const StepResult &r) { return std::string(r.drain_fail ? "true" : "false"); });
+        s << "}";
       }
       s << "]";
       s << ",\"confirm_rule\":{\"rule\":\"" << c_.confirm_rule << "\",\"full\":" << (c_.confirm_full ? "true" : "false")
@@ -1087,7 +1114,8 @@ class Engine {
     s << ",\"passing_steps_with_send_lag\":" << lag_pass << ",\"workload_finish\":\"" << (ok ? "ok" : err) << "\"";
     if (c_.drain_full_s > 0)  // opt-in keys only
       s << ",\"drain_full\":{\"cap_s\":" << fmt(c_.drain_full_s) << ",\"contaminated_steps\":" << n_contaminated_
-        << ",\"reruns\":" << n_reruns_ << "}";
+        << ",\"reruns\":" << n_reruns_ << ",\"fail_s\":" << fmt(c_.drain_fail_s) << ",\"drain_fails\":" << n_drain_fails_
+        << "}";
     s << "}\n";
     s.close();
     std::fclose(steps_);
@@ -1120,7 +1148,7 @@ class Engine {
   uint8_t slo_idx_ = 0xff;  // fixed in setup() before receivers start
   double slo_ns_ = 0;
   uint32_t step_no_ = 0;
-  uint32_t n_contaminated_ = 0, n_reruns_ = 0;  // --drain-full-s
+  uint32_t n_contaminated_ = 0, n_reruns_ = 0, n_drain_fails_ = 0;  // --drain-full-s, --drain-fail-s
   FILE *steps_ = nullptr;
   std::vector<StepLog> steps_log_;
   std::vector<StepResult> confirm_;  // repeats of the confirm at the result best_

@@ -118,6 +118,17 @@ done 0, p95 inf). With `--drain-full-s S` (S > 0; recommended 120 for RecSys str
   (send end -> drain end), `outstanding_after_drain`; manifest line `drain_full_s=S`; summary.json `drain_full`
   {`cap_s`, `contaminated_steps`, `reruns`}. `export_csv.py` appends the six steps.jsonl keys as the last columns
   (empty for runs without the option).
+- `--drain-fail-s D` (needs `--drain-full-s`, D < S; default 0 = off; RecSys target 2.0 (user 2026-11-12, conservative; passing
+  steps' max query latency <= 826 ms, overloaded steps >= 864 ms): a measured step of any phase (ramp, bisect, each confirm
+  repeat, fill, overload) whose drain took longer than D seconds left a backlog and fails with reason
+  `drain > D s (backlog)`, a non-latency failure like a stream falling behind (in the knee ramp it ends the ramp
+  like "SLO stream falls behind"; under `--confirm-rule pooled` a probe passes iff the pooled SLO percentile <= SLO
+  and no repeat failed a non-latency check, this one included). Recorded: steps.jsonl `drain_fail`, summary
+  `drain_full.fail_s`/`drain_fails`, confirm_probes.csv `rep_drain_wait_s, rep_drain_fail, rep_nonlatency_fail,
+  rep_contaminated` (appended, only with `--drain-full-s`), summary `confirm_probes[].rep_drain_wait_s/rep_drain_fail`.
+- confirm repeats are separate steps: each one is followed by the full drain and checked for a clean start, so every
+  judged repeat starts with nothing outstanding (or is a flagged re-run). Target RecSys setting (user 2026-11-12):
+  `--drain-full-s 120 --drain-fail-s 2.0 --confirm-rule pooled --confirm-reps 6 --confirm-s 15`.
 - requests that complete during the longer drain count with their real latency (with the default they would be
   +inf after `--drain-s`); a step whose drain hits the cap still counts the rest as +inf.
 - code `drain.h` (drain_step, step_judged, clean_step); unit test `test/drain_test.cc` (default-off identity with the

@@ -44,6 +44,8 @@ unset RS_PUBLISH_WINDOW_S RS_PUBLISH_WARMUP RS_PUBLISH_AFTER_S RS_PUBLISH_DRAM_R
 unset RS_CHUNK_PAIRS CHUNK_PAIRS   # serving split (rs_env -> main-block.sh CHUNK_PAIRS), only from the conf
 unset RS_SLO_TOL STREAM_SLO_TOL   # SLO-search loadgen --tol (rs_env -> main-block.sh STREAM_SLO_TOL), only from the conf
 unset RS_DRAIN_FULL_S STREAM_DRAIN_FULL_S   # SLO-search loadgen --drain-full-s (rs_env -> STREAM_DRAIN_FULL_S), only from the conf
+unset RS_DRAIN_FAIL_S STREAM_DRAIN_FAIL_S RS_CONFIRM_RULE STREAM_CONFIRM_RULE RS_CONFIRM_REPS STREAM_CONFIRM_REPS \
+  RS_CONFIRM_S STREAM_CONFIRM_S   # SLO-search loadgen --drain-fail-s / --confirm-rule/-reps/-s (rs_env), only from the conf
 CONFSH=$(python3 -I -B "$EVD/evalconf.py" shell ${EVAL_CONF:+--conf "$EVAL_CONF"}) || { echo "RUNSET STOP: ${EVAL_CONF:-eval.conf} does not parse"; exit 2; }
 eval "$CONFSH"
 export EVAL_CONF   # absolute path of the config (evalconf.py shell); pins-vdb.sh (sourced by the hook) reads the same file
@@ -194,6 +196,31 @@ rs_env() {
     [[ $RS_DRAIN_FULL_S =~ ^[1-9][0-9]*$ ]] && [ "$RS_DRAIN_FULL_S" -le 600 ] || die "bad RS_DRAIN_FULL_S ($RS_DRAIN_FULL_S: [1, 600] s)"
     RSENV+=(STREAM_DRAIN_FULL_S=$RS_DRAIN_FULL_S)
     plan "SLO search loadgen --drain-full-s $RS_DRAIN_FULL_S (RS_DRAIN_FULL_S; default not passed)"
+  fi
+  # RS_DRAIN_FAIL_S / RS_CONFIRM_RULE / RS_CONFIRM_REPS / RS_CONFIRM_S (user 2026-11-12; optional): loadgen --drain-fail-s
+  # (needs RS_DRAIN_FULL_S; target 2.0) / --confirm-rule (pooled) / --confirm-reps (6) / --confirm-s (15) of the stream
+  # SLO search (main-block.sh STREAM_<X>, which range-checks them again); unset / empty = not passed
+  if [ -n "${RS_DRAIN_FAIL_S:-}" ]; then
+    [ -n "${RS_DRAIN_FULL_S:-}" ] || die "RS_DRAIN_FAIL_S needs RS_DRAIN_FULL_S"
+    [[ $RS_DRAIN_FAIL_S =~ ^[0-9]*\.?[0-9]+$ ]] && awk -v d="$RS_DRAIN_FAIL_S" -v f="$RS_DRAIN_FULL_S" 'BEGIN { exit !(d > 0 && d < f) }' \
+      || die "bad RS_DRAIN_FAIL_S ($RS_DRAIN_FAIL_S: (0, RS_DRAIN_FULL_S))"
+    RSENV+=(STREAM_DRAIN_FAIL_S=$RS_DRAIN_FAIL_S)
+    plan "SLO search loadgen --drain-fail-s $RS_DRAIN_FAIL_S (RS_DRAIN_FAIL_S; default not passed)"
+  fi
+  if [ -n "${RS_CONFIRM_RULE:-}" ]; then
+    case $RS_CONFIRM_RULE in majority|pooled) ;; *) die "bad RS_CONFIRM_RULE ($RS_CONFIRM_RULE: majority or pooled)";; esac
+    RSENV+=(STREAM_CONFIRM_RULE=$RS_CONFIRM_RULE)
+    plan "SLO search loadgen --confirm-rule $RS_CONFIRM_RULE (RS_CONFIRM_RULE; default majority)"
+  fi
+  if [ -n "${RS_CONFIRM_REPS:-}" ]; then
+    [[ $RS_CONFIRM_REPS =~ ^[1-9][0-9]*$ ]] && [ "$RS_CONFIRM_REPS" -le 12 ] || die "bad RS_CONFIRM_REPS ($RS_CONFIRM_REPS: 1..12)"
+    RSENV+=(STREAM_CONFIRM_REPS=$RS_CONFIRM_REPS)
+    plan "SLO search loadgen --confirm-reps $RS_CONFIRM_REPS (RS_CONFIRM_REPS; default 3)"
+  fi
+  if [ -n "${RS_CONFIRM_S:-}" ]; then
+    [[ $RS_CONFIRM_S =~ ^[1-9][0-9]*$ ]] && [ "$RS_CONFIRM_S" -ge 5 ] && [ "$RS_CONFIRM_S" -le 120 ] || die "bad RS_CONFIRM_S ($RS_CONFIRM_S: 5..120 s)"
+    RSENV+=(STREAM_CONFIRM_S=$RS_CONFIRM_S)
+    plan "SLO search loadgen --confirm-s $RS_CONFIRM_S (RS_CONFIRM_S; default 30)"
   fi
   local v; for v in PRETOUCH_DIR MEASURE_ENV_DIR MEASURE_PART_DIR; do [ -z "${!v:-}" ] || RSENV+=("$v=${!v}"); done
   # RecSys v7 (RS_V7=1; workloads/recsys/DESIGN.md §10.6): RS_V7_<X> -> main-block.sh V7_<X>; @USER@ values = not

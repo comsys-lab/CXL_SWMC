@@ -40,6 +40,13 @@ inline bool step_judged(double drain_full_s, uint64_t outstanding_at_start, bool
   return !(drain_full_s > 0 && outstanding_at_start > 0 && !rerun && measured);
 }
 
+// --drain-fail-s D (> 0, only with --drain-full-s): a measured step whose full drain took longer than D seconds left a
+// backlog at the server (its own requests still queued after it stopped sending): a non-latency failure, like a
+// stream falling behind, in every phase (ramp, bisect, confirm repeats, fill, overload)
+inline bool drain_failed(double drain_full_s, double drain_fail_s, double drain_wait_s, bool measured) {
+  return drain_full_s > 0 && drain_fail_s > 0 && measured && drain_wait_s > drain_fail_s;
+}
+
 // step(rerun) -> result with .judged and .exhausted; an unjudged first attempt is run once more
 template <class StepFn>
 auto clean_step(StepFn step) -> decltype(step(false)) {
