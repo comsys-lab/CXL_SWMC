@@ -90,8 +90,11 @@ def main():
             if s < rows.get(g, 0):
                 fails.append(f"window {w}: row {g} published seq {s} older than its last update {rows.get(g)} of the window")
             last_pub[g] = (s, c)
-        if max(per_s.values()) > b:
-            fails.append(f"window {w}: a second holds {max(per_s.values())} publishes > budget {b}")
+        # wall-clock seconds: a row due just before a second boundary and written a little late lands in the next
+        # second, so a second may hold up to b + (rows of late_tol_s) publishes
+        cap = b + -(-b * int(o.late_tol_s * 1000) // 1000)
+        if max(per_s.values()) > cap:
+            fails.append(f"window {w}: a second holds {max(per_s.values())} publishes > budget {b} (+ {cap - b} late)")
         if max(late) <= o.late_tol_s and pl[-1][3] >= bound + W + int(o.late_tol_s * 1e9):
             fails.append(f"window {w}: last publish after the window end")
         late.sort()
