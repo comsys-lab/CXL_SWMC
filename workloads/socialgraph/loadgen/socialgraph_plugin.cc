@@ -217,7 +217,7 @@ class SocialGraph : public loadgen::Workload {
     if (len < sizeof(h)) return bad(oi, "short");
     std::memcpy(&h, p, sizeof(h));
     if (h.op != r.op) return bad(oi, "op");
-    if (h.status > sg::kStatusBad) return bad(oi, "status");
+    if (h.status > kStatusBusy) return bad(oi, "status");
     status_[oi][h.status].fetch_add(1);
     if (h.status == sg::kStatusBad) bad_status_.fetch_add(1);
     const uint8_t *b = p + sizeof(h);
@@ -303,10 +303,11 @@ class SocialGraph : public loadgen::Workload {
       mixline(sgl::write_name(w), wmade_[w], mix_.stream[sgl::kWrite] * mix_.write_op[w]);
     std::fprintf(t, "mix_max_abs_pp=%.4f\nmix_ok=%d\n", maxpp, total >= 100000 ? int(maxpp <= 0.5) : -1);
     for (uint32_t i = 0; i < kOps; i++)
-      std::fprintf(t, "resp.%s ok=%lu notfound=%lu full=%lu bad_status=%lu frame_err=%lu bad=%lu\n", kOpNames[i],
-                   (unsigned long)status_[i][0].load(), (unsigned long)status_[i][1].load(),
+      std::fprintf(t, "resp.%s ok=%lu notfound=%lu full=%lu bad_status=%lu busy=%lu frame_err=%lu bad=%lu\n",
+                   kOpNames[i], (unsigned long)status_[i][0].load(), (unsigned long)status_[i][1].load(),
                    (unsigned long)status_[i][2].load(), (unsigned long)status_[i][3].load(),
-                   (unsigned long)frame_err_[i].load(), (unsigned long)bad_[i].load());
+                   (unsigned long)status_[i][kStatusBusy].load(), (unsigned long)frame_err_[i].load(),
+                   (unsigned long)bad_[i].load());
     const uint64_t fo = feed_ok_.load();
     std::fprintf(t, "feed_ok=%lu feed_rows_mean=%.4f feed_records_mean=%.4f feed_missing=%lu getlink_rows=%lu\n",
                  (unsigned long)fo, fo ? double(feed_rows_.load()) / double(fo) : 0.0,
@@ -340,6 +341,9 @@ class SocialGraph : public loadgen::Workload {
 
  private:
   static constexpr uint32_t kOps = 10;
+  // RespHead.status 4 = Busy (record read gave up after the retry bound), added to proto.h by part 3 (server);
+  // counted per op, not a protocol error. Defined here so this plugin builds against proto.h at 29a23ccd7 too.
+  static constexpr uint16_t kStatusBusy = 4;
   static constexpr const char *kOpNames[kOps] = {"feed",       "getnode",    "countlink", "getlink",    "addlink",
                                                  "updatelink", "deletelink", "addnode",   "updatenode", "deletenode"};
   static uint32_t op_index(uint16_t op) {
@@ -542,7 +546,7 @@ class SocialGraph : public loadgen::Workload {
   uint64_t made_[sgl::kStreams] = {}, wmade_[sgl::kWriteOps] = {}, id2_img_ = 0, id2_uni_ = 0, id2_noimg_ = 0;
   std::vector<uint32_t> next_wseq_;
   // receiver threads
-  std::atomic<uint64_t> status_[kOps][4] = {}, frame_err_[kOps] = {}, bad_[kOps] = {};
+  std::atomic<uint64_t> status_[kOps][kStatusBusy + 1] = {}, frame_err_[kOps] = {}, bad_[kOps] = {};
   std::atomic<uint64_t> feed_rows_{0}, feed_missing_{0}, feed_records_{0}, feed_ok_{0}, getlink_rows_{0};
   std::atomic<uint64_t> wseq_mismatch_{0}, bad_status_{0}, no_coh_{0}, coh_read_n_{0}, coh_dropped_{0};
   std::mutex mu_;

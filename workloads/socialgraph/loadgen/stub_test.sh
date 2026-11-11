@@ -33,6 +33,7 @@ run() {  # <name> <rw> <port0> [opts...]
 }
 run A 100 19331 --stats-op 20 ${IMG:+--opt image=$IMG} ${GEN:+--opt gen=$GEN}
 [ -z "$IMG" ] || grep -q '^id2_from_image=[1-9]' "$OUT/A/loadgen/sg.txt" || FAIL=1
+grep -q '^resp.feed .* busy=[1-9]' "$OUT/A/loadgen/sg.txt" || FAIL=1  # stub answers ~0.1 % of feeds Busy
 [ -z "$IMG" ] || ls "$OUT"/A/loadgen/stats/*.txt > /dev/null 2>&1 || FAIL=1
 run B 470 19341
 grep -q '^id2_from_image=0 .* id2_no_image=[1-9]' "$OUT/B/loadgen/sg.txt" || FAIL=1

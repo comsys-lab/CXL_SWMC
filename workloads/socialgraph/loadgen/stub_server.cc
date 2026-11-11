@@ -73,6 +73,10 @@ static uint16_t handle(uint16_t op, const std::vector<uint8_t> &p, Out *o) {
       if (!need(sizeof(q), "feed size")) return frame::kStatusBadRequest;
       std::memcpy(&q, p.data(), sizeof(q));
       if (!id_ok(q.id1) || q.limit != 50 || q.assoc_type != sg::kAssocFriend) return bad("feed fields"), frame::kStatusBadRequest;
+      if (hash64(q.id1 ^ g_req[op].load()) % 1000 == 0) {  // RespHead.status 4 (Busy, part 3 proto.h): head only
+        h.status = 4;
+        break;
+      }
       const uint16_t n = uint16_t(std::min<uint64_t>(q.limit, hash64(q.id1) % 120));
       body.put(sg::FeedResp{1, n, 0, 3});
       for (uint16_t i = 0; i < n; i++) body.put(sg::FeedRow{uint32_t(g_base + i), 0, 1, 1, 10, {0, 0, 0}});
