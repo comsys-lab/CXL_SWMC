@@ -48,6 +48,8 @@ PRM=${POP_RECV_MODE:-$RECV_MODE} IPOLL=${RECV_IPOLL:-}
 why=$(recv_wsm_check); [ $? != 1 ] || die "$why"
 PMON=${SG_PMAX:-0} PMFROM=${SG_PMAX_FROM:-} PMW=${SG_PMAX_WARMUP_S:-15} PMM=${SG_PMAX_MEASURE_S:-90} PMD=${SG_PMAX_DRAIN_S:-5}
 [[ $PMON =~ ^[01]$ ]] && [[ $PMW =~ ^[0-9]+$ ]] && [[ $PMM =~ ^[1-9][0-9]*$ ]] && [[ $PMD =~ ^[0-9]+$ ]] || die "bad SG_PMAX*"
+FIXR=${SG_FIXED_RATE:-}
+[ -z "$FIXR" ] || { [[ $FIXR =~ ^[1-9][0-9]*$ ]] && [[ ${SG_FIXED_S:-60} =~ ^[1-9][0-9]*$ ]]; } || die "bad SG_FIXED_RATE / SG_FIXED_S"
 CXLBW=${SG_CXLBW:-0} RDYT=${SG_READY_TIMEOUT:-900} STE=${SG_STALE_EVERY:-1000}
 [[ $CXLBW =~ ^[01]$ ]] && [[ $RDYT =~ ^[1-9][0-9]*$ ]] && [[ $STE =~ ^[1-9][0-9]*$ ]] || die "bad SG_CXLBW / SG_READY_TIMEOUT / SG_STALE_EVERY"
 KEXP=$K8 DST=0 DSRX=${DS_RECV_EXTRA:-} DSFP=0
@@ -131,6 +133,7 @@ OWNER=sg-$NAME-run$EVAL_RUN
 echo "BLOCK PLAN: socialgraph $NAME ($SYSL) N=$N vcpu/VM=$VCPU threads $((VCPU - 1))+1 nodes=[${IPS[*]}] rw=$RW mix=[$LMIX] app=$APP ring=${RING:-0} cxlbw=$CXLBW"
 echo "BLOCK PLAN: server_args=[${MGSA:-$SA}] node0_args=[$NODE0_ARGS] node_env=[$NENV] node0_env=[$N0ENV] region=$REGION release=$KEXP"
 echo "BLOCK PLAN: image host=$IMAGE_HOST guest(vm0)=$IMAGE_GUEST$(case $S in hw|pop|ds) echo " -> region by sg-node.sh copy-image + verify before the run";; *) echo " -> Megalon objects (node 0 --image)";; esac); slo [$SG_SLO $SG_SLO_PART]; stale 1 in $STE"
+[ -z "$FIXR" ] || echo "BLOCK PLAN: fixed rate $FIXR req/s for ${SG_FIXED_S:-60} s (smoke; no SLO search, no pmax step)"
 echo "BLOCK PLAN: receiver pop=$([ $S = pop ] && echo "$PRM${POP_ADAPT_KO:+ ko=$POP_ADAPT_KO srcversion=$POPSV}" || echo -) ds=$([ $S = ds ] && echo "$RECV_MODE extra=[$DSRX] fault_poll=$DSFP T=$DST us" || echo -) ipoll=${IPOLL:-default} $(recv_wsm_desc)"
 [ $PMON = 0 ] || [[ ! $S =~ ^(pop|ds)$ ]] || echo "BLOCK PLAN: pmax step: --mode fixed --rates <Popcorn's max of this cell> ${PMW}s+${PMM}s+${PMD}s ($([ $S = pop ] && echo "own slo part" || echo "pop rows of [$PMFROM]: $(python3 -I -B "$EX/sg_steps.py" pmax-rate --name "pop-$MIX-n$N" $(pm_from) 2>&1)"))"
 if [ "$DRYB" = 1 ]; then echo "BLOCK DRY STOP: evidence-dir check reached ($E; dry: no lock, no VM contact)"; exit 0; fi
@@ -289,8 +292,11 @@ sys_down() {
 }
 # ---- the lifetime
 LGA=(--mix "$LMIX" --opt rw=$RW --opt image=$IMAGE_HOST --opt gen=$GEN_HOST --opt seed=$SEED --seed $SEED --x-stream feed --raw)
-PARTSV=slo PMX=()
-if [ $PMON = 1 ] && [[ $S =~ ^(pop|ds)$ ]]; then
+PARTSV=slo PMX=() SLOARGS="--slo $SG_SLO $SG_SLO_PART"
+if [ -n "$FIXR" ]; then  # smoke: one fixed rate instead of the SLO search (part name stays slo; no pmax step)
+  SLOARGS="--slo $SG_SLO --mode fixed --rates $FIXR --warmup-s 10 --step-warmup-s 3 --step-measure-s ${SG_FIXED_S:-60} --drain-s 5"
+  log "$NAME: fixed rate $FIXR (SG_FIXED_RATE, smoke), no SLO search"
+elif [ $PMON = 1 ] && [[ $S =~ ^(pop|ds)$ ]]; then
   PARTSV="slo pmax"
   if [ $S = pop ]; then pmsrc="--summary $E/$NAME/slo/loadgen/summary.json"; else pmsrc="--name pop-$MIX-n$N $(pm_from)"; fi
   PMX=("PART_ARGS_pmax=--mode fixed --rates @RATE@ --warmup-s 0 --step-warmup-s $PMW --step-measure-s $PMM --drain-s $PMD"
@@ -299,7 +305,7 @@ if [ $PMON = 1 ] && [[ $S =~ ^(pop|ds)$ ]]; then
 fi
 RE=(SYSTEM=$SYSL V=$V HOST_SERVER=$SRV LOADGEN=$LOADGEN "SERVER_ARGS=${MGSA:-$SA}" "NODE0_ARGS=$NODE0_ARGS" "NODE_ENV=$NENV" "NODE0_ENV=$N0ENV"
   "NODES=${IPS[*]}" READY_TIMEOUT=$RDYT STATS_OP=20 STALE_EVERY=$STE "PARTS=$PARTSV" H1_MEASURE_RUN=1 MEASURE_PART_DIR=$MEASURE_PART_DIR
-  "PART_ARGS_slo=--slo $SG_SLO $SG_SLO_PART" "PART_GATE_CMD=bash $HG check" "${PMX[@]}")
+  "PART_ARGS_slo=$SLOARGS" "PART_GATE_CMD=bash $HG check" "${PMX[@]}")
 gate $NAME; sys_up
 servers_gone || stop "an sg-server runs before $NAME"
 log "$NAME: sg-run.sh parts [$PARTSV] ($SYSL, $MIX, N=$N)"
