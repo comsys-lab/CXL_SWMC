@@ -52,7 +52,10 @@ img_sha() {  # Host image sha256 (computed once into image.sha256 next to the im
 case $CMD in
   plan) echo "$ALL" | sed 's/^/PLAN install /'; echo "PLAN image $IMG ($(stat -c %s "$IMG") B) -> vm0:$SG_IMAGE_GUEST"; echo "PLAN DONE";;
   install)
+    # vm0 + vm1 only (header: the VM8 guests are overlays of vm0's disk at the switch; install runs on the 2-VM topology
+    # before it, where vm2..7 are down); --n selects which N-node Megalon dirs are installed, verify checks all N VMs
     for k in "${!IPS[@]}"; do
+      [ "$k" -lt 2 ] || break
       while read -r g h; do
         want=$(sha "$h"); have=$("${SSH[@]}" comsys@${IPS[$k]} "sha256sum /home/comsys/$g 2>/dev/null | cut -c1-64" < /dev/null)
         [ "$have" = "$want" ] && continue
@@ -60,7 +63,7 @@ case $CMD in
           || { echo "INSTALL FAIL vm$k $g"; exit 1; }
         echo "installed vm$k /home/comsys/$g ($want)"
       done <<< "$ALL"
-    done; echo "INSTALL DONE (${#IPS[@]} VMs)";;
+    done; echo "INSTALL DONE (vm0 + vm1; N = $N dirs)";;
   image)
     hs=$(img_sha)
     have=$("${SSH[@]}" comsys@${IPS[0]} "cat $SG_IMAGE_GUEST.sha256 2>/dev/null; stat -c %s $SG_IMAGE_GUEST 2>/dev/null" < /dev/null | tr '\n' ' ')
