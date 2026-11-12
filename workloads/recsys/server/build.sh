@@ -18,6 +18,7 @@ c++ "${FLAGS[@]}" -mf16c -DCXL_REGION_DESTIJL -I"$DSL" "$HERE/server.cc" -o "$OU
 c++ "${FLAGS[@]}" "$W/tools/gen_samples.cc" -o "$OUT/bin/recsys-gen-samples"
 c++ "${FLAGS[@]}" "$W/tools/rate_calib.cc" -o "$OUT/bin/recsys-rate"
 c++ "${FLAGS[@]}" "$W/tests/model_test.cc" -o "$OUT/bin/recsys-model-test"
+c++ "${FLAGS[@]}" "$W/tests/chunk_test.cc" -o "$OUT/bin/recsys-chunk-test"  # serving split (server/chunk.h)
 # v7 (DESIGN.md §10): Host scorer / prequential trainer (baseline + frozen AUC, updater CPU) and the backward test
 c++ "${FLAGS[@]}" -mf16c "$W/tools/recsys_score.cc" -o "$OUT/bin/recsys-score"
 c++ "${FLAGS[@]}" -mf16c "$W/tests/model_grad_test.cc" -o "$OUT/bin/recsys-model-grad-test"

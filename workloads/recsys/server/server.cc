@@ -41,6 +41,7 @@
 
 #include "../proto.h"
 #include "backend.h"
+#include "chunk.h"
 #include "emb_v7.h"
 #include "frame.h"
 #include "layout.h"
@@ -84,7 +85,8 @@ uint64_t thread_cpu_ns() {
 struct Opts {
   Params p;
   uint32_t node = 0, port = 7100, serve_threads = 14, update_threads = 4, load_threads = 8;
-  uint32_t chunk_pairs = 0;     // pairs per parallel task; 0 = adaptive: max(min_chunk, ceil(pairs / serve_threads))
+  uint32_t chunk_pairs = 0;     // pairs per parallel task; 0 = adaptive: max(min_chunk, ceil(pairs / ways))
+  uint32_t split_ways = 0;      // ways of the adaptive split; 0 = serve_threads (chunk.h query_chunk)
   uint32_t min_chunk = 16;
   uint32_t rank = 512;          // DCNv2 low rank (MLPerf 512)
   uint64_t publish_us = 0;      // publication interval T (0 = write each sample immediately)
@@ -1630,7 +1632,7 @@ class Server {
     if (rq.pairs == 0 || n != sizeof(rq) + uint64_t(rq.pairs) * sizeof(Sample)) return bad(j), nullptr;
     auto *c = new QueryCtx;
     c->pairs = rq.pairs;
-    c->chunk = o_.chunk_pairs ? o_.chunk_pairs : std::max(o_.min_chunk, (rq.pairs + o_.serve_threads - 1) / o_.serve_threads);
+    c->chunk = query_chunk(rq.pairs, o_.chunk_pairs, o_.split_ways, o_.serve_threads, o_.min_chunk);
     c->tasks = (rq.pairs + c->chunk - 1) / c->chunk;
     c->score.assign(rq.pairs, 0.f);
     c->t_start = now_ns();
@@ -1870,6 +1872,7 @@ void usage() {
   std::fprintf(stderr,
                "usage: recsys-server --node K --nodes N --run-id 0x.. [--port P] [--region yaml]\n"
                "  [--serve-threads S (14)] [--update-threads U (4)] [--chunk-pairs C (0 = adaptive)] [--min-chunk M (16)] [--load-threads L (8)]\n"
+               "  [--split-ways K (0 = S)]   adaptive chunk (C = 0) = max(M, ceil(pairs / K)); K = 0 divides by S as before\n"
                "  [--publish-ms T | --publish-us T (0 = write each sample immediately)] [--publish-frac F (target rows/T, reported)]\n"
                "  [--update-mode batch|stream|train]   stream (T = 0 only): reply on acceptance, rows written right away (batch = default)\n"
                "  v7 (DESIGN.md §10.6): [--image F] [--model-dense F] [--update-mode train] [--train-threads N (= U)]\n"
@@ -1909,6 +1912,7 @@ int main(int argc, char **argv) {
     else if (a == "--update-threads") o.update_threads = std::stoul(v());
     else if (a == "--chunk-pairs") o.chunk_pairs = std::stoul(v());
     else if (a == "--min-chunk") o.min_chunk = std::stoul(v());
+    else if (a == "--split-ways") o.split_ways = std::stoul(v());
     else if (a == "--load-threads") o.load_threads = std::stoul(v());
     else if (a == "--publish-ms") o.publish_us = std::stoull(v()) * 1000;
     else if (a == "--publish-us") o.publish_us = std::stoull(v());

@@ -131,6 +131,8 @@
 # Serving split (reports/experiments/recsys-serving-split.md): CHUNK_PAIRS N (BLOCK=stream; lib.sh rs_env from the conf's
 #   RS_CHUNK_PAIRS) appends --chunk-pairs N to the server args of every node; unset / empty = not passed = the server's
 #   adaptive split (every earlier run, args byte for byte). BLOCK=stream prints "BLOCK PLAN: server args: <args>".
+#   2-way split (user 2026-11-13): SPLIT_WAYS K / MIN_CHUNK M (lib.sh rs_env from RS_SPLIT_WAYS / RS_MIN_CHUNK) append
+#   --split-ways K / --min-chunk M (server chunk = max(M, ceil(pairs / K)); recsys builds >= 18); not with CHUNK_PAIRS.
 # De Stijl wait assist (build >= 13, kernel switch /sys/kernel/swmc/destijl/wait_assist): DS_WAIT_ASSIST 0 | 1
 #   (runset-rs-ds.sh RS_DS_WAIT_ASSIST); unset / empty = no step (every earlier run). See the De Stijl block below.
 # STREAM_ONE_LIFETIME=1 (user 2026-11-11, Megalon only; runset-rs-h1.sh RS_MG_ONE_LIFETIME): ONE mg server lifetime (one
@@ -305,6 +307,41 @@ if [ -n "${STREAM_CONFIRM_FULL:-}" ]; then
   SSDRAIN+=(--confirm-full)
   echo "BLOCK PLAN: slo search: --confirm-full (STREAM_CONFIRM_FULL; default not passed)"
 fi
+#   Knee-dense sweep (user 2026-11-13 "knee point 부근에서 RPS를 더 촘촘히"; lib.sh rs_env from the conf's RS_SLO_START /
+#     RS_SLO_FILL / RS_SLO_OVERLOAD); each unset / empty = the stream_slo loadgen command line of every earlier run:
+#   STREAM_SLO_START      --start X of the SLO search (q/s, a number in (0, 100]; unset = 1)
+#   STREAM_SLO_FILL       --fill f1,f2,.. (each in (0, 1), at most 6; points at the result x f); unset = not passed
+#                         (loadgen default 0.7,0.8,0.9)
+#   STREAM_SLO_OVERLOAD   --overload-base result --overload f1,f2,.. (each in (1, 3], at most 7; points at the result
+#                         x f); unset = not passed (loadgen default: first failed rate above the result x 1.05,1.1,1.2)
+#   Fill and overload points run after the confirm phase, each a full step (min-step-queries, full drain when
+#   STREAM_DRAIN_FULL_S is set); they never change the result (experiments/loadgen/README.md "Past-the-knee rule").
+SSSTART=1 SSKNEE=()
+for v in STREAM_SLO_START STREAM_SLO_FILL STREAM_SLO_OVERLOAD; do
+  [ -z "${!v:-}" ] || { [ $BLOCK = stream ] && [ -n "${EVAL_RUN:-}" ]; } || { echo "SEQUENCE STOP: $v needs BLOCK=stream and EVAL_RUN"; exit 2; }
+done
+if [ -n "${STREAM_SLO_START:-}" ]; then
+  [[ $STREAM_SLO_START =~ ^[0-9]*\.?[0-9]+$ ]] && awk -v s="$STREAM_SLO_START" 'BEGIN { exit !(s > 0 && s <= 100) }' \
+    || { echo "SEQUENCE STOP: STREAM_SLO_START must be a number in (0, 100] q/s (got $STREAM_SLO_START)"; exit 2; }
+  SSSTART=$STREAM_SLO_START
+  echo "BLOCK PLAN: slo search: --start $SSSTART (STREAM_SLO_START; default 1)"
+fi
+fac_list() {  # <list> <lo> <hi> <max n>: comma-separated numbers, each in (lo, hi], at most n, strictly increasing
+  [[ $1 =~ ^[0-9]*\.?[0-9]+(,[0-9]*\.?[0-9]+)*$ ]] || return 1
+  awk -v l="$1" -v lo="$2" -v hi="$3" -v m="$4" 'BEGIN { n = split(l, a, ","); if (n > m) exit 1
+    for (i = 1; i <= n; i++) { if (!(a[i] + 0 > lo && a[i] + 0 <= hi)) exit 1; if (i > 1 && !(a[i] + 0 > a[i - 1] + 0)) exit 1 } }'; }
+if [ -n "${STREAM_SLO_FILL:-}" ]; then
+  fac_list "$STREAM_SLO_FILL" 0 0.999999 6 \
+    || { echo "SEQUENCE STOP: STREAM_SLO_FILL must be increasing factors in (0, 1), at most 6, comma-separated (got $STREAM_SLO_FILL)"; exit 2; }
+  SSKNEE+=(--fill "$STREAM_SLO_FILL")
+  echo "BLOCK PLAN: slo search: --fill $STREAM_SLO_FILL (STREAM_SLO_FILL; default not passed)"
+fi
+if [ -n "${STREAM_SLO_OVERLOAD:-}" ]; then
+  fac_list "$STREAM_SLO_OVERLOAD" 1 3 7 \
+    || { echo "SEQUENCE STOP: STREAM_SLO_OVERLOAD must be increasing factors in (1, 3], at most 7, comma-separated (got $STREAM_SLO_OVERLOAD)"; exit 2; }
+  SSKNEE+=(--overload-base result --overload "$STREAM_SLO_OVERLOAD")
+  echo "BLOCK PLAN: slo search: --overload-base result --overload $STREAM_SLO_OVERLOAD (STREAM_SLO_OVERLOAD; default not passed)"
+fi
 # Publication period T (H1 v0.6.9, user decision 2026-10-18 "T=1로 바로 가는게 좋아보여"): RS_T_MS = the updater's
 # --publish-ms. Default 60000 (every earlier block, unchanged). BLOCK=h1 requires it explicitly (pins-recsys.sh).
 # The Ekko operating point is defined at the reference T = 60 s and is an UPDATE SAMPLE RATE: EKKO_FRAC60 of all rows
@@ -462,6 +499,22 @@ if [ -n "$CHUNKP" ]; then
   [[ $CHUNKP =~ ^[1-9][0-9]*$ ]] || { echo "SEQUENCE STOP: bad CHUNK_PAIRS ($CHUNKP: pairs per serving task, >= 1)"; exit 2; }
   SA="$SA --chunk-pairs $CHUNKP"
   echo "BLOCK PLAN: serving split: --chunk-pairs $CHUNKP on every node (queries of up to $CHUNKP pairs = one serving thread each)"
+fi
+# 2-way split (user 2026-11-13): SPLIT_WAYS K = server --split-ways K, MIN_CHUNK M = server --min-chunk M on every node
+# (adaptive chunk = max(M, ceil(pairs / K)); K unset = divide by --serve-threads); unset / empty = not passed
+SPLITW=${SPLIT_WAYS:-} MINCH=${MIN_CHUNK:-}
+if [ -n "$SPLITW$MINCH" ]; then
+  [ $BLOCK = stream ] || { echo "SEQUENCE STOP: SPLIT_WAYS / MIN_CHUNK need BLOCK=stream"; exit 2; }
+  [ -z "$CHUNKP" ] || { echo "SEQUENCE STOP: SPLIT_WAYS / MIN_CHUNK with CHUNK_PAIRS (a fixed chunk ignores the adaptive split)"; exit 2; }
+  if [ -n "$SPLITW" ]; then
+    [[ $SPLITW =~ ^[1-9][0-9]*$ ]] && [ "$SPLITW" -le 32 ] || { echo "SEQUENCE STOP: bad SPLIT_WAYS ($SPLITW: ways per query, 1..32)"; exit 2; }
+    SA="$SA --split-ways $SPLITW"
+  fi
+  if [ -n "$MINCH" ]; then
+    [[ $MINCH =~ ^[1-9][0-9]*$ ]] && [ "$MINCH" -le 100000 ] || { echo "SEQUENCE STOP: bad MIN_CHUNK ($MINCH: pairs, 1..100000)"; exit 2; }
+    SA="$SA --min-chunk $MINCH"
+  fi
+  echo "BLOCK PLAN: serving split: ${SPLITW:+--split-ways $SPLITW }${MINCH:+--min-chunk $MINCH }on every node (chunk = max(${MINCH:-16}, ceil(pairs / ${SPLITW:-serve threads})))"
 fi
 [ $BLOCK != stream ] || echo "BLOCK PLAN: server args: $SA"
 pub_train() {  # every lifetime (life_start, BLOCK=stream): first window = training only (no queries, no publish)
@@ -1066,8 +1119,8 @@ stream_slo() {  # <sys> <rate>
   rc=$?; [ $rc = 0 ] || stop "$NAME warm-up rc $rc"
   pub_after "$LS/warmup"   # windowed publication: SLO search >= PUBLISH_AFTER_S after publishing started
   measure "$LS" slo "${LGC[@]}" --opt seed=$SEED --seed $SEED --slo query:$SLO_PCT:$SLO_MS --raw --tol $SSTOL \
-    --mode slo --start 1 --factor 1.5 --precision 0.02 --confirm-precision 0.01 --max-confirm-probes $STREAM_CONFIRM_PROBES --confirm-step-down 0.05 \
-    --max-steps 40 --min-step-queries 100 --ramp-knee 2 ${SSDRAIN[@]+"${SSDRAIN[@]}"}
+    --mode slo --start $SSSTART --factor 1.5 --precision 0.02 --confirm-precision 0.01 --max-confirm-probes $STREAM_CONFIRM_PROBES --confirm-step-down 0.05 \
+    --max-steps 40 --min-step-queries 100 --ramp-knee 2 ${SSDRAIN[@]+"${SSDRAIN[@]}"} ${SSKNEE[@]+"${SSKNEE[@]}"}
   rc=$?
   grep -q 'workload_finish":"ok' "$RD/loadgen/summary.json" 2>/dev/null || stop "$NAME slo: loadgen workload finish (rc $rc)"
   if [ $rc = 1 ]; then
@@ -1557,6 +1610,9 @@ if [ $BLOCK = stream ]; then  # RecSys streaming driver (header "BLOCK=stream")
       [ -z "${STREAM_CONFIRM_REPS:-}" ] || echo "slo_confirm_reps=$STREAM_CONFIRM_REPS (STREAM_CONFIRM_REPS: loadgen --confirm-reps; unset = 3)"
       [ -z "${STREAM_CONFIRM_S:-}" ] || echo "slo_confirm_s=$STREAM_CONFIRM_S (STREAM_CONFIRM_S: loadgen --confirm-s; unset = 30)"
       [ -z "${STREAM_CONFIRM_FULL:-}" ] || echo "slo_confirm_full=1 (STREAM_CONFIRM_FULL: loadgen --confirm-full; unset = not passed)"
+      [ -z "${STREAM_SLO_START:-}" ] || echo "slo_start=$SSSTART (STREAM_SLO_START: loadgen --start of the SLO search; unset = 1)"
+      [ -z "${STREAM_SLO_FILL:-}" ] || echo "slo_fill=$STREAM_SLO_FILL (STREAM_SLO_FILL: loadgen --fill; unset = not passed)"
+      [ -z "${STREAM_SLO_OVERLOAD:-}" ] || echo "slo_overload=$STREAM_SLO_OVERLOAD base result (STREAM_SLO_OVERLOAD: loadgen --overload-base result --overload; unset = not passed)"
       [ "$ONEL" = 0 ] || echo "one_lifetime=1 settle_s=$OLSET (STREAM_ONE_LIFETIME: rates [$STREAM_RATES] in one mg lifetime; later rates: settle part seed $((SEED + 101)), XT $XT s)"; } | tee "$E/eval-params.txt"
   fi
   { echo "# RecSys streaming block: per rate (in STREAM_RATES order) one lifetime per system, order shuffle(seed recsys-stream-<rate>)"
