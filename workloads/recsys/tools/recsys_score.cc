@@ -12,6 +12,7 @@
 // usage: recsys-score --mode frozen|train --image F --dense F --samples F --start S --count N --out F
 //                     [--threads T] [--chunk C] [--batch B] [--lr X] [--eps X] [--no-update]
 //                     [--acc-init X] [--acc-freq K] [--optim adagrad|sgd] [--delay-samples D] [--delay-block G]
+//                     [--store rn|fp32|sr]  (row stored back as fp16 round-to-nearest / kept fp32 / fp16 stochastic)
 //   AUC study options (train mode; defaults = previous behaviour): --acc-init sets every loaded row's Adagrad state
 //   (< 0: image value); --acc-freq adds K x (row's lookup count in the range); --optim sgd: w -= lr g;
 //   --delay-samples D emulates training-to-serving delay: sample s in block [s0, s0 + G) is scored with weights
@@ -132,6 +133,8 @@ struct Args {
   bool sgd = false;          // --optim sgd: w -= lr g (no acc); default adagrad
   uint64_t delay = 0;        // --delay-samples D: score s with weights trained only on samples < s0 - D
   uint64_t delay_block = 0;  // --delay-block G: scoring block (s0 = block start, s0 <= s < s0 + G); default min(D, 1024)
+  int store = 0;             // --store rn|fp32|sr: updated row stored back as fp16 round-to-nearest (rn, default, as the
+                             // server), kept fp32 (= an fp32 image), or fp16 stochastic rounding (sr); fp16 images only
 };
 
 static FILE *open_out(const std::string &p, uint64_t n) {
@@ -273,6 +276,7 @@ static void run_train(const Args &a, const Model &M, const Image &img, const Sam
       M.train_scratch(&tr, B);
       std::vector<float> dense(B * 13), score(B), dz(B), gsum, wtmp(dim);
       std::vector<uint16_t> w16(dim);
+      uint64_t rng = 0x9e3779b97f4a7c15ull * (t + 1) + phase_lo;  // --store sr
       std::vector<std::pair<uint32_t, uint32_t>> touch;  // (compact row, batch row * 26 + table)
       double f = 0, bw = 0, rw = 0;
       const double tt0 = thread_cpu_s();
@@ -335,8 +339,9 @@ static void run_train(const Args &a, const Model &M, const Image &img, const Sam
             for (uint32_t c = 0; c < dim; c++) w[c] -= a.ada.lr * gsum[c];
           else
             rowwise_adagrad(w, &acc[row], gsum.data(), dim, a.ada);
-          if (img.elt == 2) {  // storage precision of the record
-            f32_to_emb(w, 2, dim, w16.data());
+          if (img.elt == 2 && a.store != 1) {  // storage precision of the record
+            if (a.store == 2) f32_to_fp16_sr(w, dim, w16.data(), &rng);
+            else f32_to_emb(w, 2, dim, w16.data());
             emb_to_f32(w16.data(), 2, dim, w, false);
           }
         }
@@ -373,9 +378,10 @@ static void run_train(const Args &a, const Model &M, const Image &img, const Sam
               "cpu_s=%.3f cpu_ms_per_sample=%.3f fwd_ms=%.3f bwd_ms=%.3f rows_ms=%.3f fwd_mflop=%.1f bwd_mflop=%.1f",
               a.update, n, a.threads, a.batch, a.ada.lr, a.ada.eps, wall, n / wall, cpu, 1e3 * cpu / n, 1e3 * f / n,
               1e3 * bw / n, 1e3 * rw / n, M.flops_per_pair() / 1e6, M.backward_flops_per_pair() / 1e6);
-  if (a.acc_init >= 0 || a.acc_freq > 0 || a.sgd || a.delay)
-    std::printf(" acc_init=%g acc_freq=%g optim=%s delay_samples=%lu delay_block=%lu trained=%lu", a.acc_init,
-                a.acc_freq, a.sgd ? "sgd" : "adagrad", a.delay, a.delay_block, a.delay ? trained_hi.load() : n);
+  if (a.acc_init >= 0 || a.acc_freq > 0 || a.sgd || a.delay || a.store)
+    std::printf(" acc_init=%g acc_freq=%g optim=%s delay_samples=%lu delay_block=%lu trained=%lu store=%s", a.acc_init,
+                a.acc_freq, a.sgd ? "sgd" : "adagrad", a.delay, a.delay_block, a.delay ? trained_hi.load() : n,
+                a.store == 1 ? "fp32" : a.store == 2 ? "sr" : "rn");
   std::printf("\n");
 }
 
@@ -408,6 +414,11 @@ int main(int argc, char **argv) {
       a.sgd = o == "sgd";
     } else if (k == "--delay-samples") a.delay = std::stoull(v());
     else if (k == "--delay-block") a.delay_block = std::stoull(v());
+    else if (k == "--store") {
+      const std::string o = v();
+      if (o != "rn" && o != "fp32" && o != "sr") die("--store rn|fp32|sr");
+      a.store = o == "fp32" ? 1 : o == "sr" ? 2 : 0;
+    }
     else die("unknown option " + k);
   }
   if (a.delay && !a.delay_block) a.delay_block = std::min<uint64_t>(a.delay, 1024);
@@ -416,7 +427,7 @@ int main(int argc, char **argv) {
       a.out.empty() || !a.count || !a.threads || !a.batch || a.batch > 64)
     die("usage: --mode frozen|train --image F --dense F --samples F --start S --count N --out F [--threads T] "
         "[--chunk C] [--batch B<=64] [--lr X] [--eps X] [--no-update] [--acc-init X] [--acc-freq K] "
-        "[--optim adagrad|sgd] [--delay-samples D] [--delay-block G]");
+        "[--optim adagrad|sgd] [--delay-samples D] [--delay-block G] [--store rn|fp32|sr]");
   Model M;
   std::string err;
   if (!M.load_dense(a.dense, &err)) die(err);

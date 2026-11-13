@@ -22,6 +22,7 @@ c++ "${FLAGS[@]}" "$W/tests/chunk_test.cc" -o "$OUT/bin/recsys-chunk-test"  # se
 # v7 (DESIGN.md §10): Host scorer / prequential trainer (baseline + frozen AUC, updater CPU) and the backward test
 c++ "${FLAGS[@]}" -mf16c "$W/tools/recsys_score.cc" -o "$OUT/bin/recsys-score"
 c++ "${FLAGS[@]}" -mf16c "$W/tests/model_grad_test.cc" -o "$OUT/bin/recsys-model-grad-test"
+c++ "${FLAGS[@]}" -mf16c "$W/tests/fp16_sr_test.cc" -o "$OUT/bin/recsys-fp16-sr-test"  # stochastic rounding (emb_v7.h)
 COMMIT=$(git -C "$HERE" rev-parse HEAD)
 DIRTY=$(git -C "$HERE" status --porcelain -- "$W" "$ROOT/systems/common" "$ROOT/experiments/loadgen" "$ROOT/systems/megalon/shim" "$ROOT/systems/popcorn_new/include" "$DSL" | wc -l)
 { echo "# recsys build (CXL_SWMC/workloads/recsys/server/build.sh)"; echo "date=$(date -Is)"

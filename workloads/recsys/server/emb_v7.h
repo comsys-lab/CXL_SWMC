@@ -79,6 +79,23 @@ inline void f32_to_emb(const float *in, uint32_t elt, uint32_t dim, void *emb) {
 #endif
   for (; j < dim; j++) h[j] = _cvtss_sh(in[j], _MM_FROUND_TO_NEAREST_INT);
 }
+// fp32 -> fp16 with stochastic rounding (unbiased: E[round(x)] = x for normal fp16 values): add 13 random bits below
+// the fp16 mantissa to |x| and truncate toward zero. fp16 subnormals (|x| < 6.1e-5) drop more bits and stay slightly
+// biased toward zero. *rng: per-thread xorshift64 state (non-zero). For row updates with small steps (AUC study,
+// workspaces/recsys-auc): round-to-nearest drops every step below half an fp16 ulp.
+inline void f32_to_fp16_sr(const float *in, uint32_t dim, uint16_t *h, uint64_t *rng) {
+  uint64_t s = *rng;
+  for (uint32_t j = 0; j < dim; j++) {
+    if ((j & 3) == 0) s ^= s << 13, s ^= s >> 7, s ^= s << 17;
+    uint32_t b;
+    std::memcpy(&b, &in[j], 4);
+    if ((b & 0x7f800000u) != 0x7f800000u) b += uint32_t(s >> (16 * (j & 3))) & 0x1fffu;  // not inf/nan
+    float x;
+    std::memcpy(&x, &b, 4);
+    h[j] = _cvtss_sh(x, _MM_FROUND_TO_ZERO);
+  }
+  *rng = s;
+}
 
 struct AdagradCfg {
   float lr = 0.004f;  // MLPerf DLRMv2 training reference (DESIGN.md §10.4; user to confirm)
