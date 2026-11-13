@@ -100,6 +100,8 @@ if [ $SPART = pilot ]; then
 else
   [[ " $STALE_PILOT_RATES " == *" $RATE "* ]] || die "R=$RATE is not one of the pilot rates [$STALE_PILOT_RATES] (approved: the highest clean pilot rate)"
   MW=$STALE_MEASURE_WARMUP_S
+  TMAXS=$(( ($(echo "$STALE_MS" | tr ',' '\n' | sort -n | tail -n 1) + 999) / 1000 ))
+  [ "$MW" -ge $((15 + TMAXS)) ] || die "STALE_MEASURE_WARMUP_S=$MW < 15 s + T_max $TMAXS s (the first measured query needs T_max of update history)"
   WIN=$(( BUD / RATE - MW - STALE_MARGIN_S )); [ "$WIN" -le "$STALE_MEASURE_S" ] || WIN=$STALE_MEASURE_S
   [ "$WIN" -ge 60 ] || die "R=$RATE leaves a window of $WIN s (< 60 s)"
   [ $((RATE * (MW + WIN))) -le "$BUD" ] || die "R=$RATE x ($MW + $WIN) s > budget $BUD"
