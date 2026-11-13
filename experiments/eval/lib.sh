@@ -40,6 +40,7 @@ unset RS_V7 RS_V7_IMAGE RS_V7_DENSE RS_V7_IMAGE_HOST RS_V7_DENSE_HOST RS_V7_LR R
   RS_V7_STALE_SAMPLE RS_V7_STALE_DIR RS_V7_SAMPLES RS_V7_FROZEN   # v7 keys come only from the conf
 unset RS_PMAX RS_PMAX_FROM RS_PMAX_S RS_PMAX_SETTLE_S   # run-2 RecSys pmax step keys (rs_env), only from the conf
 unset RS_AUC_Q RS_AUC_S RS_AUC_SETTLE_S RS_AUC_ONLY     # run-2 RecSys fixed-rate AUC lifetimes (rs_env), only from the conf
+unset RS_AUC2_Q RS_AUC2_S   # extra fixed-rate parts of the AUC lifetimes (rs_env, main-block.sh STREAM_AUC2), only from the conf
 unset RS_PUBLISH_WINDOW_S RS_PUBLISH_WARMUP RS_PUBLISH_AFTER_S RS_PUBLISH_DRAM_ROWS   # windowed publication (rs_env), only from the conf
 unset RS_CHUNK_PAIRS CHUNK_PAIRS   # serving split (rs_env -> main-block.sh CHUNK_PAIRS), only from the conf
 unset RS_SPLIT_WAYS SPLIT_WAYS RS_MIN_CHUNK MIN_CHUNK   # 2-way split (rs_env -> main-block.sh SPLIT_WAYS / MIN_CHUNK), only from the conf
@@ -326,6 +327,20 @@ rs_env() {
     RSENV+=("STREAM_AUC=$RS_AUC_Q" STREAM_AUC_S=${RS_AUC_S:-300} STREAM_AUC_SETTLE_S=${RS_AUC_SETTLE_S:-30} STREAM_AUC_ONLY=${RS_AUC_ONLY:-0})
     plan "fixed-rate AUC lifetimes: [$RS_AUC_Q] (rate=query/s), warm-up as the SLO lifetimes, then ${RS_AUC_SETTLE_S:-30} s settle + 5 s + ${RS_AUC_S:-300} s measured, seed SEED + 3$([ "${RS_AUC_ONLY:-0}" = 1 ] && echo '; AUC lifetimes only (no SLO lifetime)')"
   elif [ -n "${RS_AUC_S:-}${RS_AUC_SETTLE_S:-}${RS_AUC_ONLY:-}" ]; then die "RS_AUC_S / RS_AUC_SETTLE_S / RS_AUC_ONLY without RS_AUC_Q"
+  fi
+  # extra fixed-rate parts after part auc (chain v8, user 2026-11-13): RS_AUC2_Q "<rate>=<q1>,<q2>,.. ..." (rates with
+  # an RS_AUC_Q entry), RS_AUC2_S (120 s per part); unset = none
+  if [ -n "${RS_AUC2_Q:-}" ]; then
+    [ -n "${RS_AUC_Q:-}" ] || die "RS_AUC2_Q needs RS_AUC_Q"
+    local m2
+    for m2 in $RS_AUC2_Q; do
+      [[ $m2 =~ ^[1-9][0-9]*=[0-9]+(\.[0-9]+)?(,[0-9]+(\.[0-9]+)?)*$ ]] || die "bad RS_AUC2_Q entry $m2 (<rate>=<q/s>,<q/s>,..)"
+      [[ " $RS_AUC_Q " == *" ${m2%%=*}="* ]] || die "RS_AUC2_Q rate ${m2%%=*} has no RS_AUC_Q entry"
+    done
+    [[ ${RS_AUC2_S:-120} =~ ^[1-9][0-9]*$ ]] || die "bad RS_AUC2_S"
+    RSENV+=("STREAM_AUC2=$RS_AUC2_Q" STREAM_AUC2_S=${RS_AUC2_S:-120})
+    plan "fixed-rate parts after part auc: [$RS_AUC2_Q] (rate=query/s list), one part fix2-<k> per query rate, 5 s + ${RS_AUC2_S:-120} s measured${RS_DRAIN_FULL_S:+, --drain-full-s $RS_DRAIN_FULL_S}, seed SEED + 10 + k"
+  elif [ -n "${RS_AUC2_S:-}" ]; then die "RS_AUC2_S without RS_AUC2_Q"
   fi
 }
 # rs_check.py arguments of a RecSys block: AUCSYS (systems with AUC lifetimes; empty without RS_AUC_Q), SLOSYS (the SLO

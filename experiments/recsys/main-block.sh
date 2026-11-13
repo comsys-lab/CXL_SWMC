@@ -221,7 +221,15 @@ elif [ $BLOCK = stream ]; then  # RecSys streaming block (header "BLOCK=stream")
     [[ ${STREAM_AUC_S:-300} =~ ^[1-9][0-9]*$ && ${STREAM_AUC_SETTLE_S:-30} =~ ^[1-9][0-9]*$ && ${STREAM_AUC_ONLY:-0} =~ ^[01]$ ]] \
       || { echo "SEQUENCE STOP: bad STREAM_AUC_S / STREAM_AUC_SETTLE_S / STREAM_AUC_ONLY"; exit 2; }
     [ -n "${STREAM_AUC:-}" ] || [ "${STREAM_AUC_ONLY:-0}" = 0 ] || { echo "SEQUENCE STOP: STREAM_AUC_ONLY=1 without STREAM_AUC"; exit 2; }
+    # extra fixed-rate parts in the AUC lifetimes (header "STREAM_AUC2"); unset = none
+    for m in ${STREAM_AUC2:-}; do
+      [[ $m =~ ^[1-9][0-9]*=[0-9]+(\.[0-9]+)?(,[0-9]+(\.[0-9]+)?)*$ ]] && [[ " ${STREAM_AUC:-} " == *" ${m%%=*}="* ]] \
+        || { echo "SEQUENCE STOP: bad STREAM_AUC2 entry $m (<rate with a STREAM_AUC entry>=<q/s>,<q/s>,..)"; exit 2; }
+    done
+    [[ ${STREAM_AUC2_S:-120} =~ ^[1-9][0-9]*$ ]] || { echo "SEQUENCE STOP: bad STREAM_AUC2_S"; exit 2; }
+    [ -n "${STREAM_AUC2:-}" ] || [ -z "${STREAM_AUC2_S:-}" ] || { echo "SEQUENCE STOP: STREAM_AUC2_S without STREAM_AUC2"; exit 2; }
   fi
+  [ -n "${EVAL_RUN:-}" ] || [ -z "${STREAM_AUC2:-}${STREAM_AUC2_S:-}" ] || { echo "SEQUENCE STOP: STREAM_AUC2 needs EVAL_RUN"; exit 2; }
   [ -n "${EVAL_RUN:-}" ] || [ -z "${STREAM_PMAX:-}${STREAM_PMAX_FROM:-}" ] || { echo "SEQUENCE STOP: STREAM_PMAX needs EVAL_RUN"; exit 2; }
   [ -n "${EVAL_RUN:-}" ] || [ -z "${STREAM_AUC:-}${STREAM_AUC_ONLY:-}" ] || { echo "SEQUENCE STOP: STREAM_AUC needs EVAL_RUN"; exit 2; }
   EKKO=stream
@@ -678,6 +686,7 @@ fi
 if [ -n "${STREAM_AUC:-}" ]; then  # run-2 fixed-rate AUC plan (shown by lib.sh block_dry)
   [ "$V7" = 1 ] || { echo "SEQUENCE STOP: STREAM_AUC needs V7=1"; exit 2; }
   echo "BLOCK PLAN: auc lifetimes [$STREAM_AUC] systems [${SYSTEMS:-hw pop}] only=${STREAM_AUC_ONLY:-0}: warm-up then part auc '--mode fixed --rates <q> --warmup-s ${STREAM_AUC_SETTLE_S:-30} --step-warmup-s 5 --step-measure-s ${STREAM_AUC_S:-300} --drain-s 10' seed $((SEED + 3)), AUC rows -> <E>/auc_part.csv"
+  [ -z "${STREAM_AUC2:-}" ] || echo "BLOCK PLAN: auc fix2 parts [$STREAM_AUC2] after part auc of the rate's AUC lifetime: one part fix2-<k> per rate '--raw --mode fixed --rates <q> --warmup-s 0 --step-warmup-s 5 --step-measure-s ${STREAM_AUC2_S:-120} --drain-s 10${STREAM_DRAIN_FULL_S:+ --drain-full-s $STREAM_DRAIN_FULL_S}' seed $((SEED + 10)) + k, rows -> <E>/stream-fix2.tsv"
 fi
 # receiver keys: modes of the pop / ds lifetimes of this block; a non-adaptive one refuses RECV_WATCH_US /
 # RECV_S_MAX_US (dry: BLOCK NOTE, then the evidence-dir check ends the dry start; real: stop below)
@@ -1308,6 +1317,42 @@ stream_auc() {  # <sys> <rate> <query/s>: AUC lifetime body (header "STREAM_AUC"
   [ "$st" = ok ] || echo "MAIN NOTE $NAME auc: $st (see $RD)"
   printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$NAME" $s $r "$q" "$sb" "$st" >> "$E/stream-auc.tsv"
   echo "$NAME auc: $q query/s seq_base $sb status $st"
+  stream_auc2 $s $r
+}
+# STREAM_AUC2="<rate>=<q1>,<q2>,.. ..." (header "STREAM_AUC2"; recsys-windowed-update chain v8, user 2026-11-13: equal
+#   samples near the knee): after part auc of the rate's AUC lifetime, one part fix2-<k> per listed query rate (same
+#   absolute rates for every system of the block): loadgen --raw --mode fixed --rates <q_k> --warmup-s 0 --step-warmup-s 5
+#   --step-measure-s STREAM_AUC2_S (120) --drain-s 10 (+ --drain-full-s STREAM_DRAIN_FULL_S when set), seed SEED + 10 + k.
+#   One part per rate = own pre/post snapshots (De Stijl SS-residence histogram per rate, session.sh ss_snap). Checks as
+#   part auc (workload finish other than ok, rc > 1 or rc 1 without a note = stop; stream_check / check_breakdown
+#   recorded); rows <E>/stream-fix2.tsv: name system rate_sps part q_s status. Unset = no fix2 part (every earlier run).
+stream_auc2() {  # <sys> <rate>
+  local s=$1 r=$2 m qs="" q k=0 RD rc st fs note dr=()
+  for m in ${STREAM_AUC2:-}; do [ "${m%%=*}" = "$r" ] && qs=${m#*=}; done
+  [ -n "$qs" ] || return 0
+  [ -z "${STREAM_DRAIN_FULL_S:-}" ] || dr=(--drain-full-s "$STREAM_DRAIN_FULL_S")
+  [ -s "$E/stream-fix2.tsv" ] || printf '# name\tsystem\trate_sps\tpart\tq_s\tstatus\n' > "$E/stream-fix2.tsv"
+  for q in ${qs//,/ }; do
+    k=$((k + 1)) RD=$LS/fix2-$k st=ok fs=$((SEED + 10 + k))
+    echo "$NAME fix2-$k: loadgen seed $fs, $q query/s" >> "$E/seeds.txt"
+    measure "$LS" fix2-$k "${LGC[@]}" --opt seed=$fs --seed $fs --raw --mode fixed --rates "$q" \
+      --warmup-s 0 --step-warmup-s 5 --step-measure-s "${STREAM_AUC2_S:-120}" --drain-s 10 ${dr[@]+"${dr[@]}"}
+    rc=$?
+    grep -q 'workload_finish":"ok' "$RD/loadgen/summary.json" 2>/dev/null || stop "$NAME fix2-$k: loadgen workload finish (rc $rc)"
+    if [ $rc = 1 ]; then
+      note=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("note",""))' "$RD/loadgen/summary.json" 2>/dev/null)
+      [ -n "$note" ] || stop "$NAME fix2-$k: loadgen rc 1 without a note"
+      st="loadgen-rc1"; echo "MAIN NOTE $NAME fix2-$k: $note"
+    elif [ $rc != 0 ]; then stop "$NAME fix2-$k rc $rc"; fi
+    python3 $X/stream_check.py "$RD" > "$RD/stream-check.txt" 2>&1
+    python3 $X/check_breakdown.py "$RD" > "$RD/breakdown-check.txt" 2>&1
+    grep -qE '^STREAMCHECK (PASS|NOTE)' "$RD/stream-check.txt" || st="$st,streamcheck:$(grep -m1 '^STREAMCHECK' "$RD/stream-check.txt" | cut -d' ' -f2)"
+    grep -q '^BREAKDOWN PASS' "$RD/breakdown-check.txt" || st="$st,breakdown-fail"
+    st=${st#ok,}
+    [ "$st" = ok ] || echo "MAIN NOTE $NAME fix2-$k: $st (see $RD)"
+    printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$NAME" $s $r "fix2-$k" "$q" "$st" >> "$E/stream-fix2.tsv"
+    echo "$NAME fix2-$k: $q query/s status $st"
+  done
 }
 eval_stream_rate() {  # <rate>
   local r=$1 s ord="" defer=0 fixonly=" ${STREAM_FIXONLY:-} "
@@ -1603,6 +1648,7 @@ if [ $BLOCK = stream ]; then  # RecSys streaming driver (header "BLOCK=stream")
       echo "STREAM_FIX_S=${STREAM_FIX_S:-60} STREAM_FIX_SETTLE_S=${STREAM_FIX_SETTLE_S:-60} server_args=[$SA] node0_extra=[$N0X]"
       echo "slo=query:$SLO_PCT:$SLO_MS ($SLO_RULE) max_confirm_probes=$STREAM_CONFIRM_PROBES"
       [ -z "${STREAM_AUC:-}" ] || echo "STREAM_AUC=[$STREAM_AUC] STREAM_AUC_S=${STREAM_AUC_S:-300} STREAM_AUC_SETTLE_S=${STREAM_AUC_SETTLE_S:-30} STREAM_AUC_ONLY=${STREAM_AUC_ONLY:-0} seed=$((SEED + 3))"
+      [ -z "${STREAM_AUC2:-}" ] || echo "STREAM_AUC2=[$STREAM_AUC2] STREAM_AUC2_S=${STREAM_AUC2_S:-120} drain_full_s=${STREAM_DRAIN_FULL_S:-none} seed=$((SEED + 10))+k"
       [ -z "${STREAM_SLO_TOL:-}" ] || echo "slo_tol=$SSTOL (STREAM_SLO_TOL: loadgen --tol of the SLO search; unset = 0.02)"
       [ -z "${STREAM_DRAIN_FULL_S:-}" ] || echo "slo_drain_full_s=$STREAM_DRAIN_FULL_S (STREAM_DRAIN_FULL_S: loadgen --drain-full-s of the SLO search; unset = not passed)"
       [ -z "${STREAM_DRAIN_FAIL_S:-}" ] || echo "slo_drain_fail_s=$STREAM_DRAIN_FAIL_S (STREAM_DRAIN_FAIL_S: loadgen --drain-fail-s; unset = not passed)"
