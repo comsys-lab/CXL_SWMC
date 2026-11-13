@@ -6,7 +6,9 @@ set -euo pipefail
 OUT=$1
 HERE=$(cd "$(dirname "$0")" && pwd); W=$(cd "$HERE/.." && pwd); ROOT=$(cd "$HERE/../../.." && pwd)
 mkdir -p "$OUT/bin" "$OUT/obj"
-# -march: the guests and the Host are Sapphire Rapids (avx512f/bw/vl exposed to the guests, no AMX)
+# -march: the guests and the Host are Sapphire Rapids (avx512f/bw/vl exposed to the guests). No -mamx-*: the
+# `--mlp amx` tile code (server/amx.h) is inline asm that runs only after the runtime AMX check, so these binaries
+# still run on CPUs / guests without AMX with the default --mlp avx512.
 FLAGS=(-std=c++17 -O3 -g -mavx2 -mfma -mavx512f -mavx512vl -mavx512bw -pthread -Wall -Wextra
        -I"$W" -I"$HERE" -I"$ROOT/experiments/loadgen" -I"$ROOT/systems/common" -I"$ROOT/systems/megalon/shim" -I"$ROOT/systems/popcorn_new/include")
 # libdestijl (systems/destijl/lib; de_stijl_set_staleness only): recsys-server applies $CXL_DESTIJL_T_US with
@@ -19,6 +21,7 @@ c++ "${FLAGS[@]}" "$W/tools/gen_samples.cc" -o "$OUT/bin/recsys-gen-samples"
 c++ "${FLAGS[@]}" "$W/tools/rate_calib.cc" -o "$OUT/bin/recsys-rate"
 c++ "${FLAGS[@]}" "$W/tests/model_test.cc" -o "$OUT/bin/recsys-model-test"
 c++ "${FLAGS[@]}" "$W/tests/chunk_test.cc" -o "$OUT/bin/recsys-chunk-test"  # serving split (server/chunk.h)
+c++ "${FLAGS[@]}" "$W/tests/amx_test.cc" -o "$OUT/bin/recsys-amx-test"  # --mlp amx vs fp32 (errors, throughput)
 # v7 (DESIGN.md §10): Host scorer / prequential trainer (baseline + frozen AUC, updater CPU) and the backward test
 c++ "${FLAGS[@]}" -mf16c "$W/tools/recsys_score.cc" -o "$OUT/bin/recsys-score"
 c++ "${FLAGS[@]}" -mf16c "$W/tests/model_grad_test.cc" -o "$OUT/bin/recsys-model-grad-test"

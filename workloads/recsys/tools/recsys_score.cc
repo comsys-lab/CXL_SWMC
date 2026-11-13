@@ -17,6 +17,7 @@
 //   (< 0: image value); --acc-freq adds K x (row's lookup count in the range); --optim sgd: w -= lr g;
 //   --delay-samples D emulates training-to-serving delay: sample s in block [s0, s0 + G) is scored with weights
 //   trained on exactly the samples [start, start + s0 - D) (trainer runs its own forward; each sample trained once).
+//                     [--mlp avx512|amx]   frozen only: dense forward fp32 AVX-512 (default) | bf16 AMX tiles
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <sys/resource.h>
@@ -126,6 +127,7 @@ struct Args {
   uint64_t start = 0, count = 0, chunk = 250000;
   uint32_t threads = 1, batch = 8;
   bool update = true;
+  Mlp mlp = Mlp::avx512;  // frozen only: dense-part forward kind (model.h; amx = bf16 tiles, fp32 accumulate)
   AdagradCfg ada;
   // AUC study (workspaces/recsys-auc): all defaults reproduce the earlier tool exactly
   double acc_init = -1;      // --acc-init X: row-wise Adagrad state at load (< 0: as in the image)
@@ -148,13 +150,13 @@ static FILE *open_out(const std::string &p, uint64_t n) {
 
 // Fill x0[:, dim:] of row r from pooled sums (frozen) -- done by the caller; dense part over m rows.
 static void dense_part(const Model &M, const Sample *const *sp, const float *pooled, uint32_t m, Model::Scratch *sc,
-                       float *score) {
+                       float *score, Mlp k) {
   const uint32_t D = M.spec().inter(), dim = M.spec().dim;
   float dense[64 * 13];
   for (uint32_t r = 0; r < m; r++) std::memcpy(dense + r * 13, sp[r]->dense, 13 * 4);
-  M.bottom(dense, m, sc);
+  M.bottom(dense, m, sc, k);
   for (uint32_t r = 0; r < m; r++) std::memcpy(&sc->x0[size_t(r) * D + dim], pooled + size_t(r) * 26 * dim, 26 * dim * 4);
-  M.top(m, sc, score);
+  M.top(m, sc, score, k);
 }
 
 static void run_frozen(const Args &a, const Model &M, const Image &img, const Samples &S) {
@@ -208,7 +210,7 @@ static void run_frozen(const Args &a, const Model &M, const Image &img, const Sa
           if (b >= n) break;
           const uint32_t m = uint32_t(std::min<uint64_t>(64, n - b));
           for (uint32_t r = 0; r < m; r++) sp[r] = &S.s[c0 + b + r];
-          dense_part(M, sp, &pooled[b * 26 * dim], m, &sc, score);
+          dense_part(M, sp, &pooled[b * 26 * dim], m, &sc, score, a.mlp);
           for (uint32_t r = 0; r < m; r++) out[b + r] = ScoreRec{c0 + b + r, score[r], sp[r]->label, {0, 0, 0}};
         }
       });
@@ -219,8 +221,8 @@ static void run_frozen(const Args &a, const Model &M, const Image &img, const Sa
                  ent.size(), rows.size(), tb - ta, now_s() - tb);
   }
   std::fclose(fo);
-  std::printf("mode=frozen samples=%lu wall_s=%.1f io_pool_s=%.1f dense_s=%.1f threads=%u\n", a.count, now_s() - t0,
-              io_s, mlp_s, a.threads);
+  std::printf("mode=frozen samples=%lu wall_s=%.1f io_pool_s=%.1f dense_s=%.1f threads=%u mlp=%s\n", a.count,
+              now_s() - t0, io_s, mlp_s, a.threads, mlp_name(a.mlp));
 }
 
 // ---- train: rows of the range in DRAM (compact), prequential batches, Hogwild across threads
@@ -419,10 +421,14 @@ int main(int argc, char **argv) {
       if (o != "rn" && o != "fp32" && o != "sr") die("--store rn|fp32|sr");
       a.store = o == "fp32" ? 1 : o == "sr" ? 2 : 0;
     }
+    else if (k == "--mlp") {
+      if (!parse_mlp(v(), &a.mlp)) die("--mlp avx512|amx");
+    }
     else die("unknown option " + k);
   }
   if (a.delay && !a.delay_block) a.delay_block = std::min<uint64_t>(a.delay, 1024);
   if (a.delay_block && a.delay_block % a.batch) die("--delay-block must be a multiple of --batch");
+  if (a.mlp == Mlp::amx && a.mode != "frozen") die("--mlp amx is for --mode frozen (the training path stays fp32)");
   if ((a.mode != "frozen" && a.mode != "train") || a.image.empty() || a.dense.empty() || a.samples.empty() ||
       a.out.empty() || !a.count || !a.threads || !a.batch || a.batch > 64)
     die("usage: --mode frozen|train --image F --dense F --samples F --start S --count N --out F [--threads T] "
@@ -431,6 +437,10 @@ int main(int argc, char **argv) {
   Model M;
   std::string err;
   if (!M.load_dense(a.dense, &err)) die(err);
+  if (a.mlp == Mlp::amx) {
+    if (!amx_enable(&err)) die("--mlp amx: " + err);
+    M.prepare_amx();
+  }
   Image img;
   img.open_(a.image);
   Samples S;

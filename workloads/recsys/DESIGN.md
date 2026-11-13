@@ -182,6 +182,25 @@ Every RecSys experiment from 2026-10-19 on uses this mode; H1 results and the H1
 - Megalon background threads are not in CohSnap: their CPU is exported as `thr.nr-log-sync.*` and `thr.mg-bg.*`
   (threads Megalon spawns from the main thread during start-up inherit the name mg-bg).
 
+### 6.2 AMX serving forward (`--mlp amx|avx512`, server/amx.h; 2026-11-13, builds/recsys/21)
+- `--mlp avx512` (default): the fp32 path above, bit-identical to before (frozen [0, 250k) scores equal byte for byte
+  to builds/recsys/15). `--mlp amx`: every forward layer with out % 32 == 0 (bottom 3, cross V/W x 3, top 4) runs as
+  bf16 x bf16 -> fp32 on AMX tiles: weights rounded to bf16 (nearest even) and packed into B tiles at load (30.6 MiB
+  next to the fp32 61.2 MiB, which stay for training), activations rounded to bf16 per layer, TDPBF16PS, 32 x 32
+  blocks; bias, ReLU, the cross update x0 * u + x_l, the 256 -> 1 dot and the sigmoid stay fp32. Serving only
+  (server run_chunk, recsys-score --mode frozen); top_train / backward / updater are fp32 AVX-512 unchanged.
+- Enable: at start, before any thread: CPUID.7.0:EDX amx_tile (24) + amx_bf16 (22), OSXSAVE, XCR0 bits 17/18, then
+  arch_prctl(ARCH_REQ_XCOMP_PERM, XFEATURE_XTILEDATA) and ARCH_GET_XCOMP_PERM; any failure exits with the reason.
+  Each GEMM call loads the tile config on its thread. The tile code is inline asm (no -mamx-* flags), so the same
+  binaries run without AMX under the default.
+- Host results (CPUs 18-21, node 1; tests/amx_test.cc, workspaces/recsys-amx/): kernel vs a double reference on the
+  bf16 operands rel <= 8e-6; trained weights, per layer rms rel error 2.4e-3 .. 5.0e-3, logit max abs 1.5e-2 (350
+  rows, real dense features, synthetic embedding part); day-23 [0, 250k) frozen AUC fp32 0.812721 vs amx 0.812697
+  (|d| 2.4e-5), logit |d| mean 4.8e-3 / p99 2.0e-2. Forward throughput at the 2-way chunks (100..350 pairs): 1 thread
+  82-95 GFLOP/s (avx512) vs 410-670 (amx), 4.9-7.7x; 4 threads 98-107 vs 377-556 per thread.
+- VM: the guest CPU model must expose amx-tile, amx-bf16 (CPUID) and the AMX xstate (XCR0 17/18, i.e. a host KVM and
+  QEMU that pass XTILECFG/XTILEDATA through and a guest kernel >= 5.16 with the arch_prctl permission interface).
+
 ## 7. Backends (`--backend plain|megalon`)
 - plain (all-HWcc, Popcorn): records at fixed SWcc offsets (§2), direct loads/stores, MemC3 stripes (§4). Popcorn
   init_state=shared: `--preload-only` (node 0, plain mapping, no HWcc, before coherence is enabled) then `--preloaded`
