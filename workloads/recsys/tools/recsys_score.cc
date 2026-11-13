@@ -11,6 +11,11 @@
 //         tools/auc.py computes AUC / logloss.
 // usage: recsys-score --mode frozen|train --image F --dense F --samples F --start S --count N --out F
 //                     [--threads T] [--chunk C] [--batch B] [--lr X] [--eps X] [--no-update]
+//                     [--acc-init X] [--acc-freq K] [--optim adagrad|sgd] [--delay-samples D] [--delay-block G]
+//   AUC study options (train mode; defaults = previous behaviour): --acc-init sets every loaded row's Adagrad state
+//   (< 0: image value); --acc-freq adds K x (row's lookup count in the range); --optim sgd: w -= lr g;
+//   --delay-samples D emulates training-to-serving delay: sample s in block [s0, s0 + G) is scored with weights
+//   trained on exactly the samples [start, start + s0 - D) (trainer runs its own forward; each sample trained once).
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <sys/resource.h>
@@ -121,6 +126,12 @@ struct Args {
   uint32_t threads = 1, batch = 8;
   bool update = true;
   AdagradCfg ada;
+  // AUC study (workspaces/recsys-auc): all defaults reproduce the earlier tool exactly
+  double acc_init = -1;      // --acc-init X: row-wise Adagrad state at load (< 0: as in the image)
+  double acc_freq = 0;       // --acc-freq K: acc += K * (lookups of the row in [start, start + count)) at load
+  bool sgd = false;          // --optim sgd: w -= lr g (no acc); default adagrad
+  uint64_t delay = 0;        // --delay-samples D: score s with weights trained only on samples < s0 - D
+  uint64_t delay_block = 0;  // --delay-block G: scoring block (s0 = block start, s0 <= s < s0 + G); default min(D, 1024)
 };
 
 static FILE *open_out(const std::string &p, uint64_t n) {
@@ -228,35 +239,49 @@ static void run_train(const Args &a, const Model &M, const Image &img, const Sam
   std::vector<uint32_t> idx(look.size());
   for (size_t i = 0; i < look.size(); i++)
     idx[i] = uint32_t(std::lower_bound(rows.begin(), rows.end(), look[i]) - rows.begin());
+  std::vector<uint64_t>().swap(look);
+  rows.shrink_to_fit();
   std::vector<float> W(rows.size() * dim), acc(rows.size());  // fp32 working copy; stored back as fp16 each update
-  std::vector<uint16_t> W16(img.elt == 2 ? rows.size() * dim : 0);
   double tl = now_s();
   img.scan(rows, [&](size_t q, const uint8_t *rec) {
     emb_to_f32(rec + RecOff::emb, img.elt, dim, &W[q * dim], false);
     std::memcpy(&acc[q], rec + RecOff::acc, 4);
   });
   std::fprintf(stderr, "train: %lu samples, %zu unique rows loaded in %.1f s\n", n, rows.size(), now_s() - tl);
+  if (a.acc_init >= 0) std::fill(acc.begin(), acc.end(), float(a.acc_init));
+  if (a.acc_freq > 0) {  // per-row estimate: proportional to the row's lookup count in the range (documented oracle)
+    std::vector<uint32_t> cnt(rows.size(), 0);
+    for (uint32_t i : idx) cnt[i]++;
+    for (size_t q = 0; q < rows.size(); q++) acc[q] += float(a.acc_freq * cnt[q]);
+  }
   // rows are kept in fp32 here but rounded through the record's element type after every update (as the server does)
   std::vector<ScoreRec> out(n);
   std::atomic<uint64_t> next{0};
+  std::atomic<uint64_t> trained_hi{0};  // delay mode: training phase covers local samples [0, trained_hi)
+  uint64_t phase_lo = 0, phase_hi = n;  // current phase: local samples [phase_lo, phase_hi)
+  bool phase_train = true, phase_score = true;
   std::vector<double> tcpu(a.threads * 4, 0.0);  // per thread: fwd, bwd, rows, total
   const double w0 = now_s(), c0 = cpu_s();
-  std::vector<std::thread> th;
-  for (uint32_t t = 0; t < a.threads; t++)
-    th.emplace_back([&, t] {
+  // One worker pass over [phase_lo, phase_hi) in batches of B; phase_score: write scores; phase_train: update rows.
+  // Without --delay-samples there is one phase (score and train, as before); with D > 0 phases alternate: train up to
+  // s0 - D (scores discarded, the trainer's own forward), then score [s0, s0 + G) with no update.
+  auto worker = [&](uint32_t t) {
       const uint32_t B = a.batch;
       Model::Scratch sc;
       Model::Train tr;
       M.scratch(&sc, B);
       M.train_scratch(&tr, B);
       std::vector<float> dense(B * 13), score(B), dz(B), gsum, wtmp(dim);
+      std::vector<uint16_t> w16(dim);
       std::vector<std::pair<uint32_t, uint32_t>> touch;  // (compact row, batch row * 26 + table)
       double f = 0, bw = 0, rw = 0;
       const double tt0 = thread_cpu_s();
       for (;;) {
-        const uint64_t b = next.fetch_add(B);
-        if (b >= n) break;
-        const uint32_t m = uint32_t(std::min<uint64_t>(B, n - b));
+        const uint64_t b = phase_lo + next.fetch_add(B);
+        if (b >= phase_hi) break;
+        const uint32_t m = uint32_t(std::min<uint64_t>(B, phase_hi - b));
+        if (a.delay && phase_score && trained_hi.load() > 0 && trained_hi.load() + a.delay > phase_lo)
+          die("delay invariant violated");  // scoring block [s0 = phase_lo, ..) sees only samples < s0 - D
         double q0 = thread_cpu_s();
         for (uint32_t r = 0; r < m; r++) std::memcpy(&dense[r * 13], S.s[a.start + b + r].dense, 52);
         M.bottom(dense.data(), m, &sc);
@@ -276,12 +301,12 @@ static void run_train(const Args &a, const Model &M, const Image &img, const Sam
         M.top_train(m, &sc, &tr, score.data());
         for (uint32_t r = 0; r < m; r++) {
           const Sample &x = S.s[a.start + b + r];
-          out[b + r] = ScoreRec{a.start + b + r, score[r], x.label, {0, 0, 0}};
+          if (phase_score) out[b + r] = ScoreRec{a.start + b + r, score[r], x.label, {0, 0, 0}};
           dz[r] = (score[r] - float(x.label)) / float(m);  // BCE, mean over the batch
         }
         double q1 = thread_cpu_s();
         f += q1 - q0;
-        if (!a.update) continue;
+        if (!a.update || !phase_train) continue;
         const float *gx = M.backward(m, &tr, dz.data());
         double q2 = thread_cpu_s();
         bw += q2 - q1;
@@ -306,17 +331,38 @@ static void run_train(const Args &a, const Model &M, const Image &img, const Sam
             for (uint32_t c = 0; c < dim; c++) gsum[c] += g[c];
           }
           float *w = &W[size_t(row) * dim];
-          rowwise_adagrad(w, &acc[row], gsum.data(), dim, a.ada);
+          if (a.sgd)
+            for (uint32_t c = 0; c < dim; c++) w[c] -= a.ada.lr * gsum[c];
+          else
+            rowwise_adagrad(w, &acc[row], gsum.data(), dim, a.ada);
           if (img.elt == 2) {  // storage precision of the record
-            f32_to_emb(w, 2, dim, &W16[size_t(row) * dim]);
-            emb_to_f32(&W16[size_t(row) * dim], 2, dim, w, false);
+            f32_to_emb(w, 2, dim, w16.data());
+            emb_to_f32(w16.data(), 2, dim, w, false);
           }
         }
         rw += thread_cpu_s() - q2;
       }
-      tcpu[t * 4 + 0] = f, tcpu[t * 4 + 1] = bw, tcpu[t * 4 + 2] = rw, tcpu[t * 4 + 3] = thread_cpu_s() - tt0;
-    });
-  for (auto &x : th) x.join();
+      tcpu[t * 4 + 0] += f, tcpu[t * 4 + 1] += bw, tcpu[t * 4 + 2] += rw, tcpu[t * 4 + 3] += thread_cpu_s() - tt0;
+  };
+  auto run_phase = [&](uint64_t lo, uint64_t hi, bool train, bool score) {
+    if (lo >= hi) return;
+    phase_lo = lo, phase_hi = hi, phase_train = train, phase_score = score;
+    next.store(0);
+    std::vector<std::thread> th;
+    for (uint32_t t = 0; t < a.threads; t++) th.emplace_back(worker, t);
+    for (auto &x : th) x.join();
+    if (train) trained_hi.store(hi);
+  };
+  if (!a.delay) {
+    run_phase(0, n, true, true);
+  } else {
+    // block k scores [s0, s0 + G) after training exactly [0, max(0, s0 - D)); every sample is trained once, in order
+    for (uint64_t s0 = 0; s0 < n; s0 += a.delay_block) {
+      const uint64_t lim = s0 > a.delay ? s0 - a.delay : 0;
+      run_phase(trained_hi.load(), lim, true, false);
+      run_phase(s0, std::min(n, s0 + a.delay_block), false, true);
+    }
+  }
   const double wall = now_s() - w0, cpu = cpu_s() - c0;
   double f = 0, bw = 0, rw = 0;
   for (uint32_t t = 0; t < a.threads; t++) f += tcpu[t * 4], bw += tcpu[t * 4 + 1], rw += tcpu[t * 4 + 2];
@@ -324,9 +370,13 @@ static void run_train(const Args &a, const Model &M, const Image &img, const Sam
   std::fwrite(out.data(), sizeof(ScoreRec), n, fo);
   std::fclose(fo);
   std::printf("mode=train update=%d samples=%lu threads=%u batch=%u lr=%g eps=%g wall_s=%.3f samples_per_s=%.1f "
-              "cpu_s=%.3f cpu_ms_per_sample=%.3f fwd_ms=%.3f bwd_ms=%.3f rows_ms=%.3f fwd_mflop=%.1f bwd_mflop=%.1f\n",
+              "cpu_s=%.3f cpu_ms_per_sample=%.3f fwd_ms=%.3f bwd_ms=%.3f rows_ms=%.3f fwd_mflop=%.1f bwd_mflop=%.1f",
               a.update, n, a.threads, a.batch, a.ada.lr, a.ada.eps, wall, n / wall, cpu, 1e3 * cpu / n, 1e3 * f / n,
               1e3 * bw / n, 1e3 * rw / n, M.flops_per_pair() / 1e6, M.backward_flops_per_pair() / 1e6);
+  if (a.acc_init >= 0 || a.acc_freq > 0 || a.sgd || a.delay)
+    std::printf(" acc_init=%g acc_freq=%g optim=%s delay_samples=%lu delay_block=%lu trained=%lu", a.acc_init,
+                a.acc_freq, a.sgd ? "sgd" : "adagrad", a.delay, a.delay_block, a.delay ? trained_hi.load() : n);
+  std::printf("\n");
 }
 
 int main(int argc, char **argv) {
@@ -350,12 +400,23 @@ int main(int argc, char **argv) {
     else if (k == "--lr") a.ada.lr = std::stof(v());
     else if (k == "--eps") a.ada.eps = std::stof(v());
     else if (k == "--no-update") a.update = false;
+    else if (k == "--acc-init") a.acc_init = std::stod(v());
+    else if (k == "--acc-freq") a.acc_freq = std::stod(v());
+    else if (k == "--optim") {
+      const std::string o = v();
+      if (o != "adagrad" && o != "sgd") die("--optim adagrad|sgd");
+      a.sgd = o == "sgd";
+    } else if (k == "--delay-samples") a.delay = std::stoull(v());
+    else if (k == "--delay-block") a.delay_block = std::stoull(v());
     else die("unknown option " + k);
   }
+  if (a.delay && !a.delay_block) a.delay_block = std::min<uint64_t>(a.delay, 1024);
+  if (a.delay_block && a.delay_block % a.batch) die("--delay-block must be a multiple of --batch");
   if ((a.mode != "frozen" && a.mode != "train") || a.image.empty() || a.dense.empty() || a.samples.empty() ||
       a.out.empty() || !a.count || !a.threads || !a.batch || a.batch > 64)
     die("usage: --mode frozen|train --image F --dense F --samples F --start S --count N --out F [--threads T] "
-        "[--chunk C] [--batch B<=64] [--lr X] [--eps X] [--no-update]");
+        "[--chunk C] [--batch B<=64] [--lr X] [--eps X] [--no-update] [--acc-init X] [--acc-freq K] "
+        "[--optim adagrad|sgd] [--delay-samples D] [--delay-block G]");
   Model M;
   std::string err;
   if (!M.load_dense(a.dense, &err)) die(err);
