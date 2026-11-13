@@ -89,7 +89,8 @@ struct Opts {
   uint32_t split_ways = 0;      // ways of the adaptive split; 0 = serve_threads (chunk.h query_chunk)
   uint32_t min_chunk = 16;
   uint32_t rank = 512;          // DCNv2 low rank (MLPerf 512)
-  uint64_t publish_us = 0;      // publication interval T (0 = write each sample immediately)
+  Mlp mlp = Mlp::avx512;        // serving forward: avx512 (fp32) | amx (bf16 tiles, fp32 accumulate; model.h, amx.h)
+  uint64_t publish_us = 0;     // publication interval T (0 = write each sample immediately)
   bool stream = false;          // --update-mode stream (T = 0 only): reply on acceptance, every worker writes its rows
                                 // of each sample right away (RecSys methodology 2026-10-19, DESIGN.md §5.1)
   double publish_frac = 0;      // operating point: target fraction of all rows published per T (reported; the
@@ -308,6 +309,8 @@ class Server {
       if (!model_.load_dense(o_.model_dense, &err)) die("model: " + err);
       if (model_.spec().dim != p_.dim || model_.spec().rank != o_.rank) die("model: dense weights do not match --dim/--rank");
     }
+    if (o_.mlp == Mlp::amx) model_.prepare_amx();
+    std::fprintf(stderr, "recsys-server: serving mlp=%s (training path fp32 avx512)\n", mlp_name(o_.mlp));
     if (!o_.stale_log.empty()) open_stale_log();
     if (!o_.publish_trace.empty() && win_on()) {
       trace_f_ = std::fopen(o_.publish_trace.c_str(), "wx");
@@ -373,7 +376,7 @@ class Server {
       << "\nround_rows_max_worker=" << st_.round_rows_max << "\nupdate_rate_sustained=" << (st_.flush_overruns ? 0 : 1)
       << "\nupdate_queue_max=" << st_.uq_max << "\naccum_ns=" << tsc_to_ns(st_.accum_cyc)
       << stream_text() << window_text() << "\n" << v7_text("\n")
-      << "\nver_stripes=" << p_.ver_stripes << "\ntsc_khz=" << tsc_khz()
+      << "\nver_stripes=" << p_.ver_stripes << "\nmodel.mlp=" << mlp_name(o_.mlp) << "\ntsc_khz=" << tsc_khz()
       << "\nop.coh_src=pc_threads:" << st_.coh_pc_threads << ",mg_threads:" << st_.coh_mg_threads << "\n" << op_tags()
       << op_text() << "mem.vm_rss_kb=" << status_kb("VmRSS:")
       << "\nmem.vm_hwm_kb=" << status_kb("VmHWM:") << "\nbackend=" << be_->usage() << "\n"
@@ -1656,7 +1659,7 @@ class Server {
     OpTimer ot(&tcoh_);  // Fig 2 T: this thread's work on the query, chunk claimed .. its part of the response ready
     ot.begin();
     const uint64_t t0 = now_ns();
-    model_.bottom(dense.data(), m, &sc);
+    model_.bottom(dense.data(), m, &sc, o_.mlp);
     const uint64_t t1 = now_ns();
     const uint32_t D = model_.spec().inter();
     LookupCnt lc;
@@ -1673,7 +1676,7 @@ class Server {
       }
     }
     const uint64_t t2 = now_ns();
-    model_.top(m, &sc, &c->score[r0]);
+    model_.top(m, &sc, &c->score[r0], o_.mlp);
     const uint64_t t3 = now_ns();
     c->lookup_ns += t2 - t1;
     c->mlp_ns += (t1 - t0) + (t3 - t2);
@@ -1883,6 +1886,8 @@ void usage() {
                "     each W-s window during the next window, ceil(n/W) rows/s evenly spaced (reports/experiments/recsys-windowed-update.md)\n"
                "  [--dim D (128)] [--row-cap R (26000000)] [--row-div N (1)] [--ver-stripes S (65536)]\n"
                "  [--multi-hot-div N (1)] [--rank R (512)] [--seed N] [--verify-rows 0|1] [--warm-up 0|1]\n"
+               "  [--mlp avx512|amx (avx512)]   serving forward: fp32 AVX-512 | bf16 AMX tiles, fp32 accumulate (needs AMX\n"
+               "     CPUID + XCR0 tile state + arch_prctl XTILEDATA permission; exits otherwise); training stays fp32\n"
                "  [--check-stride N (4096)] [--megalon-time-sample N (0 = off)] [--start-timeout-ms T] [--backend plain|megalon] [--megalon-lib PATH]\n"
                "  [--mg-rows-per-object N]   required with --backend megalon: 0 = one object per table, 1 = per row, N = N-row chunks\n"
                "  [--proc-kthread PREFIX]... [--proc-sysfs DIR]...\n"
@@ -1942,6 +1947,9 @@ int main(int argc, char **argv) {
     else if (a == "--publish-frac") o.publish_frac = std::stod(v());
     else if (a == "--multi-hot-div") o.p.multi_hot_div = std::stoul(v());
     else if (a == "--rank") o.rank = std::stoul(v());
+    else if (a == "--mlp") {
+      if (!parse_mlp(v(), &o.mlp)) usage();
+    }
     else if (a == "--seed") o.p.seed = std::stoull(v());
     else if (a == "--verify-rows") o.verify_rows = std::stoul(v());
     else if (a == "--warm-up") o.warm_up = std::stoul(v());
@@ -2011,6 +2019,13 @@ int main(int argc, char **argv) {
     return 0;
   }
   if (o.run_id == 0 && !o.preload_only) usage();
+  if (o.mlp == Mlp::amx && !o.preload_only) {  // process-wide AMX permission before any thread exists or uses tiles
+    std::string err;
+    if (!amx_enable(&err)) {
+      std::fprintf(stderr, "recsys-server: --mlp amx: %s\n", err.c_str());
+      return 2;
+    }
+  }
   if (o.stream && o.publish_us) {
     std::fprintf(stderr, "recsys-server: --update-mode stream needs --publish-ms 0 (no publication period)\n");
     return 2;

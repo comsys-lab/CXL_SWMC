@@ -4,9 +4,12 @@
 // (x_{l+1} = x0 * (W_l (V_l x_l) + b_l) + x_l), OverArch 1024-1024-512-256 (ReLU) + linear to 1, sigmoid.
 // Weights are process-local (each node's DRAM), deterministic from the seed (random; trained weights: §9 D4).
 // GEMM: weights packed in 32-column panels, AVX-512 8x32 micro-kernel (scalar fallback without AVX-512F).
+// Serving forward with `--mlp amx`: bf16 AMX tiles, fp32 accumulation (amx.h; bottom()/top() Mlp argument).
 #pragma once
 
 #include <immintrin.h>
+
+#include "amx.h"
 
 #include <cmath>
 #include <cstdint>
@@ -193,35 +196,77 @@ class Model {
     s->x0.assign(size_t(m) * s_.inter(), 0), s->xl.assign(size_t(m) * s_.inter(), 0);
     s->v.assign(size_t(m) * s_.rank, 0), s->w.assign(size_t(m) * s_.inter(), 0);
   }
+  // Serving forward kind (`--mlp`): Mlp::avx512 = the fp32 packed GEMM above (default; the training path
+  // top_train/backward always uses it); Mlp::amx = bf16 AMX tiles with fp32 accumulation (server/amx.h) for every
+  // layer with out % 32 == 0 (needs prepare_amx() and amx_enable()); the final 256 -> 1 dot, bias, ReLU, the cross
+  // update x_{l+1} = x0 * u + x_l and the sigmoid stay fp32 in both.
+  // Trace (tests only): copy of each layer output [m][out], in order bottom 0..2 | per cross layer V x_l, u_l, x_{l+1}
+  // | top 0..3, logit.
+  using Trace = std::vector<std::vector<float>>;
+  static void trace_push(Trace *t, const float *y, uint32_t m, size_t ld, uint32_t cols) {
+    if (!t) return;
+    t->emplace_back(size_t(m) * cols);
+    for (uint32_t r = 0; r < m; r++) std::memcpy(&t->back()[size_t(r) * cols], y + r * ld, size_t(cols) * 4);
+  }
+  // bf16 AMX tile copies of the forward layers (load time, after init / load_dense).
+  void prepare_amx() {
+    auto pk = [](const std::vector<Linear> &src, std::vector<AmxLinear> *dst) {
+      dst->assign(src.size(), {});
+      for (size_t i = 0; i < src.size(); i++)
+        if (src[i].out % kPanel == 0) (*dst)[i].pack(src[i].in, src[i].out, src[i].w, src[i].b);
+    };
+    pk(bottom_, &abottom_), pk(V_, &aV_), pk(W_, &aW_), pk(top_, &atop_);
+  }
+  bool amx_ready() const { return !atop_.empty() && atop_.size() == top_.size(); }
+  uint64_t amx_weight_bytes() const {
+    uint64_t b = 0;
+    for (auto *v : {&abottom_, &aV_, &aW_, &atop_})
+      for (auto &l : *v) b += l.wb.size() * 2 + l.b.size() * 4;
+    return b;
+  }
   // Bottom MLP: dense [m][dense_in] -> x0[:, 0:dim] (x0 row stride inter()).
-  void bottom(const float *dense, uint32_t m, Scratch *s) const {
+  void bottom(const float *dense, uint32_t m, Scratch *s, Mlp k = Mlp::avx512, Trace *tr = nullptr) const {
+    if (k == Mlp::amx) need_amx();
     const float *in = dense;
     size_t ld = s_.dense_in;
     for (size_t l = 0; l < bottom_.size(); l++) {
       const bool last = l + 1 == bottom_.size();
       float *out = last ? s->x0.data() : (l % 2 ? s->b.data() : s->a.data());
       const size_t ldo = last ? s_.inter() : bottom_[l].out;
-      gemm(bottom_[l], in, ld, m, out, ldo, true);
+      if (k == Mlp::amx && bottom_[l].out % kPanel == 0) amx_gemm(abottom_[l], in, ld, m, out, ldo, true);
+      else gemm(bottom_[l], in, ld, m, out, ldo, true);
+      trace_push(tr, out, m, ldo, bottom_[l].out);
       in = out, ld = ldo;
     }
   }
   // x0 complete (dense_out + pooled embeddings) -> score[m] (sigmoid).
-  void top(uint32_t m, Scratch *s, float *score) const {
+  void top(uint32_t m, Scratch *s, float *score, Mlp k = Mlp::avx512, Trace *tr = nullptr) const {
+    if (k == Mlp::amx) need_amx();
     const uint32_t D = s_.inter();
     std::memcpy(s->xl.data(), s->x0.data(), size_t(m) * D * 4);
     for (uint32_t l = 0; l < s_.cross_layers; l++) {
-      gemm(V_[l], s->xl.data(), D, m, s->v.data(), s_.rank, false);
-      gemm(W_[l], s->v.data(), s_.rank, m, s->w.data(), D, false);
+      if (k == Mlp::amx) {
+        amx_gemm(aV_[l], s->xl.data(), D, m, s->v.data(), s_.rank, false);
+        amx_gemm(aW_[l], s->v.data(), s_.rank, m, s->w.data(), D, false);
+      } else {
+        gemm(V_[l], s->xl.data(), D, m, s->v.data(), s_.rank, false);
+        gemm(W_[l], s->v.data(), s_.rank, m, s->w.data(), D, false);
+      }
       for (size_t i = 0; i < size_t(m) * D; i++) s->xl[i] += s->x0[i] * s->w[i];
+      trace_push(tr, s->v.data(), m, s_.rank, s_.rank), trace_push(tr, s->w.data(), m, D, D);
+      trace_push(tr, s->xl.data(), m, D, D);
     }
     const float *in = s->xl.data();
     size_t ld = D;
     for (size_t l = 0; l + 1 < top_.size(); l++) {
       float *out = l % 2 ? s->b.data() : s->a.data();
-      gemm(top_[l], in, ld, m, out, top_[l].out, true);
+      if (k == Mlp::amx && top_[l].out % kPanel == 0) amx_gemm(atop_[l], in, ld, m, out, top_[l].out, true);
+      else gemm(top_[l], in, ld, m, out, top_[l].out, true);
+      trace_push(tr, out, m, top_[l].out, top_[l].out);
       in = out, ld = top_[l].out;
     }
     gemm(top_.back(), in, ld, m, score, 1, false);
+    trace_push(tr, score, m, 1, 1);
     for (uint32_t r = 0; r < m; r++) score[r] = 1.f / (1.f + std::exp(-score[r]));
   }
 
@@ -378,8 +423,15 @@ class Model {
   const std::vector<Linear> &bottom_layers() const { return bottom_; }
 
  private:
+  void need_amx() const {
+    if (!amx_ready()) {
+      std::fprintf(stderr, "model: --mlp amx forward without prepare_amx()\n");
+      std::abort();
+    }
+  }
   ModelSpec s_;
   std::vector<Linear> bottom_, V_, W_, top_;
+  std::vector<AmxLinear> abottom_, aV_, aW_, atop_;  // --mlp amx: bf16 tile copies of the forward layers
   std::vector<Linear> Vt_, Wt_, topt_;  // v7 backward (transposes, no bias); empty for random-init models
 };
 
