@@ -21,7 +21,8 @@ when its scheduled time lies inside the measured groups' range):
   extra columns   groups (= searches), groups_excluded_short (top-K' list has < k visible records at the fresh or a
                   stale snapshot; excluded from every T), copies_not_ok, recall_ann_ok_only (copies with an OK response),
                   frac_ann_lower (ANN hits of copy T < copy T=0), mean_age_writes (mean fresh - sent, writes),
-                  pred_pp (= 100 x 2 R T / N, N = pool A size = live records; the Host-only prediction line)
+                  pred_pp (= 100 x 2 R T / N, N = pool A size = live records; the Host-only prediction line),
+                  window_s (--window-s: the measured window of the run, as given by the caller)
 --check: structural checks (every group has all T; sent non-increasing in T; sent(T=0) = fresh; searches.bin ref_w =
   sent and s_used = sent for OK responses; returned ids visible at the sent snapshot (E1); one fresh per group) ->
   "STALECHECK PASS|FAIL ..." and exit 1 on a failure. --monotone-tol X (with --check): recall_ann non-increasing in T
@@ -45,7 +46,8 @@ STALE = np.dtype([("seq", "<u8"), ("sched_ns", "<u8"), ("group", "<u4"), ("t_ms"
 assert STALE.itemsize == 40
 COLS = ["run", "T_ms", "R_updates_s", "searches", "recall_ann", "recall_ann_ci_lo", "recall_ann_ci_hi", "loss_pp",
         "loss_ci_lo", "loss_ci_hi", "exact_loss_pp", "frac_queries_any_miss", "p50_ms", "p99_ms",
-        "groups_excluded_short", "copies_not_ok", "recall_ann_ok_only", "frac_ann_lower", "mean_age_writes", "pred_pp"]
+        "groups_excluded_short", "copies_not_ok", "recall_ann_ok_only", "frac_ann_lower", "mean_age_writes", "pred_pp",
+        "window_s"]
 
 
 def search_dtype(k):  # loadgen/vectordb_plugin.cc SearchLog (packed) + ids[k] + scores[k]
@@ -78,6 +80,7 @@ def main():
     ap.add_argument("--out", required=True)
     ap.add_argument("--run", default="run")
     ap.add_argument("--rate", type=float, default=float("nan"), help="update rate R of the run (updates/s; pred_pp)")
+    ap.add_argument("--window-s", default="", help="measured window of the run (s), copied into steps.csv window_s")
     ap.add_argument("--k", type=int, default=10)
     ap.add_argument("--boot", type=int, default=2000)
     ap.add_argument("--seed", type=int, default=20261113)
@@ -252,6 +255,7 @@ def main():
             "frac_ann_lower": f"{(hit[:, t] < hit[:, i0]).mean():.6f}" if g else "",
             "mean_age_writes": f"{(fresh[gi] - sent[gi][:, t]).mean():.2f}" if g else "",
             "pred_pp": "" if np.isnan(a.rate) else f"{100 * 2 * a.rate * T / 1000 / na:.6f}",
+            "window_s": a.window_s,
         })
     with open(a.out, "w", newline="") as f:
         cw = csv.DictWriter(f, fieldnames=COLS)

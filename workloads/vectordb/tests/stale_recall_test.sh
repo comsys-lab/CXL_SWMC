@@ -75,7 +75,7 @@ grep -q "^STEP .* valid=True" "$O/urate-check.txt" || { echo "urate check: updat
 python3 "$ROOT/experiments/vectordb/e1_check.py" --writes "$S/writes.bin" --na "$NA" --nb "$NB" --searches "$O/loadgen/searches.bin" \
   --out "$O/e1" > /dev/null 2>&1 && e1="E1 PASS ($(head -n 1 "$O/e1.e1.txt"))" || { e1="E1 FAIL ($(head -n 1 "$O/e1.e1.txt" 2>/dev/null))"; RC=1; }
 python3 "$ROOT/experiments/vectordb/staleness_recall.py" --searches "$O/loadgen/searches.bin" --stale "$O/loadgen/stale.bin" \
-  --writes "$S/writes.bin" --topk "$S/topk.npz" --out "$O/steps.csv" --run stale-recall-test --rate "$URATE" --boot 1000 \
+  --writes "$S/writes.bin" --topk "$S/topk.npz" --out "$O/steps.csv" --run stale-recall-test --rate "$URATE" --window-s "$MEASURE_S" --boot 1000 \
   --check --monotone-tol "$MON_TOL" > "$O/staleness-recall.txt" 2>&1 || RC=1
 for k in 0 1; do
   sed -n '/vdb-server: stopping/,$p' "$S/node$k.log" | grep -E "^(node|P|elements|updates|searches|timeouts|bad_records|writer_threads|write_backlog)=" | tr '\n' ' '; echo

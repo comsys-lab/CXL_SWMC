@@ -152,7 +152,9 @@ for l in $H2N_LIFETIMES; do
   [[ $l != *:t* ]] || [ $s = ds ] || die "lifetime $l: :t<T> only for ds"
   [[ $l != *:t* ]] || HAST=1
   case $s in hw|pop) ;; ds) HASDS=1;; mg|mgoff) HASMG=1;; *) die "bad system in $l";; esac
-  case $m in u5|u10|u50|u90|u95) ;; *) die "bad mix in $l (u5 | u10 | u50 | u90 | u95)";; esac   # u10 u95: new H1 on H2N_TOPO=2
+  case $m in u5|u10|u50|u90|u95) [ -z "${H2N_LG_STREAMS:-}" ] || die "lifetime $l: with H2N_LG_STREAMS the mix id is u0";;
+    u0) [ -n "${H2N_LG_STREAMS:-}" ] || die "lifetime $l: mix u0 only with H2N_LG_STREAMS";;   # vector-db-staleness-recall
+    *) die "bad mix in $l (u5 | u10 | u50 | u90 | u95; u0 with H2N_LG_STREAMS)";; esac   # u10 u95: new H1 on H2N_TOPO=2
   [ $s = pop ] && HASPOP=1
   [[ $seen == *" $l "* ]] && die "lifetime $l listed twice"; seen+="$l "
   LIVES+=("$l")
@@ -387,6 +389,40 @@ if [ -n "$FRECVP$FRBASE" ]; then
   done
 fi
 [ -z "$NENV_X" ] || [[ $NENV_X =~ ^(ENV:[A-Z_][A-Z0-9_]*=[^[:space:]]*( |$))+$ ]] || die "bad H2N_NODE_ENV_EXTRA ($NENV_X)"
+# vector-db-staleness-recall keys (2026-11-13; experiments/vectordb/staleness-block.sh; all optional, unset = unchanged):
+#   H2N_PLAIN_SERVER_EXTRA "--writer-threads <n>" (only this): appended to the plain server arguments (hw / pop / ds),
+#                       the same on every node (run.sh SERVER_ARGS); urate_check.py then runs with --writers <n>
+#   H2N_WRITES_TARGETS  "<t> ...": the writes file's targets must be exactly this set (e.g. "0": every update to vm0)
+#                       instead of 0..N-1
+#   H2N_LG_STREAMS      loadgen stream arguments of fixed-window lifetimes replacing --mix update=U,search=(100-U):
+#                       "--mix search=1" plus optionally "--opt stale_ms=<ms,...>" and "--opt search_target=<k>";
+#                       needs H2N_FIXED and H2N_FIXED_UPDATE; the lifetimes use the mix id u0 (no mix fraction)
+#   H2N_FIXED_UPDATE    "<part>:<R> ...": "--fixed update=<R>" appended to PART_ARGS_<part> (every H2N_FIXED part, once)
+#   H2N_FIXED_SKIP_CMD  "bash <tree>/experiments/vectordb/staleness-pilot-skip.sh" only: run.sh PART_SKIP_CMD of fixed
+#                       lifetimes (the pilot stops at the first step whose update stream was not sustained)
+PSX=${H2N_PLAIN_SERVER_EXTRA:-} WTGT=${H2N_WRITES_TARGETS:-} LGSTR=${H2N_LG_STREAMS:-} FUPD=${H2N_FIXED_UPDATE:-} WRT=1
+FSKIP=${H2N_FIXED_SKIP_CMD:-}
+[ -z "$FSKIP" ] || { [ "$FSKIP" = "bash $TREE/experiments/vectordb/staleness-pilot-skip.sh" ] && [ -n "${FIXED:-}" ]; } \
+  || die "bad H2N_FIXED_SKIP_CMD ($FSKIP: 'bash $TREE/experiments/vectordb/staleness-pilot-skip.sh', with H2N_FIXED)"
+if [ -n "$PSX" ]; then
+  [[ $PSX =~ ^--writer-threads\ ([1-9]|1[0-6])$ ]] || die "bad H2N_PLAIN_SERVER_EXTRA ($PSX: only --writer-threads <1..16>)"
+  WRT=${BASH_REMATCH[1]}
+  [ $HASMG = 0 ] || die "H2N_PLAIN_SERVER_EXTRA: plain backend only (no mg lifetimes in this block)"
+fi
+[ -z "$WTGT" ] || [[ $WTGT =~ ^[0-7]( [0-7])*$ ]] || die "bad H2N_WRITES_TARGETS ($WTGT)"
+declare -A FUPDR=()
+if [ -n "$LGSTR$FUPD" ]; then
+  [ -n "$LGSTR" ] && [ -n "$FUPD" ] && [ -n "$FIXED" ] || die "H2N_LG_STREAMS and H2N_FIXED_UPDATE go together, with H2N_FIXED"
+  [[ $LGSTR =~ ^--mix\ search=1(\ --opt\ (stale_ms=[0-9]+(,[0-9]+)*|search_target=[0-7]))*$ ]] \
+    || die "bad H2N_LG_STREAMS ($LGSTR: --mix search=1 [--opt stale_ms=<ms,...>] [--opt search_target=<k>])"
+  for t in $FUPD; do
+    [[ $t =~ ^([a-z0-9]+):([1-9][0-9]*)$ ]] || die "bad H2N_FIXED_UPDATE token $t (<part>:<updates/s>)"
+    [ -z "${FUPDR[${BASH_REMATCH[1]}]:-}" ] || die "H2N_FIXED_UPDATE: part ${BASH_REMATCH[1]} twice"
+    FUPDR[${BASH_REMATCH[1]}]=${BASH_REMATCH[2]}
+  done
+  for t in $FIXED; do IFS=/ read -r fs fp _ <<< "$t"; [ -n "${FUPDR[$fp]:-}" ] || die "H2N_FIXED_UPDATE has no rate for part $fp"; done
+  for p in "${!FUPDR[@]}"; do [[ " $FIXED " == *"/$p/"* ]] || die "H2N_FIXED_UPDATE part $p is not an H2N_FIXED part"; done
+fi
 if [ $DSKER = 1 ]; then  # the De Stijl bundle instead of the Popcorn one (no pop lifetime in a ds block)
   [ -f "$REGION" ] && [ -f "$DS_C/p-destijl-shm.sh" ] && [ "$(sha256sum < "$DS_C/packet.sha256" | cut -c1-64)" = "$DS_BUNDLE_SHA" ] \
     && (cd "$DS_C" && sha256sum -c --quiet packet.sha256) || die "REGION ($REGION) or the De Stijl bundle ($DS_C) does not verify"
@@ -470,16 +506,18 @@ VFSA=; [ $VF = fp32 ] || VFSA=" --vec-format $VF"
 PAT='[/]bin/vdb-server( |$)'
 COMMON_SA="--nodes $N --segments 32 --M 16 --efc 128 --ef $EF --search-threads $ST --wait-timeout-ms 60000 --start-timeout-ms 5400000$VFSA"
 # plain backend (all-HWcc, Popcorn): 28m-x capacity, delete log per node X_MAXD (h2n_layout.py: total constant over N)
-SA="$COMMON_SA --max-writes $X_MAXW --max-ids $X_MAXIDS --max-deletes $X_MAXD --init-capacity $X_INIT_CAP"
+SA="$COMMON_SA --max-writes $X_MAXW --max-ids $X_MAXIDS --max-deletes $X_MAXD --init-capacity $X_INIT_CAP${PSX:+ $PSX}"
 HOSTSRV=$PLAIN_BUILD/bin/vdb-server
 [ -x "$HOSTSRV" ] || die "missing $HOSTSRV"
 [ -x "$LOADGEN" ] || die "missing $LOADGEN"
-# targets of the writes file must cover exactly the N VMs (one writer per VM receives updates)
-python3 -I -B - "$X_WRITES" "$N" <<'PY' || die "writes file $X_WRITES does not target exactly $N VMs"
+# targets of the writes file must cover exactly the N VMs (one writer per VM receives updates); H2N_WRITES_TARGETS:
+# exactly that set instead
+python3 -I -B - "$X_WRITES" "$N" "$WTGT" <<'PY' || die "writes file $X_WRITES does not target exactly ${WTGT:+[$WTGT] instead of }$N VMs"
 import sys, numpy as np
 w = np.memmap(sys.argv[1], dtype=np.dtype([("op", "u1"), ("target", "u1"), ("p", "u1", 22)]), mode="r")
 t = np.unique(w["target"])  # the whole file (verifier review v1 L8)
-sys.exit(0 if list(t) == list(range(int(sys.argv[2]))) else 1)
+want = sorted(int(x) for x in sys.argv[3].split()) if sys.argv[3] else list(range(int(sys.argv[2])))
+sys.exit(0 if list(t) == want and max(want) < int(sys.argv[2]) else 1)
 PY
 INSTALL="${VPLAIN#/home/comsys/}/bin/vdb-server $HOSTSRV
 ${VPLAIN#/home/comsys/}/bin/vdb-node.sh $TREE/scripts/guest/vdb-node.sh
@@ -560,6 +598,7 @@ echo "BLOCK PLAN: server_args plain=[$SA]${MGSA:+ megalon=[$MGSA]}"
 echo "BLOCK PLAN: receiver pop=$([ $HASPOP = 1 ] && echo "$PRM${POP_ADAPT_KO:+ ko=$POP_ADAPT_KO srcversion=$POPSV}" || echo -) ds=$([ $HASDS = 1 ] && echo "$RECV_MODE extra=[${DSRX}] fault_poll=$DSFP" || echo -) ipoll=${IPOLL:-default} $(recv_wsm_desc)"
 echo "BLOCK PLAN: $LAYOUT"
 [ -z "$FIXED" ] || echo "BLOCK PLAN: fixed windows (no SLO search) [$FIXED] node_env_extra=[$NENV_X] allow_detail=$ALLOWDET"
+[ -z "$PSX$WTGT$LGSTR" ] || echo "BLOCK PLAN: staleness keys: plain_server_extra=[$PSX] (urate_check --writers $WRT) writes_targets=[${WTGT:-0..$((N - 1))}] lg_streams=[$LGSTR] fixed_update=[$FUPD] fixed_skip_cmd=[$FSKIP]"
 [ -z "$FRECVP" ] || echo "BLOCK PLAN: receiver parameters per part [$FRECVP] base [$FRBASE] (fixed-part-hook.sh: base checked, written, read back, restored)"
 if [ "$DRYB" = 1 ]; then
   if [ $L1ON = 1 ]; then  # the L1 each lifetime would get from the results present now (mg lifetimes of this block not run yet)
@@ -701,6 +740,7 @@ gate() { bash "$HG" check "$E/gate-$1.txt" > /dev/null || stop "h3 gate ($1; see
   [ -z "$FWARM" ] || echo "warmup: fixed=[$FWARM] parts=[$FWPARTS] duration_s=$FWDUR (hw/pop/ds SLO lifetimes)"
   [ $ACCX = 0 ] || echo "accuracy_export=1"
   [ -z "$FIXED" ] || echo "fixed=[$FIXED] node_env_extra=[$NENV_X] allow_detail=$ALLOWDET (H2N_FIXED: the slo part is not run)"
+  [ -z "$PSX$WTGT$LGSTR" ] || echo "staleness: plain_server_extra=[$PSX] writes_targets=[$WTGT] lg_streams=[$LGSTR] fixed_update=[$FUPD] fixed_skip_cmd=[$FSKIP]"
   [ -z "$FRECVP" ] || echo "fixed_recvp=[$FRECVP] fixed_recvp_base=[$FRBASE]"
   for d in "${DOMS[@]}"; do x=$(virsh -c qemu:///system dumpxml --inactive "$d" 2>/dev/null); echo "vm_xml_sha256.$d=$(printf '%s' "$x" | sha256sum | cut -c1-64) bytes=${#x}"; done
 } > "$E/h2n-params.txt"
@@ -1104,7 +1144,7 @@ vdb_life() {  # <sys> <mix> [r<j> | t<T us>]
     log "$name NOTE: opcoh_check $mode $oc on $N nodes (H2N_OPCOH_STRICT=0: recorded; see $RP/opcoh-check.txt)"
   fi
   [ $s != ds ] || ds_recv $name
-  python3 $XV/urate_check.py $RP --writers 1 > $RP/urate-check.txt 2>&1 || true
+  python3 $XV/urate_check.py $RP --writers $WRT > $RP/urate-check.txt 2>&1 || true
   python3 $XV/e1_check.py --writes $X_WRITES --na $NA --nb $X_NB --searches $RP/loadgen/searches.bin --out $RP/e1 --sample 500 > /dev/null \
     || stop "$name: E1 violation (see $RP/e1.e1.txt)"
   grep -q 'workload_finish":"ok' $RP/loadgen/summary.json || stop "$name: loadgen workload finish"
@@ -1199,13 +1239,17 @@ vdb_fixed_life() {  # <sys> <mix>
   fk=$(fkey $s $mix) parts=${FPARTS[$(fkey $s $mix)]}
   R=$E/$name
   local LG=(--opt data=$X_DATA --opt writes=$X_WRITES --opt k=10 --mix "update=$U,search=$((100 - U))" --x-stream search --raw)
+  if [ -n "$LGSTR" ]; then  # vector-db-staleness-recall: absolute update rate per part (H2N_FIXED_UPDATE), own search streams
+    local LGS; read -r -a LGS <<< "$LGSTR"
+    LG=(--opt data=$X_DATA --opt writes=$X_WRITES --opt k=10 "${LGS[@]}" --x-stream search --raw)
+  fi
   local RE=(V=$VPLAIN HOST_SERVER=$HOSTSRV LOADGEN=$LOADGEN INIT=$INIT READY_TIMEOUT=$RDYT RUN_KIND=measurement TRACE=0 STATS_OP=10
     "PARTS=$parts" H1_MEASURE_RUN=1 MEASURE_PART_DIR=$MEASURE_PART_DIR "PART_GATE_CMD=bash $HG check"
     "PART_PRE_CMD=bash $EV/fixed-part-hook.sh pre $fk" "PART_POST_CMD=bash $EV/fixed-part-hook.sh post $fk")
   for t in $FIXED; do
     IFS=/ read -r fs fp fd fr frt fw fm fdr <<< "$t"
     [ "$fs" = "$fk" ] || continue
-    RE+=("PART_ARGS_$fp=--mode fixed --rates $frt --warmup-s 0 --step-warmup-s $fw --step-measure-s $fm --drain-s $fdr" "PART_SEED_$fp=$SEED")
+    RE+=("PART_ARGS_$fp=--mode fixed --rates $frt --warmup-s 0 --step-warmup-s $fw --step-measure-s $fm --drain-s $fdr${FUPDR[$fp]:+ --fixed update=${FUPDR[$fp]}}" "PART_SEED_$fp=$SEED")
   done
   if [ $s = ds ] && [ "$REPL" = damon ] && [ "$DXAT" = ready ]; then  # DAMON at READY (E0b): damonx-hook.sh wraps fixed-part-hook.sh
     RE+=("PART_PRE_CMD=bash $EV/damonx-hook.sh pre" "PART_POST_CMD=bash $EV/damonx-hook.sh post" DAMONX_FIXED_KEY=$fk DAMONX_E=$E DAMONX_NAME=$name
@@ -1213,6 +1257,9 @@ vdb_fixed_life() {  # <sys> <mix>
       DAMONX_POOL=$RPOOL DAMONX_V=$VPLAIN DAMONX_WARM=)
     log "$name: DAMON at READY (fixed parts [$parts])"
   fi
+  # H2N_FIXED_SKIP_CMD (vector-db-staleness-recall pilot): run.sh PART_SKIP_CMD (rc 0 = skip the part), called with the
+  # part name and env FIXED_RUN_DIR=<run dir> FIXED_PARTS=<parts>; skipped parts are not checked below
+  [ -z "$FSKIP" ] || RE+=("PART_SKIP_CMD=$FSKIP" "FIXED_RUN_DIR=$R" "FIXED_PARTS=$parts")
   case $s in
     hw)  RE+=(SYSTEM=all-HWcc "NODE_ENV=$NENV_X" NODE0_ENV= "SERVER_ARGS=$SA"); mode=hwcc OPS=none;;
     pop) RE+=(SYSTEM=Popcorn-$PRM "NODE_ENV=$NENV_X" NODE0_ENV= "SERVER_ARGS=$SA --preloaded"); mode=popcorn OPS=swmc_acct;;
@@ -1245,6 +1292,9 @@ vdb_fixed_life() {  # <sys> <mix>
     { grep -qx "opcoh.read_errors=0" $L && grep -qx "opcoh.register_errors=0" $L; } || stop "$name node$k: opcoh errors"
     [[ $NENV_X != *VDB_LOCK_SPLIT=1* ]] || grep -q "^vdb-server: lock split on" $L || stop "$name node$k: lock split not on"
   done
+  local ranp=; for p in $parts; do grep -q "^part_$p=skipped" $R/manifest.txt || ranp+="${ranp:+ }$p"; done
+  [ "$ranp" = "$parts" ] || log "$name: parts skipped by H2N_FIXED_SKIP_CMD: [$(for p in $parts; do [[ " $ranp " == *" $p "* ]] || printf '%s ' $p; done)]"
+  parts=$ranp
   local OPP=; for p in $parts; do OPP+="$R/$p "; done
   for p in $parts; do
     local RP=$R/$p
@@ -1259,7 +1309,7 @@ vdb_fixed_life() {  # <sys> <mix>
     t=$(grep -m1 -oE '^OPCOH_CHECK (PASS|FAIL)' $RP/opcoh-check.txt | cut -d' ' -f2); t=${t:-ERROR}
     [ "$t" = PASS ] || { [ $STRICT = 1 ] && stop "$name/$p: opcoh_check $mode $t"; log "$name/$p NOTE: opcoh_check $mode $t (recorded)"; }
     oc="${oc#-}${oc:+ }$p:$t"
-    python3 $XV/urate_check.py $RP --writers 1 > $RP/urate-check.txt 2>&1 || true
+    python3 $XV/urate_check.py $RP --writers $WRT > $RP/urate-check.txt 2>&1 || true
     python3 $XV/e1_check.py --writes $X_WRITES --na $NA --nb $X_NB --searches $RP/loadgen/searches.bin --out $RP/e1 --sample 500 > /dev/null \
       || stop "$name/$p: E1 violation (see $RP/e1.e1.txt)"
   done
