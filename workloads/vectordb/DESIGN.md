@@ -605,7 +605,11 @@ changes (builds/vdb-loadgen >= 13; plain server builds/vdb/24 unchanged).
   steps.csv per T: recall@10 vs the exact top-10 of the FRESH snapshot, paired loss vs T = 0 of the same group with a
   bootstrap CI over groups, exact (no-ANN) loss, latency percentiles; measured groups only, a copy without an OK
   response counts as 0 hits). Harness: experiments/vectordb/staleness-block.sh (parts pilot / measure; h2n-block.sh
-  fixed-window hw lifetime, keys H2N_PLAIN_SERVER_EXTRA / H2N_WRITES_TARGETS / H2N_LG_STREAMS / H2N_FIXED_UPDATE).
+  fixed-window hw lifetime, keys H2N_PLAIN_SERVER_EXTRA / H2N_WRITES_TARGETS / H2N_LG_STREAMS / H2N_FIXED_UPDATE /
+  H2N_FIXED_SKIP_CMD; conf experiments/eval/vector-db-staleness-recall.conf). Pilot: update steps 1000, 2000, 3000,
+  4000, 6000, 8000 /s (15 s warmup + 60 s each) in one lifetime, stopping at the first step urate_check.py judges not
+  sustained; result = the highest clean step. Measure at R: 25 s (15 s warmup + 10 s lookback) + W = min(600,
+  floor(1,835,008 / R) - 35) s (update budget = node 0's --max-deletes), W in the manifest and steps.csv window_s.
 - Tests: tests/plugin_stale_test.cc (snapshot rule, pruning, w_start, records); tests/stale_recall_test.sh (two
   servers on a scratch file, tiny SQ8 image, 4 writer threads on node 0, searches to node 1, stale_ms 0..10000).
 
