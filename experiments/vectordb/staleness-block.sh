@@ -50,7 +50,7 @@ EN=${E##*/}
 [ ! -e "$E" ] || die "$E exists (evidence dirs are immutable; bump v<N>)"
 plan "part $SPART${RATE:+ R=$RATE}, evidence dir $E (absent: OK)"
 # ---- conf values
-for x in STALE_MS STALE_SEARCH_TARGET STALE_QUERY_RATE STALE_PILOT_RATES STALE_PILOT_WARMUP_S STALE_PILOT_MEASURE_S \
+for x in STALE_MS STALE_SEARCH_TARGET STALE_QUERY_RATE STALE_PILOT_QUERY_RATE STALE_PILOT_RATES STALE_PILOT_WARMUP_S STALE_PILOT_MEASURE_S \
   STALE_MEASURE_WARMUP_S STALE_MEASURE_S STALE_MARGIN_S STALE_DRAIN_S STALE_UPDATE_BUDGET STALE_TOPK STALE_TOPK_SHA256 \
   STALE_SOURCE_WRITES H2N_PLAIN_SERVER_EXTRA H2N_WRITES_TARGETS; do [ -n "${!x:-}" ] || die "$EVAL_CONF lacks $x"; done
 [ "$H2N_TOPO:$VCPUS_PER_VM:$H2N_RAM_GB:$H2N_NODES" = "2:4:96:2" ] || die "the experiment runs on the 2-VM topology, 4 vCPU per VM"
@@ -91,7 +91,8 @@ Q=$STALE_QUERY_RATE NCOP=$(echo "$STALE_MS" | tr ',' '\n' | wc -l) DR=$STALE_DRA
 FIX= FUPD= WIN=
 if [ $SPART = pilot ]; then
   PW=$STALE_PILOT_WARMUP_S PM=$STALE_PILOT_MEASURE_S SUM=0
-  for r in $STALE_PILOT_RATES; do FIX+="${FIX:+ }hw/p$r/-/-/$Q/$PW/$PM/$DR"; FUPD+="${FUPD:+ }p$r:$r"; SUM=$((SUM + r)); done
+  PQ=$STALE_PILOT_QUERY_RATE  # low search load: the pilot judges the update stream only (pilot-v2 saturated vm1 at 20 q/s)
+  for r in $STALE_PILOT_RATES; do FIX+="${FIX:+ }hw/p$r/-/-/$PQ/$PW/$PM/$DR"; FUPD+="${FUPD:+ }p$r:$r"; SUM=$((SUM + r)); done
   WIN=$PM
   # every step's window and its warmup at the step's rate, all steps run (the worst case): sum x window <= budget - warmup updates
   [ $((SUM * PM)) -le $((BUD - SUM * PW)) ] || die "pilot steps [$STALE_PILOT_RATES]: $((SUM * PM)) window updates > budget $BUD - $((SUM * PW)) warmup updates"
