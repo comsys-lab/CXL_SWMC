@@ -8,8 +8,11 @@
 #                                                snapshots before/after, one loadgen run into <S>/<name>/ (manifest.txt,
 #                                                loadgen/, steps.csv, stats-steps.csv, breakdown.csv, slo.png), window
 #                                                invariants (torn_rows, misses, update_misses, bad_requests deltas = 0),
-#                                                torn.txt + torn-steps.csv (torn rows / serving lookups; torn_rows.py)
-#   session.sh stop    <S>                       stop both servers, collect node logs, final invariants from the logs,
+#                                                torn.txt + torn-steps.csv (torn rows / serving lookups; torn_rows.py);
+#                                                De Stijl lifetimes only (SYSTEM DeStijl-*): guest SS-residence
+#                                                histograms before/after (ss_snap: ss-residence-{pre,post}-t<k>.txt) and
+#                                                ss-residence.csv / .txt (ss_hist.py delta; per-measurement bucket deltas)
+#   session.sh stop   <S>                       stop both servers, collect node logs, final invariants from the logs,
 #                                                torn-lifetime.txt
 # Torn rows (user 2026-11-07): start env TORN_POLICY "system=ds T_us=<n> replica_mode=<m>" (main-block.sh, De Stijl
 #   lifetimes); torn_rows.py allow decides: T > 0 and replica_mode on = torn rows allowed (reported, no invariant); any
@@ -35,6 +38,17 @@ SSH="ssh -o BatchMode=yes -o ConnectTimeout=8 -o ServerAliveInterval=30 -o Serve
 LOCAL=${SESSION_LOCAL:-0}
 rx() {  # rx <node index> <command>: run on the node's guest (Host shell in SESSION_LOCAL=1)
   if [ "$LOCAL" = 1 ]; then bash -c "$2" < /dev/null; else $SSH comsys@"${NODE[$1]}" "$2" < /dev/null; fi
+}
+ss_snap() {  # ss_snap <pre|post>: De Stijl lifetimes only (SYSTEM DeStijl-*; every other system: nothing, no guest call):
+  # per node the guest's SS-residence histograms (cumulative ss_residence_hist + ss_residence_window_hist of
+  # SS_HIST_DIR, default /sys/kernel/swmc/destijl) into <M>/ss-residence-<pre|post>-t<k>.txt; a failed read leaves no
+  # file (ss_hist.py delta notes it); never fails the measurement
+  case ${SYSTEM:-} in DeStijl-*) ;; *) return 0;; esac
+  local k d=${SS_HIST_DIR:-/sys/kernel/swmc/destijl}
+  for k in "${!NODE[@]}"; do
+    rx "$k" "test -r $d/ss_residence_hist && for f in ss_residence_hist ss_residence_window_hist; do echo \"# \$f\"; cat $d/\$f; done" \
+      > "$M/ss-residence-$1-t$k.txt" 2>/dev/null && [ -s "$M/ss-residence-$1-t$k.txt" ] || rm -f "$M/ss-residence-$1-t$k.txt"
+  done
 }
 fetch() {  # fetch <node index> <guest glob> <local dir>
   if [ "$LOCAL" = 1 ]; then cp $2 "$3/" 2>/dev/null; else scp -q "comsys@${NODE[$1]}:$2" "$3/" 2>/dev/null; fi
@@ -197,6 +211,7 @@ measure)
     grep -E '^(node[0-9]+|vm_xml_sha256\.[a-z0-9_]+|vm_xml_error\.[a-z0-9_]+)=' "$S/session-manifest.txt"
   } > "$M/manifest.txt"
   for k in "${!NODE[@]}"; do python3 "$HERE/stats_snap.py" "${NODE[$k]}:${PORTS[$k]}" "$M/pre-t$k.txt" > /dev/null || { echo "stats node$k"; exit 3; }; done
+  ss_snap pre
   cpu() { for k in "${!NODE[@]}"; do echo "$1 node$k $(rx "$k" 'head -1 /proc/stat')"; done >> "$M/guest-cpu.txt"; }
   cpu before
   TARGETS=""; for k in "${!NODE[@]}"; do TARGETS="$TARGETS${TARGETS:+,}${NODE[$k]}:${PORTS[$k]}"; done
@@ -211,6 +226,8 @@ measure)
   tail -3 "$M/loadgen.log"
   cpu after
   for k in "${!NODE[@]}"; do python3 "$HERE/stats_snap.py" "${NODE[$k]}:${PORTS[$k]}" "$M/post-t$k.txt" > /dev/null || { echo "stats node$k after"; exit 3; }; done
+  ss_snap post
+  ! ls "$M"/ss-residence-post-t*.txt > /dev/null 2>&1 || python3 -I -B "$HERE/ss_hist.py" delta "$M" > "$M/ss-residence.txt" 2>&1 || true
   HC=0; host_check "$M/host-check.txt" after || HC=1
   NEXT=$(kvget "$M/loadgen/recsys.txt" last_update_seq)
   [[ $NEXT =~ ^[0-9]+$ ]] && [ "$NEXT" -ge "$SEQB" ] || { echo "no last_update_seq in $M/loadgen/recsys.txt"; exit 4; }
