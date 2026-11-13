@@ -234,6 +234,13 @@ if [ $SPART = pilot ]; then
   done
   log "PILOT RESULT highest_clean_rate=$best (steps [$STALE_PILOT_RATES]; $E/analysis/pilot.tsv)"
 else
+  # verifier M1: did the update stream keep up with R? (NOTE, not a stop: snapshots follow the write schedule, so the
+  # paired fresh/stale comparison stays valid; the achieved rate shows in mean_age_writes)
+  python3 -I -B "$XV/urate_check.py" "$RD/m" --writers "${H2N_PLAIN_SERVER_EXTRA##* }" > "$E/analysis/urate-m.txt" 2>&1
+  st=$(grep '^STEP ' "$E/analysis/urate-m.txt" | tail -n 1)
+  echo "update_stream_check=${st:-no STEP line}" >> "$E/staleness-manifest.txt"
+  if [[ $st == *" valid=True "* ]]; then log "update stream sustained at R=$RATE: $st"
+  else log "STALE NOTE: update stream NOT sustained at R=$RATE (${st:-no STEP line}); recall comparison kept, rate claim not"; fi
   mkdir -p "$DERIVED_ROOT/$EN"
   nice -n 19 numactl --cpunodebind=1 --membind=1 python3 -I -B "$XV/staleness_recall.py" --searches "$RD/m/loadgen/searches.bin" \
     --stale "$RD/m/loadgen/stale.bin" --writes "$X_WRITES" --topk "$STALE_TOPK" --out "$E/analysis/steps.csv" --run "$EN" \

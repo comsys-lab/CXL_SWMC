@@ -269,8 +269,11 @@ def main():
               f"loss {r['loss_pp']} pp [{r['loss_ci_lo']}, {r['loss_ci_hi']}] exact_loss {r['exact_loss_pp']} pp "
               f"any_miss {r['frac_queries_any_miss']} age {r['mean_age_writes']} p50 {r['p50_ms']} p99 {r['p99_ms']} ms")
     if a.check:
-        if n_noq:
-            bad.append(f"{n_noq} measured groups without any response")
+        if n_noq:  # verifier L3: a few groups lost at drain are a NOTE (no effect on the paired loss); many = FAIL
+            if n_noq > max(5, 0.001 * int(measured.sum())):
+                bad.append(f"{n_noq} measured groups without any response")
+            else:
+                print(f"NOTE: {n_noq} measured groups without any response (excluded; paired loss unaffected)")
         if a.monotone_tol is not None and g:
             rec = [float(r["recall_ann"]) for r in rows]
             up = [(rows[i]["T_ms"], rows[i + 1]["T_ms"]) for i in range(len(rec) - 1) if rec[i + 1] > rec[i] + a.monotone_tol]

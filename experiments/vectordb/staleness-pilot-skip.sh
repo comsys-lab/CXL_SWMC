@@ -18,7 +18,7 @@ if grep -q "^part_$prev=skipped" "$FIXED_RUN_DIR/manifest.txt" 2>/dev/null; then
 fi
 rc=$(sed -n "s/^part_${prev}_loadgen_rc=\([0-9]*\) .*/\1/p" "$FIXED_RUN_DIR/manifest.txt" | tail -n 1)
 [ "$rc" = 0 ] || { echo "skip-hook $(date -Is) $P_: SKIP (previous part $prev loadgen rc '${rc:-none}')"; exit 0; }
-out=$(python3 -I -B "$XV/urate_check.py" "$FIXED_RUN_DIR/$prev" 2>&1)
+out=$(python3 -I -B "$XV/urate_check.py" "$FIXED_RUN_DIR/$prev" --writers 4 2>&1)  # 4 writer threads (as the final judging)
 echo "$out" > "$FIXED_RUN_DIR/$prev/urate-check-pilot.txt"
 st=$(echo "$out" | grep '^STEP ' | tail -n 1)
 if [[ $st == *" valid=True "* ]]; then echo "skip-hook $(date -Is) $P_: run (previous part $prev: $st)"; exit 1; fi
