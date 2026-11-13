@@ -113,7 +113,10 @@ struct Opts {
   uint32_t train_batch = 8;     // --train-batch: samples per training step (max; taken without waiting)
   AdagradCfg ada;               // --lr (0.004 = MLPerf DLRMv2 reference, to be confirmed), --eps
   double acc_init = -1;         // --acc-init: initial row-wise Adagrad state written at load (< 0: as in the image)
-  std::string stale_log;        // --stale-log FILE: (row, seq, CLOCK_REALTIME ns) of sampled rows; node 0 = every
+  bool store_sr = false;        // --store rn|sr: updated fp16 rows stored with round-to-nearest (rn, default, every
+                                // earlier run) or stochastic rounding (sr, emb_v7.h f32_to_fp16_sr; fp16 images only;
+                                // one xorshift64 per row owner seeded from (--seed, --node, owner); recsys-training-auc)
+  std::string stale_log;       // --stale-log FILE: (row, seq, CLOCK_REALTIME ns) of sampled rows; node 0 = every
                                 // write, other nodes = every serving lookup of a sampled row
   uint32_t stale_mod = 256;     // --stale-sample N: a row is sampled iff mix64(global row) % N == 0 (same on every node)
   // ---- windowed publication (reports/experiments/recsys-windowed-update.md; train mode only; 0 = off = write-through,
@@ -423,7 +426,8 @@ class Server {
       << "train.threads=" << train_threads() << sep << "train.batch=" << o_.train_batch << sep
       << "train.lr=" << o_.ada.lr << sep << "train.eps=" << o_.ada.eps << sep << "train.acc_init="
       << (o_.acc_init < 0 ? std::string("image") : std::to_string(o_.acc_init)) << sep
-      << "train.optimizer=rowwise_adagrad" << sep << "train.dense=frozen" << sep
+      << "train.optimizer=rowwise_adagrad" << sep << "train.store=" << (o_.store_sr ? "sr" : "rn") << sep
+      << "train.dense=frozen" << sep
       << "train_samples=" << st_.train_samples << sep << "train_batches=" << st_.train_batches << sep
       << "train_lookups=" << st_.train_lookups << sep << "train_grad_rows=" << st_.grad_rows << sep
       << "train_cpu_ns=" << st_.train_cpu_ns << sep << "train_fwd_ns=" << st_.train_fwd_ns << sep
@@ -1143,14 +1147,16 @@ class Server {
   }
 
   // One row update in a private copy of the record (rec, slot_bytes): Adagrad on the fp32 row, stored back in the
-  // record precision; seq = the batch's last sample; csum over the new (key, seq, emb).
-  void rmw_record(uint8_t *rec, const float *g, uint64_t key, uint64_t seq, float *w) {
+  // record precision; seq = the batch's last sample; csum over the new (key, seq, emb). rng: the calling owner's
+  // stochastic-rounding state (--store sr only; untouched with rn).
+  void rmw_record(uint8_t *rec, const float *g, uint64_t key, uint64_t seq, float *w, uint64_t *rng) {
     const RecFmt &f = fmt_;
     float acc;
     std::memcpy(&acc, rec + f.acc_off, 4);
     emb_to_f32(rec + f.emb_off, f.elt, p_.dim, w, false);
     rowwise_adagrad(w, &acc, g, p_.dim, o_.ada);
-    f32_to_emb(w, f.elt, p_.dim, rec + f.emb_off);
+    if (o_.store_sr && f.elt == 2) f32_to_fp16_sr(w, p_.dim, reinterpret_cast<uint16_t *>(rec + f.emb_off), rng);
+    else f32_to_emb(w, f.elt, p_.dim, rec + f.emb_off);
     std::memcpy(rec + f.acc_off, &acc, 4);
     std::memcpy(rec + f.seq_off, &seq, 8);
     const uint32_t cs = row_csum_words(key, seq, rec + f.emb_off, f.ewords);
@@ -1165,6 +1171,8 @@ class Server {
     const uint32_t dim = p_.dim;
     std::vector<float> wv(dim);
     std::vector<uint8_t> buf(p_.slot_bytes);
+    // --store sr: this owner's rounding RNG, deterministic in (seed, node, owner); xorshift64 state must be non-zero
+    uint64_t rng = mix64(p_.seed * 0x9e3779b97f4a7c15ull ^ (uint64_t(o_.node) << 32) ^ (0x5352ull << 48) ^ w) | 1;
     // Every owner gets every batch (possibly empty) and applies them in batch order (= seq order), although several
     // trainers may finish out of order: row seqs then only grow, and a row's history is the sample order.
     std::map<uint64_t, std::shared_ptr<GradJob>> pend;
@@ -1185,7 +1193,7 @@ class Server {
       ot.begin();
       uint64_t sections = 0, bad_key = 0;
       if (win_on()) {
-        bad_key = dram_apply(w, j, wv.data());  // windowed publication: DRAM copy only, no shared-memory write
+        bad_key = dram_apply(w, j, wv.data(), &rng);  // windowed publication: DRAM copy only, no shared-memory write
       } else if constexpr (!Be::kAppSeqlock) {
         for (size_t i = 0; i < j.rows.size();) {
           const uint32_t k = j.rows[i].k;
@@ -1199,7 +1207,7 @@ class Server {
               uint64_t key;
               std::memcpy(&key, buf.data() + fmt_.key_off, 8);
               if (key != j.rows[x].key) { bad_key++; continue; }
-              rmw_record(buf.data(), &j.g[x * dim], key, j.seq, wv.data());
+              rmw_record(buf.data(), &j.g[x * dim], key, j.seq, wv.data(), &rng);
               std::memcpy(rec, buf.data(), p_.slot_bytes);
             }
           });
@@ -1218,7 +1226,7 @@ class Server {
           uint64_t key;
           std::memcpy(&key, buf.data() + fmt_.key_off, 8);
           if (key == t.key) {
-            rmw_record(buf.data(), &j.g[x * dim], key, j.seq, wv.data());
+            rmw_record(buf.data(), &j.g[x * dim], key, j.seq, wv.data(), &rng);
             be_->write_slot(t.k, r, [&](uint8_t *dst) { std::memcpy(dst, buf.data(), p_.slot_bytes); });
           } else {
             bad_key++;
@@ -1362,7 +1370,7 @@ class Server {
   }
   // owner w, one gradient batch: update the DRAM copies (first touch copies the shared record), add rows to D_win.
   // Returns the rows whose shared record holds another key (not updated; counted as update misses like the RMW path).
-  uint64_t dram_apply(uint32_t w, const GradJob &j, float *wv) {
+  uint64_t dram_apply(uint32_t w, const GradJob &j, float *wv, uint64_t *rng) {
     DramMap &m = *dm_[w];
     thread_local std::vector<uint8_t> buf;
     buf.resize(p_.slot_bytes);
@@ -1387,7 +1395,7 @@ class Server {
       const uint32_t v = m.ver[e].load(std::memory_order_relaxed);
       m.ver[e].store(v + 1, std::memory_order_relaxed);
       std::atomic_thread_fence(std::memory_order_release);
-      rmw_record(rec, &j.g[x * p_.dim], t.key, j.seq, wv);
+      rmw_record(rec, &j.g[x * p_.dim], t.key, j.seq, wv, rng);
       m.t_upd[e].store(now, std::memory_order_relaxed);
       m.ver[e].store(v + 2, std::memory_order_release);
       if (m.tag[e] != tg) {
@@ -1877,6 +1885,7 @@ void usage() {
                "  [--update-mode batch|stream|train]   stream (T = 0 only): reply on acceptance, rows written right away (batch = default)\n"
                "  v7 (DESIGN.md §10.6): [--image F] [--model-dense F] [--update-mode train] [--train-threads N (= U)]\n"
                "     [--train-batch B (8)] [--lr X (0.004)] [--eps X (1e-8)] [--acc-init X (< 0 = image)]\n"
+               "     [--store rn|sr (rn)]   fp16 row store: round-to-nearest or stochastic rounding (train mode, fp16 image)\n"
                "     [--stale-log FILE] [--stale-sample N (256)]   train needs --image and --model-dense\n"
                "     [--publish-window-s W (0 = off: every row update written through)] [--publish-dram-rows N (0 = min(rows, 48M))]\n"
                "     [--publish-trace FILE (Host tests)]   W > 0 (node 0): train on a DRAM copy, publish the distinct rows of\n"
@@ -1929,6 +1938,11 @@ int main(int argc, char **argv) {
     else if (a == "--lr") o.ada.lr = std::stof(v());
     else if (a == "--eps") o.ada.eps = std::stof(v());
     else if (a == "--acc-init") o.acc_init = std::stod(v());
+    else if (a == "--store") {
+      const std::string s = v();
+      if (s != "rn" && s != "sr") usage();
+      o.store_sr = s == "sr";
+    }
     else if (a == "--stale-log") o.stale_log = v();
     else if (a == "--stale-sample") o.stale_mod = std::stoul(v());
     else if (a == "--publish-window-s") o.publish_window_s = std::stoul(v());
@@ -1972,6 +1986,10 @@ int main(int argc, char **argv) {
                   !(o.ada.lr > 0) || o.p.multi_hot_div != 1)) {
     std::fprintf(stderr, "recsys-server: --update-mode train needs --image, --model-dense, --publish-ms 0, "
                          "1 <= --train-batch <= 64, --lr > 0 and --multi-hot-div 1\n");
+    return 2;
+  }
+  if (o.store_sr && (!o.train || o.p.v7_elt != 2)) {
+    std::fprintf(stderr, "recsys-server: --store sr needs --update-mode train and an fp16 --image\n");
     return 2;
   }
   if ((o.publish_window_s || o.dram_rows_cap || !o.publish_trace.empty()) && !o.train) {
