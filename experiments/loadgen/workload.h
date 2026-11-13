@@ -25,6 +25,7 @@ struct Request {
   uint32_t target = 0;  // index into --target list
   uint16_t op = 0;      // frame op code
   uint64_t seq = 0;     // plugin's own id for this request (e.g. op index), handed back in on_response
+  uint64_t sched_ns = 0;  // input to make(): the request's scheduled time (CLOCK_MONOTONIC ns); 0 in on_response
 };
 
 class Workload {
@@ -38,6 +39,13 @@ class Workload {
   // Fill *r (target, op, seq) and *payload (cleared by the caller). Return false when the stream is exhausted
   // (the run stops at the end of the current step).
   virtual bool make(uint32_t stream, Request *r, std::vector<uint8_t> *payload) = 0;
+  // Requests per arrival of `stream` (default 1 = every plugin before 2026-11-13). With B > 1 the engine calls make()
+  // B times back to back for one scheduled arrival (same sched_ns, sent in that order); every copy is its own request
+  // (latency from the shared scheduled time, counted in sent / done / achieved). The stream's rate stays arrivals/s.
+  virtual uint32_t burst(uint32_t stream) const {
+    (void)stream;
+    return 1;
+  }
   // Response for a request made earlier; called from receiver threads (one per connection, concurrently).
   // measured: the request was scheduled inside a measurement window.
   virtual void on_response(const Request &r, bool measured, uint16_t status, const uint8_t *payload,

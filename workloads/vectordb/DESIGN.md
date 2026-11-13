@@ -575,6 +575,40 @@ experiments/vectordb/urate-block.sh (m4-run.sh KIND=urate). H1 (YCSB-style mixes
   adds an N ns wp fault inside its hold, so hold_wp_ns = N x inserts exactly; checks hold_coh + hold_rq <= hold, the
   histogram sums, and that a run without VDB_LOCK_SPLIT prints no lock_split key).
 
+## 20. Stale-snapshot copies (experiment vector-db-staleness-recall, approved 2026-11-13; loadgen only, server unchanged)
+Design doc reports/experiments/vector-db-staleness-recall.md. The server already applies any requested snapshot
+exactly (E1, §4: `ins_seq <= s < del_seq`; for s below P the readiness wait is already met), so only the client
+changes (builds/vdb-loadgen >= 13; plain server builds/vdb/24 unchanged).
+- Engine (experiments/loadgen/workload.h): `Workload::burst(stream)` = requests per arrival (default 1); with B > 1
+  the engine makes B requests back to back for one scheduled arrival, all with the same scheduled time
+  (`Request::sched_ns`, now passed to every make()). Each copy is its own request in the statistics (latency from the
+  shared scheduled time; sent / done / achieved count requests). Manifest line `burst.<stream>=B` only when B > 1.
+- Plugin options (default off; without them every output is byte-for-byte the format before):
+  - `--opt stale_ms=T0,T1,...` (integer ms, distinct, <= 16 values; the experiment: 0,1,10,100,1000,10000): every
+    search arrival ("group": one query row, one target) becomes len(LIST) requests in LIST order. Copy i asks for
+    s_i = the insert w_seq of the last update SCHEDULED at or before t - T_i (t = the group's scheduled time; binary
+    search over the (scheduled time, w_seq) history of the updates made by this invocation; history older than the
+    largest T is dropped except the last entry before the oldest cutoff). T = 0 is the usual E1 ref_w (last update
+    made). Before the first update of the invocation (or t < T) s_i = the initial snapshot (w_seq of record w_start-1,
+    0 at w_start 0). Rates: the search stream's rate counts GROUPS (query/s); search requests/s = rate x len(LIST)
+    (steps.jsonl `offered` = groups/s, `achieved` = responses/s). Copy order is LIST order: copy i is queued behind
+    copies 0..i-1 on the server, so per-T latency includes that queueing (reported, not a staleness effect).
+  - `--opt search_target=N`: every search to target N; the target draw still consumes the seeded generator, so the
+    query rows equal those of the same seed without the option.
+- Records: searches.bin keeps its format; `ref_w` = the snapshot SENT (s_i), so e1_check.py / compute_gt.py check
+  and score each copy at its own snapshot. New `stale.bin` (40 B per search MADE, seq order, written at the end, also
+  for searches without a response): u64 seq (= searches.bin seq), u64 sched_ns, u32 group, u32 t_ms, u32 fresh (ref_w
+  of T = 0 at the same time), u32 sent, u32 lat_us (response - scheduled, 0 without a response), u16 status, u8 flags
+  (bit 0 responded, bit 1 measured), u8 t_idx. vectordb.txt adds stale_ms / stale_copies / stale_groups /
+  stale_records / stale_record_bytes / stale_answered and search_target (only with the options).
+- Analysis: experiments/vectordb/staleness_recall.py (searches.bin + stale.bin + writes file + exact top-K' npz ->
+  steps.csv per T: recall@10 vs the exact top-10 of the FRESH snapshot, paired loss vs T = 0 of the same group with a
+  bootstrap CI over groups, exact (no-ANN) loss, latency percentiles; measured groups only, a copy without an OK
+  response counts as 0 hits). Harness: experiments/vectordb/staleness-block.sh (parts pilot / measure; h2n-block.sh
+  fixed-window hw lifetime, keys H2N_PLAIN_SERVER_EXTRA / H2N_WRITES_TARGETS / H2N_LG_STREAMS / H2N_FIXED_UPDATE).
+- Tests: tests/plugin_stale_test.cc (snapshot rule, pruning, w_start, records); tests/stale_recall_test.sh (two
+  servers on a scratch file, tiny SQ8 image, 4 writer threads on node 0, searches to node 1, stale_ms 0..10000).
+
 ## 10. Future reference: E2 (not implemented)
 
 - No-wait: s_used = min(P, ref_w); no staleness bound.

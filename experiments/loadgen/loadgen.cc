@@ -707,33 +707,43 @@ class Engine {
           break;
         }
       }
-      Request q;
-      q.stream = uint32_t(s);
-      payload.clear();
-      if (!w_->make(uint32_t(s), &q, &payload)) {
+      // workload.h burst(): B requests for this arrival, back to back, same scheduled time (default B = 1)
+      const uint32_t nburst = std::max<uint32_t>(1, w_->burst(uint32_t(s)));
+      bool exhausted = false;
+      for (uint32_t b = 0; b < nburst; b++) {
+        Request q;
+        q.stream = uint32_t(s);
+        q.sched_ns = sched;
+        payload.clear();
+        if (!w_->make(uint32_t(s), &q, &payload)) {
+          exhausted = true;
+          break;
+        }
+        if (q.target >= fds_.size()) die("workload chose a bad target");
+        const uint64_t id = issued_.load(std::memory_order_relaxed);
+        Rec *r = store_.alloc(id);
+        r->sched = sched;
+        r->seq = q.seq;
+        r->target = q.target;
+        r->op = q.op;
+        r->stream = uint8_t(s);
+        r->measured = sched >= ws;
+        r->status.store(0, std::memory_order_relaxed);
+        r->done.store(0, std::memory_order_relaxed);
+        outstanding_.fetch_add(1, std::memory_order_acq_rel);
+        issued_.store(id + 1, std::memory_order_release);
+        wire.resize(sizeof(frame::header) + payload.size());
+        frame::fill(reinterpret_cast<frame::header *>(wire.data()), q.op, id, uint32_t(payload.size()));
+        if (!payload.empty()) std::memcpy(wire.data() + sizeof(frame::header), payload.data(), payload.size());
+        int fd = pick_fd(q.target, specs_[s].ordered);
+        r->send = now_ns();
+        if (!frame::write_full(fd, wire.data(), wire.size())) die("send failed");
+      }
+      if (exhausted) {
         res.exhausted = true;
         res.reason = "stream " + specs_[s].name + " exhausted";
         break;
       }
-      if (q.target >= fds_.size()) die("workload chose a bad target");
-      const uint64_t id = issued_.load(std::memory_order_relaxed);
-      Rec *r = store_.alloc(id);
-      r->sched = sched;
-      r->seq = q.seq;
-      r->target = q.target;
-      r->op = q.op;
-      r->stream = uint8_t(s);
-      r->measured = sched >= ws;
-      r->status.store(0, std::memory_order_relaxed);
-      r->done.store(0, std::memory_order_relaxed);
-      outstanding_.fetch_add(1, std::memory_order_acq_rel);
-      issued_.store(id + 1, std::memory_order_release);
-      wire.resize(sizeof(frame::header) + payload.size());
-      frame::fill(reinterpret_cast<frame::header *>(wire.data()), q.op, id, uint32_t(payload.size()));
-      if (!payload.empty()) std::memcpy(wire.data() + sizeof(frame::header), payload.data(), payload.size());
-      int fd = pick_fd(q.target, specs_[s].ordered);
-      r->send = now_ns();
-      if (!frame::write_full(fd, wire.data(), wire.size())) die("send failed");
       next[s] += gap(s);
     }
     const uint64_t send_end = now_ns();
@@ -951,6 +961,8 @@ class Engine {
       << "\nworkload=" << c_.workload << "\nworkload_describe=" << w_->describe() << "\n";
     for (auto &t : c_.targets) m << "target=" << t << "\n";
     for (auto &kv : c_.opts) m << "opt." << kv.first << "=" << kv.second << "\n";
+    for (size_t s = 0; s < specs_.size(); s++)  // workload.h burst(); only streams with B > 1 (older manifests unchanged)
+      if (w_->burst(uint32_t(s)) > 1) m << "burst." << specs_[s].name << "=" << w_->burst(uint32_t(s)) << "\n";
     m << "mode=" << c_.mode << "\nslo=" << c_.slo_stream << ":" << c_.slo_pct << ":" << c_.slo_ms
       << "\nx_stream=" << c_.x_stream << "\nconns=" << c_.conns << "\narrival=" << c_.arrival
       << "\nseed=" << c_.seed << "\nstart=" << c_.start << " factor=" << c_.factor << " precision=" << c_.precision
