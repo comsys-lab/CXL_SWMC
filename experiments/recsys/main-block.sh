@@ -230,6 +230,8 @@ elif [ $BLOCK = stream ]; then  # RecSys streaming block (header "BLOCK=stream")
     [ -n "${STREAM_AUC2:-}" ] || [ -z "${STREAM_AUC2_S:-}" ] || { echo "SEQUENCE STOP: STREAM_AUC2_S without STREAM_AUC2"; exit 2; }
   fi
   [ -n "${EVAL_RUN:-}" ] || [ -z "${STREAM_AUC2:-}${STREAM_AUC2_S:-}" ] || { echo "SEQUENCE STOP: STREAM_AUC2 needs EVAL_RUN"; exit 2; }
+  [[ ${STREAM_AUC2_V7POST:-0} =~ ^[01]$ ]] && { [ "${STREAM_AUC2_V7POST:-0}" = 0 ] || [ -n "${STREAM_AUC2:-}" ]; } \
+    || { echo "SEQUENCE STOP: STREAM_AUC2_V7POST must be 0 / 1 and needs STREAM_AUC2"; exit 2; }
   [ -n "${EVAL_RUN:-}" ] || [ -z "${STREAM_PMAX:-}${STREAM_PMAX_FROM:-}" ] || { echo "SEQUENCE STOP: STREAM_PMAX needs EVAL_RUN"; exit 2; }
   [ -n "${EVAL_RUN:-}" ] || [ -z "${STREAM_AUC:-}${STREAM_AUC_ONLY:-}" ] || { echo "SEQUENCE STOP: STREAM_AUC needs EVAL_RUN"; exit 2; }
   EKKO=stream
@@ -462,7 +464,14 @@ case $V7 in 0) ;; 1)
     || { echo "SEQUENCE STOP: V7 image / dense paths must not contain spaces or '='"; exit 2; }
   V7_HOST_PATH_MAP="$V7_IMAGE=$V7_IMAGE_HOST $V7_DENSE=$V7_DENSE_HOST"
   SA="${SA/--update-mode stream/--update-mode train} --image $V7_IMAGE --model-dense $V7_DENSE --lr $V7_LR --acc-init $V7_ACC_INIT --train-batch $V7_TRAIN_BATCH --train-threads ${V7_TRAIN_THREADS:-0} --stale-sample $V7_STALE_SAMPLE"
+  # recsys-training-auc: V7_STORE rn | sr (lib.sh RS_V7_STORE) = server --store; unset = not passed (rn, every earlier run)
+  if [ -n "${V7_STORE:-}" ]; then
+    [[ $V7_STORE =~ ^(rn|sr)$ ]] || { echo "SEQUENCE STOP: bad V7_STORE ($V7_STORE: rn | sr)"; exit 2; }
+    SA="$SA --store $V7_STORE"
+    echo "BLOCK PLAN: v7 row store: --store $V7_STORE on every node (fp16 $([ "$V7_STORE" = sr ] && echo "stochastic rounding" || echo "round-to-nearest"))"
+  fi
   ;; *) echo "SEQUENCE STOP: bad V7 ($V7)"; exit 2;; esac
+[ "$V7" = 1 ] || [ -z "${V7_STORE:-}" ] || { echo "SEQUENCE STOP: V7_STORE needs V7=1"; exit 2; }
 # ---- windowed update publication (reports/experiments/recsys-windowed-update.md; V7=1 only; lib.sh rs_env from the
 # conf's RS_PUBLISH_*): PUBLISH_WINDOW_S = W (server --publish-window-s, both nodes; the server enables it on node 0
 # only; unset / 0 = off = per-batch write-through, every earlier run), PUBLISH_DRAM_ROWS (optional, server
@@ -687,6 +696,7 @@ if [ -n "${STREAM_AUC:-}" ]; then  # run-2 fixed-rate AUC plan (shown by lib.sh 
   [ "$V7" = 1 ] || { echo "SEQUENCE STOP: STREAM_AUC needs V7=1"; exit 2; }
   echo "BLOCK PLAN: auc lifetimes [$STREAM_AUC] systems [${SYSTEMS:-hw pop}] only=${STREAM_AUC_ONLY:-0}: warm-up then part auc '--mode fixed --rates <q> --warmup-s ${STREAM_AUC_SETTLE_S:-30} --step-warmup-s 5 --step-measure-s ${STREAM_AUC_S:-300} --drain-s 10' seed $((SEED + 3)), AUC rows -> <E>/auc_part.csv"
   [ -z "${STREAM_AUC2:-}" ] || echo "BLOCK PLAN: auc fix2 parts [$STREAM_AUC2] after part auc of the rate's AUC lifetime: one part fix2-<k> per rate '--raw --mode fixed --rates <q> --warmup-s 0 --step-warmup-s 5 --step-measure-s ${STREAM_AUC2_S:-120} --drain-s 10${STREAM_DRAIN_FULL_S:+ --drain-full-s $STREAM_DRAIN_FULL_S}' seed $((SEED + 10)) + k, rows -> <E>/stream-fix2.tsv"
+  [ "${STREAM_AUC2_V7POST:-0}" = 0 ] || echo "BLOCK PLAN: auc fix2 parts: v7 post-processing per part (stale logs, v7-steps.csv, rows -> <E>/auc_fix2.csv)"
 fi
 # receiver keys: modes of the pop / ds lifetimes of this block; a non-adaptive one refuses RECV_WATCH_US /
 # RECV_S_MAX_US (dry: BLOCK NOTE, then the evidence-dir check ends the dry start; real: stop below)
@@ -1349,6 +1359,8 @@ stream_auc2() {  # <sys> <rate>
     grep -qE '^STREAMCHECK (PASS|NOTE)' "$RD/stream-check.txt" || st="$st,streamcheck:$(grep -m1 '^STREAMCHECK' "$RD/stream-check.txt" | cut -d' ' -f2)"
     grep -q '^BREAKDOWN PASS' "$RD/breakdown-check.txt" || st="$st,breakdown-fail"
     st=${st#ok,}
+    # recsys-training-auc (STREAM_AUC2_V7POST=1): stale logs + v7_metrics.py per part, rows in <E>/auc_fix2.csv
+    [ "${STREAM_AUC2_V7POST:-0}" = 0 ] || v7_post "$s" "$r" "$RD" "$E/auc_fix2.csv"
     [ "$st" = ok ] || echo "MAIN NOTE $NAME fix2-$k: $st (see $RD)"
     printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$NAME" $s $r "fix2-$k" "$q" "$st" >> "$E/stream-fix2.tsv"
     echo "$NAME fix2-$k: $q query/s status $st"

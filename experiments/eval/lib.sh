@@ -37,10 +37,10 @@ unset REGISTRY LEVELS_SOURCE LEVELS_REGISTRY RS_PROC_CXL_SHM RUNSETS EVIDENCE_TA
 #                    recv_mode=sleep idle_spin_us 50 idle_sleep_us 20 for pop and ds)
 unset POP_RECV_MODE POP_ADAPT_KO RECV_IPOLL RECV_WATCH_US RECV_S_MAX_US REQUIRE_SLEEP2050
 unset RS_V7 RS_V7_IMAGE RS_V7_DENSE RS_V7_IMAGE_HOST RS_V7_DENSE_HOST RS_V7_LR RS_V7_ACC_INIT RS_V7_TRAIN_BATCH RS_V7_TRAIN_THREADS RS_V7_W_S \
-  RS_V7_STALE_SAMPLE RS_V7_STALE_DIR RS_V7_SAMPLES RS_V7_FROZEN   # v7 keys come only from the conf
+  RS_V7_STALE_SAMPLE RS_V7_STALE_DIR RS_V7_SAMPLES RS_V7_FROZEN RS_V7_STORE   # v7 keys come only from the conf
 unset RS_PMAX RS_PMAX_FROM RS_PMAX_S RS_PMAX_SETTLE_S   # run-2 RecSys pmax step keys (rs_env), only from the conf
 unset RS_AUC_Q RS_AUC_S RS_AUC_SETTLE_S RS_AUC_ONLY     # run-2 RecSys fixed-rate AUC lifetimes (rs_env), only from the conf
-unset RS_AUC2_Q RS_AUC2_S   # extra fixed-rate parts of the AUC lifetimes (rs_env, main-block.sh STREAM_AUC2), only from the conf
+unset RS_AUC2_Q RS_AUC2_S RS_AUC2_V7POST   # extra fixed-rate parts of the AUC lifetimes (rs_env, main-block.sh STREAM_AUC2), only from the conf
 unset RS_PUBLISH_WINDOW_S RS_PUBLISH_WARMUP RS_PUBLISH_AFTER_S RS_PUBLISH_DRAM_ROWS   # windowed publication (rs_env), only from the conf
 unset RS_CHUNK_PAIRS CHUNK_PAIRS   # serving split (rs_env -> main-block.sh CHUNK_PAIRS), only from the conf
 unset RS_SPLIT_WAYS SPLIT_WAYS RS_MIN_CHUNK MIN_CHUNK   # 2-way split (rs_env -> main-block.sh SPLIT_WAYS / MIN_CHUNK), only from the conf
@@ -240,8 +240,17 @@ rs_env() {
     for v in IMAGE DENSE IMAGE_HOST DENSE_HOST LR ACC_INIT TRAIN_BATCH TRAIN_THREADS W_S STALE_SAMPLE STALE_DIR SAMPLES FROZEN; do
       local c=RS_V7_$v; [ -n "${!c:-}" ] || die "RS_V7=1 needs $c in $EVAL_CONF"; RSENV+=("V7_$v=${!c}")
     done
-    plan "RecSys v7: image ${RS_V7_IMAGE} dense ${RS_V7_DENSE} lr ${RS_V7_LR} acc_init ${RS_V7_ACC_INIT} batch ${RS_V7_TRAIN_BATCH} W ${RS_V7_W_S} s stale 1/${RS_V7_STALE_SAMPLE} rows";;
+    plan "RecSys v7: image ${RS_V7_IMAGE} dense ${RS_V7_DENSE} lr ${RS_V7_LR} acc_init ${RS_V7_ACC_INIT} batch ${RS_V7_TRAIN_BATCH} W ${RS_V7_W_S} s stale 1/${RS_V7_STALE_SAMPLE} rows"
+    # recsys-training-auc: RS_V7_STORE rn | sr = server --store (fp16 row store round-to-nearest / stochastic rounding);
+    # unset / empty = not passed (server default rn, every earlier run). The plain build must know --store.
+    if [ -n "${RS_V7_STORE:-}" ]; then
+      [[ $RS_V7_STORE =~ ^(rn|sr)$ ]] || die "bad RS_V7_STORE ($RS_V7_STORE: rn | sr)"
+      grep -qa -- "--store rn|sr" "$RS_PLAIN_BUILD/bin/recsys-server" || die "RS_V7_STORE: $RS_PLAIN_BUILD/bin/recsys-server has no --store"
+      RSENV+=(V7_STORE=$RS_V7_STORE)
+      plan "RecSys v7 row store: --store $RS_V7_STORE (RS_V7_STORE; default not passed = rn)"
+    fi;;
     *) die "bad RS_V7 (${RS_V7}: 0 or 1)";; esac
+  [ "${RS_V7:-0}" = 1 ] || [ -z "${RS_V7_STORE:-}" ] || die "RS_V7_STORE needs RS_V7=1"
   # windowed update publication (reports/experiments/recsys-windowed-update.md; main-block.sh PUBLISH_*): RS_PUBLISH_WINDOW_S
   # W (s; unset / 0 = off = per-batch write-through), RS_PUBLISH_WARMUP 1 (default) | 0 (training-only first window
   # per lifetime), RS_PUBLISH_AFTER_S (60: SLO search this long after publishing started), RS_PUBLISH_DRAM_ROWS (optional)
@@ -340,7 +349,12 @@ rs_env() {
     [[ ${RS_AUC2_S:-120} =~ ^[1-9][0-9]*$ ]] || die "bad RS_AUC2_S"
     RSENV+=("STREAM_AUC2=$RS_AUC2_Q" STREAM_AUC2_S=${RS_AUC2_S:-120})
     plan "fixed-rate parts after part auc: [$RS_AUC2_Q] (rate=query/s list), one part fix2-<k> per query rate, 5 s + ${RS_AUC2_S:-120} s measured${RS_DRAIN_FULL_S:+, --drain-full-s $RS_DRAIN_FULL_S}, seed SEED + 10 + k"
-  elif [ -n "${RS_AUC2_S:-}" ]; then die "RS_AUC2_S without RS_AUC2_Q"
+    # recsys-training-auc: RS_AUC2_V7POST=1 = each fix2 part also gets the v7 post-processing of part auc (stale logs
+    # fetched into the part dir, v7_metrics.py v7-steps.csv, a row in <E>/auc_fix2.csv); unset = none (chain v8)
+    case ${RS_AUC2_V7POST:-} in "") ;; 1) RSENV+=(STREAM_AUC2_V7POST=1)
+      plan "fixed-rate parts after part auc: v7 post-processing per part (stale logs, v7-steps.csv, auc_fix2.csv; RS_AUC2_V7POST=1)";;
+      *) die "bad RS_AUC2_V7POST ($RS_AUC2_V7POST: 1 or unset)";; esac
+  elif [ -n "${RS_AUC2_S:-}${RS_AUC2_V7POST:-}" ]; then die "RS_AUC2_S / RS_AUC2_V7POST without RS_AUC2_Q"
   fi
 }
 # rs_check.py arguments of a RecSys block: AUCSYS (systems with AUC lifetimes; empty without RS_AUC_Q), SLOSYS (the SLO
