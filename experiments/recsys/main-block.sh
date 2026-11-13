@@ -133,6 +133,7 @@
 #   adaptive split (every earlier run, args byte for byte). BLOCK=stream prints "BLOCK PLAN: server args: <args>".
 #   2-way split (user 2026-11-13): SPLIT_WAYS K / MIN_CHUNK M (lib.sh rs_env from RS_SPLIT_WAYS / RS_MIN_CHUNK) append
 #   --split-ways K / --min-chunk M (server chunk = max(M, ceil(pairs / K)); recsys builds >= 18); not with CHUNK_PAIRS.
+#   recsys-amx-2way: MLP amx (lib.sh rs_env from RS_MLP) appends --mlp amx (recsys builds >= 21); unset = not passed.
 # De Stijl wait assist (build >= 13, kernel switch /sys/kernel/swmc/destijl/wait_assist): DS_WAIT_ASSIST 0 | 1
 #   (runset-rs-ds.sh RS_DS_WAIT_ASSIST); unset / empty = no step (every earlier run). See the De Stijl block below.
 # STREAM_ONE_LIFETIME=1 (user 2026-11-11, Megalon only; runset-rs-h1.sh RS_MG_ONE_LIFETIME): ONE mg server lifetime (one
@@ -533,6 +534,14 @@ if [ -n "$SPLITW$MINCH" ]; then
   fi
   echo "BLOCK PLAN: serving split: ${SPLITW:+--split-ways $SPLITW }${MINCH:+--min-chunk $MINCH }on every node (chunk = max(${MINCH:-16}, ceil(pairs / ${SPLITW:-serve threads})))"
 fi
+# recsys-amx-2way: MLP amx (lib.sh rs_env from RS_MLP) = server --mlp amx on every node of every system (bf16 AMX
+# tiles, fp32 accumulate; serving forward only); unset / empty = not passed (avx512, every earlier run byte for byte)
+case ${MLP:-} in
+  "") ;;
+  amx) [ $BLOCK = stream ] || { echo "SEQUENCE STOP: MLP needs BLOCK=stream"; exit 2; }
+    SA="$SA --mlp amx"
+    echo "BLOCK PLAN: serving mlp: --mlp amx on every node (bf16 AMX tiles, fp32 accumulate; serving forward only)";;
+  *) echo "SEQUENCE STOP: bad MLP (${MLP}: amx or unset)"; exit 2;; esac
 [ $BLOCK != stream ] || echo "BLOCK PLAN: server args: $SA"
 pub_train() {  # every lifetime (life_start, BLOCK=stream): first window = training only (no queries, no publish)
   [ "$PUBW" != 0 ] && [ "$PUBWU" = 1 ] || return 0

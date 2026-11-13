@@ -44,6 +44,7 @@ unset RS_AUC2_Q RS_AUC2_S RS_AUC2_V7POST   # extra fixed-rate parts of the AUC l
 unset RS_PUBLISH_WINDOW_S RS_PUBLISH_WARMUP RS_PUBLISH_AFTER_S RS_PUBLISH_DRAM_ROWS   # windowed publication (rs_env), only from the conf
 unset RS_CHUNK_PAIRS CHUNK_PAIRS   # serving split (rs_env -> main-block.sh CHUNK_PAIRS), only from the conf
 unset RS_SPLIT_WAYS SPLIT_WAYS RS_MIN_CHUNK MIN_CHUNK   # 2-way split (rs_env -> main-block.sh SPLIT_WAYS / MIN_CHUNK), only from the conf
+unset RS_MLP MLP   # serving MLP kind (rs_env -> main-block.sh MLP -> server --mlp), only from the conf
 unset RS_SLO_START STREAM_SLO_START RS_SLO_FILL STREAM_SLO_FILL RS_SLO_OVERLOAD STREAM_SLO_OVERLOAD   # knee-dense SLO search (rs_env), only from the conf
 unset RS_SLO_TOL STREAM_SLO_TOL   # SLO-search loadgen --tol (rs_env -> main-block.sh STREAM_SLO_TOL), only from the conf
 unset RS_DRAIN_FULL_S STREAM_DRAIN_FULL_S   # SLO-search loadgen --drain-full-s (rs_env -> STREAM_DRAIN_FULL_S), only from the conf
@@ -144,6 +145,7 @@ manifest() {  # written into E at the real start
     [ "$WL" != recsys ] || echo "EVAL_RS_LEAN=${EVAL_RS_LEAN:-0} (1 = confirm probes capped at 3)"
     [ "$WL" != recsys ] || [ -z "${RS_CHUNK_PAIRS:-}" ] || echo "serving split: --chunk-pairs $RS_CHUNK_PAIRS on every node (RS_CHUNK_PAIRS)"
     [ "$WL" != recsys ] || [ -z "${RS_SPLIT_WAYS:-}${RS_MIN_CHUNK:-}" ] || echo "serving split: split_ways=${RS_SPLIT_WAYS:-unset} min_chunk=${RS_MIN_CHUNK:-unset} on every node (RS_SPLIT_WAYS / RS_MIN_CHUNK)"
+    [ "$WL" != recsys ] || [ -z "${RS_MLP:-}" ] || echo "serving mlp: ${RS_MLP} on every node (RS_MLP; avx512 = --mlp not passed)"
     [ "$WL" != recsys ] || [ -z "${RS_SLO_START:-}${RS_SLO_FILL:-}${RS_SLO_OVERLOAD:-}" ] || echo "slo search: start=${RS_SLO_START:-unset} fill=${RS_SLO_FILL:-unset} overload(base result)=${RS_SLO_OVERLOAD:-unset} (RS_SLO_START / RS_SLO_FILL / RS_SLO_OVERLOAD)"
   } > "$E/eval-manifest.txt"
 }
@@ -290,6 +292,17 @@ rs_env() {
     fi
     plan "serving split: ${RS_SPLIT_WAYS:+--split-ways $RS_SPLIT_WAYS }${RS_MIN_CHUNK:+--min-chunk $RS_MIN_CHUNK }on every node (RS_SPLIT_WAYS / RS_MIN_CHUNK)"
   fi
+  # recsys-amx-2way: RS_MLP avx512 | amx = server --mlp on every node of every system (plain and Megalon builds);
+  # unset / empty / avx512 = not passed (server default avx512 = fp32 AVX-512 forward, every earlier run byte for byte).
+  # amx = bf16 AMX tiles, fp32 accumulate (serving forward only; training stays fp32); both builds must know --mlp
+  case ${RS_MLP:-avx512} in
+    avx512) [ -z "${RS_MLP:-}" ] || plan "serving MLP: avx512 (RS_MLP; --mlp not passed = server default fp32 AVX-512)";;
+    amx) local b; for b in "$RS_PLAIN_BUILD" "$RS_MEG_BUILD"; do
+        grep -qa -- "--mlp avx512|amx" "$b/bin/recsys-server" || die "RS_MLP=amx: $b/bin/recsys-server has no --mlp"
+      done
+      RSENV+=(MLP=amx)
+      plan "serving MLP: --mlp amx on every node (RS_MLP; bf16 AMX tiles, fp32 accumulate; needs amx_tile / amx_bf16 in the guests)";;
+    *) die "bad RS_MLP ($RS_MLP: avx512 | amx)";; esac
   # knee-dense SLO search (user 2026-11-13; main-block.sh STREAM_SLO_START / _FILL / _OVERLOAD, which range-check them
   # again): RS_SLO_START X = loadgen --start X (q/s; unset = 1), RS_SLO_FILL f,.. = --fill f,.. (each in (0, 1)),
   # RS_SLO_OVERLOAD f,.. = --overload-base result --overload f,.. (each in (1, 3]); unset / empty = not passed
@@ -409,7 +422,7 @@ block_dry() {
   # De Stijl build 13: "PLAN: wait assist: " (DS_WAIT_ASSIST set); Megalon one lifetime: "PLAN: one lifetime: "
   # (STREAM_ONE_LIFETIME=1 only); SLO-search tol: "PLAN: slo search: " (STREAM_SLO_TOL set only); recsys-training-auc:
   # "PLAN: v7 row store: " (V7_STORE set only)
-  echo "$out" | grep -E '^BLOCK (PLAN: L1 |PLAN: DAMON |PLAN: pmax |PLAN: auc |PLAN: receiver|PLAN: fixed warmup |PLAN: replica: |PLAN: torn rows: |PLAN: megalon-page: |PLAN: megalon-ideal: |PLAN: windowed publication |PLAN: serving split: |PLAN: server args: |PLAN: wait assist: |PLAN: one lifetime: |PLAN: slo search: |PLAN: v7 row store: |DRY NOTE|NOTE)' | while IFS= read -r l; do plan "block dry: $l"; done
+  echo "$out" | grep -E '^BLOCK (PLAN: L1 |PLAN: DAMON |PLAN: pmax |PLAN: auc |PLAN: receiver|PLAN: fixed warmup |PLAN: replica: |PLAN: torn rows: |PLAN: megalon-page: |PLAN: megalon-ideal: |PLAN: windowed publication |PLAN: serving split: |PLAN: server args: |PLAN: wait assist: |PLAN: one lifetime: |PLAN: slo search: |PLAN: v7 row store: |PLAN: serving mlp: |DRY NOTE|NOTE)' | while IFS= read -r l; do plan "block dry: $l"; done
   out=$(echo "$out" | tail -n 3)
   if [[ "$out" == *"$want"* ]]; then plan "block dry start reached its evidence-dir check: $(echo "$out" | grep -m1 "$want")"
   else die "block dry start did not reach the evidence-dir check: $out"; fi
