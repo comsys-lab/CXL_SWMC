@@ -105,6 +105,14 @@ def main():
         cap = max(a.lag_abs, R * a.lag_max_s)
         ok_lag = lag_e - lag_b <= tol and lag_e <= cap
         why = [] if ok_rate else [f"written {pub} < {a.ratio} x accepted {acc} samples"]
+        if R == 0:  # u0 (main-block.sh header "U0"): valid = node 0 accepted, wrote and published nothing in the window
+            try:  # windowed publication keys exist only with --publish-window-s (absent = no publisher = 0)
+                prow = num(E, "published_rows") - num(B, "published_rows") if "published_rows" in E else 0
+            except KeyError as k:
+                print(f"STREAMCHECK FAIL {a.run}: step {n} stats key {k} missing")
+                return 1
+            ok_rate = acc == 0 and pub == 0 and rw == 0 and prow == 0
+            why = [] if ok_rate else [f"u0: accepted {acc} samples, published_seq +{pub}, rows_written +{rw}, published_rows +{prow} (want 0)"]
         if lag_e - lag_b > tol:
             why.append(f"backlog grew {lag_b} -> {lag_e} samples (> {tol:g})")
         if lag_e > cap:

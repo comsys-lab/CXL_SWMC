@@ -45,6 +45,7 @@ unset RS_PUBLISH_WINDOW_S RS_PUBLISH_WARMUP RS_PUBLISH_AFTER_S RS_PUBLISH_DRAM_R
 unset RS_CHUNK_PAIRS CHUNK_PAIRS   # serving split (rs_env -> main-block.sh CHUNK_PAIRS), only from the conf
 unset RS_SPLIT_WAYS SPLIT_WAYS RS_MIN_CHUNK MIN_CHUNK   # 2-way split (rs_env -> main-block.sh SPLIT_WAYS / MIN_CHUNK), only from the conf
 unset RS_MLP MLP   # serving MLP kind (rs_env -> main-block.sh MLP -> server --mlp), only from the conf
+unset RS_U0_QWIN_SAMPLES STREAM_U0_QWIN_SAMPLES   # u0 query window (rs_env -> main-block.sh header "U0"), only from the conf
 unset RS_SLO_START STREAM_SLO_START RS_SLO_FILL STREAM_SLO_FILL RS_SLO_OVERLOAD STREAM_SLO_OVERLOAD   # knee-dense SLO search (rs_env), only from the conf
 unset RS_SLO_TOL STREAM_SLO_TOL   # SLO-search loadgen --tol (rs_env -> main-block.sh STREAM_SLO_TOL), only from the conf
 unset RS_DRAIN_FULL_S STREAM_DRAIN_FULL_S   # SLO-search loadgen --drain-full-s (rs_env -> STREAM_DRAIN_FULL_S), only from the conf
@@ -303,6 +304,15 @@ rs_env() {
       RSENV+=(MLP=amx)
       plan "serving MLP: --mlp amx on every node (RS_MLP; bf16 AMX tiles, fp32 accumulate; needs amx_tile / amx_bf16 in the guests)";;
     *) die "bad RS_MLP ($RS_MLP: avx512 | amx)";; esac
+  # recsys-amx-2way u0 (widening 2026-11-17): RS_POINTS entry 0 = no update samples (main-block.sh header "U0");
+  # RS_U0_QWIN_SAMPLES N = the prequential query window in samples at u0 (required with a 0 entry, refused without)
+  if [[ " ${RS_POINTS:-} " == *" 0 "* ]]; then
+    [ "${RS_V7:-0}" = 1 ] || die "RS_POINTS 0 (u0) needs RS_V7=1"
+    [[ ${RS_U0_QWIN_SAMPLES:-} =~ ^[1-9][0-9]*$ ]] || die "RS_POINTS 0 (u0) needs RS_U0_QWIN_SAMPLES (query window in samples, >= 1)"
+    RSENV+=(STREAM_U0_QWIN_SAMPLES=$RS_U0_QWIN_SAMPLES)
+    plan "u0: no update samples (loadgen --fixed update=0), prequential query window $RS_U0_QWIN_SAMPLES samples from trace position 0 (RS_U0_QWIN_SAMPLES); zero row writes checked per step and per lifetime"
+  elif [ -n "${RS_U0_QWIN_SAMPLES:-}" ]; then die "RS_U0_QWIN_SAMPLES without an RS_POINTS entry 0"
+  fi
   # knee-dense SLO search (user 2026-11-13; main-block.sh STREAM_SLO_START / _FILL / _OVERLOAD, which range-check them
   # again): RS_SLO_START X = loadgen --start X (q/s; unset = 1), RS_SLO_FILL f,.. = --fill f,.. (each in (0, 1)),
   # RS_SLO_OVERLOAD f,.. = --overload-base result --overload f,.. (each in (1, 3]); unset / empty = not passed
@@ -341,7 +351,7 @@ rs_env() {
     [ "${RS_V7:-0}" = 1 ] || die "RS_AUC_Q needs RS_V7=1"
     local m
     for m in $RS_AUC_Q; do
-      [[ $m =~ ^[1-9][0-9]*=[0-9]+(\.[0-9]+)?$ ]] || die "bad RS_AUC_Q entry $m (<rate>=<query/s>)"
+      [[ $m =~ ^(0|[1-9][0-9]*)=[0-9]+(\.[0-9]+)?$ ]] || die "bad RS_AUC_Q entry $m (<rate>=<query/s>)"
       [[ " $RS_POINTS " == *" ${m%%=*} "* ]] || die "RS_AUC_Q rate ${m%%=*} not in RS_POINTS"
     done
     [[ ${RS_AUC_S:-300} =~ ^[1-9][0-9]*$ && ${RS_AUC_SETTLE_S:-30} =~ ^[1-9][0-9]*$ && ${RS_AUC_ONLY:-0} =~ ^[01]$ ]] \
@@ -356,7 +366,7 @@ rs_env() {
     [ -n "${RS_AUC_Q:-}" ] || die "RS_AUC2_Q needs RS_AUC_Q"
     local m2
     for m2 in $RS_AUC2_Q; do
-      [[ $m2 =~ ^[1-9][0-9]*=[0-9]+(\.[0-9]+)?(,[0-9]+(\.[0-9]+)?)*$ ]] || die "bad RS_AUC2_Q entry $m2 (<rate>=<q/s>,<q/s>,..)"
+      [[ $m2 =~ ^(0|[1-9][0-9]*)=[0-9]+(\.[0-9]+)?(,[0-9]+(\.[0-9]+)?)*$ ]] || die "bad RS_AUC2_Q entry $m2 (<rate>=<q/s>,<q/s>,..)"
       [[ " $RS_AUC_Q " == *" ${m2%%=*}="* ]] || die "RS_AUC2_Q rate ${m2%%=*} has no RS_AUC_Q entry"
     done
     [[ ${RS_AUC2_S:-120} =~ ^[1-9][0-9]*$ ]] || die "bad RS_AUC2_S"
@@ -421,8 +431,8 @@ block_dry() {
   # recsys-serving-split: main-block.sh "PLAN: serving split: " (CHUNK_PAIRS set) and "PLAN: server args: " (BLOCK=stream);
   # De Stijl build 13: "PLAN: wait assist: " (DS_WAIT_ASSIST set); Megalon one lifetime: "PLAN: one lifetime: "
   # (STREAM_ONE_LIFETIME=1 only); SLO-search tol: "PLAN: slo search: " (STREAM_SLO_TOL set only); recsys-training-auc:
-  # "PLAN: v7 row store: " (V7_STORE set only)
-  echo "$out" | grep -E '^BLOCK (PLAN: L1 |PLAN: DAMON |PLAN: pmax |PLAN: auc |PLAN: receiver|PLAN: fixed warmup |PLAN: replica: |PLAN: torn rows: |PLAN: megalon-page: |PLAN: megalon-ideal: |PLAN: windowed publication |PLAN: serving split: |PLAN: server args: |PLAN: wait assist: |PLAN: one lifetime: |PLAN: slo search: |PLAN: v7 row store: |PLAN: serving mlp: |DRY NOTE|NOTE)' | while IFS= read -r l; do plan "block dry: $l"; done
+  # "PLAN: v7 row store: " (V7_STORE set only); recsys-amx-2way u0: "PLAN: u0: " (a STREAM_RATES entry 0 only)
+  echo "$out" | grep -E '^BLOCK (PLAN: L1 |PLAN: DAMON |PLAN: pmax |PLAN: auc |PLAN: receiver|PLAN: fixed warmup |PLAN: replica: |PLAN: torn rows: |PLAN: megalon-page: |PLAN: megalon-ideal: |PLAN: windowed publication |PLAN: serving split: |PLAN: server args: |PLAN: wait assist: |PLAN: one lifetime: |PLAN: slo search: |PLAN: v7 row store: |PLAN: serving mlp: |PLAN: u0: |DRY NOTE|NOTE)' | while IFS= read -r l; do plan "block dry: $l"; done
   out=$(echo "$out" | tail -n 3)
   if [[ "$out" == *"$want"* ]]; then plan "block dry start reached its evidence-dir check: $(echo "$out" | grep -m1 "$want")"
   else die "block dry start did not reach the evidence-dir check: $out"; fi

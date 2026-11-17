@@ -153,6 +153,8 @@
 #   rates. After the last rate: life_stop of <E>/mg-u<r1> (node logs / final checks there, for the whole lifetime;
 #   torn_rows.py block counts a continuation dir by its measurements). A stop in a later rate ends the block as a
 #   failed lifetime does (the finish trap stops the servers); earlier rates' rows and part dirs stay.
+# U0 (recsys-amx-2way widening 2026-11-17): STREAM_RATES entry 0 = serving with no update samples, see "---- U0" below
+#   (STREAM_U0_QWIN_SAMPLES, idle pubtrain, zero-row-write checks); no 0 entry = every earlier run unchanged.
 set -uo pipefail
 E=${1:?evidence dir}
 P=/home/comsys/sungsu/destijl-control X=$(cd "$(dirname "$0")" && pwd)
@@ -190,7 +192,9 @@ if [ $BLOCK = h1 ]; then  # H1-HOOK v2 inputs (see the header)
 elif [ $BLOCK = stream ]; then  # RecSys streaming block (header "BLOCK=stream")
   [ -z "${EKKO:-}" ] && [ -z "${RS_T_MS:-}" ] || { echo "SEQUENCE STOP: BLOCK=stream takes STREAM_RATES, not EKKO / RS_T_MS"; exit 2; }
   : "${STREAM_RATES:?}"
-  for r in $STREAM_RATES; do [[ $r =~ ^[1-9][0-9]*$ ]] && [ $((r % 50)) = 0 ] && [ $r -le 2000 ] || { echo "SEQUENCE STOP: STREAM_RATES entry $r is not a multiple of 50 in [50, 2000] samples/s"; exit 2; }; done
+  for r in $STREAM_RATES; do
+    [ "$r" = 0 ] && continue   # u0 (header "U0"): its own checks after the v7 keys
+    [[ $r =~ ^[1-9][0-9]*$ ]] && [ $((r % 50)) = 0 ] && [ $r -le 2000 ] || { echo "SEQUENCE STOP: STREAM_RATES entry $r is not a multiple of 50 in [50, 2000] samples/s"; exit 2; }; done
   [ -d "${PRETOUCH_DIR:-}" ] || { echo "SEQUENCE STOP: BLOCK=stream needs PRETOUCH_DIR"; exit 2; }
   if [ -z "${EVAL_RUN:-}" ]; then
     case " ${SYSTEMS:-hw pop} " in *" mgoff "*|*" mgrow "*) echo "SEQUENCE STOP: BLOCK=stream systems are hw, pop, mg"; exit 2;; esac
@@ -217,14 +221,14 @@ elif [ $BLOCK = stream ]; then  # RecSys streaming block (header "BLOCK=stream")
     [ "${STREAM_PMAX:-0}" = 0 ] || [ -f "$X/../eval/pmax_decide.py" ] || { echo "SEQUENCE STOP: missing experiments/eval/pmax_decide.py"; exit 2; }
     # run-2 fixed-rate AUC lifetimes (header "STREAM_AUC")
     for m in ${STREAM_AUC:-}; do
-      [[ $m =~ ^[1-9][0-9]*=[0-9]+(\.[0-9]+)?$ ]] && [[ " $STREAM_RATES " == *" ${m%%=*} "* ]] || { echo "SEQUENCE STOP: bad STREAM_AUC entry $m (<rate in STREAM_RATES>=<query/s>)"; exit 2; }
+      [[ $m =~ ^(0|[1-9][0-9]*)=[0-9]+(\.[0-9]+)?$ ]] && [[ " $STREAM_RATES " == *" ${m%%=*} "* ]] || { echo "SEQUENCE STOP: bad STREAM_AUC entry $m (<rate in STREAM_RATES>=<query/s>)"; exit 2; }
     done
     [[ ${STREAM_AUC_S:-300} =~ ^[1-9][0-9]*$ && ${STREAM_AUC_SETTLE_S:-30} =~ ^[1-9][0-9]*$ && ${STREAM_AUC_ONLY:-0} =~ ^[01]$ ]] \
       || { echo "SEQUENCE STOP: bad STREAM_AUC_S / STREAM_AUC_SETTLE_S / STREAM_AUC_ONLY"; exit 2; }
     [ -n "${STREAM_AUC:-}" ] || [ "${STREAM_AUC_ONLY:-0}" = 0 ] || { echo "SEQUENCE STOP: STREAM_AUC_ONLY=1 without STREAM_AUC"; exit 2; }
     # extra fixed-rate parts in the AUC lifetimes (header "STREAM_AUC2"); unset = none
     for m in ${STREAM_AUC2:-}; do
-      [[ $m =~ ^[1-9][0-9]*=[0-9]+(\.[0-9]+)?(,[0-9]+(\.[0-9]+)?)*$ ]] && [[ " ${STREAM_AUC:-} " == *" ${m%%=*}="* ]] \
+      [[ $m =~ ^(0|[1-9][0-9]*)=[0-9]+(\.[0-9]+)?(,[0-9]+(\.[0-9]+)?)*$ ]] && [[ " ${STREAM_AUC:-} " == *" ${m%%=*}="* ]] \
         || { echo "SEQUENCE STOP: bad STREAM_AUC2 entry $m (<rate with a STREAM_AUC entry>=<q/s>,<q/s>,..)"; exit 2; }
     done
     [[ ${STREAM_AUC2_S:-120} =~ ^[1-9][0-9]*$ ]] || { echo "SEQUENCE STOP: bad STREAM_AUC2_S"; exit 2; }
@@ -496,6 +500,25 @@ if [ "$PUBW" != 0 ]; then
   echo "BLOCK PLAN: windowed publication W=$PUBW s (dram rows ${PUBLISH_DRAM_ROWS:-default}); warmup=$PUBWU: part pubtrain = updates only $((PUBW + PUBSL)) s, then publish_started=1, SLO search >= $PUBAFT s after publishing started"
 elif [ -n "${PUBLISH_DRAM_ROWS:-}" ]; then echo "SEQUENCE STOP: PUBLISH_DRAM_ROWS without PUBLISH_WINDOW_S"; exit 2
 fi
+# ---- U0 (recsys-amx-2way widening 2026-11-17, "u0로 hw, pop, ds 측정해봐"): STREAM_RATES entry 0 = serving with NO
+# update samples: same servers and args (train mode, windowed publication W, split, mlp), loadgen --fixed update=0 (the
+# loadgen never schedules a stream of rate 0). Prequential queries need a window size that does not come from the rate:
+# STREAM_U0_QWIN_SAMPLES N (required with a 0 entry; --opt query_window_samples=N instead of update_rate; the update
+# position stays at seq_base 0, so queries draw from trace positions [0, N)). The server's window 0 starts at the first
+# update sample, so at u0 the publisher never starts: part pubtrain is replaced by an idle wait of the same length
+# (W + PUBLISH_TRAIN_SLACK_S; no loadgen: a step with every rate 0 ends at once) and the PUBLISH_AFTER_S wait is skipped.
+# Zero row writes: stream_check.py rates a step with update offered 0 valid only if node 0 accepted, wrote and
+# published nothing (update_accepted_seq, published_seq, rows_written, published_rows deltas 0), and life_stop checks
+# node 0's final counters samples=0 rows_written=0 published_rows=0 (u0-check-<name>.txt; else stop). Unset / no 0
+# entry = nothing here is used (every earlier run unchanged). Not with STREAM_ONE_LIFETIME or STREAM_PMAX.
+U0QW=${STREAM_U0_QWIN_SAMPLES:-} U0=0
+if [[ " ${STREAM_RATES:-} " == *" 0 "* ]]; then
+  [ $BLOCK = stream ] && [ -n "${EVAL_RUN:-}" ] && [ "$V7" = 1 ] || { echo "SEQUENCE STOP: STREAM_RATES 0 (u0) needs BLOCK=stream, EVAL_RUN and V7=1"; exit 2; }
+  [[ $U0QW =~ ^[1-9][0-9]*$ ]] || { echo "SEQUENCE STOP: STREAM_RATES 0 (u0) needs STREAM_U0_QWIN_SAMPLES (query window in samples, >= 1; got '$U0QW')"; exit 2; }
+  [ "${STREAM_ONE_LIFETIME:-0}" = 0 ] && [ "${STREAM_PMAX:-0}" = 0 ] || { echo "SEQUENCE STOP: STREAM_RATES 0 (u0) takes no STREAM_ONE_LIFETIME / STREAM_PMAX"; exit 2; }
+  echo "BLOCK PLAN: u0: no update samples (loadgen --fixed update=0), prequential query window $U0QW samples from trace position 0 (STREAM_U0_QWIN_SAMPLES); $([ "$PUBW" != 0 ] && [ "$PUBWU" = 1 ] && echo "pubtrain = idle wait $((PUBW + PUBSL)) s (publisher never starts), no PUBLISH_AFTER_S wait; ")zero row writes checked per step (stream_check.py) and per lifetime (node 0 samples=0 rows_written=0 published_rows=0)"
+elif [ -n "$U0QW" ]; then echo "SEQUENCE STOP: STREAM_U0_QWIN_SAMPLES without a STREAM_RATES entry 0"; exit 2
+fi
 # ---- one mg lifetime for all rates (header "STREAM_ONE_LIFETIME"); 0 / unset = nothing below is used
 ONEL=${STREAM_ONE_LIFETIME:-0} OLSET=${STREAM_SETTLE_S:-} OL_STALE= OL_N=0 OL_S0= OL_NAME0= OL_T0=0 OL_DIRS=
 case $ONEL in
@@ -546,6 +569,10 @@ case ${MLP:-} in
 pub_train() {  # every lifetime (life_start, BLOCK=stream): first window = training only (no queries, no publish)
   [ "$PUBW" != 0 ] && [ "$PUBWU" = 1 ] || return 0
   local rc ps
+  if [ "$U0" = 1 ]; then  # u0 (header "U0"): no update sample, so no window and no loadgen part; same wall time idle
+    echo "$(date -Is) $NAME: u0: idle $((PUBW + PUBSL)) s in place of part pubtrain (no update samples: the publisher does not start)"
+    sleep $((PUBW + PUBSL)); return 0
+  fi
   measure "$LS" pubtrain "${LGC[@]}" --opt seed=$((SEED + 101)) --seed $((SEED + 101)) --mode fixed --rates 0 \
     --warmup-s 0 --step-warmup-s 0 --step-measure-s $((PUBW + PUBSL)) --drain-s 2
   rc=$?; [ $rc = 0 ] || stop "$NAME pubtrain rc $rc"
@@ -555,6 +582,7 @@ pub_train() {  # every lifetime (life_start, BLOCK=stream): first window = train
 }
 pub_after() {  # <part dir with post-t0.txt>: sleep until PUBLISH_AFTER_S have passed since publishing started
   [ "$PUBW" != 0 ] && [ "$PUBWU" = 1 ] || return 0
+  [ "$U0" = 0 ] || return 0   # u0: publishing never starts (no update sample)
   local m s since
   m=$(sed -n 's/^stats_mono_ns=//p' "$1/post-t0.txt" | tail -1); s=$(sed -n 's/^publish_start_mono_ns=//p' "$1/post-t0.txt" | tail -1)
   [[ $m =~ ^[0-9]+$ && $s =~ ^[1-9][0-9]*$ ]] || stop "$NAME: node 0 stats_mono_ns / publish_start_mono_ns missing in $1/post-t0.txt"
@@ -570,6 +598,22 @@ v7_lgc() {  # <rate>: v7 loadgen options (appended to LGC; later --opt values wi
   # both from the caller (exit 2, "seq_base/wrap are set by session.sh"; same fix as 4447b2f53 for the v6 LGC)
   LGC=(--opt samples=$V7_SAMPLES --opt queries=$V7_SAMPLES --opt quantiles=$D/dist_quantile.txt --fixed update=$1 --mix query=1
        --x-stream query --opt prequential=1 --opt update_rate=$1 --opt query_window_s=$V7_W_S)
+  # u0 (header "U0"): window size from STREAM_U0_QWIN_SAMPLES (query_window_s x 0 = 0 samples is refused by the plugin)
+  [ "$1" != 0 ] || LGC=(--opt samples=$V7_SAMPLES --opt queries=$V7_SAMPLES --opt quantiles=$D/dist_quantile.txt --fixed update=0 --mix query=1
+       --x-stream query --opt prequential=1 --opt query_window_samples=$U0QW)
+}
+u0_check() {  # u0 lifetime end (life_stop): node 0 accepted / wrote / published no row over the whole lifetime
+  [ "$U0" = 1 ] || return 0
+  local f=$E/u0-check-$NAME.txt k v bad=
+  for k in samples rows_written published_rows; do
+    v=$(sed -n "s/^$k=//p" "$LS/node0.log" 2>/dev/null | tail -1)
+    echo "node0 $k=${v:-missing}" >> "$f"
+    [ "$v" = 0 ] || bad+=" $k=${v:-missing}"
+  done
+  v=$(sed -n 's/^rows_written=//p' "$LS/node1.log" 2>/dev/null | tail -1); echo "node1 rows_written=${v:-missing}" >> "$f"
+  [ "$v" = 0 ] || bad+=" node1.rows_written=${v:-missing}"
+  [ -z "$bad" ] || stop "$NAME: u0 lifetime wrote rows:$bad ($f)"
+  echo "U0 CHECK PASS $NAME: node 0 samples=0 rows_written=0 published_rows=0, node 1 rows_written=0" | tee -a "$f"
 }
 # <lifetime name> <node>: guest path, unique per evidence dir: the server creates it exclusively (FATAL "cannot create
 # (exists?)"), and basename E alone ("block", "probe") repeats over retries (v<N>) and runs (rs-h1 v4: probe-mg-u50-fix-n0)
@@ -975,6 +1019,7 @@ life_stop() {  # <sys>: session stop, final checks, page MSI teardown (pop)
   local s=$1 S=$LS
   bash $X/session.sh stop "$S" > "$S.stop.out" 2>&1 || { tail -5 "$S.stop.out"; stop "$s session stop / final checks"; }
   tail -1 "$S.stop.out"
+  u0_check   # u0 only (header "U0")
   if [ $s = ds ] && [ "$DST" != 0 ]; then local k
     for k in 0 1; do grep -q "^recsys-server: de stijl staleness T=$DST us on " "$S/node$k.log" || stop "node$k: staleness T=$DST not applied"; done
   fi
@@ -1689,6 +1734,7 @@ if [ $BLOCK = stream ]; then  # RecSys streaming driver (header "BLOCK=stream")
     LGC=(--opt samples=$D/$UPD_FILE --opt queries=$D/$QRY_FILE
          --opt quantiles=$D/dist_quantile.txt --fixed update=$r --mix query=1 --x-stream query)
     v7_lgc $r
+    U0=0; [ "$r" != 0 ] || U0=1   # header "U0"
     if [ "$ONEL" = 1 ]; then ol_rate $r; continue; fi   # STREAM_ONE_LIFETIME=1 only
     if [ -n "${EVAL_RUN:-}" ]; then eval_stream_rate $r; stream_auc_rate $r; continue; fi
     for s in $(h1shuffle recsys-stream-$r ${SYSTEMS:-hw pop}); do

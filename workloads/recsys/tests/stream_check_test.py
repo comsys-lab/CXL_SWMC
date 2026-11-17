@@ -78,5 +78,10 @@ run("batch-mode server (no update_mode key)", base, 5, "FAIL", mode=None)
 b = [dict(s) for s in base]; b[2] = step(2, "ramp", 5, True, lag=(2500, 2510))
 run("backlog flat but 2510 > 5 s of updates", b, 5, "NOTE")
 run("no SLO result", base, None, "NOTE")
+# u0 (main-block.sh header "U0"): update offered 0; valid only with zero accepted / published / written rows
+u0 = [step(s["n"], s["phase"], s["x"], s["pass"], R=0) for s in base]
+run("u0: no update accepted or written", u0, 5, "PASS")
+b = [dict(s) for s in u0]; b[5]["e"] = (b[5]["e"][0], 1005, 1005, 0)
+run("u0: 5 samples accepted and written at the result", b, 5, "NOTE")
 print("STREAM CHECK TEST " + ("FAIL (%d)" % fails if fails else "PASS"))
 sys.exit(1 if fails else 0)
