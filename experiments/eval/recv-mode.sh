@@ -18,6 +18,10 @@
 # readback (unset = the readback must show the default 200). watch_us 1..1000000; s_max_us s_min_us (50, the module
 # default the harness never changes) ..1000000. recv_wsm_check validates both; a pop / ds lifetime whose mode is not
 # adaptive refuses them (the blocks stop; recv_apply refuses too), a block without pop / ds lifetimes only notes them.
+# RECV_SPIN_US / RECV_SMIN_US (optional integers, unset = module default 50 / 50 = every run before 2026-11-19; adaptive
+# only; recsys-amx-2way receiver variant): written to spin_us and s_min_us after s_max_us (so s_min_us never exceeds
+# s_max_us between the writes when both grow) and checked in the readback (unset = 50 / 50). spin_us 0..1000000,
+# s_min_us 1..1000000; s_max_us (RECV_S_MAX_US, default 200) must be >= s_min_us. Same rules as the two keys above.
 # Guest readback (recv-readback.sh via ssh bash -s): one line "recv_mode=.. ring_coherent=.. ipoll=.. fault_poll=..
 # spin_us=.. watch_us=.. s_min_us=.. s_max_us=.. idle_spin_us=.. idle_sleep_us=.. srcversion=.. ipoll_threads=..
 # ipoll_run_ns=.. recv_run_ns=.." (absent for a parameter the module lacks).
@@ -103,18 +107,21 @@ recv_run2_guard() {
 # 2 = stop in a real run, note in a dry one). No mode given (hw-only block): 0.
 RECV_S_MIN_US=50   # module default s_min_us (the readback checks it); s_max_us below it is refused
 recv_wsm_check() {
-  local w=${RECV_WATCH_US:-} x=${RECV_S_MAX_US:-} m
-  [ -n "$w$x" ] || return 0
+  local w=${RECV_WATCH_US:-} x=${RECV_S_MAX_US:-} sp=${RECV_SPIN_US:-} sn=${RECV_SMIN_US:-} m
+  [ -n "$w$x$sp$sn" ] || return 0
   [ -z "$w" ] || { [[ $w =~ ^[1-9][0-9]{0,6}$ ]] && [ "$w" -le 1000000 ]; } || { echo "bad RECV_WATCH_US '$w' (integer us, 1..1000000)"; return 1; }
-  [ -z "$x" ] || { [[ $x =~ ^[1-9][0-9]{0,6}$ ]] && [ "$x" -le 1000000 ]; } || { echo "bad RECV_S_MAX_US '$x' (integer us, $RECV_S_MIN_US..1000000)"; return 1; }
-  [ -z "$x" ] || [ "$x" -ge $RECV_S_MIN_US ] || { echo "RECV_S_MAX_US=$x < s_min_us $RECV_S_MIN_US (the sleep tier needs s_max_us >= s_min_us)"; return 1; }
+  [ -z "$sp" ] || { [[ $sp =~ ^(0|[1-9][0-9]{0,6})$ ]] && [ "$sp" -le 1000000 ]; } || { echo "bad RECV_SPIN_US '$sp' (integer us, 0..1000000)"; return 1; }
+  [ -z "$sn" ] || { [[ $sn =~ ^[1-9][0-9]{0,6}$ ]] && [ "$sn" -le 1000000 ]; } || { echo "bad RECV_SMIN_US '$sn' (integer us, 1..1000000)"; return 1; }
+  [ -z "$x" ] || { [[ $x =~ ^[1-9][0-9]{0,6}$ ]] && [ "$x" -le 1000000 ]; } || { echo "bad RECV_S_MAX_US '$x' (integer us, ${sn:-$RECV_S_MIN_US}..1000000)"; return 1; }
+  [ -z "$x" ] || [ "$x" -ge "${sn:-$RECV_S_MIN_US}" ] || { echo "RECV_S_MAX_US=$x < s_min_us ${sn:-$RECV_S_MIN_US} (the sleep tier needs s_max_us >= s_min_us)"; return 1; }
+  [ -z "$sn" ] || [ -n "$x" ] || [ "$sn" -le 200 ] || { echo "RECV_SMIN_US=$sn > the default s_max_us 200 (set RECV_S_MAX_US >= $sn)"; return 1; }
   for m in "$@"; do
-    [ "$m" = adaptive ] || { echo "RECV_WATCH_US / RECV_S_MAX_US need recv_mode=adaptive (a pop / ds lifetime runs recv_mode=$m)"; return 2; }
+    [ "$m" = adaptive ] || { echo "RECV_WATCH_US / RECV_S_MAX_US / RECV_SPIN_US / RECV_SMIN_US need recv_mode=adaptive (a pop / ds lifetime runs recv_mode=$m)"; return 2; }
   done
   return 0
 }
-recv_wsm_desc() {  # plan / manifest text of the two keys: "watch_us=<v|default> s_max_us=<v|default>"
-  echo "watch_us=${RECV_WATCH_US:-default} s_max_us=${RECV_S_MAX_US:-default}"
+recv_wsm_desc() {  # plan / manifest text: "watch_us=<v|default> s_max_us=<v|default>" (+ " spin_us=<v> s_min_us=<v>" when set)
+  echo "watch_us=${RECV_WATCH_US:-default} s_max_us=${RECV_S_MAX_US:-default}${RECV_SPIN_US:+ spin_us=$RECV_SPIN_US}${RECV_SMIN_US:+ s_min_us=$RECV_SMIN_US}"
 }
 
 recv_pop_srcversion() {  # srcversion of POP_ADAPT_KO (- when unset)
@@ -122,9 +129,10 @@ recv_pop_srcversion() {  # srcversion of POP_ADAPT_KO (- when unset)
 }
 
 # recv_rb_check <pop|ds> <mode> <readback line> <srcversion | -> <ipoll | -> <fault_poll | -> [<watch_us | ->
-# [<s_max_us | ->]]: 0 = OK, else prints why (watch_us / s_max_us: - or absent = the module default 200)
+# [<s_max_us | -> [<spin_us | -> [<s_min_us | ->]]]]: 0 = OK, else prints why (watch_us / s_max_us: - or absent = the
+# module default 200; spin_us / s_min_us: - or absent = the module default 50)
 recv_rb_check() {
-  local s=$1 m=$2 l=" $3 " sv=$4 ip=$5 fp=$6 ww=${7:--} wx=${8:--} v
+  local s=$1 m=$2 l=" $3 " sv=$4 ip=$5 fp=$6 ww=${7:--} wx=${8:--} wsp=${9:--} wsn=${10:--} v
   rbv() { v=$(echo "$l" | sed -n "s/.* $1=\([^ ]*\) .*/\1/p"); }
   rbv recv_mode; [ "$v" = "$m" ] || { echo "recv_mode=$v (want $m)"; return 1; }
   if [ "$m" = sleep ] && [ "${REQUIRE_SLEEP2050:-0}" = 1 ]; then
@@ -143,7 +151,8 @@ recv_rb_check() {
   # one adaptive configuration for pop and ds (verifier M4): busy tier 50 / 200 us, sleep tier 50..200 us by default;
   # watch_us / s_max_us = RECV_WATCH_US / RECV_S_MAX_US when the conf sets them (same conf keys for pop and ds)
   local p w
-  for p in spin_us=50 watch_us=${ww/#-/200} s_min_us=$RECV_S_MIN_US s_max_us=${wx/#-/200}; do
+  # spin_us / s_min_us = RECV_SPIN_US / RECV_SMIN_US when the conf sets them (default 50 / 50 as before)
+  for p in spin_us=${wsp/#-/50} watch_us=${ww/#-/200} s_min_us=${wsn/#-/$RECV_S_MIN_US} s_max_us=${wx/#-/200}; do
     rbv ${p%%=*}; w=${p#*=}; [ "$v" = "$w" ] || { echo "${p%%=*}=$v (want $w: pop and ds use the same adaptive parameters)"; return 1; }
   done
   rbv fault_poll; [ "$fp" = - ] || [ "$v" = absent ] || [ "$v" = "$fp" ] || { echo "fault_poll=$v (want $fp)"; return 1; }
@@ -164,7 +173,8 @@ RECV_RB_DEFAULT=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/recv-readback.sh
 # Popcorn srcversion); Popcorn also instr_enabled=1, De Stijl protocol=destijl and every DSRX parameter applied. The
 # first failure calls the stop function; RECV_WATCH_US / RECV_S_MAX_US with a non-adaptive mode stop before any write.
 recv_apply() {
-  local s=$1 ip rb i p w x why fp=- ipo=${IPOLL:-} st=${RECV_STOP:-stop} bad= wu=${RECV_WATCH_US:-} su=${RECV_S_MAX_US:-}
+  local s=$1 ip rb i p w x why fp=- ipo=${IPOLL:-} st=${RECV_STOP:-stop} bad= wu=${RECV_WATCH_US:-} su=${RECV_S_MAX_US:-} \
+    ssp=${RECV_SPIN_US:-} ssn=${RECV_SMIN_US:-}
   [ $s = ds ] && fp=${DSFP:-0}
   [ $s = pop ] && fp=0
   why=$(recv_wsm_check "$3") || { $st "$2: $why"; return 1; }
@@ -173,6 +183,8 @@ recv_apply() {
     [ -z "$ipo" ] || [ "$3" != adaptive ] || w+=" && echo $ipo > /sys/module/cxl_shm/parameters/ipoll"
     [ -z "$wu" ] || [ "$3" != adaptive ] || w+=" && echo $wu > /sys/module/cxl_shm/parameters/watch_us"
     [ -z "$su" ] || [ "$3" != adaptive ] || w+=" && echo $su > /sys/module/cxl_shm/parameters/s_max_us"
+    [ -z "$ssp" ] || [ "$3" != adaptive ] || w+=" && echo $ssp > /sys/module/cxl_shm/parameters/spin_us"
+    [ -z "$ssn" ] || [ "$3" != adaptive ] || w+=" && echo $ssn > /sys/module/cxl_shm/parameters/s_min_us"
     $SSH comsys@$ip "sudo -n sh -c '$w'" < /dev/null || { $st "$2: recv_mode write on $ip"; return 1; }
     rb=$($SSH comsys@$ip "bash -s" < "$RECV_RB_DEFAULT" 2>/dev/null)
     i=$($SSH comsys@$ip "cat /sys/kernel/swmc/instr/enabled 2>/dev/null || echo absent" < /dev/null)
@@ -185,7 +197,7 @@ recv_apply() {
       echo "$ip $rb instr_enabled=$i" >> "$E/recv-mode-$2.txt"
       [ "$i" = 1 ] || bad="instr on $ip ($i)"
     fi
-    why=$(recv_rb_check $s "$3" "$rb" "$([ $s = pop ] && echo "${POPSV:--}" || echo -)" "${ipo:--}" "$fp" "${wu:--}" "${su:--}") || bad="receiver on $ip: $why"
+    why=$(recv_rb_check $s "$3" "$rb" "$([ $s = pop ] && echo "${POPSV:--}" || echo -)" "${ipo:--}" "$fp" "${wu:--}" "${su:--}" "${ssp:--}" "${ssn:--}") || bad="receiver on $ip: $why"
     [ -z "$bad" ] || { $st "$2: $bad"; return 1; }
   done
 }

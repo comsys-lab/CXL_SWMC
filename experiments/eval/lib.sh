@@ -31,11 +31,14 @@ TREE=$(cd "$EVD/../.." && pwd)
 #   RECV_WATCH_US    adaptive watch_us (us, 1..1000000), written after the enable with ipoll; unset = default 200
 #   RECV_S_MAX_US    adaptive s_max_us (us, s_min_us 50..1000000), written after the enable; unset = default 200
 #                    (both: recv-mode.sh recv_wsm_check; adaptive pop / ds lifetimes only, refused for other modes)
+#   RECV_SPIN_US     adaptive spin_us (us, 0..1000000), written after s_max_us; unset = default 50 (every earlier run)
+#   RECV_SMIN_US     adaptive s_min_us (us, 1..s_max_us), written after spin_us; unset = default 50 (every earlier run)
+#                    (same rules as RECV_WATCH_US / RECV_S_MAX_US; recsys-amx-2way De Stijl receiver variant 2026-11-19)
 #   (De Stijl fault-entry polling: fault_poll=0|1 in H2N_DS_RECV_EXTRA / RS_DS_RECV_EXTRA; build-9 bundles load 0)
 unset REGISTRY LEVELS_SOURCE LEVELS_REGISTRY RS_PROC_CXL_SHM RUNSETS EVIDENCE_TAG EXPORT_SUFFIX
 #   REQUIRE_SLEEP2050 1 = run-2 receiver guard (recv-mode.sh recv_run2_guard; passed to the blocks: the readback asserts
 #                    recv_mode=sleep idle_spin_us 50 idle_sleep_us 20 for pop and ds)
-unset POP_RECV_MODE POP_ADAPT_KO RECV_IPOLL RECV_WATCH_US RECV_S_MAX_US REQUIRE_SLEEP2050
+unset POP_RECV_MODE POP_ADAPT_KO RECV_IPOLL RECV_WATCH_US RECV_S_MAX_US RECV_SPIN_US RECV_SMIN_US REQUIRE_SLEEP2050
 unset RS_V7 RS_V7_IMAGE RS_V7_DENSE RS_V7_IMAGE_HOST RS_V7_DENSE_HOST RS_V7_LR RS_V7_ACC_INIT RS_V7_TRAIN_BATCH RS_V7_TRAIN_THREADS RS_V7_W_S \
   RS_V7_STALE_SAMPLE RS_V7_STALE_DIR RS_V7_SAMPLES RS_V7_FROZEN RS_V7_STORE   # v7 keys come only from the conf
 unset RS_PMAX RS_PMAX_FROM RS_PMAX_S RS_PMAX_SETTLE_S   # run-2 RecSys pmax step keys (rs_env), only from the conf
@@ -155,10 +158,11 @@ manifest() {  # written into E at the real start
 # POP_C (adaptive: POP_ADAPT_KO). The blocks refuse RECV_WATCH_US / RECV_S_MAX_US for a non-adaptive pop / ds lifetime.
 . "$EVD/recv-mode.sh"
 RECVENV=()
-for _v in POP_RECV_MODE POP_ADAPT_KO RECV_IPOLL RECV_WATCH_US RECV_S_MAX_US REQUIRE_SLEEP2050; do [ -z "${!_v:-}" ] || RECVENV+=("$_v=${!_v}"); done
+for _v in POP_RECV_MODE POP_ADAPT_KO RECV_IPOLL RECV_WATCH_US RECV_S_MAX_US RECV_SPIN_US RECV_SMIN_US REQUIRE_SLEEP2050; do [ -z "${!_v:-}" ] || RECVENV+=("$_v=${!_v}"); done
 [[ ${RECV_IPOLL:-} =~ ^[01]?$ ]] || { echo "RUNSET STOP: bad RECV_IPOLL (${RECV_IPOLL})"; exit 2; }
 _why=$(recv_wsm_check) || { echo "RUNSET STOP: $_why"; exit 2; }
 [ -z "${RECV_WATCH_US:-}${RECV_S_MAX_US:-}" ] || plan "receiver: adaptive $(recv_wsm_desc) (RECV_WATCH_US / RECV_S_MAX_US, written after the enable, pop and ds)"
+[ -z "${RECV_SPIN_US:-}${RECV_SMIN_US:-}" ] || plan "receiver: adaptive spin_us=${RECV_SPIN_US:-default} s_min_us=${RECV_SMIN_US:-default} (RECV_SPIN_US / RECV_SMIN_US, written after s_max_us)"
 # run-2 guard (conf REQUIRE_SLEEP2050=1, earlier REQUIRE_ADAPTIVE=1; recv-mode.sh recv_run2_guard): a real run refuses placeholder receiver pins
 if _why=$(recv_run2_guard); then
   if [ "${REQUIRE_SLEEP2050:-0}" = 1 ]; then plan "run-2 guard: sleep 20/50 receiver for pop and ds, POP_ADAPT_KO set: OK"

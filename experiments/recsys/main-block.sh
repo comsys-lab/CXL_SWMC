@@ -752,10 +752,11 @@ if [ -n "${STREAM_AUC:-}" ]; then  # run-2 fixed-rate AUC plan (shown by lib.sh 
   [ "${STREAM_AUC2_V7POST:-0}" = 0 ] || echo "BLOCK PLAN: auc fix2 parts: v7 post-processing per part (stale logs, v7-steps.csv, rows -> <E>/auc_fix2.csv)"
 fi
 # receiver keys: modes of the pop / ds lifetimes of this block; a non-adaptive one refuses RECV_WATCH_US /
-# RECV_S_MAX_US (dry: BLOCK NOTE, then the evidence-dir check ends the dry start; real: stop below)
+# RECV_S_MAX_US / RECV_SPIN_US / RECV_SMIN_US (dry: BLOCK NOTE, then the evidence-dir check ends the dry start; real:
+# stop below)
 RMODES=; [[ " ${SYSTEMS:-hw pop mg} " != *" pop "* ]] || RMODES+="$PRM"; [[ " ${SYSTEMS:-hw pop mg} " != *" ds "* ]] || RMODES+="${RMODES:+ }$RECV_MODE"
 WSMWHY=
-if [ -n "${RECV_WATCH_US:-}${RECV_S_MAX_US:-}" ]; then
+if [ -n "${RECV_WATCH_US:-}${RECV_S_MAX_US:-}${RECV_SPIN_US:-}${RECV_SMIN_US:-}" ]; then
   # shellcheck disable=SC2086
   WSMWHY=$(recv_wsm_check $RMODES) || echo "BLOCK NOTE: $WSMWHY (a real run stops here)"
   [ -n "$RMODES" ] || echo "BLOCK NOTE: $(recv_wsm_desc) not applied: no pop / ds lifetime in this block"
@@ -1574,7 +1575,7 @@ h1_entry() {  # <name> <sys> <phase> <part> <steps> <lifetime kind>
   printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$1" "$2" "$H1_MIX" "$3" "$H1_N" "${LS#$E/}/$4" "$5" "$6" >> "$E/h1-runs.tsv"
 }
 
-echo "$(date -Is) block $OWNER start (git $(git -C $P/CXL_SWMC rev-parse --short HEAD)) K8=$K8 RECV_MODE=$RECV_MODE POP_RECV_MODE=$PRM POP_ADAPT_KO=${POP_ADAPT_KO:-} POP_SRCVERSION=$POPSV RECV_IPOLL=${IPOLL:-} RECV_WATCH_US=${RECV_WATCH_US:-} RECV_S_MAX_US=${RECV_S_MAX_US:-} MEG_BUILD=$MB VM_PLAIN=$VM_PLAIN VM_MEG=$VM_MEG D=$D SEED=$SEED ROUNDS=$ROUNDS FIXED=$FIXED XT=$XT MG_RPO_OPT='$MG_RPO_OPT' MG_TABLE_N=$MG_TABLE_N MG_ROW_N=$MG_ROW_N V1_OPFAIL_CONTINUE='$V1_OPFAIL_CONTINUE' MG_COH_SAMPLE='$MG_COH_SAMPLE'"
+echo "$(date -Is) block $OWNER start (git $(git -C $P/CXL_SWMC rev-parse --short HEAD)) K8=$K8 RECV_MODE=$RECV_MODE POP_RECV_MODE=$PRM POP_ADAPT_KO=${POP_ADAPT_KO:-} POP_SRCVERSION=$POPSV RECV_IPOLL=${IPOLL:-} RECV_WATCH_US=${RECV_WATCH_US:-} RECV_S_MAX_US=${RECV_S_MAX_US:-}${RECV_SPIN_US:+ RECV_SPIN_US=$RECV_SPIN_US}${RECV_SMIN_US:+ RECV_SMIN_US=$RECV_SMIN_US} MEG_BUILD=$MB VM_PLAIN=$VM_PLAIN VM_MEG=$VM_MEG D=$D SEED=$SEED ROUNDS=$ROUNDS FIXED=$FIXED XT=$XT MG_RPO_OPT='$MG_RPO_OPT' MG_TABLE_N=$MG_TABLE_N MG_ROW_N=$MG_ROW_N V1_OPFAIL_CONTINUE='$V1_OPFAIL_CONTINUE' MG_COH_SAMPLE='$MG_COH_SAMPLE'"
 [ $BLOCK = h1 ] && { bash $PTG "$PRETOUCH_DIR" "$E/pretouch-gate.txt" || stop "pretouch gate at block start"; }
 precheck
 # update rate for the Ekko operating point (Host compute, after the lock check and the input sha256 check in
