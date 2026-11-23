@@ -1,0 +1,322 @@
+From 1546bd7dc470e5799a7662711f78db14b53517a3 Mon Sep 17 00:00:00 2001
+From: Sungsu Ahn <sungsu_ahn@korea.ac.kr>
+Date: Thu, 15 Oct 2026 05:04:05 +0900
+Subject: [PATCH 22/51] fix: lost admit races no longer orphan or double-own
+ coherence records; reclaim never frees an unlocked record
+
+Attempt 12 (G-B v2.12, f1-art64) hung with writer_owner_mismatch > 0: a key's
+record carried another key's BlockId. Three upstream defects:
+
+- CheckPutArrayWmeta(key, cn, NUMA_MEM, -1) (RO admit losing to an existing
+  slot) set the key's wmeta to -1 even when the key was RW: the record was
+  dropped without a free and without the RO switch's deallocation event.
+  Now an RW key is left unchanged (None); only an already-RO key is idempotent.
+- Admit/AdmitWrite treated GCD_SLOT_UPDATE_FAILED ("slot exists") as a failed
+  install and freed the record, although the op had installed it on the RO
+  key. The key then pointed at a free record that the next allocation gave to
+  another key. Now the record is kept (WSeqEnd); only the cache node is freed.
+- artifact64 reclaim: when the RO switch of the victim's BlockId answered a
+  different record, upstream freed that record without holding its lock
+  (stealing a writer's lock or leaking it) and left the victim locked forever.
+  SharedMetadata::FinishReclaim now unlocks the victim and frees the other
+  record only after locking it. rev64/packed4 behaviour is unchanged.
+
+Diag counters reclaim_victim_mismatch and admit_record_installed in DiagSummary.
+Rust test admit_on_existing_slot_never_demotes_and_reports_installed_record.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ lib/globals.cc                            |  4 +-
+ lib/shm_obj_handle.cc                     | 50 ++++++++++++++++-------
+ src/common/diag.h                         |  5 +++
+ src/core/write_meta.cc                    | 23 +++++++++++
+ src/core/write_meta.h                     |  4 ++
+ src/manager/wmeta_manager.cc              | 18 +++-----
+ third-party/nr_rust/ffi/ffi_nr_hashmap.rs |  9 +++-
+ third-party/nr_rust/ffi/port_tests.rs     | 30 ++++++++++++++
+ 8 files changed, 112 insertions(+), 31 deletions(-)
+
+diff --git a/lib/globals.cc b/lib/globals.cc
+index 183e55a..00649cc 100644
+--- a/lib/globals.cc
++++ b/lib/globals.cc
+@@ -141,7 +141,9 @@ std::string DiagSummary() {
+     return "DIAG gets_ro=" + std::to_string(diag::gets_ro_path.load()) + " gets_rw=" + std::to_string(diag::gets_rw_path.load()) +
+            " writer_checks=" + std::to_string(diag::writer_checks.load()) +
+            " writer_stale_entry=" + std::to_string(diag::writer_stale_entry.load()) +
+-           " writer_owner_mismatch=" + std::to_string(diag::writer_owner_mismatch.load());
++           " writer_owner_mismatch=" + std::to_string(diag::writer_owner_mismatch.load()) +
++           " reclaim_victim_mismatch=" + std::to_string(diag::reclaim_victim_mismatch.load()) +
++           " admit_record_installed=" + std::to_string(diag::admit_record_installed.load());
+ }
+ 
+ }  // namespace rackobj
+diff --git a/lib/shm_obj_handle.cc b/lib/shm_obj_handle.cc
+index 4c3b962..f5d3bb0 100644
+--- a/lib/shm_obj_handle.cc
++++ b/lib/shm_obj_handle.cc
+@@ -422,11 +422,9 @@ expected<common::CacheNode *, std::error_code> SharedMemoryObjectHandle<Policy>:
+ #else
+         diag::Rec(diag::kEvReclaim, vic_block_id.GetOffset(), static_cast<int64_t>(diag_victim), new_wmeta_index_optional.has_value() ? static_cast<uint32_t>(*new_wmeta_index_optional + 1) : 0u);
+ #endif
+-        if (new_wmeta_index_optional.has_value()) {
+-            c3po_->Scr_meta()->RecycleWmeta(new_wmeta_index_optional.value());
+-        } else {
+-            cur->WUnlockOnly();
+-        }
++        (void)cur;
++        // the answer stays the next reservation's scan hint, as upstream
++        c3po_->Scr_meta()->FinishReclaim(diag_victim, new_wmeta_index_optional);
+ 
+         cpu_relax();
+     } while (true);
+@@ -489,7 +487,20 @@ expected<common::CacheNode *, std::error_code> SharedMemoryObjectHandle<Policy>:
+                           << shared_cache_node_ << " ,block_id: " << block_id;
+ 
+             /* 10. free list insert cn */
++#ifdef DYN_WMETA
++            // De Stijl port: SLOT_UPDATE_FAILED ("slot exists") means the op found the key's slot taken but RO and
++            // installed OUR record on it (CheckPutArrayWmeta): the record belongs to the key now. Upstream freed it,
++            // leaving the key pointing at a free record that the next allocation hands to another key (two owners;
++            // the key's writers then fail WSeqBegin on FREE and its promotion fails "already RW": livelock).
++            if (error == common::NrGcdError::GCD_SLOT_UPDATE_FAILED && new_wmeta_index_optional.has_value()) {
++                diag::admit_record_installed.fetch_add(1, std::memory_order_relaxed);
++                c3po_->Scr_meta()->GetWmeta(new_wmeta_index_optional.value())->WSeqEnd();
++            } else if (new_wmeta_index_optional.has_value()) {
++                c3po_->Scr_meta()->RecycleWmeta(new_wmeta_index_optional.value(), true);
++            }
++#else
+             c3po_->Scr_meta()->RecycleWmeta(new_wmeta_index_optional.value(), true);
++#endif
+             cache_shrd_ptr_->scr_bitmap_.SetDirty(new_index, false);
+             cache_shrd_ptr_->scr_bitmap_.RecycleCacheNode(new_index);
+             // std::optional<common::GCDEntry> entry_optional = c3po_->Gcd()->Get(block_id, nr_meta);
+@@ -563,11 +574,9 @@ expected<common::CacheNode *, std::error_code> SharedMemoryObjectHandle<Policy>:
+ #else
+             diag::Rec(diag::kEvReclaim, vic_block_id.GetOffset(), static_cast<int64_t>(diag_victim), new_wmeta_index_optional.has_value() ? static_cast<uint32_t>(*new_wmeta_index_optional + 1) : 0u);
+ #endif
+-            if (new_wmeta_index_optional.has_value()) {
+-                c3po_->Scr_meta()->RecycleWmeta(new_wmeta_index_optional.value());
+-            } else {
+-                cur->WUnlockOnly();
+-            }
++            (void)cur;
++            // the answer stays the next reservation's scan hint, as upstream
++            c3po_->Scr_meta()->FinishReclaim(diag_victim, new_wmeta_index_optional);
+ 
+             cpu_relax();
+         } while (true);
+@@ -616,7 +625,20 @@ expected<common::CacheNode *, std::error_code> SharedMemoryObjectHandle<Policy>:
+                           << shared_cache_node_ << " ,block_id: " << block_id;
+ 
+             /* 10. free list insert cn */
++#ifdef DYN_WMETA
++            // De Stijl port: SLOT_UPDATE_FAILED ("slot exists") means the op found the key's slot taken but RO and
++            // installed OUR record on it (CheckPutArrayWmeta): the record belongs to the key now. Upstream freed it,
++            // leaving the key pointing at a free record that the next allocation hands to another key (two owners;
++            // the key's writers then fail WSeqBegin on FREE and its promotion fails "already RW": livelock).
++            if (error == common::NrGcdError::GCD_SLOT_UPDATE_FAILED && new_wmeta_index_optional.has_value()) {
++                diag::admit_record_installed.fetch_add(1, std::memory_order_relaxed);
++                c3po_->Scr_meta()->GetWmeta(new_wmeta_index_optional.value())->WSeqEnd();
++            } else if (new_wmeta_index_optional.has_value()) {
++                c3po_->Scr_meta()->RecycleWmeta(new_wmeta_index_optional.value(), true);
++            }
++#else
+             c3po_->Scr_meta()->RecycleWmeta(new_wmeta_index_optional.value(), true);
++#endif
+             cache_shrd_ptr_->scr_bitmap_.SetDirty(new_index, false);
+             cache_shrd_ptr_->scr_bitmap_.RecycleCacheNode(new_index);
+             new_node_result = unexpected(std::make_error_code(std::errc::resource_unavailable_try_again));
+@@ -670,11 +692,9 @@ std::error_code SharedMemoryObjectHandle<Policy>::SwitchRW(const common::WriteHa
+ #else
+         diag::Rec(diag::kEvReclaim, vic_block_id.GetOffset(), static_cast<int64_t>(diag_victim), new_wmeta_index_optional.has_value() ? static_cast<uint32_t>(*new_wmeta_index_optional + 1) : 0u);
+ #endif
+-        if (new_wmeta_index_optional.has_value()) {
+-            c3po_->Scr_meta()->RecycleWmeta(new_wmeta_index_optional.value());
+-        } else {
+-            cur->WUnlockOnly();
+-        }
++        (void)cur;
++        // the answer stays the next reservation's scan hint, as upstream
++        c3po_->Scr_meta()->FinishReclaim(diag_victim, new_wmeta_index_optional);
+ 
+         cpu_relax();
+     } while (true);
+diff --git a/src/common/diag.h b/src/common/diag.h
+index 2650977..d57e4ce 100644
+--- a/src/common/diag.h
++++ b/src/common/diag.h
+@@ -31,6 +31,11 @@ inline thread_local LastGet last_get;
+ inline std::atomic<uint64_t> writer_checks{0};
+ inline std::atomic<uint64_t> writer_stale_entry{0};
+ inline std::atomic<uint64_t> writer_owner_mismatch{0};
++// Counted whether or not MEGALON_DIAG is set (rare paths, see attempt 12 in reports/M2-first-runs.md):
++//   reclaim_victim_mismatch: artifact64 reclaim, the RO switch of the victim's BlockId returned another record
++//   admit_record_installed:  admit's insert answered "slot exists" but installed our record on the key
++inline std::atomic<uint64_t> reclaim_victim_mismatch{0};
++inline std::atomic<uint64_t> admit_record_installed{0};
+ inline std::atomic<uint64_t> gets_ro_path{0};
+ inline std::atomic<uint64_t> gets_rw_path{0};
+ 
+diff --git a/src/core/write_meta.cc b/src/core/write_meta.cc
+index 2d31cb8..c631111 100644
+--- a/src/core/write_meta.cc
++++ b/src/core/write_meta.cc
+@@ -1,5 +1,7 @@
+ #include "write_meta.h"
+ 
++#include "common/diag.h"
++
+ namespace rackobj::common {
+ 
+ bool WriteMetadata::WSeqBegin() { return write_seqlock_begin(&seqlock_); }
+@@ -191,6 +193,27 @@ bool SharedMetadata::RecycleWmeta(size_t wm_index, bool with_lock) {
+     }
+ }
+ 
++// De Stijl port. Upstream freed `result` and left `victim` locked whenever they differed. They differ only in
++// artifact64, where the key comes from the victim's BlockId field: if that field is stale (the victim is no longer,
++// or not only, that key's record), the RO switch hits the key's real record. Upstream then (a) freed a record it had
++// not locked (free_seqlock_with_lock frees any locked record, i.e. it stole a writer's lock) or failed and leaked it,
++// and (b) never unlocked the victim, so every user of the victim blocked forever. Here: the key is RO now, so its
++// record is free to reclaim once we hold its lock (wait for a writer); the victim is unlocked and left allocated.
++bool SharedMetadata::FinishReclaim(size_t victim, std::optional<size_t> result) {
++    WriteMetadata *vic = &b_meta_.wmeta_start_addr_[victim];
++    if (!result.has_value()) {
++        vic->WUnlockOnly();
++        return false;
++    }
++    if (result.value() == victim) return RecycleWmeta(victim);
++
++    diag::reclaim_victim_mismatch.fetch_add(1, std::memory_order_relaxed);
++    vic->WUnlockOnly();
++    WriteMetadata *rec = &b_meta_.wmeta_start_addr_[result.value()];
++    if (!rec->WLockOnly()) return false;  // already free
++    return RecycleWmeta(result.value());
++}
++
+ void SharedMetadata::CreateLocalSeqMap(int nid) {
+     // De Stijl port: process-local, private heap (was local_region_ memkind memory)
+     local_seqcount_vec_[nid] = std::make_unique<std::vector<VectorElement>>(b_meta_.wmeta_slot_len_);
+diff --git a/src/core/write_meta.h b/src/core/write_meta.h
+index a3d5d46..318d10a 100644
+--- a/src/core/write_meta.h
++++ b/src/core/write_meta.h
+@@ -189,6 +189,10 @@ public:
+ 
+     bool RecycleWmeta(size_t wm_index, bool with_lock = true);
+ 
++    // Finish a reclaim of `victim` (locked by the caller) after the RO switch answered `result` (the record the
++    // switched key held, or nullopt). Returns true when a record was freed.
++    bool FinishReclaim(size_t victim, std::optional<size_t> result);
++
+     size_t GetWmetaCount() { return b_meta_.allocated_slot_num_->load(std::memory_order_relaxed); }
+ 
+     size_t WmetaOverThreshold() {
+diff --git a/src/manager/wmeta_manager.cc b/src/manager/wmeta_manager.cc
+index a634266..c4986dc 100644
+--- a/src/manager/wmeta_manager.cc
++++ b/src/manager/wmeta_manager.cc
+@@ -96,16 +96,12 @@ size_t WriteMetadataManager::IterativeReclaim(size_t count
+ #else
+         diag::Rec(diag::kEvReclaim, block_id.GetOffset(), static_cast<int64_t>(wmeta_idx), wmeta_idx_optional.has_value() ? static_cast<uint32_t>(*wmeta_idx_optional + 1) : 0u);
+ #endif
+-        if (wmeta_idx_optional.has_value()) {
+-            // CHECK(!shared_cache->scr_bitmap_.IsWmetaFree(wmeta_idx)) << "the slot is already free before freeing";
+-            // CHECK(wmeta_idx == wmeta_idx_optional.value())
+-            //     << "wmeta idx and optional idx doesnot match: " << wmeta_idx << ":" << wmeta_idx_optional.value();
+-            c3po_->Scr_meta()->RecycleWmeta(wmeta_idx_optional.value());
++        // upstream had CHECK(wmeta_idx == wmeta_idx_optional) commented out: they can differ in artifact64
++        // (stale BlockId); FinishReclaim handles it (unlocks the victim, frees the switched key's record locked)
++        if (c3po_->Scr_meta()->FinishReclaim(wmeta_idx, wmeta_idx_optional)) {
+             wmeta_over_thres--;
+             // updated policy: iteration starts from last index that is switched to RO
+             curr_switch_idx_ = (wmeta_idx + 1) % num_wmeta_slot;
+-        } else {
+-            cur->WUnlockOnly();
+         }
+     }
+     return count - wmeta_over_thres;
+@@ -127,6 +123,7 @@ size_t WriteMetadataManager::SampleReclaim(size_t count
+         if (!wmeta_idx.has_value()) continue;
+ 
+         cur = c3po_->Scr_meta()->GetWmeta(wmeta_idx.value());
++        (void)cur;  // only the artifact64 path reads it
+ #ifdef WMETA_OWNER_REV
+         // packed4: the record holds no BlockId; the log op resolves the victim's key (replica reverse map)
+         std::optional<size_t> wmeta_idx_optional = c3po_->Gcd()->SwitchToReadOnlyByWmeta(wmeta_idx.value(), nr_meta);
+@@ -145,12 +142,7 @@ size_t WriteMetadataManager::SampleReclaim(size_t count
+ #else
+         diag::Rec(diag::kEvReclaim, block_id.GetOffset(), static_cast<int64_t>(wmeta_idx.value()), wmeta_idx_optional.has_value() ? static_cast<uint32_t>(*wmeta_idx_optional + 1) : 0u);
+ #endif
+-        if (wmeta_idx_optional.has_value()) {
+-            c3po_->Scr_meta()->RecycleWmeta(wmeta_idx_optional.value());
+-            wmeta_over_thres--;
+-        } else {
+-            cur->WUnlockOnly();
+-        }
++        if (c3po_->Scr_meta()->FinishReclaim(wmeta_idx.value(), wmeta_idx_optional)) wmeta_over_thres--;
+     }
+ 
+     return count - wmeta_over_thres;
+diff --git a/third-party/nr_rust/ffi/ffi_nr_hashmap.rs b/third-party/nr_rust/ffi/ffi_nr_hashmap.rs
+index c823dc4..785a372 100644
+--- a/third-party/nr_rust/ffi/ffi_nr_hashmap.rs
++++ b/third-party/nr_rust/ffi/ffi_nr_hashmap.rs
+@@ -424,8 +424,13 @@ impl NrHashMapFFi {
+                 } else if idx == NUMA_MEM {
+                     // slot is allocated, trying to switch rw mode
+                     if wmeta_idx == -1 {
+-                        // switching to ro, idempotent
+-                        entry.wmeta_idx_ = wmeta_idx;
++                        // De Stijl port: an RO admit (Admit, no record) that lost the race to another admit must not
++                        // demote the key: upstream set wmeta -1 here, dropping the key's record without freeing it
++                        // (it stayed allocated with its BlockId, later reclaimed as a stale victim) and without the
++                        // deallocation event the RO switch gives. Only an already-RO key is the idempotent case.
++                        if entry.wmeta_idx_ != -1 {
++                            return OptionGCDReponse(None);
++                        }
+                         return OptionGCDReponse(Some(GCDReponse {
+                             key: null_BlockId(),
+                             value: *entry,
+diff --git a/third-party/nr_rust/ffi/port_tests.rs b/third-party/nr_rust/ffi/port_tests.rs
+index 973f379..8bb50fa 100644
+--- a/third-party/nr_rust/ffi/port_tests.rs
++++ b/third-party/nr_rust/ffi/port_tests.rs
+@@ -289,3 +289,33 @@ fn ro_switch_alone_clears_remote_notification_after_tail_check() {
+     n1.sync(t1);
+     assert!(!n1.check_notification_reset(t1), "the RO switch (deallocation) must notify on replay");
+ }
++
++#[test]
++fn admit_on_existing_slot_never_demotes_and_reports_installed_record() {
++    // Attempt 12: a lost admit race must not drop the key's record (RO admit) and its "slot exists" answer means
++    // the record WAS installed (RW admit on an RO key), so the caller keeps it.
++    let m = shared_mem(min_entries());
++    let n0 = node(&m, 0, true, 2000);
++    let n1 = node(&m, 1, false, 2000);
++    let t0 = n0.register(0).unwrap();
++    let t1 = n1.register(1).unwrap();
++    let wm = |n: &Arc<NodeReplicated<NrHashMapFFi>>, t| n.execute(Access::Get(key(4)), t).0.unwrap().value.wmeta_idx_;
++    n0.execute_mut(Modify::PutArrayWmeta(key(4), 14, NUMA_MEM, 6), t0); // RW with record 6
++
++    // RO admit losing to the existing RW entry: no change (upstream set wmeta -1 and orphaned record 6)
++    assert!(n1.execute_mut(Modify::CheckPutArrayWmeta(key(4), 15, NUMA_MEM, -1), t1).0.is_none());
++    assert_eq!((wm(&n0, t0), wm(&n1, t1)), (6, 6));
++    // RW admit losing to an RW entry: nothing installed
++    assert!(n1.execute_mut(Modify::CheckPutArrayWmeta(key(4), 15, NUMA_MEM, 7), t1).0.is_none());
++    assert_eq!(wm(&n1, t1), 6);
++
++    n0.execute_mut(Modify::CheckSwitchWmetaArray(key(4), -1), t0); // RO
++    // RO admit on an RO entry: idempotent "slot exists" answer, still RO
++    let r = n1.execute_mut(Modify::CheckPutArrayWmeta(key(4), 16, NUMA_MEM, -1), t1).0.unwrap();
++    assert_eq!((r.key == null_BlockId(), wm(&n1, t1)), (true, -1));
++    // RW admit on an RO entry: "slot exists" (FFI 2 = GCD_SLOT_UPDATE_FAILED) yet record 9 is installed
++    let r = n1.execute_mut(Modify::CheckPutArrayWmeta(key(4), 17, NUMA_MEM, 9), t1).0.unwrap();
++    assert!(r.key == null_BlockId());
++    assert_eq!((wm(&n0, t0), wm(&n1, t1)), (9, 9));
++    assert_eq!(n0.execute(Access::Get(key(4)), t0).0.unwrap().value.cn_array_[0].cn_idx_, 14, "slot unchanged");
++}
+-- 
+2.34.1
+

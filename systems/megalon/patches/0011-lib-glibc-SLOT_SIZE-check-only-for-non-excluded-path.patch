@@ -1,0 +1,37 @@
+From e8f1ccdf6505abaa1551f8e4b930af9a6c477b44 Mon Sep 17 00:00:00 2001
+From: Sungsu Ahn <sungsu_ahn@korea.ac.kr>
+Date: Wed, 14 Oct 2026 22:55:16 +0900
+Subject: [PATCH 11/51] lib/glibc: SLOT_SIZE check only for non-excluded paths
+
+Excluded (kernel-managed) paths such as /dev, /sys, /proc are passed to the
+real open(); other libraries in the process (libnuma, hwloc) open them too.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ lib/glibc/open.cc | 3 ++-
+ 1 file changed, 2 insertions(+), 1 deletion(-)
+
+diff --git a/lib/glibc/open.cc b/lib/glibc/open.cc
+index 9a47d38..a5b5224 100644
+--- a/lib/glibc/open.cc
++++ b/lib/glibc/open.cc
+@@ -31,7 +31,6 @@ using std::string;
+ #endif
+ 
+ static RackOBJFile* rackobj_open(const char* pathname, int flags, mode_t mode) {
+-    CHECK(SLOT_SIZE == 4096) << "SLOT_SIZE must be 4096";
+     shared_ptr<RackOBJFile> fp = nullptr;
+     RackOBJPath path(rackobj::lib::client_cfg, pathname);
+ 
+@@ -52,6 +51,8 @@ static RackOBJFile* rackobj_open(const char* pathname, int flags, mode_t mode) {
+                    << ") --> " << fp->GetFileTypeString() << ", real fd=" << fd
+                    << ", vfd=" << fp->GetVirtualFileDescriptor() << ", fp=" << fp;
+     } else {
++        // only the file interface needs 4 KiB slots; excluded (kernel-managed) paths pass through above
++        CHECK(SLOT_SIZE == 4096) << "SLOT_SIZE must be 4096";
+         uint64_t server_id = rackobj::lib::client_cfg.GetServerId();
+ 
+         int fd = rackobj::lib::original_syscalls.open(path.GetRealPath().c_str(), O_DIRECT | O_RDWR | (flags & O_CREAT),
+-- 
+2.34.1
+

@@ -1,0 +1,300 @@
+From a812bd9bc03ab01dc5e51107fee68ba0f5ebd62a Mon Sep 17 00:00:00 2001
+From: Sungsu Ahn <sungsu_ahn@korea.ac.kr>
+Date: Thu, 15 Oct 2026 09:11:56 +0900
+Subject: [PATCH 29/51] object-test: write every object before concurrent
+ readers; churn phase for record reclaim under reads
+
+Verifier D1: phase 3 objects get generation 1 before the barrier and an all-zero
+read now counts as torn, so a reused arena or a lost create race cannot cause a
+false FAIL; backwards is checked per object and writer node (S has two writers).
+Verifier D2: optional phase 6 (argument 3 = objects per node): one writer per
+node rewrites random objects of both nodes while readers on both nodes check
+generations; with config destijl-2vm-objects-reclaim.yaml (logical_scr_size 8KB,
+2048 records) and 2048 objects per node this is ~2x RW objects per record, so
+reclaim (deallocation) races concurrent reads and objects go RO->RW repeatedly.
+Final generation of every object must be one of the two writers' last ones.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ benchmarks/object_test.cc               | 145 ++++++++++++++++++++----
+ config/destijl-2vm-objects-reclaim.yaml |  30 +++++
+ 2 files changed, 154 insertions(+), 21 deletions(-)
+ create mode 100644 config/destijl-2vm-objects-reclaim.yaml
+
+diff --git a/benchmarks/object_test.cc b/benchmarks/object_test.cc
+index cedd6ab..602ac92 100644
+--- a/benchmarks/object_test.cc
++++ b/benchmarks/object_test.cc
+@@ -2,7 +2,7 @@
+ // Run one process per node exactly like kv-store (RACKOBJ_CONFIG, MEGALON_NODE_ID, MEGALON_RUN_ID, region config);
+ // the Megalon config must set object_arena_size (>= 64MB) and should be the same file on both nodes.
+ //
+-//   object-test <concurrent phase seconds> [reader threads per node, default 2]
++//   object-test <concurrent phase seconds> [reader threads per node, default 2] [churn objects per node, default 0]
+ //
+ // Exit: 0 PASS, 3 FAIL. Both nodes run the same phase sequence, separated by NodeBarrier:
+ //   0 errors and races: -EINVAL / -ENOENT / -ENOMEM paths; both nodes create the same id (exactly one wins, the
+@@ -17,10 +17,19 @@
+ //   4 many objects: each node creates and writes kMany objects of varied sizes (alignment, partial last line),
+ //     the other node verifies all of them (many records: with a small logical_scr_size this drives reclaim).
+ //   5 slots unchanged: a Put on node 0 is read by node 1 with Get (objects and slots coexist).
++//   6 churn (only if churn objects > 0; run it with a tiny logical_scr_size, e.g. config destijl-2vm-objects-reclaim.yaml,
++//     megalon flavor): each node creates K small objects and writes generation 1; then one writer per node rewrites
++//     random objects of BOTH nodes (2K RW candidates, about 2x the records) while readers on both nodes read random
++//     objects. Record reclaim (RO switch = deallocation) then happens under concurrent reads, and objects go RO->RW
++//     repeatedly. Same checks as phase 3 (no torn read, no generation going backwards per object and writer node),
++//     and every object's final generation must be the last one written by one of the two writers.
++// Every object is written (generation >= 1) before any concurrent reader starts, so a reused arena (old contents) or a
++// lost create race never produces a false FAIL.
+ // Shared counters are checked at the end (created == expected, lost bytes only from the phase-0 race).
+ #include <rackobj.h>
+ 
+ #include <algorithm>
++#include <array>
+ #include <atomic>
+ #include <cerrno>
+ #include <chrono>
+@@ -63,6 +72,9 @@ constexpr uint64_t kShared = kBase + 4;
+ uint64_t PatId(size_t n) { return kBase + 10 + n; }
+ uint64_t ConcId(size_t n) { return kBase + 20 + n; }
+ uint64_t ManyId(size_t n, size_t i) { return kBase + 0x100000 + n * 0x10000 + i; }
++uint64_t ChurnId(size_t n, size_t i) { return kBase + 0x1000000 + n * 0x100000 + i; }
++constexpr uint64_t kChurnFinal = kBase + 5;
++constexpr size_t kChurnLen = 264;  // multiple of 8, not of 64
+ constexpr size_t kMany = 1000;
+ constexpr size_t kMailboxHalf = 512;
+ constexpr uint64_t kMailMagic = 0x4d41494c424f5821ull;
+@@ -168,39 +180,62 @@ uint64_t InspectGen(const uint8_t *p, size_t size, uint64_t id) {
+ }
+ 
+ struct ReaderResult {
+-    uint64_t reads = 0, retries = 0, torn = 0, backwards = 0, unwritten = 0;
++    uint64_t reads = 0, retries = 0, torn = 0, backwards = 0;
+ };
+ 
++// Generations are (counter << 1) | writer node, and 1 is the initial generation written before any reader starts.
++// Two writers of one object are not ordered with each other, so "backwards" is checked per object and writer node.
+ void Reader(int tid, const std::vector<uint64_t> &ids, std::chrono::steady_clock::time_point until, ReaderResult *r) {
+     rackobj::Register(tid);
+-    std::vector<uint64_t> last(ids.size(), 0);
++    std::vector<std::array<uint64_t, 2>> last(ids.size(), {0, 0});
+     std::mt19937_64 rng(static_cast<uint64_t>(tid) * 7919 + node_id);
+     while (std::chrono::steady_clock::now() < until) {
+         size_t k = rng() % ids.size();
+         rackobj::ObjectHandle h;
+         uint64_t gen;
+-        bool zero;
+         for (;;) {
+             CHECK_EQ(rackobj::ObjectReadStart(ids[k], &h), 0);
+             // everything is inspected inside the section; it only counts if ObjectReadEnd accepts the read
+             gen = InspectGen(h.ptr, h.size, ids[k]);
+-            zero = reinterpret_cast<const volatile uint64_t *>(h.ptr)[0] == 0;
+             if (rackobj::ObjectReadEnd(&h)) break;
+             r->retries++;
+         }
+         r->reads++;
+-        if (gen == 0) {
+-            // an accepted read of a never-written object (gen word 0) is fine; anything else is torn
+-            if (zero) r->unwritten++;
+-            else r->torn++;
++        if (gen == 0) {  // every object was written before the readers started: not one complete generation
++            r->torn++;
+             continue;
+         }
+-        if (gen < last[k]) r->backwards++;
+-        last[k] = gen;
++        if (gen < last[k][gen & 1]) r->backwards++;
++        last[k][gen & 1] = gen;
+     }
+     rackobj::UnRegister();
+ }
+ 
++void SumReaders(const std::vector<ReaderResult> &rr, ReaderResult *tot) {
++    for (auto &r : rr) {
++        tot->reads += r.reads;
++        tot->retries += r.retries;
++        tot->torn += r.torn;
++        tot->backwards += r.backwards;
++    }
++}
++
++// phase 6: one writer per node rewrites random objects of both nodes; last[k] = last generation it wrote to ids[k]
++void ChurnWriter(int tid, const std::vector<uint64_t> &ids, std::chrono::steady_clock::time_point until,
++                 std::vector<uint64_t> *last, uint64_t *writes) {
++    rackobj::Register(tid);
++    std::mt19937_64 rng(0xc4u + node_id);
++    uint64_t g = 0;
++    while (std::chrono::steady_clock::now() < until) {
++        size_t k = rng() % ids.size();
++        const uint64_t gen = (++g << 1) | node_id;
++        WriteGen(ids[k], gen);
++        (*last)[k] = gen;
++    }
++    *writes = g;
++    rackobj::UnRegister();
++}
++
+ // generations are (counter << 1 | node) so the two writers of S never produce the same gen
+ uint64_t Writer(int tid, uint64_t own, std::chrono::steady_clock::time_point until, uint64_t *shared_last) {
+     rackobj::Register(tid);
+@@ -223,12 +258,14 @@ int main(int argc, char **argv) {
+     absl::SetStderrThreshold(absl::LogSeverity::kInfo);
+     absl::InitializeLog();
+     if (argc < 2) {
+-        std::fprintf(stderr, "usage: %s <concurrent phase seconds> [reader threads per node]\n", argv[0]);
++        std::fprintf(stderr, "usage: %s <concurrent phase seconds> [reader threads per node] [churn objects per node]\n",
++                     argv[0]);
+         return 1;
+     }
+     const int conc_s = std::atoi(argv[1]);
+     const int readers = argc > 2 ? std::atoi(argv[2]) : 2;
+-    CHECK(conc_s > 0 && readers > 0 && readers <= 16);
++    const size_t churn = argc > 3 ? static_cast<size_t>(std::atoll(argv[3])) : 0;
++    CHECK(conc_s > 0 && readers > 0 && readers <= 14 && churn <= 0x80000);  // <= 32 NR registrations per node
+     node_id = rackobj::GetConfigSize_t("node_id");
+     const size_t other = 1 - node_id;
+     rackobj::Register(0);
+@@ -254,6 +291,9 @@ int main(int argc, char **argv) {
+     EXPECT(rackobj::ObjectCreate(PatId(node_id), kPatLen[node_id]) == 0);
+     EXPECT(rackobj::ObjectCreate(ConcId(node_id), kConcLen) == 0);
+     EXPECT(rackobj::ObjectCreate(PatId(node_id), 64) == -EEXIST);
++    // initial generation 1 before any concurrent reader (the arena may hold an earlier run's bytes)
++    WriteGen(ConcId(node_id), 1);
++    if (node_id == 0) WriteGen(kShared, 1);
+     Barrier("created");
+     const int race_rc = rackobj::ObjectCreate(kRace, 1000 + node_id);  // both nodes, same id
+     EXPECT(race_rc == 0 || race_rc == -EEXIST);
+@@ -309,13 +349,7 @@ int main(int argc, char **argv) {
+     Barrier("concurrent done");
+     {
+         ReaderResult tot;
+-        for (auto &r : rr) {
+-            tot.reads += r.reads;
+-            tot.retries += r.retries;
+-            tot.torn += r.torn;
+-            tot.backwards += r.backwards;
+-            tot.unwritten += r.unwritten;
+-        }
++        SumReaders(rr, &tot);
+         LOG(INFO) << "concurrent: reads " << tot.reads << ", retries " << tot.retries << ", torn " << tot.torn
+                   << ", backwards " << tot.backwards << ", own last gen " << own_last;
+         EXPECT(tot.reads > 0);
+@@ -381,9 +415,78 @@ int main(int argc, char **argv) {
+     }
+     Barrier("slot checked");
+ 
++    // ---- phase 6: churn (record reclaim under concurrent reads, repeated RO->RW) ----
++    if (churn) {
++        rackobj::ObjectStats before{};
++        rackobj::GetObjectStats(&before);
++        std::vector<uint64_t> ids;
++        for (size_t n = 0; n < 2; n++)
++            for (size_t i = 0; i < churn; i++) ids.push_back(ChurnId(n, i));
++        if (node_id == 0) EXPECT(rackobj::ObjectCreate(kChurnFinal, 2 * ids.size() * 8) == 0);
++        for (size_t i = 0; i < churn; i++) {
++            EXPECT(rackobj::ObjectCreate(ChurnId(node_id, i), kChurnLen) == 0);
++            WriteGen(ChurnId(node_id, i), 1);
++        }
++        Barrier("churn init");
++        std::vector<uint64_t> last(ids.size(), 0);
++        uint64_t writes = 0;
++        std::vector<ReaderResult> cr(static_cast<size_t>(readers));
++        {
++            auto until = std::chrono::steady_clock::now() + std::chrono::seconds(conc_s);
++            std::vector<std::thread> th;
++            for (int i = 0; i < readers; i++)
++                th.emplace_back(Reader, 2 + readers + i, std::cref(ids), until, &cr[static_cast<size_t>(i)]);
++            std::thread w(ChurnWriter, 1 + 2 * readers + 1, std::cref(ids), until, &last, &writes);
++            w.join();
++            for (auto &t : th) t.join();
++        }
++        {
++            rackobj::ObjectHandle h;
++            CHECK_EQ(rackobj::ObjectWriteStart(kChurnFinal, &h), 0);
++            memcpy(h.ptr + node_id * ids.size() * 8, last.data(), ids.size() * 8);
++            rackobj::ObjectWriteEnd(&h);
++        }
++        Barrier("churn done");
++        ReaderResult tot;
++        SumReaders(cr, &tot);
++        std::vector<uint64_t> theirs(ids.size());
++        {
++            rackobj::ObjectHandle h;
++            do {
++                CHECK_EQ(rackobj::ObjectReadStart(kChurnFinal, &h), 0);
++                memcpy(theirs.data(), h.ptr + other * ids.size() * 8, ids.size() * 8);
++            } while (!rackobj::ObjectReadEnd(&h));
++        }
++        size_t bad_final = 0;
++        for (size_t k = 0; k < ids.size(); k++) {
++            rackobj::ObjectHandle h;
++            uint64_t g;
++            do {
++                CHECK_EQ(rackobj::ObjectReadStart(ids[k], &h), 0);
++                g = InspectGen(h.ptr, h.size, ids[k]);
++            } while (!rackobj::ObjectReadEnd(&h));
++            const bool ok = (last[k] == 0 && theirs[k] == 0) ? g == 1 : (g == last[k] || g == theirs[k]);
++            if (!ok) bad_final++;
++        }
++        rackobj::ObjectStats after{};
++        rackobj::GetObjectStats(&after);
++        LOG(INFO) << "churn: " << ids.size() << " objects, writes " << writes << ", reads " << tot.reads << ", retries "
++                  << tot.retries << ", torn " << tot.torn << ", backwards " << tot.backwards << ", bad final "
++                  << bad_final << ", RW switches " << after.switch_rw - before.switch_rw << ", read retries notify "
++                  << after.read_retry_notify - before.read_retry_notify << " / incoherent "
++                  << after.read_retry_incoherent - before.read_retry_incoherent << ", replay flushes "
++                  << after.replay_flushes - before.replay_flushes;
++        EXPECT(writes > 0 && tot.reads > 0);
++        EXPECT(tot.torn == 0);
++        EXPECT(tot.backwards == 0);
++        EXPECT(bad_final == 0);
++        Barrier("churn checked");
++    }
++
+     rackobj::ObjectStats st{};
+     rackobj::GetObjectStats(&st);
+-    const uint64_t expect_created = 4 /*mailbox, S, P(0), P(1)*/ + 2 /*C(0), C(1)*/ + 1 /*race*/ + 2 * kMany;
++    const uint64_t expect_created =
++        4 /*mailbox, S, P(0), P(1)*/ + 2 /*C(0), C(1)*/ + 1 /*race*/ + 2 * kMany + (churn ? 2 * churn + 1 : 0);
+     EXPECT(st.created == expect_created);
+     EXPECT(st.lost_bytes <= 4096);  // only the losing race create (1000 or 1001 B rounded up to object_align)
+     LOG(INFO) << "OBJECT-STATS node " << node_id << ": arena " << st.used_bytes << "/" << st.arena_bytes << " B, created "
+diff --git a/config/destijl-2vm-objects-reclaim.yaml b/config/destijl-2vm-objects-reclaim.yaml
+new file mode 100644
+index 0000000..7a08d53
+--- /dev/null
++++ b/config/destijl-2vm-objects-reclaim.yaml
+@@ -0,0 +1,30 @@
++# De Stijl 2-VM port, phase B: destijl-2vm-objects.yaml with a tiny record budget, to drive coherence-record reclaim
++# of objects under concurrent reads (object-test <s> <readers> 2048). megalon flavor only.
++mount_directory: /mydata        # required by the config parser; unused
++key_space: 1000000
++slots: 1001000                  # same value for every flavor [V9]
++logical_scr_size: 8KB          # TINY on purpose: 2048 dynamic records for ~2x as many RW objects (object-test churn phase); megalon flavor only (hwcc needs a record per slot)
++node_id: 0                      # 0 = init (VM0), 1 = attach (VM1)
++region_config: ""               # empty: $CXL_REGION_CONFIG
++reinit: false
++attach_mprotect: true
++stuck_timeout_ms: 10000
++log_sync_interval_us: 100
++nr_log_size: 64MB
++attach_timeout_s: 600
++start_barrier_timeout_s: 600
++# phase B: object arena in SWcc after the slot data and the NR log body; bump allocation at create, never freed
++object_arena_size: 256MB        # 0 disables objects (layout then identical to destijl-2vm.yaml)
++object_align: 64                # start alignment and size rounding: 64 or 4096
++object_max_count: 65536         # hwcc flavor only: static coherence records reserved for objects (one per object)
++replicate: false
++flush: false
++evict: false
++partition_ratio: 0.0
++excluded_files:
++excluded_directories:
++  - /usr
++  - /proc
++  - /etc
++  - /dev
++  - /sys
+-- 
+2.34.1
+

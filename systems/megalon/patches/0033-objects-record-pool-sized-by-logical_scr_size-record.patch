@@ -1,0 +1,104 @@
+From 2fd5998468c9aac0a939d7944479b0d347cb643e Mon Sep 17 00:00:00 2001
+From: Sungsu Ahn <sungsu_ahn@korea.ac.kr>
+Date: Fri, 16 Oct 2026 03:12:09 +0900
+Subject: [PATCH 33/51] objects: record pool sized by logical_scr_size / record
+ size (deviation R1)
+
+With objects enabled (object_arena_size > 0) and DYN_WMETA, the dynamic record
+pool is logical_scr_size / 4 B (packed4), as the paper sizes the SCR, instead of
+the artifact's min(logical_scr_size / 4, slots * 100 / WMETA_WATERMARK), which
+tied the records available to objects to the kv cache slot count (11,377 for
+slots 10240). Without objects, and in the hwcc flavor, nothing changes.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ lib/shm_obj_handle.cc |  4 ++--
+ src/core/c3.cc        | 12 +++++++++---
+ src/core/c3.h         |  8 +++++---
+ 3 files changed, 16 insertions(+), 8 deletions(-)
+
+diff --git a/lib/shm_obj_handle.cc b/lib/shm_obj_handle.cc
+index b785e7e..78d2b31 100644
+--- a/lib/shm_obj_handle.cc
++++ b/lib/shm_obj_handle.cc
+@@ -40,7 +40,7 @@ SharedMemoryObjectHandle<Policy>::SharedMemoryObjectHandle(const int node, const
+         NrFfi::NrLogLayout lay = NrFfi::nr_log_layout(cfg.GetNrLogBytes());
+         // phase B objects: static records (hwcc) and the ObjectShared block; both 0 when objects are disabled
+         size_t wmeta_slots = C3POHandle::RecordCount(shared_num_slots, cfg.GetLogicalSCRSize(),
+-                                                     ObjectStore::StaticRecords(cfg));
++                                                     ObjectStore::StaticRecords(cfg), cfg.GetObjectArenaBytes() > 0);
+         size_t footprint = port::PortContext::ScrFootprint(shared_num_slots, wmeta_slots, lay.header_size,
+                                                            ObjectStore::ScrExtraBytes(cfg));
+         LOG(INFO) << "slots " << shared_num_slots << ", wmeta records " << wmeta_slots << ", NR log "
+@@ -61,7 +61,7 @@ SharedMemoryObjectHandle<Policy>::SharedMemoryObjectHandle(const int node, const
+     c3po_ = C3POHandle::CreateOrMap(shared_num_slots, (void *)0x6f0000000000, NUMA_MEM, cache_->GetPageBaseAddr(),
+                                     sc_shm_region_, cfg.GetLogicalSCRSize());
+     c3po_->InitSharedMetadata(shared_num_slots, sc_shm_region_, &cache_shrd_ptr_->scr_bitmap_,
+-                              ObjectStore::StaticRecords(cfg));
++                              ObjectStore::StaticRecords(cfg), cfg.GetObjectArenaBytes() > 0);
+     LOG(INFO) << "init step: shared metadata done";
+     // phase B: object arena (LNR) + allocator block (SCR) only when enabled; RO->RW switch is the slot path's SwitchRW
+     static_assert(std::is_same_v<Policy, common::LruPolicy>, "ObjectStore binds SwitchRW for LruPolicy");
+diff --git a/src/core/c3.cc b/src/core/c3.cc
+index 796b7b9..7b7ad0f 100644
+--- a/src/core/c3.cc
++++ b/src/core/c3.cc
+@@ -62,20 +62,26 @@ size_t C3POHandle::WmetaSlots(size_t num_slots, size_t logical_scr_size) {
+     return std::min(wmeta_slots, max_wmeta_slots);
+ }
+ 
+-size_t C3POHandle::RecordCount(size_t num_slots, size_t logical_scr_size, size_t object_records) {
++size_t C3POHandle::RecordCount(size_t num_slots, size_t logical_scr_size, size_t object_records, bool objects) {
+ #ifdef DYN_WMETA
+     (void)object_records;
++    /* De Stijl port, deviation R1 (2026-10-16): with objects enabled the dynamic record pool is sized as the paper
++     * sizes the SCR, logical_scr_size / record size, and no longer capped by the kv slot count (the artifact's
++     * num_slots * 100 / WMETA_WATERMARK ties the records objects can use to the kv cache size). Without objects
++     * the artifact's count is unchanged. */
++    if (objects) return logical_scr_size / CEIL_DIV(SEQLOCK_BITS, 8);
+     return WmetaSlots(num_slots, logical_scr_size);
+ #else
++    (void)objects;
+     return WmetaSlots(num_slots, logical_scr_size) + object_records;
+ #endif
+ }
+ 
+ void C3POHandle::InitSharedMetadata(size_t num_slots,
+                                     const std::shared_ptr<common::AllocatableLocalMemoryRegion> &sc_shm_region,
+-                                    SharedBitmap *bitmap, size_t object_records) {
++                                    SharedBitmap *bitmap, size_t object_records, bool objects) {
+     size_t perobjmetasize = CEIL_DIV(SEQLOCK_BITS, 8);  // sizeof(seqlock_t);
+-    size_t wmeta_slots = RecordCount(num_slots, c3po_->logical_scr_size_, object_records);
++    size_t wmeta_slots = RecordCount(num_slots, c3po_->logical_scr_size_, object_records, objects);
+ #ifndef DYN_WMETA
+     // static records: wmeta index == cn index, so every slot needs a record
+     // (phase B object records come after the slot records and do not count here)
+diff --git a/src/core/c3.h b/src/core/c3.h
+index 15f7507..027be39 100644
+--- a/src/core/c3.h
++++ b/src/core/c3.h
+@@ -112,7 +112,7 @@ public:
+     /* object_records: phase B static object records (hwcc only, see RecordCount); 0 = unchanged layout */
+     void InitSharedMetadata(size_t num_slots,
+                             const std::shared_ptr<common::AllocatableLocalMemoryRegion> &sc_shm_region,
+-                            SharedBitmap *bitmap, size_t object_records = 0);
++                            SharedBitmap *bitmap, size_t object_records = 0, bool objects = false);
+ 
+     void SetPartitionRatio(size_t key_space, double partition_ratio) {
+         key_space_ = key_space;
+@@ -126,8 +126,10 @@ public:
+ 
+     /* Phase B (paper §4 objects). Total records in the WriteMetadata array. DYN_WMETA: objects share the dynamic
+      * pool with slots (unchanged count). Static records (hwcc): every object gets its own record, as every slot
+-     * does, at ObjectRecordBase .. ObjectRecordBase + object_records - 1 (after the slot records). */
+-    static size_t RecordCount(size_t num_slots, size_t logical_scr_size, size_t object_records);
++     * does, at ObjectRecordBase .. ObjectRecordBase + object_records - 1 (after the slot records).
++     * objects (DYN_WMETA only, deviation R1): objects enabled -> logical_scr_size / record size, not capped by
++     * num_slots. */
++    static size_t RecordCount(size_t num_slots, size_t logical_scr_size, size_t object_records, bool objects = false);
+     static size_t ObjectRecordBase(size_t num_slots, size_t logical_scr_size) {
+         return WmetaSlots(num_slots, logical_scr_size);
+     }
+-- 
+2.34.1
+

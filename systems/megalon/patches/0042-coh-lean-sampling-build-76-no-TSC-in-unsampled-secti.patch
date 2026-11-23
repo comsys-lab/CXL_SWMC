@@ -1,0 +1,1842 @@
+From 268ea28739c94321ef9d5407b91a69cbb2575906 Mon Sep 17 00:00:00 2001
+From: Sungsu Ahn <sungsu_ahn@korea.ac.kr>
+Date: Sat, 17 Oct 2026 00:52:33 +0900
+Subject: [PATCH 42/51] coh: lean sampling (build 76): no TSC in unsampled
+ sections; per-thread port counters
+
+Instrumentation (observation only, no protocol change):
+- Counts exact in every section; every duration only in timed sections:
+  a jittered 1-in-N countdown for read sections and, separately, for
+  write sections (write_sampled -> ThreadAnchor.reserved[0]); estimators
+  x * read_sections / check_sampled and x * write_sections / write_sampled.
+- Unsampled sections read no TSC and add no thread-local lookups outside
+  the API entry: c3.cc seqlock hooks and the KV Get stage/copy markers use
+  ReadHandle/WriteHandle fields; NR anchors are timed through a separate FFI
+  entry GetAnchorTimed (one shared execute_anchor copy, no TLS read inside
+  the measured lookup); spin, NR-wait and reclaim sites count always and
+  time only while the thread's section-timed flag is set (waitstat slot 6).
+- MEGALON_COH_EVENTS=always (validation): read events and all writes timed
+  in every section; CohSnap.reserved[1] = bit0 timers | bit1 lean | bit2
+  events_always.
+- KV create counts no longer depend on the timers (kvw_copied bool).
+Port fix (not instrumentation): ObjectStore's process-wide counter atomics
+(one locked add per read section, three per write section, on lines shared
+by all threads) become per-thread blocks summed by Stats().
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ benchmarks/object_test.cc                     |  71 +++--
+ include/rackobj.h                             |   8 +-
+ lib/object_store.cc                           | 283 +++++++++++-------
+ lib/object_store.h                            |  10 +-
+ lib/shm_obj_handle.cc                         | 225 ++++++++------
+ src/common/coh_stats.cc                       |   3 +
+ src/common/coh_stats.h                        |  69 ++++-
+ src/core/c3.cc                                |  53 ++--
+ src/core/c3.h                                 |   4 +
+ src/core/seqcount.cc                          |   4 +-
+ src/index/gcd_nr.cc                           |  16 +-
+ src/index/gcd_nr.h                            |   1 +
+ src/index/nr_hashmap.h                        |   1 +
+ third-party/nr_rust/ffi/ffi_nr_hashmap.rs     |  14 +
+ third-party/nr_rust/ffi/port_tests.rs         |  24 +-
+ .../nr_rust/node-replication/src/nr/log.rs    |   4 +-
+ .../nr_rust/node-replication/src/nr/mod.rs    |  32 +-
+ .../node-replication/src/nr/replica.rs        |  26 +-
+ .../node-replication/src/nr/waitstat.rs       |  36 ++-
+ 19 files changed, 604 insertions(+), 280 deletions(-)
+
+diff --git a/benchmarks/object_test.cc b/benchmarks/object_test.cc
+index f87e70a..45d7bb4 100644
+--- a/benchmarks/object_test.cc
++++ b/benchmarks/object_test.cc
+@@ -300,6 +300,7 @@ rackobj::ThreadAnchor AncDiff(const rackobj::ThreadAnchor &a, const rackobj::Thr
+     const uint64_t *pa = reinterpret_cast<const uint64_t *>(&a);
+     uint64_t *pd = reinterpret_cast<uint64_t *>(&d);
+     for (size_t i = 0; i < offsetof(rackobj::ThreadAnchor, reserved) / 8; i++) pd[i] -= pa[i];
++    d.reserved[0] -= a.reserved[0];  // build 76: write_sampled
+     return d;
+ }
+ 
+@@ -307,12 +308,12 @@ rackobj::ThreadAnchor AncDiff(const rackobj::ThreadAnchor &a, const rackobj::Thr
+ std::string AncPerSection(const char *what, const rackobj::ThreadAnchor &d) {
+     char b[400];
+     const double rs = d.check_sampled ? static_cast<double>(d.check_sampled) : 1.0;
+-    const double ws = d.write_sections ? static_cast<double>(d.write_sections) : 1.0;
++    const double ws = d.reserved[0] ? static_cast<double>(d.reserved[0]) : 1.0;  // build 76: timed write sections
+     std::snprintf(b, sizeof(b),
+                   "ANCHOR-PER-SECTION %s: sampled %lu read lookup %.1f nr %.1f rseq %.1f | writes %lu lookup %.1f nr %.1f "
+                   "wseq %.1f wseq_end %.1f ns",
+                   what, d.check_sampled, d.read_lookup_ns_sampled / rs, d.read_nr_ns_sampled / rs,
+-                  d.rseq_ns_sampled / rs, d.write_sections, d.write_lookup_ns / ws, d.write_nr_ns / ws, d.wseq_ns / ws,
++                  d.rseq_ns_sampled / rs, d.reserved[0], d.write_lookup_ns / ws, d.write_nr_ns / ws, d.wseq_ns / ws,
+                   d.wseq_end_ns / ws);
+     return b;
+ }
+@@ -401,8 +402,22 @@ void CohPhase(HelperThread &helper) {
+     rackobj::ObjectStats os{};
+     rackobj::GetObjectStats(&os);
+     const bool hwcc = os.static_records_used > 0;  // hwcc flavor: static records (objects RW at create), no stale/RO
+-    const bool timed = Coh().reserved[1] == 1;
+-    auto tpos = [&](uint64_t ns) { return !timed || ns > 0; };  // durations are 0 with MEGALON_COH_TIMERS=0
++    // build 76: counts exact in every section; durations only in timed sections (1 in N, jittered; every section
++    // with N = 1 or MEGALON_COH_EVENTS=always for events and writes)
++    const auto coh_cfg = Coh();
++    const bool timed = (coh_cfg.reserved[1] & 1) != 0;
++    const uint64_t N = coh_cfg.check_sample;
++    const bool evall = (coh_cfg.reserved[1] & 4) != 0;
++    const bool every = timed && (N == 1 || evall);
++    auto tpos = [&](uint64_t ns) { return !every || ns > 0; };  // one-off event / write durations
++    auto spos = [&](uint64_t ns) { return !timed || ns > 0; };  // sums over many sections
++    auto in_range = [&](uint64_t got, uint64_t n) {  // timed sections among n with the jittered 1-in-N countdown
++        if (!timed) return got == 0;
++        if (N == 1) return got == n;
++        return got + 1 >= n / (3 * N / 2) && got <= 2 * n / N + 1;
++    };
++    (void)spos;
++    (void)in_range;
+     EXPECT(rackobj::ObjectCreate(CohX(node_id), kConcLen) == 0);
+     EXPECT(rackobj::ObjectCreate(CohRO(node_id), 4096) == 0);
+     WriteGen(CohX(node_id), 1);
+@@ -499,7 +514,7 @@ void CohPhase(HelperThread &helper) {
+         auto d = CohDiff(c0, Coh());
+         LOG(INFO) << "COH spin (read of C(own) while the helper held its write section 20 ms): " << CohStr(d);
+         EXPECT(g == 5);
+-        EXPECT(d.spin_cnt >= 1 && (!timed || d.spin_ns >= 5000000));
++        EXPECT(d.spin_cnt >= 1 && (!every || d.spin_ns >= 5000000));
+         EXPECT(d.check_ns_sampled < 5000000);  // the spin is not counted as section-check time
+     }
+     // section checks: 1 in check_sample read sections per thread is timed
+@@ -511,20 +526,22 @@ void CohPhase(HelperThread &helper) {
+         for (uint64_t i = 0; i < n; i++) (void)read_gen(CohX(node_id));
+         auto z = AncDiff(z0, Anc());
+         LOG(INFO) << AncPerSection("object read", z);
+-        EXPECT(z.check_sampled == 16 && z.read_lookup_ns_sampled == Split()[0] - a0[0]);
+-        EXPECT(!timed || (z.rseq_ns_sampled > 0 && z.read_nr_ns_sampled > 0));  // C(own) is RW: version reads
++        EXPECT(in_range(z.check_sampled, n) && z.read_lookup_ns_sampled == Split()[0] - a0[0]);
++        EXPECT(spos(z.rseq_ns_sampled) && spos(z.read_nr_ns_sampled));  // C(own) is RW: version reads
+         {
+             auto w0 = Anc();
+-            for (int i = 0; i < 64; i++) WriteGen(CohX(node_id), 100 + i);
++            for (uint64_t i = 0; i < n; i++) WriteGen(CohX(node_id), 100 + i);
+             auto wd = AncDiff(w0, Anc());
+             LOG(INFO) << AncPerSection("object write", wd);
+-            EXPECT(wd.write_sections == 64 && (!timed || (wd.wseq_ns > 0 && wd.wseq_end_ns > 0 && wd.write_lookup_ns > 0)));
++            EXPECT(wd.write_sections == n && (evall ? wd.reserved[0] == n : in_range(wd.reserved[0], n)));
++            EXPECT(spos(wd.wseq_ns) && spos(wd.wseq_end_ns) && spos(wd.write_lookup_ns));
+         }
+         auto d = CohDiff(c0, Coh());
+         auto a1 = Split();
+         LOG(INFO) << "COH checks (" << n << " uncontended read sections): " << CohStr(d) << " | " << SplitStr(a0, a1);
+-        EXPECT(tpos(d.reserved[7]) && d.reserved[7] == a1[0] - a0[0] && tpos(a1[1] - a0[1]));
+-        EXPECT(d.read_sections == n && d.write_sections == 64 && d.check_sampled == 16 && tpos(d.check_ns_sampled));
++        EXPECT(spos(d.reserved[7]) && d.reserved[7] == a1[0] - a0[0] && spos(a1[1] - a0[1]));
++        EXPECT(d.read_sections == n && d.write_sections == n && in_range(d.check_sampled, n) && spos(d.check_ns_sampled));
++        EXPECT(d.wflush_cnt == n && spos(d.wflush_ns) && spos(d.wstart_ns));
+         EXPECT(d.stale_cnt == 0 && d.concur_cnt == 0 && d.meta_cnt == 0);
+     }
+     Barrier("coh checked");
+@@ -554,8 +571,22 @@ void KvCohPhase(HelperThread &helper, bool churn) {
+     rackobj::ObjectStats os{};
+     rackobj::GetObjectStats(&os);
+     const bool hwcc = os.static_records_used > 0;
+-    const bool timed = Coh().reserved[1] == 1;
+-    auto tpos = [&](uint64_t ns) { return !timed || ns > 0; };
++    // build 76: counts exact in every section; durations only in timed sections (1 in N, jittered; every section
++    // with N = 1 or MEGALON_COH_EVENTS=always for events and writes)
++    const auto coh_cfg = Coh();
++    const bool timed = (coh_cfg.reserved[1] & 1) != 0;
++    const uint64_t N = coh_cfg.check_sample;
++    const bool evall = (coh_cfg.reserved[1] & 4) != 0;
++    const bool every = timed && (N == 1 || evall);
++    auto tpos = [&](uint64_t ns) { return !every || ns > 0; };  // one-off event / write durations
++    auto spos = [&](uint64_t ns) { return !timed || ns > 0; };  // sums over many sections
++    auto in_range = [&](uint64_t got, uint64_t n) {  // timed sections among n with the jittered 1-in-N countdown
++        if (!timed) return got == 0;
++        if (N == 1) return got == n;
++        return got + 1 >= n / (3 * N / 2) && got <= 2 * n / N + 1;
++    };
++    (void)spos;
++    (void)in_range;
+     const off_t own = KvKey(node_id, 0);
+     {  // create (admit) and update: write sections, wflush bytes = value size
+         auto c0 = Coh();
+@@ -623,20 +654,22 @@ void KvCohPhase(HelperThread &helper, bool churn) {
+         for (uint64_t i = 0; i < n; i++) (void)KvGetGen(own);
+         auto z = AncDiff(z0, Anc());
+         LOG(INFO) << AncPerSection("KV get", z);
+-        EXPECT(z.check_sampled == 16 && (!timed || (z.rseq_ns_sampled > 0 && z.read_nr_ns_sampled > 0)));
++        EXPECT(in_range(z.check_sampled, n) && spos(z.rseq_ns_sampled) && spos(z.read_nr_ns_sampled));
+         {
+             auto w0 = Anc();
+-            for (int i = 0; i < 64; i++) KvPut(own, 1000 + i);
++            for (uint64_t i = 0; i < n; i++) KvPut(own, 1000 + i);
+             auto wd = AncDiff(w0, Anc());
+             LOG(INFO) << AncPerSection("KV put", wd);
+-            EXPECT(wd.write_sections == 64 && (!timed || (wd.wseq_ns > 0 && wd.wseq_end_ns > 0 && wd.write_lookup_ns > 0)));
++            EXPECT(wd.write_sections == n && (evall ? wd.reserved[0] == n : in_range(wd.reserved[0], n)));
++            EXPECT(spos(wd.wseq_ns) && spos(wd.wseq_end_ns) && spos(wd.write_lookup_ns));
+         }
+         auto d = CohDiff(c0, Coh());
+         auto a1 = Split();
+         LOG(INFO) << "KVCOH checks (" << n << " uncontended Gets): " << CohStr(d) << " | " << SplitStr(a0, a1);
+-        EXPECT(tpos(d.reserved[7]) && d.reserved[7] == a1[0] - a0[0] && tpos(a1[1] - a0[1]));
+-        EXPECT(!timed || a1[2] > a0[2]);  // the 64 Puts move the write split
+-        EXPECT(d.read_sections == n && d.reserved[5] == n && d.check_sampled == 16 && tpos(d.check_ns_sampled));
++        EXPECT(spos(d.reserved[7]) && d.reserved[7] == a1[0] - a0[0] && spos(a1[1] - a0[1]));
++        EXPECT(!timed || a1[2] > a0[2]);  // the n Puts move the write split
++        EXPECT(d.read_sections == n && d.reserved[5] == n && in_range(d.check_sampled, n) && spos(d.check_ns_sampled));
++        EXPECT(d.write_sections == n && d.reserved[6] == n && d.wflush_cnt == n && d.wflush_bytes == (hwcc ? 0 : n * kKvLen));
+         EXPECT(d.stale_cnt == 0 && d.concur_cnt == 0 && d.meta_cnt == 0);
+     }
+     Barrier("kv checked");
+diff --git a/include/rackobj.h b/include/rackobj.h
+index 1ef9013..20e7935 100644
+--- a/include/rackobj.h
++++ b/include/rackobj.h
+@@ -83,6 +83,12 @@ struct ObjectStats {
+     uint64_t read_retry_concurrent;  // (B) read_end: version changed during the read
+ };
+ 
++/* Build 76 (lean sampling, reports/M2-megalon-port-changes.md §18): counts are exact in every section; every duration
++ * below is a sum over TIMED sections only: a jittered 1 in check_sample read sections (check_sampled) and write
++ * sections (ThreadAnchor.reserved[0] = write_sampled). Estimate: read-side ns * read_sections / check_sampled, write-
++ * side ns * write_sections / write_sampled. reserved[1]: bit 0 timers on, bit 1 lean sampling, bit 2
++ * MEGALON_COH_EVENTS=always (read events and all writes timed in every section: full sums, not scaled). The intervals
++ * themselves are unchanged from builds 71-75 (below). */
+ /* Build 71 instrumentation (MOT1 v6 Fig 2/3a; observation only). Coherence time of the CALLING thread since its
+  * Register(): durations in ns (plain rdtsc without fences, converted with the TSC rate), counts in events. Field order
+  * = mshim::CohSnap (systems/megalon/shim/megalon_objapi.h, contract v2). Intervals (exact definitions:
+@@ -163,7 +169,7 @@ struct ThreadAnchor {
+     uint64_t read_sections, write_sections, check_sampled;
+     uint64_t read_lookup_ns_sampled, read_nr_ns_sampled, rseq_ns_sampled;
+     uint64_t write_lookup_ns, write_nr_ns, wseq_ns, wseq_end_ns;
+-    uint64_t reserved[6];
++    uint64_t reserved[6];  // [0] (build 76) write_sampled: timed write sections
+ };
+ 
+ void GetThreadAnchor(ThreadAnchor* s);
+diff --git a/lib/object_store.cc b/lib/object_store.cc
+index b96c1a8..739f2cf 100644
+--- a/lib/object_store.cc
++++ b/lib/object_store.cc
+@@ -1,6 +1,8 @@
+ #include "object_store.h"
+ 
+ #include <cerrno>
++#include <mutex>
++#include <vector>
+ 
+ #include "absl/log/check.h"
+ #include "absl/log/log.h"
+@@ -29,6 +31,41 @@ struct Section {
+ thread_local Section sec;
+ thread_local uint64_t next_token = 0;
+ 
++// Build 76 port fix (not instrumentation): the object counters of ObjectStats ("this node") were process-wide atomics
++// (one locked add per read section, three per write section, on cache lines shared by every thread). They are now
++// per-thread blocks, written only by their thread (relaxed load + store, no lock prefix) and summed by Stats().
++struct alignas(64) ObjCounters {
++    std::atomic<uint64_t> creates{0}, create_exists{0}, create_nomem{0};
++    std::atomic<uint64_t> read_sections{0}, read_retry_notify{0}, read_retry_incoherent{0};
++    std::atomic<uint64_t> read_retry_stale{0}, read_retry_concurrent{0};
++    std::atomic<uint64_t> write_sections{0}, write_retry{0}, switch_rw{0};
++    std::atomic<uint64_t> flushes{0}, flush_bytes{0};
++};
++std::mutex ctr_mu;
++std::vector<ObjCounters *> *ctr_all = new std::vector<ObjCounters *>;  // never freed: blocks outlive their threads
++thread_local ObjCounters *t_ctr = nullptr;
++
++ObjCounters &Ctr() {
++    if (!t_ctr) [[unlikely]] {
++        auto *c = new ObjCounters;
++        std::lock_guard<std::mutex> g(ctr_mu);
++        ctr_all->push_back(c);
++        t_ctr = c;
++    }
++    return *t_ctr;
++}
++
++inline void Inc(std::atomic<uint64_t> &a, uint64_t v) {
++    a.store(a.load(std::memory_order_relaxed) + v, std::memory_order_relaxed);
++}
++
++uint64_t Sum(std::atomic<uint64_t> ObjCounters::*f) {
++    std::lock_guard<std::mutex> g(ctr_mu);
++    uint64_t n = 0;
++    for (const ObjCounters *c : *ctr_all) n += (c->*f).load(std::memory_order_relaxed);
++    return n;
++}
++
+ }  // namespace
+ 
+ size_t ObjectStore::ScrExtraBytes(const RackOBJConfig &cfg) {
+@@ -105,8 +142,8 @@ bool ObjectStore::Decode(const std::optional<common::GCDEntry> &e, uint8_t **ptr
+ void ObjectStore::Flush(uint8_t *ptr, size_t size) {
+ #ifndef FULL_COHERENCE
+     c3po_->cache_flush(reinterpret_cast<char *>(ptr), size);  // ptr is 64 B aligned: [ptr, ptr+size) fully covered
+-    local_.flushes.fetch_add(1, std::memory_order_relaxed);
+-    local_.flush_bytes.fetch_add(size, std::memory_order_relaxed);
++    Inc(Ctr().flushes, 1);
++    Inc(Ctr().flush_bytes, size);
+ #else
+     (void)ptr;
+     (void)size;
+@@ -124,7 +161,7 @@ int ObjectStore::Create(uint64_t id, size_t size, Tlm *tlm) {
+     size_t sz;
+     // synced lookup first: no space is reserved for an id that already exists
+     if (Decode(c3po_->Gcd()->Get(key, nr_meta), &p, &sz)) {
+-        local_.create_exists.fetch_add(1, std::memory_order_relaxed);
++        Inc(Ctr().create_exists, 1);
+         return -EEXIST;
+     }
+     std::optional<size_t> wmeta = std::nullopt;  // paper §3.4.2: no coherence record at create (read-shared)
+@@ -134,7 +171,7 @@ int ObjectStore::Create(uint64_t id, size_t size, Tlm *tlm) {
+         uint64_t r = shared_->next_record.v.load(std::memory_order_relaxed);
+         do {
+             if (r >= max_records_) {
+-                local_.create_nomem.fetch_add(1, std::memory_order_relaxed);
++                Inc(Ctr().create_nomem, 1);
+                 return -ENOSPC;
+             }
+         } while (!shared_->next_record.v.compare_exchange_weak(r, r + 1, std::memory_order_relaxed));
+@@ -146,7 +183,7 @@ int ObjectStore::Create(uint64_t id, size_t size, Tlm *tlm) {
+     do {
+         if (cur + rounded > arena_bytes_ || cur + rounded < cur) {
+             if (wmeta.has_value()) shared_->lost_records.v.fetch_add(1, std::memory_order_relaxed);
+-            local_.create_nomem.fetch_add(1, std::memory_order_relaxed);
++            Inc(Ctr().create_nomem, 1);
+             return -ENOMEM;
+         }
+     } while (!shared_->next_off.v.compare_exchange_weak(cur, cur + rounded, std::memory_order_relaxed));
+@@ -155,11 +192,11 @@ int ObjectStore::Create(uint64_t id, size_t size, Tlm *tlm) {
+         // another node created the id between the lookup and our log entry: the space (and record) stay unused
+         shared_->lost_bytes.v.fetch_add(rounded, std::memory_order_relaxed);
+         if (wmeta.has_value()) shared_->lost_records.v.fetch_add(1, std::memory_order_relaxed);
+-        local_.create_exists.fetch_add(1, std::memory_order_relaxed);
++        Inc(Ctr().create_exists, 1);
+         return -EEXIST;
+     }
+     shared_->created.v.fetch_add(1, std::memory_order_relaxed);
+-    local_.creates.fetch_add(1, std::memory_order_relaxed);
++    Inc(Ctr().creates, 1);
+     return 0;
+ }
+ 
+@@ -178,80 +215,96 @@ int ObjectStore::ReadStart(uint64_t id, ObjectHandle *h, Tlm *tlm) {
+     CHECK(sec.kind == Section::kNone) << "nested object section (one open section per thread)";
+     const auto *nr_meta = tlm->nr_meta_per_thread_;
+     CHECK(nr_meta) << "Register() the thread before using objects";
+-    // build 71 instrumentation (observation only; intervals: rackobj.h ObjectThreadCoh)
++    // build 71-76 instrumentation (observation only; intervals: rackobj.h ObjectThreadCoh). Build 76: counts in every
++    // section; TSC only in timed sections (sampled: check, anchor split, rseq, events; events_always: events too).
+     coh::Tls &ct = coh::tls;
+-    const coh::Spin sp0 = coh::SpinNow(ct);
+     const bool sampled = coh::TakeSample(ct);
+-    const uint64_t t_in = sampled ? coh::Now() : 0;
+-    uint64_t stale_wall = 0, stale_spin = 0;  // (A) inside this call
++    const bool timed = sampled && coh::g_cfg.timers;
++    const bool ev = coh::g_cfg.timers && (sampled || coh::g_cfg.events_always);
++    const uint64_t sp0_cnt = coh::SpinCnt(ct);
++    uint64_t sp0_cyc = 0, t_in = 0;
++    if (ev) {
++        coh::EvTimedOn(ct);
++        sp0_cyc = coh::SpinNow(ct).cyc;
++        t_in = coh::Now();
++    }
++    uint64_t stale_wall = 0, stale_spin = 0;  // (A) inside this call (timed sections only)
+     uint64_t stale_t = 0, stale_sp = 0;
+     bool stale_open = false;
+-    coh::AnchorSplit anchor;  // build 74: first attempt's GetAnchor of a sampled section
++    coh::AnchorSplit anchor;  // build 74: first attempt's GetAnchor of a timed section
+     auto close_stale = [&] {
+         if (!stale_open) return;
++        stale_open = false;
++        if (!ev) return;
+         const uint64_t t = coh::Now(), sp = coh::SpinNow(ct).cyc;
+         const uint64_t wall = coh::Sub(ct, t, stale_t), spin = sp - stale_sp;  // spin: monotonic totals
+         stale_wall += wall;
+         stale_spin += spin;
+         ct.stale_cyc += coh::Sub(ct, wall, spin);
+-        stale_open = false;
+     };
+     const common::BlockId key = Key(id);
+     uint8_t *ptr;
+     size_t size;
+     for (;;) {
++        const bool first = !stale_open;  // attempts inside (A) are Megalon-only work
+         std::optional<common::GCDEntry> entry =
+-            sampled && !stale_open
+-                ? coh::TimedAnchor(ct, &anchor, [&] { return c3po_->Gcd()->GetAnchor(key, nr_meta); })
++            timed && first
++                ? coh::TimedAnchor(ct, &anchor, [&] { return c3po_->Gcd()->GetAnchorTimed(key, nr_meta); })
+                 : c3po_->Gcd()->GetAnchor(key, nr_meta);
+         if (!Decode(entry, &ptr, &size)) {  // objects are created explicitly (no admit)
+             close_stale();
+-            const coh::Spin sp = coh::SpinNow(ct);
+-            ct.spin_cnt += sp.cnt - sp0.cnt;
+-            ct.spin_cyc += sp.cyc - sp0.cyc;
++            ct.spin_cnt += coh::SpinCnt(ct) - sp0_cnt;
++            if (ev) {
++                ct.spin_cyc += coh::SpinNow(ct).cyc - sp0_cyc;
++                coh::EvTimedOff(ct);
++            }
+             return -ENOENT;
+         }
+         common::init_read_handle(sec.rh, key, entry, tlm->logical_node_id_);
+         sec.rh.from_cxl = true;
+         sec.rh.cn_index = entry->cn_array_[0].cn_idx_;
+-        const bool coh_rseq = sampled && !stale_open;  // build 75: this attempt's start work is check time
+-        ct.rseq_on = coh_rseq;
+-        ct.rseq_s_pend = 0;
++        sec.rh.coh_timed = timed && first;  // build 75/76: this attempt's version read is check time
++        if (sec.rh.coh_timed) ct.rseq_s_pend = 0;
+         const bool ok = c3po_->read_seq_start(sec.rh);
+-        ct.rseq_on = false;
+-        if (coh_rseq) ct.rseq_cyc += ct.rseq_s_pend;
++        if (sec.rh.coh_timed) ct.rseq_cyc += ct.rseq_s_pend;
+         close_stale();
+         if (ok) break;
+         CHECK(sec.rh.rh_errno == ReadErrno::PAGE_INCOHERENT) << "read_seq_start: unexpected error";
+         // (A) stale copy: open until the restarted attempt has finished
+-        stale_t = coh::Now();
+-        stale_sp = coh::SpinNow(ct).cyc;
++        if (ev) {
++            stale_t = coh::Now();
++            stale_sp = coh::SpinNow(ct).cyc;
++        }
+         stale_open = true;
+         Flush(ptr, size);
+         ct.stale_cnt++;
+-        local_.read_retry_incoherent.fetch_add(1, std::memory_order_relaxed);
+-        local_.read_retry_stale.fetch_add(1, std::memory_order_relaxed);
++        Inc(Ctr().read_retry_incoherent, 1);
++        Inc(Ctr().read_retry_stale, 1);
+     }
+     sec.kind = Section::kRead;
+     sec.token = ++next_token;
+     sec.ptr = ptr;
+     sec.size = size;
+     *h = ObjectHandle{ptr, size, id, sec.token};
+-    local_.read_sections.fetch_add(1, std::memory_order_relaxed);
+-    const uint64_t t_ret = coh::Now();
+-    const coh::Spin sp1 = coh::SpinNow(ct);
++    Inc(Ctr().read_sections, 1);
+     ct.read_sections++;
+-    ct.sec_ret = t_ret;
+-    ct.sec_sp0_cnt = sp0.cnt;
+-    ct.sec_sp0_cyc = sp0.cyc;
+-    ct.sec_sp1_cyc = sp1.cyc;
+-    ct.sec_sampled = sampled;
+-    if (sampled) {
+-        ct.check_sampled++;
+-        ct.check_cyc += coh::Sub(ct, coh::Sub(ct, t_ret, t_in),
+-                                 stale_wall + ((sp1.cyc - sp0.cyc) - stale_spin) + anchor.lookup + anchor.nr);
+-        ct.lookup_cyc += anchor.lookup;
+-        ct.rnr_cyc += anchor.nr;
++    ct.sec_timed = timed;
++    ct.sec_ev = ev;
++    ct.sec_sp0_cnt = sp0_cnt;
++    if (ev) {
++        const uint64_t t_ret = coh::Now();
++        const uint64_t sp1 = coh::SpinNow(ct).cyc;
++        ct.sec_ret = t_ret;
++        ct.sec_sp0_cyc = sp0_cyc;
++        ct.sec_sp1_cyc = sp1;
++        if (timed) {
++            ct.check_sampled++;
++            ct.check_cyc += coh::Sub(ct, coh::Sub(ct, t_ret, t_in),
++                                     stale_wall + ((sp1 - sp0_cyc) - stale_spin) + anchor.lookup + anchor.nr);
++            ct.lookup_cyc += anchor.lookup;
++            ct.rnr_cyc += anchor.nr;
++        }
++        coh::EvTimedOff(ct);
+     }
+     return 0;
+ }
+@@ -262,47 +315,46 @@ bool ObjectStore::ReadEnd(ObjectHandle *h, Tlm *tlm) {
+     CHECK(sec.kind == Section::kRead && h && h->token == sec.token) << "ObjectReadEnd without its ObjectReadStart";
+     sec.kind = Section::kNone;
+     coh::Tls &ct = coh::tls;
+-    const bool sampled = ct.sec_sampled;
+-    const uint64_t t_e = sampled ? coh::Now() : 0;
+-    const uint64_t spe = sampled ? coh::SpinNow(ct).cyc : 0;
+-    ct.rseq_on = sampled;  // build 75: committed only if the section is accepted (else the time is (B)/(C))
+-    ct.rseq_e_pend = 0;
++    const bool timed = ct.sec_timed, ev = ct.sec_ev;
++    uint64_t t_e = 0, spe = 0;
++    if (ev) {
++        coh::EvTimedOn(ct);
++        t_e = coh::Now();
++        spe = coh::SpinNow(ct).cyc;
++    }
++    sec.rh.coh_timed = timed;  // build 75/76: committed only if the section is accepted (else (B)/(C))
++    if (timed) ct.rseq_e_pend = 0;
+     const bool ok = c3po_->read_seq_end(sec.rh, tlm->nr_meta_per_thread_);
+-    ct.rseq_on = false;
+-    if (ok && sampled) ct.rseq_cyc += ct.rseq_e_pend;
++    if (ok && timed) ct.rseq_cyc += ct.rseq_e_pend;
+     bool concurrent = false;
+     if (!ok) {
+         switch (sec.rh.rh_errno) {
+             case ReadErrno::META_OUTDATE:  // a log event on the object: the replay already flushed it (Get: retry)
+-                local_.read_retry_notify.fetch_add(1, std::memory_order_relaxed);
++                Inc(Ctr().read_retry_notify, 1);
+                 break;
+             case ReadErrno::PAGE_INCOHERENT:  // counter changed during the read (Get: flush, retry)
+                 Flush(sec.ptr, sec.size);
+-                local_.read_retry_incoherent.fetch_add(1, std::memory_order_relaxed);
+-                local_.read_retry_concurrent.fetch_add(1, std::memory_order_relaxed);
++                Inc(Ctr().read_retry_incoherent, 1);
++                Inc(Ctr().read_retry_concurrent, 1);
+                 concurrent = true;
+                 break;
+             default:
+                 LOG(FATAL) << "read_seq_end: unexpected error";
+         }
+     }
+-    // build 71 instrumentation (observation only; intervals: rackobj.h ObjectThreadCoh)
+-    const coh::Spin sp2 = coh::SpinNow(ct);
+-    ct.spin_cnt += sp2.cnt - ct.sec_sp0_cnt;
+-    ct.spin_cyc += sp2.cyc - ct.sec_sp0_cyc;
++    ct.spin_cnt += coh::SpinCnt(ct) - ct.sec_sp0_cnt;
++    if (!ok) (concurrent ? ct.concur_cnt : ct.meta_cnt)++;
++    if (!ev) return ok;
++    const uint64_t sp2 = coh::SpinNow(ct).cyc;
++    ct.spin_cyc += sp2 - ct.sec_sp0_cyc;
+     if (ok) {
+-        if (sampled) ct.check_cyc += coh::Sub(ct, coh::Sub(ct, coh::Now(), t_e), sp2.cyc - spe);
+-        return true;
+-    }
+-    const uint64_t d = coh::Sub(ct, coh::Sub(ct, coh::Now(), ct.sec_ret), sp2.cyc - ct.sec_sp1_cyc);
+-    if (concurrent) {
+-        ct.concur_cnt++;
+-        ct.concur_cyc += d;
++        if (timed) ct.check_cyc += coh::Sub(ct, coh::Sub(ct, coh::Now(), t_e), sp2 - spe);
+     } else {
+-        ct.meta_cnt++;
+-        ct.meta_cyc += d;
++        const uint64_t d = coh::Sub(ct, coh::Sub(ct, coh::Now(), ct.sec_ret), sp2 - ct.sec_sp1_cyc);
++        (concurrent ? ct.concur_cyc : ct.meta_cyc) += d;
+     }
+-    return false;
++    coh::EvTimedOff(ct);
++    return ok;
+ }
+ 
+ // write_start = the slot Put up to the data copy: GetAnchor; RO -> SwitchRW (allocate a record via the log, with
+@@ -312,8 +364,14 @@ int ObjectStore::WriteStart(uint64_t id, ObjectHandle *h, Tlm *tlm) {
+     CHECK(sec.kind == Section::kNone) << "nested object section (one open section per thread)";
+     const auto *nr_meta = tlm->nr_meta_per_thread_;
+     CHECK(nr_meta) << "Register() the thread before using objects";
+-    coh::Tls &ct = coh::tls;  // build 71 instrumentation: every write start timed, entry .. return
+-    const uint64_t t_in = coh::Now();
++    // build 76: write sections timed 1 in N (every section with events_always); counts in every section
++    coh::Tls &ct = coh::tls;
++    const bool wt = coh::g_cfg.timers && (coh::TakeWSample(ct) || coh::g_cfg.events_always);
++    uint64_t t_in = 0;
++    if (wt) {
++        coh::EvTimedOn(ct);
++        t_in = coh::Now();
++    }
+     coh::AnchorSplit anchor;
+     const common::BlockId key = Key(id);
+     uint8_t *ptr;
+@@ -321,9 +379,13 @@ int ObjectStore::WriteStart(uint64_t id, ObjectHandle *h, Tlm *tlm) {
+     for (;;) {
+         anchor = coh::AnchorSplit{};  // build 74: only the final attempt's anchor is excluded from wstart
+         std::optional<common::GCDEntry> entry =
+-            coh::TimedAnchor(ct, &anchor, [&] { return c3po_->Gcd()->GetAnchor(key, nr_meta); });
++            wt ? coh::TimedAnchor(ct, &anchor, [&] { return c3po_->Gcd()->GetAnchorTimed(key, nr_meta); })
++               : c3po_->Gcd()->GetAnchor(key, nr_meta);
+         if (!Decode(entry, &ptr, &size)) {
+-            ct.wstart_cyc += coh::Sub(ct, coh::Now(), t_in);
++            if (wt) {
++                ct.wstart_cyc += coh::Sub(ct, coh::Now(), t_in);
++                coh::EvTimedOff(ct);
++            }
+             return -ENOENT;
+         }
+         common::init_write_handle(sec.wh, key, entry, tlm->logical_node_id_);
+@@ -332,37 +394,40 @@ int ObjectStore::WriteStart(uint64_t id, ObjectHandle *h, Tlm *tlm) {
+ #ifndef DYN_WMETA
+             LOG(FATAL) << "object " << id << " has no static record (hwcc objects are created RW)";
+ #endif
+-            const uint64_t t_sw = coh::Now(), rc0 = ct.reclaim_cnt, ry0 = ct.reclaim_cyc;
++            const uint64_t t_sw = wt ? coh::Now() : 0, rc0 = ct.reclaim_cnt, ry0 = ct.reclaim_cyc;
+             std::error_code ec = switch_rw_(sec.wh, tlm);
+             ct.switch_rw_cnt++;
+-            ct.switch_rw_cyc += coh::Sub(ct, coh::Now(), t_sw);
++            if (wt) ct.switch_rw_cyc += coh::Sub(ct, coh::Now(), t_sw);
+             ct.reclaim_obj_cnt += ct.reclaim_cnt - rc0;
+             ct.reclaim_obj_cyc += ct.reclaim_cyc - ry0;
+             CHECK(ec != std::make_error_code(std::errc::operation_not_permitted)) << "object entry vanished";
+-            local_.switch_rw.fetch_add(1, std::memory_order_relaxed);
++            Inc(Ctr().switch_rw, 1);
+             continue;
+         }
+         sec.wh.from_cxl = true;
+-        ct.wseq_on = true;  // build 75: only the final (successful) attempt's lock CAS is committed
+-        ct.wseq_pend = 0;
+-        const bool coh_ok = c3po_->write_seq_start(sec.wh, nr_meta);
+-        ct.wseq_on = false;
+-        if (coh_ok) {
+-            ct.wseq_cyc += ct.wseq_pend;
++        sec.wh.coh_timed = wt;  // build 75/76: only the final (successful) attempt's lock CAS is committed
++        if (wt) ct.wseq_pend = 0;
++        if (c3po_->write_seq_start(sec.wh, nr_meta)) {
++            if (wt) ct.wseq_cyc += ct.wseq_pend;
+             break;
+         }
+-        local_.write_retry.fetch_add(1, std::memory_order_relaxed);
++        Inc(Ctr().write_retry, 1);
+     }
+     sec.kind = Section::kWrite;
+     sec.token = ++next_token;
+     sec.ptr = ptr;
+     sec.size = size;
+     *h = ObjectHandle{ptr, size, id, sec.token};
+-    local_.write_sections.fetch_add(1, std::memory_order_relaxed);
++    Inc(Ctr().write_sections, 1);
+     ct.write_sections++;
+-    ct.wstart_cyc += coh::Sub(ct, coh::Sub(ct, coh::Now(), t_in), anchor.lookup + anchor.nr);
+-    ct.wlookup_cyc += anchor.lookup;
+-    ct.wnr_cyc += anchor.nr;
++    ct.sec_wtimed = wt;
++    if (wt) {
++        ct.write_sampled++;
++        ct.wstart_cyc += coh::Sub(ct, coh::Sub(ct, coh::Now(), t_in), anchor.lookup + anchor.nr);
++        ct.wlookup_cyc += anchor.lookup;
++        ct.wnr_cyc += anchor.nr;
++        coh::EvTimedOff(ct);
++    }
+     return 0;
+ }
+ 
+@@ -370,20 +435,27 @@ int ObjectStore::WriteStart(uint64_t id, ObjectHandle *h, Tlm *tlm) {
+ // write_seq_end (counter even, wrap-around event, l = c, unlock).
+ void ObjectStore::WriteEnd(ObjectHandle *h, Tlm *tlm) {
+     CHECK(sec.kind == Section::kWrite && h && h->token == sec.token) << "ObjectWriteEnd without its ObjectWriteStart";
+-    coh::Tls &ct = coh::tls;  // build 71 instrumentation: every write end timed, entry .. return
+-    const uint64_t t_in = coh::Now();
++    coh::Tls &ct = coh::tls;  // build 76: timed only if the section's WriteStart was
++    const bool wt = ct.sec_wtimed;
++    uint64_t t_in = 0;
++    if (wt) {
++        coh::EvTimedOn(ct);
++        t_in = coh::Now();
++    }
+     Flush(sec.ptr, sec.size);
+-    ct.wseq_on = true;  // build 75: the unlock store inside wflush
+-    ct.wseq_end_pend = 0;
++    sec.wh.coh_timed = wt;  // build 75/76: the unlock store inside wflush
++    if (wt) ct.wseq_end_pend = 0;
+     c3po_->write_seq_end(sec.wh, tlm->nr_meta_per_thread_);
+-    ct.wseq_on = false;
+-    ct.wseq_end_cyc += ct.wseq_end_pend;
+     sec.kind = Section::kNone;
+     ct.wflush_cnt++;
+ #ifndef FULL_COHERENCE
+     ct.wflush_bytes += sec.size;
+ #endif
+-    ct.wflush_cyc += coh::Sub(ct, coh::Now(), t_in);
++    if (wt) {
++        ct.wseq_end_cyc += ct.wseq_end_pend;
++        ct.wflush_cyc += coh::Sub(ct, coh::Now(), t_in);
++        coh::EvTimedOff(ct);
++    }
+ }
+ 
+ void ObjectStore::ThreadAnchorSnap(rackobj::ThreadAnchor *s) {
+@@ -403,6 +475,7 @@ void ObjectStore::ThreadAnchorSnap(rackobj::ThreadAnchor *s) {
+     s->write_nr_ns = ns(t.wnr_cyc);
+     s->wseq_ns = ns(t.wseq_cyc);
+     s->wseq_end_ns = ns(t.wseq_end_cyc);
++    s->reserved[0] = t.write_sampled;  // build 76: timed write sections (write-side estimator denominator)
+ }
+ 
+ void ObjectStore::ThreadAnchorSplit(uint64_t out[4]) {
+@@ -447,7 +520,9 @@ void ObjectStore::ThreadCoh(ObjectThreadCoh *s) {
+     s->wflush_ns = ns(t.wflush_cyc);
+     s->wflush_bytes = t.wflush_bytes;
+     s->reserved[0] = static_cast<uint64_t>(hz / 1000.0 + 0.5);
+-    s->reserved[1] = on ? 1 : 0;
++    // build 76: bit 0 timers on, bit 1 lean sampling semantics (durations over timed sections only), bit 2
++    // MEGALON_COH_EVENTS=always (events and write sections timed in every section)
++    s->reserved[1] = (on ? 1u : 0u) | 2u | (coh::g_cfg.events_always ? 4u : 0u);
+     s->reserved[2] = t.tsc_backwards + coh::NrPtr()[2];  // build 72: clamped negative intervals (this thread)
+     s->reserved[3] = t.admit_cnt;                         // build 73: KV Put creates (CreateEntry), inside wstart
+     s->reserved[4] = ns(t.admit_cyc);
+@@ -465,19 +540,19 @@ void ObjectStore::Stats(ObjectStats *s) const {
+     s->lost_bytes = shared_->lost_bytes.v.load(std::memory_order_relaxed);
+     s->static_records_used = shared_->next_record.v.load(std::memory_order_relaxed);
+     s->lost_records = shared_->lost_records.v.load(std::memory_order_relaxed);
+-    s->creates = local_.creates.load();
+-    s->create_exists = local_.create_exists.load();
+-    s->create_nomem = local_.create_nomem.load();
+-    s->read_sections = local_.read_sections.load();
+-    s->read_retry_notify = local_.read_retry_notify.load();
+-    s->read_retry_incoherent = local_.read_retry_incoherent.load();
+-    s->write_sections = local_.write_sections.load();
+-    s->write_retry = local_.write_retry.load();
+-    s->switch_rw = local_.switch_rw.load();
+-    s->flushes = local_.flushes.load();
+-    s->flush_bytes = local_.flush_bytes.load();
+-    s->read_retry_stale = local_.read_retry_stale.load();
+-    s->read_retry_concurrent = local_.read_retry_concurrent.load();
++    s->creates = Sum(&ObjCounters::creates);
++    s->create_exists = Sum(&ObjCounters::create_exists);
++    s->create_nomem = Sum(&ObjCounters::create_nomem);
++    s->read_sections = Sum(&ObjCounters::read_sections);
++    s->read_retry_notify = Sum(&ObjCounters::read_retry_notify);
++    s->read_retry_incoherent = Sum(&ObjCounters::read_retry_incoherent);
++    s->write_sections = Sum(&ObjCounters::write_sections);
++    s->write_retry = Sum(&ObjCounters::write_retry);
++    s->switch_rw = Sum(&ObjCounters::switch_rw);
++    s->flushes = Sum(&ObjCounters::flushes);
++    s->flush_bytes = Sum(&ObjCounters::flush_bytes);
++    s->read_retry_stale = Sum(&ObjCounters::read_retry_stale);
++    s->read_retry_concurrent = Sum(&ObjCounters::read_retry_concurrent);
+     NrFfi::nr_obj_replay_flush_stats(&s->replay_flushes, &s->replay_flush_bytes);
+ }
+ 
+diff --git a/lib/object_store.h b/lib/object_store.h
+index f3d0d7c..1e2393e 100644
+--- a/lib/object_store.h
++++ b/lib/object_store.h
+@@ -91,15 +91,7 @@ private:
+     port::ObjectShared *shared_ = nullptr;
+     SwitchRwFn switch_rw_;
+ 
+-    // process-local cost counters
+-    struct Local {
+-        std::atomic<uint64_t> creates{0}, create_exists{0}, create_nomem{0};
+-        std::atomic<uint64_t> read_sections{0}, read_retry_notify{0}, read_retry_incoherent{0};
+-        std::atomic<uint64_t> read_retry_stale{0}, read_retry_concurrent{0};  // build 71: split of incoherent
+-        std::atomic<uint64_t> write_sections{0}, write_retry{0}, switch_rw{0};
+-        std::atomic<uint64_t> flushes{0}, flush_bytes{0};
+-    };
+-    mutable Local local_;
++    // build 76: the process-local cost counters are per-thread blocks in object_store.cc (summed by Stats)
+ };
+ 
+ }  // namespace rackobj::lib
+diff --git a/lib/shm_obj_handle.cc b/lib/shm_obj_handle.cc
+index b23377d..815ca86 100644
+--- a/lib/shm_obj_handle.cc
++++ b/lib/shm_obj_handle.cc
+@@ -222,9 +222,12 @@ size_t SharedMemoryObjectHandle<Policy>::CopyFromUserBufferCXL(const WriteHandle
+ 
+     size_t bytes_write = std::min(count, (size_t)SLOT_SIZE - offset_into_page);
+     uint8_t *page = cache_shrd_ptr_->page_data_.GetDataSlot(wh.cn_index.value());
+-    coh::tls.kvw_copy0 = coh::Now();  // build 73 instrumentation (KV Put): the data copy is not coherence work
++    // build 73/76 instrumentation (KV Put, timed sections only): the data copy is not coherence work
++    if (wh.coh_timed) [[unlikely]]
++        coh::tls.kvw_copy0 = coh::Now();
+     memcpy(page + offset_into_page, ptr, bytes_write);
+-    coh::tls.kvw_copy1 = coh::Now();
++    if (wh.coh_timed) [[unlikely]]
++        coh::tls.kvw_copy1 = coh::Now();
+ 
+     // flush data
+ #ifndef FULL_COHERENCE
+@@ -579,11 +582,11 @@ expected<common::CacheNode *, std::error_code> SharedMemoryObjectHandle<Policy>:
+ 
+             // critical path reclamation
+             // De Stijl port instrumentation (build 73): timed like SwitchRW's reclaim attempts; observation only
+-            const uint64_t reclaim_t0 = coh::Now();
++            const uint64_t reclaim_t0 = coh::tls.ev_timed ? coh::Now() : 0;  // build 76: timed sections only
+             new_wmeta_index_optional = c3po_->Scr_meta()->SampleVictim(MAX_WMETA_SAMPLING_SIZE);
+             if (!new_wmeta_index_optional.has_value()) {
+                 coh::tls.reclaim_cnt++;
+-                coh::tls.reclaim_cyc += coh::Sub(coh::tls, coh::Now(), reclaim_t0);
++                if (coh::tls.ev_timed) coh::tls.reclaim_cyc += coh::Sub(coh::tls, coh::Now(), reclaim_t0);
+                 continue;
+             }
+ 
+@@ -611,7 +614,7 @@ expected<common::CacheNode *, std::error_code> SharedMemoryObjectHandle<Policy>:
+             // the answer stays the next reservation's scan hint, as upstream
+             c3po_->Scr_meta()->FinishReclaim(diag_victim, new_wmeta_index_optional);
+             coh::tls.reclaim_cnt++;
+-            coh::tls.reclaim_cyc += coh::Sub(coh::tls, coh::Now(), reclaim_t0);
++            if (coh::tls.ev_timed) coh::tls.reclaim_cyc += coh::Sub(coh::tls, coh::Now(), reclaim_t0);
+ 
+             cpu_relax();
+         } while (true);
+@@ -622,13 +625,18 @@ expected<common::CacheNode *, std::error_code> SharedMemoryObjectHandle<Policy>:
+ 
+         /* 6. Fetch Content */
+         size_t slot_size = (size_t)SLOT_SIZE;
+-        coh::tls.kvw_copy0 = coh::Now();  // build 73 instrumentation (KV Put create): copy, then data flush
++        // build 73/76 instrumentation (KV Put create): copy, then data flush; the "copied" flag is independent of
++        // the timers (build 76 fix: create counts were lost with MEGALON_COH_TIMERS=0)
++        coh::Tls &coh_t = coh::tls;
++        coh_t.kvw_copied = true;
++        const bool coh_on = coh_t.ev_timed;
++        if (coh_on) coh_t.kvw_copy0 = coh::Now();
+         memcpy(static_cast<void *>(cache_shrd_ptr_->GetDataSlot(new_index)), write_data, count);
+-        coh::tls.kvw_copy1 = coh::Now();
++        if (coh_on) coh_t.kvw_copy1 = coh::Now();
+ #ifndef FULL_COHERENCE
+         c3po_->cache_flush(reinterpret_cast<char *>(cache_shrd_ptr_->GetDataSlot(new_index)), count);
+ #endif
+-        coh::tls.kvw_flush_end = coh::Now();
++        if (coh_on) coh_t.kvw_flush_end = coh::Now();
+         new_node->SetLength(slot_size);
+         DLOG(INFO) << "admit write wout fetch block";
+     }
+@@ -709,11 +717,11 @@ std::error_code SharedMemoryObjectHandle<Policy>::SwitchRW(const common::WriteHa
+         // critical path reclamation
+         // De Stijl port instrumentation (build 71): every attempt timed, SampleVictim .. FinishReclaim (or the empty
+         // sample); observation only
+-        const uint64_t reclaim_t0 = coh::Now();
++        const uint64_t reclaim_t0 = coh::tls.ev_timed ? coh::Now() : 0;  // build 76: timed sections only
+         new_wmeta_index_optional = c3po_->Scr_meta()->SampleVictim(MAX_WMETA_SAMPLING_SIZE);
+         if (!new_wmeta_index_optional.has_value()) {
+             coh::tls.reclaim_cnt++;
+-            coh::tls.reclaim_cyc += coh::Sub(coh::tls, coh::Now(), reclaim_t0);
++            if (coh::tls.ev_timed) coh::tls.reclaim_cyc += coh::Sub(coh::tls, coh::Now(), reclaim_t0);
+             continue;
+         }
+ 
+@@ -741,7 +749,7 @@ std::error_code SharedMemoryObjectHandle<Policy>::SwitchRW(const common::WriteHa
+         // the answer stays the next reservation's scan hint, as upstream
+         c3po_->Scr_meta()->FinishReclaim(diag_victim, new_wmeta_index_optional);
+         coh::tls.reclaim_cnt++;
+-        coh::tls.reclaim_cyc += coh::Sub(coh::tls, coh::Now(), reclaim_t0);
++        if (coh::tls.ev_timed) coh::tls.reclaim_cyc += coh::Sub(coh::tls, coh::Now(), reclaim_t0);
+ 
+         cpu_relax();
+     } while (true);
+@@ -939,17 +947,22 @@ expected<size_t, ReadErrno> SharedMemoryObjectHandle<Policy>::ReadFromCXL(struct
+ 
+     /* read seq begin */
+     // C3PO API
+-    coh::Tls &ct = coh::tls;  // build 73 instrumentation (KV Get), observation only
++    // build 73/76 instrumentation (KV Get), observation only: the stage is recorded in the handle (no TLS); the
++    // slot-copy timestamps only in timed sections
+     if (!c3po_->read_seq_start(rh)) {
+-        ct.kvr_stage = 1;
++        rh.coh_stage = 1;
+         return unexpected(rh.rh_errno);
+     }
+-    ct.kvr_copy0 = coh::Now();
+-    ct.kvr_sp_copy0 = coh::SpinNow(ct).cyc;
++    coh::Tls *coh_t = rh.coh_ev ? &coh::tls : nullptr;
++    if (coh_t) [[unlikely]] {
++        coh_t->kvr_copy0 = coh::Now();
++        coh_t->kvr_sp_copy0 = coh::SpinNow(*coh_t).cyc;
++    }
+     // cache_->policy_.Touch(*entry_optional);
+     /* 4. read page (memcpy) */
+     bytes_read = CopyToUserBufferCXL(rh, ptr, count, offset_into_page);
+-    if (ct.kvr_sampled) ct.kvr_copy1 = coh::Now();
++    if (coh_t && coh_t->sec_timed) [[unlikely]]
++        coh_t->kvr_copy1 = coh::Now();
+ 
+     /* read seq check retry */
+     // C3PO API
+@@ -959,7 +972,7 @@ expected<size_t, ReadErrno> SharedMemoryObjectHandle<Policy>::ReadFromCXL(struct
+                              nr_meta
+ #endif
+                              )) {
+-        ct.kvr_stage = 2;
++        rh.coh_stage = 2;
+         return unexpected(rh.rh_errno);
+     }
+ 
+@@ -1155,49 +1168,60 @@ size_t SharedMemoryObjectHandle<Policy>::Get(const common::BlockId &block_id, ui
+                    << offset_into_page << " into the page (exceeds page limit)";
+     }
+ 
+-    // De Stijl port instrumentation (build 73): one KV Get = one read section of CohSnap; observation only.
+-    // Intervals as the object API (rackobj.h ObjectThreadCoh, reports/M2-megalon-port-changes.md §14).
++    // De Stijl port instrumentation (build 73-76): one KV Get = one read section of CohSnap; observation only.
++    // Intervals as the object API (rackobj.h ObjectThreadCoh, reports/M2-megalon-port-changes.md §14, §18). Build 76:
++    // counts in every Get; TSC only in timed Gets.
+     coh::Tls &ct = coh::tls;
+-    const coh::Spin coh_sp0 = coh::SpinNow(ct);
+     const bool coh_sampled = coh::TakeSample(ct);
+-    const uint64_t coh_t_in = coh_sampled ? coh::Now() : 0;
+-    ct.kvr_sampled = coh_sampled;
++    const bool coh_timed = coh_sampled && coh::g_cfg.timers;
++    const bool coh_ev = coh::g_cfg.timers && (coh_sampled || coh::g_cfg.events_always);
++    const uint64_t coh_sp0_cnt = coh::SpinCnt(ct);
++    uint64_t coh_sp0_cyc = 0, coh_t_in = 0;
++    if (coh_ev) {
++        coh::EvTimedOn(ct);
++        coh_sp0_cyc = coh::SpinNow(ct).cyc;
++        coh_t_in = coh::Now();
++    }
++    ct.sec_timed = coh_timed;  // read by ReadFromCXL (slot-copy end) when the handle says coh_ev
+     uint64_t coh_ev_wall = 0, coh_ev_spin = 0;  // (A)(B)(C) wall time and the spin inside them, this Get
+     bool coh_stale_open = false;
+-    coh::AnchorSplit coh_anchor;  // build 74: GetAnchor split of the attempts outside (A), sampled Gets only
++    coh::AnchorSplit coh_anchor;  // build 74: GetAnchor split of the attempts outside (A), timed Gets only
+     uint64_t coh_stale_t = 0, coh_stale_sp = 0;
+     auto coh_close_stale = [&](uint64_t end_t, uint64_t end_sp) {
+         if (!coh_stale_open) return;
++        coh_stale_open = false;
++        if (!coh_ev) return;
+         const uint64_t wall = coh::Sub(ct, end_t, coh_stale_t), spin = end_sp - coh_stale_sp;
+         coh_ev_wall += wall;
+         coh_ev_spin += spin;
+         ct.stale_cyc += coh::Sub(ct, wall, spin);
+-        coh_stale_open = false;
+     };
+-    auto coh_spin_total = [&] {  // (D) of the whole Get
+-        const coh::Spin sp = coh::SpinNow(ct);
+-        ct.spin_cnt += sp.cnt - coh_sp0.cnt;
+-        ct.spin_cyc += sp.cyc - coh_sp0.cyc;
+-        return sp.cyc - coh_sp0.cyc;
++    auto coh_spin_total = [&]() -> uint64_t {  // (D) of the whole Get
++        ct.spin_cnt += coh::SpinCnt(ct) - coh_sp0_cnt;
++        if (!coh_ev) return 0;
++        const uint64_t d = coh::SpinNow(ct).cyc - coh_sp0_cyc;
++        ct.spin_cyc += d;
++        return d;
+     };
+ 
+ retry:
+     size_t bytes_read = 0;
+-    ct.kvr_stage = 0;
+-    ct.kvr_copy0 = ct.kvr_copy1 = 0;
++    if (coh_ev) ct.kvr_copy0 = ct.kvr_copy1 = 0;
++    const bool coh_first = !coh_stale_open;  // attempts inside (A) are Megalon-only work
+ 
+-    entry_optional = coh_sampled && !coh_stale_open
+-                         ? coh::TimedAnchor(ct, &coh_anchor, [&] { return c3po_->Gcd()->GetAnchor(block_id, nr_meta); })
+-                         : c3po_->Gcd()->GetAnchor(block_id, nr_meta);
++    entry_optional =
++        coh_timed && coh_first
++            ? coh::TimedAnchor(ct, &coh_anchor, [&] { return c3po_->Gcd()->GetAnchorTimed(block_id, nr_meta); })
++            : c3po_->Gcd()->GetAnchor(block_id, nr_meta);
+ 
+     init_read_handle(rh, block_id, entry_optional, local_meta->logical_node_id_);
++    // build 75/76: version reads of the attempts outside (A) of a timed Get; start part is always check time, the
++    // end part only if the attempt is accepted (else it is (B)/(C))
++    rh.coh_ev = coh_ev;
++    rh.coh_timed = coh_timed && coh_first;
++    if (rh.coh_timed) ct.rseq_s_pend = ct.rseq_e_pend = 0;
+ 
+     expected<size_t, ReadErrno> result;
+-    // build 75: version reads of the attempts outside (A) of a sampled Get; start part is always check time, the
+-    // end part only if the attempt is accepted (else it is (B)/(C))
+-    const bool coh_rseq = coh_sampled && !coh_stale_open;
+-    ct.rseq_on = coh_rseq;
+-    ct.rseq_s_pend = ct.rseq_e_pend = 0;
+     switch (selectCacheNode(rh)) {
+         case ReadLocation::CXL_SHARED:
+             result = ReadFromCXL(rh, ptr, count, offset_into_page, local_meta);
+@@ -1214,33 +1238,37 @@ retry:
+             break;
+         }
+         case ReadLocation::NO_ENTRY: { /* Cache miss: GCD get failed */
+-            ct.rseq_on = false;
+-            coh_close_stale(coh::Now(), coh::SpinNow(ct).cyc);  // build 73: a miss is not a read section
++            if (coh_ev) coh_close_stale(coh::Now(), coh::SpinNow(ct).cyc);  // build 73: a miss is not a section
++            coh_stale_open = false;
+             (void)coh_spin_total();
++            if (coh_ev) coh::EvTimedOff(ct);
+             return 0;
+         }
+         case ReadLocation::INVALID:
+             LOG(FATAL) << "ReadLocation not initialized";
+     }
+ 
+-    ct.rseq_on = false;
+-    if (coh_rseq) ct.rseq_cyc += ct.rseq_s_pend + (result.has_value() ? ct.rseq_e_pend : 0);
++    if (rh.coh_timed) ct.rseq_cyc += ct.rseq_s_pend + (result.has_value() ? ct.rseq_e_pend : 0);
+     // build 73: an open (A) ends when the restarted attempt has passed (or failed) read_seq_start
+     if (coh_stale_open) {
+-        if (ct.kvr_copy0 != 0)
++        if (!coh_ev)
++            coh_stale_open = false;
++        else if (ct.kvr_copy0 != 0)
+             coh_close_stale(ct.kvr_copy0, ct.kvr_sp_copy0);
+         else
+             coh_close_stale(coh::Now(), coh::SpinNow(ct).cyc);
+     }
+     if (!result.has_value()) {
+-        // build 73: (B)/(C) = slot copy start of the failed attempt .. this retry (incl. the flush), minus (D)
++        // build 73: (B)/(C) = slot copy start of the failed attempt .. this retry (incl. the flush), minus (D);
++        // counted always, timed in timed Gets
+         auto coh_discard = [&](uint64_t *cnt, uint64_t *cyc) {
++            ++*cnt;
++            if (!coh_ev) return;
+             const uint64_t t = coh::Now(), sp = coh::SpinNow(ct).cyc;
+             const uint64_t t0 = ct.kvr_copy0 ? ct.kvr_copy0 : t, sp_0 = ct.kvr_copy0 ? ct.kvr_sp_copy0 : sp;
+             const uint64_t wall = coh::Sub(ct, t, t0), spin = sp - sp_0;
+             coh_ev_wall += wall;
+             coh_ev_spin += spin;
+-            ++*cnt;
+             *cyc += coh::Sub(ct, wall, spin);
+         };
+         switch (rh.rh_errno) {
+@@ -1250,9 +1278,11 @@ retry:
+                 coh_discard(&ct.meta_cnt, &ct.meta_cyc);
+                 goto retry;
+             case ReadErrno::PAGE_INCOHERENT:
+-                if (ct.kvr_stage == 1) {  // (A) stale copy at read_seq_start: open until the restart passed it
+-                    coh_stale_t = coh::Now();
+-                    coh_stale_sp = coh::SpinNow(ct).cyc;
++                if (rh.coh_stage == 1) {  // (A) stale copy at read_seq_start: open until the restart passed it
++                    if (coh_ev) {
++                        coh_stale_t = coh::Now();
++                        coh_stale_sp = coh::SpinNow(ct).cyc;
++                    }
+                     coh_stale_open = true;
+                     ct.stale_cnt++;
+                 }
+@@ -1261,7 +1291,7 @@ retry:
+                     cache_flush_data(rh);
+ #endif
+                 }
+-                if (ct.kvr_stage == 2) coh_discard(&ct.concur_cnt, &ct.concur_cyc);  // (B) at read_seq_end
++                if (rh.coh_stage == 2) coh_discard(&ct.concur_cnt, &ct.concur_cyc);  // (B) at read_seq_end
+                 coherence_retry_cnt[rh.from_cxl ? 0 : rh.current_nid]++;
+                 DLOG(WARNING) << "Read: failed due to cache_flush, retry_cnt: "
+                               << coherence_retry_cnt[rh.from_cxl ? 0 : rh.current_nid];
+@@ -1272,12 +1302,12 @@ retry:
+     }
+     bytes_read = result.value();
+     (void)admit_retry_cnt;
+-    {  // build 73: section counts and the sampled check time
+-        const uint64_t t_ret = coh_sampled ? coh::Now() : 0;
++    {  // build 73/76: section counts and the sampled check time
++        const uint64_t t_ret = coh_timed ? coh::Now() : 0;
+         const uint64_t spin = coh_spin_total();
+         ct.read_sections++;
+         ct.kv_reads++;
+-        if (coh_sampled) {
++        if (coh_timed) {
+             const uint64_t copy = ct.kvr_copy0 ? coh::Sub(ct, ct.kvr_copy1, ct.kvr_copy0) : 0;
+             ct.check_sampled++;
+             ct.check_cyc += coh::Sub(ct, coh::Sub(ct, coh::Sub(ct, t_ret, coh_t_in), copy),
+@@ -1285,6 +1315,7 @@ retry:
+             ct.lookup_cyc += coh_anchor.lookup;
+             ct.rnr_cyc += coh_anchor.nr;
+         }
++        if (coh_ev) coh::EvTimedOff(ct);
+     }
+ 
+     if (diag::Enabled()) {
+@@ -1423,12 +1454,18 @@ size_t SharedMemoryObjectHandle<Policy>::Put(const common::BlockId &block_id, co
+                    << offset_into_page << " into the page (exceeds page limit)";
+     }
+ 
+-    // De Stijl port instrumentation (build 73): one KV Put = one write section of CohSnap; observation only.
++    // De Stijl port instrumentation (build 73-76): one KV Put = one write section of CohSnap; observation only.
+     // wstart = entry .. data copy start (GetAnchor, switch_rw, create incl. its log op, retries, write_seq_start);
+     // wflush = data copy end .. return (flush of the written bytes, write_seq_end); the copy itself is excluded.
++    // Build 76: counts in every Put; TSC only in timed Puts (1 in N; every Put with MEGALON_COH_EVENTS=always).
+     coh::Tls &ct = coh::tls;
+-    const uint64_t coh_t_in = coh::Now();
+-    ct.kvw_copy0 = ct.kvw_copy1 = ct.kvw_flush_end = 0;
++    const bool coh_wt = coh::g_cfg.timers && (coh::TakeWSample(ct) || coh::g_cfg.events_always);
++    uint64_t coh_t_in = 0;
++    if (coh_wt) {
++        coh::EvTimedOn(ct);
++        coh_t_in = coh::Now();
++        ct.kvw_copy0 = ct.kvw_copy1 = ct.kvw_flush_end = 0;
++    }
+     coh::AnchorSplit coh_anchor;  // build 74: the final attempt's GetAnchor is excluded from wstart
+ 
+ retry:
+@@ -1436,7 +1473,8 @@ retry:
+ 
+     coh_anchor = coh::AnchorSplit{};
+     entry_optional =
+-        coh::TimedAnchor(ct, &coh_anchor, [&] { return c3po_->Gcd()->GetAnchor(block_id, nr_meta); });
++        coh_wt ? coh::TimedAnchor(ct, &coh_anchor, [&] { return c3po_->Gcd()->GetAnchorTimed(block_id, nr_meta); })
++               : c3po_->Gcd()->GetAnchor(block_id, nr_meta);
+ 
+     init_write_handle(wh, block_id, entry_optional, local_meta->logical_node_id_);
+ 
+@@ -1449,28 +1487,33 @@ retry:
+             break;
+         }
+         case WriteErrno::PAGE_NOT_FOUND: {  // Cache miss
+-            const uint64_t t_a = coh::Now();
+-            ct.kvw_copy0 = ct.kvw_copy1 = ct.kvw_flush_end = 0;
++            const uint64_t t_a = coh_wt ? coh::Now() : 0;
++            ct.kvw_copied = false;
++            if (coh_wt) ct.kvw_copy0 = ct.kvw_copy1 = ct.kvw_flush_end = 0;
+             auto result = CreateEntry(block_id, ptr, count, local_meta);
+-            {  // build 73: create = admit; the data copy is excluded, the data flush is wflush, the rest wstart
++            // build 73/76: create = admit; the data copy is excluded, the data flush is wflush, the rest wstart.
++            // Counts from kvw_copied (exact with timers off too), times only in timed Puts.
++            ct.admit_cnt++;
++            if (ct.kvw_copied) {
++                ct.write_sections++;
++                ct.kv_writes++;
++                ct.wflush_cnt++;
++#ifndef FULL_COHERENCE
++                ct.wflush_bytes += count;
++#endif
++            }
++            if (coh_wt) {
+                 const uint64_t t_b = coh::Now();
+-                const bool copied = ct.kvw_copy0 != 0;
+-                const uint64_t copy = copied ? coh::Sub(ct, ct.kvw_copy1, ct.kvw_copy0) : 0;
+-                const uint64_t fl = copied ? coh::Sub(ct, ct.kvw_flush_end, ct.kvw_copy1) : 0;
+-                ct.admit_cnt++;
++                const uint64_t copy = ct.kvw_copied ? coh::Sub(ct, ct.kvw_copy1, ct.kvw_copy0) : 0;
++                const uint64_t fl = ct.kvw_copied ? coh::Sub(ct, ct.kvw_flush_end, ct.kvw_copy1) : 0;
+                 ct.admit_cyc += coh::Sub(ct, coh::Sub(ct, t_b, t_a), copy + fl);
+-                ct.wstart_cyc += coh::Sub(ct, coh::Sub(ct, t_b, coh_t_in), copy + fl + coh_anchor.lookup + coh_anchor.nr);
++                ct.wstart_cyc +=
++                    coh::Sub(ct, coh::Sub(ct, t_b, coh_t_in), copy + fl + coh_anchor.lookup + coh_anchor.nr);
+                 ct.wlookup_cyc += coh_anchor.lookup;
+                 ct.wnr_cyc += coh_anchor.nr;
+-                if (copied) {
+-                    ct.write_sections++;
+-                    ct.kv_writes++;
+-                    ct.wflush_cnt++;
+-                    ct.wflush_cyc += fl;
+-#ifndef FULL_COHERENCE
+-                    ct.wflush_bytes += count;
+-#endif
+-                }
++                ct.wflush_cyc += fl;
++                if (ct.kvw_copied) ct.write_sampled++;
++                coh::EvTimedOff(ct);
+             }
+             if (result.error() == std::make_error_code(std::errc::not_enough_memory)) return bytes_write;
+             return count;
+@@ -1478,14 +1521,17 @@ retry:
+         case WriteErrno::MULTIPLE_REPLICA:  // need collapse the entry and
+         case WriteErrno::PAGE_RO: {         // need to switch to rw
+             DLOG(INFO) << "page RO";
+-            const uint64_t t_sw = coh::Now(), rc0 = ct.reclaim_cnt, ry0 = ct.reclaim_cyc;  // build 73
++            const uint64_t t_sw = coh_wt ? coh::Now() : 0, rc0 = ct.reclaim_cnt, ry0 = ct.reclaim_cyc;  // build 73
+             auto ec = SwitchRW(wh, local_meta);
+             ct.switch_rw_cnt++;
+-            ct.switch_rw_cyc += coh::Sub(ct, coh::Now(), t_sw);
++            if (coh_wt) ct.switch_rw_cyc += coh::Sub(ct, coh::Now(), t_sw);
+             ct.reclaim_obj_cnt += ct.reclaim_cnt - rc0;
+             ct.reclaim_obj_cyc += ct.reclaim_cyc - ry0;
+             if (ec == std::make_error_code(std::errc::not_enough_memory)) {
+-                ct.wstart_cyc += coh::Sub(ct, coh::Now(), coh_t_in);
++                if (coh_wt) {
++                    ct.wstart_cyc += coh::Sub(ct, coh::Now(), coh_t_in);
++                    coh::EvTimedOff(ct);
++                }
+                 return bytes_write;
+             }
+             retry_cnt++;
+@@ -1506,13 +1552,12 @@ retry:
+ 
+     expected<size_t, WriteErrno> result;
+ 
+-    ct.wseq_on = true;  // build 75: lock CAS (wstart) and unlock store (wflush) of this attempt
+-    ct.wseq_pend = ct.wseq_end_pend = 0;
++    wh.coh_timed = coh_wt;  // build 75/76: lock CAS (wstart), copy markers and unlock store (wflush) of this attempt
++    if (coh_wt) ct.wseq_pend = ct.wseq_end_pend = 0;
+     if (wh.from_cxl)
+         result = WriteToCXL(wh, ptr, count, offset_into_page, local_meta);
+     else
+         result = WriteToLocal(wh, ptr, count, offset_into_page, local_meta);
+-    ct.wseq_on = false;
+ 
+     if (!result.has_value()) {
+         retry_cnt++;
+@@ -1520,21 +1565,25 @@ retry:
+     } else {
+         bytes_write = *result;
+     }
+-    if (wh.from_cxl) {  // build 73: write section times (the local-exclusive path is PARTITIONED_NODE only)
+-        const uint64_t t_ret = coh::Now();
++    if (wh.from_cxl) {  // build 73: write section counts and times (the local-exclusive path is PARTITIONED_NODE only)
+         ct.write_sections++;
+         ct.kv_writes++;
+-        ct.wstart_cyc += coh::Sub(ct, coh::Sub(ct, ct.kvw_copy0, coh_t_in), coh_anchor.lookup + coh_anchor.nr);
+-        ct.wlookup_cyc += coh_anchor.lookup;
+-        ct.wnr_cyc += coh_anchor.nr;
+-        ct.wseq_cyc += ct.wseq_pend;
+-        ct.wseq_end_cyc += ct.wseq_end_pend;
+         ct.wflush_cnt++;
+-        ct.wflush_cyc += coh::Sub(ct, t_ret, ct.kvw_copy1);
+ #ifndef FULL_COHERENCE
+         ct.wflush_bytes += bytes_write;
+ #endif
++        if (coh_wt) {
++            const uint64_t t_ret = coh::Now();
++            ct.write_sampled++;
++            ct.wstart_cyc += coh::Sub(ct, coh::Sub(ct, ct.kvw_copy0, coh_t_in), coh_anchor.lookup + coh_anchor.nr);
++            ct.wlookup_cyc += coh_anchor.lookup;
++            ct.wnr_cyc += coh_anchor.nr;
++            ct.wseq_cyc += ct.wseq_pend;
++            ct.wseq_end_cyc += ct.wseq_end_pend;
++            ct.wflush_cyc += coh::Sub(ct, t_ret, ct.kvw_copy1);
++        }
+     }
++    if (coh_wt) coh::EvTimedOff(ct);
+ 
+     DLOG(INFO) << "num of retries: " << retry_cnt;
+     return bytes_write;
+diff --git a/src/common/coh_stats.cc b/src/common/coh_stats.cc
+index 00d7f64..bb42e1f 100644
+--- a/src/common/coh_stats.cc
++++ b/src/common/coh_stats.cc
+@@ -30,6 +30,7 @@ __attribute__((constructor)) void Init() {
+         long n = std::strtol(v, nullptr, 10);
+         g_cfg.check_sample = n >= 1 ? static_cast<uint64_t>(n) : 64;
+     }
++    if (const char *v = std::getenv("MEGALON_COH_EVENTS")) g_cfg.events_always = std::strcmp(v, "always") == 0;
+     NrFfi::nr_coh_set_timers(g_cfg.timers);
+     load_ns = MonoNs();
+     load_tsc = __rdtsc();
+@@ -51,6 +52,8 @@ void ResetThread() {
+     t.reclaim_cnt = rc_cnt;
+     t.reclaim_cyc = rc_cyc;
+     t.nr = NrFfi::nr_thread_wait_stat();
++    t.rng = __rdtsc() ^ (reinterpret_cast<uintptr_t>(&t) * 0x9e3779b97f4a7c15ull) ^ 1;  // jitter seed per thread
++    const_cast<uint64_t *>(t.nr)[6] = 0;
+ }
+ 
+ double TscHz() {
+diff --git a/src/common/coh_stats.h b/src/common/coh_stats.h
+index 23b3a30..c59cb2e 100644
+--- a/src/common/coh_stats.h
++++ b/src/common/coh_stats.h
+@@ -5,7 +5,11 @@
+ // Timers: plain rdtsc without fences (accumulated in TSC cycles, converted to ns with the TSC rate when read).
+ // Environment (read once at load):
+ //   MEGALON_COH_TIMERS=0          no rdtsc at all (counts kept, durations 0); default 1
+-//   MEGALON_COH_CHECK_SAMPLE=N    section checks timed in 1 of N read sections per thread; default 64, >= 1
++//   MEGALON_COH_CHECK_SAMPLE=N    1 of N read sections and 1 of N write sections per thread are timed (mean N; the
++//                                 countdown is jittered, uniform in [N/2, N/2 + N)); default 64, >= 1
++//   MEGALON_COH_EVENTS=always     (validation only) also time every event, and every write section, in every section
++// Build 76 (lean): unsampled sections read no TSC; counts are exact in every section; every duration is a sum over
++// timed sections only (estimate: x * read_sections / check_sampled, write side x * write_sections / write_sampled).
+ #pragma once
+ 
+ #include <x86intrin.h>
+@@ -17,6 +21,7 @@ namespace rackobj::coh {
+ struct Config {
+     bool timers = true;
+     uint64_t check_sample = 64;
++    bool events_always = false;  // MEGALON_COH_EVENTS=always
+ };
+ extern Config g_cfg;
+ 
+@@ -45,8 +50,6 @@ struct Tls {
+     bool sec_sampled;      // this section's checks are timed
+     uint64_t tsc_backwards;  // build 72: negative TSC intervals clamped to 0 (CPU migration / TSC skew guard)
+     // build 73: KV Get/Put (shm_obj_handle.cc) markers of the current op's last attempt, and KV-only totals
+-    uint32_t kvr_stage;     // last ReadFromCXL: 0 passed / not reached, 1 read_seq_start failed, 2 read_seq_end failed
+-    bool kvr_sampled;       // the current Get is a sampled read section
+     uint64_t kvr_copy0, kvr_copy1, kvr_sp_copy0;  // Now() before/after the slot copy (copy1 only if sampled), spin
+     uint64_t kvw_copy0, kvw_copy1, kvw_flush_end;  // Put: Now() before/after the data copy, after the data flush
+     uint64_t kv_reads, kv_writes, admit_cnt, admit_cyc;
+@@ -55,12 +58,17 @@ struct Tls {
+     uint64_t lookup_cyc;            // (i) index lookup, sampled read sections -> reserved[7]
+     uint64_t rnr_cyc;               // (ii) NR sync/replay/combine, sampled read sections (not in CohSnap)
+     uint64_t wlookup_cyc, wnr_cyc;  // (i), (ii) of write sections (not in CohSnap)
+-    // build 75: seqlock work all-HWcc also executes (c3.cc hooks, active while the flags are set by the callers)
+-    bool rseq_on, wseq_on;
++    // build 75: seqlock work all-HWcc also executes (c3.cc hooks, active when the handle's coh_timed is set)
+     uint64_t rseq_s_pend, rseq_e_pend;  // read_seq_start RSeqBegin (minus its spin) / read_seq_end RSeqRetry
+     uint64_t wseq_pend, wseq_end_pend;  // write_seq_start WSeqBegin / write_seq_end WSeqEnd
+     uint64_t rseq_cyc;                  // committed: sampled read sections, the calls whose time is in check
+     uint64_t wseq_cyc, wseq_end_cyc;    // committed: every write section's final attempt (inside wstart / wflush)
++    // build 76: lean sampling
++    uint64_t wsample_left, write_sampled;  // write-section countdown, timed write sections
++    uint64_t rng;                          // xorshift64 state of the jittered countdowns
++    bool ev_timed;                         // the current section times its events / waits (sampled or events_always)
++    bool sec_timed, sec_ev, sec_wtimed;    // open read section: checks timed / events timed; open write section timed
++    bool kvw_copied;                       // KV Put: CreateEntry copied the value (independent of the timers)
+ };
+ 
+ // One GetAnchor split into (i) the index lookup and (ii) the rest of the NR anchor (sync to the log tail, replay,
+@@ -70,15 +78,37 @@ struct AnchorSplit {
+     uint64_t lookup = 0, nr = 0;
+ };
+ 
+-// Sampling decision for one read section (object or KV): the 1st, (N+1)th, ... of the thread.
++// Next countdown: N = 1 -> 0 (every section); else uniform in [N/2, N/2 + N - 1] (mean about N).
++inline uint64_t NextGap(Tls &t) {
++    const uint64_t n = g_cfg.check_sample;
++    if (n <= 1) return 0;
++    uint64_t x = t.rng ? t.rng : 0x9e3779b97f4a7c15ull;
++    x ^= x << 13;
++    x ^= x >> 7;
++    x ^= x << 17;
++    t.rng = x;
++    return n / 2 + x % n - 1;
++}
++
++// Sampling decision for one read section (object or KV): the thread's first section, then jittered 1 in N.
+ inline bool TakeSample(Tls &t) {
+     if (t.sample_left == 0) {
+-        t.sample_left = g_cfg.check_sample - 1;
++        t.sample_left = NextGap(t);
+         return true;
+     }
+     t.sample_left--;
+     return false;
+ }
++
++// The same for write sections (own countdown).
++inline bool TakeWSample(Tls &t) {
++    if (t.wsample_left == 0) {
++        t.wsample_left = NextGap(t);
++        return true;
++    }
++    t.wsample_left--;
++    return false;
++}
+ extern thread_local Tls tls;
+ 
+ // end - start of two TSC values (or of an interval and its nested part); a negative result (TSC not monotonic
+@@ -90,6 +120,13 @@ inline uint64_t Sub(Tls &t, uint64_t end, uint64_t start) {
+     return 0;
+ }
+ 
++// Contended-wait episode count of the calling thread (counted in every section).
++const uint64_t *NrPtr();
++inline uint64_t SpinCnt(Tls &t) {
++    const uint64_t *nr = t.nr ? t.nr : NrPtr();
++    return t.rseq_spin_cnt + nr[0];
++}
++
+ // Contended-wait totals of the calling thread (read_seqlock_begin spin + NR read-side waits).
+ struct Spin {
+     uint64_t cnt, cyc;
+@@ -100,22 +137,32 @@ inline Spin SpinNow(Tls &t) {
+     return Spin{t.rseq_spin_cnt + nr[0], t.rseq_spin_cyc + nr[1]};
+ }
+ 
+-// Runs fn() (one GetAnchor) with the NR anchor flag set and returns its result; adds the split to *out.
++// Runs fn() (one GetAnchorTimed: the NR side sets its anchor flag and times the dispatch) and returns its result;
++// adds the split to *out. Timed sections only.
+ template <class F>
+ inline auto TimedAnchor(Tls &t, AnchorSplit *out, F &&fn) {
+-    uint64_t *w = const_cast<uint64_t *>(t.nr ? t.nr : NrPtr());
++    const uint64_t *w = t.nr ? t.nr : NrPtr();
+     const uint64_t l0 = w[4], f0 = w[5], s0 = SpinNow(t).cyc;
+-    w[3] = 1;
+     const uint64_t t0 = Now();
+     auto r = fn();
+     const uint64_t t1 = Now();
+-    w[3] = 0;
+     const uint64_t lookup = w[4] - l0, fl = w[5] - f0, spin = SpinNow(t).cyc - s0;
+     out->lookup += lookup;
+     out->nr += Sub(t, Sub(t, t1, t0), lookup + fl + spin);
+     return r;
+ }
+ 
++// Marks the start / end of a timed section: event and wait timing on (C++ sites read ev_timed; NR waitstat reads its
++// slot 6). Unsampled sections never call these.
++inline void EvTimedOn(Tls &t) {
++    t.ev_timed = true;
++    const_cast<uint64_t *>(t.nr ? t.nr : NrPtr())[6] = 1;
++}
++inline void EvTimedOff(Tls &t) {
++    t.ev_timed = false;
++    const_cast<uint64_t *>(t.nr ? t.nr : NrPtr())[6] = 0;
++}
++
+ // Called at Register(): zero the attribution (the raw totals are monotonic) and bind the NR pointer.
+ void ResetThread();
+ 
+diff --git a/src/core/c3.cc b/src/core/c3.cc
+index 2248f63..07d55d1 100644
+--- a/src/core/c3.cc
++++ b/src/core/c3.cc
+@@ -420,11 +420,15 @@ bool C3POHandle::read_seq_start(ReadHandle &rh) {
+     if (wmeta_index.has_value()) {  // RW mode: enable read sequence lock
+         common::WriteMetadata *wmeta = c3po_->scr_meta_->GetWmeta(wmeta_index.value());
+         // build 75 instrumentation: the version read all-HWcc also executes (flagged calls only), minus its spin (D)
+-        coh::Tls &ct = coh::tls;
+-        const bool coh_on = ct.rseq_on;
+-        const uint64_t coh_t0 = coh_on ? coh::Now() : 0, coh_sp0 = ct.rseq_spin_cyc;
+-        uint32_t cxl_seq = wmeta->RSeqBegin();
+-        if (coh_on) ct.rseq_s_pend += coh::Sub(ct, coh::Sub(ct, coh::Now(), coh_t0), ct.rseq_spin_cyc - coh_sp0);
++        uint32_t cxl_seq;
++        if (rh.coh_timed) [[unlikely]] {  // build 76: timed sections only (flag in the handle, no TLS otherwise)
++            coh::Tls &ct = coh::tls;
++            const uint64_t coh_t0 = coh::Now(), coh_sp0 = ct.rseq_spin_cyc;
++            cxl_seq = wmeta->RSeqBegin();
++            ct.rseq_s_pend += coh::Sub(ct, coh::Sub(ct, coh::Now(), coh_t0), ct.rseq_spin_cyc - coh_sp0);
++        } else {
++            cxl_seq = wmeta->RSeqBegin();
++        }
+ #ifndef FULL_COHERENCE
+         std::optional<SharedMetadata::LocalSeqcountT> local_seq =
+             c3po_->scr_meta_->GetLocalSeqcount(wmeta_index.value(), rh.current_nid);
+@@ -511,10 +515,15 @@ bool C3POHandle::read_seq_end(ReadHandle &rh
+     common::WriteMetadata *wmeta = c3po_->scr_meta_->GetWmeta(wmeta_index.value());
+ 
+     // build 75 instrumentation: the version re-read all-HWcc also executes (flagged calls only)
+-    coh::Tls &coh_t = coh::tls;
+-    const uint64_t coh_t0 = coh_t.rseq_on ? coh::Now() : 0;
+-    const bool coh_retry = wmeta->RSeqRetry(static_cast<uint32_t>(rh.seqcount));
+-    if (coh_t.rseq_on) coh_t.rseq_e_pend += coh::Sub(coh_t, coh::Now(), coh_t0);
++    bool coh_retry;
++    if (rh.coh_timed) [[unlikely]] {  // build 76: timed sections only
++        coh::Tls &coh_t = coh::tls;
++        const uint64_t coh_t0 = coh::Now();
++        coh_retry = wmeta->RSeqRetry(static_cast<uint32_t>(rh.seqcount));
++        coh_t.rseq_e_pend += coh::Sub(coh_t, coh::Now(), coh_t0);
++    } else {
++        coh_retry = wmeta->RSeqRetry(static_cast<uint32_t>(rh.seqcount));
++    }
+     if (coh_retry) {
+ #ifndef FULL_COHERENCE
+         c3po_->scr_meta_->UpdateLocalSeqcount(wmeta_index.value(), rh.current_nid, std::nullopt);
+@@ -656,10 +665,15 @@ bool C3POHandle::write_seq_start(WriteHandle &wh
+     }
+     common::WriteMetadata *wmeta = c3po_->scr_meta_->GetWmeta(wmeta_index.value());
+     // build 75 instrumentation: the lock/version CAS all-HWcc also executes (flagged calls only; incl. its wait)
+-    coh::Tls &coh_t = coh::tls;
+-    const uint64_t coh_t0 = coh_t.wseq_on ? coh::Now() : 0;
+-    const bool coh_locked = wmeta->WSeqBegin();
+-    if (coh_t.wseq_on) coh_t.wseq_pend += coh::Sub(coh_t, coh::Now(), coh_t0);
++    bool coh_locked;
++    if (wh.coh_timed) [[unlikely]] {  // build 76: timed sections only
++        coh::Tls &coh_t = coh::tls;
++        const uint64_t coh_t0 = coh::Now();
++        coh_locked = wmeta->WSeqBegin();
++        coh_t.wseq_pend += coh::Sub(coh_t, coh::Now(), coh_t0);
++    } else {
++        coh_locked = wmeta->WSeqBegin();
++    }
+     if (!coh_locked) {
+         // for dynamic wmeta
+         set_write_handle_errno(wh, WriteErrno::META_OUTDATE);
+@@ -734,10 +748,15 @@ void C3POHandle::write_seq_end(WriteHandle &wh, const NrFfi::NrMeta *nr_meta) {
+ 
+     common::WriteMetadata *wmeta = c3po_->scr_meta_->GetWmeta(wmeta_index.value());
+     // build 75 instrumentation: the version store / unlock all-HWcc also executes (flagged calls only)
+-    coh::Tls &coh_t = coh::tls;
+-    const uint64_t coh_t0 = coh_t.wseq_on ? coh::Now() : 0;
+-    auto seq = wmeta->WSeqEnd();  // seqlock unlock
+-    if (coh_t.wseq_on) coh_t.wseq_end_pend += coh::Sub(coh_t, coh::Now(), coh_t0);
++    uint32_t seq;
++    if (wh.coh_timed) [[unlikely]] {  // build 76: timed sections only
++        coh::Tls &coh_t = coh::tls;
++        const uint64_t coh_t0 = coh::Now();
++        seq = wmeta->WSeqEnd();  // seqlock unlock
++        coh_t.wseq_end_pend += coh::Sub(coh_t, coh::Now(), coh_t0);
++    } else {
++        seq = wmeta->WSeqEnd();  // seqlock unlock
++    }
+ 
+     /**
+      * We discussed that this would be incorrect for the very first time, since the seqlock begins
+diff --git a/src/core/c3.h b/src/core/c3.h
+index 027be39..7f41f0f 100644
+--- a/src/core/c3.h
++++ b/src/core/c3.h
+@@ -54,6 +54,9 @@ struct ReadHandle {
+     bool from_cxl = false;
+     ReadErrno rh_errno;
+     bool is_local_cpu_cached = false;
++    bool coh_timed = false;  // build 76 instrumentation: time the seqlock calls (timed sections only)
++    bool coh_ev = false;     // build 76 (KV Get): events of this attempt are timed (slot-copy timestamps)
++    uint8_t coh_stage = 0;   // build 76 (KV Get): 1 read_seq_start failed, 2 read_seq_end failed (set by ReadFromCXL)
+ };
+ 
+ struct WriteHandle {
+@@ -63,6 +66,7 @@ struct WriteHandle {
+     int current_nid;
+     bool from_cxl = false;
+     WriteErrno wh_errno;
++    bool coh_timed = false;  // build 76 instrumentation: time the seqlock calls (timed sections only)
+ };
+ 
+ /* Consistent Coherent CXL Page nOtification Layer*/
+diff --git a/src/core/seqcount.cc b/src/core/seqcount.cc
+index b1d6de9..f616471 100644
+--- a/src/core/seqcount.cc
++++ b/src/core/seqcount.cc
+@@ -331,14 +331,14 @@ uint32_t read_seqlock_begin(seqlock_t* s) {
+         if (!(seq & 1)) break;
+         if (!spun) {
+             spun = true;
+-            spin_t0 = coh::Now();
++            if (coh::tls.ev_timed) spin_t0 = coh::Now();  // build 76: timed sections only (count always)
+         }
+         cpu_relax();
+     } while (true);
+     if (spun) [[unlikely]] {
+         coh::Tls& t = coh::tls;
+         t.rseq_spin_cnt++;
+-        t.rseq_spin_cyc += coh::Sub(t, coh::Now(), spin_t0);
++        if (t.ev_timed) t.rseq_spin_cyc += coh::Sub(t, coh::Now(), spin_t0);
+     }
+ 
+     return seq & SEQ_MASK;
+diff --git a/src/index/gcd_nr.cc b/src/index/gcd_nr.cc
+index b27de8a..111530a 100644
+--- a/src/index/gcd_nr.cc
++++ b/src/index/gcd_nr.cc
+@@ -121,8 +121,9 @@ std::optional<GCDEntry> GlobalCacheDirectoryHandleNr::Get(const BlockId& block_i
+     return entry;
+ }
+ 
+-std::optional<GCDEntry> GlobalCacheDirectoryHandleNr::GetAnchor(const BlockId& block_id, const NrFfi::NrMeta* nr_meta) {
+-    NrFfi::GCDEntry nr_entry = NrFfi::GetAnchor(nr_meta, block_id);
++namespace {
++GCDEntry FromNr(const NrFfi::GCDEntry& nr_entry_in) {
++    NrFfi::GCDEntry nr_entry = nr_entry_in;
+     GCDEntry entry;
+     for (int i = 0; i < LOGICAL_NODE_NUM + 1; i++) {
+         NrFfi::CNStatus_t& nr_status = nr_entry.cn_array_[i];
+@@ -139,6 +140,17 @@ std::optional<GCDEntry> GlobalCacheDirectoryHandleNr::GetAnchor(const BlockId& b
+         entry.wmeta_idx_ = std::nullopt;
+     return entry;
+ }
++}  // namespace
++
++std::optional<GCDEntry> GlobalCacheDirectoryHandleNr::GetAnchor(const BlockId& block_id, const NrFfi::NrMeta* nr_meta) {
++    return FromNr(NrFfi::GetAnchor(nr_meta, block_id));
++}
++
++// build 76 instrumentation: the anchor of a timed section (NR times the lookup and Megalon-only flushes)
++std::optional<GCDEntry> GlobalCacheDirectoryHandleNr::GetAnchorTimed(const BlockId& block_id,
++                                                                    const NrFfi::NrMeta* nr_meta) {
++    return FromNr(NrFfi::GetAnchorTimed(nr_meta, block_id));
++}
+ 
+ /**
+  * remove the gcd entry
+diff --git a/src/index/gcd_nr.h b/src/index/gcd_nr.h
+index d76c877..8f85917 100644
+--- a/src/index/gcd_nr.h
++++ b/src/index/gcd_nr.h
+@@ -53,6 +53,7 @@ public:
+     std::optional<GCDEntry> Get(const BlockId& block_id, const NrFfi::NrMeta* nr_meta);
+ 
+     std::optional<GCDEntry> GetAnchor(const BlockId& block_id, const NrFfi::NrMeta* nr_meta);
++    std::optional<GCDEntry> GetAnchorTimed(const BlockId& block_id, const NrFfi::NrMeta* nr_meta);  // build 76
+ 
+     std::optional<ssize_t> Delete(const BlockId& to_remove, const NrFfi::NrMeta* nr_meta);
+ 
+diff --git a/src/index/nr_hashmap.h b/src/index/nr_hashmap.h
+index b954377..37deea3 100644
+--- a/src/index/nr_hashmap.h
++++ b/src/index/nr_hashmap.h
+@@ -57,6 +57,7 @@ bool Swap(const NrMeta* metadata, rackobj::common::BlockId to_insert, rackobj::c
+           rackobj::common::GCDEntry val);
+ GCDEntry Get(const NrMeta* metadata, rackobj::common::BlockId key);
+ GCDEntry GetAnchor(const NrMeta* metadata, rackobj::common::BlockId key);
++GCDEntry GetAnchorTimed(const NrMeta* metadata, rackobj::common::BlockId key);  // build 76 instrumentation
+ GCDEntry GetAsync(const NrMeta* metadata, rackobj::common::BlockId key);
+ 
+ void PutArray(const NrMeta* metadata, rackobj::common::BlockId key, ssize_t cn, uint64_t idx, ssize_t wmeta_idx = -1);
+diff --git a/third-party/nr_rust/ffi/ffi_nr_hashmap.rs b/third-party/nr_rust/ffi/ffi_nr_hashmap.rs
+index 0f5983d..4f49f9a 100644
+--- a/third-party/nr_rust/ffi/ffi_nr_hashmap.rs
++++ b/third-party/nr_rust/ffi/ffi_nr_hashmap.rs
+@@ -1322,6 +1322,20 @@ pub extern "C" fn GetAnchor(metadata: *mut NrMeta, key: BlockId) -> GCDEntry {
+     }
+ }
+ 
++/// De Stijl port instrumentation (build 76): GetAnchor of a timed (sampled) section (lookup and Megalon-only flush
++/// timing in waitstat slots 4/5). Same result as GetAnchor.
++#[no_mangle]
++pub extern "C" fn GetAnchorTimed(metadata: *mut NrMeta, key: BlockId) -> GCDEntry {
++    unsafe {
++        let wrapper = (*metadata).nrht.execute_anchor_timed(Access::Get(key), (*metadata).ttkn);
++        let response = wrapper.0;
++        match response {
++            Some(value) => value.value,
++            None => init_empty_gcd_entry(),
++        }
++    }
++}
++
+ #[no_mangle]
+ pub extern "C" fn GetAsync(metadata: *mut NrMeta, key: BlockId) -> GCDEntry {
+     unsafe {
+diff --git a/third-party/nr_rust/ffi/port_tests.rs b/third-party/nr_rust/ffi/port_tests.rs
+index 6a08c88..6d93044 100644
+--- a/third-party/nr_rust/ffi/port_tests.rs
++++ b/third-party/nr_rust/ffi/port_tests.rs
+@@ -394,16 +394,19 @@ fn waitstat_records_contended_read_lock_only() {
+     });
+     while !held.load(Ordering::SeqCst) {}
+     let (c1, y1) = ws();
++    unsafe { *(waitstat::thread_ptr() as *mut u64).add(6) = 1 };  // build 76: a timed section
+     drop(lock.read(0));
++    unsafe { *(waitstat::thread_ptr() as *mut u64).add(6) = 0 };
+     let (c2, y2) = ws();
+     w.join().unwrap();
+     assert_eq!(c2 - c1, 1, "one wait episode");
+     assert!(y2 - y1 > 1_000_000, "waited ~20 ms, got {} cycles", y2 - y1);
+ }
+ 
+-/// Build 74 instrumentation: a flagged anchor records its index-lookup cycles (slot 4); an unflagged one records
+-/// nothing; replaying another node's ops inside a flagged anchor records Megalon-only flush cycles (slot 5) only with
+-/// the `scr` feature.
++/// Build 74/76 instrumentation: a timed anchor (execute_anchor_timed inside a timed section, slot 6 set) records its
++/// index-lookup cycles (slot 4); a plain anchor records nothing; replaying another node's ops inside a timed anchor
++/// records Megalon-only flush cycles (slot 5) only with the `scr` feature. (The C++ side calls the timed anchor only
++/// in timed sections, so it reads the TSC without the section gate.)
+ #[test]
+ fn waitstat_flagged_anchor_records_lookup_only_when_flagged() {
+     use node_replication::nr::waitstat;
+@@ -416,18 +419,21 @@ fn waitstat_flagged_anchor_records_lookup_only_when_flagged() {
+     let t1 = n1.register(1).unwrap();
+     n0.execute_mut(Modify::PutArrayWmeta(key(1), 11, 0, -1), t0);
+     let (l0, f0) = (rd(4), rd(5));
++    unsafe { *w().add(6) = 1 };
+     let _ = n1.execute_anchor(Access::Get(key(1)), t1);
+-    assert_eq!((rd(4), rd(5)), (l0, f0), "unflagged anchor must not record");
++    assert_eq!((rd(4), rd(5)), (l0, f0), "plain anchor must not record");
++    unsafe { *w().add(6) = 0 };
+     for k in 0..50u64 {
+         n0.execute_mut(Modify::PutArrayWmeta(key(100 + k), 100 + k as isize, 0, -1), t0);
+     }
+-    unsafe { *w().add(3) = 1 };
+-    let r = n1.execute_anchor(Access::Get(key(1)), t1);
+-    unsafe { *w().add(3) = 0 };
++    unsafe { *w().add(6) = 1 };
++    let r = n1.execute_anchor_timed(Access::Get(key(1)), t1);
++    unsafe { *w().add(6) = 0 };
++    assert_eq!(rd(3), 0, "anchor flag cleared");
+     assert_eq!(r.0.unwrap().value.cn_array_[0].cn_idx_, 11);
+-    assert!(rd(4) > l0, "flagged anchor records the lookup");
++    assert!(rd(4) > l0, "timed anchor records the lookup");
+     if cfg!(feature = "scr") {
+-        assert!(rd(5) > f0, "replaying 50 remote ops in a flagged anchor records coherence flushes (scr)");
++        assert!(rd(5) > f0, "replaying 50 remote ops in a timed anchor records coherence flushes (scr)");
+     } else {
+         assert_eq!(rd(5), f0);
+     }
+diff --git a/third-party/nr_rust/node-replication/src/nr/log.rs b/third-party/nr_rust/node-replication/src/nr/log.rs
+index c834589..571213a 100644
+--- a/third-party/nr_rust/node-replication/src/nr/log.rs
++++ b/third-party/nr_rust/node-replication/src/nr/log.rs
+@@ -443,7 +443,7 @@ where
+             {
+                 // build 74 instrumentation: Megalon-only coherence work inside a flagged anchor
+                 let flagged = super::waitstat::anchor_flagged();
+-                let t_fl = if flagged { super::waitstat::now() } else { 0 };
++                let t_fl = if flagged { super::waitstat::now_raw() } else { 0 };
+                 unsafe {
+                     let mut off = 0;
+                     while off < Self::entry_size() {
+@@ -453,7 +453,7 @@ where
+                     _mm_mfence();
+                 }
+                 if flagged {
+-                    super::waitstat::acc(super::waitstat::SLOT_COH_FLUSH, t_fl);
++                    super::waitstat::acc_raw(super::waitstat::SLOT_COH_FLUSH, t_fl);
+                 }
+             }
+ 
+diff --git a/third-party/nr_rust/node-replication/src/nr/mod.rs b/third-party/nr_rust/node-replication/src/nr/mod.rs
+index 488b99c..61814bf 100644
+--- a/third-party/nr_rust/node-replication/src/nr/mod.rs
++++ b/third-party/nr_rust/node-replication/src/nr/mod.rs
+@@ -1025,12 +1025,13 @@ where
+         op: <D as Dispatch>::ReadOperation<'rop>,
+         tkn: ThreadToken,
+         cl: Option<CombinerLock<'a, D>>,
++        timed: bool,
+     ) -> Result<<D as Dispatch>::Response, (ReplicaError<D>, <D as Dispatch>::ReadOperation<'rop>)>
+     {
+         if let Some(combiner_lock) = cl {
+-            self.local(tkn.rid).execute_locked_anchor(self.log, op, tkn.rtkn, combiner_lock)
++            self.local(tkn.rid).execute_locked_anchor(self.log, op, tkn.rtkn, combiner_lock, timed)
+         } else {
+-            self.local(tkn.rid).execute_anchor(self.log, op, tkn.rtkn)
++            self.local(tkn.rid).execute_anchor(self.log, op, tkn.rtkn, timed)
+         }
+     }
+ 
+@@ -1147,6 +1148,31 @@ where
+         &self,
+         op: <D as Dispatch>::ReadOperation<'_>,
+         tkn: ThreadToken,
++    ) -> <D as Dispatch>::Response {
++        self.execute_anchor_t(op, tkn, false)
++    }
++
++    /// De Stijl port instrumentation (build 76): `execute_anchor` of a timed (sampled) section; sets the anchor
++    /// flag for the Megalon-only flush timing during this call and times the index dispatch.
++    pub fn execute_anchor_timed(
++        &self,
++        op: <D as Dispatch>::ReadOperation<'_>,
++        tkn: ThreadToken,
++    ) -> <D as Dispatch>::Response {
++        waitstat::set_anchor_flag(true);
++        let r = self.execute_anchor_t(op, tkn, true);
++        waitstat::set_anchor_flag(false);
++        r
++    }
++
++    // One shared copy for timed and untimed anchors (build 76): a separate timed copy would run cold (1 in N) and
++    // bias the sampled durations upward.
++    #[inline(never)]
++    fn execute_anchor_t(
++        &self,
++        op: <D as Dispatch>::ReadOperation<'_>,
++        tkn: ThreadToken,
++        timed: bool,
+     ) -> <D as Dispatch>::Response {
+         enum ResolveOp<'a, 'rop, D>
+         where
+@@ -1163,7 +1189,7 @@ where
+         q.push(ResolveOp::Exec(None, op));
+         loop {
+             match q.pop().unwrap() {
+-                ResolveOp::Exec(cl, op) => match self.try_execute_anchor(op, tkn, cl) {
++                ResolveOp::Exec(cl, op) => match self.try_execute_anchor(op, tkn, cl, timed) {
+                     Ok(resp) => {
+                         assert!(q.is_empty());
+                         return resp;
+diff --git a/third-party/nr_rust/node-replication/src/nr/replica.rs b/third-party/nr_rust/node-replication/src/nr/replica.rs
+index 491433a..ef8bc36 100644
+--- a/third-party/nr_rust/node-replication/src/nr/replica.rs
++++ b/third-party/nr_rust/node-replication/src/nr/replica.rs
+@@ -788,11 +788,13 @@ where
+         return Ok(self.data.read(idx.tid() - 1).dispatch(op));
+     }
+ 
++    #[inline(never)] // build 76: one copy for timed and untimed anchors
+     pub fn execute_anchor<'rop>(
+         &self,
+         slog: &Log<<D as Dispatch>::WriteOperation>,
+         op: <D as Dispatch>::ReadOperation<'rop>,
+         idx: ReplicaToken,
++        timed: bool,
+     ) -> Result<<D as Dispatch>::Response, (ReplicaError<D>, <D as Dispatch>::ReadOperation<'rop>)>
+     {
+         // We can perform the read only if our replica is synced up against
+@@ -806,12 +808,11 @@ where
+         // concurrent replay (exec_notify holds the write guard) cannot run
+         // between the dispatch and the store and miss clearing it.
+         let guard = self.data.read(idx.tid() - 1);
+-        // build 74 instrumentation: the index lookup itself (work all-HWcc does too), flagged anchors only
+-        let flagged = super::waitstat::anchor_flagged();
+-        let t_lookup = if flagged { super::waitstat::now() } else { 0 };
++        // build 74/76 instrumentation: the index lookup itself (work all-HWcc does too), timed anchors only
++        let t_lookup = if timed { super::waitstat::now_raw() } else { 0 };
+         let response = guard.dispatch(op);
+-        if flagged {
+-            super::waitstat::acc(super::waitstat::SLOT_LOOKUP, t_lookup);
++        if timed {
++            super::waitstat::acc_raw(super::waitstat::SLOT_LOOKUP, t_lookup);
+         }
+         self.change_notif[idx.tid() - 1].store(response.cn_idx(), Ordering::Release);
+         drop(guard);
+@@ -881,12 +882,14 @@ where
+         Ok(self.data.read(idx.tid() - 1).dispatch(op))
+     }
+ 
++    #[inline(never)] // build 76: one copy for timed and untimed anchors
+     pub fn execute_locked_anchor<'rop, 'lock>(
+         &'lock self,
+         slog: &Log<<D as Dispatch>::WriteOperation>,
+         op: <D as Dispatch>::ReadOperation<'rop>,
+         idx: ReplicaToken,
+         combiner_lock: CombinerLock<'lock, D>,
++        timed: bool,
+     ) -> Result<<D as Dispatch>::Response, (ReplicaError<D>, <D as Dispatch>::ReadOperation<'rop>)>
+     {
+         // We can perform the read only if our replica is synced up against
+@@ -910,12 +913,11 @@ where
+ 
+         // [C3] see execute_anchor.
+         let guard = self.data.read(idx.tid() - 1);
+-        // build 74 instrumentation: the index lookup itself (work all-HWcc does too), flagged anchors only
+-        let flagged = super::waitstat::anchor_flagged();
+-        let t_lookup = if flagged { super::waitstat::now() } else { 0 };
++        // build 74/76 instrumentation: the index lookup itself (work all-HWcc does too), timed anchors only
++        let t_lookup = if timed { super::waitstat::now_raw() } else { 0 };
+         let response = guard.dispatch(op);
+-        if flagged {
+-            super::waitstat::acc(super::waitstat::SLOT_LOOKUP, t_lookup);
++        if timed {
++            super::waitstat::acc_raw(super::waitstat::SLOT_LOOKUP, t_lookup);
+         }
+         self.change_notif[idx.tid() - 1].store(response.cn_idx(), Ordering::Release);
+         drop(guard);
+@@ -1235,7 +1237,7 @@ where
+                 // where upstream flushes a slot; slots keep upstream's range.
+                 // build 74 instrumentation: Megalon-only coherence work inside a flagged anchor
+                 let flagged = super::waitstat::anchor_flagged();
+-                let t_fl = if flagged { super::waitstat::now() } else { 0 };
++                let t_fl = if flagged { super::waitstat::now_raw() } else { 0 };
+                 if let Some((off, len)) = resp.obj_span() {
+                     let region_ptr = unsafe { self.base_addr.add(off) };
+                     flush_mem_region(region_ptr, len);
+@@ -1246,7 +1248,7 @@ where
+                     flush_mem_region(region_ptr, self.slot_size);
+                 }
+                 if flagged {
+-                    super::waitstat::acc(super::waitstat::SLOT_COH_FLUSH, t_fl);
++                    super::waitstat::acc_raw(super::waitstat::SLOT_COH_FLUSH, t_fl);
+                 }
+             }
+         }
+diff --git a/third-party/nr_rust/node-replication/src/nr/waitstat.rs b/third-party/nr_rust/node-replication/src/nr/waitstat.rs
+index 4b752a5..61f2010 100644
+--- a/third-party/nr_rust/node-replication/src/nr/waitstat.rs
++++ b/third-party/nr_rust/node-replication/src/nr/waitstat.rs
+@@ -14,8 +14,10 @@ use core::sync::atomic::{AtomicBool, Ordering};
+ /// (build 74) anchor-timing flag (set by C++ around a sampled GetAnchor), index lookup cycles of flagged anchors
+ /// (the hash-map dispatch), Megalon-only coherence flush cycles inside flagged anchors (replay flushes of slots /
+ /// objects in exec_notify and the clflush of log entries before reading them; `scr` / `no-coherence` only)].
++/// (build 76) [6] section-timed flag, set by C++ only for timed (sampled) sections: episodes are counted always,
++/// their cycles only while it is set; [3] is now set by GetAnchorTimed itself.
+ #[thread_local]
+-static mut WAIT: [u64; 6] = [0, 0, 0, 0, 0, 0];
++static mut WAIT: [u64; 7] = [0, 0, 0, 0, 0, 0, 0];
+ 
+ pub const SLOT_LOOKUP: usize = 4;
+ pub const SLOT_COH_FLUSH: usize = 5;
+@@ -45,6 +47,18 @@ pub static TIMERS: AtomicBool = AtomicBool::new(true);
+ 
+ #[inline(always)]
+ pub fn now() -> u64 {
++    // build 76: TSC only while the calling thread runs a timed section (slot 6); callers are slow paths only
++    if TIMERS.load(Ordering::Relaxed) && unsafe { (*core::ptr::addr_of!(WAIT))[6] != 0 } {
++        unsafe { core::arch::x86_64::_rdtsc() }
++    } else {
++        0
++    }
++}
++
++/// TSC without the section gate: only for code that is already known to run in a timed anchor (dispatch timing,
++/// flushes under the anchor flag); avoids a thread-local read inside the measured interval.
++#[inline(always)]
++pub fn now_raw() -> u64 {
+     if TIMERS.load(Ordering::Relaxed) {
+         unsafe { core::arch::x86_64::_rdtsc() }
+     } else {
+@@ -52,6 +66,26 @@ pub fn now() -> u64 {
+     }
+ }
+ 
++/// acc() with now_raw().
++#[inline(always)]
++pub fn acc_raw(s: usize, t0: u64) {
++    let t1 = now_raw();
++    unsafe {
++        let w = &mut *core::ptr::addr_of_mut!(WAIT);
++        if t1 >= t0 {
++            w[s] += t1 - t0;
++        } else {
++            w[2] += 1;
++        }
++    }
++}
++
++/// Sets / clears the anchor flag [3] (GetAnchorTimed only).
++#[inline(always)]
++pub fn set_anchor_flag(on: bool) {
++    unsafe { (*core::ptr::addr_of_mut!(WAIT))[3] = on as u64 };
++}
++
+ /// Ends an episode that started at `t0` (a value of `now()`).
+ #[cold]
+ #[inline(never)]
+-- 
+2.34.1
+

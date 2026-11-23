@@ -1,0 +1,107 @@
+From e8064949aca5108681742354b5395a14c1a46135 Mon Sep 17 00:00:00 2001
+From: Sungsu Ahn <sungsu_ahn@korea.ac.kr>
+Date: Thu, 15 Oct 2026 04:32:20 +0900
+Subject: [PATCH 21/51] fix: an RO switch of an already-RO key does not notify;
+ tests check the deallocation notification directly
+
+Verifier on 5acf086: the idempotent RO switch now answers empty again (not a deallocation, no notify/flush),
+and the tests assert on node 1 that the RO switch alone (CheckSwitchWmetaArray(-1) and
+SwitchToReadOnlyByWmeta) clears a remote notification after the tail check. NR tests 14/14 (wmeta-rev), 10/10.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ third-party/nr_rust/ffi/ffi_nr_hashmap.rs  |  3 +-
+ third-party/nr_rust/ffi/port_tests.rs      | 34 ++++++++++++++++++++--
+ third-party/nr_rust/ffi/wmeta_rev_tests.rs | 19 ++++++++++++
+ 3 files changed, 52 insertions(+), 4 deletions(-)
+
+diff --git a/third-party/nr_rust/ffi/ffi_nr_hashmap.rs b/third-party/nr_rust/ffi/ffi_nr_hashmap.rs
+index 70deacd..c823dc4 100644
+--- a/third-party/nr_rust/ffi/ffi_nr_hashmap.rs
++++ b/third-party/nr_rust/ffi/ffi_nr_hashmap.rs
+@@ -452,7 +452,8 @@ impl NrHashMapFFi {
+                         // host detects on replay): respond with the entry itself (old wmeta, the key's cn) so the
+                         // replay clears notifications on this object and flushes its slot. Upstream answered with
+                         // an empty entry (cn -1): no notification, no flush.
+-                        let resp = *entry;
++                        // An already-RO key is not a deallocation: keep upstream's empty answer (no notify/flush).
++                        let resp = if entry.wmeta_idx_ != -1 { *entry } else { init_empty_gcd_entry() };
+                         entry.wmeta_idx_ = wmeta_idx;
+                         return OptionGCDReponse(Some(GCDReponse {
+                             key: key,
+diff --git a/third-party/nr_rust/ffi/port_tests.rs b/third-party/nr_rust/ffi/port_tests.rs
+index 528e936..973f379 100644
+--- a/third-party/nr_rust/ffi/port_tests.rs
++++ b/third-party/nr_rust/ffi/port_tests.rs
+@@ -254,10 +254,38 @@ fn ro_switch_notifies_on_replay_and_synced_check_sees_remote_events() {
+     let r = n0.execute_mut(Modify::CheckSwitchWmetaArray(key(1), -1), t0).0.unwrap();
+     assert_eq!((r.value.wmeta_idx_, r.value.cn_array_[0].cn_idx_), (5, 11));
+ 
+-    // Node 1 has not replayed: the plain check misses the event, the synced check does not.
++    // Node 1 has not replayed: without a tail check the RO switch is invisible ...
+     assert!(n1.check_notification_reset(t1), "without a tail check the remote event is invisible");
++    // ... with the tail check (sync, as CheckNotificationResetSynced does) the RO switch itself clears it.
++    let _ = n1.execute_anchor(Access::Get(key(2)), t1); // syncs nothing new, re-arms on another key
++    let _ = n1.execute_anchor(Access::Get(key(1)), t1); // arms on key 1 (cn 11), replica in sync
++    n0.execute_mut(Modify::CheckSwitchWmetaArray(key(1), 7), t0); // RO -> RW (record 7)
++    let _ = n1.execute_anchor(Access::Get(key(1)), t1); // re-arm after replaying the promotion
++    n0.execute_mut(Modify::CheckSwitchWmetaArray(key(1), -1), t0); // RW -> RO: deallocation event
++    assert!(n1.check_notification_reset(t1), "not replayed yet: plain check passes");
++    let _ = n1.execute_anchor(Access::Get(key(1)), t1); // re-arm (this read syncs and replays the switch)
++    n0.execute_mut(Modify::CheckSwitchWmetaArray(key(1), 8), t0); // RO -> RW again
++    n0.execute_mut(Modify::CheckSwitchWmetaArray(key(1), -1), t0); // and RO again (the paper's A example)
++    n1.sync(t1);
++    assert!(!n1.check_notification_reset(t1), "tail check + replay must surface the RW/RO transitions");
++    // An RO switch of an already-RO key is no deallocation: empty answer, no notification.
+     let _ = n1.execute_anchor(Access::Get(key(1)), t1);
+-    n0.execute_mut(Modify::CheckSwitchWmetaArray(key(1), 6), t0); // RO -> RW on node 0
++    let r = n0.execute_mut(Modify::CheckSwitchWmetaArray(key(1), -1), t0).0.unwrap();
++    assert_eq!((r.value.wmeta_idx_, r.value.cn_array_[0].cn_idx_), (-1, -1));
++    n1.sync(t1);
++    assert!(n1.check_notification_reset(t1), "idempotent RO switch must not notify");
++}
++
++#[test]
++fn ro_switch_alone_clears_remote_notification_after_tail_check() {
++    let m = shared_mem(min_entries());
++    let n0 = node(&m, 0, true, 2000);
++    let n1 = node(&m, 1, false, 2000);
++    let t0 = n0.register(0).unwrap();
++    let t1 = n1.register(1).unwrap();
++    n0.execute_mut(Modify::PutArrayWmeta(key(3), 13, 0, 9), t0); // RW with record 9
++    let _ = n1.execute_anchor(Access::Get(key(3)), t1); // node 1 arms on cn 13
++    n0.execute_mut(Modify::CheckSwitchWmetaArray(key(3), -1), t0); // only the deallocation
+     n1.sync(t1);
+-    assert!(!n1.check_notification_reset(t1), "tail check + replay must clear the notification");
++    assert!(!n1.check_notification_reset(t1), "the RO switch (deallocation) must notify on replay");
+ }
+diff --git a/third-party/nr_rust/ffi/wmeta_rev_tests.rs b/third-party/nr_rust/ffi/wmeta_rev_tests.rs
+index 636f827..ffa6bac 100644
+--- a/third-party/nr_rust/ffi/wmeta_rev_tests.rs
++++ b/third-party/nr_rust/ffi/wmeta_rev_tests.rs
+@@ -124,3 +124,22 @@ fn replicas_resolve_victims_identically_across_nodes() {
+         assert_eq!(n1.execute(Access::Get(key(k)), t1).0.unwrap().value.wmeta_idx_, -1);
+     }
+ }
++
++#[test]
++fn switch_by_wmeta_notifies_remote_reader_after_tail_check() {
++    let m = shared_mem(min_entries());
++    let n0 = node(&m, 0, true, 2000);
++    let n1 = node(&m, 1, false, 2000);
++    let t0 = n0.register(0).unwrap();
++    let t1 = n1.register(1).unwrap();
++    n0.execute_mut(Modify::PutArrayWmeta(key(4), 14, NUMA_MEM, 21), t0);
++    let _ = n1.execute_anchor(Access::Get(key(4)), t1); // node 1 arms on cn 14
++    let g = n0.execute_mut(Modify::SwitchToReadOnlyByWmeta(21), t0).0.unwrap();
++    assert_eq!((g.value.wmeta_idx_, g.value.cn_array_[0].cn_idx_), (21, 14));
++    assert!(n1.check_notification_reset(t1), "not replayed yet");
++    let _ = n1.execute_anchor(Access::Get(key(4)), t1); // re-arm (syncs past the switch)
++    n0.execute_mut(Modify::CheckSwitchWmetaArray(key(4), 22), t0);
++    let _ = n0.execute_mut(Modify::SwitchToReadOnlyByWmeta(22), t0);
++    n1.sync(t1);
++    assert!(!n1.check_notification_reset(t1), "by-wmeta deallocation must notify on replay");
++}
+-- 
+2.34.1
+

@@ -1,0 +1,843 @@
+From a701c5cc5d4413f6475b1a22973251897396035c Mon Sep 17 00:00:00 2001
+From: Sungsu Ahn <sungsu_ahn@korea.ac.kr>
+Date: Sat, 17 Oct 2026 01:13:42 +0900
+Subject: [PATCH 43/51] coh 76: keep only what the v6 figures use; TLS without
+ init wrappers; RwLock fast path inlined
+
+- MEGALON_COH_DETAIL=1 (default off) gates what no v6 figure needs:
+  switch_rw / reclaim counts and times (parts of write start), KV create
+  counts/ns and KV shares (reserved[3..6]), the NR object replay-flush
+  statistics (process-wide atomics in exec_notify, port-added).
+- Sections reach their coh::Tls through ThreadLocalMeta (set at Register);
+  coh::tls is constinit (no TLS init wrapper calls); object counters hang off
+  the Tls.
+- RwLock::read: the uncontended first iteration inlined, the waiting loop
+  (with the wait accounting) out of line; same algorithm as upstream.
+- Timed anchors read the TSC without the section gate (no thread-local read
+  inside the measured lookup); one shared execute_anchor copy.
+- NR/object tests enable the replay-flush statistics they check.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ benchmarks/object_test.cc                     | 17 +++--
+ include/rackobj.h                             |  5 +-
+ lib/globals.cc                                |  1 +
+ lib/object_store.cc                           | 74 ++++++++++---------
+ lib/object_store.h                            |  3 +-
+ lib/shm_obj_handle.cc                         | 52 +++++++------
+ src/common/coh_stats.cc                       |  8 +-
+ src/common/coh_stats.h                        | 18 ++++-
+ src/common/thread_local.h                     |  5 ++
+ src/index/nr_hashmap.h                        |  1 +
+ third-party/nr_rust/ffi/ffi_nr_hashmap.rs     |  6 ++
+ third-party/nr_rust/ffi/object_tests.rs       | 26 ++++---
+ .../node-replication/src/nr/replica.rs        |  7 +-
+ .../nr_rust/node-replication/src/nr/rwlock.rs | 24 +++++-
+ .../node-replication/src/nr/waitstat.rs       |  3 +
+ 15 files changed, 165 insertions(+), 85 deletions(-)
+
+diff --git a/benchmarks/object_test.cc b/benchmarks/object_test.cc
+index 45d7bb4..f801273 100644
+--- a/benchmarks/object_test.cc
++++ b/benchmarks/object_test.cc
+@@ -53,6 +53,8 @@
+ namespace {
+ 
+ size_t node_id = 0;
++// build 76: switch_rw / reclaim / KV-create / KV-share counters exist only with MEGALON_COH_DETAIL=1
++const bool det = std::getenv("MEGALON_COH_DETAIL") && std::string(std::getenv("MEGALON_COH_DETAIL")) == "1";
+ std::atomic<uint64_t> failures{0};
+ uint32_t phase = 0;
+ 
+@@ -488,7 +490,8 @@ void CohPhase(HelperThread &helper) {
+         LOG(INFO) << "COH switch_rw (helper write of RO(own)): " << CohStr(hd);
+         if (!hwcc) {
+             EXPECT(d.meta_cnt == 1 && tpos(d.meta_ns) && d.concur_cnt == 0);
+-            EXPECT(hd.switch_rw_cnt >= 1 && tpos(hd.switch_rw_ns) && hd.wstart_ns >= hd.switch_rw_ns);
++            EXPECT(!det || (hd.switch_rw_cnt >= 1 && tpos(hd.switch_rw_ns) && hd.wstart_ns >= hd.switch_rw_ns));
++            EXPECT(det || (hd.switch_rw_cnt == 0 && hd.switch_rw_ns == 0));
+         }
+         EXPECT(hd.reclaim_ns <= hd.switch_rw_ns && hd.wflush_cnt == 1 && hd.write_sections == 1);
+     }
+@@ -594,7 +597,7 @@ void KvCohPhase(HelperThread &helper, bool churn) {
+         auto d = CohDiff(c0, Coh());
+         LOG(INFO) << "KVCOH create (Put of a new key): " << CohStr(d) << " | admit " << d.reserved[3] << "/"
+                   << d.reserved[4] << " ns, kv " << d.reserved[5] << "/" << d.reserved[6];
+-        EXPECT(d.write_sections == 1 && d.reserved[6] == 1 && d.reserved[3] == 1 && tpos(d.reserved[4]));
++        EXPECT(d.write_sections == 1 && (!det || (d.reserved[6] == 1 && d.reserved[3] == 1 && tpos(d.reserved[4]))));
+         EXPECT(d.wflush_cnt == 1 && (d.wflush_bytes == kKvLen || hwcc) && tpos(d.wstart_ns));
+         EXPECT(d.reserved[4] <= d.wstart_ns && d.read_sections == 0);
+         c0 = Coh();
+@@ -621,7 +624,7 @@ void KvCohPhase(HelperThread &helper, bool churn) {
+         auto d = CohDiff(c0, Coh());
+         LOG(INFO) << "KVCOH stale (node 1 Get after node 0's Put): " << CohStr(d);
+         EXPECT(hwcc || (d.stale_cnt == 1 && tpos(d.stale_ns)));
+-        EXPECT(d.read_sections == 1 && d.reserved[5] == 1 && d.concur_cnt == 0 && d.meta_cnt == 0);
++        EXPECT(d.read_sections == 1 && (!det || d.reserved[5] == 1) && d.concur_cnt == 0 && d.meta_cnt == 0);
+     }
+     Barrier("kv A checked");
+     // (B) concurrent write and (D) writer spin: the helper rewrites the own key in a loop while this thread reads it
+@@ -668,8 +671,8 @@ void KvCohPhase(HelperThread &helper, bool churn) {
+         LOG(INFO) << "KVCOH checks (" << n << " uncontended Gets): " << CohStr(d) << " | " << SplitStr(a0, a1);
+         EXPECT(spos(d.reserved[7]) && d.reserved[7] == a1[0] - a0[0] && spos(a1[1] - a0[1]));
+         EXPECT(!timed || a1[2] > a0[2]);  // the n Puts move the write split
+-        EXPECT(d.read_sections == n && d.reserved[5] == n && in_range(d.check_sampled, n) && spos(d.check_ns_sampled));
+-        EXPECT(d.write_sections == n && d.reserved[6] == n && d.wflush_cnt == n && d.wflush_bytes == (hwcc ? 0 : n * kKvLen));
++        EXPECT(d.read_sections == n && (!det || d.reserved[5] == n) && in_range(d.check_sampled, n) && spos(d.check_ns_sampled));
++        EXPECT(d.write_sections == n && (!det || d.reserved[6] == n) && d.wflush_cnt == n && d.wflush_bytes == (hwcc ? 0 : n * kKvLen));
+         EXPECT(d.stale_cnt == 0 && d.concur_cnt == 0 && d.meta_cnt == 0);
+     }
+     Barrier("kv checked");
+@@ -709,7 +712,7 @@ void KvCohPhase(HelperThread &helper, bool churn) {
+         LOG(INFO) << "KVCOH churn writer: " << CohStr(hd) << " | admit " << hd.reserved[3];
+         EXPECT(torn == 0);
+         EXPECT(d.meta_cnt >= 1 && tpos(d.meta_ns));
+-        EXPECT(hd.switch_rw_cnt >= 1 && tpos(hd.switch_rw_ns) && hd.switch_rw_ns <= hd.wstart_ns);
++        EXPECT(!det || (hd.switch_rw_cnt >= 1 && tpos(hd.switch_rw_ns) && hd.switch_rw_ns <= hd.wstart_ns));
+         EXPECT(hd.reclaim_ns <= hd.wstart_ns);
+     }
+     Barrier("kv churn checked");
+@@ -987,7 +990,7 @@ int main(int argc, char **argv) {
+                   << after.replay_flushes - before.replay_flushes;
+         LOG(INFO) << "COH churn writer: " << CohStr(wcoh) << " | wall " << wwall << " ns, max write " << wmax << " ns";
+         EXPECT(wcoh.wstart_ns + wcoh.wflush_ns <= wwall);  // sub-intervals of the writer's wall time
+-        EXPECT(wcoh.switch_rw_cnt == win1.switch_rw - win0.switch_rw);
++        EXPECT(!det || wcoh.switch_rw_cnt == win1.switch_rw - win0.switch_rw);
+         EXPECT(wcoh.write_sections == writes && wcoh.wflush_cnt == writes);
+         EXPECT(writes > 0 && tot.reads > 0);
+         EXPECT(tot.torn == 0);
+diff --git a/include/rackobj.h b/include/rackobj.h
+index 20e7935..56b229d 100644
+--- a/include/rackobj.h
++++ b/include/rackobj.h
+@@ -87,8 +87,9 @@ struct ObjectStats {
+  * below is a sum over TIMED sections only: a jittered 1 in check_sample read sections (check_sampled) and write
+  * sections (ThreadAnchor.reserved[0] = write_sampled). Estimate: read-side ns * read_sections / check_sampled, write-
+  * side ns * write_sections / write_sampled. reserved[1]: bit 0 timers on, bit 1 lean sampling, bit 2
+- * MEGALON_COH_EVENTS=always (read events and all writes timed in every section: full sums, not scaled). The intervals
+- * themselves are unchanged from builds 71-75 (below). */
++ * MEGALON_COH_EVENTS=always (read events and all writes timed in every section: full sums, not scaled). Only with
++ * MEGALON_COH_DETAIL=1 (default off; no v6 figure needs them): switch_rw_*, reclaim_*, reserved[3..6], and the NR
++ * object replay-flush statistics of ObjectStats. The intervals themselves are unchanged from builds 71-75 (below). */
+ /* Build 71 instrumentation (MOT1 v6 Fig 2/3a; observation only). Coherence time of the CALLING thread since its
+  * Register(): durations in ns (plain rdtsc without fences, converted with the TSC rate), counts in events. Field order
+  * = mshim::CohSnap (systems/megalon/shim/megalon_objapi.h, contract v2). Intervals (exact definitions:
+diff --git a/lib/globals.cc b/lib/globals.cc
+index 267e437..2cf8977 100644
+--- a/lib/globals.cc
++++ b/lib/globals.cc
+@@ -77,6 +77,7 @@ void Register(int tid) {
+     lib::thread_local_meta.file_backed_ = false;
+     lib::thread_local_meta.logical_node_id_ = rid;
+     coh::ResetThread();  // build 71 instrumentation: per-thread coherence time since Register()
++    lib::thread_local_meta.coh_tls_ = &coh::tls;  // build 76: sections reach it without a thread-local lookup
+ 
+     LOG(INFO) << "thread " << tid << " registered on node " << rid;
+ }
+diff --git a/lib/object_store.cc b/lib/object_store.cc
+index 739f2cf..f14fbb3 100644
+--- a/lib/object_store.cc
++++ b/lib/object_store.cc
+@@ -43,16 +43,14 @@ struct alignas(64) ObjCounters {
+ };
+ std::mutex ctr_mu;
+ std::vector<ObjCounters *> *ctr_all = new std::vector<ObjCounters *>;  // never freed: blocks outlive their threads
+-thread_local ObjCounters *t_ctr = nullptr;
+-
+-ObjCounters &Ctr() {
+-    if (!t_ctr) [[unlikely]] {
++ObjCounters &Ctr(coh::Tls &ct) {  // the block pointer lives in the thread's coh::Tls (kept across Register)
++    if (!ct.obj_ctr) [[unlikely]] {
+         auto *c = new ObjCounters;
+         std::lock_guard<std::mutex> g(ctr_mu);
+         ctr_all->push_back(c);
+-        t_ctr = c;
++        ct.obj_ctr = c;
+     }
+-    return *t_ctr;
++    return *static_cast<ObjCounters *>(ct.obj_ctr);
+ }
+ 
+ inline void Inc(std::atomic<uint64_t> &a, uint64_t v) {
+@@ -139,18 +137,20 @@ bool ObjectStore::Decode(const std::optional<common::GCDEntry> &e, uint8_t **ptr
+ }
+ 
+ // Where the slot path flushes a slot (cache_flush_data, CopyFromUserBufferCXL), the object path flushes the object.
+-void ObjectStore::Flush(uint8_t *ptr, size_t size) {
++void ObjectStore::Flush(uint8_t *ptr, size_t size, coh::Tls &ct) {
+ #ifndef FULL_COHERENCE
+     c3po_->cache_flush(reinterpret_cast<char *>(ptr), size);  // ptr is 64 B aligned: [ptr, ptr+size) fully covered
+-    Inc(Ctr().flushes, 1);
+-    Inc(Ctr().flush_bytes, size);
++    Inc(Ctr(ct).flushes, 1);
++    Inc(Ctr(ct).flush_bytes, size);
+ #else
+     (void)ptr;
+     (void)size;
++    (void)ct;
+ #endif
+ }
+ 
+ int ObjectStore::Create(uint64_t id, size_t size, Tlm *tlm) {
++    coh::Tls &ct = coh::Of(tlm);
+     if (!enabled()) return -ENOTSUP;
+     if (size == 0 || id > static_cast<uint64_t>(INT64_MAX)) return -EINVAL;
+     CHECK(sec.kind == Section::kNone) << "ObjectCreate inside an open object section";
+@@ -161,7 +161,7 @@ int ObjectStore::Create(uint64_t id, size_t size, Tlm *tlm) {
+     size_t sz;
+     // synced lookup first: no space is reserved for an id that already exists
+     if (Decode(c3po_->Gcd()->Get(key, nr_meta), &p, &sz)) {
+-        Inc(Ctr().create_exists, 1);
++        Inc(Ctr(ct).create_exists, 1);
+         return -EEXIST;
+     }
+     std::optional<size_t> wmeta = std::nullopt;  // paper §3.4.2: no coherence record at create (read-shared)
+@@ -171,7 +171,7 @@ int ObjectStore::Create(uint64_t id, size_t size, Tlm *tlm) {
+         uint64_t r = shared_->next_record.v.load(std::memory_order_relaxed);
+         do {
+             if (r >= max_records_) {
+-                Inc(Ctr().create_nomem, 1);
++                Inc(Ctr(ct).create_nomem, 1);
+                 return -ENOSPC;
+             }
+         } while (!shared_->next_record.v.compare_exchange_weak(r, r + 1, std::memory_order_relaxed));
+@@ -183,7 +183,7 @@ int ObjectStore::Create(uint64_t id, size_t size, Tlm *tlm) {
+     do {
+         if (cur + rounded > arena_bytes_ || cur + rounded < cur) {
+             if (wmeta.has_value()) shared_->lost_records.v.fetch_add(1, std::memory_order_relaxed);
+-            Inc(Ctr().create_nomem, 1);
++            Inc(Ctr(ct).create_nomem, 1);
+             return -ENOMEM;
+         }
+     } while (!shared_->next_off.v.compare_exchange_weak(cur, cur + rounded, std::memory_order_relaxed));
+@@ -192,11 +192,11 @@ int ObjectStore::Create(uint64_t id, size_t size, Tlm *tlm) {
+         // another node created the id between the lookup and our log entry: the space (and record) stay unused
+         shared_->lost_bytes.v.fetch_add(rounded, std::memory_order_relaxed);
+         if (wmeta.has_value()) shared_->lost_records.v.fetch_add(1, std::memory_order_relaxed);
+-        Inc(Ctr().create_exists, 1);
++        Inc(Ctr(ct).create_exists, 1);
+         return -EEXIST;
+     }
+     shared_->created.v.fetch_add(1, std::memory_order_relaxed);
+-    Inc(Ctr().creates, 1);
++    Inc(Ctr(ct).creates, 1);
+     return 0;
+ }
+ 
+@@ -217,7 +217,7 @@ int ObjectStore::ReadStart(uint64_t id, ObjectHandle *h, Tlm *tlm) {
+     CHECK(nr_meta) << "Register() the thread before using objects";
+     // build 71-76 instrumentation (observation only; intervals: rackobj.h ObjectThreadCoh). Build 76: counts in every
+     // section; TSC only in timed sections (sampled: check, anchor split, rseq, events; events_always: events too).
+-    coh::Tls &ct = coh::tls;
++    coh::Tls &ct = coh::Of(tlm);
+     const bool sampled = coh::TakeSample(ct);
+     const bool timed = sampled && coh::g_cfg.timers;
+     const bool ev = coh::g_cfg.timers && (sampled || coh::g_cfg.events_always);
+@@ -276,17 +276,17 @@ int ObjectStore::ReadStart(uint64_t id, ObjectHandle *h, Tlm *tlm) {
+             stale_sp = coh::SpinNow(ct).cyc;
+         }
+         stale_open = true;
+-        Flush(ptr, size);
++        Flush(ptr, size, ct);
+         ct.stale_cnt++;
+-        Inc(Ctr().read_retry_incoherent, 1);
+-        Inc(Ctr().read_retry_stale, 1);
++        Inc(Ctr(ct).read_retry_incoherent, 1);
++        Inc(Ctr(ct).read_retry_stale, 1);
+     }
+     sec.kind = Section::kRead;
+     sec.token = ++next_token;
+     sec.ptr = ptr;
+     sec.size = size;
+     *h = ObjectHandle{ptr, size, id, sec.token};
+-    Inc(Ctr().read_sections, 1);
++    Inc(Ctr(ct).read_sections, 1);
+     ct.read_sections++;
+     ct.sec_timed = timed;
+     ct.sec_ev = ev;
+@@ -314,7 +314,7 @@ int ObjectStore::ReadStart(uint64_t id, ObjectHandle *h, Tlm *tlm) {
+ bool ObjectStore::ReadEnd(ObjectHandle *h, Tlm *tlm) {
+     CHECK(sec.kind == Section::kRead && h && h->token == sec.token) << "ObjectReadEnd without its ObjectReadStart";
+     sec.kind = Section::kNone;
+-    coh::Tls &ct = coh::tls;
++    coh::Tls &ct = coh::Of(tlm);
+     const bool timed = ct.sec_timed, ev = ct.sec_ev;
+     uint64_t t_e = 0, spe = 0;
+     if (ev) {
+@@ -330,12 +330,12 @@ bool ObjectStore::ReadEnd(ObjectHandle *h, Tlm *tlm) {
+     if (!ok) {
+         switch (sec.rh.rh_errno) {
+             case ReadErrno::META_OUTDATE:  // a log event on the object: the replay already flushed it (Get: retry)
+-                Inc(Ctr().read_retry_notify, 1);
++                Inc(Ctr(ct).read_retry_notify, 1);
+                 break;
+             case ReadErrno::PAGE_INCOHERENT:  // counter changed during the read (Get: flush, retry)
+-                Flush(sec.ptr, sec.size);
+-                Inc(Ctr().read_retry_incoherent, 1);
+-                Inc(Ctr().read_retry_concurrent, 1);
++                Flush(sec.ptr, sec.size, ct);
++                Inc(Ctr(ct).read_retry_incoherent, 1);
++                Inc(Ctr(ct).read_retry_concurrent, 1);
+                 concurrent = true;
+                 break;
+             default:
+@@ -365,7 +365,7 @@ int ObjectStore::WriteStart(uint64_t id, ObjectHandle *h, Tlm *tlm) {
+     const auto *nr_meta = tlm->nr_meta_per_thread_;
+     CHECK(nr_meta) << "Register() the thread before using objects";
+     // build 76: write sections timed 1 in N (every section with events_always); counts in every section
+-    coh::Tls &ct = coh::tls;
++    coh::Tls &ct = coh::Of(tlm);
+     const bool wt = coh::g_cfg.timers && (coh::TakeWSample(ct) || coh::g_cfg.events_always);
+     uint64_t t_in = 0;
+     if (wt) {
+@@ -394,14 +394,18 @@ int ObjectStore::WriteStart(uint64_t id, ObjectHandle *h, Tlm *tlm) {
+ #ifndef DYN_WMETA
+             LOG(FATAL) << "object " << id << " has no static record (hwcc objects are created RW)";
+ #endif
+-            const uint64_t t_sw = wt ? coh::Now() : 0, rc0 = ct.reclaim_cnt, ry0 = ct.reclaim_cyc;
++            // switch_rw / reclaim are parts of write start (Fig 3a has no separate component): MEGALON_COH_DETAIL only
++            const bool det = coh::g_cfg.detail;
++            const uint64_t t_sw = wt && det ? coh::Now() : 0, rc0 = ct.reclaim_cnt, ry0 = ct.reclaim_cyc;
+             std::error_code ec = switch_rw_(sec.wh, tlm);
+-            ct.switch_rw_cnt++;
+-            if (wt) ct.switch_rw_cyc += coh::Sub(ct, coh::Now(), t_sw);
+-            ct.reclaim_obj_cnt += ct.reclaim_cnt - rc0;
+-            ct.reclaim_obj_cyc += ct.reclaim_cyc - ry0;
++            if (det) {
++                ct.switch_rw_cnt++;
++                if (wt) ct.switch_rw_cyc += coh::Sub(ct, coh::Now(), t_sw);
++                ct.reclaim_obj_cnt += ct.reclaim_cnt - rc0;
++                ct.reclaim_obj_cyc += ct.reclaim_cyc - ry0;
++            }
+             CHECK(ec != std::make_error_code(std::errc::operation_not_permitted)) << "object entry vanished";
+-            Inc(Ctr().switch_rw, 1);
++            Inc(Ctr(ct).switch_rw, 1);
+             continue;
+         }
+         sec.wh.from_cxl = true;
+@@ -411,14 +415,14 @@ int ObjectStore::WriteStart(uint64_t id, ObjectHandle *h, Tlm *tlm) {
+             if (wt) ct.wseq_cyc += ct.wseq_pend;
+             break;
+         }
+-        Inc(Ctr().write_retry, 1);
++        Inc(Ctr(ct).write_retry, 1);
+     }
+     sec.kind = Section::kWrite;
+     sec.token = ++next_token;
+     sec.ptr = ptr;
+     sec.size = size;
+     *h = ObjectHandle{ptr, size, id, sec.token};
+-    Inc(Ctr().write_sections, 1);
++    Inc(Ctr(ct).write_sections, 1);
+     ct.write_sections++;
+     ct.sec_wtimed = wt;
+     if (wt) {
+@@ -435,14 +439,14 @@ int ObjectStore::WriteStart(uint64_t id, ObjectHandle *h, Tlm *tlm) {
+ // write_seq_end (counter even, wrap-around event, l = c, unlock).
+ void ObjectStore::WriteEnd(ObjectHandle *h, Tlm *tlm) {
+     CHECK(sec.kind == Section::kWrite && h && h->token == sec.token) << "ObjectWriteEnd without its ObjectWriteStart";
+-    coh::Tls &ct = coh::tls;  // build 76: timed only if the section's WriteStart was
++    coh::Tls &ct = coh::Of(tlm);  // build 76: timed only if the section's WriteStart was
+     const bool wt = ct.sec_wtimed;
+     uint64_t t_in = 0;
+     if (wt) {
+         coh::EvTimedOn(ct);
+         t_in = coh::Now();
+     }
+-    Flush(sec.ptr, sec.size);
++    Flush(sec.ptr, sec.size, ct);
+     sec.wh.coh_timed = wt;  // build 75/76: the unlock store inside wflush
+     if (wt) ct.wseq_end_pend = 0;
+     c3po_->write_seq_end(sec.wh, tlm->nr_meta_per_thread_);
+diff --git a/lib/object_store.h b/lib/object_store.h
+index 1e2393e..6417ab9 100644
+--- a/lib/object_store.h
++++ b/lib/object_store.h
+@@ -24,6 +24,7 @@
+ #include <functional>
+ #include <system_error>
+ 
++#include "common/coh_stats.h"
+ #include "common/config.h"
+ #include "common/thread_local.h"
+ #include "core/c3.h"
+@@ -79,7 +80,7 @@ public:
+ private:
+     static common::BlockId Key(uint64_t id);
+     bool Decode(const std::optional<common::GCDEntry> &e, uint8_t **ptr, size_t *size) const;
+-    void Flush(uint8_t *ptr, size_t size);
++    void Flush(uint8_t *ptr, size_t size, coh::Tls &ct);
+ 
+     C3POHandle *c3po_;
+     const uint8_t *flush_base_;
+diff --git a/lib/shm_obj_handle.cc b/lib/shm_obj_handle.cc
+index 815ca86..eb79155 100644
+--- a/lib/shm_obj_handle.cc
++++ b/lib/shm_obj_handle.cc
+@@ -582,11 +582,11 @@ expected<common::CacheNode *, std::error_code> SharedMemoryObjectHandle<Policy>:
+ 
+             // critical path reclamation
+             // De Stijl port instrumentation (build 73): timed like SwitchRW's reclaim attempts; observation only
+-            const uint64_t reclaim_t0 = coh::tls.ev_timed ? coh::Now() : 0;  // build 76: timed sections only
++            const uint64_t reclaim_t0 = coh::g_cfg.detail && coh::tls.ev_timed ? coh::Now() : 0;  // build 76: timed sections only
+             new_wmeta_index_optional = c3po_->Scr_meta()->SampleVictim(MAX_WMETA_SAMPLING_SIZE);
+             if (!new_wmeta_index_optional.has_value()) {
+-                coh::tls.reclaim_cnt++;
+-                if (coh::tls.ev_timed) coh::tls.reclaim_cyc += coh::Sub(coh::tls, coh::Now(), reclaim_t0);
++                if (coh::g_cfg.detail) coh::tls.reclaim_cnt++;
++                if (coh::g_cfg.detail && coh::tls.ev_timed) coh::tls.reclaim_cyc += coh::Sub(coh::tls, coh::Now(), reclaim_t0);
+                 continue;
+             }
+ 
+@@ -613,8 +613,8 @@ expected<common::CacheNode *, std::error_code> SharedMemoryObjectHandle<Policy>:
+             (void)cur;
+             // the answer stays the next reservation's scan hint, as upstream
+             c3po_->Scr_meta()->FinishReclaim(diag_victim, new_wmeta_index_optional);
+-            coh::tls.reclaim_cnt++;
+-            if (coh::tls.ev_timed) coh::tls.reclaim_cyc += coh::Sub(coh::tls, coh::Now(), reclaim_t0);
++            if (coh::g_cfg.detail) coh::tls.reclaim_cnt++;
++            if (coh::g_cfg.detail && coh::tls.ev_timed) coh::tls.reclaim_cyc += coh::Sub(coh::tls, coh::Now(), reclaim_t0);
+ 
+             cpu_relax();
+         } while (true);
+@@ -627,7 +627,7 @@ expected<common::CacheNode *, std::error_code> SharedMemoryObjectHandle<Policy>:
+         size_t slot_size = (size_t)SLOT_SIZE;
+         // build 73/76 instrumentation (KV Put create): copy, then data flush; the "copied" flag is independent of
+         // the timers (build 76 fix: create counts were lost with MEGALON_COH_TIMERS=0)
+-        coh::Tls &coh_t = coh::tls;
++        coh::Tls &coh_t = coh::Of(local_meta);
+         coh_t.kvw_copied = true;
+         const bool coh_on = coh_t.ev_timed;
+         if (coh_on) coh_t.kvw_copy0 = coh::Now();
+@@ -717,11 +717,11 @@ std::error_code SharedMemoryObjectHandle<Policy>::SwitchRW(const common::WriteHa
+         // critical path reclamation
+         // De Stijl port instrumentation (build 71): every attempt timed, SampleVictim .. FinishReclaim (or the empty
+         // sample); observation only
+-        const uint64_t reclaim_t0 = coh::tls.ev_timed ? coh::Now() : 0;  // build 76: timed sections only
++        const uint64_t reclaim_t0 = coh::g_cfg.detail && coh::tls.ev_timed ? coh::Now() : 0;  // build 76: timed sections only
+         new_wmeta_index_optional = c3po_->Scr_meta()->SampleVictim(MAX_WMETA_SAMPLING_SIZE);
+         if (!new_wmeta_index_optional.has_value()) {
+-            coh::tls.reclaim_cnt++;
+-            if (coh::tls.ev_timed) coh::tls.reclaim_cyc += coh::Sub(coh::tls, coh::Now(), reclaim_t0);
++            if (coh::g_cfg.detail) coh::tls.reclaim_cnt++;
++            if (coh::g_cfg.detail && coh::tls.ev_timed) coh::tls.reclaim_cyc += coh::Sub(coh::tls, coh::Now(), reclaim_t0);
+             continue;
+         }
+ 
+@@ -748,8 +748,8 @@ std::error_code SharedMemoryObjectHandle<Policy>::SwitchRW(const common::WriteHa
+         (void)cur;
+         // the answer stays the next reservation's scan hint, as upstream
+         c3po_->Scr_meta()->FinishReclaim(diag_victim, new_wmeta_index_optional);
+-        coh::tls.reclaim_cnt++;
+-        if (coh::tls.ev_timed) coh::tls.reclaim_cyc += coh::Sub(coh::tls, coh::Now(), reclaim_t0);
++        if (coh::g_cfg.detail) coh::tls.reclaim_cnt++;
++        if (coh::g_cfg.detail && coh::tls.ev_timed) coh::tls.reclaim_cyc += coh::Sub(coh::tls, coh::Now(), reclaim_t0);
+ 
+         cpu_relax();
+     } while (true);
+@@ -953,7 +953,7 @@ expected<size_t, ReadErrno> SharedMemoryObjectHandle<Policy>::ReadFromCXL(struct
+         rh.coh_stage = 1;
+         return unexpected(rh.rh_errno);
+     }
+-    coh::Tls *coh_t = rh.coh_ev ? &coh::tls : nullptr;
++    coh::Tls *coh_t = rh.coh_ev ? &coh::Of(local_meta) : nullptr;
+     if (coh_t) [[unlikely]] {
+         coh_t->kvr_copy0 = coh::Now();
+         coh_t->kvr_sp_copy0 = coh::SpinNow(*coh_t).cyc;
+@@ -1171,7 +1171,7 @@ size_t SharedMemoryObjectHandle<Policy>::Get(const common::BlockId &block_id, ui
+     // De Stijl port instrumentation (build 73-76): one KV Get = one read section of CohSnap; observation only.
+     // Intervals as the object API (rackobj.h ObjectThreadCoh, reports/M2-megalon-port-changes.md §14, §18). Build 76:
+     // counts in every Get; TSC only in timed Gets.
+-    coh::Tls &ct = coh::tls;
++    coh::Tls &ct = coh::Of(local_meta);
+     const bool coh_sampled = coh::TakeSample(ct);
+     const bool coh_timed = coh_sampled && coh::g_cfg.timers;
+     const bool coh_ev = coh::g_cfg.timers && (coh_sampled || coh::g_cfg.events_always);
+@@ -1306,7 +1306,7 @@ retry:
+         const uint64_t t_ret = coh_timed ? coh::Now() : 0;
+         const uint64_t spin = coh_spin_total();
+         ct.read_sections++;
+-        ct.kv_reads++;
++        if (coh::g_cfg.detail) ct.kv_reads++;
+         if (coh_timed) {
+             const uint64_t copy = ct.kvr_copy0 ? coh::Sub(ct, ct.kvr_copy1, ct.kvr_copy0) : 0;
+             ct.check_sampled++;
+@@ -1458,7 +1458,7 @@ size_t SharedMemoryObjectHandle<Policy>::Put(const common::BlockId &block_id, co
+     // wstart = entry .. data copy start (GetAnchor, switch_rw, create incl. its log op, retries, write_seq_start);
+     // wflush = data copy end .. return (flush of the written bytes, write_seq_end); the copy itself is excluded.
+     // Build 76: counts in every Put; TSC only in timed Puts (1 in N; every Put with MEGALON_COH_EVENTS=always).
+-    coh::Tls &ct = coh::tls;
++    coh::Tls &ct = coh::Of(local_meta);
+     const bool coh_wt = coh::g_cfg.timers && (coh::TakeWSample(ct) || coh::g_cfg.events_always);
+     uint64_t coh_t_in = 0;
+     if (coh_wt) {
+@@ -1493,10 +1493,10 @@ retry:
+             auto result = CreateEntry(block_id, ptr, count, local_meta);
+             // build 73/76: create = admit; the data copy is excluded, the data flush is wflush, the rest wstart.
+             // Counts from kvw_copied (exact with timers off too), times only in timed Puts.
+-            ct.admit_cnt++;
++            if (coh::g_cfg.detail) ct.admit_cnt++;
+             if (ct.kvw_copied) {
+                 ct.write_sections++;
+-                ct.kv_writes++;
++                if (coh::g_cfg.detail) ct.kv_writes++;
+                 ct.wflush_cnt++;
+ #ifndef FULL_COHERENCE
+                 ct.wflush_bytes += count;
+@@ -1506,7 +1506,7 @@ retry:
+                 const uint64_t t_b = coh::Now();
+                 const uint64_t copy = ct.kvw_copied ? coh::Sub(ct, ct.kvw_copy1, ct.kvw_copy0) : 0;
+                 const uint64_t fl = ct.kvw_copied ? coh::Sub(ct, ct.kvw_flush_end, ct.kvw_copy1) : 0;
+-                ct.admit_cyc += coh::Sub(ct, coh::Sub(ct, t_b, t_a), copy + fl);
++                if (coh::g_cfg.detail) ct.admit_cyc += coh::Sub(ct, coh::Sub(ct, t_b, t_a), copy + fl);
+                 ct.wstart_cyc +=
+                     coh::Sub(ct, coh::Sub(ct, t_b, coh_t_in), copy + fl + coh_anchor.lookup + coh_anchor.nr);
+                 ct.wlookup_cyc += coh_anchor.lookup;
+@@ -1521,12 +1521,16 @@ retry:
+         case WriteErrno::MULTIPLE_REPLICA:  // need collapse the entry and
+         case WriteErrno::PAGE_RO: {         // need to switch to rw
+             DLOG(INFO) << "page RO";
+-            const uint64_t t_sw = coh_wt ? coh::Now() : 0, rc0 = ct.reclaim_cnt, ry0 = ct.reclaim_cyc;  // build 73
++            // build 73/76: switch_rw / reclaim are parts of write start; separate values only with MEGALON_COH_DETAIL
++            const bool det = coh::g_cfg.detail;
++            const uint64_t t_sw = coh_wt && det ? coh::Now() : 0, rc0 = ct.reclaim_cnt, ry0 = ct.reclaim_cyc;
+             auto ec = SwitchRW(wh, local_meta);
+-            ct.switch_rw_cnt++;
+-            if (coh_wt) ct.switch_rw_cyc += coh::Sub(ct, coh::Now(), t_sw);
+-            ct.reclaim_obj_cnt += ct.reclaim_cnt - rc0;
+-            ct.reclaim_obj_cyc += ct.reclaim_cyc - ry0;
++            if (det) {
++                ct.switch_rw_cnt++;
++                if (coh_wt) ct.switch_rw_cyc += coh::Sub(ct, coh::Now(), t_sw);
++                ct.reclaim_obj_cnt += ct.reclaim_cnt - rc0;
++                ct.reclaim_obj_cyc += ct.reclaim_cyc - ry0;
++            }
+             if (ec == std::make_error_code(std::errc::not_enough_memory)) {
+                 if (coh_wt) {
+                     ct.wstart_cyc += coh::Sub(ct, coh::Now(), coh_t_in);
+@@ -1567,7 +1571,7 @@ retry:
+     }
+     if (wh.from_cxl) {  // build 73: write section counts and times (the local-exclusive path is PARTITIONED_NODE only)
+         ct.write_sections++;
+-        ct.kv_writes++;
++        if (coh::g_cfg.detail) ct.kv_writes++;
+         ct.wflush_cnt++;
+ #ifndef FULL_COHERENCE
+         ct.wflush_bytes += bytes_write;
+diff --git a/src/common/coh_stats.cc b/src/common/coh_stats.cc
+index bb42e1f..5c62be0 100644
+--- a/src/common/coh_stats.cc
++++ b/src/common/coh_stats.cc
+@@ -11,7 +11,9 @@
+ namespace rackobj::coh {
+ 
+ Config g_cfg;
+-thread_local Tls tls;
++constinit thread_local Tls tls{};
++
++Tls &SlowTls() { return tls; }
+ 
+ namespace {
+ 
+@@ -31,6 +33,8 @@ __attribute__((constructor)) void Init() {
+         g_cfg.check_sample = n >= 1 ? static_cast<uint64_t>(n) : 64;
+     }
+     if (const char *v = std::getenv("MEGALON_COH_EVENTS")) g_cfg.events_always = std::strcmp(v, "always") == 0;
++    if (const char *v = std::getenv("MEGALON_COH_DETAIL")) g_cfg.detail = std::strcmp(v, "1") == 0;
++    NrFfi::nr_coh_set_detail(g_cfg.detail);
+     NrFfi::nr_coh_set_timers(g_cfg.timers);
+     load_ns = MonoNs();
+     load_tsc = __rdtsc();
+@@ -46,7 +50,9 @@ const uint64_t *NrPtr() {
+ void ResetThread() {
+     Tls &t = tls;
+     const uint64_t rs_cnt = t.rseq_spin_cnt, rs_cyc = t.rseq_spin_cyc, rc_cnt = t.reclaim_cnt, rc_cyc = t.reclaim_cyc;
++    void *const obj_ctr = t.obj_ctr;
+     std::memset(static_cast<void *>(&t), 0, sizeof(t));
++    t.obj_ctr = obj_ctr;
+     t.rseq_spin_cnt = rs_cnt;
+     t.rseq_spin_cyc = rs_cyc;
+     t.reclaim_cnt = rc_cnt;
+diff --git a/src/common/coh_stats.h b/src/common/coh_stats.h
+index c59cb2e..8af2212 100644
+--- a/src/common/coh_stats.h
++++ b/src/common/coh_stats.h
+@@ -8,6 +8,8 @@
+ //   MEGALON_COH_CHECK_SAMPLE=N    1 of N read sections and 1 of N write sections per thread are timed (mean N; the
+ //                                 countdown is jittered, uniform in [N/2, N/2 + N)); default 64, >= 1
+ //   MEGALON_COH_EVENTS=always     (validation only) also time every event, and every write section, in every section
++//   MEGALON_COH_DETAIL=1          counters/timers no v6 figure uses (switch_rw, reclaim, KV creates and shares, NR
++//                                 replay-flush statistics); default off
+ // Build 76 (lean): unsampled sections read no TSC; counts are exact in every section; every duration is a sum over
+ // timed sections only (estimate: x * read_sections / check_sampled, write side x * write_sections / write_sampled).
+ #pragma once
+@@ -22,6 +24,8 @@ struct Config {
+     bool timers = true;
+     uint64_t check_sample = 64;
+     bool events_always = false;  // MEGALON_COH_EVENTS=always
++    bool detail = false;         // MEGALON_COH_DETAIL=1: counters/timers no v6 figure needs (switch_rw, reclaim, KV
++                                 // creates, KV shares, NR replay-flush stats); default off
+ };
+ extern Config g_cfg;
+ 
+@@ -69,8 +73,13 @@ struct Tls {
+     bool ev_timed;                         // the current section times its events / waits (sampled or events_always)
+     bool sec_timed, sec_ev, sec_wtimed;    // open read section: checks timed / events timed; open write section timed
+     bool kvw_copied;                       // KV Put: CreateEntry copied the value (independent of the timers)
++    void *obj_ctr;                         // this thread's ObjectStore counter block (object_store.cc; kept at Register)
+ };
+ 
++// The thread's Tls through ThreadLocalMeta (set at Register; no thread-local lookup), or coh::tls.
++template <class M>
++inline struct Tls &Of(M *tlm);
++
+ // One GetAnchor split into (i) the index lookup and (ii) the rest of the NR anchor (sync to the log tail, replay,
+ // combining, FFI), each in cycles. Megalon-only coherence flushes inside the anchor (replay flushes, log-entry
+ // invalidation) and contended waits (D) are in neither: they stay in check / (D).
+@@ -109,7 +118,14 @@ inline bool TakeWSample(Tls &t) {
+     t.wsample_left--;
+     return false;
+ }
+-extern thread_local Tls tls;
++// constinit: zero-initialised, so callers need no TLS init wrapper (build 76)
++extern constinit thread_local Tls tls;
++Tls &SlowTls();  // out of line: coh::tls for a thread whose ThreadLocalMeta has no pointer yet
++
++template <class M>
++inline Tls &Of(M *tlm) {
++    return tlm->coh_tls_ ? *tlm->coh_tls_ : SlowTls();
++}
+ 
+ // end - start of two TSC values (or of an interval and its nested part); a negative result (TSC not monotonic
+ // across CPUs, or skew between nested timestamps) is clamped to 0 and counted in tls.tsc_backwards.
+diff --git a/src/common/thread_local.h b/src/common/thread_local.h
+index 19a952b..9d17938 100644
+--- a/src/common/thread_local.h
++++ b/src/common/thread_local.h
+@@ -8,6 +8,10 @@
+ 
+ namespace rackobj {
+ 
++namespace coh {
++struct Tls;
++}
++
+ typedef struct pthread_stats {
+     uint64_t read_retry_cnt;         // number of time reads have retried (single read call can have multiple retries)
+     uint64_t read_retry_invocation;  // number of read function invocations that had at least one retry
+@@ -37,6 +41,7 @@ public:
+     common::LocalMemoryObject<Policy>* local_cache_ptr_;
+     int logical_node_id_;
+     pthread_stats_t pt_stat;
++    coh::Tls* coh_tls_ = nullptr;  // build 76 instrumentation: this thread's coh::tls, set at Register (no TLS lookup)
+ };
+ 
+ }  // namespace rackobj
+diff --git a/src/index/nr_hashmap.h b/src/index/nr_hashmap.h
+index 37deea3..482c373 100644
+--- a/src/index/nr_hashmap.h
++++ b/src/index/nr_hashmap.h
+@@ -143,6 +143,7 @@ void nr_obj_replay_flush_stats(uint64_t* count, uint64_t* bytes);
+  * (nr/waitstat.rs; stable address per thread) and the timer switch (MEGALON_COH_TIMERS). */
+ const uint64_t* nr_thread_wait_stat();
+ void nr_coh_set_timers(bool on);
++void nr_coh_set_detail(bool on);  // build 76: NR replay-flush stats only with MEGALON_COH_DETAIL=1
+ 
+ }  // extern "C"
+ }  // namespace NrFfi
+diff --git a/third-party/nr_rust/ffi/ffi_nr_hashmap.rs b/third-party/nr_rust/ffi/ffi_nr_hashmap.rs
+index 4f49f9a..3ca3894 100644
+--- a/third-party/nr_rust/ffi/ffi_nr_hashmap.rs
++++ b/third-party/nr_rust/ffi/ffi_nr_hashmap.rs
+@@ -1483,6 +1483,12 @@ pub extern "C" fn nr_thread_wait_stat() -> *const u64 {
+     node_replication::nr::waitstat::thread_ptr()
+ }
+ 
++/// Build 76: object replay-flush statistics on/off (MEGALON_COH_DETAIL; default off).
++#[no_mangle]
++pub extern "C" fn nr_coh_set_detail(on: bool) {
++    node_replication::nr::waitstat::DETAIL.store(on, Ordering::Relaxed);
++}
++
+ /// Instrumentation timers on/off (counts are kept either way; durations are 0 when off).
+ #[no_mangle]
+ pub extern "C" fn nr_coh_set_timers(on: bool) {
+diff --git a/third-party/nr_rust/ffi/object_tests.rs b/third-party/nr_rust/ffi/object_tests.rs
+index 51b0e57..e6bec76 100644
+--- a/third-party/nr_rust/ffi/object_tests.rs
++++ b/third-party/nr_rust/ffi/object_tests.rs
+@@ -9,7 +9,7 @@
+ 
+ use std::sync::Arc;
+ 
+-use node_replication::nr::{obj_replay_flush_stats, IdxGetter, NodeReplicated, ThreadToken};
++use node_replication::nr::{IdxGetter, NodeReplicated, ThreadToken};
+ 
+ use super::port_tests::{key, min_entries, node, shared_mem};
+ use super::*;
+@@ -57,8 +57,14 @@ fn entry(n: &Node, t: ThreadToken, k: BlockId) -> Option<GCDEntry> {
+ /// entry, user decision D4 2026-10-15) and on the other node, so one event replayed by both = 2 flushes of `size`
+ /// bytes; only with `scr`.
+ /// The counters are process-wide: these checks need `--test-threads=1` (as build.sh runs them).
++/// Build 76: the replay-flush statistics count only with MEGALON_COH_DETAIL (waitstat::DETAIL); the tests enable it.
++fn detail_stats() -> (usize, usize) {
++    node_replication::nr::waitstat::DETAIL.store(true, std::sync::atomic::Ordering::Relaxed);
++    node_replication::nr::obj_replay_flush_stats()
++}
++
+ fn flush_delta(before: (usize, usize)) -> (usize, usize) {
+-    let now = obj_replay_flush_stats();
++    let now = detail_stats();
+     (now.0 - before.0, now.1 - before.1)
+ }
+ 
+@@ -118,7 +124,7 @@ fn every_coherence_event_on_an_object_notifies_and_flushes_its_range() {
+     let size = 3000usize; // not a multiple of 64: the flush covers the last partial line too
+     let k = okey(1);
+ 
+-    let f = obj_replay_flush_stats();
++    let f = detail_stats();
+     assert_eq!(ObjectCreate(m0, k, units(ARENA_OFF), size as isize, -1), 0);
+     n1.sync(t1);
+     expect_flushes(f, 2, size); // create: issuer + peer
+@@ -127,7 +133,7 @@ fn every_coherence_event_on_an_object_notifies_and_flushes_its_range() {
+     let _ = n1.execute_anchor(Access::Get(k), t1);
+     assert!(n1.check_notification_reset(t1), "armed, nothing replayed yet");
+     let _ = n1.execute_anchor(Access::Get(k), t1);
+-    let f = obj_replay_flush_stats();
++    let f = detail_stats();
+     assert_eq!(InvalidateExceptArrayUpdateWmeta(m0, k, 0, 5), 0);
+     n1.sync(t1);
+     assert!(!n1.check_notification_reset(t1), "RW switch must notify a reader of the object");
+@@ -136,7 +142,7 @@ fn every_coherence_event_on_an_object_notifies_and_flushes_its_range() {
+     assert_eq!((e.wmeta_idx_, obj_decode(&e)), (5, Some((ARENA_OFF, size))), "descriptor survives the switch");
+     // a second RW switch fails (already RW) and is no event
+     let _ = n1.execute_anchor(Access::Get(k), t1);
+-    let f = obj_replay_flush_stats();
++    let f = detail_stats();
+     assert_eq!(InvalidateExceptArrayUpdateWmeta(m0, k, 0, 6), 2);
+     n1.sync(t1);
+     assert!(n1.check_notification_reset(t1));
+@@ -144,7 +150,7 @@ fn every_coherence_event_on_an_object_notifies_and_flushes_its_range() {
+ 
+     // seq wrap-around event (write_seq_end -> SeqCountWrapAround -> DummyLog)
+     let _ = n1.execute_anchor(Access::Get(k), t1);
+-    let f = obj_replay_flush_stats();
++    let f = detail_stats();
+     DummyEvent(m0, k);
+     n1.sync(t1);
+     assert!(!n1.check_notification_reset(t1), "wrap-around must notify");
+@@ -152,7 +158,7 @@ fn every_coherence_event_on_an_object_notifies_and_flushes_its_range() {
+ 
+     // RO switch = record deallocation (reclaim), answered with the entry (fix e806494)
+     let _ = n1.execute_anchor(Access::Get(k), t1);
+-    let f = obj_replay_flush_stats();
++    let f = detail_stats();
+     assert_eq!(CheckSwitchWmetaArray(m0, k, -1), 5);
+     n1.sync(t1);
+     assert!(!n1.check_notification_reset(t1), "deallocation must notify");
+@@ -161,7 +167,7 @@ fn every_coherence_event_on_an_object_notifies_and_flushes_its_range() {
+     assert_eq!((e.wmeta_idx_, obj_decode(&e)), (-1, Some((ARENA_OFF, size))));
+     // RO switch of an RO object: no event
+     let _ = n1.execute_anchor(Access::Get(k), t1);
+-    let f = obj_replay_flush_stats();
++    let f = detail_stats();
+     let _ = CheckSwitchWmetaArray(m0, k, -1);
+     n1.sync(t1);
+     assert!(n1.check_notification_reset(t1));
+@@ -170,7 +176,7 @@ fn every_coherence_event_on_an_object_notifies_and_flushes_its_range() {
+     // own ops are flushed by the issuing node too (D4: paper §3.4.3 "while replaying the log, if a host finds an
+     // allocation or deallocation event, it flushes"; NR replays the issuer's own entries): n0 issues an event (applied
+     // in its own combine, `mine`) with n1 not syncing: exactly one flush; n1's replay: one more
+-    let f = obj_replay_flush_stats();
++    let f = detail_stats();
+     DummyEvent(m0, k);
+     n0.sync(t0);
+     n0.log_sync_local();
+@@ -231,7 +237,7 @@ fn object_records_resolve_through_the_reverse_map() {
+     n1.sync(t1);
+     // node 1 reclaims record 11 without knowing the key
+     let _ = n0.execute_anchor(Access::Get(okey(9)), t0);
+-    let f = obj_replay_flush_stats();
++    let f = detail_stats();
+     assert_eq!(SwitchToReadOnlyByWmeta(m1, 11), 11);
+     n0.sync(t0);
+     assert!(!n0.check_notification_reset(t0), "reclaim of an object's record must notify the other node");
+diff --git a/third-party/nr_rust/node-replication/src/nr/replica.rs b/third-party/nr_rust/node-replication/src/nr/replica.rs
+index ef8bc36..23d4026 100644
+--- a/third-party/nr_rust/node-replication/src/nr/replica.rs
++++ b/third-party/nr_rust/node-replication/src/nr/replica.rs
+@@ -1241,8 +1241,11 @@ where
+                 if let Some((off, len)) = resp.obj_span() {
+                     let region_ptr = unsafe { self.base_addr.add(off) };
+                     flush_mem_region(region_ptr, len);
+-                    OBJ_REPLAY_FLUSHES.fetch_add(1, Ordering::Relaxed);
+-                    OBJ_REPLAY_FLUSH_BYTES.fetch_add(len, Ordering::Relaxed);
++                    // process-wide port statistics (shared cache line): MEGALON_COH_DETAIL only (build 76)
++                    if super::waitstat::DETAIL.load(Ordering::Relaxed) {
++                        OBJ_REPLAY_FLUSHES.fetch_add(1, Ordering::Relaxed);
++                        OBJ_REPLAY_FLUSH_BYTES.fetch_add(len, Ordering::Relaxed);
++                    }
+                 } else {
+                     let region_ptr = unsafe { self.base_addr.add(idx as usize * self.slot_size) };
+                     flush_mem_region(region_ptr, self.slot_size);
+diff --git a/third-party/nr_rust/node-replication/src/nr/rwlock.rs b/third-party/nr_rust/node-replication/src/nr/rwlock.rs
+index a4bd5b1..2db9c3d 100644
+--- a/third-party/nr_rust/node-replication/src/nr/rwlock.rs
++++ b/third-party/nr_rust/node-replication/src/nr/rwlock.rs
+@@ -166,7 +166,27 @@ where
+     ///     const MY_THREAD_ID: usize = 16;
+     ///     let r_guard = lock.read(MY_THREAD_ID);
+     ///     assert_eq!(0, *r_guard);
++    #[inline(always)]
+     pub fn read(&self, tid: usize) -> ReadGuard<T> {
++        // build 76: the uncontended first iteration of upstream's loop, inlined; any writer seen -> read_slow
++        // (upstream's loop with the wait accounting), so the hot path is as small as upstream's.
++        let ptr = unsafe {
++            &*(&self.wlock as *const crossbeam_utils::CachePadded<core::sync::atomic::AtomicBool>
++                as *const bool)
++        };
++        if unsafe { !core::ptr::read_volatile(ptr) } {
++            self.rlock[tid].fetch_add(1, Ordering::Acquire);
++            if !self.wlock.load(Ordering::Relaxed) {
++                return unsafe { ReadGuard::new(self, tid) };
++            }
++            self.rlock[tid].fetch_sub(1, Ordering::Release);
++        }
++        self.read_slow(tid)
++    }
++
++    #[cold]
++    #[inline(never)]
++    fn read_slow(&self, tid: usize) -> ReadGuard<T> {
+         // We perform a small optimization. Before attempting to acquire a read lock, we issue
+         // naked reads to the write lock and wait until it is free. For that, we retrieve a
+         // raw pointer to the write lock over here.
+@@ -176,8 +196,8 @@ where
+         };
+ 
+         // De Stijl port instrumentation (waitstat, observation only): one wait episode from the
+-        // first time a writer is seen until the read lock is held.
+-        let mut wait: Option<u64> = None;
++        // first time a writer is seen (the fast path in read() saw one) until the read lock is held.
++        let mut wait: Option<u64> = Some(super::waitstat::now());
+         loop {
+             // First, wait until the write lock is free. This is the small
+             // optimization spoken of earlier.
+diff --git a/third-party/nr_rust/node-replication/src/nr/waitstat.rs b/third-party/nr_rust/node-replication/src/nr/waitstat.rs
+index 61f2010..19b9b79 100644
+--- a/third-party/nr_rust/node-replication/src/nr/waitstat.rs
++++ b/third-party/nr_rust/node-replication/src/nr/waitstat.rs
+@@ -45,6 +45,9 @@ pub fn acc(s: usize, t0: u64) {
+ /// Timers on (default) or off (MEGALON_COH_TIMERS=0): off keeps the counts, durations stay 0.
+ pub static TIMERS: AtomicBool = AtomicBool::new(true);
+ 
++/// (build 76) MEGALON_COH_DETAIL=1: port statistics no v6 figure needs (object replay-flush counters).
++pub static DETAIL: AtomicBool = AtomicBool::new(false);
++
+ #[inline(always)]
+ pub fn now() -> u64 {
+     // build 76: TSC only while the calling thread runs a timed section (slot 6); callers are slow paths only
+-- 
+2.34.1
+

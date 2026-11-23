@@ -1,0 +1,29 @@
+From 0ad3d29abdbd08e003a56af2feef63d2829c50db Mon Sep 17 00:00:00 2001
+From: Sungsu Ahn <sungsu_ahn@korea.ac.kr>
+Date: Sat, 7 Nov 2026 00:46:49 +0900
+Subject: [PATCH 51/51] shm_obj_handle.h: forward-declare rackobj::WmetaCounts
+ (build 80 compile fix)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ lib/shm_obj_handle.h | 4 ++++
+ 1 file changed, 4 insertions(+)
+
+diff --git a/lib/shm_obj_handle.h b/lib/shm_obj_handle.h
+index c11716d..eeaa98b 100644
+--- a/lib/shm_obj_handle.h
++++ b/lib/shm_obj_handle.h
+@@ -27,6 +27,10 @@ class FlushManagerHandle;
+ 
+ }  // namespace rackobj::common
+ 
++namespace rackobj {
++struct WmetaCounts;  // build 80: include/rackobj.h
++}  // namespace rackobj
++
+ namespace rackobj::lib {
+ 
+ using common::C3POHandle;
+-- 
+2.34.1
+

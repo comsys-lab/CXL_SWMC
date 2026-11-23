@@ -1,0 +1,30 @@
+From 905a5e384efdadf5799bc2727d5f1845b871a30e Mon Sep 17 00:00:00 2001
+From: Sungsu Ahn <sungsu_ahn@korea.ac.kr>
+Date: Sat, 17 Oct 2026 01:21:39 +0900
+Subject: [PATCH 44/51] object-test: (B) case accepts (C) when the record was
+ reclaimed meanwhile (reclaim config)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ benchmarks/object_test.cc | 5 ++++-
+ 1 file changed, 4 insertions(+), 1 deletion(-)
+
+diff --git a/benchmarks/object_test.cc b/benchmarks/object_test.cc
+index f801273..f647f83 100644
+--- a/benchmarks/object_test.cc
++++ b/benchmarks/object_test.cc
+@@ -470,7 +470,10 @@ void CohPhase(HelperThread &helper) {
+         EXPECT(!ok);
+         auto d = CohDiff(c0, Coh());
+         LOG(INFO) << "COH concurrent (read of C(own) while the helper wrote it): " << CohStr(d);
+-        EXPECT(d.concur_cnt == 1 && tpos(d.concur_ns) && d.meta_cnt == 0 && d.stale_cnt == 0);
++        // with a tiny record pool (reclaim config) the record of C(own) can be reclaimed meanwhile: the helper's write
++        // then switches it RO -> RW (a log event) and the section ends in (C) instead of (B); either is one event
++        EXPECT(d.concur_cnt + d.meta_cnt == 1 && d.stale_cnt == 0);
++        EXPECT(d.concur_cnt == 0 || tpos(d.concur_ns));
+         EXPECT(read_gen(CohX(node_id)) == 3);
+     }
+     // (C) metadata notification: reading an RO object while the helper's write switches it RO -> RW (log event)
+-- 
+2.34.1
+

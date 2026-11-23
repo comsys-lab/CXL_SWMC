@@ -1,0 +1,32 @@
+From 5a80ba19b0ba3bf1deedf800ed4ef14c85f4b2a7 Mon Sep 17 00:00:00 2001
+From: Sungsu Ahn <sungsu_ahn@korea.ac.kr>
+Date: Thu, 15 Oct 2026 09:11:56 +0900
+Subject: [PATCH 27/51] objects: refuse PARTITIONED_NODE (slot-only code would
+ misread the object cn encoding)
+
+Verifier D5.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ lib/object_store.cc | 5 +++++
+ 1 file changed, 5 insertions(+)
+
+diff --git a/lib/object_store.cc b/lib/object_store.cc
+index c22b9dc..308b808 100644
+--- a/lib/object_store.cc
++++ b/lib/object_store.cc
+@@ -51,6 +51,11 @@ ObjectStore::ObjectStore(C3POHandle *c3po, const uint8_t *flush_base, size_t rec
+ #ifdef FILE_INTERFACE
+     LOG(FATAL) << "objects and FILE_INTERFACE are exclusive (real inode numbers could collide with the object "
+                   "namespace)";
++#endif
++#ifdef PARTITIONED_NODE
++    // slot-only code (local copies, MoveToLocal, active-node tracking on the CacheNode) reads cn_array_[1..] as local
++    // copies and cn_array_[0] as a CacheNode index; it would misread the object encoding
++    LOG(FATAL) << "objects and PARTITIONED_NODE are exclusive (object cn encoding is not a CacheNode index)";
+ #endif
+     auto &ctx = port::PortContext::Get();
+     arena_bytes_ = cfg.GetObjectArenaBytes();
+-- 
+2.34.1
+

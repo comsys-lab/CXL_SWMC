@@ -1,0 +1,1154 @@
+From ac0d92a851f87d85840dfcaaf7fb0b7988ba6a22 Mon Sep 17 00:00:00 2001
+From: Sungsu Ahn <sungsu_ahn@korea.ac.kr>
+Date: Sat, 17 Oct 2026 02:04:45 +0900
+Subject: [PATCH 45/51] coh 77: untimed hot paths in build-70 shape; probe
+ calibration
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Instrumentation only (no protocol change):
+- KV Get: the untimed Get is the artifact's Get plus exact counts; timed Gets
+  run GetTimed (out of line). ReadFromCXL, read_seq_start/end and
+  write_seq_start/end are build 70's bodies plus one dispatch branch to their
+  timed variants; GetAnchor is build 70's body (GetAnchorTimed separate).
+- read_seqlock_begin: the contended spin out of line (fast path = upstream).
+- NR: combine_until_synced costs only upstream's loop test when synced; timed
+  anchors receive a pointer for the dispatch cycles (no thread-local access
+  or call next to the dispatch); the anchor flag is set by the C++ caller.
+- Timed variants are deliberately not marked cold: a cold placement made a
+  timed section cost ~1.5 us and would bias the sampled durations.
+- Probe calibration at Register: median of back-to-back TSC pairs ->
+  ThreadAnchor.reserved[1] (ns), [2] (ps); timed-event counts (A), (B)+(C),
+  (D) -> reserved[3..5] for the subtraction rule (rackobj.h, M2 §19).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ benchmarks/object_test.cc                     |   3 +-
+ include/rackobj.h                             |   8 +-
+ lib/object_store.cc                           |  14 +-
+ lib/shm_obj_handle.cc                         | 164 +++++++++-
+ lib/shm_obj_handle.h                          |   8 +
+ src/common/coh_stats.cc                       |  19 ++
+ src/common/coh_stats.h                        |  10 +-
+ src/core/c3.cc                                | 289 ++++++++++++++++++
+ src/core/c3.h                                 |   6 +
+ src/core/seqcount.cc                          |  37 +--
+ src/index/gcd_nr.cc                           |  32 +-
+ src/index/gcd_nr.h                            |   3 +-
+ src/index/nr_hashmap.h                        |   3 +-
+ third-party/nr_rust/ffi/ffi_nr_hashmap.rs     |   4 +-
+ third-party/nr_rust/ffi/port_tests.rs         |   4 +-
+ .../nr_rust/node-replication/src/nr/mod.rs    |  25 +-
+ .../node-replication/src/nr/replica.rs        |  40 ++-
+ .../node-replication/src/nr/waitstat.rs       |   8 +-
+ 18 files changed, 602 insertions(+), 75 deletions(-)
+
+diff --git a/benchmarks/object_test.cc b/benchmarks/object_test.cc
+index f647f83..d1c8457 100644
+--- a/benchmarks/object_test.cc
++++ b/benchmarks/object_test.cc
+@@ -531,7 +531,8 @@ void CohPhase(HelperThread &helper) {
+         const uint64_t n = 16 * c0.check_sample;  // build 75: 16 sampled sections per comparison line
+         for (uint64_t i = 0; i < n; i++) (void)read_gen(CohX(node_id));
+         auto z = AncDiff(z0, Anc());
+-        LOG(INFO) << AncPerSection("object read", z);
++        LOG(INFO) << AncPerSection("object read", z) << " | probe " << Anc().reserved[2] << " ps";
++        EXPECT(!timed || (Anc().reserved[2] >= 1000 && Anc().reserved[2] <= 200000));  // build 77: 1-200 ns
+         EXPECT(in_range(z.check_sampled, n) && z.read_lookup_ns_sampled == Split()[0] - a0[0]);
+         EXPECT(spos(z.rseq_ns_sampled) && spos(z.read_nr_ns_sampled));  // C(own) is RW: version reads
+         {
+diff --git a/include/rackobj.h b/include/rackobj.h
+index 56b229d..b302a18 100644
+--- a/include/rackobj.h
++++ b/include/rackobj.h
+@@ -170,8 +170,14 @@ struct ThreadAnchor {
+     uint64_t read_sections, write_sections, check_sampled;
+     uint64_t read_lookup_ns_sampled, read_nr_ns_sampled, rseq_ns_sampled;
+     uint64_t write_lookup_ns, write_nr_ns, wseq_ns, wseq_end_ns;
+-    uint64_t reserved[6];  // [0] (build 76) write_sampled: timed write sections
++    uint64_t reserved[6];  // [0] (build 76) write_sampled: timed write sections; (build 77) [1] probe_ns, [2] probe_ps,
++                           // [3] timed (A) events, [4] timed (B)+(C) events, [5] timed (D) episodes
+ };
++// Probe correction (build >= 77; reports/M2-megalon-port-changes.md §19): every timed interval also measures
++// the TSC reads inside it. p = AnchorSnap.reserved[2] / 1000 ns (per-thread median of back-to-back TSC pairs at reg()).
++// Subtract p x k from each sum before scaling: per sampled read section (check_sampled): check 7, read_lookup 1,
++// read_nr 2, rseq 2; per timed write section (write_sampled): wstart 4, wflush 3, write_lookup 1, write_nr 2, wseq 1,
++// wseq_end 1; per timed event: stale 1 x reserved[3], concur+meta 4 x reserved[4], spin 1 x reserved[5].
+ 
+ void GetThreadAnchor(ThreadAnchor* s);
+ // build 71, overhead measurement only (object-test OBJECT_TEST_OVERHEAD): switch the instrumentation timers at run
+diff --git a/lib/object_store.cc b/lib/object_store.cc
+index f14fbb3..61a127c 100644
+--- a/lib/object_store.cc
++++ b/lib/object_store.cc
+@@ -236,6 +236,7 @@ int ObjectStore::ReadStart(uint64_t id, ObjectHandle *h, Tlm *tlm) {
+         if (!stale_open) return;
+         stale_open = false;
+         if (!ev) return;
++        ct.ta_cnt++;  // build 77: a timed (A) interval
+         const uint64_t t = coh::Now(), sp = coh::SpinNow(ct).cyc;
+         const uint64_t wall = coh::Sub(ct, t, stale_t), spin = sp - stale_sp;  // spin: monotonic totals
+         stale_wall += wall;
+@@ -249,12 +250,13 @@ int ObjectStore::ReadStart(uint64_t id, ObjectHandle *h, Tlm *tlm) {
+         const bool first = !stale_open;  // attempts inside (A) are Megalon-only work
+         std::optional<common::GCDEntry> entry =
+             timed && first
+-                ? coh::TimedAnchor(ct, &anchor, [&] { return c3po_->Gcd()->GetAnchorTimed(key, nr_meta); })
++                ? coh::TimedAnchor(ct, &anchor, [&](uint64_t *lk) { return c3po_->Gcd()->GetAnchorTimed(key, nr_meta, lk); })
+                 : c3po_->Gcd()->GetAnchor(key, nr_meta);
+         if (!Decode(entry, &ptr, &size)) {  // objects are created explicitly (no admit)
+             close_stale();
+             ct.spin_cnt += coh::SpinCnt(ct) - sp0_cnt;
+             if (ev) {
++                ct.td_cnt += coh::SpinCnt(ct) - sp0_cnt;
+                 ct.spin_cyc += coh::SpinNow(ct).cyc - sp0_cyc;
+                 coh::EvTimedOff(ct);
+             }
+@@ -345,6 +347,8 @@ bool ObjectStore::ReadEnd(ObjectHandle *h, Tlm *tlm) {
+     ct.spin_cnt += coh::SpinCnt(ct) - ct.sec_sp0_cnt;
+     if (!ok) (concurrent ? ct.concur_cnt : ct.meta_cnt)++;
+     if (!ev) return ok;
++    ct.td_cnt += coh::SpinCnt(ct) - ct.sec_sp0_cnt;  // build 77: (D) episodes of a timed section
++    if (!ok) ct.tbc_cnt++;
+     const uint64_t sp2 = coh::SpinNow(ct).cyc;
+     ct.spin_cyc += sp2 - ct.sec_sp0_cyc;
+     if (ok) {
+@@ -379,7 +383,7 @@ int ObjectStore::WriteStart(uint64_t id, ObjectHandle *h, Tlm *tlm) {
+     for (;;) {
+         anchor = coh::AnchorSplit{};  // build 74: only the final attempt's anchor is excluded from wstart
+         std::optional<common::GCDEntry> entry =
+-            wt ? coh::TimedAnchor(ct, &anchor, [&] { return c3po_->Gcd()->GetAnchorTimed(key, nr_meta); })
++            wt ? coh::TimedAnchor(ct, &anchor, [&](uint64_t *lk) { return c3po_->Gcd()->GetAnchorTimed(key, nr_meta, lk); })
+                : c3po_->Gcd()->GetAnchor(key, nr_meta);
+         if (!Decode(entry, &ptr, &size)) {
+             if (wt) {
+@@ -480,6 +484,12 @@ void ObjectStore::ThreadAnchorSnap(rackobj::ThreadAnchor *s) {
+     s->wseq_ns = ns(t.wseq_cyc);
+     s->wseq_end_ns = ns(t.wseq_end_cyc);
+     s->reserved[0] = t.write_sampled;  // build 76: timed write sections (write-side estimator denominator)
++    // build 77: probe calibration (cost of one timed interval's own TSC reads), ns and ps
++    s->reserved[1] = ns(t.probe_cyc);
++    s->reserved[2] = hz > 0 ? static_cast<uint64_t>(static_cast<double>(t.probe_cyc) * 1e12 / hz + 0.5) : 0;
++    s->reserved[3] = t.ta_cnt;   // (A) events whose durations are in stale_ns
++    s->reserved[4] = t.tbc_cnt;  // (B)+(C) events whose durations are in concur_ns / meta_ns
++    s->reserved[5] = t.td_cnt;   // (D) episodes whose durations are in spin_ns
+ }
+ 
+ void ObjectStore::ThreadAnchorSplit(uint64_t out[4]) {
+diff --git a/lib/shm_obj_handle.cc b/lib/shm_obj_handle.cc
+index eb79155..b0915d5 100644
+--- a/lib/shm_obj_handle.cc
++++ b/lib/shm_obj_handle.cc
+@@ -937,6 +937,61 @@ template <typename Policy>
+ expected<size_t, ReadErrno> SharedMemoryObjectHandle<Policy>::ReadFromCXL(struct ReadHandle &rh, uint8_t *ptr,
+                                                                           size_t count, size_t offset_into_page,
+                                                                           ThreadLocalMeta<Policy> *local_meta) {
++    if (rh.coh_ev) [[unlikely]]  // build 77: timed Get attempt, out of line
++        return ReadFromCXLTimed(rh, ptr, count, offset_into_page, local_meta);
++    size_t bytes_read = 0;
++#ifdef NR
++    auto nr_meta = local_meta->nr_meta_per_thread_;
++#else
++    (void)local_meta;
++#endif
++    DLOG(INFO) << "Cache hit: GCD get succeed, Accessing CXL page!";
++
++    /* read seq begin */
++    // C3PO API
++    if (!c3po_->read_seq_start(rh)) {
++        rh.coh_stage = 1;  // build 73-77: (A) vs (B) for the exact counts
++        return unexpected(rh.rh_errno);
++    }
++    // cache_->policy_.Touch(*entry_optional);
++    /* 4. read page (memcpy) */
++    bytes_read = CopyToUserBufferCXL(rh, ptr, count, offset_into_page);
++
++    /* read seq check retry */
++    // C3PO API
++    if (!c3po_->read_seq_end(rh
++#ifdef NR
++                             ,
++                             nr_meta
++#endif
++                             )) {
++        rh.coh_stage = 2;
++        return unexpected(rh.rh_errno);
++    }
++
++    /* 6. increase replicate access counter */
++    /* TODO: disabled for logical node */
++    // if (!c3po_->ExistOnLogicalNode(rh.entry_optional, rh.current_nid) &&
++    //     repl_mgr_[rh.current_nid]->ShouldReplicate(rh.cn_index.value())) {
++    //     /* 7. add cn into replicate workqueue */
++    //     if (shouldReplicate(ptr)) {
++    //         if (rh.current_nid == 1) {
++    //             DLOG(INFO) << "debugging";
++    //         }
++    //         bool succeed = repl_mgr_[rh.current_nid]->enqueue(rh.key, rh.cn_index.value());
++    //         if (!succeed) repl_mgr_[rh.current_nid]->ClearReplicate(rh.cn_index.value());
++    //     }
++    // }
++
++    // if (bytes_read == 0) LOG(WARNING) << "bytes_read=0";
++    return bytes_read;
++}
++
++// build 73-77 instrumentation: ReadFromCXL of a timed Get attempt (slot-copy timestamps); otherwise identical
++template <typename Policy>
++expected<size_t, ReadErrno> SharedMemoryObjectHandle<Policy>::ReadFromCXLTimed(struct ReadHandle &rh, uint8_t *ptr,
++                                                                          size_t count, size_t offset_into_page,
++                                                                          ThreadLocalMeta<Policy> *local_meta) {
+     size_t bytes_read = 0;
+ #ifdef NR
+     auto nr_meta = local_meta->nr_meta_per_thread_;
+@@ -1152,9 +1207,107 @@ retry:
+     return bytes_read;
+ }
+ 
++// Build 77: the untimed KV Get = the artifact's Get plus exact counts only (one read section, (A)/(B)/(C) events, (D)
++// episodes); timed Gets (1 in N, or every Get with MEGALON_COH_EVENTS=always) take GetTimed (out of line).
+ template <typename Policy>
+ size_t SharedMemoryObjectHandle<Policy>::Get(const common::BlockId &block_id, uint8_t *ptr, size_t count,
+                                              size_t offset_into_page, ThreadLocalMeta<Policy> *local_meta) {
++    coh::Tls &ct = coh::Of(local_meta);
++    {
++        const bool sampled = coh::TakeSample(ct);
++        if (coh::g_cfg.timers && (sampled || coh::g_cfg.events_always)) [[unlikely]]
++            return GetTimed(block_id, ptr, count, offset_into_page, local_meta, sampled);
++    }
++    const uint64_t coh_sp0 = coh::SpinCntReg(ct);
++    struct ReadHandle rh;
++    std::optional<common::GCDEntry> entry_optional;
++    uint64_t coherence_retry_cnt[LOGICAL_NODE_NUM] = {0};  // for retry on coherence failure
++    auto nr_meta = local_meta->nr_meta_per_thread_;
++
++    if (offset_into_page + count > common::BlockId::kBlockSize) {
++        LOG(FATAL) << "SharedMemoryObjectHandle::Read attempting to read " << count << " bytes at an offset of "
++                   << offset_into_page << " into the page (exceeds page limit)";
++    }
++
++retry:
++    size_t bytes_read = 0;
++
++    entry_optional = c3po_->Gcd()->GetAnchor(block_id, nr_meta);
++
++    init_read_handle(rh, block_id, entry_optional, local_meta->logical_node_id_);
++
++    expected<size_t, ReadErrno> result;
++    switch (selectCacheNode(rh)) {
++        case ReadLocation::CXL_SHARED:
++            result = ReadFromCXL(rh, ptr, count, offset_into_page, local_meta);
++            break;
++        case ReadLocation::LOCAL_NODE:
++            result = ReadFromLocal(rh, ptr, count, offset_into_page, local_meta);
++            break;
++        case ReadLocation::LOCAL_NODE_EXCLUSIVE:
++            result = ReadFromLocalExclusive(rh, ptr, count, offset_into_page, local_meta);
++            break;
++        case ReadLocation::REMOTE_NODE: { /* Cache hit: Page exists on other node, but not on this NUMA Node or CXL */
++            /* Request other node to move page to CXL */
++            LOG(FATAL) << "Move Remote Page to CXL not implemented";
++            break;
++        }
++        case ReadLocation::NO_ENTRY: { /* Cache miss: GCD get failed */
++            ct.spin_cnt += coh::SpinCntReg(ct) - coh_sp0;  // a miss is not a read section
++            return 0;
++        }
++        case ReadLocation::INVALID:
++            LOG(FATAL) << "ReadLocation not initialized";
++    }
++
++    if (!result.has_value()) [[unlikely]] {
++        switch (rh.rh_errno) {
++            case ReadErrno::NO_ERROR:
++                break;
++            case ReadErrno::META_OUTDATE:
++                ct.meta_cnt++;  // (C)
++                goto retry;
++            case ReadErrno::PAGE_INCOHERENT:
++                if (rh.coh_stage == 1) ct.stale_cnt++;   // (A) stale copy at read_seq_start
++                if (rh.coh_stage == 2) ct.concur_cnt++;  // (B) version changed at read_seq_end
++                if (rh.from_cxl) {
++#ifndef FULL_COHERENCE
++                    cache_flush_data(rh);
++#endif
++                }
++                coherence_retry_cnt[rh.from_cxl ? 0 : rh.current_nid]++;
++                DLOG(WARNING) << "Read: failed due to cache_flush, retry_cnt: "
++                              << coherence_retry_cnt[rh.from_cxl ? 0 : rh.current_nid];
++                goto retry;
++            default:
++                LOG(FATAL) << "Wrong error code";
++        }
++    }
++    bytes_read = result.value();
++    ct.read_sections++;
++    ct.spin_cnt += coh::SpinCntReg(ct) - coh_sp0;
++    if (coh::g_cfg.detail) ct.kv_reads++;
++
++    if (diag::Enabled()) {
++        auto &lg = diag::last_get;
++        lg.valid = true;
++        lg.cn = rh.entry_optional.has_value() && rh.entry_optional->cn_array_[0].cn_idx_.has_value()
++                    ? static_cast<int64_t>(*rh.entry_optional->cn_array_[0].cn_idx_)
++                    : -1;
++        lg.wmeta = rh.entry_optional.has_value() && rh.entry_optional->wmeta_idx_.has_value()
++                       ? static_cast<int64_t>(*rh.entry_optional->wmeta_idx_)
++                       : -1;
++        lg.seq = static_cast<uint32_t>(rh.seqcount);
++        lg.retries = static_cast<uint32_t>(coherence_retry_cnt[0]);
++        (lg.wmeta < 0 ? diag::gets_ro_path : diag::gets_rw_path).fetch_add(1, std::memory_order_relaxed);
++    }
++    return bytes_read;
++}
++
++template <typename Policy>
++size_t SharedMemoryObjectHandle<Policy>::GetTimed(const common::BlockId &block_id, uint8_t *ptr, size_t count,
++                                                  size_t offset_into_page, ThreadLocalMeta<Policy> *local_meta,
++                                                  bool coh_sampled) {
+     struct ReadHandle rh;
+     std::optional<common::GCDEntry> entry_optional;
+     uint64_t admit_retry_cnt = 0;
+@@ -1168,11 +1321,11 @@ size_t SharedMemoryObjectHandle<Policy>::Get(const common::BlockId &block_id, ui
+                    << offset_into_page << " into the page (exceeds page limit)";
+     }
+ 
+-    // De Stijl port instrumentation (build 73-76): one KV Get = one read section of CohSnap; observation only.
++    // De Stijl port instrumentation (build 73-77): one KV Get = one read section of CohSnap; observation only.
+     // Intervals as the object API (rackobj.h ObjectThreadCoh, reports/M2-megalon-port-changes.md §14, §18). Build 76:
+     // counts in every Get; TSC only in timed Gets.
++    // build 77: the timed Get (sampled, or MEGALON_COH_EVENTS=always); the untimed Get is Get() below
+     coh::Tls &ct = coh::Of(local_meta);
+-    const bool coh_sampled = coh::TakeSample(ct);
+     const bool coh_timed = coh_sampled && coh::g_cfg.timers;
+     const bool coh_ev = coh::g_cfg.timers && (coh_sampled || coh::g_cfg.events_always);
+     const uint64_t coh_sp0_cnt = coh::SpinCnt(ct);
+@@ -1191,6 +1344,7 @@ size_t SharedMemoryObjectHandle<Policy>::Get(const common::BlockId &block_id, ui
+         if (!coh_stale_open) return;
+         coh_stale_open = false;
+         if (!coh_ev) return;
++        ct.ta_cnt++;  // build 77: a timed (A) interval
+         const uint64_t wall = coh::Sub(ct, end_t, coh_stale_t), spin = end_sp - coh_stale_sp;
+         coh_ev_wall += wall;
+         coh_ev_spin += spin;
+@@ -1199,6 +1353,7 @@ size_t SharedMemoryObjectHandle<Policy>::Get(const common::BlockId &block_id, ui
+     auto coh_spin_total = [&]() -> uint64_t {  // (D) of the whole Get
+         ct.spin_cnt += coh::SpinCnt(ct) - coh_sp0_cnt;
+         if (!coh_ev) return 0;
++        ct.td_cnt += coh::SpinCnt(ct) - coh_sp0_cnt;  // build 77: (D) episodes of a timed Get
+         const uint64_t d = coh::SpinNow(ct).cyc - coh_sp0_cyc;
+         ct.spin_cyc += d;
+         return d;
+@@ -1211,7 +1366,7 @@ retry:
+ 
+     entry_optional =
+         coh_timed && coh_first
+-            ? coh::TimedAnchor(ct, &coh_anchor, [&] { return c3po_->Gcd()->GetAnchorTimed(block_id, nr_meta); })
++            ? coh::TimedAnchor(ct, &coh_anchor, [&](uint64_t *lk) { return c3po_->Gcd()->GetAnchorTimed(block_id, nr_meta, lk); })
+             : c3po_->Gcd()->GetAnchor(block_id, nr_meta);
+ 
+     init_read_handle(rh, block_id, entry_optional, local_meta->logical_node_id_);
+@@ -1264,6 +1419,7 @@ retry:
+         auto coh_discard = [&](uint64_t *cnt, uint64_t *cyc) {
+             ++*cnt;
+             if (!coh_ev) return;
++            ct.tbc_cnt++;  // build 77: a timed (B)/(C) interval
+             const uint64_t t = coh::Now(), sp = coh::SpinNow(ct).cyc;
+             const uint64_t t0 = ct.kvr_copy0 ? ct.kvr_copy0 : t, sp_0 = ct.kvr_copy0 ? ct.kvr_sp_copy0 : sp;
+             const uint64_t wall = coh::Sub(ct, t, t0), spin = sp - sp_0;
+@@ -1473,7 +1629,7 @@ retry:
+ 
+     coh_anchor = coh::AnchorSplit{};
+     entry_optional =
+-        coh_wt ? coh::TimedAnchor(ct, &coh_anchor, [&] { return c3po_->Gcd()->GetAnchorTimed(block_id, nr_meta); })
++        coh_wt ? coh::TimedAnchor(ct, &coh_anchor, [&](uint64_t *lk) { return c3po_->Gcd()->GetAnchorTimed(block_id, nr_meta, lk); })
+                : c3po_->Gcd()->GetAnchor(block_id, nr_meta);
+ 
+     init_write_handle(wh, block_id, entry_optional, local_meta->logical_node_id_);
+diff --git a/lib/shm_obj_handle.h b/lib/shm_obj_handle.h
+index b988d63..a0cc8ff 100644
+--- a/lib/shm_obj_handle.h
++++ b/lib/shm_obj_handle.h
+@@ -152,6 +152,14 @@ private:
+     expected<size_t, common::ReadErrno> ReadFromLocal(struct common::ReadHandle& rh, uint8_t* ptr, size_t count,
+                                                       size_t offset_into_page, ThreadLocalMeta<Policy>* local_meta);
+ 
++    // build 77 instrumentation: the timed KV Get (1 in N sampled, or MEGALON_COH_EVENTS=always), out of line
++    [[gnu::noinline]] size_t GetTimed(const common::BlockId& block_id, uint8_t* ptr, size_t count,
++                                                 size_t offset_into_page, ThreadLocalMeta<Policy>* local_meta,
++                                                 bool coh_sampled);
++
++    [[gnu::noinline]] expected<size_t, common::ReadErrno> ReadFromCXLTimed(
++        struct common::ReadHandle& rh, uint8_t* ptr, size_t count, size_t offset_into_page,
++        ThreadLocalMeta<Policy>* local_meta);  // build 77 instrumentation
+     expected<size_t, common::ReadErrno> ReadFromCXL(struct common::ReadHandle& rh, uint8_t* ptr, size_t count,
+                                                     size_t offset_into_page, ThreadLocalMeta<Policy>* local_meta);
+ 
+diff --git a/src/common/coh_stats.cc b/src/common/coh_stats.cc
+index 5c62be0..d575731 100644
+--- a/src/common/coh_stats.cc
++++ b/src/common/coh_stats.cc
+@@ -2,6 +2,7 @@
+ 
+ #include <time.h>
+ 
++#include <algorithm>
+ #include <atomic>
+ #include <cstdlib>
+ #include <cstring>
+@@ -59,6 +60,24 @@ void ResetThread() {
+     t.reclaim_cyc = rc_cyc;
+     t.nr = NrFfi::nr_thread_wait_stat();
+     t.rng = __rdtsc() ^ (reinterpret_cast<uintptr_t>(&t) * 0x9e3779b97f4a7c15ull) ^ 1;  // jitter seed per thread
++    // build 77 probe calibration: the cost of one timed interval's own TSC reads = median delta of back-to-back
++    // TSC pairs on this thread (after 64 warm-up pairs); 0 with timers off
++    if (g_cfg.timers) {
++        constexpr int kPairs = 255;
++        uint64_t d[kPairs];
++        for (int i = 0; i < 64; i++) {
++            const uint64_t a = Now();
++            const uint64_t b = Now();
++            d[0] = b - a;
++        }
++        for (int i = 0; i < kPairs; i++) {
++            const uint64_t a = Now();
++            const uint64_t b = Now();
++            d[i] = b >= a ? b - a : 0;
++        }
++        std::nth_element(d, d + kPairs / 2, d + kPairs);
++        t.probe_cyc = d[kPairs / 2];
++    }
+     const_cast<uint64_t *>(t.nr)[6] = 0;
+ }
+ 
+diff --git a/src/common/coh_stats.h b/src/common/coh_stats.h
+index 8af2212..92d5fdf 100644
+--- a/src/common/coh_stats.h
++++ b/src/common/coh_stats.h
+@@ -74,6 +74,8 @@ struct Tls {
+     bool sec_timed, sec_ev, sec_wtimed;    // open read section: checks timed / events timed; open write section timed
+     bool kvw_copied;                       // KV Put: CreateEntry copied the value (independent of the timers)
+     void *obj_ctr;                         // this thread's ObjectStore counter block (object_store.cc; kept at Register)
++    uint64_t probe_cyc;                    // build 77: median delta of back-to-back TSC pairs, measured at Register
++    uint64_t ta_cnt, tbc_cnt, td_cnt;      // build 77: (A), (B)+(C) events and (D) episodes whose durations were timed
+ };
+ 
+ // The thread's Tls through ThreadLocalMeta (set at Register; no thread-local lookup), or coh::tls.
+@@ -142,6 +144,8 @@ inline uint64_t SpinCnt(Tls &t) {
+     const uint64_t *nr = t.nr ? t.nr : NrPtr();
+     return t.rseq_spin_cnt + nr[0];
+ }
++// The same for a registered thread (t.nr set by ResetThread at Register): no fallback branch.
++inline uint64_t SpinCntReg(const Tls &t) { return t.rseq_spin_cnt + t.nr[0]; }
+ 
+ // Contended-wait totals of the calling thread (read_seqlock_begin spin + NR read-side waits).
+ struct Spin {
+@@ -157,11 +161,13 @@ inline Spin SpinNow(Tls &t) {
+ // adds the split to *out. Timed sections only.
+ template <class F>
+ inline auto TimedAnchor(Tls &t, AnchorSplit *out, F &&fn) {
+-    const uint64_t *w = t.nr ? t.nr : NrPtr();
++    uint64_t *w = const_cast<uint64_t *>(t.nr ? t.nr : NrPtr());
+     const uint64_t l0 = w[4], f0 = w[5], s0 = SpinNow(t).cyc;
++    w[3] = 1;  // anchor flag: the NR replay times its Megalon-only flushes into w[5]
+     const uint64_t t0 = Now();
+-    auto r = fn();
++    auto r = fn(&w[4]);  // fn passes &w[4] to GetAnchorTimed (lookup cycles)
+     const uint64_t t1 = Now();
++    w[3] = 0;
+     const uint64_t lookup = w[4] - l0, fl = w[5] - f0, spin = SpinNow(t).cyc - s0;
+     out->lookup += lookup;
+     out->nr += Sub(t, Sub(t, t1, t0), lookup + fl + spin);
+diff --git a/src/core/c3.cc b/src/core/c3.cc
+index 07d55d1..194e0ce 100644
+--- a/src/core/c3.cc
++++ b/src/core/c3.cc
+@@ -405,6 +405,46 @@ std::optional<size_t> C3POHandle::FindRemoteCacheNodeIndex(const std::optional<c
+ }
+ 
+ bool C3POHandle::read_seq_start(ReadHandle &rh) {
++    if (rh.coh_timed) [[unlikely]]  // build 77: instrumented variant, out of line (timed sections only)
++        return read_seq_start_timed(rh);
++    std::optional<size_t> cn_index;
++    std::optional<size_t> wmeta_index;
++
++    if (!rh.from_cxl) return true;
++
++    cn_index = CacheNodeIndexOnCxl(rh.entry_optional);
++    if (!cn_index.has_value()) {
++        set_read_handle_errno(rh, ReadErrno::PAGE_NOT_FOUND);
++        return false;
++    }
++
++    wmeta_index = rh.entry_optional->wmeta_idx_;
++    if (wmeta_index.has_value()) {  // RW mode: enable read sequence lock
++        common::WriteMetadata *wmeta = c3po_->scr_meta_->GetWmeta(wmeta_index.value());
++        uint32_t cxl_seq = wmeta->RSeqBegin();
++#ifndef FULL_COHERENCE
++        std::optional<SharedMetadata::LocalSeqcountT> local_seq =
++            c3po_->scr_meta_->GetLocalSeqcount(wmeta_index.value(), rh.current_nid);
++        if (local_seq != std::nullopt && local_seq != cxl_seq) {
++#ifdef C3_RWLOCK
++            (void)wmeta->RSeqRetry(0);  // explicitly unlock
++#endif
++            c3po_->scr_meta_->UpdateLocalSeqcount(wmeta_index.value(), rh.current_nid, std::nullopt);
++            set_read_handle_errno(rh, ReadErrno::PAGE_INCOHERENT);
++            return false;
++        }
++        // update local cache state
++        if (local_seq != std::nullopt) {
++            rh.is_local_cpu_cached = true;
++        }
++#endif
++        rh.seqcount = cxl_seq;
++    }
++    return true;
++}
++
++// build 75-77 instrumentation: read_seq_start of a timed section (seqlock calls timed; otherwise identical)
++bool C3POHandle::read_seq_start_timed(ReadHandle &rh) {
+     std::optional<size_t> cn_index;
+     std::optional<size_t> wmeta_index;
+ 
+@@ -455,6 +495,130 @@ bool C3POHandle::read_seq_end(ReadHandle &rh
+                               ,
+                               const NrFfi::NrMeta *nr_meta
+ #endif
++) {
++    if (rh.coh_timed) [[unlikely]]  // build 77: instrumented variant, out of line (timed sections only)
++        return read_seq_end_timed(rh, nr_meta);
++    std::optional<size_t> cn_index;
++    std::optional<size_t> wmeta_index;
++
++    if (!rh.from_cxl) return true;
++
++    cn_index = CacheNodeIndexOnCxl(rh.entry_optional);
++    if (!cn_index.has_value()) {
++        set_read_handle_errno(rh, ReadErrno::PAGE_NOT_FOUND);
++        return false;
++    }
++
++    if (!CheckNotification(
++#ifdef NR
++            nr_meta
++#endif
++            )) {
++        DLOG(WARNING) << (rh.from_cxl ? "CXL" : "local") << " page @" << rh.cn_index.value() << " with block_id "
++                      << rh.key << " is not coherent";
++        set_read_handle_errno(rh, ReadErrno::META_OUTDATE);
++        return false;
++    }
++
++    // if (h.seq_num check fail) {
++    wmeta_index = rh.entry_optional->wmeta_idx_;
++    if (!wmeta_index.has_value()) {
++        // READ-ONLY page path - track active_node via CacheNode
++#ifdef PARTITIONED_NODE
++        common::CacheNode *cn = shared_cache_->cache_slot_.GetCacheNode(cn_index.value());
++        uint8_t active_node = cn->GetActiveNode();
++
++        if (active_node == rh.current_nid) {
++            auto current_node_cnt = c3po_->scr_meta_->IncrementCurrentNodeCount(cn_index.value(), rh.current_nid) + 1;
++            if (current_node_cnt == CONSECUTIVE_ACCESS_THRESHOLD) {
++                if (partition_ratio_ > 0.0) {
++                    off_t lower = static_cast<off_t>(
++                        (static_cast<long double>(key_space_) * partition_ratio_ * rh.current_nid) / LOGICAL_NODE_NUM);
++                    off_t upper = static_cast<off_t>(
++                        (static_cast<long double>(key_space_) * partition_ratio_ * (rh.current_nid + 1)) /
++                        LOGICAL_NODE_NUM);
++                    if (rh.key.GetOffset() >= lower && rh.key.GetOffset() < upper) {
++                        MoveToLocalReadOnly(rh, cn_index.value()
++#ifdef NR
++                                                    ,
++                                            nr_meta
++#endif
++                        );
++                    }
++                }
++            }
++        } else {
++            cn->SetActiveNode(static_cast<uint8_t>(rh.current_nid));
++            c3po_->scr_meta_->ResetCurrentNodeCount(cn_index.value(), rh.current_nid);
++        }
++#endif
++        return true;
++    }
++    common::WriteMetadata *wmeta = c3po_->scr_meta_->GetWmeta(wmeta_index.value());
++
++    if (wmeta->RSeqRetry(static_cast<uint32_t>(rh.seqcount))) {
++#ifndef FULL_COHERENCE
++        c3po_->scr_meta_->UpdateLocalSeqcount(wmeta_index.value(), rh.current_nid, std::nullopt);
++#endif
++        set_read_handle_errno(rh, ReadErrno::PAGE_INCOHERENT);
++        return false;
++    }
++#ifndef FULL_COHERENCE
++    if (!rh.is_local_cpu_cached)
++        c3po_->scr_meta_->UpdateLocalSeqcount(wmeta_index.value(), rh.current_nid, rh.seqcount);
++#endif
++#ifdef PARTITIONED_NODE
++    common::CacheNode *cn = shared_cache_->cache_slot_.GetCacheNode(cn_index.value());
++    uint8_t active_node = cn->GetActiveNode();
++    // LOG(INFO) << "Read page " << rh.key << " from node " << active_node << " to node " << rh.current_nid;
++    if (active_node == rh.current_nid) {
++        c3po_->scr_meta_->IncrementCurrentNodeCount(cn_index.value(), rh.current_nid);
++        if (c3po_->scr_meta_->GetCurrentNodeCount(cn_index.value(), rh.current_nid) > CONSECUTIVE_ACCESS_THRESHOLD) {
++            // LOG(INFO) << "Replicating page " << rh.key << " to local node " << rh.current_nid
++            //           << " (active node: " << active_node << ")";
++            // Replicate hot page from shared CXL cache to local DRAM
++            if (partition_ratio_ > 0.0) {
++                off_t lower = static_cast<off_t>(
++                    (static_cast<long double>(key_space_) * partition_ratio_ * rh.current_nid) / LOGICAL_NODE_NUM);
++                off_t upper = static_cast<off_t>(
++                    (static_cast<long double>(key_space_) * partition_ratio_ * (rh.current_nid + 1)) /
++                    LOGICAL_NODE_NUM);
++
++                if (rh.key.GetOffset() >= lower && rh.key.GetOffset() < upper) {
++                    MoveToLocalReadOnly(rh, cn_index.value()
++#ifdef NR
++                                                ,
++                                        nr_meta
++#endif
++                    );
++                } else {
++                    // LOG(FATAL) << "Page " << rh.key << " is not in the partition,"
++                    //            << " key_offset=" << rh.key.GetOffset() << ", key_space_=" << key_space_
++                    //            << ", partition_ratio_=" << partition_ratio_ << ", LOGICAL_NODE_NUM=" <<
++                    //            LOGICAL_NODE_NUM
++                    //            << ", current_nid=" << rh.current_nid
++                    //            << ", active_node=" << static_cast<uint64_t>(active_node) << ", lower=" <<
++                    //            lower
++                    //            << ", upper=" << upper << ", threshold=" << CONSECUTIVE_ACCESS_THRESHOLD
++                    //            << ", node_count="
++                    //            << c3po_->scr_meta_->GetCurrentNodeCount(cn_index.value(), rh.current_nid);
++                }
++            }
++        }
++    } else {
++        c3po_->scr_meta_->ResetCurrentNodeCount(cn_index.value(), rh.current_nid);
++        cn->SetActiveNode(static_cast<uint8_t>(rh.current_nid));
++    }
++#endif
++    return true;
++}
++
++// build 75-77 instrumentation: read_seq_end of a timed section (seqlock calls timed; otherwise identical)
++bool C3POHandle::read_seq_end_timed(ReadHandle &rh
++#ifdef NR
++                              ,
++                              const NrFfi::NrMeta *nr_meta
++#endif
+ ) {
+     std::optional<size_t> cn_index;
+     std::optional<size_t> wmeta_index;
+@@ -642,6 +806,85 @@ bool C3POHandle::write_seq_start(WriteHandle &wh
+                                  ,
+                                  const NrFfi::NrMeta *nr_meta
+ #endif
++) {
++    if (wh.coh_timed) [[unlikely]]  // build 77: instrumented variant, out of line (timed sections only)
++        return write_seq_start_timed(wh, nr_meta);
++    std::optional<size_t> cn_index;
++    std::optional<size_t> wmeta_index;
++
++    if (!wh.from_cxl) {
++        // TODO: hold local locks
++        return true;
++    }
++
++    cn_index = CacheNodeIndexOnCxl(wh.entry_optional);
++    if (!cn_index.has_value()) {
++        set_write_handle_errno(wh, WriteErrno::PAGE_NOT_FOUND);
++        return false;
++    }
++
++    // grab the lock
++    wmeta_index = wh.entry_optional->wmeta_idx_;
++    if (!wmeta_index.has_value()) {
++        set_write_handle_errno(wh, WriteErrno::PAGE_RO);
++        return false;
++    }
++    common::WriteMetadata *wmeta = c3po_->scr_meta_->GetWmeta(wmeta_index.value());
++    if (!wmeta->WSeqBegin()) {
++        // for dynamic wmeta
++        set_write_handle_errno(wh, WriteErrno::META_OUTDATE);
++        return false;
++    }
++
++#ifdef NR
++    if (!CheckNotificationWrite(nr_meta)) {
++        wmeta->WSeqEnd();
++        set_write_handle_errno(wh, WriteErrno::META_OUTDATE);
++        return false;
++    }
++    if (diag::Enabled()) {
++        // observe only (behaviour unchanged): does the key still hold the record we just locked?
++        diag::writer_checks.fetch_add(1, std::memory_order_relaxed);
++        diag::last_write.wmeta = static_cast<int64_t>(wmeta_index.value());
++#ifndef WMETA_OWNER_REV
++        if (!(wmeta->GetBlockID() == wh.key)) {
++            diag::last_write.flags |= diag::kFlOwnerMismatch;
++            uint64_t n = diag::writer_owner_mismatch.fetch_add(1, std::memory_order_relaxed);
++            LOG_IF(WARNING, n < 10) << "DIAG writer: locked record " << wmeta_index.value() << " for key " << wh.key
++                                    << " but its BlockId is " << wmeta->GetBlockID();
++        }
++#endif
++        std::optional<common::GCDEntry> re = Gcd()->Get(wh.key, nr_meta);
++        if (!re.has_value() || re->wmeta_idx_ != wmeta_index) {
++            diag::last_write.flags |= diag::kFlStale;
++            uint64_t n = diag::writer_stale_entry.fetch_add(1, std::memory_order_relaxed);
++            LOG_IF(WARNING, n < 10) << "DIAG writer: key " << wh.key << " locked record " << wmeta_index.value()
++                                    << " but a synced re-read shows "
++                                    << (!re.has_value() ? std::string("no entry")
++                                        : re->wmeta_idx_.has_value() ? "record " + std::to_string(*re->wmeta_idx_)
++                                                                     : std::string("RO (no record)"));
++        }
++    }
++#else
++    // recheck metadata update, prevent time-to-check and time-to-modify problem, use gcd_get again
++    std::optional<common::GCDEntry> recheck_optional = Gcd()->Get(wh.key);
++    if (!isEqual(recheck_optional, wh.entry_optional)) {
++        (void)c3po_->WUnlock(cn_index.value());
++        DLOG(WARNING) << " page @" << wh.cn_index.value() << " with block_id " << wh.key << " is not valid";
++        set_write_handle_errno(wh, WriteErrno::META_OUTDATE);
++        return false;
++    }
++#endif
++
++    return true;
++}
++
++// build 75-77 instrumentation: write_seq_start of a timed section (seqlock calls timed; otherwise identical)
++bool C3POHandle::write_seq_start_timed(WriteHandle &wh
++#ifdef NR
++                                 ,
++                                 const NrFfi::NrMeta *nr_meta
++#endif
+ ) {
+     std::optional<size_t> cn_index;
+     std::optional<size_t> wmeta_index;
+@@ -724,6 +967,52 @@ bool C3POHandle::write_seq_start(WriteHandle &wh
+ }
+ 
+ void C3POHandle::write_seq_end(WriteHandle &wh, const NrFfi::NrMeta *nr_meta) {
++    if (wh.coh_timed) [[unlikely]]  // build 77: instrumented variant, out of line (timed sections only)
++        return write_seq_end_timed(wh, nr_meta);
++    std::optional<size_t> cn_index;
++    std::optional<size_t> wmeta_index;
++
++    if (!wh.from_cxl) {
++        // TODO: release local locks
++        return;
++    }
++
++    cn_index = CacheNodeIndexOnCxl(wh.entry_optional);
++    if (!cn_index.has_value()) {
++        LOG(FATAL) << "page evicted during write";
++        set_write_handle_errno(wh, WriteErrno::PAGE_NOT_FOUND);
++        return;
++    }
++
++    wmeta_index = wh.entry_optional->wmeta_idx_;
++    if (!wmeta_index.has_value()) {
++        LOG(FATAL) << "page switched to RO when locked";
++        set_write_handle_errno(wh, WriteErrno::PAGE_RO);
++        return;
++    }
++
++    common::WriteMetadata *wmeta = c3po_->scr_meta_->GetWmeta(wmeta_index.value());
++    auto seq = wmeta->WSeqEnd();  // seqlock unlock
++
++    /**
++     * We discussed that this would be incorrect for the very first time, since the seqlock begins
++     * at zero. I have changed my mind on this. Since correct operation is to use write_seq_begin
++     * before write_seq_end, this would only ever see even numbers, not including zero. So the first
++     * time this is called, seq should be == 2
++     */
++    if (seq == 0) {
++        // generate log entry for overflow to let readers know their cached value could be stale
++        // some_function(wh.key);
++        c3po_->gcd_->SeqCountWrapAround(wh.key, nr_meta);
++    }
++// update local seq count
++#ifndef FULL_COHERENCE
++    c3po_->scr_meta_->UpdateLocalSeqcount(wmeta_index.value(), wh.current_nid, seq);
++#endif
++}
++
++// build 75-77 instrumentation: write_seq_end of a timed section (seqlock calls timed; otherwise identical)
++void C3POHandle::write_seq_end_timed(WriteHandle &wh, const NrFfi::NrMeta *nr_meta) {
+     std::optional<size_t> cn_index;
+     std::optional<size_t> wmeta_index;
+ 
+diff --git a/src/core/c3.h b/src/core/c3.h
+index 7f41f0f..3916000 100644
+--- a/src/core/c3.h
++++ b/src/core/c3.h
+@@ -255,6 +255,12 @@ public:
+ 
+     void write_seq_end(WriteHandle &wh, const NrFfi::NrMeta *nr_meta);
+ 
++    // build 77 instrumentation: the timed variants (out of line, not marked cold: a cold placement made timed sections slow and biased); the plain functions are build 70's
++    [[gnu::noinline]] bool read_seq_start_timed(ReadHandle &rh);
++    [[gnu::noinline]] bool read_seq_end_timed(ReadHandle &rh, const NrFfi::NrMeta *nr_meta);
++    [[gnu::noinline]] bool write_seq_start_timed(WriteHandle &wh, const NrFfi::NrMeta *nr_meta);
++    [[gnu::noinline]] void write_seq_end_timed(WriteHandle &wh, const NrFfi::NrMeta *nr_meta);
++
+     [[nodiscard]] bool WLock(size_t wm_idx) { return c3po_->WLock(wm_idx); }
+ 
+     [[nodiscard]] unsigned int WUnlock(size_t wm_idx) { return c3po_->WUnlock(wm_idx); }
+diff --git a/src/core/seqcount.cc b/src/core/seqcount.cc
+index f616471..5ef0250 100644
+--- a/src/core/seqcount.cc
++++ b/src/core/seqcount.cc
+@@ -317,29 +317,32 @@ uint32_t seqlock_full(seqlock_t* s) { return s->sequence.load(std::memory_order_
+ 
+ uint32_t seqlock_full_relaxed(seqlock_t* s) { return s->sequence.load(std::memory_order_relaxed); }
+ 
+-uint32_t read_seqlock_begin(seqlock_t* s) {
+-#if C3_RWLOCK == 0
++// build 77: the contended spin (counted always, timed in timed sections) out of line; the fast path is upstream's
++[[gnu::noinline]] static uint32_t read_seqlock_begin_spin(seqlock_t* s) {
+     uint32_t seq;
+-    uint64_t spin_t0 = 0;  // De Stijl port instrumentation (build 71): contended spin only, observation only
+-    bool spun = false;
+-
++    coh::Tls& t = coh::tls;
++    const uint64_t spin_t0 = t.ev_timed ? coh::Now() : 0;
+     do {
++        cpu_relax();
+ #ifdef NO_COHERENCE
+         cache_flush(reinterpret_cast<char*>(s), sizeof(*s));
+ #endif
+         seq = s->sequence.load(std::memory_order_acquire);
+-        if (!(seq & 1)) break;
+-        if (!spun) {
+-            spun = true;
+-            if (coh::tls.ev_timed) spin_t0 = coh::Now();  // build 76: timed sections only (count always)
+-        }
+-        cpu_relax();
+-    } while (true);
+-    if (spun) [[unlikely]] {
+-        coh::Tls& t = coh::tls;
+-        t.rseq_spin_cnt++;
+-        if (t.ev_timed) t.rseq_spin_cyc += coh::Sub(t, coh::Now(), spin_t0);
+-    }
++    } while (seq & 1);
++    t.rseq_spin_cnt++;
++    if (t.ev_timed) t.rseq_spin_cyc += coh::Sub(t, coh::Now(), spin_t0);
++    return seq;
++}
++
++uint32_t read_seqlock_begin(seqlock_t* s) {
++#if C3_RWLOCK == 0
++    uint32_t seq;
++#ifdef NO_COHERENCE
++    cache_flush(reinterpret_cast<char*>(s), sizeof(*s));
++#endif
++    seq = s->sequence.load(std::memory_order_acquire);
++    if (seq & 1) [[unlikely]]
++        seq = read_seqlock_begin_spin(s);
+ 
+     return seq & SEQ_MASK;
+ #else
+diff --git a/src/index/gcd_nr.cc b/src/index/gcd_nr.cc
+index 111530a..3197054 100644
+--- a/src/index/gcd_nr.cc
++++ b/src/index/gcd_nr.cc
+@@ -121,9 +121,8 @@ std::optional<GCDEntry> GlobalCacheDirectoryHandleNr::Get(const BlockId& block_i
+     return entry;
+ }
+ 
+-namespace {
+-GCDEntry FromNr(const NrFfi::GCDEntry& nr_entry_in) {
+-    NrFfi::GCDEntry nr_entry = nr_entry_in;
++std::optional<GCDEntry> GlobalCacheDirectoryHandleNr::GetAnchor(const BlockId& block_id, const NrFfi::NrMeta* nr_meta) {
++    NrFfi::GCDEntry nr_entry = NrFfi::GetAnchor(nr_meta, block_id);
+     GCDEntry entry;
+     for (int i = 0; i < LOGICAL_NODE_NUM + 1; i++) {
+         NrFfi::CNStatus_t& nr_status = nr_entry.cn_array_[i];
+@@ -140,16 +139,27 @@ GCDEntry FromNr(const NrFfi::GCDEntry& nr_entry_in) {
+         entry.wmeta_idx_ = std::nullopt;
+     return entry;
+ }
+-}  // namespace
+ 
+-std::optional<GCDEntry> GlobalCacheDirectoryHandleNr::GetAnchor(const BlockId& block_id, const NrFfi::NrMeta* nr_meta) {
+-    return FromNr(NrFfi::GetAnchor(nr_meta, block_id));
+-}
+-
+-// build 76 instrumentation: the anchor of a timed section (NR times the lookup and Megalon-only flushes)
++// build 76/77 instrumentation: the anchor of a timed section (NR adds the index-dispatch cycles to *lookup_cyc); same
++// conversion as GetAnchor
+ std::optional<GCDEntry> GlobalCacheDirectoryHandleNr::GetAnchorTimed(const BlockId& block_id,
+-                                                                    const NrFfi::NrMeta* nr_meta) {
+-    return FromNr(NrFfi::GetAnchorTimed(nr_meta, block_id));
++                                                                    const NrFfi::NrMeta* nr_meta, uint64_t* lookup_cyc) {
++    NrFfi::GCDEntry nr_entry = NrFfi::GetAnchorTimed(nr_meta, block_id, lookup_cyc);
++    GCDEntry entry;
++    for (int i = 0; i < LOGICAL_NODE_NUM + 1; i++) {
++        NrFfi::CNStatus_t& nr_status = nr_entry.cn_array_[i];
++        CNStatus_t& status = entry.cn_array_[i];
++        if (nr_status.cn_idx_ != -1)
++            status.cn_idx_ = nr_status.cn_idx_;
++        else
++            status.cn_idx_ = std::nullopt;
++        status.invalidate_ = nr_status.invalidate_;
++    }
++    if (nr_entry.wmeta_idx_ != -1)
++        entry.wmeta_idx_ = nr_entry.wmeta_idx_;
++    else
++        entry.wmeta_idx_ = std::nullopt;
++    return entry;
+ }
+ 
+ /**
+diff --git a/src/index/gcd_nr.h b/src/index/gcd_nr.h
+index 8f85917..6674448 100644
+--- a/src/index/gcd_nr.h
++++ b/src/index/gcd_nr.h
+@@ -53,7 +53,8 @@ public:
+     std::optional<GCDEntry> Get(const BlockId& block_id, const NrFfi::NrMeta* nr_meta);
+ 
+     std::optional<GCDEntry> GetAnchor(const BlockId& block_id, const NrFfi::NrMeta* nr_meta);
+-    std::optional<GCDEntry> GetAnchorTimed(const BlockId& block_id, const NrFfi::NrMeta* nr_meta);  // build 76
++    std::optional<GCDEntry> GetAnchorTimed(const BlockId& block_id, const NrFfi::NrMeta* nr_meta,
++                                           uint64_t* lookup_cyc);  // build 76/77 instrumentation
+ 
+     std::optional<ssize_t> Delete(const BlockId& to_remove, const NrFfi::NrMeta* nr_meta);
+ 
+diff --git a/src/index/nr_hashmap.h b/src/index/nr_hashmap.h
+index 482c373..550db98 100644
+--- a/src/index/nr_hashmap.h
++++ b/src/index/nr_hashmap.h
+@@ -57,7 +57,8 @@ bool Swap(const NrMeta* metadata, rackobj::common::BlockId to_insert, rackobj::c
+           rackobj::common::GCDEntry val);
+ GCDEntry Get(const NrMeta* metadata, rackobj::common::BlockId key);
+ GCDEntry GetAnchor(const NrMeta* metadata, rackobj::common::BlockId key);
+-GCDEntry GetAnchorTimed(const NrMeta* metadata, rackobj::common::BlockId key);  // build 76 instrumentation
++// build 76/77 instrumentation: GetAnchor of a timed section; adds the index-dispatch cycles to *lookup_cyc
++GCDEntry GetAnchorTimed(const NrMeta* metadata, rackobj::common::BlockId key, uint64_t* lookup_cyc);
+ GCDEntry GetAsync(const NrMeta* metadata, rackobj::common::BlockId key);
+ 
+ void PutArray(const NrMeta* metadata, rackobj::common::BlockId key, ssize_t cn, uint64_t idx, ssize_t wmeta_idx = -1);
+diff --git a/third-party/nr_rust/ffi/ffi_nr_hashmap.rs b/third-party/nr_rust/ffi/ffi_nr_hashmap.rs
+index 3ca3894..bb58329 100644
+--- a/third-party/nr_rust/ffi/ffi_nr_hashmap.rs
++++ b/third-party/nr_rust/ffi/ffi_nr_hashmap.rs
+@@ -1325,9 +1325,9 @@ pub extern "C" fn GetAnchor(metadata: *mut NrMeta, key: BlockId) -> GCDEntry {
+ /// De Stijl port instrumentation (build 76): GetAnchor of a timed (sampled) section (lookup and Megalon-only flush
+ /// timing in waitstat slots 4/5). Same result as GetAnchor.
+ #[no_mangle]
+-pub extern "C" fn GetAnchorTimed(metadata: *mut NrMeta, key: BlockId) -> GCDEntry {
++pub extern "C" fn GetAnchorTimed(metadata: *mut NrMeta, key: BlockId, lookup_cyc: *mut u64) -> GCDEntry {
+     unsafe {
+-        let wrapper = (*metadata).nrht.execute_anchor_timed(Access::Get(key), (*metadata).ttkn);
++        let wrapper = (*metadata).nrht.execute_anchor_timed(Access::Get(key), (*metadata).ttkn, lookup_cyc);
+         let response = wrapper.0;
+         match response {
+             Some(value) => value.value,
+diff --git a/third-party/nr_rust/ffi/port_tests.rs b/third-party/nr_rust/ffi/port_tests.rs
+index 6d93044..5f61826 100644
+--- a/third-party/nr_rust/ffi/port_tests.rs
++++ b/third-party/nr_rust/ffi/port_tests.rs
+@@ -427,7 +427,9 @@ fn waitstat_flagged_anchor_records_lookup_only_when_flagged() {
+         n0.execute_mut(Modify::PutArrayWmeta(key(100 + k), 100 + k as isize, 0, -1), t0);
+     }
+     unsafe { *w().add(6) = 1 };
+-    let r = n1.execute_anchor_timed(Access::Get(key(1)), t1);
++    unsafe { *w().add(3) = 1 };  // the caller (C++ TimedAnchor) sets the anchor flag
++    let r = n1.execute_anchor_timed(Access::Get(key(1)), t1, unsafe { w().add(4) });
++    unsafe { *w().add(3) = 0 };
+     unsafe { *w().add(6) = 0 };
+     assert_eq!(rd(3), 0, "anchor flag cleared");
+     assert_eq!(r.0.unwrap().value.cn_array_[0].cn_idx_, 11);
+diff --git a/third-party/nr_rust/node-replication/src/nr/mod.rs b/third-party/nr_rust/node-replication/src/nr/mod.rs
+index 61814bf..b436981 100644
+--- a/third-party/nr_rust/node-replication/src/nr/mod.rs
++++ b/third-party/nr_rust/node-replication/src/nr/mod.rs
+@@ -1025,13 +1025,13 @@ where
+         op: <D as Dispatch>::ReadOperation<'rop>,
+         tkn: ThreadToken,
+         cl: Option<CombinerLock<'a, D>>,
+-        timed: bool,
++        lookup_cyc: *mut u64,
+     ) -> Result<<D as Dispatch>::Response, (ReplicaError<D>, <D as Dispatch>::ReadOperation<'rop>)>
+     {
+         if let Some(combiner_lock) = cl {
+-            self.local(tkn.rid).execute_locked_anchor(self.log, op, tkn.rtkn, combiner_lock, timed)
++            self.local(tkn.rid).execute_locked_anchor(self.log, op, tkn.rtkn, combiner_lock, lookup_cyc)
+         } else {
+-            self.local(tkn.rid).execute_anchor(self.log, op, tkn.rtkn, timed)
++            self.local(tkn.rid).execute_anchor(self.log, op, tkn.rtkn, lookup_cyc)
+         }
+     }
+ 
+@@ -1149,30 +1149,27 @@ where
+         op: <D as Dispatch>::ReadOperation<'_>,
+         tkn: ThreadToken,
+     ) -> <D as Dispatch>::Response {
+-        self.execute_anchor_t(op, tkn, false)
++        self.execute_anchor_t(op, tkn, core::ptr::null_mut())
+     }
+ 
+-    /// De Stijl port instrumentation (build 76): `execute_anchor` of a timed (sampled) section; sets the anchor
+-    /// flag for the Megalon-only flush timing during this call and times the index dispatch.
++    /// De Stijl port instrumentation (build 76/77): `execute_anchor` of a timed (sampled) section; adds the index
++    /// dispatch cycles to `*lookup_cyc` (the caller also sets the waitstat anchor flag for the flush timing).
+     pub fn execute_anchor_timed(
+         &self,
+         op: <D as Dispatch>::ReadOperation<'_>,
+         tkn: ThreadToken,
++        lookup_cyc: *mut u64,
+     ) -> <D as Dispatch>::Response {
+-        waitstat::set_anchor_flag(true);
+-        let r = self.execute_anchor_t(op, tkn, true);
+-        waitstat::set_anchor_flag(false);
+-        r
++        self.execute_anchor_t(op, tkn, lookup_cyc)
+     }
+ 
+-    // One shared copy for timed and untimed anchors (build 76): a separate timed copy would run cold (1 in N) and
+-    // bias the sampled durations upward.
++    // One shared copy for timed and untimed anchors (a separate timed copy would run cold, 1 in N).
+     #[inline(never)]
+     fn execute_anchor_t(
+         &self,
+         op: <D as Dispatch>::ReadOperation<'_>,
+         tkn: ThreadToken,
+-        timed: bool,
++        lookup_cyc: *mut u64,
+     ) -> <D as Dispatch>::Response {
+         enum ResolveOp<'a, 'rop, D>
+         where
+@@ -1189,7 +1186,7 @@ where
+         q.push(ResolveOp::Exec(None, op));
+         loop {
+             match q.pop().unwrap() {
+-                ResolveOp::Exec(cl, op) => match self.try_execute_anchor(op, tkn, cl, timed) {
++                ResolveOp::Exec(cl, op) => match self.try_execute_anchor(op, tkn, cl, lookup_cyc) {
+                     Ok(resp) => {
+                         assert!(q.is_empty());
+                         return resp;
+diff --git a/third-party/nr_rust/node-replication/src/nr/replica.rs b/third-party/nr_rust/node-replication/src/nr/replica.rs
+index 23d4026..7b1daed 100644
+--- a/third-party/nr_rust/node-replication/src/nr/replica.rs
++++ b/third-party/nr_rust/node-replication/src/nr/replica.rs
+@@ -788,13 +788,12 @@ where
+         return Ok(self.data.read(idx.tid() - 1).dispatch(op));
+     }
+ 
+-    #[inline(never)] // build 76: one copy for timed and untimed anchors
+     pub fn execute_anchor<'rop>(
+         &self,
+         slog: &Log<<D as Dispatch>::WriteOperation>,
+         op: <D as Dispatch>::ReadOperation<'rop>,
+         idx: ReplicaToken,
+-        timed: bool,
++        lookup_cyc: *mut u64,
+     ) -> Result<<D as Dispatch>::Response, (ReplicaError<D>, <D as Dispatch>::ReadOperation<'rop>)>
+     {
+         // We can perform the read only if our replica is synced up against
+@@ -808,11 +807,13 @@ where
+         // concurrent replay (exec_notify holds the write guard) cannot run
+         // between the dispatch and the store and miss clearing it.
+         let guard = self.data.read(idx.tid() - 1);
+-        // build 74/76 instrumentation: the index lookup itself (work all-HWcc does too), timed anchors only
+-        let t_lookup = if timed { super::waitstat::now_raw() } else { 0 };
++        // build 74-77 instrumentation: the index lookup itself (work all-HWcc does too), timed anchors only. The
++        // cycles go to the caller's slot through a pointer (no call, no thread-local access next to the dispatch,
++        // so the untimed path compiles like upstream's).
++        let t_lookup = if !lookup_cyc.is_null() { super::waitstat::now_raw() } else { 0 };
+         let response = guard.dispatch(op);
+-        if timed {
+-            super::waitstat::acc_raw(super::waitstat::SLOT_LOOKUP, t_lookup);
++        if !lookup_cyc.is_null() {
++            unsafe { *lookup_cyc += super::waitstat::now_raw().saturating_sub(t_lookup) };
+         }
+         self.change_notif[idx.tid() - 1].store(response.cn_idx(), Ordering::Release);
+         drop(guard);
+@@ -882,14 +883,13 @@ where
+         Ok(self.data.read(idx.tid() - 1).dispatch(op))
+     }
+ 
+-    #[inline(never)] // build 76: one copy for timed and untimed anchors
+     pub fn execute_locked_anchor<'rop, 'lock>(
+         &'lock self,
+         slog: &Log<<D as Dispatch>::WriteOperation>,
+         op: <D as Dispatch>::ReadOperation<'rop>,
+         idx: ReplicaToken,
+         combiner_lock: CombinerLock<'lock, D>,
+-        timed: bool,
++        lookup_cyc: *mut u64,
+     ) -> Result<<D as Dispatch>::Response, (ReplicaError<D>, <D as Dispatch>::ReadOperation<'rop>)>
+     {
+         // We can perform the read only if our replica is synced up against
+@@ -913,11 +913,13 @@ where
+ 
+         // [C3] see execute_anchor.
+         let guard = self.data.read(idx.tid() - 1);
+-        // build 74/76 instrumentation: the index lookup itself (work all-HWcc does too), timed anchors only
+-        let t_lookup = if timed { super::waitstat::now_raw() } else { 0 };
++        // build 74-77 instrumentation: the index lookup itself (work all-HWcc does too), timed anchors only. The
++        // cycles go to the caller's slot through a pointer (no call, no thread-local access next to the dispatch,
++        // so the untimed path compiles like upstream's).
++        let t_lookup = if !lookup_cyc.is_null() { super::waitstat::now_raw() } else { 0 };
+         let response = guard.dispatch(op);
+-        if timed {
+-            super::waitstat::acc_raw(super::waitstat::SLOT_LOOKUP, t_lookup);
++        if !lookup_cyc.is_null() {
++            unsafe { *lookup_cyc += super::waitstat::now_raw().saturating_sub(t_lookup) };
+         }
+         self.change_notif[idx.tid() - 1].store(response.cn_idx(), Ordering::Release);
+         drop(guard);
+@@ -1100,6 +1102,20 @@ where
+         &'r self,
+         slog: &Log<<D as Dispatch>::WriteOperation>,
+         ctail: usize,
++    ) -> Result<(), ReplicaError<'r, D>> {
++        // build 77: already synced (the common case) costs exactly upstream's loop test
++        if slog.is_replica_synced_for_reads(&self.log_tkn, ctail) {
++            return Ok(());
++        }
++        self.combine_until_synced_slow(slog, ctail)
++    }
++
++    #[cold]
++    #[inline(never)]
++    fn combine_until_synced_slow<'r>(
++        &'r self,
++        slog: &Log<<D as Dispatch>::WriteOperation>,
++        ctail: usize,
+     ) -> Result<(), ReplicaError<'r, D>> {
+         let mut wait: Option<u64> = None;
+         while !slog.is_replica_synced_for_reads(&self.log_tkn, ctail) {
+diff --git a/third-party/nr_rust/node-replication/src/nr/waitstat.rs b/third-party/nr_rust/node-replication/src/nr/waitstat.rs
+index 19b9b79..7ffdf07 100644
+--- a/third-party/nr_rust/node-replication/src/nr/waitstat.rs
++++ b/third-party/nr_rust/node-replication/src/nr/waitstat.rs
+@@ -15,7 +15,8 @@ use core::sync::atomic::{AtomicBool, Ordering};
+ /// (the hash-map dispatch), Megalon-only coherence flush cycles inside flagged anchors (replay flushes of slots /
+ /// objects in exec_notify and the clflush of log entries before reading them; `scr` / `no-coherence` only)].
+ /// (build 76) [6] section-timed flag, set by C++ only for timed (sampled) sections: episodes are counted always,
+-/// their cycles only while it is set; [3] is now set by GetAnchorTimed itself.
++/// their cycles only while it is set; [3] (anchor flag) and [4] (lookup cycles, through GetAnchorTimed's pointer) are
++/// written by the C++ caller of a timed anchor (build 77).
+ #[thread_local]
+ static mut WAIT: [u64; 7] = [0, 0, 0, 0, 0, 0, 0];
+ 
+@@ -83,11 +84,6 @@ pub fn acc_raw(s: usize, t0: u64) {
+     }
+ }
+ 
+-/// Sets / clears the anchor flag [3] (GetAnchorTimed only).
+-#[inline(always)]
+-pub fn set_anchor_flag(on: bool) {
+-    unsafe { (*core::ptr::addr_of_mut!(WAIT))[3] = on as u64 };
+-}
+ 
+ /// Ends an episode that started at `t0` (a value of `now()`).
+ #[cold]
+-- 
+2.34.1
+

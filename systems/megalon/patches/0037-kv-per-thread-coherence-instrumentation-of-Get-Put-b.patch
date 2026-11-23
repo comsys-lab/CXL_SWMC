@@ -1,0 +1,567 @@
+From f2a7499654dd7e17cf81ae7524c1effb84efe67a Mon Sep 17 00:00:00 2001
+From: Sungsu Ahn <sungsu_ahn@korea.ac.kr>
+Date: Fri, 16 Oct 2026 22:44:14 +0900
+Subject: [PATCH 37/51] kv: per-thread coherence instrumentation of Get/Put
+ (build 73; no protocol change)
+
+The paper's KV API (rackobj::Get/Put -> SharedMemoryObjectHandle::Get/Put)
+is now counted in the same ObjectThreadCoh / CohSnap fields as the object
+API: one Get = one read section (checks sampled 1 in N with the shared
+per-thread counter; (A) stale at read_seq_start, (B) PAGE_INCOHERENT at
+read_seq_end incl. the slot flush, (C) META_OUTDATE, (D) contended waits of
+the whole Get; the slot copy of the accepted attempt is excluded from the
+check time), one Put = one write section (wstart = entry .. data copy incl.
+switch_rw, create/admit with its log op and reclaim, retries,
+write_seq_start; wflush = after the copy .. return, bytes = value bytes
+flushed). reserved[3..4] KV creates and their ns, reserved[5..6] KV Gets /
+Puts. CreateEntry's critical-path reclaim attempts are timed like
+SwitchRW's. Same TSC clamp. Fixes the ObjectThreadCoh estimator comment
+(ratio estimator). object-test phase 8: constructed KV cases per counter.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ benchmarks/object_test.cc | 140 +++++++++++++++++++++++++++++++++++++-
+ include/rackobj.h         |  15 ++--
+ lib/object_store.cc       |  12 ++--
+ lib/shm_obj_handle.cc     | 135 +++++++++++++++++++++++++++++++++++-
+ src/common/coh_stats.h    |  16 +++++
+ 5 files changed, 301 insertions(+), 17 deletions(-)
+
+diff --git a/benchmarks/object_test.cc b/benchmarks/object_test.cc
+index 9178454..3fbd667 100644
+--- a/benchmarks/object_test.cc
++++ b/benchmarks/object_test.cc
+@@ -284,6 +284,7 @@ rackobj::ObjectThreadCoh CohDiff(const rackobj::ObjectThreadCoh &a, const rackob
+     const uint64_t *pa = reinterpret_cast<const uint64_t *>(&a);
+     uint64_t *pd = reinterpret_cast<uint64_t *>(&d);
+     for (size_t i = 0; i < offsetof(rackobj::ObjectThreadCoh, reserved) / 8; i++) pd[i] -= pa[i];
++    for (size_t i = 3; i < 7; i++) d.reserved[i] -= a.reserved[i];  // [3..6] are totals (build 73); [0..2] absolute
+     d.check_sample = b.check_sample;
+     return d;
+ }
+@@ -357,8 +358,7 @@ private:
+     std::thread t_;
+ };
+ 
+-void CohPhase(int helper_tid) {
+-    HelperThread helper(helper_tid);
++void CohPhase(HelperThread &helper) {
+     rackobj::ObjectStats os{};
+     rackobj::GetObjectStats(&os);
+     const bool hwcc = os.static_records_used > 0;  // hwcc flavor: static records (objects RW at create), no stale/RO
+@@ -476,6 +476,135 @@ void CohPhase(int helper_tid) {
+     Barrier("coh checked");
+ }
+ 
++// ---- phase 8 (build 73): KV Get/Put (the paper's key-value API) in the same per-thread counters ----
++constexpr size_t kKvLen = 1024;  // <= SLOT_SIZE of every KEY_SIZE build
++off_t KvKey(size_t n, size_t i) { return static_cast<off_t>(600000 + n * 100000 + i); }
++
++void KvPut(off_t key, uint64_t gen) {
++    uint64_t w[kKvLen / 8];
++    for (size_t i = 0; i < kKvLen / 8; i++) w[i] = mix64(static_cast<uint64_t>(key) ^ (gen << 20) ^ (i << 44));
++    w[0] = gen;
++    (void)rackobj::Put(reinterpret_cast<const uint8_t *>(w), kKvLen, key);
++}
++
++// generation of the value, 0 if torn, ~0 if the key is missing
++uint64_t KvGetGen(off_t key) {
++    uint64_t w[kKvLen / 8];
++    if (rackobj::Get(reinterpret_cast<uint8_t *>(w), kKvLen, key) <= 0) return ~0ull;
++    for (size_t i = 1; i < kKvLen / 8; i++)
++        if (w[i] != mix64(static_cast<uint64_t>(key) ^ (w[0] << 20) ^ (i << 44))) return 0;
++    return w[0];
++}
++
++void KvCohPhase(HelperThread &helper, bool churn) {
++    rackobj::ObjectStats os{};
++    rackobj::GetObjectStats(&os);
++    const bool hwcc = os.static_records_used > 0;
++    const bool timed = Coh().reserved[1] == 1;
++    auto tpos = [&](uint64_t ns) { return !timed || ns > 0; };
++    const off_t own = KvKey(node_id, 0);
++    {  // create (admit) and update: write sections, wflush bytes = value size
++        auto c0 = Coh();
++        KvPut(own, 1);
++        auto d = CohDiff(c0, Coh());
++        LOG(INFO) << "KVCOH create (Put of a new key): " << CohStr(d) << " | admit " << d.reserved[3] << "/"
++                  << d.reserved[4] << " ns, kv " << d.reserved[5] << "/" << d.reserved[6];
++        EXPECT(d.write_sections == 1 && d.reserved[6] == 1 && d.reserved[3] == 1 && tpos(d.reserved[4]));
++        EXPECT(d.wflush_cnt == 1 && (d.wflush_bytes == kKvLen || hwcc) && tpos(d.wstart_ns));
++        EXPECT(d.reserved[4] <= d.wstart_ns && d.read_sections == 0);
++        c0 = Coh();
++        KvPut(own, 2);
++        d = CohDiff(c0, Coh());
++        LOG(INFO) << "KVCOH update (Put of an existing key): " << CohStr(d) << " | admit " << d.reserved[3];
++        EXPECT(d.write_sections == 1 && d.reserved[3] == 0 && d.wflush_cnt == 1);
++        EXPECT((d.wflush_bytes == kKvLen || hwcc) && tpos(d.wflush_ns) && tpos(d.wstart_ns));
++    }
++    if (node_id == 0) KvPut(KvKey(0, 1), 1);
++    Barrier("kv created");
++    // (A) stale copy: node 1 validates node 0's key, node 0 rewrites it, node 1 reads again
++    if (node_id == 1) EXPECT(KvGetGen(KvKey(0, 1)) == 1);
++    Barrier("kv A validated");
++    if (node_id == 0) KvPut(KvKey(0, 1), 2);
++    Barrier("kv A rewritten");
++    if (node_id == 1) {
++        auto c0 = Coh();
++        EXPECT(KvGetGen(KvKey(0, 1)) == 2);
++        auto d = CohDiff(c0, Coh());
++        LOG(INFO) << "KVCOH stale (node 1 Get after node 0's Put): " << CohStr(d);
++        EXPECT(hwcc || (d.stale_cnt == 1 && tpos(d.stale_ns)));
++        EXPECT(d.read_sections == 1 && d.reserved[5] == 1 && d.concur_cnt == 0 && d.meta_cnt == 0);
++    }
++    Barrier("kv A checked");
++    // (B) concurrent write and (D) writer spin: the helper rewrites the own key in a loop while this thread reads it
++    {
++        std::atomic<bool> stop{false};
++        helper.Start([&stop, own] {
++            for (uint64_t g = 3; !stop.load(std::memory_order_relaxed); g++) KvPut(own, g);
++        });
++        auto c0 = Coh();
++        rackobj::ObjectThreadCoh d{};
++        uint64_t gets = 0, torn = 0;
++        const auto until = std::chrono::steady_clock::now() + std::chrono::seconds(5);
++        while (std::chrono::steady_clock::now() < until) {
++            for (int i = 0; i < 1000; i++, gets++) torn += KvGetGen(own) == 0;
++            d = CohDiff(c0, Coh());
++            if (d.concur_cnt >= 1 && d.spin_cnt >= 1) break;
++        }
++        stop.store(true);
++        helper.Wait();
++        LOG(INFO) << "KVCOH concurrent+spin (" << gets << " Gets while the helper rewrote the key): " << CohStr(d);
++        EXPECT(torn == 0 && d.read_sections == gets);
++        EXPECT(hwcc || (d.concur_cnt >= 1 && tpos(d.concur_ns)));
++        EXPECT(d.spin_cnt >= 1 && tpos(d.spin_ns));
++    }
++    {  // section checks: 1 in check_sample Gets is timed
++        auto c0 = Coh();
++        const uint64_t n = 4 * c0.check_sample;
++        for (uint64_t i = 0; i < n; i++) (void)KvGetGen(own);
++        auto d = CohDiff(c0, Coh());
++        LOG(INFO) << "KVCOH checks (" << n << " uncontended Gets): " << CohStr(d);
++        EXPECT(d.read_sections == n && d.reserved[5] == n && d.check_sampled == 4 && tpos(d.check_ns_sampled));
++        EXPECT(d.stale_cnt == 0 && d.concur_cnt == 0 && d.meta_cnt == 0);
++    }
++    Barrier("kv checked");
++    if (!churn || hwcc) return;
++    // (C) notification and switch_rw (reclaim config): more keys than records, so the record manager reclaims keys
++    // to RO; the helper rewrites random keys (RO -> RW switches = log events) while this thread reads random keys
++    constexpr size_t kKeys = 2048;
++    for (size_t i = 0; i < kKeys; i++) KvPut(KvKey(node_id, 10 + i), 1);
++    Barrier("kv churn created");
++    {
++        std::atomic<bool> stop{false};
++        rackobj::ObjectThreadCoh hd{};
++        helper.Start([&stop, &hd] {
++            auto a = Coh();
++            std::mt19937_64 rng(77 + node_id);
++            for (uint64_t g = 2; !stop.load(std::memory_order_relaxed); g++)
++                KvPut(KvKey(rng() & 1, 10 + rng() % kKeys), g);
++            hd = CohDiff(a, Coh());
++        });
++        std::mt19937_64 rng(99 + node_id);
++        auto c0 = Coh();
++        rackobj::ObjectThreadCoh d{};
++        uint64_t gets = 0, torn = 0;
++        const auto until = std::chrono::steady_clock::now() + std::chrono::seconds(10);
++        while (std::chrono::steady_clock::now() < until) {
++            for (int i = 0; i < 1000; i++, gets++) torn += KvGetGen(KvKey(rng() & 1, 10 + rng() % kKeys)) == 0;
++            d = CohDiff(c0, Coh());
++            if (d.meta_cnt >= 1) break;
++        }
++        stop.store(true);
++        helper.Wait();
++        LOG(INFO) << "KVCOH meta (" << gets << " random Gets during random Puts, reclaim config): " << CohStr(d);
++        LOG(INFO) << "KVCOH churn writer: " << CohStr(hd) << " | admit " << hd.reserved[3];
++        EXPECT(torn == 0);
++        EXPECT(d.meta_cnt >= 1 && tpos(d.meta_ns));
++        EXPECT(hd.switch_rw_cnt >= 1 && tpos(hd.switch_rw_ns) && hd.switch_rw_ns <= hd.wstart_ns);
++        EXPECT(hd.reclaim_ns <= hd.wstart_ns);
++    }
++    Barrier("kv churn checked");
++}
++
+ // Optional (OBJECT_TEST_OVERHEAD=<sections>, node 0 only, node 1 waits): ns per read / write section of a 64 B object
+ // (one thread, no contention), timers on and off alternating in one process (rackobj::SetCohTimersForMeasurement).
+ void OverheadPhase(uint64_t n) {
+@@ -758,7 +887,12 @@ int main(int argc, char **argv) {
+     }
+ 
+     // ---- phase 7: per-thread coherence counters (build 71) ----
+-    CohPhase(1 + 2 * readers + 2);
++    {
++        HelperThread helper(1 + 2 * readers + 2);  // one registration for phases 7 and 8 (<= 32 per node)
++        CohPhase(helper);
++        // ---- phase 8: KV Get/Put counters (build 73) ----
++        KvCohPhase(helper, churn > 0);
++    }
+     if (const char *ov = std::getenv("OBJECT_TEST_OVERHEAD")) OverheadPhase(std::strtoull(ov, nullptr, 10));
+ 
+     rackobj::ObjectStats st{};
+diff --git a/include/rackobj.h b/include/rackobj.h
+index 8d7a16b..d697687 100644
+--- a/include/rackobj.h
++++ b/include/rackobj.h
+@@ -86,11 +86,14 @@ struct ObjectStats {
+ /* Build 71 instrumentation (MOT1 v6 Fig 2/3a; observation only). Coherence time of the CALLING thread since its
+  * Register(): durations in ns (plain rdtsc without fences, converted with the TSC rate), counts in events. Field order
+  * = mshim::CohSnap (systems/megalon/shim/megalon_objapi.h, contract v2). Intervals (exact definitions:
+- * reports/M2-megalon-port-changes.md §13):
+- *   read_sections / write_sections    ObjectReadStart / ObjectWriteStart calls that returned 0 (this thread)
++ * reports/M2-megalon-port-changes.md §13, KV §14). Since build 73 the KV API (Get/Put) is counted in the same
++ * fields (one Get = one read section, one Put = one write section; §14), see reserved[5..6] for the KV share.
++ *   read_sections / write_sections    ObjectReadStart / ObjectWriteStart calls that returned 0, plus KV Gets that
++ *                                     found the key and KV Puts that wrote (this thread)
+  *   check_*        read sections only, 1 in check_sample per thread (the 1st, N+1th, ...): ReadStart entry .. return
+  *                  plus, if ReadEnd returns true, ReadEnd entry .. return; minus the (A) and (D) time inside them.
+- *                  check_sampled = sampled sections; estimate of all sections = check_ns_sampled * check_sample
++ *                  check_sampled = sampled read sections; estimate for all read sections = check_ns_sampled *
++ *                  read_sections / check_sampled (ratio estimator; the thread's first section is always sampled)
+  *   stale (A)      read_start found a stale copy: from read_seq_start's PAGE_INCOHERENT until the restarted attempt
+  *                  succeeded (whole-object flush + the restart: GetAnchor, read_seq_start), minus (D) inside it
+  *   concur (B)     ReadEnd returned false on PAGE_INCOHERENT: ReadStart return .. ReadEnd return (the discarded
+@@ -101,7 +104,7 @@ struct ObjectStats {
+  *                  read waits; one count per episode. Never overlaps check/stale/concur/meta
+  *   wstart         ObjectWriteStart entry .. return, everything (GetAnchor, switch_rw incl. reclaim, retries,
+  *                  write_seq_start, NR waits); switch_rw (each SwitchRW call) and reclaim (each critical-path
+- *                  reclaim attempt inside it) are sub-intervals of wstart
++ *                  reclaim attempt inside it, or inside a KV create) are sub-intervals of wstart
+  *   wflush         ObjectWriteEnd entry .. return (whole-object clflushopt + fence, write_seq_end); wflush_bytes =
+  *                  bytes flushed (0 in the hwcc flavor: no flush) */
+ struct ObjectThreadCoh {
+@@ -114,7 +117,9 @@ struct ObjectThreadCoh {
+     uint64_t wstart_ns, switch_rw_cnt, switch_rw_ns, reclaim_cnt, reclaim_ns;
+     uint64_t wflush_cnt, wflush_ns, wflush_bytes;
+     uint64_t reserved[8];  // [0] TSC rate in kHz used for the conversion; [1] timers on (1/0); [2] (build 72)
+-                           // negative TSC intervals clamped to 0 in this thread (should stay 0)
++                           // negative TSC intervals clamped to 0 in this thread (should stay 0); (build 73)
++                           // [3] KV creates (Put on a missing key), [4] their ns (inside wstart, copy and data
++                           // flush excluded), [5] KV Gets and [6] KV Puts among read_/write_sections
+ };
+ 
+ int ObjectCreate(uint64_t id, size_t size);
+diff --git a/lib/object_store.cc b/lib/object_store.cc
+index bde0696..41f0173 100644
+--- a/lib/object_store.cc
++++ b/lib/object_store.cc
+@@ -181,13 +181,7 @@ int ObjectStore::ReadStart(uint64_t id, ObjectHandle *h, Tlm *tlm) {
+     // build 71 instrumentation (observation only; intervals: rackobj.h ObjectThreadCoh)
+     coh::Tls &ct = coh::tls;
+     const coh::Spin sp0 = coh::SpinNow(ct);
+-    bool sampled = false;
+-    if (ct.sample_left == 0) {
+-        sampled = true;
+-        ct.sample_left = coh::g_cfg.check_sample - 1;
+-    } else {
+-        ct.sample_left--;
+-    }
++    const bool sampled = coh::TakeSample(ct);
+     const uint64_t t_in = sampled ? coh::Now() : 0;
+     uint64_t stale_wall = 0, stale_spin = 0;  // (A) inside this call
+     uint64_t stale_t = 0, stale_sp = 0;
+@@ -392,6 +386,10 @@ void ObjectStore::ThreadCoh(ObjectThreadCoh *s) {
+     s->reserved[0] = static_cast<uint64_t>(hz / 1000.0 + 0.5);
+     s->reserved[1] = on ? 1 : 0;
+     s->reserved[2] = t.tsc_backwards + coh::NrPtr()[2];  // build 72: clamped negative intervals (this thread)
++    s->reserved[3] = t.admit_cnt;                         // build 73: KV Put creates (CreateEntry), inside wstart
++    s->reserved[4] = ns(t.admit_cyc);
++    s->reserved[5] = t.kv_reads;                          // build 73: KV Gets / Puts among read/write_sections
++    s->reserved[6] = t.kv_writes;
+ }
+ 
+ void ObjectStore::Stats(ObjectStats *s) const {
+diff --git a/lib/shm_obj_handle.cc b/lib/shm_obj_handle.cc
+index 3211076..5d33cff 100644
+--- a/lib/shm_obj_handle.cc
++++ b/lib/shm_obj_handle.cc
+@@ -222,7 +222,9 @@ size_t SharedMemoryObjectHandle<Policy>::CopyFromUserBufferCXL(const WriteHandle
+ 
+     size_t bytes_write = std::min(count, (size_t)SLOT_SIZE - offset_into_page);
+     uint8_t *page = cache_shrd_ptr_->page_data_.GetDataSlot(wh.cn_index.value());
++    coh::tls.kvw_copy0 = coh::Now();  // build 73 instrumentation (KV Put): the data copy is not coherence work
+     memcpy(page + offset_into_page, ptr, bytes_write);
++    coh::tls.kvw_copy1 = coh::Now();
+ 
+     // flush data
+ #ifndef FULL_COHERENCE
+@@ -576,8 +578,14 @@ expected<common::CacheNode *, std::error_code> SharedMemoryObjectHandle<Policy>:
+             if (new_wmeta_index_optional.has_value()) break;
+ 
+             // critical path reclamation
++            // De Stijl port instrumentation (build 73): timed like SwitchRW's reclaim attempts; observation only
++            const uint64_t reclaim_t0 = coh::Now();
+             new_wmeta_index_optional = c3po_->Scr_meta()->SampleVictim(MAX_WMETA_SAMPLING_SIZE);
+-            if (!new_wmeta_index_optional.has_value()) continue;
++            if (!new_wmeta_index_optional.has_value()) {
++                coh::tls.reclaim_cnt++;
++                coh::tls.reclaim_cyc += coh::Sub(coh::tls, coh::Now(), reclaim_t0);
++                continue;
++            }
+ 
+             common::WriteMetadata *cur = c3po_->Scr_meta()->GetWmeta(new_wmeta_index_optional.value());
+             const size_t diag_victim = new_wmeta_index_optional.value();
+@@ -602,6 +610,8 @@ expected<common::CacheNode *, std::error_code> SharedMemoryObjectHandle<Policy>:
+             (void)cur;
+             // the answer stays the next reservation's scan hint, as upstream
+             c3po_->Scr_meta()->FinishReclaim(diag_victim, new_wmeta_index_optional);
++            coh::tls.reclaim_cnt++;
++            coh::tls.reclaim_cyc += coh::Sub(coh::tls, coh::Now(), reclaim_t0);
+ 
+             cpu_relax();
+         } while (true);
+@@ -612,10 +622,13 @@ expected<common::CacheNode *, std::error_code> SharedMemoryObjectHandle<Policy>:
+ 
+         /* 6. Fetch Content */
+         size_t slot_size = (size_t)SLOT_SIZE;
++        coh::tls.kvw_copy0 = coh::Now();  // build 73 instrumentation (KV Put create): copy, then data flush
+         memcpy(static_cast<void *>(cache_shrd_ptr_->GetDataSlot(new_index)), write_data, count);
++        coh::tls.kvw_copy1 = coh::Now();
+ #ifndef FULL_COHERENCE
+         c3po_->cache_flush(reinterpret_cast<char *>(cache_shrd_ptr_->GetDataSlot(new_index)), count);
+ #endif
++        coh::tls.kvw_flush_end = coh::Now();
+         new_node->SetLength(slot_size);
+         DLOG(INFO) << "admit write wout fetch block";
+     }
+@@ -926,12 +939,17 @@ expected<size_t, ReadErrno> SharedMemoryObjectHandle<Policy>::ReadFromCXL(struct
+ 
+     /* read seq begin */
+     // C3PO API
++    coh::Tls &ct = coh::tls;  // build 73 instrumentation (KV Get), observation only
+     if (!c3po_->read_seq_start(rh)) {
++        ct.kvr_stage = 1;
+         return unexpected(rh.rh_errno);
+     }
++    ct.kvr_copy0 = coh::Now();
++    ct.kvr_sp_copy0 = coh::SpinNow(ct).cyc;
+     // cache_->policy_.Touch(*entry_optional);
+     /* 4. read page (memcpy) */
+     bytes_read = CopyToUserBufferCXL(rh, ptr, count, offset_into_page);
++    if (ct.kvr_sampled) ct.kvr_copy1 = coh::Now();
+ 
+     /* read seq check retry */
+     // C3PO API
+@@ -941,6 +959,7 @@ expected<size_t, ReadErrno> SharedMemoryObjectHandle<Policy>::ReadFromCXL(struct
+                              nr_meta
+ #endif
+                              )) {
++        ct.kvr_stage = 2;
+         return unexpected(rh.rh_errno);
+     }
+ 
+@@ -1136,8 +1155,35 @@ size_t SharedMemoryObjectHandle<Policy>::Get(const common::BlockId &block_id, ui
+                    << offset_into_page << " into the page (exceeds page limit)";
+     }
+ 
++    // De Stijl port instrumentation (build 73): one KV Get = one read section of CohSnap; observation only.
++    // Intervals as the object API (rackobj.h ObjectThreadCoh, reports/M2-megalon-port-changes.md §14).
++    coh::Tls &ct = coh::tls;
++    const coh::Spin coh_sp0 = coh::SpinNow(ct);
++    const bool coh_sampled = coh::TakeSample(ct);
++    const uint64_t coh_t_in = coh_sampled ? coh::Now() : 0;
++    ct.kvr_sampled = coh_sampled;
++    uint64_t coh_ev_wall = 0, coh_ev_spin = 0;  // (A)(B)(C) wall time and the spin inside them, this Get
++    bool coh_stale_open = false;
++    uint64_t coh_stale_t = 0, coh_stale_sp = 0;
++    auto coh_close_stale = [&](uint64_t end_t, uint64_t end_sp) {
++        if (!coh_stale_open) return;
++        const uint64_t wall = coh::Sub(ct, end_t, coh_stale_t), spin = end_sp - coh_stale_sp;
++        coh_ev_wall += wall;
++        coh_ev_spin += spin;
++        ct.stale_cyc += coh::Sub(ct, wall, spin);
++        coh_stale_open = false;
++    };
++    auto coh_spin_total = [&] {  // (D) of the whole Get
++        const coh::Spin sp = coh::SpinNow(ct);
++        ct.spin_cnt += sp.cnt - coh_sp0.cnt;
++        ct.spin_cyc += sp.cyc - coh_sp0.cyc;
++        return sp.cyc - coh_sp0.cyc;
++    };
++
+ retry:
+     size_t bytes_read = 0;
++    ct.kvr_stage = 0;
++    ct.kvr_copy0 = ct.kvr_copy1 = 0;
+ 
+     entry_optional = c3po_->Gcd()->GetAnchor(block_id
+ #ifdef NR
+@@ -1165,24 +1211,51 @@ retry:
+             break;
+         }
+         case ReadLocation::NO_ENTRY: { /* Cache miss: GCD get failed */
++            coh_close_stale(coh::Now(), coh::SpinNow(ct).cyc);  // build 73: a miss is not a read section
++            (void)coh_spin_total();
+             return 0;
+         }
+         case ReadLocation::INVALID:
+             LOG(FATAL) << "ReadLocation not initialized";
+     }
+ 
++    // build 73: an open (A) ends when the restarted attempt has passed (or failed) read_seq_start
++    if (coh_stale_open) {
++        if (ct.kvr_copy0 != 0)
++            coh_close_stale(ct.kvr_copy0, ct.kvr_sp_copy0);
++        else
++            coh_close_stale(coh::Now(), coh::SpinNow(ct).cyc);
++    }
+     if (!result.has_value()) {
++        // build 73: (B)/(C) = slot copy start of the failed attempt .. this retry (incl. the flush), minus (D)
++        auto coh_discard = [&](uint64_t *cnt, uint64_t *cyc) {
++            const uint64_t t = coh::Now(), sp = coh::SpinNow(ct).cyc;
++            const uint64_t t0 = ct.kvr_copy0 ? ct.kvr_copy0 : t, sp_0 = ct.kvr_copy0 ? ct.kvr_sp_copy0 : sp;
++            const uint64_t wall = coh::Sub(ct, t, t0), spin = sp - sp_0;
++            coh_ev_wall += wall;
++            coh_ev_spin += spin;
++            ++*cnt;
++            *cyc += coh::Sub(ct, wall, spin);
++        };
+         switch (rh.rh_errno) {
+             case ReadErrno::NO_ERROR:
+                 break;
+             case ReadErrno::META_OUTDATE:
++                coh_discard(&ct.meta_cnt, &ct.meta_cyc);
+                 goto retry;
+             case ReadErrno::PAGE_INCOHERENT:
++                if (ct.kvr_stage == 1) {  // (A) stale copy at read_seq_start: open until the restart passed it
++                    coh_stale_t = coh::Now();
++                    coh_stale_sp = coh::SpinNow(ct).cyc;
++                    coh_stale_open = true;
++                    ct.stale_cnt++;
++                }
+                 if (rh.from_cxl) {
+ #ifndef FULL_COHERENCE
+                     cache_flush_data(rh);
+ #endif
+                 }
++                if (ct.kvr_stage == 2) coh_discard(&ct.concur_cnt, &ct.concur_cyc);  // (B) at read_seq_end
+                 coherence_retry_cnt[rh.from_cxl ? 0 : rh.current_nid]++;
+                 DLOG(WARNING) << "Read: failed due to cache_flush, retry_cnt: "
+                               << coherence_retry_cnt[rh.from_cxl ? 0 : rh.current_nid];
+@@ -1193,6 +1266,18 @@ retry:
+     }
+     bytes_read = result.value();
+     (void)admit_retry_cnt;
++    {  // build 73: section counts and the sampled check time
++        const uint64_t t_ret = coh_sampled ? coh::Now() : 0;
++        const uint64_t spin = coh_spin_total();
++        ct.read_sections++;
++        ct.kv_reads++;
++        if (coh_sampled) {
++            const uint64_t copy = ct.kvr_copy0 ? coh::Sub(ct, ct.kvr_copy1, ct.kvr_copy0) : 0;
++            ct.check_sampled++;
++            ct.check_cyc += coh::Sub(ct, coh::Sub(ct, coh::Sub(ct, t_ret, coh_t_in), copy),
++                                     coh_ev_wall + (spin - coh_ev_spin));
++        }
++    }
+ 
+     if (diag::Enabled()) {
+         auto &lg = diag::last_get;
+@@ -1330,6 +1415,13 @@ size_t SharedMemoryObjectHandle<Policy>::Put(const common::BlockId &block_id, co
+                    << offset_into_page << " into the page (exceeds page limit)";
+     }
+ 
++    // De Stijl port instrumentation (build 73): one KV Put = one write section of CohSnap; observation only.
++    // wstart = entry .. data copy start (GetAnchor, switch_rw, create incl. its log op, retries, write_seq_start);
++    // wflush = data copy end .. return (flush of the written bytes, write_seq_end); the copy itself is excluded.
++    coh::Tls &ct = coh::tls;
++    const uint64_t coh_t_in = coh::Now();
++    ct.kvw_copy0 = ct.kvw_copy1 = ct.kvw_flush_end = 0;
++
+ retry:
+     size_t bytes_write = 0;
+ 
+@@ -1351,15 +1443,43 @@ retry:
+             break;
+         }
+         case WriteErrno::PAGE_NOT_FOUND: {  // Cache miss
++            const uint64_t t_a = coh::Now();
++            ct.kvw_copy0 = ct.kvw_copy1 = ct.kvw_flush_end = 0;
+             auto result = CreateEntry(block_id, ptr, count, local_meta);
++            {  // build 73: create = admit; the data copy is excluded, the data flush is wflush, the rest wstart
++                const uint64_t t_b = coh::Now();
++                const bool copied = ct.kvw_copy0 != 0;
++                const uint64_t copy = copied ? coh::Sub(ct, ct.kvw_copy1, ct.kvw_copy0) : 0;
++                const uint64_t fl = copied ? coh::Sub(ct, ct.kvw_flush_end, ct.kvw_copy1) : 0;
++                ct.admit_cnt++;
++                ct.admit_cyc += coh::Sub(ct, coh::Sub(ct, t_b, t_a), copy + fl);
++                ct.wstart_cyc += coh::Sub(ct, coh::Sub(ct, t_b, coh_t_in), copy + fl);
++                if (copied) {
++                    ct.write_sections++;
++                    ct.kv_writes++;
++                    ct.wflush_cnt++;
++                    ct.wflush_cyc += fl;
++#ifndef FULL_COHERENCE
++                    ct.wflush_bytes += count;
++#endif
++                }
++            }
+             if (result.error() == std::make_error_code(std::errc::not_enough_memory)) return bytes_write;
+             return count;
+         }
+         case WriteErrno::MULTIPLE_REPLICA:  // need collapse the entry and
+         case WriteErrno::PAGE_RO: {         // need to switch to rw
+             DLOG(INFO) << "page RO";
++            const uint64_t t_sw = coh::Now(), rc0 = ct.reclaim_cnt, ry0 = ct.reclaim_cyc;  // build 73
+             auto ec = SwitchRW(wh, local_meta);
+-            if (ec == std::make_error_code(std::errc::not_enough_memory)) return bytes_write;
++            ct.switch_rw_cnt++;
++            ct.switch_rw_cyc += coh::Sub(ct, coh::Now(), t_sw);
++            ct.reclaim_obj_cnt += ct.reclaim_cnt - rc0;
++            ct.reclaim_obj_cyc += ct.reclaim_cyc - ry0;
++            if (ec == std::make_error_code(std::errc::not_enough_memory)) {
++                ct.wstart_cyc += coh::Sub(ct, coh::Now(), coh_t_in);
++                return bytes_write;
++            }
+             retry_cnt++;
+             goto retry;
+         }
+@@ -1389,6 +1509,17 @@ retry:
+     } else {
+         bytes_write = *result;
+     }
++    if (wh.from_cxl) {  // build 73: write section times (the local-exclusive path is PARTITIONED_NODE only)
++        const uint64_t t_ret = coh::Now();
++        ct.write_sections++;
++        ct.kv_writes++;
++        ct.wstart_cyc += coh::Sub(ct, ct.kvw_copy0, coh_t_in);
++        ct.wflush_cnt++;
++        ct.wflush_cyc += coh::Sub(ct, t_ret, ct.kvw_copy1);
++#ifndef FULL_COHERENCE
++        ct.wflush_bytes += bytes_write;
++#endif
++    }
+ 
+     DLOG(INFO) << "num of retries: " << retry_cnt;
+     return bytes_write;
+diff --git a/src/common/coh_stats.h b/src/common/coh_stats.h
+index 8698899..c7775f8 100644
+--- a/src/common/coh_stats.h
++++ b/src/common/coh_stats.h
+@@ -44,7 +44,23 @@ struct Tls {
+     uint64_t sec_sp0_cnt, sec_sp0_cyc, sec_sp1_cyc;  // SpinNow at ReadStart entry (cnt, cyc) and return (cyc)
+     bool sec_sampled;      // this section's checks are timed
+     uint64_t tsc_backwards;  // build 72: negative TSC intervals clamped to 0 (CPU migration / TSC skew guard)
++    // build 73: KV Get/Put (shm_obj_handle.cc) markers of the current op's last attempt, and KV-only totals
++    uint32_t kvr_stage;     // last ReadFromCXL: 0 passed / not reached, 1 read_seq_start failed, 2 read_seq_end failed
++    bool kvr_sampled;       // the current Get is a sampled read section
++    uint64_t kvr_copy0, kvr_copy1, kvr_sp_copy0;  // Now() before/after the slot copy (copy1 only if sampled), spin
++    uint64_t kvw_copy0, kvw_copy1, kvw_flush_end;  // Put: Now() before/after the data copy, after the data flush
++    uint64_t kv_reads, kv_writes, admit_cnt, admit_cyc;
+ };
++
++// Sampling decision for one read section (object or KV): the 1st, (N+1)th, ... of the thread.
++inline bool TakeSample(Tls &t) {
++    if (t.sample_left == 0) {
++        t.sample_left = g_cfg.check_sample - 1;
++        return true;
++    }
++    t.sample_left--;
++    return false;
++}
+ extern thread_local Tls tls;
+ 
+ // end - start of two TSC values (or of an interval and its nested part); a negative result (TSC not monotonic
+-- 
+2.34.1
+

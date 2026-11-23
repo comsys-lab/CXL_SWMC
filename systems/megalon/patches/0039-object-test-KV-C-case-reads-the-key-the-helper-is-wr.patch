@@ -1,0 +1,63 @@
+From 40d9bff92b999923d59cc130d83b25e3563b54cc Mon Sep 17 00:00:00 2001
+From: Sungsu Ahn <sungsu_ahn@korea.ac.kr>
+Date: Fri, 16 Oct 2026 23:01:02 +0900
+Subject: [PATCH 39/51] object-test: KV (C) case reads the key the helper is
+ writing (deterministic within 1000 Gets)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ benchmarks/object_test.cc | 18 +++++++++++-------
+ 1 file changed, 11 insertions(+), 7 deletions(-)
+
+diff --git a/benchmarks/object_test.cc b/benchmarks/object_test.cc
+index b7a62cc..0d77654 100644
+--- a/benchmarks/object_test.cc
++++ b/benchmarks/object_test.cc
+@@ -591,33 +591,37 @@ void KvCohPhase(HelperThread &helper, bool churn) {
+     Barrier("kv checked");
+     if (!churn || hwcc) return;
+     // (C) notification and switch_rw (reclaim config): more keys than records, so the record manager reclaims keys
+-    // to RO; the helper rewrites random keys (RO -> RW switches = log events) while this thread reads random keys
++    // to RO; the helper rewrites random keys (RO -> RW switches = log events) and publishes the key it is writing,
++    // which this thread keeps reading (a log event on the key while a Get is between GetAnchor and read_seq_end)
+     constexpr size_t kKeys = 2048;
+     for (size_t i = 0; i < kKeys; i++) KvPut(KvKey(node_id, 10 + i), 1);
+     Barrier("kv churn created");
+     {
+         std::atomic<bool> stop{false};
++        std::atomic<off_t> cur{KvKey(node_id, 10)};
+         rackobj::ObjectThreadCoh hd{};
+-        helper.Start([&stop, &hd] {
++        helper.Start([&stop, &hd, &cur] {
+             auto a = Coh();
+             std::mt19937_64 rng(77 + node_id);
+-            for (uint64_t g = 2; !stop.load(std::memory_order_relaxed); g++)
+-                KvPut(KvKey(rng() & 1, 10 + rng() % kKeys), g);
++            for (uint64_t g = 2; !stop.load(std::memory_order_relaxed); g++) {
++                const off_t k = KvKey(rng() & 1, 10 + rng() % kKeys);
++                cur.store(k, std::memory_order_relaxed);
++                KvPut(k, g);
++            }
+             hd = CohDiff(a, Coh());
+         });
+-        std::mt19937_64 rng(99 + node_id);
+         auto c0 = Coh();
+         rackobj::ObjectThreadCoh d{};
+         uint64_t gets = 0, torn = 0;
+         const auto until = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+         while (std::chrono::steady_clock::now() < until) {
+-            for (int i = 0; i < 1000; i++, gets++) torn += KvGetGen(KvKey(rng() & 1, 10 + rng() % kKeys)) == 0;
++            for (int i = 0; i < 1000; i++, gets++) torn += KvGetGen(cur.load(std::memory_order_relaxed)) == 0;
+             d = CohDiff(c0, Coh());
+             if (d.meta_cnt >= 1) break;
+         }
+         stop.store(true);
+         helper.Wait();
+-        LOG(INFO) << "KVCOH meta (" << gets << " random Gets during random Puts, reclaim config): " << CohStr(d);
++        LOG(INFO) << "KVCOH meta (" << gets << " Gets of the key the helper is writing, reclaim config): " << CohStr(d);
+         LOG(INFO) << "KVCOH churn writer: " << CohStr(hd) << " | admit " << hd.reserved[3];
+         EXPECT(torn == 0);
+         EXPECT(d.meta_cnt >= 1 && tpos(d.meta_ns));
+-- 
+2.34.1
+

@@ -1,0 +1,214 @@
+From 249ffe4d5aa5f4b88805dee0d635ab99f8f783d5 Mon Sep 17 00:00:00 2001
+From: Sungsu Ahn <sungsu_ahn@korea.ac.kr>
+Date: Thu, 15 Oct 2026 16:32:47 +0900
+Subject: [PATCH 30/51] nr: replay flushes on the issuing node too (own
+ events), slots and objects
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+User decision D4 (2026-10-15). Paper §3.4.3: "While replaying the log, if a
+host finds an allocation or deallocation event, it flushes the CPU caches for
+the affected objects"; NR replays the issuer's own entries as well (combine,
+mine = true). Upstream (and the port so far) flushed only for !mine ops, so a
+node's own RO switch (reclaim) could leave lines it had cached before another
+node's write, and its next RO-path read skipped every check. exec_notify now
+flushes the slot (or the object's range) for every replayed op that names one;
+notification clearing is unchanged. This changes the slot path: each own op
+whose response carries a cn index (admit, create, RO/RW switch, wrap-around)
+now also flushes that slot on the issuer.
+
+object_tests: an own event gives exactly one flush on the issuer and one on
+the peer (was: none on the issuer).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ include/rackobj.h                             |  2 +-
+ src/index/nr_hashmap.h                        |  2 +-
+ third-party/nr_rust/ffi/ffi_nr_hashmap.rs     |  2 +-
+ third-party/nr_rust/ffi/object_tests.rs       | 27 ++++++++++---------
+ .../node-replication/src/nr/replica.rs        | 15 +++++++----
+ 5 files changed, 28 insertions(+), 20 deletions(-)
+
+diff --git a/include/rackobj.h b/include/rackobj.h
+index a54a8a2..245cbff 100644
+--- a/include/rackobj.h
++++ b/include/rackobj.h
+@@ -72,7 +72,7 @@ struct ObjectStats {
+     uint64_t read_sections, read_retry_notify, read_retry_incoherent;
+     uint64_t write_sections, write_retry, switch_rw;
+     uint64_t flushes, flush_bytes;                // read-side incoherent flushes + write_end flushes
+-    uint64_t replay_flushes, replay_flush_bytes;  // NR replay of the other node's object events
++    uint64_t replay_flushes, replay_flush_bytes;  // NR replay of object events (own and other node's)
+ };
+ 
+ int ObjectCreate(uint64_t id, size_t size);
+diff --git a/src/index/nr_hashmap.h b/src/index/nr_hashmap.h
+index aec6712..0857745 100644
+--- a/src/index/nr_hashmap.h
++++ b/src/index/nr_hashmap.h
+@@ -135,7 +135,7 @@ void DummyEvent(const NrMeta* metadata, rackobj::common::BlockId key);
+  * size in bytes, wmeta_idx -1 (read-shared) or a static record. 0: created; 1: the key already has an entry. */
+ size_t ObjectCreate(const NrMeta* metadata, rackobj::common::BlockId key, ssize_t off_units, ssize_t size,
+                     ssize_t wmeta_idx);
+-/* replay flushes of objects issued by the other node, in this process */
++/* replay flushes of object events (this node's own and the other node's), in this process */
+ void nr_obj_replay_flush_stats(uint64_t* count, uint64_t* bytes);
+ 
+ }  // extern "C"
+diff --git a/third-party/nr_rust/ffi/ffi_nr_hashmap.rs b/third-party/nr_rust/ffi/ffi_nr_hashmap.rs
+index 6293f14..89b8b84 100644
+--- a/third-party/nr_rust/ffi/ffi_nr_hashmap.rs
++++ b/third-party/nr_rust/ffi/ffi_nr_hashmap.rs
+@@ -1449,7 +1449,7 @@ pub extern "C" fn ObjectCreate(metadata: *mut NrMeta, key: BlockId, off_units: i
+     }
+ }
+ 
+-/// Replay flushes of variable-size objects issued by the other node, in this process: count and bytes.
++/// Replay flushes of variable-size objects (own and other node's events), in this process: count and bytes.
+ #[no_mangle]
+ pub extern "C" fn nr_obj_replay_flush_stats(count: *mut u64, bytes: *mut u64) {
+     if count.is_null() || bytes.is_null() {
+diff --git a/third-party/nr_rust/ffi/object_tests.rs b/third-party/nr_rust/ffi/object_tests.rs
+index 27333f3..51b0e57 100644
+--- a/third-party/nr_rust/ffi/object_tests.rs
++++ b/third-party/nr_rust/ffi/object_tests.rs
+@@ -53,17 +53,19 @@ fn entry(n: &Node, t: ThreadToken, k: BlockId) -> Option<GCDEntry> {
+     n.execute(Access::Get(k), t).0.map(|r| r.value)
+ }
+ 
+-/// Object replay flushes expected per remote event: one per event, `size` bytes each, only with `scr`.
++/// Object replay flushes: every replay of an object event flushes the whole object, on the issuing node (its own
++/// entry, user decision D4 2026-10-15) and on the other node, so one event replayed by both = 2 flushes of `size`
++/// bytes; only with `scr`.
+ /// The counters are process-wide: these checks need `--test-threads=1` (as build.sh runs them).
+ fn flush_delta(before: (usize, usize)) -> (usize, usize) {
+     let now = obj_replay_flush_stats();
+     (now.0 - before.0, now.1 - before.1)
+ }
+ 
+-fn expect_flushes(before: (usize, usize), events: usize, size: usize) {
++fn expect_flushes(before: (usize, usize), flushes: usize, size: usize) {
+     let d = flush_delta(before);
+     if cfg!(any(feature = "scr", feature = "no-coherence")) {
+-        assert_eq!(d, (events, events * size), "replay must flush the whole object once per remote event");
++        assert_eq!(d, (flushes, flushes * size), "each replay (issuer and peer) must flush the whole object once");
+     } else {
+         assert_eq!(d, (0, 0), "hwcc build: no replay flushes");
+     }
+@@ -119,7 +121,7 @@ fn every_coherence_event_on_an_object_notifies_and_flushes_its_range() {
+     let f = obj_replay_flush_stats();
+     assert_eq!(ObjectCreate(m0, k, units(ARENA_OFF), size as isize, -1), 0);
+     n1.sync(t1);
+-    expect_flushes(f, 1, size); // create
++    expect_flushes(f, 2, size); // create: issuer + peer
+ 
+     // RO -> RW (record 5), as the slot SwitchRW does (InvalidateExceptArrayUpdateWmeta, CXL index 0)
+     let _ = n1.execute_anchor(Access::Get(k), t1);
+@@ -129,7 +131,7 @@ fn every_coherence_event_on_an_object_notifies_and_flushes_its_range() {
+     assert_eq!(InvalidateExceptArrayUpdateWmeta(m0, k, 0, 5), 0);
+     n1.sync(t1);
+     assert!(!n1.check_notification_reset(t1), "RW switch must notify a reader of the object");
+-    expect_flushes(f, 1, size);
++    expect_flushes(f, 2, size);
+     let e = entry(&n1, t1, k).unwrap();
+     assert_eq!((e.wmeta_idx_, obj_decode(&e)), (5, Some((ARENA_OFF, size))), "descriptor survives the switch");
+     // a second RW switch fails (already RW) and is no event
+@@ -146,7 +148,7 @@ fn every_coherence_event_on_an_object_notifies_and_flushes_its_range() {
+     DummyEvent(m0, k);
+     n1.sync(t1);
+     assert!(!n1.check_notification_reset(t1), "wrap-around must notify");
+-    expect_flushes(f, 1, size);
++    expect_flushes(f, 2, size);
+ 
+     // RO switch = record deallocation (reclaim), answered with the entry (fix e806494)
+     let _ = n1.execute_anchor(Access::Get(k), t1);
+@@ -154,7 +156,7 @@ fn every_coherence_event_on_an_object_notifies_and_flushes_its_range() {
+     assert_eq!(CheckSwitchWmetaArray(m0, k, -1), 5);
+     n1.sync(t1);
+     assert!(!n1.check_notification_reset(t1), "deallocation must notify");
+-    expect_flushes(f, 1, size);
++    expect_flushes(f, 2, size);
+     let e = entry(&n1, t1, k).unwrap();
+     assert_eq!((e.wmeta_idx_, obj_decode(&e)), (-1, Some((ARENA_OFF, size))));
+     // RO switch of an RO object: no event
+@@ -165,15 +167,16 @@ fn every_coherence_event_on_an_object_notifies_and_flushes_its_range() {
+     assert!(n1.check_notification_reset(t1));
+     expect_flushes(f, 0, size);
+ 
+-    // own ops are not flushed by the issuing node (upstream rule, same as slots): n0 issues an event and replays the
+-    // log itself (its own op is applied in its combine, `mine`), with n1 not syncing: no flush; n1's replay: one flush
++    // own ops are flushed by the issuing node too (D4: paper §3.4.3 "while replaying the log, if a host finds an
++    // allocation or deallocation event, it flushes"; NR replays the issuer's own entries): n0 issues an event (applied
++    // in its own combine, `mine`) with n1 not syncing: exactly one flush; n1's replay: one more
+     let f = obj_replay_flush_stats();
+     DummyEvent(m0, k);
+     n0.sync(t0);
+     n0.log_sync_local();
+-    expect_flushes(f, 0, size);
+-    n1.sync(t1);
+     expect_flushes(f, 1, size);
++    n1.sync(t1);
++    expect_flushes(f, 2, size);
+ }
+ 
+ #[test]
+@@ -232,7 +235,7 @@ fn object_records_resolve_through_the_reverse_map() {
+     assert_eq!(SwitchToReadOnlyByWmeta(m1, 11), 11);
+     n0.sync(t0);
+     assert!(!n0.check_notification_reset(t0), "reclaim of an object's record must notify the other node");
+-    expect_flushes(f, 1, size);
++    expect_flushes(f, 2, size);
+     let e = entry(&n0, t0, okey(9)).unwrap();
+     assert_eq!((e.wmeta_idx_, obj_decode(&e)), (-1, Some((ARENA_OFF, size))));
+     // the record is no longer owned
+diff --git a/third-party/nr_rust/node-replication/src/nr/replica.rs b/third-party/nr_rust/node-replication/src/nr/replica.rs
+index d10796c..f1cb153 100644
+--- a/third-party/nr_rust/node-replication/src/nr/replica.rs
++++ b/third-party/nr_rust/node-replication/src/nr/replica.rs
+@@ -39,7 +39,7 @@ pub use crate::replica::MAX_THREADS_PER_REPLICA;
+ 
+ type DefaultHasher = BuildHasherDefault<core::hash::SipHasher>;
+ 
+-/// De Stijl port (paper §4 variable-size objects): replay flushes of objects issued by another node, per process
++/// De Stijl port (paper §4 variable-size objects): replay flushes of objects (own and other nodes' events, D4), per process
+ /// (cost counters; slots are not counted).
+ static OBJ_REPLAY_FLUSHES: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+ static OBJ_REPLAY_FLUSH_BYTES: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+@@ -1135,7 +1135,7 @@ where
+     fn exec(&self, slog: &Log<<D as Dispatch>::WriteOperation>) {
+         // Execute any operations on the shared log against this replica.
+         // [V4] Replays like combine: clears matching change notifications and
+-        // flushes the slot of non-local ops (exec_notify), so the sync thread
++        // flushes the slot of replayed ops (exec_notify), so the sync thread
+         // and stuck-replica syncs keep CheckNotification correct.
+         let next = self.next.load(Ordering::Relaxed);
+         {
+@@ -1152,8 +1152,8 @@ where
+     }
+ 
+     /// Post-replay hook shared by combine and exec [V4]: clears every thread's
+-    /// change notification that matches the replayed slot and, for ops issued
+-    /// by another replica, writes back/invalidates that slot.
++    /// change notification that matches the replayed slot and writes back/invalidates
++    /// that slot (or object range), also for this replica's own ops (D4).
+     #[inline(always)]
+     fn exec_notify(&self, resp: &<D as Dispatch>::Response, mine: bool, num_registered_threads: usize) {
+         let idx = resp.cn_idx();
+@@ -1165,7 +1165,12 @@ where
+                 entry.store(-1, Ordering::Release);
+             }
+         }
+-        if !mine {
++        // De Stijl port (user decision D4, 2026-10-15; paper §3.4.3: "While replaying the log, if a host finds an
++        // allocation or deallocation event, it flushes the CPU caches for the affected objects"): NR replays the
++        // issuer's own entries too (`mine`), so the issuing node flushes as well. Upstream flushed only `!mine`, which
++        // let a node's own RO switch (reclaim) leave lines it cached before another node's write. Slots and objects.
++        let _ = mine;
++        {
+             #[cfg(any(feature = "scr", feature = "no-coherence"))]
+             {
+                 // De Stijl port (paper §4): a variable-size object is flushed over its whole byte range, exactly
+-- 
+2.34.1
+

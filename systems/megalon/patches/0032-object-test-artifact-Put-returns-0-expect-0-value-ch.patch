@@ -1,0 +1,30 @@
+From be691c91b0a0bac4d853c0a14d1a87ce2c20b725 Mon Sep 17 00:00:00 2001
+From: Sungsu Ahn <sungsu_ahn@korea.ac.kr>
+Date: Thu, 15 Oct 2026 17:19:23 +0900
+Subject: [PATCH 32/51] object-test: artifact Put returns 0; expect 0 (value
+ checked by Get on both nodes)
+
+G-B v2.15 attempt 15 stopped at o1-60 on this check (node0 only).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ benchmarks/object_test.cc | 3 ++-
+ 1 file changed, 2 insertions(+), 1 deletion(-)
+
+diff --git a/benchmarks/object_test.cc b/benchmarks/object_test.cc
+index a399719..6e14807 100644
+--- a/benchmarks/object_test.cc
++++ b/benchmarks/object_test.cc
+@@ -408,7 +408,8 @@ int main(int argc, char **argv) {
+     const off_t slot_key = 4242;
+     char val[64];
+     std::snprintf(val, sizeof(val), "slot-from-node-0");
+-    if (node_id == 0) EXPECT(rackobj::Put(reinterpret_cast<const uint8_t *>(val), sizeof(val), slot_key) > 0);
++    // artifact RackOBJKV::Put always returns 0 (lib/kv.cc); the value is checked by Get on both nodes below
++    if (node_id == 0) EXPECT(rackobj::Put(reinterpret_cast<const uint8_t *>(val), sizeof(val), slot_key) == 0);
+     Barrier("slot put");
+     {
+         char got[64] = {};
+-- 
+2.34.1
+

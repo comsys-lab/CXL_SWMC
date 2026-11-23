@@ -1,0 +1,363 @@
+From 0f4b98020904a5e84930fdefde7382b37e1f45af Mon Sep 17 00:00:00 2001
+From: Sungsu Ahn <sungsu_ahn@korea.ac.kr>
+Date: Thu, 15 Oct 2026 03:18:07 +0900
+Subject: [PATCH 19/51] diag: per-thread event ring (writes with locked
+ record/stale flag, RO->RW promotions, reclaims) and torn-value source
+ decoding
+
+MEGALON_DIAG=1 only. Each Put records (key, record locked by write_seq_start, stale/owner flags, low 32
+bits of the value stamp); SwitchRW records the promotion; every reclaim records the victim record and
+the record the RO switch returned. kv-store dumps the rings to <result>/diag-ring.bin and, on a failed
+value check, names the stamp each word of the torn value came from (mix64 is inverted).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ benchmarks/kv_store.cc       | 32 ++++++++++++++-
+ include/rackobj.h            |  1 +
+ lib/globals.cc               | 28 ++++++++++++-
+ lib/shm_obj_handle.cc        | 20 +++++++++
+ src/common/diag.h            | 79 ++++++++++++++++++++++++++++++++++++
+ src/core/c3.cc               |  3 ++
+ src/manager/wmeta_manager.cc | 11 +++++
+ 7 files changed, 172 insertions(+), 2 deletions(-)
+
+diff --git a/benchmarks/kv_store.cc b/benchmarks/kv_store.cc
+index 40bdb80..6640ccb 100644
+--- a/benchmarks/kv_store.cc
++++ b/benchmarks/kv_store.cc
+@@ -97,6 +97,35 @@ static inline uint64_t mix64(uint64_t x) {
+     return x;
+ }
+ 
++// inverse of mix64 (diagnostics: recover which write's stamp produced each word of a torn value)
++static inline uint64_t unmix64(uint64_t x) {
++    x ^= x >> 33;
++    x *= 0x9cb4b2f8129337dbULL;
++    x ^= x >> 33;
++    x *= 0x4f74430c22a54005ULL;
++    x ^= x >> 33;
++    return x;
++}
++
++// "words a-b <- stamp S" runs of a torn value (word i was written with stamp unmix64(w[i]) ^ key ^ (i << 48))
++static std::string TornValueSources(const uint8_t* buf, off_t key) {
++    uint64_t w[kValueWords];
++    memcpy(w, buf, ACCESS_SIZE);
++    std::ostringstream os;
++    os << "head stamp " << std::hex << w[1];
++    size_t start = 2;
++    uint64_t cur = unmix64(w[2]) ^ static_cast<uint64_t>(key) ^ (2ULL << 48);
++    for (size_t i = 3; i <= kValueWords; i++) {
++        uint64_t s = i < kValueWords ? (unmix64(w[i]) ^ static_cast<uint64_t>(key) ^ (static_cast<uint64_t>(i) << 48)) : ~cur;
++        if (s != cur) {
++            os << "; words " << std::dec << start << "-" << i - 1 << " <- stamp " << std::hex << cur;
++            start = i;
++            cur = s;
++        }
++    }
++    return os.str();
++}
++
+ static inline void FillValue(uint8_t* buf, off_t key, uint64_t stamp) {
+     uint64_t w[kValueWords];
+     w[0] = static_cast<uint64_t>(key);
+@@ -240,7 +269,7 @@ static void workload(AccessPattern* ap, const std::string& latency_filename, con
+                     LOG(ERROR) << "value check failed: key " << offset << " got key "
+                                << *reinterpret_cast<const uint64_t*>(vbuf) << " stamp " << std::hex
+                                << *reinterpret_cast<const uint64_t*>(vbuf + 8) << std::dec << "; "
+-                               << rackobj::DiagLastGet();
++                               << rackobj::DiagLastGet() << "; t_ns=" << now_ns() << "; " << TornValueSources(vbuf, offset);
+                 bad++;
+             } else if (check_values && (*reinterpret_cast<const uint64_t*>(vbuf + 8) >> 56) != node_id) {
+                 remote++;
+@@ -688,6 +717,7 @@ int main(int argc, char** argv) {
+         code = 0;
+     }
+     LOG(INFO) << rackobj::DiagSummary();
++    LOG(INFO) << rackobj::DiagDump(dir2 + "/diag-ring.bin");
+     LOG(INFO) << "VALUE CHECK: node=" << node_id << " gets=" << vg << " remote_values=" << vr << " bad_values=" << vb
+               << " misses=" << vm << " short_reads=" << vs << " " << verdict;
+     return code;
+diff --git a/include/rackobj.h b/include/rackobj.h
+index 0a8f773..30a2089 100644
+--- a/include/rackobj.h
++++ b/include/rackobj.h
+@@ -47,4 +47,5 @@ void NodeBarrier(uint32_t phase);
+ /* De Stijl port diagnostics (MEGALON_DIAG=1): this thread's last Get (path/entry/seq) and the process counters. */
+ std::string DiagLastGet();
+ std::string DiagSummary();
++std::string DiagDump(const std::string& path);
+ }  // namespace rackobj
+\ No newline at end of file
+diff --git a/lib/globals.cc b/lib/globals.cc
+index 00ceef0..183e55a 100644
+--- a/lib/globals.cc
++++ b/lib/globals.cc
+@@ -3,6 +3,7 @@
+ 
+ #include <rackobj.h>
+ 
++#include <cstring>
+ #include <shared_mutex>
+ 
+ #include "absl/log/check.h"
+@@ -50,7 +51,15 @@ uint64_t GetAdmitCount() { return lib::thread_local_meta.pt_stat.admit_cnt; }
+ 
+ void ClearMovementCounter() { lib::page_cache.ClearReclaimCount(); };
+ 
+-ssize_t Put(const uint8_t* buf, uint64_t count, off_t key) { return lib::RackOBJKV::Put(buf, count, key); }
++ssize_t Put(const uint8_t* buf, uint64_t count, off_t key) {
++    if (!diag::Enabled()) return lib::RackOBJKV::Put(buf, count, key);
++    diag::last_write = {};
++    ssize_t rc = lib::RackOBJKV::Put(buf, count, key);
++    uint32_t aux = 0;
++    if (buf && count >= 12) memcpy(&aux, buf + 8, sizeof(aux));  // kv-store: low 32 bits of the value stamp
++    diag::Rec(diag::kEvWrite, static_cast<uint64_t>(key), diag::last_write.wmeta, aux, diag::last_write.flags);
++    return rc;
++}
+ 
+ ssize_t Get(uint8_t* buf, uint64_t count, off_t key) { return lib::RackOBJKV::Get(buf, count, key); }
+ 
+@@ -110,6 +119,23 @@ std::string DiagLastGet() {
+            " seq=" + std::to_string(g.seq) + " coherence_retries=" + std::to_string(g.retries);
+ }
+ 
++// Raw dump of every thread's event ring: a sequence of diag::Ev records (24 B, see common/diag.h). Returns a summary.
++std::string DiagDump(const std::string &path) {
++    if (!diag::Enabled()) return "diag off";
++    std::lock_guard<std::mutex> g(diag::ring_mu);
++    FILE *f = fopen(path.c_str(), "wb");
++    if (!f) return "diag dump: cannot open " + path;
++    size_t total = 0, dropped = 0;
++    for (auto *r : diag::rings) {
++        fwrite(r->buf.get(), sizeof(diag::Ev), r->n, f);
++        total += r->n;
++        dropped += r->dropped;
++    }
++    fclose(f);
++    return "diag dump " + path + ": " + std::to_string(total) + " events, " + std::to_string(diag::rings.size()) +
++           " threads, dropped " + std::to_string(dropped);
++}
++
+ std::string DiagSummary() {
+     if (!diag::Enabled()) return "diag off";
+     return "DIAG gets_ro=" + std::to_string(diag::gets_ro_path.load()) + " gets_rw=" + std::to_string(diag::gets_rw_path.load()) +
+diff --git a/lib/shm_obj_handle.cc b/lib/shm_obj_handle.cc
+index acb1ea4..4c3b962 100644
+--- a/lib/shm_obj_handle.cc
++++ b/lib/shm_obj_handle.cc
+@@ -403,6 +403,7 @@ expected<common::CacheNode *, std::error_code> SharedMemoryObjectHandle<Policy>:
+         if (!new_wmeta_index_optional.has_value()) continue;
+ 
+         common::WriteMetadata *cur = c3po_->Scr_meta()->GetWmeta(new_wmeta_index_optional.value());
++        const size_t diag_victim = new_wmeta_index_optional.value();
+ #ifdef WMETA_OWNER_REV
+         // packed4: the record holds no BlockId; the log op resolves the victim's key (replica reverse map)
+         new_wmeta_index_optional = c3po_->Gcd()->SwitchToReadOnlyByWmeta(new_wmeta_index_optional.value(), nr_meta);
+@@ -415,6 +416,11 @@ expected<common::CacheNode *, std::error_code> SharedMemoryObjectHandle<Policy>:
+                                                                   nr_meta
+ #endif /* NR */
+         );
++#endif
++#ifdef WMETA_OWNER_REV
++        diag::Rec(diag::kEvReclaim, ~0u, static_cast<int64_t>(diag_victim), new_wmeta_index_optional.has_value() ? static_cast<uint32_t>(*new_wmeta_index_optional + 1) : 0u);
++#else
++        diag::Rec(diag::kEvReclaim, vic_block_id.GetOffset(), static_cast<int64_t>(diag_victim), new_wmeta_index_optional.has_value() ? static_cast<uint32_t>(*new_wmeta_index_optional + 1) : 0u);
+ #endif
+         if (new_wmeta_index_optional.has_value()) {
+             c3po_->Scr_meta()->RecycleWmeta(new_wmeta_index_optional.value());
+@@ -538,6 +544,7 @@ expected<common::CacheNode *, std::error_code> SharedMemoryObjectHandle<Policy>:
+             if (!new_wmeta_index_optional.has_value()) continue;
+ 
+             common::WriteMetadata *cur = c3po_->Scr_meta()->GetWmeta(new_wmeta_index_optional.value());
++            const size_t diag_victim = new_wmeta_index_optional.value();
+ #ifdef WMETA_OWNER_REV
+             // packed4: the record holds no BlockId; the log op resolves the victim's key (replica reverse map)
+             new_wmeta_index_optional = c3po_->Gcd()->SwitchToReadOnlyByWmeta(new_wmeta_index_optional.value(), nr_meta);
+@@ -550,6 +557,11 @@ expected<common::CacheNode *, std::error_code> SharedMemoryObjectHandle<Policy>:
+                                                                       nr_meta
+ #endif /* NR */
+             );
++#endif
++#ifdef WMETA_OWNER_REV
++            diag::Rec(diag::kEvReclaim, ~0u, static_cast<int64_t>(diag_victim), new_wmeta_index_optional.has_value() ? static_cast<uint32_t>(*new_wmeta_index_optional + 1) : 0u);
++#else
++            diag::Rec(diag::kEvReclaim, vic_block_id.GetOffset(), static_cast<int64_t>(diag_victim), new_wmeta_index_optional.has_value() ? static_cast<uint32_t>(*new_wmeta_index_optional + 1) : 0u);
+ #endif
+             if (new_wmeta_index_optional.has_value()) {
+                 c3po_->Scr_meta()->RecycleWmeta(new_wmeta_index_optional.value());
+@@ -639,6 +651,7 @@ std::error_code SharedMemoryObjectHandle<Policy>::SwitchRW(const common::WriteHa
+         if (!new_wmeta_index_optional.has_value()) continue;
+ 
+         common::WriteMetadata *cur = c3po_->Scr_meta()->GetWmeta(new_wmeta_index_optional.value());
++        const size_t diag_victim = new_wmeta_index_optional.value();
+ #ifdef WMETA_OWNER_REV
+         // packed4: the record holds no BlockId; the log op resolves the victim's key (replica reverse map)
+         new_wmeta_index_optional = c3po_->Gcd()->SwitchToReadOnlyByWmeta(new_wmeta_index_optional.value(), nr_meta);
+@@ -651,6 +664,11 @@ std::error_code SharedMemoryObjectHandle<Policy>::SwitchRW(const common::WriteHa
+                                                                   nr_meta
+ #endif /* NR */
+         );
++#endif
++#ifdef WMETA_OWNER_REV
++        diag::Rec(diag::kEvReclaim, ~0u, static_cast<int64_t>(diag_victim), new_wmeta_index_optional.has_value() ? static_cast<uint32_t>(*new_wmeta_index_optional + 1) : 0u);
++#else
++        diag::Rec(diag::kEvReclaim, vic_block_id.GetOffset(), static_cast<int64_t>(diag_victim), new_wmeta_index_optional.has_value() ? static_cast<uint32_t>(*new_wmeta_index_optional + 1) : 0u);
+ #endif
+         if (new_wmeta_index_optional.has_value()) {
+             c3po_->Scr_meta()->RecycleWmeta(new_wmeta_index_optional.value());
+@@ -670,6 +688,8 @@ std::error_code SharedMemoryObjectHandle<Policy>::SwitchRW(const common::WriteHa
+ 
+ #ifdef NR
+     size_t rc = c3po_->Gcd()->InvalidateSwitchToRWShared(wh.key, new_wmeta_index_optional.value(), nr_meta);
++    diag::Rec(diag::kEvPromote, wh.key.GetOffset(), static_cast<int64_t>(new_wmeta_index_optional.value()),
++              static_cast<uint32_t>(rc));
+ #else
+     (void)local_meta;
+     size_t rc = c3po_->Gcd()->InvalidateSwitchToRWShared(wh.key, new_wmeta_index_optional.value());
+diff --git a/src/common/diag.h b/src/common/diag.h
+index 42443d9..2650977 100644
+--- a/src/common/diag.h
++++ b/src/common/diag.h
+@@ -35,3 +35,82 @@ inline std::atomic<uint64_t> gets_ro_path{0};
+ inline std::atomic<uint64_t> gets_rw_path{0};
+ 
+ }  // namespace rackobj::diag
++
++// ---- event ring (MEGALON_DIAG=1): per-thread, lock-free append, dumped once at the end (DiagDump) ----
++#include <ctime>
++#include <memory>
++#include <mutex>
++#include <vector>
++
++namespace rackobj::diag {
++
++enum EvType : uint16_t {
++    kEvWrite = 1,    // Put returned: key, record locked by write_seq_start (-2: path without it), aux = value bytes 8..11
++    kEvPromote = 2,  // SwitchRW: key -> RW with record wmeta, aux = NR result code
++    kEvReclaim = 3,  // reclaim RO switch of victim record wmeta: aux = returned record + 1 (0 = none); key = BlockId (artifact64) or ~0
++};
++enum EvFlag : uint8_t { kFlStale = 1, kFlOwnerMismatch = 2 };
++
++struct Ev {
++    uint64_t t_ns;  // CLOCK_REALTIME
++    uint32_t key;
++    int32_t wmeta;
++    uint32_t aux;
++    uint16_t type;
++    uint8_t tid;  // ring index in this process
++    uint8_t flags;
++};
++static_assert(sizeof(Ev) == 24);
++
++struct Ring {
++    std::unique_ptr<Ev[]> buf;
++    size_t cap = 0, n = 0, dropped = 0;
++    uint8_t tid = 0;
++};
++inline std::mutex ring_mu;
++inline std::vector<Ring *> rings;
++
++inline size_t RingCap() {
++    static const size_t cap = [] {
++        const char *v = std::getenv("MEGALON_DIAG_RING");
++        return v ? static_cast<size_t>(std::atoll(v)) : static_cast<size_t>(8) << 20;  // events per thread
++    }();
++    return cap;
++}
++
++inline Ring *MyRing() {
++    thread_local Ring *r = [] {
++        auto *x = new Ring;  // never freed: dumped at exit by DiagDump
++        x->cap = RingCap();
++        x->buf.reset(new Ev[x->cap]);  // untouched pages until written
++        std::lock_guard<std::mutex> g(ring_mu);
++        x->tid = static_cast<uint8_t>(rings.size());
++        rings.push_back(x);
++        return x;
++    }();
++    return r;
++}
++
++inline uint64_t NowNs() {
++    timespec ts;
++    clock_gettime(CLOCK_REALTIME, &ts);
++    return static_cast<uint64_t>(ts.tv_sec) * 1000000000ull + static_cast<uint64_t>(ts.tv_nsec);
++}
++
++inline void Rec(uint16_t type, uint64_t key, int64_t wmeta, uint32_t aux, uint8_t flags = 0) {
++    if (!Enabled()) return;
++    Ring *r = MyRing();
++    if (r->n < r->cap)
++        r->buf[r->n++] = Ev{NowNs(), static_cast<uint32_t>(key), static_cast<int32_t>(wmeta), aux, type, r->tid, flags};
++    else
++        r->dropped++;
++}
++
++// set by write_seq_start for the current Put (reset by the Put wrapper)
++struct LastWrite {
++    int64_t wmeta = -2;
++    uint8_t flags = 0;
++};
++inline thread_local LastWrite last_write;
++
++}  // namespace rackobj::diag
+diff --git a/src/core/c3.cc b/src/core/c3.cc
+index 456f673..de02ee5 100644
+--- a/src/core/c3.cc
++++ b/src/core/c3.cc
+@@ -631,8 +631,10 @@ bool C3POHandle::write_seq_start(WriteHandle &wh
+     if (diag::Enabled()) {
+         // observe only (behaviour unchanged): does the key still hold the record we just locked?
+         diag::writer_checks.fetch_add(1, std::memory_order_relaxed);
++        diag::last_write.wmeta = static_cast<int64_t>(wmeta_index.value());
+ #ifndef WMETA_OWNER_REV
+         if (!(wmeta->GetBlockID() == wh.key)) {
++            diag::last_write.flags |= diag::kFlOwnerMismatch;
+             uint64_t n = diag::writer_owner_mismatch.fetch_add(1, std::memory_order_relaxed);
+             LOG_IF(WARNING, n < 10) << "DIAG writer: locked record " << wmeta_index.value() << " for key " << wh.key
+                                     << " but its BlockId is " << wmeta->GetBlockID();
+@@ -640,6 +642,7 @@ bool C3POHandle::write_seq_start(WriteHandle &wh
+ #endif
+         std::optional<common::GCDEntry> re = Gcd()->Get(wh.key, nr_meta);
+         if (!re.has_value() || re->wmeta_idx_ != wmeta_index) {
++            diag::last_write.flags |= diag::kFlStale;
+             uint64_t n = diag::writer_stale_entry.fetch_add(1, std::memory_order_relaxed);
+             LOG_IF(WARNING, n < 10) << "DIAG writer: key " << wh.key << " locked record " << wmeta_index.value()
+                                     << " but a synced re-read shows "
+diff --git a/src/manager/wmeta_manager.cc b/src/manager/wmeta_manager.cc
+index 4e873fa..a634266 100644
+--- a/src/manager/wmeta_manager.cc
++++ b/src/manager/wmeta_manager.cc
+@@ -1,3 +1,4 @@
++#include "common/diag.h"
+ #include "wmeta_manager.h"
+ 
+ #include <cstring>
+@@ -89,6 +90,11 @@ size_t WriteMetadataManager::IterativeReclaim(size_t count
+                                                                                   nr_meta
+ #endif /* NR */
+         );
++#endif
++#ifdef WMETA_OWNER_REV
++        diag::Rec(diag::kEvReclaim, ~0u, static_cast<int64_t>(wmeta_idx), wmeta_idx_optional.has_value() ? static_cast<uint32_t>(*wmeta_idx_optional + 1) : 0u);
++#else
++        diag::Rec(diag::kEvReclaim, block_id.GetOffset(), static_cast<int64_t>(wmeta_idx), wmeta_idx_optional.has_value() ? static_cast<uint32_t>(*wmeta_idx_optional + 1) : 0u);
+ #endif
+         if (wmeta_idx_optional.has_value()) {
+             // CHECK(!shared_cache->scr_bitmap_.IsWmetaFree(wmeta_idx)) << "the slot is already free before freeing";
+@@ -133,6 +139,11 @@ size_t WriteMetadataManager::SampleReclaim(size_t count
+                                                                                   nr_meta
+ #endif /* NR */
+         );
++#endif
++#ifdef WMETA_OWNER_REV
++        diag::Rec(diag::kEvReclaim, ~0u, static_cast<int64_t>(wmeta_idx.value()), wmeta_idx_optional.has_value() ? static_cast<uint32_t>(*wmeta_idx_optional + 1) : 0u);
++#else
++        diag::Rec(diag::kEvReclaim, block_id.GetOffset(), static_cast<int64_t>(wmeta_idx.value()), wmeta_idx_optional.has_value() ? static_cast<uint32_t>(*wmeta_idx_optional + 1) : 0u);
+ #endif
+         if (wmeta_idx_optional.has_value()) {
+             c3po_->Scr_meta()->RecycleWmeta(wmeta_idx_optional.value());
+-- 
+2.34.1
+

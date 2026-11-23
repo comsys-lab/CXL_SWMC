@@ -1,0 +1,1326 @@
+From e368e63c2f413b9bad0505081b541ff6ac7596da Mon Sep 17 00:00:00 2001
+From: Sungsu Ahn <sungsu_ahn@korea.ac.kr>
+Date: Thu, 15 Oct 2026 08:56:33 +0900
+Subject: [PATCH 26/51] =?UTF-8?q?objects:=20paper=20=C2=A74=20variable-siz?=
+ =?UTF-8?q?e=20objects=20with=20create/read=5Fstart/read=5Fend/write=5Fsta?=
+ =?UTF-8?q?rt/write=5Fend?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+ObjectCreate(id, size) bump-allocates contiguous bytes in an SWcc arena (64 B or
+4 KiB aligned, no free) and publishes the descriptor (location, size) in the
+object's own index entry through the NR log. One object = one entry = one
+coherence record: none at create in the megalon flavor (paper §3.4.2), a static
+record per object in hwcc. Sections run the slot path's own functions
+(GetAnchor, read_seq_start/end, write_seq_start/end, SwitchRW, reclaim, replay)
+with the slot range replaced by the object's [ptr, ptr+size); data is read and
+written in place. Slot Put/Get paths are unchanged. Config keys
+object_arena_size (0 = disabled, layout unchanged), object_align,
+object_max_count. Test binary object-test (2 nodes, self-checking).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ benchmarks/CMakeLists.txt       |   5 +
+ benchmarks/object_test.cc       | 402 ++++++++++++++++++++++++++++++++
+ config/destijl-2vm-objects.yaml |  30 +++
+ include/rackobj.h               |  45 ++++
+ lib/globals.cc                  |  19 ++
+ lib/object_store.cc             | 287 +++++++++++++++++++++++
+ lib/object_store.h              |  96 ++++++++
+ lib/shm_obj_handle.cc           |  30 ++-
+ lib/shm_obj_handle.h            |   7 +
+ src/common/config.cc            |  13 +-
+ src/common/config.h             |  11 +
+ src/core/c3.cc                  |  17 +-
+ src/core/c3.h                   |  11 +-
+ src/index/gcd_nr.cc             |   6 +
+ src/index/gcd_nr.h              |   5 +
+ src/index/nr_hashmap.h          |   8 +
+ src/shared_memory/cxl_port.cc   |   8 +-
+ src/shared_memory/cxl_port.h    |  12 +-
+ 18 files changed, 1001 insertions(+), 11 deletions(-)
+ create mode 100644 benchmarks/object_test.cc
+ create mode 100644 config/destijl-2vm-objects.yaml
+ create mode 100644 lib/object_store.cc
+ create mode 100644 lib/object_store.h
+
+diff --git a/benchmarks/CMakeLists.txt b/benchmarks/CMakeLists.txt
+index fe1ba02..fb438b6 100644
+--- a/benchmarks/CMakeLists.txt
++++ b/benchmarks/CMakeLists.txt
+@@ -8,6 +8,11 @@ add_executable(kv-store kv_store.cc)
+ target_include_directories(kv-store PRIVATE ${MEGALON_SOURCE_DIR}/include/)
+ target_link_libraries(kv-store megalon numa absl::log_initialize)
+ 
++# De Stijl port, phase B: 2-node self-checking test of the paper's variable-size objects (needs object_arena_size)
++add_executable(object-test object_test.cc)
++target_include_directories(object-test PRIVATE ${MEGALON_SOURCE_DIR}/include/)
++target_link_libraries(object-test megalon absl::log_initialize)
++
+ if(FILE_INTERFACE)
+     add_executable(page-cache page_cache.cc)
+     target_include_directories(page-cache PRIVATE ${MEGALON_SOURCE_DIR}/include/)
+diff --git a/benchmarks/object_test.cc b/benchmarks/object_test.cc
+new file mode 100644
+index 0000000..cedd6ab
+--- /dev/null
++++ b/benchmarks/object_test.cc
+@@ -0,0 +1,402 @@
++// De Stijl port, phase B: self-checking 2-node test of the paper's variable-size objects (§4; lib/object_store.h).
++// Run one process per node exactly like kv-store (RACKOBJ_CONFIG, MEGALON_NODE_ID, MEGALON_RUN_ID, region config);
++// the Megalon config must set object_arena_size (>= 64MB) and should be the same file on both nodes.
++//
++//   object-test <concurrent phase seconds> [reader threads per node, default 2]
++//
++// Exit: 0 PASS, 3 FAIL. Both nodes run the same phase sequence, separated by NodeBarrier:
++//   0 errors and races: -EINVAL / -ENOENT / -ENOMEM paths; both nodes create the same id (exactly one wins, the
++//     loser gets -EEXIST); a second create of an existing id is -EEXIST; lookups report the creator's size.
++//   1 pattern: node n fills its object P(n) (odd size, > 1 MiB) in place in one write section; both nodes verify both
++//     objects in place through read sections (also checks that the reported size and contents agree across nodes).
++//   2 cross-node writer: node n rewrites the OTHER node's object P(1-n) (gen 2), the owner verifies it.
++//   3 concurrent: node n's writer thread rewrites C(n) whole (one generation per section) and both nodes' writers
++//     rewrite the shared object S; reader threads on both nodes read C(0), C(1), S in place. Every read that
++//     ObjectReadEnd accepts must be one complete generation (no torn read) and generations must not go backwards per
++//     reader and object; afterwards each node must see the writers' last generations (exchanged via a mailbox).
++//   4 many objects: each node creates and writes kMany objects of varied sizes (alignment, partial last line),
++//     the other node verifies all of them (many records: with a small logical_scr_size this drives reclaim).
++//   5 slots unchanged: a Put on node 0 is read by node 1 with Get (objects and slots coexist).
++// Shared counters are checked at the end (created == expected, lost bytes only from the phase-0 race).
++#include <rackobj.h>
++
++#include <algorithm>
++#include <atomic>
++#include <cerrno>
++#include <chrono>
++#include <cstdio>
++#include <cstring>
++#include <random>
++#include <string>
++#include <thread>
++#include <vector>
++
++#include "absl/log/check.h"
++#include "absl/log/globals.h"
++#include "absl/log/initialize.h"
++#include "absl/log/log.h"
++
++namespace {
++
++size_t node_id = 0;
++std::atomic<uint64_t> failures{0};
++uint32_t phase = 0;
++
++#define EXPECT(cond)                                                   \
++    do {                                                               \
++        if (!(cond)) {                                                 \
++            failures.fetch_add(1);                                     \
++            LOG(ERROR) << "FAIL (line " << __LINE__ << "): " << #cond; \
++        }                                                              \
++    } while (0)
++
++void Barrier(const char *what) {
++    rackobj::NodeBarrier(++phase);
++    LOG(INFO) << "phase " << phase << " (" << what << ") reached by both nodes";
++}
++
++constexpr uint64_t kBase = 0x0b1ec7000000ull;
++constexpr uint64_t kRace = kBase + 1;
++constexpr uint64_t kMailbox = kBase + 2;
++constexpr uint64_t kMissing = kBase + 3;
++constexpr uint64_t kShared = kBase + 4;
++uint64_t PatId(size_t n) { return kBase + 10 + n; }
++uint64_t ConcId(size_t n) { return kBase + 20 + n; }
++uint64_t ManyId(size_t n, size_t i) { return kBase + 0x100000 + n * 0x10000 + i; }
++constexpr size_t kMany = 1000;
++constexpr size_t kMailboxHalf = 512;
++constexpr uint64_t kMailMagic = 0x4d41494c424f5821ull;
++const size_t kPatLen[2] = {(1u << 20) + 13, (1u << 20) + 300 * 1024 + 7};
++constexpr size_t kConcLen = (64u << 10) + 72;  // multiple of 8 bytes, not of 64
++
++inline uint64_t mix64(uint64_t x) {
++    x ^= x >> 33;
++    x *= 0xff51afd7ed558ccdULL;
++    x ^= x >> 33;
++    x *= 0xc4ceb9fe1a85ec53ULL;
++    x ^= x >> 33;
++    return x;
++}
++
++inline uint8_t PatByte(uint64_t id, uint64_t gen, size_t off) {
++    uint64_t w = mix64(id * 0x9E3779B97F4A7C15ull ^ (gen << 48) ^ static_cast<uint64_t>(off / 8));
++    return static_cast<uint8_t>(w >> ((off % 8) * 8));
++}
++
++void FillPat(uint8_t *dst, uint64_t id, uint64_t gen, size_t len) {
++    for (size_t i = 0; i < len; i++) dst[i] = PatByte(id, gen, i);
++}
++
++size_t Mismatch(const uint8_t *p, uint64_t id, uint64_t gen, size_t len) {
++    size_t bad = 0;
++    for (size_t i = 0; i < len; i++) bad += p[i] != PatByte(id, gen, i);
++    return bad;
++}
++
++// Writes generation `gen` of the byte pattern over the whole object, in place.
++void WritePat(uint64_t id, uint64_t gen) {
++    rackobj::ObjectHandle h;
++    CHECK_EQ(rackobj::ObjectWriteStart(id, &h), 0) << "write_start " << id;
++    FillPat(h.ptr, id, gen, h.size);
++    rackobj::ObjectWriteEnd(&h);
++}
++
++// Reads object `id` in place until a read is accepted; returns (size, mismatching bytes vs generation gen).
++std::pair<size_t, size_t> CheckPat(uint64_t id, uint64_t gen, uint64_t *retries = nullptr) {
++    rackobj::ObjectHandle h;
++    size_t bad = 0;
++    for (;;) {
++        CHECK_EQ(rackobj::ObjectReadStart(id, &h), 0) << "read_start " << id;
++        bad = Mismatch(h.ptr, id, gen, h.size);
++        if (rackobj::ObjectReadEnd(&h)) break;
++        if (retries) ++*retries;
++    }
++    return {h.size, bad};
++}
++
++// mailbox: node n owns bytes [n * 512, (n+1) * 512): magic, count, values
++void MailPut(const std::vector<uint64_t> &v) {
++    CHECK_LE(v.size() + 2, kMailboxHalf / 8);
++    rackobj::ObjectHandle h;
++    CHECK_EQ(rackobj::ObjectWriteStart(kMailbox, &h), 0);
++    auto *w = reinterpret_cast<uint64_t *>(h.ptr + node_id * kMailboxHalf);
++    w[0] = kMailMagic;
++    w[1] = v.size();
++    for (size_t i = 0; i < v.size(); i++) w[2 + i] = v[i];
++    rackobj::ObjectWriteEnd(&h);
++}
++
++std::vector<uint64_t> MailGet(size_t from) {
++    rackobj::ObjectHandle h;
++    std::vector<uint64_t> out;
++    for (;;) {
++        CHECK_EQ(rackobj::ObjectReadStart(kMailbox, &h), 0);
++        const auto *w = reinterpret_cast<const uint64_t *>(h.ptr + from * kMailboxHalf);
++        out.clear();
++        bool ok = w[0] == kMailMagic && w[1] + 2 <= kMailboxHalf / 8;
++        if (ok) out.assign(w + 2, w + 2 + w[1]);
++        if (rackobj::ObjectReadEnd(&h)) {
++            CHECK(ok) << "mailbox of node " << from << " not written";
++            return out;
++        }
++    }
++}
++
++// concurrent-phase layout: word 0 = gen, word 1 = writer node, word i = f(id, gen, i)
++inline uint64_t ConcWord(uint64_t id, uint64_t gen, size_t i) { return mix64(id ^ (gen << 20) ^ (i << 44)); }
++
++void WriteGen(uint64_t id, uint64_t gen) {
++    rackobj::ObjectHandle h;
++    CHECK_EQ(rackobj::ObjectWriteStart(id, &h), 0);
++    auto *w = reinterpret_cast<uint64_t *>(h.ptr);
++    const size_t n = h.size / 8;
++    for (size_t i = 2; i < n; i++) w[i] = ConcWord(id, gen, i);
++    w[1] = node_id;
++    w[0] = gen;
++    rackobj::ObjectWriteEnd(&h);
++}
++
++// gen of a complete generation, 0 if torn (inspected inside the section; only valid if ReadEnd accepts)
++uint64_t InspectGen(const uint8_t *p, size_t size, uint64_t id) {
++    const auto *w = reinterpret_cast<const uint64_t *>(p);
++    const size_t n = size / 8;
++    const uint64_t gen = w[0];
++    if (gen == 0) return 0;
++    for (size_t i = 2; i < n; i++)
++        if (w[i] != ConcWord(id, gen, i)) return 0;
++    return gen;
++}
++
++struct ReaderResult {
++    uint64_t reads = 0, retries = 0, torn = 0, backwards = 0, unwritten = 0;
++};
++
++void Reader(int tid, const std::vector<uint64_t> &ids, std::chrono::steady_clock::time_point until, ReaderResult *r) {
++    rackobj::Register(tid);
++    std::vector<uint64_t> last(ids.size(), 0);
++    std::mt19937_64 rng(static_cast<uint64_t>(tid) * 7919 + node_id);
++    while (std::chrono::steady_clock::now() < until) {
++        size_t k = rng() % ids.size();
++        rackobj::ObjectHandle h;
++        uint64_t gen;
++        bool zero;
++        for (;;) {
++            CHECK_EQ(rackobj::ObjectReadStart(ids[k], &h), 0);
++            // everything is inspected inside the section; it only counts if ObjectReadEnd accepts the read
++            gen = InspectGen(h.ptr, h.size, ids[k]);
++            zero = reinterpret_cast<const volatile uint64_t *>(h.ptr)[0] == 0;
++            if (rackobj::ObjectReadEnd(&h)) break;
++            r->retries++;
++        }
++        r->reads++;
++        if (gen == 0) {
++            // an accepted read of a never-written object (gen word 0) is fine; anything else is torn
++            if (zero) r->unwritten++;
++            else r->torn++;
++            continue;
++        }
++        if (gen < last[k]) r->backwards++;
++        last[k] = gen;
++    }
++    rackobj::UnRegister();
++}
++
++// generations are (counter << 1 | node) so the two writers of S never produce the same gen
++uint64_t Writer(int tid, uint64_t own, std::chrono::steady_clock::time_point until, uint64_t *shared_last) {
++    rackobj::Register(tid);
++    uint64_t g = 0;
++    while (std::chrono::steady_clock::now() < until) {
++        ++g;
++        WriteGen(own, (g << 1) | node_id);
++        if (g % 4 == 0) {
++            WriteGen(kShared, (g << 1) | node_id);
++            *shared_last = (g << 1) | node_id;
++        }
++    }
++    rackobj::UnRegister();
++    return (g << 1) | node_id;
++}
++
++}  // namespace
++
++int main(int argc, char **argv) {
++    absl::SetStderrThreshold(absl::LogSeverity::kInfo);
++    absl::InitializeLog();
++    if (argc < 2) {
++        std::fprintf(stderr, "usage: %s <concurrent phase seconds> [reader threads per node]\n", argv[0]);
++        return 1;
++    }
++    const int conc_s = std::atoi(argv[1]);
++    const int readers = argc > 2 ? std::atoi(argv[2]) : 2;
++    CHECK(conc_s > 0 && readers > 0 && readers <= 16);
++    node_id = rackobj::GetConfigSize_t("node_id");
++    const size_t other = 1 - node_id;
++    rackobj::Register(0);
++
++    rackobj::ObjectStats st0{};
++    rackobj::GetObjectStats(&st0);
++    CHECK(st0.arena_bytes >= (64u << 20)) << "object_arena_size must be >= 64MB for this test";
++
++    // ---- phase 0: errors and races ----
++    EXPECT(rackobj::ObjectCreate(kBase + 99, 0) == -EINVAL);
++    {
++        rackobj::ObjectHandle h;
++        EXPECT(rackobj::ObjectReadStart(kMissing, &h) == -ENOENT);
++        EXPECT(rackobj::ObjectWriteStart(kMissing, &h) == -ENOENT);
++        size_t sz = 0;
++        EXPECT(rackobj::ObjectLookup(kMissing, &sz) == -ENOENT);
++        EXPECT(rackobj::ObjectCreate(kBase + 98 + 2 * node_id, st0.arena_bytes + 1) == -ENOMEM);
++    }
++    if (node_id == 0) {
++        EXPECT(rackobj::ObjectCreate(kMailbox, 2 * kMailboxHalf) == 0);
++        EXPECT(rackobj::ObjectCreate(kShared, kConcLen) == 0);
++    }
++    EXPECT(rackobj::ObjectCreate(PatId(node_id), kPatLen[node_id]) == 0);
++    EXPECT(rackobj::ObjectCreate(ConcId(node_id), kConcLen) == 0);
++    EXPECT(rackobj::ObjectCreate(PatId(node_id), 64) == -EEXIST);
++    Barrier("created");
++    const int race_rc = rackobj::ObjectCreate(kRace, 1000 + node_id);  // both nodes, same id
++    EXPECT(race_rc == 0 || race_rc == -EEXIST);
++    MailPut({static_cast<uint64_t>(race_rc == 0)});
++    Barrier("race done");
++    {
++        auto o = MailGet(other);
++        EXPECT(o.size() == 1);
++        const uint64_t wins = (race_rc == 0) + (o.empty() ? 0 : o[0]);
++        EXPECT(wins == 1);
++        size_t sz = 0;
++        EXPECT(rackobj::ObjectLookup(kRace, &sz) == 0);
++        EXPECT(sz == 1000 || sz == 1001);
++        EXPECT(rackobj::ObjectLookup(PatId(other), &sz) == 0 && sz == kPatLen[other]);
++        LOG(INFO) << "race on id " << kRace << ": this node " << (race_rc == 0 ? "won" : "lost") << ", size " << sz;
++    }
++
++    // ---- phase 1: pattern, in place ----
++    WritePat(PatId(node_id), 1);
++    Barrier("pattern written");
++    for (size_t n = 0; n < 2; n++) {
++        auto [sz, bad] = CheckPat(PatId(n), 1);
++        EXPECT(sz == kPatLen[n]);
++        EXPECT(bad == 0);
++        LOG(INFO) << "pattern P(" << n << "): size " << sz << ", bad bytes " << bad;
++    }
++    Barrier("pattern checked");
++
++    // ---- phase 2: cross-node writer ----
++    WritePat(PatId(other), 2);
++    Barrier("cross-node written");
++    {
++        auto [sz, bad] = CheckPat(PatId(node_id), 2);
++        EXPECT(sz == kPatLen[node_id] && bad == 0);
++        LOG(INFO) << "own object rewritten by node " << other << ": bad bytes " << bad;
++    }
++    Barrier("cross-node checked");
++
++    // ---- phase 3: concurrent ----
++    uint64_t own_last = 0, shared_last = 0;
++    std::vector<ReaderResult> rr(static_cast<size_t>(readers));
++    {
++        auto until = std::chrono::steady_clock::now() + std::chrono::seconds(conc_s);
++        std::vector<uint64_t> ids = {ConcId(0), ConcId(1), kShared};
++        std::vector<std::thread> th;
++        for (int i = 0; i < readers; i++)
++            th.emplace_back(Reader, 2 + i, std::cref(ids), until, &rr[static_cast<size_t>(i)]);
++        std::thread w([&] { own_last = Writer(1, ConcId(node_id), until, &shared_last); });
++        w.join();
++        for (auto &t : th) t.join();
++    }
++    MailPut({own_last, shared_last});
++    Barrier("concurrent done");
++    {
++        ReaderResult tot;
++        for (auto &r : rr) {
++            tot.reads += r.reads;
++            tot.retries += r.retries;
++            tot.torn += r.torn;
++            tot.backwards += r.backwards;
++            tot.unwritten += r.unwritten;
++        }
++        LOG(INFO) << "concurrent: reads " << tot.reads << ", retries " << tot.retries << ", torn " << tot.torn
++                  << ", backwards " << tot.backwards << ", own last gen " << own_last;
++        EXPECT(tot.reads > 0);
++        EXPECT(tot.torn == 0);
++        EXPECT(tot.backwards == 0);
++        auto o = MailGet(other);
++        EXPECT(o.size() == 2);
++        const uint64_t other_last = o.empty() ? 0 : o[0];
++        const uint64_t other_shared = o.size() < 2 ? 0 : o[1];
++        rackobj::ObjectHandle h;
++        auto final_gen = [&](uint64_t id) {
++            uint64_t g;
++            for (;;) {
++                CHECK_EQ(rackobj::ObjectReadStart(id, &h), 0);
++                g = InspectGen(h.ptr, h.size, id);
++                if (rackobj::ObjectReadEnd(&h)) return g;
++            }
++        };
++        EXPECT(final_gen(ConcId(node_id)) == own_last);
++        EXPECT(final_gen(ConcId(other)) == other_last);
++        const uint64_t s = final_gen(kShared);
++        EXPECT(s == shared_last || s == other_shared);
++        LOG(INFO) << "final gens: C(own) " << final_gen(ConcId(node_id)) << ", C(other) " << final_gen(ConcId(other))
++                  << " (other reported " << other_last << "), S " << s;
++    }
++    Barrier("concurrent checked");
++
++    // ---- phase 4: many objects ----
++    {
++        std::mt19937_64 rng(1234 + node_id);
++        for (size_t i = 0; i < kMany; i++) {
++            const size_t sz = 1 + rng() % 9000;
++            EXPECT(rackobj::ObjectCreate(ManyId(node_id, i), sz) == 0);
++            WritePat(ManyId(node_id, i), 5);
++        }
++    }
++    Barrier("many written");
++    {
++        std::mt19937_64 rng(1234 + other);
++        size_t bad_objs = 0;
++        uint64_t retries = 0;
++        for (size_t i = 0; i < kMany; i++) {
++            const size_t want = 1 + rng() % 9000;
++            auto [sz, bad] = CheckPat(ManyId(other, i), 5, &retries);
++            if (sz != want || bad) bad_objs++;
++        }
++        EXPECT(bad_objs == 0);
++        LOG(INFO) << "many: " << kMany << " objects of node " << other << " checked, bad " << bad_objs << ", retries "
++                  << retries;
++    }
++    Barrier("many checked");
++
++    // ---- phase 5: slots unchanged (Put/Get next to objects) ----
++    const off_t slot_key = 4242;
++    char val[64];
++    std::snprintf(val, sizeof(val), "slot-from-node-0");
++    if (node_id == 0) EXPECT(rackobj::Put(reinterpret_cast<const uint8_t *>(val), sizeof(val), slot_key) > 0);
++    Barrier("slot put");
++    {
++        char got[64] = {};
++        ssize_t n = rackobj::Get(reinterpret_cast<uint8_t *>(got), sizeof(got), slot_key);
++        EXPECT(n > 0 && std::strcmp(got, val) == 0);
++    }
++    Barrier("slot checked");
++
++    rackobj::ObjectStats st{};
++    rackobj::GetObjectStats(&st);
++    const uint64_t expect_created = 4 /*mailbox, S, P(0), P(1)*/ + 2 /*C(0), C(1)*/ + 1 /*race*/ + 2 * kMany;
++    EXPECT(st.created == expect_created);
++    EXPECT(st.lost_bytes <= 4096);  // only the losing race create (1000 or 1001 B rounded up to object_align)
++    LOG(INFO) << "OBJECT-STATS node " << node_id << ": arena " << st.used_bytes << "/" << st.arena_bytes << " B, created "
++              << st.created << " (expected " << expect_created << "), lost " << st.lost_bytes << " B / "
++              << st.lost_records << " records, static records " << st.static_records_used << "; creates " << st.creates
++              << ", read sections " << st.read_sections << " (retry notify " << st.read_retry_notify
++              << ", incoherent " << st.read_retry_incoherent << "), write sections " << st.write_sections
++              << " (retry " << st.write_retry << ", RW switches " << st.switch_rw << "), flushes " << st.flushes << " ("
++              << st.flush_bytes << " B), replay flushes " << st.replay_flushes << " (" << st.replay_flush_bytes << " B)";
++    Barrier("end");
++    rackobj::UnRegister();
++    const bool pass = failures.load() == 0;
++    LOG(INFO) << "OBJECT-TEST " << (pass ? "PASS" : "FAIL") << " node " << node_id << " (" << failures.load()
++              << " failed checks)";
++    return pass ? 0 : 3;
++}
+diff --git a/config/destijl-2vm-objects.yaml b/config/destijl-2vm-objects.yaml
+new file mode 100644
+index 0000000..1aff38b
+--- /dev/null
++++ b/config/destijl-2vm-objects.yaml
+@@ -0,0 +1,30 @@
++# De Stijl 2-VM port, phase B: destijl-2vm.yaml plus the paper's variable-size objects (§4; object-test, vectordb).
++# Same file on both VMs except node_id (or set MEGALON_NODE_ID); run_id via MEGALON_RUN_ID.
++mount_directory: /mydata        # required by the config parser; unused
++key_space: 1000000
++slots: 1001000                  # same value for every flavor [V9]
++logical_scr_size: 200MB         # required; same value for every flavor [V9] (small values drive record reclaim)
++node_id: 0                      # 0 = init (VM0), 1 = attach (VM1)
++region_config: ""               # empty: $CXL_REGION_CONFIG
++reinit: false
++attach_mprotect: true
++stuck_timeout_ms: 10000
++log_sync_interval_us: 100
++nr_log_size: 64MB
++attach_timeout_s: 600
++start_barrier_timeout_s: 600
++# phase B: object arena in SWcc after the slot data and the NR log body; bump allocation at create, never freed
++object_arena_size: 256MB        # 0 disables objects (layout then identical to destijl-2vm.yaml)
++object_align: 64                # start alignment and size rounding: 64 or 4096
++object_max_count: 65536         # hwcc flavor only: static coherence records reserved for objects (one per object)
++replicate: false
++flush: false
++evict: false
++partition_ratio: 0.0
++excluded_files:
++excluded_directories:
++  - /usr
++  - /proc
++  - /etc
++  - /dev
++  - /sys
+diff --git a/include/rackobj.h b/include/rackobj.h
+index 30a2089..a54a8a2 100644
+--- a/include/rackobj.h
++++ b/include/rackobj.h
+@@ -1,5 +1,6 @@
+ #pragma once
+ 
++#include <cstddef>
+ #include <cstdint>
+ #include <unistd.h>
+ #include <string>
+@@ -44,6 +45,50 @@ double GetPartitionRatio();
+  * Only the calling thread waits. */
+ void NodeBarrier(uint32_t phase);
+ 
++/* ---- De Stijl port, phase B: variable-size objects as the Megalon paper proposes (§4, API as in §4/§5) ----
++ * Enabled by object_arena_size > 0 in the config. An object is `size` contiguous bytes in shared memory (SWcc), size
++ * fixed at create; its descriptor and coherence record live in its index entry (one object = one entry = one record).
++ *   ObjectCreate(id, size)          0 | -EINVAL | -EEXIST (id exists) | -ENOMEM (arena full) | -ENOSPC (hwcc: no
++ *                                   static record left) | -ENOTSUP (objects disabled)
++ *   ObjectReadStart(id, &h)         0 | -ENOENT | -ENOTSUP; then read [h.ptr, h.ptr + h.size) IN PLACE
++ *   ObjectReadEnd(&h)               true: the read is valid; false: redo it (start again with ObjectReadStart)
++ *   ObjectWriteStart(id, &h)        0 | -ENOENT | -ENOTSUP; then write [h.ptr, h.ptr + h.size) IN PLACE
++ *   ObjectWriteEnd(&h)              publishes the write (flushes the whole object, unlocks)
++ * Read pattern:  do { ObjectReadStart(id, &h); use(h.ptr, h.size); } while (!ObjectReadEnd(&h));
++ * Contract: Register(tid) first; at most one open section per thread; no Put/Get/Create inside a section; data read
++ * inside a section is only valid after ObjectReadEnd returned true. No delete (bump allocation, no reclamation). */
++struct ObjectHandle {
++    uint8_t* ptr = nullptr;
++    size_t size = 0;
++    uint64_t id = 0;
++    uint64_t token = 0;  // internal: identifies the thread's open section
++};
++
++struct ObjectStats {
++    // shared (every node)
++    uint64_t arena_bytes, used_bytes, created, lost_bytes, static_records_used, lost_records;
++    // this node
++    uint64_t creates, create_exists, create_nomem;
++    uint64_t read_sections, read_retry_notify, read_retry_incoherent;
++    uint64_t write_sections, write_retry, switch_rw;
++    uint64_t flushes, flush_bytes;                // read-side incoherent flushes + write_end flushes
++    uint64_t replay_flushes, replay_flush_bytes;  // NR replay of the other node's object events
++};
++
++int ObjectCreate(uint64_t id, size_t size);
++
++int ObjectLookup(uint64_t id, size_t* size);  // synced index lookup; 0 | -ENOENT | -ENOTSUP
++
++int ObjectReadStart(uint64_t id, ObjectHandle* h);
++
++bool ObjectReadEnd(ObjectHandle* h);
++
++int ObjectWriteStart(uint64_t id, ObjectHandle* h);
++
++void ObjectWriteEnd(ObjectHandle* h);
++
++void GetObjectStats(ObjectStats* s);
++
+ /* De Stijl port diagnostics (MEGALON_DIAG=1): this thread's last Get (path/entry/seq) and the process counters. */
+ std::string DiagLastGet();
+ std::string DiagSummary();
+diff --git a/lib/globals.cc b/lib/globals.cc
+index 00649cc..5f62bce 100644
+--- a/lib/globals.cc
++++ b/lib/globals.cc
+@@ -1,5 +1,6 @@
+ #include "common/diag.h"
+ #include "globals.h"
++#include "object_store.h"
+ 
+ #include <rackobj.h>
+ 
+@@ -112,6 +113,24 @@ void NodeBarrier(uint32_t phase) {
+     port::PortContext::Get().NodeBarrier(phase);
+ }
+ 
++int ObjectCreate(uint64_t id, size_t size) { return lib::page_cache.Objects()->Create(id, size, &lib::thread_local_meta); }
++
++int ObjectLookup(uint64_t id, size_t *size) { return lib::page_cache.Objects()->Lookup(id, size, &lib::thread_local_meta); }
++
++int ObjectReadStart(uint64_t id, ObjectHandle *h) {
++    return lib::page_cache.Objects()->ReadStart(id, h, &lib::thread_local_meta);
++}
++
++bool ObjectReadEnd(ObjectHandle *h) { return lib::page_cache.Objects()->ReadEnd(h, &lib::thread_local_meta); }
++
++int ObjectWriteStart(uint64_t id, ObjectHandle *h) {
++    return lib::page_cache.Objects()->WriteStart(id, h, &lib::thread_local_meta);
++}
++
++void ObjectWriteEnd(ObjectHandle *h) { lib::page_cache.Objects()->WriteEnd(h, &lib::thread_local_meta); }
++
++void GetObjectStats(ObjectStats *s) { lib::page_cache.Objects()->Stats(s); }
++
+ std::string DiagLastGet() {
+     const auto &g = diag::last_get;
+     if (!g.valid) return "no Get recorded (MEGALON_DIAG unset?)";
+diff --git a/lib/object_store.cc b/lib/object_store.cc
+new file mode 100644
+index 0000000..c22b9dc
+--- /dev/null
++++ b/lib/object_store.cc
+@@ -0,0 +1,287 @@
++#include "object_store.h"
++
++#include <cerrno>
++
++#include "absl/log/check.h"
++#include "absl/log/log.h"
++#include "index/nr_hashmap.h"
++
++namespace rackobj::lib {
++
++using common::ReadErrno;
++using common::WriteErrno;
++
++namespace {
++
++constexpr size_t A64(size_t x) { return (x + 63) & ~static_cast<size_t>(63); }
++
++// The thread's open section. One per thread: a section is validated through the thread's single change
++// notification (NR execute_anchor stores one cn index per thread), exactly as one Get/Put is.
++struct Section {
++    enum Kind { kNone, kRead, kWrite } kind = kNone;
++    uint64_t token = 0;
++    uint8_t *ptr = nullptr;
++    size_t size = 0;
++    common::ReadHandle rh;
++    common::WriteHandle wh;
++};
++thread_local Section sec;
++thread_local uint64_t next_token = 0;
++
++}  // namespace
++
++size_t ObjectStore::ScrExtraBytes(const RackOBJConfig &cfg) {
++    return cfg.GetObjectArenaBytes() ? A64(sizeof(port::ObjectShared)) + 64 : 0;
++}
++
++size_t ObjectStore::StaticRecords(const RackOBJConfig &cfg) {
++    return cfg.GetObjectArenaBytes() ? cfg.GetObjectMaxCount() : 0;
++}
++
++ObjectStore::ObjectStore(C3POHandle *c3po, const uint8_t *flush_base, size_t record_base, const RackOBJConfig &cfg,
++                         SwitchRwFn switch_rw)
++    : c3po_(c3po), flush_base_(flush_base), record_base_(record_base), switch_rw_(std::move(switch_rw)) {
++    if (cfg.GetObjectArenaBytes() == 0) {
++        LOG(INFO) << "objects: disabled (object_arena_size 0)";
++        return;
++    }
++#if KEY_SIZE != 24
++    LOG(FATAL) << "objects need KEY_SIZE 24 (BlockId inode namespace " << kObjectInode << ")";
++#endif
++#ifdef FILE_INTERFACE
++    LOG(FATAL) << "objects and FILE_INTERFACE are exclusive (real inode numbers could collide with the object "
++                  "namespace)";
++#endif
++    auto &ctx = port::PortContext::Get();
++    arena_bytes_ = cfg.GetObjectArenaBytes();
++    align_ = cfg.GetObjectAlign();
++#ifndef DYN_WMETA
++    max_records_ = cfg.GetObjectMaxCount();
++#endif
++    shared_ = reinterpret_cast<port::ObjectShared *>(ctx.scr()->AllocateBytes(sizeof(port::ObjectShared), 64));
++    if (!ctx.attach()) {
++        std::construct_at(shared_);
++        shared_->next_off.v.store(0);
++        shared_->next_record.v.store(0);
++        shared_->created.v.store(0);
++        shared_->lost_bytes.v.store(0);
++        shared_->lost_records.v.store(0);
++    }
++    arena_ = ctx.lnr()->AllocateBytes(arena_bytes_, std::max<size_t>(align_, 4096));
++    CHECK(arena_ >= flush_base_ && static_cast<size_t>(arena_ - flush_base_) % kObjGranule == 0)
++        << "object arena must follow the slot data (flush base) at a 64 B multiple";
++    CHECK(static_cast<size_t>(arena_ - flush_base_) + arena_bytes_ < kObjCnFlag) << "object arena too far";
++    LOG(INFO) << "objects: arena " << arena_bytes_ << " B at " << static_cast<void *>(arena_) << " (LNR, flush base +"
++              << (arena_ - flush_base_) << "), align " << align_ << ", "
++#ifdef DYN_WMETA
++              << "records: dynamic pool shared with slots"
++#else
++              << "static records " << record_base_ << " .. " << record_base_ + max_records_ - 1
++#endif
++        ;
++}
++
++common::BlockId ObjectStore::Key(uint64_t id) {
++    return common::BlockId(static_cast<uint64_t>(0), static_cast<ino_t>(kObjectInode), static_cast<off_t>(id));
++}
++
++bool ObjectStore::Decode(const std::optional<common::GCDEntry> &e, uint8_t **ptr, size_t *size) const {
++    if (!e.has_value() || !e->cn_array_[0].cn_idx_.has_value()) return false;
++    size_t cn = *e->cn_array_[0].cn_idx_;
++    CHECK(cn & kObjCnFlag) << "object key with a non-object entry (cn " << cn << ")";
++    CHECK(e->cn_array_[1].cn_idx_.has_value() && *e->cn_array_[1].cn_idx_ > 0) << "object entry without size";
++    *ptr = const_cast<uint8_t *>(flush_base_) + (cn & ~kObjCnFlag) * kObjGranule;
++    *size = *e->cn_array_[1].cn_idx_;
++    return true;
++}
++
++// Where the slot path flushes a slot (cache_flush_data, CopyFromUserBufferCXL), the object path flushes the object.
++void ObjectStore::Flush(uint8_t *ptr, size_t size) {
++#ifndef FULL_COHERENCE
++    c3po_->cache_flush(reinterpret_cast<char *>(ptr), size);  // ptr is 64 B aligned: [ptr, ptr+size) fully covered
++    local_.flushes.fetch_add(1, std::memory_order_relaxed);
++    local_.flush_bytes.fetch_add(size, std::memory_order_relaxed);
++#else
++    (void)ptr;
++    (void)size;
++#endif
++}
++
++int ObjectStore::Create(uint64_t id, size_t size, Tlm *tlm) {
++    if (!enabled()) return -ENOTSUP;
++    if (size == 0 || id > static_cast<uint64_t>(INT64_MAX)) return -EINVAL;
++    CHECK(sec.kind == Section::kNone) << "ObjectCreate inside an open object section";
++    const auto *nr_meta = tlm->nr_meta_per_thread_;
++    CHECK(nr_meta) << "Register() the thread before using objects";
++    const common::BlockId key = Key(id);
++    uint8_t *p;
++    size_t sz;
++    // synced lookup first: no space is reserved for an id that already exists
++    if (Decode(c3po_->Gcd()->Get(key, nr_meta), &p, &sz)) {
++        local_.create_exists.fetch_add(1, std::memory_order_relaxed);
++        return -EEXIST;
++    }
++    std::optional<size_t> wmeta = std::nullopt;  // paper §3.4.2: no coherence record at create (read-shared)
++#ifndef DYN_WMETA
++    // static records (hwcc): every object gets its own record at create, as every slot does at admit
++    {
++        uint64_t r = shared_->next_record.v.load(std::memory_order_relaxed);
++        do {
++            if (r >= max_records_) {
++                local_.create_nomem.fetch_add(1, std::memory_order_relaxed);
++                return -ENOSPC;
++            }
++        } while (!shared_->next_record.v.compare_exchange_weak(r, r + 1, std::memory_order_relaxed));
++        wmeta = record_base_ + r;
++    }
++#endif
++    const size_t rounded = (size + align_ - 1) & ~(align_ - 1);
++    uint64_t cur = shared_->next_off.v.load(std::memory_order_relaxed);
++    do {
++        if (cur + rounded > arena_bytes_ || cur + rounded < cur) {
++            if (wmeta.has_value()) shared_->lost_records.v.fetch_add(1, std::memory_order_relaxed);
++            local_.create_nomem.fetch_add(1, std::memory_order_relaxed);
++            return -ENOMEM;
++        }
++    } while (!shared_->next_off.v.compare_exchange_weak(cur, cur + rounded, std::memory_order_relaxed));
++    const size_t off_units = (static_cast<size_t>(arena_ - flush_base_) + cur) / kObjGranule;
++    if (!c3po_->Gcd()->CreateObject(key, off_units, size, wmeta, nr_meta)) {
++        // another node created the id between the lookup and our log entry: the space (and record) stay unused
++        shared_->lost_bytes.v.fetch_add(rounded, std::memory_order_relaxed);
++        if (wmeta.has_value()) shared_->lost_records.v.fetch_add(1, std::memory_order_relaxed);
++        local_.create_exists.fetch_add(1, std::memory_order_relaxed);
++        return -EEXIST;
++    }
++    shared_->created.v.fetch_add(1, std::memory_order_relaxed);
++    local_.creates.fetch_add(1, std::memory_order_relaxed);
++    return 0;
++}
++
++int ObjectStore::Lookup(uint64_t id, size_t *size, Tlm *tlm) {
++    if (!enabled()) return -ENOTSUP;
++    CHECK(sec.kind == Section::kNone) << "ObjectLookup inside an open object section";
++    uint8_t *p;
++    return Decode(c3po_->Gcd()->Get(Key(id), tlm->nr_meta_per_thread_), &p, size) ? 0 : -ENOENT;
++}
++
++// read_start = the slot Get up to the data copy: GetAnchor (replica synced to the log, notification armed on the
++// object), then read_seq_start (RW: wait for an even counter c, compare with the host-side counter l; on mismatch
++// flush the object and retry, as Get's PAGE_INCOHERENT branch does). RO objects skip the pre-read check.
++int ObjectStore::ReadStart(uint64_t id, ObjectHandle *h, Tlm *tlm) {
++    if (!enabled()) return -ENOTSUP;
++    CHECK(sec.kind == Section::kNone) << "nested object section (one open section per thread)";
++    const auto *nr_meta = tlm->nr_meta_per_thread_;
++    CHECK(nr_meta) << "Register() the thread before using objects";
++    const common::BlockId key = Key(id);
++    uint8_t *ptr;
++    size_t size;
++    for (;;) {
++        std::optional<common::GCDEntry> entry = c3po_->Gcd()->GetAnchor(key, nr_meta);
++        if (!Decode(entry, &ptr, &size)) return -ENOENT;  // objects are created explicitly (no admit)
++        common::init_read_handle(sec.rh, key, entry, tlm->logical_node_id_);
++        sec.rh.from_cxl = true;
++        sec.rh.cn_index = entry->cn_array_[0].cn_idx_;
++        if (c3po_->read_seq_start(sec.rh)) break;
++        CHECK(sec.rh.rh_errno == ReadErrno::PAGE_INCOHERENT) << "read_seq_start: unexpected error";
++        Flush(ptr, size);
++        local_.read_retry_incoherent.fetch_add(1, std::memory_order_relaxed);
++    }
++    sec.kind = Section::kRead;
++    sec.token = ++next_token;
++    sec.ptr = ptr;
++    sec.size = size;
++    *h = ObjectHandle{ptr, size, id, sec.token};
++    local_.read_sections.fetch_add(1, std::memory_order_relaxed);
++    return 0;
++}
++
++// read_end = Get's post-read checks: read_seq_end (tail check + "log updates concerning A" via the notification;
++// RW: counter changed -> flush the object; success records l = c). false = the caller must redo the read.
++bool ObjectStore::ReadEnd(ObjectHandle *h, Tlm *tlm) {
++    CHECK(sec.kind == Section::kRead && h && h->token == sec.token) << "ObjectReadEnd without its ObjectReadStart";
++    sec.kind = Section::kNone;
++    if (c3po_->read_seq_end(sec.rh, tlm->nr_meta_per_thread_)) return true;
++    switch (sec.rh.rh_errno) {
++        case ReadErrno::META_OUTDATE:  // a log event on the object: the replay already flushed it (Get: retry)
++            local_.read_retry_notify.fetch_add(1, std::memory_order_relaxed);
++            return false;
++        case ReadErrno::PAGE_INCOHERENT:  // counter changed during the read (Get: flush, retry)
++            Flush(sec.ptr, sec.size);
++            local_.read_retry_incoherent.fetch_add(1, std::memory_order_relaxed);
++            return false;
++        default:
++            LOG(FATAL) << "read_seq_end: unexpected error";
++    }
++    return false;
++}
++
++// write_start = the slot Put up to the data copy: GetAnchor; RO -> SwitchRW (allocate a record via the log, with
++// critical-path reclaim) and retry; write_seq_start (lock bit, counter odd, tail check + notification check) or retry.
++int ObjectStore::WriteStart(uint64_t id, ObjectHandle *h, Tlm *tlm) {
++    if (!enabled()) return -ENOTSUP;
++    CHECK(sec.kind == Section::kNone) << "nested object section (one open section per thread)";
++    const auto *nr_meta = tlm->nr_meta_per_thread_;
++    CHECK(nr_meta) << "Register() the thread before using objects";
++    const common::BlockId key = Key(id);
++    uint8_t *ptr;
++    size_t size;
++    for (;;) {
++        std::optional<common::GCDEntry> entry = c3po_->Gcd()->GetAnchor(key, nr_meta);
++        if (!Decode(entry, &ptr, &size)) return -ENOENT;
++        common::init_write_handle(sec.wh, key, entry, tlm->logical_node_id_);
++        sec.wh.cn_index = entry->cn_array_[0].cn_idx_;
++        if (c3po_->IsRO(entry)) {
++#ifndef DYN_WMETA
++            LOG(FATAL) << "object " << id << " has no static record (hwcc objects are created RW)";
++#endif
++            std::error_code ec = switch_rw_(sec.wh, tlm);
++            CHECK(ec != std::make_error_code(std::errc::operation_not_permitted)) << "object entry vanished";
++            local_.switch_rw.fetch_add(1, std::memory_order_relaxed);
++            continue;
++        }
++        sec.wh.from_cxl = true;
++        if (c3po_->write_seq_start(sec.wh, nr_meta)) break;
++        local_.write_retry.fetch_add(1, std::memory_order_relaxed);
++    }
++    sec.kind = Section::kWrite;
++    sec.token = ++next_token;
++    sec.ptr = ptr;
++    sec.size = size;
++    *h = ObjectHandle{ptr, size, id, sec.token};
++    local_.write_sections.fetch_add(1, std::memory_order_relaxed);
++    return 0;
++}
++
++// write_end = Put's post-write steps: flush the written data (here the whole object, the API has no range), then
++// write_seq_end (counter even, wrap-around event, l = c, unlock).
++void ObjectStore::WriteEnd(ObjectHandle *h, Tlm *tlm) {
++    CHECK(sec.kind == Section::kWrite && h && h->token == sec.token) << "ObjectWriteEnd without its ObjectWriteStart";
++    Flush(sec.ptr, sec.size);
++    c3po_->write_seq_end(sec.wh, tlm->nr_meta_per_thread_);
++    sec.kind = Section::kNone;
++}
++
++void ObjectStore::Stats(ObjectStats *s) const {
++    *s = ObjectStats{};
++    if (!enabled()) return;
++    s->arena_bytes = arena_bytes_;
++    s->used_bytes = shared_->next_off.v.load(std::memory_order_relaxed);
++    s->created = shared_->created.v.load(std::memory_order_relaxed);
++    s->lost_bytes = shared_->lost_bytes.v.load(std::memory_order_relaxed);
++    s->static_records_used = shared_->next_record.v.load(std::memory_order_relaxed);
++    s->lost_records = shared_->lost_records.v.load(std::memory_order_relaxed);
++    s->creates = local_.creates.load();
++    s->create_exists = local_.create_exists.load();
++    s->create_nomem = local_.create_nomem.load();
++    s->read_sections = local_.read_sections.load();
++    s->read_retry_notify = local_.read_retry_notify.load();
++    s->read_retry_incoherent = local_.read_retry_incoherent.load();
++    s->write_sections = local_.write_sections.load();
++    s->write_retry = local_.write_retry.load();
++    s->switch_rw = local_.switch_rw.load();
++    s->flushes = local_.flushes.load();
++    s->flush_bytes = local_.flush_bytes.load();
++    NrFfi::nr_obj_replay_flush_stats(&s->replay_flushes, &s->replay_flush_bytes);
++}
++
++}  // namespace rackobj::lib
+diff --git a/lib/object_store.h b/lib/object_store.h
+new file mode 100644
+index 0000000..326dfbc
+--- /dev/null
++++ b/lib/object_store.h
+@@ -0,0 +1,96 @@
++// De Stijl port, phase B: variable-size objects as the Megalon paper proposes (§4: "MEGALON can be easily extended
++// to support variable-sized objects at object creation time by keeping the object size as a field in the logically
++// shared metadata"). Design and every difference from the slot path: reports/M2-megalon-objects-paper.md (De Stijl
++// control repo).
++//
++// One object = one index entry = one coherence record, exactly like a slot:
++//   index entry (NR replicated map, key BlockId(0, kObjectInode, id)):
++//     cn_array_[0] = kObjCnFlag | (object offset from the slot data base) / 64   location, also the "cn index"
++//     cn_array_[1] = size in bytes (invalidate_ set: never a local copy)            fixed at create
++//     wmeta_idx_   = coherence record; -1 while read-shared (DYN_WMETA); static record in hwcc
++//   data: [ptr, ptr + size) contiguous in an SWcc (LNR) arena, bump-allocated at create, never freed
++//   SCR: ObjectShared (bump cursor + counters), and in hwcc the static object records
++//
++// The coherence protocol is the slot path's, reused function by function: GetAnchor, C3POHandle::read_seq_start /
++// read_seq_end / write_seq_start / write_seq_end, SharedMemoryObjectHandle::SwitchRW (RO->RW, critical-path
++// reclaim), the wmeta manager (reclaim) and the NR replay (exec_notify). Where the slot path flushes a slot, the object
++// path flushes [ptr, ptr + size). Nothing else is added: no chunking, no per-chunk records, no writer preflush.
++#pragma once
++
++#include <rackobj.h>
++
++#include <atomic>
++#include <cstdint>
++#include <functional>
++#include <system_error>
++
++#include "common/config.h"
++#include "common/thread_local.h"
++#include "core/c3.h"
++#include "core/lru_policy.h"
++#include "shared_memory/cxl_port.h"
++
++namespace rackobj::lib {
++
++// Key namespace (BlockId inode) of objects; Put/Get slot keys use inode 0. Same value in ffi/object_tests.rs.
++constexpr uint64_t kObjectInode = 0x4d4f424a;  // "MOBJ"
++// Location encoding in cn_array_[0]; same values as ffi/types.rs OBJ_CN_FLAG / OBJ_GRANULE.
++constexpr size_t kObjCnFlag = static_cast<size_t>(1) << 62;
++constexpr size_t kObjGranule = 64;
++
++using common::C3POHandle;
++
++class ObjectStore {
++public:
++    using Tlm = ThreadLocalMeta<common::LruPolicy>;
++    // The slot path's RO->RW switch (SharedMemoryObjectHandle::SwitchRW), called with the object's WriteHandle.
++    using SwitchRwFn = std::function<std::error_code(const common::WriteHandle &, Tlm *)>;
++
++    /* SCR bytes for ObjectShared (0 when objects are disabled), for PortContext::ScrFootprint. */
++    static size_t ScrExtraBytes(const RackOBJConfig &cfg);
++
++    /* Static object records to reserve (hwcc; C3POHandle::RecordCount ignores it with DYN_WMETA). */
++    static size_t StaticRecords(const RackOBJConfig &cfg);
++
++    /* Allocates ObjectShared (SCR) and the object arena (LNR) when enabled; must run in the same order on every node,
++     * before PortContext::Finish. flush_base = the NR replica's flush base (slot data base). */
++    ObjectStore(C3POHandle *c3po, const uint8_t *flush_base, size_t record_base, const RackOBJConfig &cfg,
++                SwitchRwFn switch_rw);
++
++    bool enabled() const { return arena_bytes_ != 0; }
++
++    int Create(uint64_t id, size_t size, Tlm *tlm);
++    int Lookup(uint64_t id, size_t *size, Tlm *tlm);
++    int ReadStart(uint64_t id, ObjectHandle *h, Tlm *tlm);
++    bool ReadEnd(ObjectHandle *h, Tlm *tlm);
++    int WriteStart(uint64_t id, ObjectHandle *h, Tlm *tlm);
++    void WriteEnd(ObjectHandle *h, Tlm *tlm);
++
++    void Stats(ObjectStats *s) const;
++
++private:
++    static common::BlockId Key(uint64_t id);
++    bool Decode(const std::optional<common::GCDEntry> &e, uint8_t **ptr, size_t *size) const;
++    void Flush(uint8_t *ptr, size_t size);
++
++    C3POHandle *c3po_;
++    const uint8_t *flush_base_;
++    [[maybe_unused]] size_t record_base_;  // static records only
++    size_t arena_bytes_ = 0;
++    size_t align_ = 64;
++    [[maybe_unused]] size_t max_records_ = 0;  // static records only
++    uint8_t *arena_ = nullptr;
++    port::ObjectShared *shared_ = nullptr;
++    SwitchRwFn switch_rw_;
++
++    // process-local cost counters
++    struct Local {
++        std::atomic<uint64_t> creates{0}, create_exists{0}, create_nomem{0};
++        std::atomic<uint64_t> read_sections{0}, read_retry_notify{0}, read_retry_incoherent{0};
++        std::atomic<uint64_t> write_sections{0}, write_retry{0}, switch_rw{0};
++        std::atomic<uint64_t> flushes{0}, flush_bytes{0};
++    };
++    mutable Local local_;
++};
++
++}  // namespace rackobj::lib
+diff --git a/lib/shm_obj_handle.cc b/lib/shm_obj_handle.cc
+index f5d3bb0..b785e7e 100644
+--- a/lib/shm_obj_handle.cc
++++ b/lib/shm_obj_handle.cc
+@@ -5,6 +5,7 @@
+ #include "manager/evict_manager.h"
+ #include "manager/flush_manager.h"
+ #include "manager/replicate_manager.h"
++#include "object_store.h"
+ #include "original_syscalls.h"
+ #include "shared_memory/cxl_port.h"
+ #include "common/diag.h"
+@@ -37,8 +38,11 @@ SharedMemoryObjectHandle<Policy>::SharedMemoryObjectHandle(const int node, const
+     auto &ctx = port::PortContext::Get();
+     {
+         NrFfi::NrLogLayout lay = NrFfi::nr_log_layout(cfg.GetNrLogBytes());
+-        size_t wmeta_slots = C3POHandle::WmetaSlots(shared_num_slots, cfg.GetLogicalSCRSize());
+-        size_t footprint = port::PortContext::ScrFootprint(shared_num_slots, wmeta_slots, lay.header_size);
++        // phase B objects: static records (hwcc) and the ObjectShared block; both 0 when objects are disabled
++        size_t wmeta_slots = C3POHandle::RecordCount(shared_num_slots, cfg.GetLogicalSCRSize(),
++                                                     ObjectStore::StaticRecords(cfg));
++        size_t footprint = port::PortContext::ScrFootprint(shared_num_slots, wmeta_slots, lay.header_size,
++                                                           ObjectStore::ScrExtraBytes(cfg));
+         LOG(INFO) << "slots " << shared_num_slots << ", wmeta records " << wmeta_slots << ", NR log "
+                   << lay.entries << " x " << lay.entry_size << " B";
+         ctx.Init(cfg, shared_num_slots, footprint);
+@@ -56,8 +60,15 @@ SharedMemoryObjectHandle<Policy>::SharedMemoryObjectHandle(const int node, const
+     cache_ = cache_shrd_ptr_.get();
+     c3po_ = C3POHandle::CreateOrMap(shared_num_slots, (void *)0x6f0000000000, NUMA_MEM, cache_->GetPageBaseAddr(),
+                                     sc_shm_region_, cfg.GetLogicalSCRSize());
+-    c3po_->InitSharedMetadata(shared_num_slots, sc_shm_region_, &cache_shrd_ptr_->scr_bitmap_);
++    c3po_->InitSharedMetadata(shared_num_slots, sc_shm_region_, &cache_shrd_ptr_->scr_bitmap_,
++                              ObjectStore::StaticRecords(cfg));
+     LOG(INFO) << "init step: shared metadata done";
++    // phase B: object arena (LNR) + allocator block (SCR) only when enabled; RO->RW switch is the slot path's SwitchRW
++    static_assert(std::is_same_v<Policy, common::LruPolicy>, "ObjectStore binds SwitchRW for LruPolicy");
++    objects_ = std::make_unique<ObjectStore>(
++        c3po_.get(), cache_->GetPageBaseAddr(),
++        C3POHandle::ObjectRecordBase(shared_num_slots, cfg.GetLogicalSCRSize()), cfg,
++        [this](const common::WriteHandle &wh, ObjectStore::Tlm *tlm) { return SwitchRW(wh, tlm); });
+     c3po_->SetPartitionRatio(cfg.GetKeySpace(), cfg.GetPartitionRatio());
+     LOG(INFO) << "init step: partition ratio set";
+ 
+@@ -111,6 +122,19 @@ SharedMemoryObjectHandle<Policy>::~SharedMemoryObjectHandle() {
+               << "%, reclaim count: " << reclaim_count << ", allocate count: " << allocate_count;
+ #endif
+ 
++    if (objects_ && objects_->enabled()) {
++        ObjectStats os;
++        objects_->Stats(&os);
++        LOG(INFO) << "objects: arena used " << os.used_bytes << "/" << os.arena_bytes << " B, created " << os.created
++                  << " (lost " << os.lost_bytes << " B, " << os.lost_records << " records), static records used "
++                  << os.static_records_used << "; this node: creates " << os.creates << " (exists "
++                  << os.create_exists << ", nomem " << os.create_nomem << "), read sections " << os.read_sections
++                  << " (retry notify " << os.read_retry_notify << ", incoherent " << os.read_retry_incoherent
++                  << "), write sections " << os.write_sections << " (retry " << os.write_retry << ", RW switches "
++                  << os.switch_rw << "), flushes " << os.flushes << " (" << os.flush_bytes << " B), replay flushes "
++                  << os.replay_flushes << " (" << os.replay_flush_bytes << " B)";
++    }
++
+     auto cachep = cache_shrd_ptr_.get();
+     size_t nr_active = cachep->GetActivePageCount();
+     size_t nr_total = cachep->page_count_;
+diff --git a/lib/shm_obj_handle.h b/lib/shm_obj_handle.h
+index f92bc07..b988d63 100644
+--- a/lib/shm_obj_handle.h
++++ b/lib/shm_obj_handle.h
+@@ -31,6 +31,8 @@ namespace rackobj::lib {
+ 
+ using common::C3POHandle;
+ 
++class ObjectStore;  // phase B: paper §4 variable-size objects (object_store.h)
++
+ template <typename Policy>
+ class SharedMemoryObjectHandle {
+     using FetchBlockResult = expected<size_t, PosixError>;
+@@ -90,6 +92,9 @@ public:
+ 
+     inline void cache_flush_metadata(const common::ReadHandle& rh);
+ 
++    /* Phase B: variable-size objects (paper §4); always constructed, disabled when object_arena_size == 0. */
++    ObjectStore* Objects() { return objects_.get(); }
++
+ private:
+     std::shared_ptr<common::AllocatableLocalMemoryRegion> sc_shm_region_;  // Small Coherent Region
+     std::shared_ptr<common::AllocatableLocalMemoryRegion> nc_shm_region_;  // Non-coherent Region
+@@ -102,6 +107,8 @@ private:
+ 
+     std::unique_ptr<C3POHandle> c3po_;
+ 
++    std::unique_ptr<ObjectStore> objects_;
++
+     int shared_cache_node_;
+ 
+     std::random_device rdev_;
+diff --git a/src/common/config.cc b/src/common/config.cc
+index a193fa3..ff8fa60 100644
+--- a/src/common/config.cc
++++ b/src/common/config.cc
+@@ -185,11 +185,22 @@ RackOBJConfig::RackOBJConfig() {
+         if ((run_id_ & 0xffffffffull) == 0) LOG(FATAL) << "run_id must have non-zero low 32 bits";
+     }
+ 
++    // Phase B: variable-size objects (paper §4). Contiguous bytes in an SWcc arena carved after the slot data and the
++    // NR log body; size fixed at create; no reclamation. object_max_count only matters without DYN_WMETA (hwcc), where
++    // every object gets a static coherence record as every slot does.
++    object_arena_bytes_ = config["object_arena_size"] ? convert_mem_size(config["object_arena_size"].as<string>()) : 0;
++    object_align_ = config["object_align"] ? config["object_align"].as<size_t>() : 64;
++    CHECK(object_align_ == 64 || object_align_ == 4096) << "object_align must be 64 or 4096 (got " << object_align_ << ")";
++    CHECK(object_arena_bytes_ % object_align_ == 0) << "object_arena_size must be a multiple of object_align";
++    object_max_count_ = config["object_max_count"] ? config["object_max_count"].as<size_t>() : 65536;
++    CHECK(object_arena_bytes_ == 0 || object_max_count_ > 0) << "object_max_count must be > 0";
++
+     LOG(INFO) << "port config: run_id=" << std::hex << run_id_ << std::dec << " node_id=" << node_id_ << " region_config="
+               << (region_config_.empty() ? std::string("$CXL_REGION_CONFIG") : region_config_)
+               << " reinit=" << reinit_ << " attach_mprotect=" << attach_mprotect_
+               << " stuck_timeout_ms=" << stuck_timeout_ms_ << " log_sync_interval_us=" << log_sync_interval_us_
+-              << " nr_log_bytes=" << nr_log_bytes_;
++              << " nr_log_bytes=" << nr_log_bytes_ << " object_arena_bytes=" << object_arena_bytes_
++              << " object_align=" << object_align_ << " object_max_count=" << object_max_count_;
+ }
+ 
+ bool RackOBJConfig::IsPathExcluded(const std::filesystem::path &path) const {
+diff --git a/src/common/config.h b/src/common/config.h
+index 561d072..7901b82 100644
+--- a/src/common/config.h
++++ b/src/common/config.h
+@@ -65,6 +65,14 @@ public:
+ 
+     uint64_t RunId() const { return run_id_; }  // same non-zero id on every node of one run (MEGALON_RUN_ID)
+ 
++    /* De Stijl port, phase B: variable-size objects as the paper proposes (§4). 0 = disabled (default; the shared
++     * layout is then the one without objects). */
++    size_t GetObjectArenaBytes() const { return object_arena_bytes_; }  // SWcc bytes for object data (bump, no free)
++
++    size_t GetObjectAlign() const { return object_align_; }  // 64 or 4096: start alignment, size rounding
++
++    size_t GetObjectMaxCount() const { return object_max_count_; }  // hwcc (static records): records reserved
++
+ private:
+     uint64_t shm_numa_node_;
+     uint64_t exec_numa_node_;
+@@ -93,6 +101,9 @@ private:
+     uint64_t barrier_timeout_s_;
+     size_t nr_log_bytes_;
+     uint64_t run_id_;
++    size_t object_arena_bytes_;
++    size_t object_align_;
++    size_t object_max_count_;
+ 
+     std::filesystem::path mount_directory_;
+     std::vector<std::filesystem::path> excluded_files_;
+diff --git a/src/core/c3.cc b/src/core/c3.cc
+index b4ded21..796b7b9 100644
+--- a/src/core/c3.cc
++++ b/src/core/c3.cc
+@@ -62,14 +62,25 @@ size_t C3POHandle::WmetaSlots(size_t num_slots, size_t logical_scr_size) {
+     return std::min(wmeta_slots, max_wmeta_slots);
+ }
+ 
++size_t C3POHandle::RecordCount(size_t num_slots, size_t logical_scr_size, size_t object_records) {
++#ifdef DYN_WMETA
++    (void)object_records;
++    return WmetaSlots(num_slots, logical_scr_size);
++#else
++    return WmetaSlots(num_slots, logical_scr_size) + object_records;
++#endif
++}
++
+ void C3POHandle::InitSharedMetadata(size_t num_slots,
+                                     const std::shared_ptr<common::AllocatableLocalMemoryRegion> &sc_shm_region,
+-                                    SharedBitmap *bitmap) {
++                                    SharedBitmap *bitmap, size_t object_records) {
+     size_t perobjmetasize = CEIL_DIV(SEQLOCK_BITS, 8);  // sizeof(seqlock_t);
+-    size_t wmeta_slots = WmetaSlots(num_slots, c3po_->logical_scr_size_);
++    size_t wmeta_slots = RecordCount(num_slots, c3po_->logical_scr_size_, object_records);
+ #ifndef DYN_WMETA
+     // static records: wmeta index == cn index, so every slot needs a record
+-    CHECK(wmeta_slots >= num_slots) << "without DYN_WMETA every slot needs a WriteMetadata record: " << wmeta_slots
++    // (phase B object records come after the slot records and do not count here)
++    CHECK(WmetaSlots(num_slots, c3po_->logical_scr_size_) >= num_slots)
++        << "without DYN_WMETA every slot needs a WriteMetadata record: " << WmetaSlots(num_slots, c3po_->logical_scr_size_)
+                                     << " records < " << num_slots << " slots (raise logical_scr_size)";
+ #endif
+     auto &ctx = port::PortContext::Get();
+diff --git a/src/core/c3.h b/src/core/c3.h
+index 4233ee6..15f7507 100644
+--- a/src/core/c3.h
++++ b/src/core/c3.h
+@@ -109,9 +109,10 @@ public:
+     explicit C3POHandle(C3PO *c3po, int cxl_nid) noexcept;
+     ~C3POHandle() = default;
+ 
++    /* object_records: phase B static object records (hwcc only, see RecordCount); 0 = unchanged layout */
+     void InitSharedMetadata(size_t num_slots,
+                             const std::shared_ptr<common::AllocatableLocalMemoryRegion> &sc_shm_region,
+-                            SharedBitmap *bitmap);
++                            SharedBitmap *bitmap, size_t object_records = 0);
+ 
+     void SetPartitionRatio(size_t key_space, double partition_ratio) {
+         key_space_ = key_space;
+@@ -123,6 +124,14 @@ public:
+     /* Number of WriteMetadata records: min(logical_scr_size / 4, num_slots * 100 / WMETA_WATERMARK). */
+     static size_t WmetaSlots(size_t num_slots, size_t logical_scr_size);
+ 
++    /* Phase B (paper §4 objects). Total records in the WriteMetadata array. DYN_WMETA: objects share the dynamic
++     * pool with slots (unchanged count). Static records (hwcc): every object gets its own record, as every slot
++     * does, at ObjectRecordBase .. ObjectRecordBase + object_records - 1 (after the slot records). */
++    static size_t RecordCount(size_t num_slots, size_t logical_scr_size, size_t object_records);
++    static size_t ObjectRecordBase(size_t num_slots, size_t logical_scr_size) {
++        return WmetaSlots(num_slots, logical_scr_size);
++    }
++
+     void CreateWmetaMgr(int nid, const std::shared_ptr<common::AllocatableLocalMemoryRegion> &local_region);
+ 
+     void SetSharedPageCache(const std::shared_ptr<common::BasePageCache> &pcache_p);
+diff --git a/src/index/gcd_nr.cc b/src/index/gcd_nr.cc
+index 7cf5cbd..b27de8a 100644
+--- a/src/index/gcd_nr.cc
++++ b/src/index/gcd_nr.cc
+@@ -281,4 +281,10 @@ void GlobalCacheDirectoryHandleNr::SeqCountWrapAround(const BlockId& key, const
+     return NrFfi::DummyEvent(nr_meta, key);
+ }
+ 
++bool GlobalCacheDirectoryHandleNr::CreateObject(const BlockId& key, size_t off_units, size_t size,
++                                                std::optional<size_t> wmeta_idx, const NrFfi::NrMeta* nr_meta) {
++    return NrFfi::ObjectCreate(nr_meta, key, static_cast<ssize_t>(off_units), static_cast<ssize_t>(size),
++                               wmeta_idx.has_value() ? static_cast<ssize_t>(*wmeta_idx) : -1) == 0;
++}
++
+ }  // namespace rackobj::common
+diff --git a/src/index/gcd_nr.h b/src/index/gcd_nr.h
+index 674479d..d76c877 100644
+--- a/src/index/gcd_nr.h
++++ b/src/index/gcd_nr.h
+@@ -99,6 +99,11 @@ public:
+ 
+     void SeqCountWrapAround(const BlockId& key, const NrFfi::NrMeta* nr_meta);
+ 
++    /* Phase B (paper §4 objects): publish an object's entry (descriptor + record) through the log if the key has
++     * none. true: created; false: the key already has an entry. See lib/object_store.h. */
++    bool CreateObject(const BlockId& key, size_t off_units, size_t size, std::optional<size_t> wmeta_idx,
++                      const NrFfi::NrMeta* nr_meta);
++
+     bool UnRegisterThread(const NrFfi::NrMeta* nr_meta, bool lock = true);
+ 
+     void ReadLock() { pthread_rwlock_rdlock(&gcd_->lock_); }
+diff --git a/src/index/nr_hashmap.h b/src/index/nr_hashmap.h
+index 285dd7b..aec6712 100644
+--- a/src/index/nr_hashmap.h
++++ b/src/index/nr_hashmap.h
+@@ -130,5 +130,13 @@ bool CheckNotificationResetSynced(const NrMeta* metadata);
+  */
+ void DummyEvent(const NrMeta* metadata, rackobj::common::BlockId key);
+ 
++/* De Stijl port, phase B (paper §4 variable-size objects; ffi_nr_hashmap.rs, types.rs obj_entry).
++ * Publish the object's entry if the key has none: location off_units (byte offset from the replica's flush base / 64),
++ * size in bytes, wmeta_idx -1 (read-shared) or a static record. 0: created; 1: the key already has an entry. */
++size_t ObjectCreate(const NrMeta* metadata, rackobj::common::BlockId key, ssize_t off_units, ssize_t size,
++                    ssize_t wmeta_idx);
++/* replay flushes of objects issued by the other node, in this process */
++void nr_obj_replay_flush_stats(uint64_t* count, uint64_t* bytes);
++
+ }  // extern "C"
+ }  // namespace NrFfi
+diff --git a/src/shared_memory/cxl_port.cc b/src/shared_memory/cxl_port.cc
+index b599cbc..b10aa26 100644
+--- a/src/shared_memory/cxl_port.cc
++++ b/src/shared_memory/cxl_port.cc
+@@ -77,10 +77,10 @@ PortContext &PortContext::Get() {
+     return ctx;
+ }
+ 
+-size_t PortContext::ScrFootprint(size_t num_slots, size_t wmeta_slots, size_t log_header_size) {
++size_t PortContext::ScrFootprint(size_t num_slots, size_t wmeta_slots, size_t log_header_size, size_t extra_bytes) {
+     size_t bitmap = A64(((num_slots + 63) / 64) * sizeof(uint64_t));
+     return kCtrlSize + A64(sizeof(SharedCounters)) + 4 * bitmap + 128 + A64(log_header_size) + 64 +
+-           wmeta_slots * sizeof(common::WriteMetadata);
++           wmeta_slots * sizeof(common::WriteMetadata) + extra_bytes;
+ }
+ 
+ uint64_t PortContext::ComputeLayoutHash(const RackOBJConfig &cfg, size_t num_slots) const {
+@@ -96,6 +96,10 @@ uint64_t PortContext::ComputeLayoutHash(const RackOBJConfig &cfg, size_t num_slo
+       << " sz(SharedCounters)=" << sizeof(SharedCounters) << " sz(ControlBlock)=" << sizeof(ControlBlock)
+       << " sz(GCDEntry)=" << sizeof(NrFfi::GCDEntry) << " nrlog_hdr=" << lay.header_size
+       << " nrlog_entry=" << lay.entry_size << " nrlog_entries=" << lay.entries;
++    // phase B objects: only when enabled, so the hash string of a layout without objects is unchanged
++    if (cfg.GetObjectArenaBytes())
++        o << " obj_arena=" << cfg.GetObjectArenaBytes() << " obj_align=" << cfg.GetObjectAlign()
++          << " obj_max=" << cfg.GetObjectMaxCount() << " sz(ObjectShared)=" << sizeof(ObjectShared);
+     LOG(INFO) << "layout: " << o.str();
+     return Fnv1a(o.str());
+ }
+diff --git a/src/shared_memory/cxl_port.h b/src/shared_memory/cxl_port.h
+index 1c68d3b..ad4b874 100644
+--- a/src/shared_memory/cxl_port.h
++++ b/src/shared_memory/cxl_port.h
+@@ -52,6 +52,16 @@ struct SharedCounters {
+     PaddedCounter bitmap_dirty;     // SharedBitmap::dirty_count_ (stats only)
+ };
+ 
++/* Phase B (paper §4 variable-size objects): allocator state shared by every node. Allocated in SCR only when
++ * objects are enabled (object_arena_size > 0), so a layout without objects is unchanged. */
++struct ObjectShared {
++    PaddedCounter next_off;       // CAS bump allocator over the object arena, bytes; never decreases (no free)
++    PaddedCounter next_record;    // static records only (no DYN_WMETA): next unused object record
++    PaddedCounter created;        // creates that published their entry
++    PaddedCounter lost_bytes;     // bytes reserved by a create that then lost the id to another node's create
++    PaddedCounter lost_records;   // static records reserved by such a create (hwcc)
++};
++
+ struct ControlBlock {
+     uint64_t magic;
+     uint32_t version;
+@@ -113,7 +123,7 @@ public:
+ 
+     /* Upper bound of the SCR bytes used by the shared structures, used to refuse
+      * runs that would not fit into hwcc_size [V9]. */
+-    static size_t ScrFootprint(size_t num_slots, size_t wmeta_slots, size_t log_header_size);
++    static size_t ScrFootprint(size_t num_slots, size_t wmeta_slots, size_t log_header_size, size_t extra_bytes = 0);
+ 
+ private:
+     PortContext() = default;
+-- 
+2.34.1
+

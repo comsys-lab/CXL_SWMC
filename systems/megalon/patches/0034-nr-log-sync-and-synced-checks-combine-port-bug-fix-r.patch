@@ -1,0 +1,200 @@
+From ea025ef405d84bcd9405865a3abde34274770322 Mon Sep 17 00:00:00 2001
+From: Sungsu Ahn <sungsu_ahn@korea.ac.kr>
+Date: Fri, 16 Oct 2026 04:24:52 +0900
+Subject: [PATCH 34/51] nr: log-sync and synced checks combine (port bug fix,
+ restores artifact behaviour)
+
+The port's background log-sync thread (log_sync_local, d675e4a) and the
+tail check of CheckNotificationResetSynced (NodeReplicated::sync, 5acf086)
+brought the replica up to the log tail with Replica::try_sync -> exec: they
+held the combiner lock but only replayed, never collecting the ops other
+threads had enqueued. A thread whose try_combine found the lock held that
+way then spun in get_response until its 2^29-spin retry (~0.43 s on the
+Host): 0.1-0.2% of creates and RO->RW switches took 0.43 s and were >99%
+of their time (reports/LMDB-port.md 10.2).
+
+In the artifact (3be2fa7) every normal-path combiner-lock holder combines:
+reads use sync_for_read (try_combine), its background sync was
+log_sync_numa (sync_for_read), the ffi never called sync; exec-only
+try_sync is used only in the log-GC stuck-replica recovery.
+
+- log_sync_local uses Replica::sync_for_read (the artifact's background
+  sync) instead of try_sync.
+- NodeReplicated::sync uses the new Replica::sync_combine (try_combine
+  until the replica reaches the completed tail) and resolves NoLogSpace /
+  GcFailed as NodeReplicated::execute does.
+- Unchanged: resolve_stuck (upstream recovery), get_response's 2^29
+  constant, records, seqlocks, flushes, invalidation, exec_notify; the
+  replica still reaches ctail before the notification is tested (5acf086)
+  and the sync thread still advances the local ltail (d675e4a).
+- port test op_enqueued_during_sync_round_is_served: max execute_mut
+  8.7 s on the old code (FAILED), 10-15 us with the fix.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ third-party/nr_rust/ffi/port_tests.rs         | 52 ++++++++++++++++++-
+ .../nr_rust/node-replication/src/nr/mod.rs    | 34 ++++++++++--
+ .../node-replication/src/nr/replica.rs        | 24 +++++++++
+ 3 files changed, 104 insertions(+), 6 deletions(-)
+
+diff --git a/third-party/nr_rust/ffi/port_tests.rs b/third-party/nr_rust/ffi/port_tests.rs
+index 8bb50fa..60c382f 100644
+--- a/third-party/nr_rust/ffi/port_tests.rs
++++ b/third-party/nr_rust/ffi/port_tests.rs
+@@ -167,7 +167,7 @@ fn ops_cross_nodes_through_shared_log() {
+ 
+ #[test]
+ fn sync_replay_clears_change_notification() {
+-    // [V4] A replay by the log-sync path (try_sync -> exec) clears matching
++    // [V4] A replay by the log-sync path (log_sync_local) clears matching
+     // change notifications exactly like combine does.
+     let m = shared_mem(min_entries());
+     let n0 = node(&m, 0, true, 2000);
+@@ -319,3 +319,53 @@ fn admit_on_existing_slot_never_demotes_and_reports_installed_record() {
+     assert_eq!((wm(&n0, t0), wm(&n1, t1)), (9, 9));
+     assert_eq!(n0.execute(Access::Get(key(4)), t0).0.unwrap().value.cn_array_[0].cn_idx_, 14, "slot unchanged");
+ }
++
++#[test]
++fn op_enqueued_during_sync_round_is_served() {
++    // Port bug fix (restores artifact behaviour): the log-sync thread
++    // (log_sync_local) and the synced notification check (sync) hold the
++    // combiner lock while bringing the replica up to the tail. They must
++    // combine, i.e. also append and answer the ops other threads enqueued
++    // meanwhile; an exec-only round left such an op spinning in get_response
++    // until its 2^29-spin retry (~0.4 s on the Host). Node 1 keeps appending so
++    // node 0's sync rounds really replay (hold the lock); node 0's writer must
++    // never wait anywhere near that long.
++    let m = shared_mem(min_entries());
++    let n0 = node(&m, 0, true, 10_000);
++    let n1 = node(&m, 1, false, 10_000);
++    let stop = Arc::new(AtomicBool::new(false));
++    let tw = n0.register(0).unwrap();
++    let ts = n0.register(0).unwrap();
++    let t1 = n1.register(1).unwrap();
++    let (n0s, stops) = (Arc::clone(&n0), Arc::clone(&stop));
++    let syncer = std::thread::spawn(move || {
++        while !stops.load(Ordering::Acquire) {
++            n0s.sync(ts); // CheckNotificationResetSynced's tail check
++            n0s.log_sync_local(); // background log-sync round
++        }
++    });
++    let (n1a, stopa) = (Arc::clone(&n1), Arc::clone(&stop));
++    let appender = std::thread::spawn(move || {
++        let mut k = 0u64;
++        while !stopa.load(Ordering::Acquire) {
++            n1a.execute_mut(Modify::PutArrayWmeta(key(1000 + k % 64), (k as usize % SLOTS) as isize, 0, -1), t1);
++            k += 1;
++        }
++    });
++    let mut max_ns = 0u64;
++    let t_start = std::time::Instant::now();
++    for k in 0..5000u64 {
++        let t = std::time::Instant::now();
++        n0.execute_mut(Modify::PutArrayWmeta(key(k % 64), (k as usize % SLOTS) as isize, 0, -1), tw);
++        let d = t.elapsed().as_nanos() as u64;
++        max_ns = max_ns.max(d);
++        if max_ns >= 100_000_000 || t_start.elapsed().as_secs() >= 20 {
++            break;
++        }
++    }
++    stop.store(true, Ordering::Release);
++    syncer.join().unwrap();
++    appender.join().unwrap();
++    println!("op_enqueued_during_sync_round_is_served: max execute_mut {} us", max_ns / 1000);
++    assert!(max_ns < 100_000_000, "an op waited {} ms behind a sync round that did not combine", max_ns / 1_000_000);
++}
+diff --git a/third-party/nr_rust/node-replication/src/nr/mod.rs b/third-party/nr_rust/node-replication/src/nr/mod.rs
+index b1b20b6..e5b8838 100644
+--- a/third-party/nr_rust/node-replication/src/nr/mod.rs
++++ b/third-party/nr_rust/node-replication/src/nr/mod.rs
+@@ -1269,9 +1269,30 @@ where
+         resp.set(async move { self.execute(op, tkn) });
+     }
+ 
++    /// Brings `tkn`'s replica up to the completed log tail (the tail check of
++    /// CheckNotificationResetSynced). De Stijl port bug fix (restores artifact
++    /// behaviour): syncs by flat combining (`Replica::sync_combine`), so a
++    /// thread holding the combiner lock here also serves the operations other
++    /// threads enqueued meanwhile; the former `Replica::sync` (exec only) left
++    /// them spinning in `get_response`. Errors are resolved as in
++    /// [`NodeReplicated::execute`].
+     #[doc(hidden)]
+     pub fn sync(&self, tkn: ThreadToken) {
+-        self.local(tkn.rid).sync(self.log)
++        let mut cl: Option<CombinerLock<'_, D>> = None;
++        loop {
++            match self.local(tkn.rid).sync_combine(self.log, cl.take()) {
++                Ok(()) => return,
++                Err(ReplicaError::NoLogSpace(stuck_ridx, cl_acq)) => {
++                    assert_ne!(stuck_ridx, tkn.rid);
++                    self.resolve_stuck(stuck_ridx, false);
++                    cl = Some(cl_acq);
++                }
++                Err(ReplicaError::GcFailed(stuck_ridx)) => {
++                    assert_ne!(stuck_ridx, tkn.rid);
++                    self.resolve_stuck(stuck_ridx, false);
++                }
++            }
++        }
+     }
+ 
+     /// Syncs every local replica for reads; replicas of other processes are
+@@ -1282,12 +1303,15 @@ where
+         }
+     }
+ 
+-    /// One non-blocking replay round on every local replica (background
+-    /// log-sync thread): uses `Replica::try_sync`, which replays through
+-    /// `exec_notify` [V4].
++    /// Background log-sync thread round on every local replica. De Stijl port
++    /// bug fix (restores artifact behaviour): uses `Replica::sync_for_read`
++    /// (flat combining, the artifact's background-sync path `log_sync_numa`)
++    /// instead of the exec-only `Replica::try_sync`, so a sync round also serves
++    /// operations enqueued while it holds the combiner lock. Replay still goes
++    /// through `exec_notify` [V4] and advances this replica's ltail.
+     pub fn log_sync_local(&self) {
+         for r in self.replicas.iter().flatten() {
+-            r.try_sync(self.log);
++            r.sync_for_read(self.log);
+         }
+     }
+ }
+diff --git a/third-party/nr_rust/node-replication/src/nr/replica.rs b/third-party/nr_rust/node-replication/src/nr/replica.rs
+index f1cb153..b846aa0 100644
+--- a/third-party/nr_rust/node-replication/src/nr/replica.rs
++++ b/third-party/nr_rust/node-replication/src/nr/replica.rs
+@@ -1064,6 +1064,30 @@ where
+         }
+     }
+ 
++    /// De Stijl port bug fix (restores artifact behaviour): brings the replica up
++    /// to the completed tail like [`Replica::sync`], but every round is a flat
++    /// combine (`try_combine`, as the artifact's `sync_for_read`), so operations
++    /// other threads enqueued while this thread holds the combiner lock are
++    /// appended and answered. `exec`-only rounds left them waiting in
++    /// `get_response` for up to 2^29 spins. Errors carry the combiner lock
++    /// (NoLogSpace) back to the caller exactly as `execute` does; `cl` resumes
++    /// with it.
++    pub(crate) fn sync_combine<'r>(
++        &'r self,
++        slog: &Log<<D as Dispatch>::WriteOperation>,
++        cl: Option<CombinerLock<'r, D>>,
++    ) -> Result<(), ReplicaError<'r, D>> {
++        let ctail = slog.get_ctail();
++        if let Some(combiner_lock) = cl {
++            self.combine(slog, combiner_lock)?;
++        }
++        while !slog.is_replica_synced_for_reads(&self.log_tkn, ctail) {
++            self.try_combine(slog)?;
++            spin_loop();
++        }
++        Ok(())
++    }
++
+     /// Similar to [`Replica::sync`] but doesn't repeatedly try to acquire the
+     /// combiner lock: if another thread already holds the lock and works
+     /// towards advancing the replica it will just return.
+-- 
+2.34.1
+

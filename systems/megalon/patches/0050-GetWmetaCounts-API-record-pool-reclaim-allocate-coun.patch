@@ -1,0 +1,130 @@
+From 4b524ec69e9f9353a3a60131b49d59fb033c66cc Mon Sep 17 00:00:00 2001
+From: Sungsu Ahn <sungsu_ahn@korea.ac.kr>
+Date: Sat, 7 Nov 2026 00:45:29 +0900
+Subject: [PATCH 50/51] GetWmetaCounts API: record-pool reclaim/allocate
+ counters readable at any time (build 80)
+
+rackobj::GetWmetaCounts(WmetaCounts*) returns the values the teardown line
+"seqlock alloc ratio ... reclaim count: R, allocate count: A" prints
+(SCR shared counters, one cluster-wide value seen by every node), plus
+records in use / pool size and a dyn_wmeta flag. Plain atomic loads; no
+existing struct, counter or code path changes. object-test prints a
+WMETA-COUNTS line per node and checks it (experiment
+megalon-page-granularity, verifier MED-1).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ benchmarks/object_test.cc | 11 +++++++++++
+ include/rackobj.h         | 18 ++++++++++++++++++
+ lib/globals.cc            |  2 ++
+ lib/shm_obj_handle.cc     | 15 +++++++++++++++
+ lib/shm_obj_handle.h      |  3 +++
+ 5 files changed, 49 insertions(+)
+
+diff --git a/benchmarks/object_test.cc b/benchmarks/object_test.cc
+index f175a6c..0c8b6a0 100644
+--- a/benchmarks/object_test.cc
++++ b/benchmarks/object_test.cc
+@@ -1135,6 +1135,17 @@ int main(int argc, char **argv) {
+               << ", incoherent " << st.read_retry_incoherent << "), write sections " << st.write_sections
+               << " (retry " << st.write_retry << ", RW switches " << st.switch_rw << "), flushes " << st.flushes << " ("
+               << st.flush_bytes << " B), replay flushes " << st.replay_flushes << " (" << st.replay_flush_bytes << " B)";
++    {
++        // build 80: record-pool counters (rackobj.h WmetaCounts; cluster-wide, the teardown line's values). Every
++        // phase above wrote objects, so with DYN_WMETA at least one record was allocated.
++        rackobj::WmetaCounts wc{};
++        rackobj::GetWmetaCounts(&wc);
++        LOG(INFO) << "WMETA-COUNTS node " << node_id << ": dyn_wmeta " << wc.dyn_wmeta << ", reclaim count "
++                  << wc.reclaim_count << ", allocate count " << wc.allocate_count << ", records in use "
++                  << wc.records_in_use << "/" << wc.record_slots;
++        EXPECT(wc.record_slots > 0 && wc.records_in_use <= wc.record_slots);
++        EXPECT(!wc.dyn_wmeta || wc.allocate_count > 0);
++    }
+     Barrier("end");
+     rackobj::UnRegister();
+     const bool pass = failures.load() == 0;
+diff --git a/include/rackobj.h b/include/rackobj.h
+index 8c0a63f..1185caa 100644
+--- a/include/rackobj.h
++++ b/include/rackobj.h
+@@ -199,6 +199,24 @@ struct ObjectLookupHist {
+ };
+ void GetObjectLookupHist(ObjectLookupHist* s);
+ 
++/* Build 80 (megalon-page): the coherence-record (WriteMetadata) pool counters that the teardown line "seqlock alloc
++ * ratio: (...) = ..%, reclaim count: R, allocate count: A" prints (shm_obj_handle.cc destructor, DYN_WMETA), readable
++ * at any time after init. The counters live in the SCR counter block shared by every node (port::SharedCounters), so
++ * every node reads the SAME cluster-wide values (do not sum them over nodes). Cumulative since the SCR was initialised
++ * (or since the last ClearMovementCounter()). Plain atomic loads; no lock, no coherence traffic beyond the loads.
++ *   reclaim_count     records taken back from an object/page by the record reclaimer (BaseMetadata::reclaim_count_)
++ *   allocate_count    record allocations (BaseMetadata::allocate_count_)
++ *   records_in_use    records currently allocated (allocated_slot_num_, "write_page_count" of the teardown line)
++ *   record_slots      size of the record pool (wmeta_slot_len_)
++ *   dyn_wmeta         1 if built with DYN_WMETA (records allocated on first write and reclaimed), 0 = static records
++ *                     (the teardown line is not printed then; the counters stay 0)
++ * All zero before init (no SCR attached). */
++struct WmetaCounts {
++    uint64_t reclaim_count, allocate_count, records_in_use, record_slots, dyn_wmeta;
++    uint64_t reserved[3];
++};
++void GetWmetaCounts(WmetaCounts* s);
++
+ // build 71, overhead measurement only (object-test OBJECT_TEST_OVERHEAD): switch the instrumentation timers at run
+ // time (initial value: MEGALON_COH_TIMERS). Call only while no thread of the process has an open section or a
+ // wait in progress; durations recorded across a switch are meaningless.
+diff --git a/lib/globals.cc b/lib/globals.cc
+index dacf686..c13266c 100644
+--- a/lib/globals.cc
++++ b/lib/globals.cc
+@@ -142,6 +142,8 @@ void GetThreadAnchor(ThreadAnchor *s) { lib::ObjectStore::ThreadAnchorSnap(s); }
+ 
+ void GetObjectLookupHist(ObjectLookupHist *s) { lib::ObjectStore::ThreadLookupHist(s); }
+ 
++void GetWmetaCounts(WmetaCounts *s) { lib::page_cache.WmetaCountsSnap(s); }
++
+ void SetCohTimersForMeasurement(bool on) {
+     coh::g_cfg.timers = on;
+     NrFfi::nr_coh_set_timers(on);
+diff --git a/lib/shm_obj_handle.cc b/lib/shm_obj_handle.cc
+index 2813a54..399ee95 100644
+--- a/lib/shm_obj_handle.cc
++++ b/lib/shm_obj_handle.cc
+@@ -177,6 +177,21 @@ void SharedMemoryObjectHandle<Policy>::ClearReclaimCount() {
+     if (port::PortContext::Get().node_id() == 0) c3po_->Scr_meta()->ResetReclaimCount();
+ }
+ 
++template <typename Policy>
++void SharedMemoryObjectHandle<Policy>::WmetaCountsSnap(rackobj::WmetaCounts *s) {
++    *s = rackobj::WmetaCounts{};
++#ifdef DYN_WMETA
++    s->dyn_wmeta = 1;
++#endif
++    if (!c3po_ || !c3po_->Scr_meta()) return;  // before init
++    auto *m = c3po_->Scr_meta();
++    // same loads as the destructor's teardown line (shared SCR counters: one cluster-wide value)
++    s->reclaim_count = m->GetRecycleCount();
++    s->allocate_count = m->GetAllocateCount();
++    s->records_in_use = m->GetWmetaCount();
++    s->record_slots = m->GetWmetaSlotLen();
++}
++
+ template <typename Policy>
+ size_t SharedMemoryObjectHandle<Policy>::CopyToUserBufferCXL(const ReadHandle &rh, void *ptr, size_t count,
+                                                              size_t offset_into_page) {
+diff --git a/lib/shm_obj_handle.h b/lib/shm_obj_handle.h
+index a0cc8ff..c11716d 100644
+--- a/lib/shm_obj_handle.h
++++ b/lib/shm_obj_handle.h
+@@ -88,6 +88,9 @@ public:
+ 
+     void ClearReclaimCount();
+ 
++    /* build 80: rackobj.h WmetaCounts (the teardown "reclaim count / allocate count" values, readable any time) */
++    void WmetaCountsSnap(rackobj::WmetaCounts* s);
++
+     inline void cache_flush_data(const common::ReadHandle& rh);
+ 
+     inline void cache_flush_metadata(const common::ReadHandle& rh);
+-- 
+2.34.1
+

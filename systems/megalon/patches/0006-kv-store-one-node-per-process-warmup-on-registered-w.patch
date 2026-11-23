@@ -1,0 +1,367 @@
+From ef571046b081962329f1ccb89b65ae22fc989130 Mon Sep 17 00:00:00 2001
+From: Sungsu Ahn <sungsu_ahn@korea.ac.kr>
+Date: Wed, 14 Oct 2026 22:20:41 +0900
+Subject: [PATCH 06/51] kv-store: one node per process, warmup on registered
+ workers, value checks
+
+- node_id from config; NUMA strict policy and getcpu checks removed.
+- Warmup Puts run on the worker threads themselves (registrations per
+  node are never freed: workers + wmeta manager <= 32, checked).
+  Every node warms the whole key space.
+- Put writes a self-describing value (key, stamp, derived words); Get
+  checks key and contents and counts misses/short reads/bad values. The
+  run exits 3 if any check fails. write_ratio 0 keeps upstream's
+  data-less read-only warmup and checks misses only.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ benchmarks/kv_store.cc | 241 ++++++++++++++++++++++++++---------------
+ 1 file changed, 151 insertions(+), 90 deletions(-)
+
+diff --git a/benchmarks/kv_store.cc b/benchmarks/kv_store.cc
+index 4199e01..f97c35f 100644
+--- a/benchmarks/kv_store.cc
++++ b/benchmarks/kv_store.cc
+@@ -35,7 +35,10 @@ using namespace rackobj::benchmark;
+ 
+ static uint32_t exec_time;
+ static uint32_t preheat_time;
+-static uint32_t num_exec_numa = 0;
++static size_t node_id = 0;
++// write_ratio == 0 keeps upstream's warmup (Put(nullptr): read-only entries without data), so
++// there is no value to check; only misses are checked then.
++static bool check_values = true;
+ 
+ #define FLUSH_THRESHOLD 5000
+ #define REPORT_INTERVAL 1
+@@ -75,6 +78,51 @@ struct TimingControl {
+     std::atomic<int64_t> measure_end_ns{-1};
+ };
+ 
++// ---------- Value checks (De Stijl port) ----------
++// Every Put writes a self-describing value: [0] key, [1] stamp (node, thread, seq),
++// [2..] words derived from (key, stamp, index). A Get must return a complete value
++// of the requested key; a torn or misplaced value fails the check.
++static_assert(ACCESS_SIZE % sizeof(uint64_t) == 0 && ACCESS_SIZE >= 3 * sizeof(uint64_t));
++static constexpr size_t kValueWords = ACCESS_SIZE / sizeof(uint64_t);
++
++static inline uint64_t mix64(uint64_t x) {
++    x ^= x >> 33;
++    x *= 0xff51afd7ed558ccdULL;
++    x ^= x >> 33;
++    x *= 0xc4ceb9fe1a85ec53ULL;
++    x ^= x >> 33;
++    return x;
++}
++
++static inline void FillValue(uint8_t* buf, off_t key, uint64_t stamp) {
++    uint64_t w[kValueWords];
++    w[0] = static_cast<uint64_t>(key);
++    w[1] = stamp;
++    for (size_t i = 2; i < kValueWords; i++) w[i] = mix64(static_cast<uint64_t>(key) ^ stamp ^ (i << 48));
++    memcpy(buf, w, ACCESS_SIZE);
++}
++
++static inline bool CheckValue(const uint8_t* buf, off_t key) {
++    uint64_t w[kValueWords];
++    memcpy(w, buf, ACCESS_SIZE);
++    if (w[0] != static_cast<uint64_t>(key)) return false;
++    for (size_t i = 2; i < kValueWords; i++)
++        if (w[i] != mix64(static_cast<uint64_t>(key) ^ w[1] ^ (i << 48))) return false;
++    return true;
++}
++
++static inline uint64_t MakeStamp(size_t thread_idx, uint64_t seq) {
++    return (static_cast<uint64_t>(node_id) << 56) | (static_cast<uint64_t>(thread_idx & 0xffff) << 40) |
++           (seq & ((1ULL << 40) - 1));
++}
++
++struct ValueCheckStats {
++    std::atomic<uint64_t> gets{0};
++    std::atomic<uint64_t> misses{0};       // Get found no entry (all keys are warmed up first)
++    std::atomic<uint64_t> bad_values{0};   // Get returned a value that fails CheckValue
++    std::atomic<uint64_t> short_reads{0};  // Get returned fewer than ACCESS_SIZE bytes
++};
++
+ // helper to get current time in ns since epoch
+ static inline int64_t now_ns() {
+     using namespace std::chrono;
+@@ -118,7 +166,7 @@ struct alignas(128) PaddedCounter {
+ static void workload(AccessPattern* ap, const std::string& latency_filename, const std::string& write_latency_filename,
+                      const std::string& tput_filename, std::atomic<uint64_t>* read_retry_cnt,
+                      std::atomic<uint64_t>* read_cnt, std::atomic<uint64_t>* read_retry_invoc, TimingControl* control,
+-                     PaddedCounter* local_ctr, size_t thread_idx) {
++                     PaddedCounter* local_ctr, size_t thread_idx, ValueCheckStats* vstats) {
+     // local buffers/samples
+     std::vector<int64_t> samples_read;
+     std::vector<int64_t> samples_write;
+@@ -135,6 +183,8 @@ static void workload(AccessPattern* ap, const std::string& latency_filename, con
+     std::uniform_int_distribution<> distrib(0, LOCAL_BUF_SLOT_NUM - 1);
+ 
+     uint64_t local_ops = 0;
++    uint64_t put_seq = 0;
++    uint64_t gets = 0, misses = 0, bad = 0, short_reads = 0;
+     bool warmup_done_local = false;
+     bool measure_local = false;
+     bool cooldown_local = false;
+@@ -159,16 +209,37 @@ static void workload(AccessPattern* ap, const std::string& latency_filename, con
+         uint32_t tsc_aux;
+         uint64_t t1 = __rdtscp(&tsc_aux);
+ 
+-        int rc;
++        uint8_t* vbuf = reinterpret_cast<uint8_t*>(buf) + buf_offset;
++        if (!is_read) {
++            FillValue(vbuf, offset, MakeStamp(thread_idx, ++put_seq));
++            t1 = __rdtscp(&tsc_aux);  // value generation is not part of the measured op
++        }
++
++        ssize_t rc;
+         if (is_read) {
+-            rc = rackobj::Get(reinterpret_cast<uint8_t*>(buf) + buf_offset, ACCESS_SIZE, offset);
++            rc = rackobj::Get(vbuf, ACCESS_SIZE, offset);
+         } else {
+-            rc = rackobj::Put(reinterpret_cast<uint8_t*>(buf) + buf_offset, ACCESS_SIZE, offset);
++            rc = rackobj::Put(vbuf, ACCESS_SIZE, offset);
+         }
+ 
+         uint64_t t2 = __rdtscp(&tsc_aux);
+         PCHECK(rc != -1);
+ 
++        if (is_read) {
++            gets++;
++            if (rc == 0) {
++                misses++;
++            } else if (static_cast<size_t>(rc) < ACCESS_SIZE) {
++                short_reads++;
++            } else if (check_values && !CheckValue(vbuf, offset)) {
++                if (bad < 5)
++                    LOG(ERROR) << "value check failed: key " << offset << " got key "
++                               << *reinterpret_cast<const uint64_t*>(vbuf) << " stamp 0x" << std::hex
++                               << *reinterpret_cast<const uint64_t*>(vbuf + 8) << std::dec;
++                bad++;
++            }
++        }
++
+         local_ops++;
+         if (local_ops >= FLUSH_THRESHOLD) {
+             local_ctr->ops.fetch_add(local_ops, std::memory_order_relaxed);
+@@ -215,6 +286,11 @@ static void workload(AccessPattern* ap, const std::string& latency_filename, con
+         f << local_count << "\n" << duration_s << "\n";
+     }
+ 
++    vstats->gets.fetch_add(gets);
++    vstats->misses.fetch_add(misses);
++    vstats->bad_values.fetch_add(bad);
++    vstats->short_reads.fetch_add(short_reads);
++
+ #ifndef NONRACKOBJ
+     read_cnt->fetch_add(samples_read.size(), std::memory_order_seq_cst);
+     read_retry_cnt->fetch_add(rackobj::GetReadRetryCount());
+@@ -239,8 +315,6 @@ int main(int argc, char** argv) {
+         exit(1);
+     }
+ 
+-    numa_set_strict(1);  // setting strict memory policy
+-
+     string pattern(argv[1]);
+     string result_dir(argv[2]);
+     size_t thread_cnt = std::stoull(argv[3]);
+@@ -263,7 +337,12 @@ int main(int argc, char** argv) {
+     LOG(INFO) << "exec_time: " << exec_time;
+ 
+     size_t key_space = rackobj::GetConfigSize_t("key_space");
+-    num_exec_numa = rackobj::GetConfigSize_t("num_exec_numa");
++    node_id = rackobj::GetConfigSize_t("node_id");
++    // NR registrations are per node and never freed: workers + the wmeta manager (node 0) must fit in 32.
++    CHECK(thread_cnt >= 1 && thread_cnt + (node_id == 0 ? 1 : 0) <= 32)
++        << "thread_cnt " << thread_cnt << " exceeds the 32 NR registrations of a node";
++    check_values = write_ratio > 0.0;
++    LOG(INFO) << "node_id: " << node_id << ", value checks: " << (check_values ? "on" : "misses only (write_ratio 0)");
+ 
+     string dir = result_dir + pattern + "-" + write_ratio_str;
+     if (pattern == "hotcachepartial") dir += "/" + std::to_string(zipfian_theta);
+@@ -294,10 +373,7 @@ int main(int argc, char** argv) {
+ 
+     LOG(INFO) << "RESULT DIR " << dir;
+ 
+-    uint32_t numa_node = UINT32_MAX;
+-    int rc = getcpu(nullptr, &numa_node);
+-    CHECK(rc != -1) << "getcpu() failed";
+-    LOG(INFO) << "Running on numa node " << numa_node << " , write ratio: " << write_ratio;
++    LOG(INFO) << "Running as node " << node_id << ", write ratio: " << write_ratio;
+ 
+     LOG(INFO) << "Running " << thread_cnt << " concurrent threads";
+     string dir2 = dir + "/" + to_string(thread_cnt);
+@@ -317,50 +393,14 @@ int main(int argc, char** argv) {
+         exit(1);
+     }
+ 
+-    static constexpr const size_t warmup_threads = 18;
+-    std::vector<std::jthread> warm_threads(warmup_threads);
+-    ThreadBarrier warmup_barrier(warmup_threads);
+-
++    // De Stijl port: the warmup Puts run on the (already registered) worker threads, so the
++    // per-node NR registrations stay at thread_cnt (+1 wmeta manager on node 0). Every node warms
++    // the whole key space, so after its own warmup every key exists, whatever the other node does.
+     std::vector<off_t> warmup_sequence = ap_shared->WarmupSequence();
+     const size_t operation_count = warmup_sequence.size();
+-    LOG(INFO) << "warming up with " << operation_count << " ops";
+-
+-    for (size_t thread_idx = 0; thread_idx < warm_threads.size(); ++thread_idx) {
+-        warm_threads[thread_idx] =
+-            std::jthread([thread_idx, operation_count, warmup_sequence, &warmup_barrier, write_ratio] {
+-                rackobj::Register(thread_idx);
+-                uint32_t numa_node_local = UINT32_MAX;
+-                int rc_getcpu = getcpu(nullptr, &numa_node_local);
+-                CHECK(rc_getcpu != -1) << "getcpu() failed";
+-                CHECK(numa_node_local == (thread_idx % num_exec_numa) + 1)
+-                    << "not running on target node: " << numa_node_local;
+-
+-                warmup_barrier.Wait();
+-
+-                uint8_t* buf = nullptr;
+-                std::unique_ptr<uint8_t[]> buf_holder;
+-                if (write_ratio > 0.0) {
+-                    buf_holder = std::make_unique<uint8_t[]>(ACCESS_SIZE);
+-                    buf = buf_holder.get();
+-                }
+-                ssize_t rc;
+-
+-                for (size_t i = thread_idx; i < operation_count; i += warmup_threads) {
+-                    rc = rackobj::Put(buf, ACCESS_SIZE, warmup_sequence[i]);
+-                    PCHECK(rc != -1) << "warmup put failed";
+-                }
+-
+-                warmup_barrier.Wait();
+-                rackobj::UnRegister();
+-            });
+-    }
+-
+-    for (auto& t : warm_threads) {
+-        if (t.joinable()) t.join();
+-    }
+-
+-    LOG(INFO) << "done loading...";
+-    sleep(5);
++    LOG(INFO) << "warming up with " << operation_count << " ops on " << thread_cnt << " threads";
++    std::atomic<size_t> warm_done{0};
++    std::atomic<bool> go{false};
+ 
+     // ---------------------------------------------------------------------
+     // Setup timing control + per-thread counters + reporter + controller
+@@ -372,6 +412,59 @@ int main(int argc, char** argv) {
+     std::atomic<uint64_t> read_cnt{0};
+     std::atomic<uint64_t> read_retry_cnt{0};
+     std::atomic<uint64_t> read_retry_invoc{0};
++    ValueCheckStats vstats;
++
++    // ---------------------------------------------------------------------
++    // Spawn worker threads (the "real" threads that execute the workload)
++    // ---------------------------------------------------------------------
++    std::vector<std::jthread> workers(thread_cnt);
++    ThreadBarrier barrier(thread_cnt);  // barrier used to start workers together
++
++    for (size_t i = 0; i < thread_cnt; ++i) {
++        workers[i] = std::jthread([&, i] {
++            rackobj::Register(i);
++
++            // warmup share of this thread: write a checkable value to every key
++            {
++                std::unique_ptr<uint8_t[]> wbuf = std::make_unique<uint8_t[]>(ACCESS_SIZE);
++                uint64_t seq = 0;
++                for (size_t k = i; k < operation_count; k += thread_cnt) {
++                    uint8_t* b = nullptr;  // upstream: no data when write_ratio == 0 (read-only entries)
++                    if (check_values) {
++                        FillValue(wbuf.get(), warmup_sequence[k], MakeStamp(i, ++seq) | (1ULL << 39));
++                        b = wbuf.get();
++                    }
++                    ssize_t rc = rackobj::Put(b, ACCESS_SIZE, warmup_sequence[k]);
++                    PCHECK(rc != -1) << "warmup put failed";
++                }
++            }
++            warm_done.fetch_add(1);
++            while (!go.load(std::memory_order_acquire)) std::this_thread::sleep_for(std::chrono::milliseconds(1));
++
++            unique_ptr<AccessPattern> ap_local =
++                InitializeAccessPattern(pattern, key_space, rackobj::GetConfigSize_t("logical_nid"), write_ratio,
++                                        partition_percentage, partition_access_prob, zipfian_theta);
++
++            // wait for all workers (not for controller) to be ready
++            barrier.Wait();
++
++            string latency_filename = dir2 + "/latencies-" + to_string(i);
++            string write_latency_filename = dir2 + "/write-latencies-" + to_string(i);
++            string tput_filename = dir2 + "/throughput-" + to_string(i);
++
++            // pass pointer to this thread's counter
++            workload(ap_local.get(), latency_filename, write_latency_filename, tput_filename, &read_retry_cnt,
++                     &read_cnt, &read_retry_invoc, &control, &thread_counters[i], i, &vstats);
++
++            barrier.Wait();  // optional: wait for all to finish
++            rackobj::UnRegister();
++        });
++    }
++
++    while (warm_done.load() < thread_cnt) std::this_thread::sleep_for(std::chrono::milliseconds(10));
++    LOG(INFO) << "done loading...";
++    sleep(5);
++    go.store(true, std::memory_order_release);
+ 
+     // Controller thread: drives warmup -> measure -> cooldown -> stop
+     std::jthread controller([&] {
+@@ -451,41 +544,6 @@ int main(int argc, char** argv) {
+         }
+     });
+ 
+-    // ---------------------------------------------------------------------
+-    // Spawn worker threads (the "real" threads that execute the workload)
+-    // ---------------------------------------------------------------------
+-    std::vector<std::jthread> workers(thread_cnt);
+-    ThreadBarrier barrier(thread_cnt);  // barrier used to start workers together
+-
+-    for (size_t i = 0; i < thread_cnt; ++i) {
+-        workers[i] = std::jthread([&, i] {
+-            rackobj::Register(i);  // keeps your existing Register behavior (affinity etc.)
+-
+-            uint32_t numa_node_local = UINT32_MAX;
+-            int rc_getcpu = getcpu(nullptr, &numa_node_local);
+-            CHECK(rc_getcpu != -1) << "getcpu() failed";
+-            CHECK(numa_node_local == (i % num_exec_numa) + 1) << "not running on target node: " << numa_node_local;
+-
+-            unique_ptr<AccessPattern> ap_local =
+-                InitializeAccessPattern(pattern, key_space, rackobj::GetConfigSize_t("logical_nid"), write_ratio,
+-                                        partition_percentage, partition_access_prob, zipfian_theta);
+-
+-            // wait for all workers (not for controller) to be ready
+-            barrier.Wait();
+-
+-            string latency_filename = dir2 + "/latencies-" + to_string(i);
+-            string write_latency_filename = dir2 + "/write-latencies-" + to_string(i);
+-            string tput_filename = dir2 + "/throughput-" + to_string(i);
+-
+-            // pass pointer to this thread's counter
+-            workload(ap_local.get(), latency_filename, write_latency_filename, tput_filename, &read_retry_cnt,
+-                     &read_cnt, &read_retry_invoc, &control, &thread_counters[i], i);
+-
+-            barrier.Wait();  // optional: wait for all to finish
+-            rackobj::UnRegister();
+-        });
+-    }
+-
+     // join workers
+     for (auto& th : workers) {
+         if (th.joinable()) th.join();
+@@ -511,5 +569,8 @@ int main(int argc, char** argv) {
+         LOG(INFO) << "No reads recorded.";
+     }
+ 
+-    return 0;
++    uint64_t vb = vstats.bad_values.load(), vm = vstats.misses.load(), vs = vstats.short_reads.load();
++    LOG(INFO) << "VALUE CHECK: gets=" << vstats.gets.load() << " bad_values=" << vb << " misses=" << vm
++              << " short_reads=" << vs << (vb + vm + vs ? " FAIL" : " PASS");
++    return (vb + vm + vs) ? 3 : 0;
+ }
+\ No newline at end of file
+-- 
+2.34.1
+

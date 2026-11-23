@@ -1,0 +1,83 @@
+From 3c130ea1a6336ea014332be11b5adabbb876576b Mon Sep 17 00:00:00 2001
+From: Sungsu Ahn <sungsu_ahn@korea.ac.kr>
+Date: Thu, 15 Oct 2026 16:34:28 +0900
+Subject: [PATCH] hnsw: zero_copy deserialize config (views over the binary
+ set's bytes)
+
+De Stijl port (vectordb on shared CXL memory): with zero_copy=true,
+Deserialize() reads through faiss::ZeroCopyIOReader so the index arrays
+are views over the caller's bytes instead of copies. The caller keeps the
+bytes alive. Default off; unchanged behaviour otherwise.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ include/knowhere/config.h    |  7 +++++++
+ src/index/hnsw/faiss_hnsw.cc | 20 ++++++++++++++++++++
+ 2 files changed, 27 insertions(+)
+
+diff --git a/include/knowhere/config.h b/include/knowhere/config.h
+index 8969e6a..ce9164a 100644
+--- a/include/knowhere/config.h
++++ b/include/knowhere/config.h
+@@ -604,6 +604,7 @@ class BaseConfig : public Config {
+     CFG_BOOL trace_visit;
+     CFG_BOOL enable_mmap;
+     CFG_BOOL enable_mmap_pop;
++    CFG_BOOL zero_copy;
+     CFG_BOOL shuffle_build;
+     CFG_STRING trace_id;
+     CFG_STRING span_id;
+@@ -711,6 +712,12 @@ class BaseConfig : public Config {
+             .description("enable map_populate option for mmap")
+             .for_deserialize()
+             .for_deserialize_from_file();
++        // De Stijl port (vectordb on shared CXL memory): Deserialize() maps the index arrays straight from the
++        // binary's bytes (faiss::ZeroCopyIOReader) instead of copying them; the caller keeps the bytes alive.
++        KNOWHERE_CONFIG_DECLARE_FIELD(zero_copy)
++            .set_default(false)
++            .description("deserialize as views over the binary set's memory (no copy)")
++            .for_deserialize();
+         KNOWHERE_CONFIG_DECLARE_FIELD(shuffle_build)
+             .set_default(true)
+             .description("shuffle ids before index building")
+diff --git a/src/index/hnsw/faiss_hnsw.cc b/src/index/hnsw/faiss_hnsw.cc
+index 0adb553..6371f0e 100644
+--- a/src/index/hnsw/faiss_hnsw.cc
++++ b/src/index/hnsw/faiss_hnsw.cc
+@@ -31,6 +31,7 @@
+ #include "faiss/IndexRefine.h"
+ #include "faiss/impl/ScalarQuantizer.h"
+ #include "faiss/impl/mapped_io.h"
++#include "faiss/impl/zerocopy_io.h"
+ #include "faiss/index_io.h"
+ #include "index/hnsw/faiss_hnsw_config.h"
+ #include "index/hnsw/hnsw.h"
+@@ -212,6 +213,25 @@ class BaseFaissRegularIndexNode : public BaseFaissIndexNode {
+             return Status::invalid_binary_set;
+         }
+ 
++        const bool zero_copy = config && static_cast<const knowhere::BaseConfig&>(*config).zero_copy.value_or(false);
++        if (zero_copy) {
++            // De Stijl port: views over the caller's bytes (e.g. an index object in shared CXL memory)
++            try {
++                faiss::ZeroCopyIOReader zr(binary->data.get(), binary->size);
++                if (faiss::read_is_mv(&zr)) {
++                    LOG_KNOWHERE_ERROR_ << "zero_copy does not support mv indexes";
++                    return Status::invalid_args;
++                }
++                zr.reset();
++                indexes.resize(1);
++                indexes[0].reset(faiss::read_index(&zr));
++            } catch (const std::exception& e) {
++                LOG_KNOWHERE_WARNING_ << "faiss inner error (zero_copy): " << e.what();
++                return Status::faiss_inner_error;
++            }
++            return Status::success;
++        }
++
+         MemoryIOReader reader(binary->data.get(), binary->size);
+         try {
+             // this is a hack for compatibility, faiss index has 4-byte header to indicate index category
+-- 
+2.34.1
+

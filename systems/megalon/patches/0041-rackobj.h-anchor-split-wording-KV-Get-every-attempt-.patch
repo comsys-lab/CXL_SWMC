@@ -1,0 +1,38 @@
+From 5a8e6c48879b07f7f13408ff040880747a8ceb9a Mon Sep 17 00:00:00 2001
+From: Sungsu Ahn <sungsu_ahn@korea.ac.kr>
+Date: Fri, 16 Oct 2026 23:21:39 +0900
+Subject: [PATCH 41/51] rackobj.h: anchor split wording (KV Get: every attempt
+ outside (A); object: first attempt); comment only
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ include/rackobj.h | 6 ++++--
+ 1 file changed, 4 insertions(+), 2 deletions(-)
+
+diff --git a/include/rackobj.h b/include/rackobj.h
+index 02d552a..1ef9013 100644
+--- a/include/rackobj.h
++++ b/include/rackobj.h
+@@ -92,7 +92,8 @@ struct ObjectStats {
+  *                                     found the key and KV Puts that wrote (this thread)
+  *   check_*        read sections only, 1 in check_sample per thread (the 1st, N+1th, ...): ReadStart entry .. return
+  *                  plus, if ReadEnd returns true, ReadEnd entry .. return; minus the (A) and (D) time inside them;
+- *                  since build 74 also minus the first attempt's GetAnchor except its Megalon-only flushes (index
++ *                  since build 74 also minus GetAnchor except its Megalon-only flushes (object sections: the first
++ *                  attempt's anchor; KV Get: the anchor of every attempt outside (A), incl. (B)/(C) retries) (index
+  *                  lookup -> reserved[7], NR sync/replay -> GetThreadAnchorSplit; all-HWcc does both, §15).
+  *                  check_sampled = sampled read sections; estimate for all read sections = check_ns_sampled *
+  *                  read_sections / check_sampled (ratio estimator; the thread's first section is always sampled)
+@@ -150,7 +151,8 @@ void GetThreadAnchorSplit(uint64_t out[4]);
+ /* Build 75: the work of the CALLING thread that a Megalon-hwcc all-HWcc also executes, since Register(), ns (field
+  * order = mshim::AnchorSnap, systems/megalon/shim/megalon_objapi.h v3; intervals reports/M2-megalon-port-changes.md
+  * §16). Sampled fields cover the same sampled read sections as ObjectThreadCoh.check_ns_sampled.
+- *   read_lookup_ns_sampled  index lookup of the first anchor outside (A) (excluded from check; = reserved[7])
++ *   read_lookup_ns_sampled  index lookup of the anchors excluded from check (object: first attempt; KV Get: every
++ *                           attempt outside (A), incl. (B)/(C) retries) (= reserved[7])
+  *   read_nr_ns_sampled      NR anchor work of that anchor (excluded from check)
+  *   rseq_ns_sampled         seqlock version reads whose time is in check: RSeqBegin of read_seq_start (minus its (D)
+  *                           spin) of attempts outside (A), RSeqRetry of read_seq_end of accepted sections (INSIDE check)
+-- 
+2.34.1
+

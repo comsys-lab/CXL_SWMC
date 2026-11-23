@@ -1,0 +1,830 @@
+From adf4f10830151bb1ebbb57070e55e99836a6eb64 Mon Sep 17 00:00:00 2001
+From: Sungsu Ahn <sungsu_ahn@korea.ac.kr>
+Date: Thu, 15 Oct 2026 01:36:21 +0900
+Subject: [PATCH 16/51] port: packed4 HWcc record layout (paper's 4 B record),
+ owner key in the NR replica; release a failed install once
+
+MEGALON_WMETA_LAYOUT=artifact64 (default, upstream 64 B line per record) | packed4 (-DWMETA_PACKED4):
+WriteMetadata is the 32-bit sequence only (active_node had no reader; BlockId was read by reclaim only).
+With DYN_WMETA the owner key moves to each node's NR replica (feature wmeta-rev): a reverse map
+wmeta_idx -> key kept in dispatch_mut by diffing the touched keys, and a log op SwitchToReadOnlyByWmeta
+that resolves the victim's key at its log position, so a stale key can never return another record.
+The five reclaim sites use it under WMETA_PACKED4. Layout hash includes WMETA_PACKED4.
+
+Also (both layouts): GCD_SLOT_WMETA_UPDATE_FAILED no longer recycles the record before falling through
+to the second recycle (double decrement of the allocated count, or freeing another thread's reservation).
+
+Rust tests: scr wmeta-rev 11/11, wmeta-rev 11/11, scr 8/8, none 8/8. Verifier: PASS-with-corrections.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ CMakeLists.txt                             |  16 +++
+ lib/shm_obj_handle.cc                      |  30 ++++-
+ src/core/local_cache_node.h                |   2 +
+ src/core/seqcount.cc                       |   2 +
+ src/core/seqcount.h                        |  14 +++
+ src/core/write_meta.cc                     |   4 +
+ src/core/write_meta.h                      |  23 +++-
+ src/index/gcd_nr.cc                        |  10 ++
+ src/index/gcd_nr.h                         |   5 +
+ src/index/nr_hashmap.h                     |   7 ++
+ src/manager/wmeta_manager.cc               |  10 ++
+ src/shared_memory/cxl_port.cc              |   3 +
+ third-party/nr_rust/ffi/Cargo.toml         |   3 +
+ third-party/nr_rust/ffi/ffi_nr_hashmap.rs  | 125 ++++++++++++++++++++
+ third-party/nr_rust/ffi/port_tests.rs      |  10 +-
+ third-party/nr_rust/ffi/types.rs           |  11 +-
+ third-party/nr_rust/ffi/wmeta_rev_tests.rs | 126 +++++++++++++++++++++
+ 17 files changed, 387 insertions(+), 14 deletions(-)
+ create mode 100644 third-party/nr_rust/ffi/wmeta_rev_tests.rs
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index fcf0dea..ddd2cab 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -90,6 +90,18 @@ if (LIMITED_SCR)
+     add_definitions(-DDYN_WMETA=1)      # with limited coherence region, seqlock needs to be dynamic
+ endif()
+ 
++# De Stijl port: HWcc record layout. artifact64 = upstream (64 B line per record, owner BlockId in the record);
++# packed4 = the paper's 4 B record (sequence only); with DYN_WMETA the owner key moves to the NR replica
++# (nr feature wmeta-rev).
++set(MEGALON_WMETA_LAYOUT "artifact64" CACHE STRING "artifact64 | packed4")
++set_property(CACHE MEGALON_WMETA_LAYOUT PROPERTY STRINGS artifact64 packed4)
++if (MEGALON_WMETA_LAYOUT STREQUAL "packed4")
++    add_definitions(-DWMETA_PACKED4=1)
++elseif (NOT MEGALON_WMETA_LAYOUT STREQUAL "artifact64")
++    message(FATAL_ERROR "MEGALON_WMETA_LAYOUT must be artifact64 or packed4 (got '${MEGALON_WMETA_LAYOUT}')")
++endif()
++message(STATUS "MEGALON_WMETA_LAYOUT=${MEGALON_WMETA_LAYOUT}")
++
+ if (FULL_COHERENCE)
+     add_definitions(-DFULL_COHERENCE=1)
+ endif()
+@@ -164,6 +176,10 @@ elseif (NO_COHERENCE)
+ else()
+     set(MEGALON_NR_FEATURES "")
+ endif()
++if (MEGALON_WMETA_LAYOUT STREQUAL "packed4" AND LIMITED_SCR)
++    # reverse map only where records are reclaimed (DYN_WMETA); static records never need the owner key
++    string(APPEND MEGALON_NR_FEATURES " wmeta-rev")
++endif()
+ set(MEGALON_NR_LIB "" CACHE FILEPATH "absolute path of the per-flavor libnr_hashmap.a")
+ if (NOT MEGALON_NR_LIB OR NOT IS_ABSOLUTE "${MEGALON_NR_LIB}" OR NOT EXISTS "${MEGALON_NR_LIB}")
+     message(FATAL_ERROR "MEGALON_NR_LIB must be the absolute path of an existing libnr_hashmap.a (got '${MEGALON_NR_LIB}')")
+diff --git a/lib/shm_obj_handle.cc b/lib/shm_obj_handle.cc
+index 3a00b47..3820a86 100644
+--- a/lib/shm_obj_handle.cc
++++ b/lib/shm_obj_handle.cc
+@@ -102,6 +102,9 @@ SharedMemoryObjectHandle<Policy>::~SharedMemoryObjectHandle() {
+     uint64_t reclaim_count = c3po_->Scr_meta()->GetRecycleCount();
+     uint64_t allocate_count = c3po_->Scr_meta()->GetAllocateCount();
+ 
++#ifdef WMETA_PACKED4
++    LOG(INFO) << "wmeta layout packed4: replays with one record held by two keys: " << NrFfi::NrWmetaRevShared();
++#endif
+     LOG(INFO) << "seqlock alloc ratio: (" << write_page_count << "|" << c3po_->Scr_meta()->GetWmetaSlotLen() << ") = "
+               << static_cast<double>(write_page_count) * 100 / static_cast<double>(c3po_->Scr_meta()->GetWmetaSlotLen())
+               << "%, reclaim count: " << reclaim_count << ", allocate count: " << allocate_count;
+@@ -399,6 +402,10 @@ expected<common::CacheNode *, std::error_code> SharedMemoryObjectHandle<Policy>:
+         if (!new_wmeta_index_optional.has_value()) continue;
+ 
+         common::WriteMetadata *cur = c3po_->Scr_meta()->GetWmeta(new_wmeta_index_optional.value());
++#ifdef WMETA_PACKED4
++        // packed4: the record holds no BlockId; the log op resolves the victim's key (replica reverse map)
++        new_wmeta_index_optional = c3po_->Gcd()->SwitchToReadOnlyByWmeta(new_wmeta_index_optional.value(), nr_meta);
++#else
+         common::BlockId vic_block_id = cur->GetBlockID();
+ 
+         new_wmeta_index_optional = c3po_->Gcd()->SwitchToReadOnly(vic_block_id
+@@ -407,6 +414,7 @@ expected<common::CacheNode *, std::error_code> SharedMemoryObjectHandle<Policy>:
+                                                                   nr_meta
+ #endif /* NR */
+         );
++#endif
+         if (new_wmeta_index_optional.has_value()) {
+             c3po_->Scr_meta()->RecycleWmeta(new_wmeta_index_optional.value());
+         } else {
+@@ -466,9 +474,9 @@ expected<common::CacheNode *, std::error_code> SharedMemoryObjectHandle<Policy>:
+         case common::NrGcdError::GCD_NO_ERROR:
+             break;
+         case common::NrGcdError::GCD_SLOT_WMETA_UPDATE_FAILED:
+-#ifdef DYN_WMETA
+-            c3po_->Scr_meta()->RecycleWmeta(new_wmeta_index_optional.value(), true);
+-#endif  // static wmeta: release the lock exactly once (below); a second release could drop another writer's lock
++            // De Stijl port: falls through; the record is released exactly once below. Upstream recycled it here
++            // too: with DYN_WMETA the second call saw FREE (allocated count decremented twice) or, if another thread
++            // had reserved the record in between, freed that thread's reservation; static wmeta dropped a lock.
+         case common::NrGcdError::GCD_SLOT_UPDATE_FAILED:
+             DLOG(WARNING) << "Admit: GCD page @" << new_node << " checkinsert failed: concurrent insertion to node "
+                           << shared_cache_node_ << " ,block_id: " << block_id;
+@@ -529,6 +537,10 @@ expected<common::CacheNode *, std::error_code> SharedMemoryObjectHandle<Policy>:
+             if (!new_wmeta_index_optional.has_value()) continue;
+ 
+             common::WriteMetadata *cur = c3po_->Scr_meta()->GetWmeta(new_wmeta_index_optional.value());
++#ifdef WMETA_PACKED4
++            // packed4: the record holds no BlockId; the log op resolves the victim's key (replica reverse map)
++            new_wmeta_index_optional = c3po_->Gcd()->SwitchToReadOnlyByWmeta(new_wmeta_index_optional.value(), nr_meta);
++#else
+             common::BlockId vic_block_id = cur->GetBlockID();
+ 
+             new_wmeta_index_optional = c3po_->Gcd()->SwitchToReadOnly(vic_block_id
+@@ -537,6 +549,7 @@ expected<common::CacheNode *, std::error_code> SharedMemoryObjectHandle<Policy>:
+                                                                       nr_meta
+ #endif /* NR */
+             );
++#endif
+             if (new_wmeta_index_optional.has_value()) {
+                 c3po_->Scr_meta()->RecycleWmeta(new_wmeta_index_optional.value());
+             } else {
+@@ -582,9 +595,9 @@ expected<common::CacheNode *, std::error_code> SharedMemoryObjectHandle<Policy>:
+         case common::NrGcdError::GCD_NO_ERROR:
+             break;
+         case common::NrGcdError::GCD_SLOT_WMETA_UPDATE_FAILED:
+-#ifdef DYN_WMETA
+-            c3po_->Scr_meta()->RecycleWmeta(new_wmeta_index_optional.value(), true);
+-#endif  // static wmeta: release the lock exactly once (below); a second release could drop another writer's lock
++            // De Stijl port: falls through; the record is released exactly once below. Upstream recycled it here
++            // too: with DYN_WMETA the second call saw FREE (allocated count decremented twice) or, if another thread
++            // had reserved the record in between, freed that thread's reservation; static wmeta dropped a lock.
+         case common::NrGcdError::GCD_SLOT_UPDATE_FAILED:
+             DLOG(WARNING) << "Admit: GCD page @" << new_node << " checkinsert failed: concurrent insertion to node "
+                           << shared_cache_node_ << " ,block_id: " << block_id;
+@@ -625,6 +638,10 @@ std::error_code SharedMemoryObjectHandle<Policy>::SwitchRW(const common::WriteHa
+         if (!new_wmeta_index_optional.has_value()) continue;
+ 
+         common::WriteMetadata *cur = c3po_->Scr_meta()->GetWmeta(new_wmeta_index_optional.value());
++#ifdef WMETA_PACKED4
++        // packed4: the record holds no BlockId; the log op resolves the victim's key (replica reverse map)
++        new_wmeta_index_optional = c3po_->Gcd()->SwitchToReadOnlyByWmeta(new_wmeta_index_optional.value(), nr_meta);
++#else
+         common::BlockId vic_block_id = cur->GetBlockID();
+ 
+         new_wmeta_index_optional = c3po_->Gcd()->SwitchToReadOnly(vic_block_id
+@@ -633,6 +650,7 @@ std::error_code SharedMemoryObjectHandle<Policy>::SwitchRW(const common::WriteHa
+                                                                   nr_meta
+ #endif /* NR */
+         );
++#endif
+         if (new_wmeta_index_optional.has_value()) {
+             c3po_->Scr_meta()->RecycleWmeta(new_wmeta_index_optional.value());
+         } else {
+diff --git a/src/core/local_cache_node.h b/src/core/local_cache_node.h
+index 655b6c5..8d75f14 100644
+--- a/src/core/local_cache_node.h
++++ b/src/core/local_cache_node.h
+@@ -32,7 +32,9 @@ public:
+         pthread_rwlock_init(&evict_rw_lock_, NULL);
+         // Initialize seqlock to 0 (allocated, unlocked, no FREE_BIT)
+         seqlock_.sequence = 0;
++#ifndef WMETA_PACKED4
+         seqlock_.active_node = 0;
++#endif
+     }
+ 
+     virtual ~LocalCacheNode() { pthread_rwlock_destroy(&evict_rw_lock_); }
+diff --git a/src/core/seqcount.cc b/src/core/seqcount.cc
+index fa04777..f41574b 100644
+--- a/src/core/seqcount.cc
++++ b/src/core/seqcount.cc
+@@ -17,9 +17,11 @@ uint32_t read_seqcount_begin(struct seqcount* s) {
+     return seq;
+ }
+ 
++#ifndef WMETA_PACKED4
+ uint8_t get_active_node(seqlock_t* s) { return s->active_node.load(std::memory_order_relaxed); }
+ 
+ void set_active_node(seqlock_t* s, uint8_t node) { s->active_node.store(node, std::memory_order_relaxed); }
++#endif
+ 
+ bool read_seqcount_retry(struct seqcount* s, uint32_t seq) {
+ #ifdef NO_COHERENCE
+diff --git a/src/core/seqcount.h b/src/core/seqcount.h
+index 8820d1f..eb15940 100644
+--- a/src/core/seqcount.h
++++ b/src/core/seqcount.h
+@@ -83,14 +83,20 @@ constexpr uint32_t SEQ_MASK = ~(FREE_BIT | LOCK_BIT);
+  * data layout:
+  * | free bit | lock bit | ... sequence count ... |
+  */
++// De Stijl port: WMETA_PACKED4 (paper layout) keeps only the 32-bit sequence (free and lock bits included). The
++// active_node byte is not read anywhere in the artifact (active-node tracking lives in CacheNode).
+ typedef struct seqlock {
+ #ifdef __cplusplus
+     std::atomic<uint32_t> sequence;
++#ifndef WMETA_PACKED4
+     std::atomic<uint8_t> active_node;
++#endif
+ #else
+     volatile uint32_t sequence;
++#ifndef WMETA_PACKED4
+     volatile uint8_t active_node;
+ #endif
++#endif
+ 
+ #if C3_RWLOCK != 0
+     C3RwLock rw_lock;
+@@ -98,13 +104,21 @@ typedef struct seqlock {
+ #endif
+ } seqlock_t;
+ 
++#if defined(WMETA_PACKED4) && C3_RWLOCK != 0
++#error "WMETA_PACKED4 needs C3_RWLOCK == 0 (the record is the 32-bit sequence only)"
++#endif
++
+ static inline void seqlock_init(seqlock_t *s) {
+     s->sequence = FREE_BIT;
++#ifndef WMETA_PACKED4
+     s->active_node = 0;
++#endif
+ }
+ 
++#ifndef WMETA_PACKED4
+ uint8_t get_active_node(seqlock_t *s);
+ void set_active_node(seqlock_t *s, uint8_t node);
++#endif
+ 
+ uint32_t read_seqlock_begin(seqlock_t *s);
+ 
+diff --git a/src/core/write_meta.cc b/src/core/write_meta.cc
+index bf8c390..edf702f 100644
+--- a/src/core/write_meta.cc
++++ b/src/core/write_meta.cc
+@@ -28,7 +28,11 @@ uint32_t WriteMetadata::seqlock(bool relaxed) {
+ 
+ bool WriteMetadata::TryAllocateLock(const BlockId &block_id, bool with_lock) {
+     if (try_allocate_seqlock(&seqlock_, with_lock)) {
++#ifndef WMETA_PACKED4
+         block_id_ = block_id;
++#else
++        (void)block_id;  // packed4: the owner key is recorded by the NR op that installs this record
++#endif
+         return true;
+     }
+     return false;
+diff --git a/src/core/write_meta.h b/src/core/write_meta.h
+index 244a02f..d145773 100644
+--- a/src/core/write_meta.h
++++ b/src/core/write_meta.h
+@@ -23,7 +23,20 @@ struct SpinLockWrapper {
+ // RW shared page
+ 
+ // SCR
++// De Stijl port: two record layouts (MEGALON_WMETA_LAYOUT).
++//   artifact64 (default): upstream, one 64 B cache line per record: seqlock (+ unused active_node) and the
++//              owner BlockId, which reclaim reads to find the victim's key.
++//   packed4 (WMETA_PACKED4): the paper's 4 B record, the sequence only, packed 16 per line. The owner key is
++//              kept in each node's NR replica (reverse map, nr feature wmeta-rev) and resolved inside the
++//              reclaim log op (GlobalCacheDirectoryHandleNr::SwitchToReadOnlyByWmeta).
++#ifdef WMETA_PACKED4
++#ifndef NR
++#error "WMETA_PACKED4 needs NR (the owner key lives in the NR replica)"
++#endif
++class WriteMetadata {
++#else
+ class alignas(64) WriteMetadata {
++#endif
+ public:
+     explicit WriteMetadata(bool alloc = false) : seqlock_(alloc ? 0 : FREE_BIT) {}
+ 
+@@ -49,6 +62,7 @@ public:
+ 
+     [[nodiscard]] bool FreeLockReset(bool with_lock = true);
+ 
++#ifndef WMETA_PACKED4
+     uint8_t GetActiveNode() { return get_active_node(&seqlock_); }
+     void SetActiveNode(uint8_t node) { set_active_node(&seqlock_, node); }
+ 
+@@ -61,11 +75,14 @@ public:
+     }
+ 
+     BlockId GetBlockID() { return block_id_; }
++#endif
+ 
+ private:
+     // seqcount_t seqcount_;
+     seqlock_t seqlock_;
++#ifndef WMETA_PACKED4
+     BlockId block_id_;
++#endif
+ 
+ #ifndef C3_RWLOCK
+     static_assert(sizeof(seqlock_t) + sizeof(BlockId) <= CACHE_LINE_SIZE,
+@@ -73,7 +90,9 @@ private:
+ #endif
+ };
+ 
+-#ifndef C3_RWLOCK
++#ifdef WMETA_PACKED4
++static_assert(sizeof(WriteMetadata) == 4 && alignof(WriteMetadata) == 4, "packed4 record must be 4 bytes");
++#elif !defined(C3_RWLOCK)
+ static_assert(sizeof(WriteMetadata) == CACHE_LINE_SIZE, "WriteMetadata must be exactly one cache line (64 bytes)");
+ #else
+ static_assert(sizeof(WriteMetadata) % CACHE_LINE_SIZE == 0, "WriteMetadata must be cache line (64 bytes) aligned");
+@@ -131,7 +150,7 @@ public:
+         CHECK(wmeta_slot_len) << "write metadata slot length should not be zero!";
+         b_meta_.UseSharedCounters(allocated, reclaim, allocate);
+         b_meta_.wmeta_allocator_ = std::make_unique<LocalMemoryAllocator<WriteMetadata>>(sc_shm_region);
+-        // records in SCR, 64 B each; same address on every node (deterministic arena)
++        // records in SCR (64 B each, or 4 B with WMETA_PACKED4); same address on every node (deterministic arena)
+         b_meta_.wmeta_start_addr_ = b_meta_.wmeta_allocator_->AllocateAligned<MemoryAlignment::kCacheAlign>(wmeta_slot_len);
+         CHECK(b_meta_.wmeta_start_addr_) << "write metadata allocation failed!";
+ 
+diff --git a/src/index/gcd_nr.cc b/src/index/gcd_nr.cc
+index 3d10ced..6ffbaf4 100644
+--- a/src/index/gcd_nr.cc
++++ b/src/index/gcd_nr.cc
+@@ -202,6 +202,16 @@ std::optional<size_t> GlobalCacheDirectoryHandleNr::SwitchToReadOnly(const Block
+     return static_cast<size_t>(result);
+ }
+ 
++#ifdef WMETA_PACKED4
++std::optional<size_t> GlobalCacheDirectoryHandleNr::SwitchToReadOnlyByWmeta(size_t wmeta_idx,
++                                                                            const NrFfi::NrMeta* nr_meta) {
++    ssize_t result = NrFfi::SwitchToReadOnlyByWmeta(nr_meta, static_cast<ssize_t>(wmeta_idx));
++    if (result < 0) return std::nullopt;
++    CHECK_EQ(static_cast<size_t>(result), wmeta_idx) << "SwitchToReadOnlyByWmeta returned another record";
++    return static_cast<size_t>(result);
++}
++#endif
++
+ bool GlobalCacheDirectoryHandleNr::SwitchToRWShared(const BlockId& to_modify, size_t wmeta_idx,
+                                                     const NrFfi::NrMeta* nr_meta) {
+     ssize_t result = NrFfi::CheckSwitchWmetaArray(nr_meta, to_modify, static_cast<ssize_t>(wmeta_idx));
+diff --git a/src/index/gcd_nr.h b/src/index/gcd_nr.h
+index 078e39d..fe6879d 100644
+--- a/src/index/gcd_nr.h
++++ b/src/index/gcd_nr.h
+@@ -72,6 +72,11 @@ public:
+                                  const NrFfi::NrMeta* nr_meta);
+ 
+     std::optional<size_t> SwitchToReadOnly(const BlockId& to_modify, const NrFfi::NrMeta* nr_meta);
++#ifdef WMETA_PACKED4
++    // De Stijl port (packed4): RO-switch the key that holds record wmeta_idx; the key is resolved from the replica's
++    // reverse map inside the log op. Returns wmeta_idx, or nullopt if no live entry holds it.
++    std::optional<size_t> SwitchToReadOnlyByWmeta(size_t wmeta_idx, const NrFfi::NrMeta* nr_meta);
++#endif
+ 
+     bool SwitchToRWShared(const BlockId& to_modify, size_t wmeta_idx, const NrFfi::NrMeta* nr_meta);
+ 
+diff --git a/src/index/nr_hashmap.h b/src/index/nr_hashmap.h
+index a8ae0ff..15f4c77 100644
+--- a/src/index/nr_hashmap.h
++++ b/src/index/nr_hashmap.h
+@@ -97,6 +97,13 @@ size_t CheckPutArray(const NrMeta* metadata, rackobj::common::BlockId key, ssize
+  */
+ ssize_t CheckSwitchWmetaArray(const NrMeta* metadata, rackobj::common::BlockId key, ssize_t wmeta_idx = -1);
+ 
++/* De Stijl port (packed4, nr feature wmeta-rev): RO-switch the key holding record wmeta_idx (resolved in the log op).
++ * Returns wmeta_idx, or -1 if no live entry holds it. */
++ssize_t SwitchToReadOnlyByWmeta(const NrMeta* metadata, ssize_t wmeta_idx);
++
++/* De Stijl port (packed4): replays in which two live keys ended up holding one record (diagnostic, per process). */
++uint64_t NrWmetaRevShared();
++
+ ssize_t CheckMoveLocalArray(const NrMeta* metadata, rackobj::common::BlockId key, ssize_t cn, uint64_t idx);
+ 
+ bool CheckPutSwapArray(const NrMeta* metadata, rackobj::common::BlockId key, ssize_t cn, uint64_t new_idx,
+diff --git a/src/manager/wmeta_manager.cc b/src/manager/wmeta_manager.cc
+index fdb4103..2592653 100644
+--- a/src/manager/wmeta_manager.cc
++++ b/src/manager/wmeta_manager.cc
+@@ -76,6 +76,10 @@ size_t WriteMetadataManager::IterativeReclaim(size_t count
+         cur = c3po_->Scr_meta()->GetWmeta(wmeta_idx);
+         if (!cur->WLockOnly()) continue;
+ 
++#ifdef WMETA_PACKED4
++        // packed4: the record holds no BlockId; the log op resolves the victim's key (replica reverse map)
++        std::optional<size_t> wmeta_idx_optional = c3po_->Gcd()->SwitchToReadOnlyByWmeta(wmeta_idx, nr_meta);
++#else
+         BlockId block_id = cur->GetBlockID();
+ 
+         // switch back to RO
+@@ -85,6 +89,7 @@ size_t WriteMetadataManager::IterativeReclaim(size_t count
+                                                                                   nr_meta
+ #endif /* NR */
+         );
++#endif
+         if (wmeta_idx_optional.has_value()) {
+             // CHECK(!shared_cache->scr_bitmap_.IsWmetaFree(wmeta_idx)) << "the slot is already free before freeing";
+             // CHECK(wmeta_idx == wmeta_idx_optional.value())
+@@ -116,6 +121,10 @@ size_t WriteMetadataManager::SampleReclaim(size_t count
+         if (!wmeta_idx.has_value()) continue;
+ 
+         cur = c3po_->Scr_meta()->GetWmeta(wmeta_idx.value());
++#ifdef WMETA_PACKED4
++        // packed4: the record holds no BlockId; the log op resolves the victim's key (replica reverse map)
++        std::optional<size_t> wmeta_idx_optional = c3po_->Gcd()->SwitchToReadOnlyByWmeta(wmeta_idx.value(), nr_meta);
++#else
+         BlockId block_id = cur->GetBlockID();
+ 
+         std::optional<size_t> wmeta_idx_optional = c3po_->Gcd()->SwitchToReadOnly(block_id
+@@ -124,6 +133,7 @@ size_t WriteMetadataManager::SampleReclaim(size_t count
+                                                                                   nr_meta
+ #endif /* NR */
+         );
++#endif
+         if (wmeta_idx_optional.has_value()) {
+             c3po_->Scr_meta()->RecycleWmeta(wmeta_idx_optional.value());
+             wmeta_over_thres--;
+diff --git a/src/shared_memory/cxl_port.cc b/src/shared_memory/cxl_port.cc
+index 962df27..f900065 100644
+--- a/src/shared_memory/cxl_port.cc
++++ b/src/shared_memory/cxl_port.cc
+@@ -58,6 +58,9 @@ std::string FlavorDefines() {
+ #endif
+ #ifdef FILE_INTERFACE
+     d += "FILE_INTERFACE,";
++#endif
++#ifdef WMETA_PACKED4
++    d += "WMETA_PACKED4,";
+ #endif
+     return d;
+ }
+diff --git a/third-party/nr_rust/ffi/Cargo.toml b/third-party/nr_rust/ffi/Cargo.toml
+index 38c7735..95b18d1 100644
+--- a/third-party/nr_rust/ffi/Cargo.toml
++++ b/third-party/nr_rust/ffi/Cargo.toml
+@@ -28,3 +28,6 @@ path = "ffi_nr_hashmap.rs"
+ default = []
+ scr = ["node-replication/scr"]
+ no-coherence = ["node-replication/no-coherence"]
++# De Stijl port, packed4 record layout: each replica keeps wmeta_idx -> key (reverse map) so the 4 B HWcc record
++# needs no BlockId; reclaim resolves a victim record to its key inside the log op (SwitchToReadOnlyByWmeta)
++wmeta-rev = []
+diff --git a/third-party/nr_rust/ffi/ffi_nr_hashmap.rs b/third-party/nr_rust/ffi/ffi_nr_hashmap.rs
+index 4fb352a..f5c0f9f 100644
+--- a/third-party/nr_rust/ffi/ffi_nr_hashmap.rs
++++ b/third-party/nr_rust/ffi/ffi_nr_hashmap.rs
+@@ -11,6 +11,8 @@ mod constants;
+ mod types;
+ #[cfg(test)]
+ mod port_tests;
++#[cfg(all(test, feature = "wmeta-rev"))]
++mod wmeta_rev_tests;
+ 
+ use topology::*;
+ use constants::*;
+@@ -57,9 +59,47 @@ pub enum Modify {
+ 
+     CheckSwitchWmetaArray(BlockId, isize),
+ 
++    /// De Stijl port (packed4, feature wmeta-rev): switch the key that holds this wmeta to RO. The key comes
++    /// from the replica's reverse map at this op's log position. Returns like CheckSwitchWmetaArray(key, -1).
++    SwitchToReadOnlyByWmeta(isize),
++
+     DummyLog(BlockId),
+ }
+ 
++impl Modify {
++    /// Keys whose entry (and so whose wmeta_idx_) the op may change; used to keep the reverse map.
++    #[cfg(feature = "wmeta-rev")]
++    fn touched_keys(&self) -> [Option<BlockId>; 2] {
++        match *self {
++            Modify::Put(k, _) | Modify::CheckPut(k, _) | Modify::Delete(k) => [Some(k), None],
++            Modify::Swap(a, b, _) => [Some(a), Some(b)],
++            Modify::PutArray(k, ..) | Modify::PutArrayWmeta(k, ..) | Modify::CheckPutArray(k, ..) => [Some(k), None],
++            Modify::CheckPutArrayWmeta(k, ..) | Modify::CheckPutSwapArray(k, ..) => [Some(k), None],
++            Modify::InvalidateArray(k, _) | Modify::InvalidateExceptArray(k, _) => [Some(k), None],
++            Modify::InvalidateExceptArrayUpdateWmeta(k, ..) | Modify::CheckMoveLocalArray(k, ..) => [Some(k), None],
++            Modify::DeleteArray(k, _) | Modify::DeleteIfArray(k, _) => [Some(k), None],
++            Modify::CheckSwapArray(a, b, ..) => [Some(a), Some(b)],
++            Modify::CheckSwitchWmetaArray(k, _) | Modify::DummyLog(k) => [Some(k), None],
++            Modify::SwitchToReadOnlyByWmeta(_) => [None, None],
++        }
++    }
++}
++
++/// Replays in which a wmeta was assigned to a key while another live entry still held it (two keys share one
++/// record; upstream behaviour after a failed insert). Per process, counts every replica's replay. Diagnostic.
++#[cfg(feature = "wmeta-rev")]
++static WMETA_REV_SHARED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
++
++#[no_mangle]
++pub extern "C" fn NrWmetaRevShared() -> u64 {
++    #[cfg(feature = "wmeta-rev")]
++    {
++        return WMETA_REV_SHARED.load(Ordering::Relaxed);
++    }
++    #[cfg(not(feature = "wmeta-rev"))]
++    0
++}
++
+ /// We support an immutable read operation to lookup a key from the hashmap.
+ #[derive(Clone, Debug, PartialEq)]
+ pub enum Access {
+@@ -185,6 +225,72 @@ impl Dispatch for NrHashMapFFi {
+ 
+     /// The `dispatch_mut` function contains the logic for the mutable operations.
+     fn dispatch_mut(&mut self, op: Self::WriteOperation) -> Self::Response {
++        #[cfg(feature = "wmeta-rev")]
++        {
++            return self.dispatch_mut_rev(op);
++        }
++        #[cfg(not(feature = "wmeta-rev"))]
++        self.apply_mut(op)
++    }
++}
++
++impl NrHashMapFFi {
++    /// wmeta_idx_ of key's entry, -1 if there is none.
++    #[cfg(feature = "wmeta-rev")]
++    fn wmeta_of(&self, k: &BlockId) -> isize {
++        self.storage.get(k).map_or(-1, |e| e.wmeta_idx_)
++    }
++
++    /// apply_mut plus reverse-map upkeep: every op is diffed on the keys it touches (old vs new wmeta_idx_),
++    /// so no op body has to maintain the map itself.
++    #[cfg(feature = "wmeta-rev")]
++    fn dispatch_mut_rev(&mut self, op: Modify) -> OptionGCDReponse {
++        if let Modify::SwitchToReadOnlyByWmeta(w) = op {
++            return self.switch_ro_by_wmeta(w);
++        }
++        let keys = op.touched_keys();
++        let before = keys.map(|k| k.map(|k| (k, self.wmeta_of(&k))));
++        let resp = self.apply_mut(op);
++        for &(k, old) in before.iter().flatten() {
++            let new = self.wmeta_of(&k);
++            if new == old {
++                continue;
++            }
++            if old != -1 && self.rev.get(&old) == Some(&k) {
++                self.rev.remove(&old);
++            }
++            if new != -1 {
++                if let Some(prev) = self.rev.insert(new, k) {
++                    if prev != k && self.wmeta_of(&prev) == new {
++                        WMETA_REV_SHARED.fetch_add(1, Ordering::Relaxed);
++                    }
++                }
++            }
++        }
++        resp
++    }
++
++    /// Victim record w -> its key (reverse map at this log position) -> RO. Same response as
++    /// CheckSwitchWmetaArray(key, -1); None when no live entry holds w.
++    #[cfg(feature = "wmeta-rev")]
++    fn switch_ro_by_wmeta(&mut self, w: isize) -> OptionGCDReponse {
++        let Some(k) = self.rev.get(&w).copied() else {
++            return OptionGCDReponse(None);
++        };
++        match self.storage.get_mut(&k) {
++            Some(entry) if entry.wmeta_idx_ == w => {
++                entry.wmeta_idx_ = -1;
++                self.rev.remove(&w);
++                OptionGCDReponse(Some(GCDReponse {
++                    key: k,
++                    value: init_empty_gcd_entry_with_wmeta_idx(w),
++                }))
++            }
++            _ => OptionGCDReponse(None),
++        }
++    }
++
++    fn apply_mut(&mut self, op: Modify) -> OptionGCDReponse {
+         match op {
+             Modify::Put(key, value) => {
+                 self.storage.insert(key, value);
+@@ -559,6 +665,10 @@ impl Dispatch for NrHashMapFFi {
+                 }
+                 OptionGCDReponse(None)
+             }
++
++            Modify::SwitchToReadOnlyByWmeta(_) => {
++                panic!("BUG: SwitchToReadOnlyByWmeta needs the wmeta-rev feature (packed4 record layout)")
++            }
+         }
+     }
+ }
+@@ -1080,6 +1190,21 @@ pub extern "C" fn CheckSwitchWmetaArray(
+     }
+ }
+ 
++/**
++ * De Stijl port (packed4): switch the key holding wmeta record `wmeta_idx` to RO; the key is resolved from the
++ * replica's reverse map inside the log op. Returns wmeta_idx on success, -1 if no live entry holds it.
++ */
++#[no_mangle]
++pub extern "C" fn SwitchToReadOnlyByWmeta(metadata: *mut NrMeta, wmeta_idx: isize) -> isize {
++    unsafe {
++        let wrapper = (*metadata).nrht.execute_mut(Modify::SwitchToReadOnlyByWmeta(wmeta_idx), (*metadata).ttkn);
++        match wrapper.0 {
++            Some(value) => value.value.wmeta_idx_,
++            None => -1,
++        }
++    }
++}
++
+ /**
+  * Move index to local exclusive, remove the cxl entry
+  * return:
+diff --git a/third-party/nr_rust/ffi/port_tests.rs b/third-party/nr_rust/ffi/port_tests.rs
+index c8d5d48..b888745 100644
+--- a/third-party/nr_rust/ffi/port_tests.rs
++++ b/third-party/nr_rust/ffi/port_tests.rs
+@@ -15,7 +15,7 @@ use super::*;
+ const SLOTS: usize = 256;
+ const SLOT_SIZE: usize = 1024;
+ 
+-struct SharedMem {
++pub(crate) struct SharedMem {
+     hdr: *mut u8,
+     body: *mut u8,
+     entries: usize,
+@@ -24,7 +24,7 @@ struct SharedMem {
+ unsafe impl Send for SharedMem {}
+ unsafe impl Sync for SharedMem {}
+ 
+-fn shared_mem(entries: usize) -> SharedMem {
++pub(crate) fn shared_mem(entries: usize) -> SharedMem {
+     let l = nr_log_layout(0);
+     assert_eq!(l.entry_size, NR_LOG_ENTRY_SIZE);
+     unsafe {
+@@ -49,7 +49,7 @@ fn test_on_stuck(rid: usize, ltail: usize, head: usize, tail: usize, _w: u64) ->
+     panic!("remote replica {} stuck: ltail={} head={} tail={}", rid, ltail, head, tail);
+ }
+ 
+-fn node(m: &SharedMem, id: usize, init: bool, timeout_ms: u64) -> Arc<NodeReplicated<NrHashMapFFi>> {
++pub(crate) fn node(m: &SharedMem, id: usize, init: bool, timeout_ms: u64) -> Arc<NodeReplicated<NrHashMapFFi>> {
+     let log = log_of(m, init).expect("in-place log");
+     let rw = RemoteWait { now_ns: test_now_ns, timeout_ns: timeout_ms * 1_000_000, on_stuck: test_on_stuck };
+     Arc::new(
+@@ -67,13 +67,13 @@ fn node(m: &SharedMem, id: usize, init: bool, timeout_ms: u64) -> Arc<NodeReplic
+     )
+ }
+ 
+-fn key(k: u64) -> BlockId {
++pub(crate) fn key(k: u64) -> BlockId {
+     let mut b = null_BlockId();
+     b.offset_ = k as _;
+     b
+ }
+ 
+-fn min_entries() -> usize {
++pub(crate) fn min_entries() -> usize {
+     2 * node_replication::nr::log::GC_FROM_HEAD
+ }
+ 
+diff --git a/third-party/nr_rust/ffi/types.rs b/third-party/nr_rust/ffi/types.rs
+index 0715af9..af936a1 100644
+--- a/third-party/nr_rust/ffi/types.rs
++++ b/third-party/nr_rust/ffi/types.rs
+@@ -282,12 +282,21 @@ pub fn init_gcd_entry_debug(key: BlockId, cn: isize, idx: u64) -> GCDEntry {
+ #[derive(Default, Clone)]
+ pub struct NrHashMapFFi {
+     pub storage: std::collections::HashMap<BlockId, GCDEntry>,
++    /// De Stijl port (packed4): wmeta_idx -> key whose entry holds it. Process-local like the rest of the
++    /// replica; every replica applies the same log in the same order, so all reverse maps agree at each
++    /// log position. Kept in dispatch_mut only (ffi_nr_hashmap.rs, dispatch_mut_rev).
++    #[cfg(feature = "wmeta-rev")]
++    pub rev: std::collections::HashMap<isize, BlockId>,
+ }
+ 
+ impl NrHashMapFFi {
+     pub fn new(cap: usize) -> NrHashMapFFi {
+         let storage = std::collections::HashMap::with_capacity(cap);
+-        NrHashMapFFi { storage }
++        NrHashMapFFi {
++            storage,
++            #[cfg(feature = "wmeta-rev")]
++            rev: std::collections::HashMap::new(),
++        }
+     }
+ }
+ 
+diff --git a/third-party/nr_rust/ffi/wmeta_rev_tests.rs b/third-party/nr_rust/ffi/wmeta_rev_tests.rs
+new file mode 100644
+index 0000000..636f827
+--- /dev/null
++++ b/third-party/nr_rust/ffi/wmeta_rev_tests.rs
+@@ -0,0 +1,126 @@
++//! De Stijl port, packed4 record layout (feature wmeta-rev): tests of the per-replica reverse map
++//! wmeta_idx -> key and of SwitchToReadOnlyByWmeta. Pure Rust, heap memory only.
++
++use std::collections::HashMap;
++
++use node_replication::nr::Dispatch;
++use rand::rngs::SmallRng;
++use rand::{Rng, SeedableRng};
++
++use super::port_tests::{key, node, shared_mem, min_entries};
++use super::*;
++
++const KEYS: u64 = 8;
++const WMETAS: isize = 6;
++
++fn entry_with_wmeta(cn: isize, w: isize) -> GCDEntry {
++    let mut e = init_gcd_entry(cn, NUMA_MEM);
++    e.wmeta_idx_ = w;
++    e
++}
++
++fn random_op(r: &mut SmallRng) -> Modify {
++    let k = key(r.gen_range(0..KEYS));
++    let k2 = key(r.gen_range(0..KEYS));
++    let w = r.gen_range(-1..WMETAS);
++    let cn = r.gen_range(0..16) as isize;
++    match r.gen_range(0..11) {
++        0 => Modify::PutArrayWmeta(k, cn, NUMA_MEM, w),
++        1 => Modify::CheckPutArrayWmeta(k, cn, NUMA_MEM, w),
++        2 => Modify::CheckSwitchWmetaArray(k, w),
++        3 => Modify::InvalidateExceptArrayUpdateWmeta(k, NUMA_MEM, w),
++        4 => Modify::Delete(k),
++        5 => Modify::DeleteIfArray(k, NUMA_MEM),
++        6 => Modify::DeleteArray(k, NUMA_MEM),
++        7 => Modify::Swap(k, k2, entry_with_wmeta(cn, w)),
++        8 => Modify::Put(k, entry_with_wmeta(cn, w)),
++        9 => Modify::CheckSwapArray(k, k2, cn, NUMA_MEM, NUMA_MEM),
++        _ => Modify::SwitchToReadOnlyByWmeta(r.gen_range(0..WMETAS)),
++    }
++}
++
++/// Reverse map vs storage, and vs the upstream meaning of the record's BlockId ("the key that last got this
++/// record"): rev[w] == k  <=>  k is the last key assigned w and still holds w.
++fn check(h: &NrHashMapFFi, last: &HashMap<isize, BlockId>) {
++    for (w, k) in &h.rev {
++        assert_eq!(h.storage.get(k).map(|e| e.wmeta_idx_), Some(*w), "rev[{}] = {:?} does not hold it", w, k);
++    }
++    for w in 0..WMETAS {
++        let expect = last.get(&w).copied().filter(|k| h.storage.get(k).map(|e| e.wmeta_idx_) == Some(w));
++        assert_eq!(h.rev.get(&w).copied(), expect, "rev[{}]", w);
++    }
++}
++
++#[test]
++fn reverse_map_tracks_every_wmeta_change() {
++    for seed in 0..200u64 {
++        let mut r = SmallRng::seed_from_u64(seed);
++        let mut h = NrHashMapFFi::new(64);
++        let mut last: HashMap<isize, BlockId> = HashMap::new();
++        for _ in 0..400 {
++            let op = random_op(&mut r);
++            // shadow of upstream's record BlockId: the key whose wmeta was last set to w
++            let before: HashMap<BlockId, isize> = h.storage.iter().map(|(k, e)| (*k, e.wmeta_idx_)).collect();
++            let expect_switch = if let Modify::SwitchToReadOnlyByWmeta(w) = op { Some((w, h.rev.get(&w).copied())) } else { None };
++            let resp = h.dispatch_mut(op.clone());
++            for (k, e) in &h.storage {
++                if e.wmeta_idx_ != -1 && before.get(k) != Some(&e.wmeta_idx_) {
++                    last.insert(e.wmeta_idx_, *k);
++                }
++            }
++            if let Some((w, holder)) = expect_switch {
++                match holder {
++                    Some(k) => {
++                        let g = resp.0.expect("switch of a held record succeeds");
++                        assert_eq!((g.key, g.value.wmeta_idx_), (k, w));
++                        assert_eq!(h.storage[&k].wmeta_idx_, -1);
++                    }
++                    None => assert!(resp.0.is_none(), "no holder => None"),
++                }
++            }
++            check(&h, &last);
++        }
++    }
++}
++
++#[test]
++fn switch_by_wmeta_never_returns_another_record() {
++    // upstream hazard: victim record 1's BlockId still names key A, but A now holds record 2;
++    // SwitchToReadOnly(A) would return 2. By-wmeta resolution returns None instead.
++    let mut h = NrHashMapFFi::new(8);
++    let a = key(1);
++    h.dispatch_mut(Modify::PutArrayWmeta(a, 3, NUMA_MEM, 1));
++    h.dispatch_mut(Modify::CheckSwitchWmetaArray(a, -1));
++    h.dispatch_mut(Modify::CheckSwitchWmetaArray(a, 2));
++    assert!(h.dispatch_mut(Modify::SwitchToReadOnlyByWmeta(1)).0.is_none());
++    assert_eq!(h.storage[&a].wmeta_idx_, 2);
++    let g = h.dispatch_mut(Modify::SwitchToReadOnlyByWmeta(2)).0.unwrap();
++    assert_eq!((g.key, g.value.wmeta_idx_), (a, 2));
++    assert!(h.rev.is_empty());
++}
++
++#[test]
++fn replicas_resolve_victims_identically_across_nodes() {
++    let m = shared_mem(min_entries());
++    let n0 = node(&m, 0, true, 2000);
++    let n1 = node(&m, 1, false, 2000);
++    let t0 = n0.register(0).unwrap();
++    let t1 = n1.register(1).unwrap();
++    // node 0 makes keys RW with records 0..50; node 1 reclaims them by record index only
++    for k in 0..50u64 {
++        n0.execute_mut(Modify::PutArrayWmeta(key(k), k as isize, NUMA_MEM, k as isize), t0);
++    }
++    for w in 0..50isize {
++        let g = n1.execute_mut(Modify::SwitchToReadOnlyByWmeta(w), t1).0.expect("node 1 resolves node 0's record");
++        assert_eq!((g.key, g.value.wmeta_idx_), (key(w as u64), w));
++    }
++    // reassign a record on node 1, reclaim it on node 0: node 0 must see the new owner
++    n1.execute_mut(Modify::CheckSwitchWmetaArray(key(7), 3), t1);
++    let g = n0.execute_mut(Modify::SwitchToReadOnlyByWmeta(3), t0).0.unwrap();
++    assert_eq!(g.key, key(7));
++    assert!(n0.execute_mut(Modify::SwitchToReadOnlyByWmeta(3), t0).0.is_none());
++    for k in 0..50u64 {
++        assert_eq!(n0.execute(Access::Get(key(k)), t0).0.unwrap().value.wmeta_idx_, -1);
++        assert_eq!(n1.execute(Access::Get(key(k)), t1).0.unwrap().value.wmeta_idx_, -1);
++    }
++}
+-- 
+2.34.1
+

@@ -1,0 +1,1243 @@
+From 9d2b44a96a72403634c83d494afbbc6e5fd18ef5 Mon Sep 17 00:00:00 2001
+From: Sungsu Ahn <sungsu_ahn@korea.ac.kr>
+Date: Fri, 16 Oct 2026 22:10:22 +0900
+Subject: [PATCH 35/51] objects: per-thread coherence instrumentation (MOT1 v6,
+ build 71; no protocol change)
+
+Observation only: the coherence protocol, its checks, flushes and retries are
+unchanged. Adds per-thread accounting of the object API's coherence time,
+read through rackobj::GetObjectThreadCoh (field order = shim CohSnap v2):
+
+- read sections: section checks timed 1 in MEGALON_COH_CHECK_SAMPLE (default
+  64); (A) stale copy at read_start and (B) concurrent write at read_end split
+  (read_retry_incoherent = read_retry_stale + read_retry_concurrent, v1 field
+  kept); (C) META_OUTDATE; (D) contended waits: read_seqlock_begin while odd,
+  NR read-side combiner-lock waits and replica RwLock read waits
+  (nr/waitstat.rs, per-thread totals via nr_thread_wait_stat).
+- write sections: write start (incl. switch_rw and critical-path reclaim) and
+  write end (whole-object flush + write_seq_end, bytes) every time.
+- plain rdtsc without fences, ns via the TSC rate measured against
+  CLOCK_MONOTONIC; MEGALON_COH_TIMERS=0 disables all timer reads.
+- object-test phase 7: each counter moves in a constructed case (stale,
+  concurrent, meta, spin, checks, flush, switch_rw); churn writer totals vs
+  process stats; OBJECT_TEST_OVERHEAD runs timers on/off alternately.
+- NR test waitstat_records_contended_read_lock_only.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ benchmarks/object_test.cc                     | 286 +++++++++++++++++-
+ include/rackobj.h                             |  43 +++
+ lib/globals.cc                                |  11 +
+ lib/object_store.cc                           | 156 +++++++++-
+ lib/object_store.h                            |   4 +
+ lib/shm_obj_handle.cc                         |  12 +-
+ src/common/coh_stats.cc                       |  69 +++++
+ src/common/coh_stats.h                        |  65 ++++
+ src/core/seqcount.cc                          |  13 +
+ src/index/nr_hashmap.h                        |   4 +
+ third-party/nr_rust/ffi/ffi_nr_hashmap.rs     |  13 +
+ third-party/nr_rust/ffi/port_tests.rs         |  31 ++
+ .../nr_rust/node-replication/src/lib.rs       |   3 +-
+ .../nr_rust/node-replication/src/nr/mod.rs    |   1 +
+ .../node-replication/src/nr/replica.rs        |  44 ++-
+ .../nr_rust/node-replication/src/nr/rwlock.rs |  12 +
+ .../node-replication/src/nr/waitstat.rs       |  44 +++
+ 17 files changed, 779 insertions(+), 32 deletions(-)
+ create mode 100644 src/common/coh_stats.cc
+ create mode 100644 src/common/coh_stats.h
+ create mode 100644 third-party/nr_rust/node-replication/src/nr/waitstat.rs
+
+diff --git a/benchmarks/object_test.cc b/benchmarks/object_test.cc
+index 6e14807..56df91a 100644
+--- a/benchmarks/object_test.cc
++++ b/benchmarks/object_test.cc
+@@ -33,8 +33,13 @@
+ #include <atomic>
+ #include <cerrno>
+ #include <chrono>
++#include <condition_variable>
++#include <functional>
++#include <mutex>
+ #include <cstdio>
++#include <cstdlib>
+ #include <cstring>
++#include <cstddef>
+ #include <random>
+ #include <string>
+ #include <thread>
+@@ -222,17 +227,25 @@ void SumReaders(const std::vector<ReaderResult> &rr, ReaderResult *tot) {
+ 
+ // phase 6: one writer per node rewrites random objects of both nodes; last[k] = last generation it wrote to ids[k]
+ void ChurnWriter(int tid, const std::vector<uint64_t> &ids, std::chrono::steady_clock::time_point until,
+-                 std::vector<uint64_t> *last, uint64_t *writes) {
++                 std::vector<uint64_t> *last, uint64_t *writes, rackobj::ObjectThreadCoh *coh = nullptr,
++                 uint64_t *wall_ns = nullptr, uint64_t *max_ns = nullptr) {
+     rackobj::Register(tid);
+     std::mt19937_64 rng(0xc4u + node_id);
+-    uint64_t g = 0;
+-    while (std::chrono::steady_clock::now() < until) {
++    uint64_t g = 0, mx = 0;
++    const auto t0 = std::chrono::steady_clock::now();
++    for (auto t = t0; t < until;) {
+         size_t k = rng() % ids.size();
+         const uint64_t gen = (++g << 1) | node_id;
+         WriteGen(ids[k], gen);
+         (*last)[k] = gen;
++        const auto t1 = std::chrono::steady_clock::now();
++        mx = std::max<uint64_t>(mx, static_cast<uint64_t>(std::chrono::nanoseconds(t1 - t).count()));
++        t = t1;
+     }
+     *writes = g;
++    if (coh) rackobj::GetObjectThreadCoh(coh);  // build 71: this writer's coherence time since Register()
++    if (wall_ns) *wall_ns = static_cast<uint64_t>(std::chrono::nanoseconds(std::chrono::steady_clock::now() - t0).count());
++    if (max_ns) *max_ns = mx;
+     rackobj::UnRegister();
+ }
+ 
+@@ -252,6 +265,253 @@ uint64_t Writer(int tid, uint64_t own, std::chrono::steady_clock::time_point unt
+     return (g << 1) | node_id;
+ }
+ 
++// ---- phase 7 (build 71): per-thread coherence counters (rackobj::GetObjectThreadCoh) move in constructed cases ----
++constexpr uint64_t kCohA = kBase + 6;  // node 0 creates; node 1 sees a stale copy after node 0's write
++uint64_t CohX(size_t n) { return kBase + 30 + n; }   // RW object of node n (concurrent write, writer spin)
++uint64_t CohRO(size_t n) { return kBase + 40 + n; }  // RO object of node n until the helper's first write (meta)
++uint64_t CohOv(size_t n) { return kBase + 50 + n; }  // 64 B object of node n (overhead loop)
++constexpr size_t kCohLen = 4096 * 4;
++
++rackobj::ObjectThreadCoh Coh() {
++    rackobj::ObjectThreadCoh c{};
++    rackobj::GetObjectThreadCoh(&c);
++    return c;
++}
++
++// b - a, field by field (all fields are monotonic per thread)
++rackobj::ObjectThreadCoh CohDiff(const rackobj::ObjectThreadCoh &a, const rackobj::ObjectThreadCoh &b) {
++    rackobj::ObjectThreadCoh d = b;
++    const uint64_t *pa = reinterpret_cast<const uint64_t *>(&a);
++    uint64_t *pd = reinterpret_cast<uint64_t *>(&d);
++    for (size_t i = 0; i < offsetof(rackobj::ObjectThreadCoh, reserved) / 8; i++) pd[i] -= pa[i];
++    d.check_sample = b.check_sample;
++    return d;
++}
++
++std::string CohStr(const rackobj::ObjectThreadCoh &c) {
++    char b[768];
++    std::snprintf(b, sizeof(b),
++                  "rs=%lu ws=%lu check(sample 1/%lu)=%lu ns over %lu | stale %lu/%lu ns | concur %lu/%lu ns | meta %lu/%lu "
++                  "ns | spin %lu/%lu ns | wstart %lu ns, switch_rw %lu/%lu ns, reclaim %lu/%lu ns | wflush %lu/%lu ns/%lu B "
++                  "| tsc %lu kHz timers %lu",
++                  c.read_sections, c.write_sections, c.check_sample, c.check_ns_sampled, c.check_sampled, c.stale_cnt,
++                  c.stale_ns, c.concur_cnt, c.concur_ns, c.meta_cnt, c.meta_ns, c.spin_cnt, c.spin_ns, c.wstart_ns,
++                  c.switch_rw_cnt, c.switch_rw_ns, c.reclaim_cnt, c.reclaim_ns, c.wflush_cnt, c.wflush_ns,
++                  c.wflush_bytes, c.reserved[0], c.reserved[1]);
++    return b;
++}
++
++// A second registered thread of this node (one open section per thread: the helper is the second party). Registered
++// once: NR registrations are never freed (<= 32 per node).
++class HelperThread {
++public:
++    explicit HelperThread(int tid) : t_([this, tid] { Loop(tid); }) {}
++    ~HelperThread() {
++        {
++            std::lock_guard<std::mutex> l(m_);
++            stop_ = true;
++        }
++        cv_.notify_all();
++        t_.join();
++    }
++    void Start(std::function<void()> f) {
++        std::lock_guard<std::mutex> l(m_);
++        job_ = std::move(f);
++        done_ = false;
++        cv_.notify_all();
++    }
++    void Wait() {
++        std::unique_lock<std::mutex> l(m_);
++        cv_.wait(l, [&] { return done_; });
++    }
++    void Run(std::function<void()> f) {
++        Start(std::move(f));
++        Wait();
++    }
++
++private:
++    void Loop(int tid) {
++        rackobj::Register(tid);
++        for (;;) {
++            std::function<void()> f;
++            {
++                std::unique_lock<std::mutex> l(m_);
++                cv_.wait(l, [&] { return job_ || stop_; });
++                if (!job_) break;
++                f = std::move(job_);
++                job_ = nullptr;
++            }
++            f();
++            {
++                std::lock_guard<std::mutex> l(m_);
++                done_ = true;
++            }
++            cv_.notify_all();
++        }
++        rackobj::UnRegister();
++    }
++    std::mutex m_;
++    std::condition_variable cv_;
++    std::function<void()> job_;
++    bool done_ = true, stop_ = false;
++    std::thread t_;
++};
++
++void CohPhase(int helper_tid) {
++    HelperThread helper(helper_tid);
++    rackobj::ObjectStats os{};
++    rackobj::GetObjectStats(&os);
++    const bool hwcc = os.static_records_used > 0;  // hwcc flavor: static records (objects RW at create), no stale/RO
++    const bool timed = Coh().reserved[1] == 1;
++    auto tpos = [&](uint64_t ns) { return !timed || ns > 0; };  // durations are 0 with MEGALON_COH_TIMERS=0
++    EXPECT(rackobj::ObjectCreate(CohX(node_id), kConcLen) == 0);
++    EXPECT(rackobj::ObjectCreate(CohRO(node_id), 4096) == 0);
++    WriteGen(CohX(node_id), 1);
++    if (node_id == 0) {
++        EXPECT(rackobj::ObjectCreate(kCohA, kCohLen) == 0);
++        WriteGen(kCohA, 1);
++    }
++    Barrier("coh created");
++    rackobj::ObjectHandle h;
++    auto read_gen = [&](uint64_t id) {
++        uint64_t g;
++        do {
++            CHECK_EQ(rackobj::ObjectReadStart(id, &h), 0);
++            g = InspectGen(h.ptr, h.size, id);
++        } while (!rackobj::ObjectReadEnd(&h));
++        return g;
++    };
++    // (A) stale copy at read_start: node 1 validates kCohA, node 0 rewrites it, node 1 reads again
++    if (node_id == 1) EXPECT(read_gen(kCohA) == 1);
++    Barrier("coh A validated");
++    if (node_id == 0) {
++        auto c0 = Coh();
++        WriteGen(kCohA, 2);
++        auto d = CohDiff(c0, Coh());
++        LOG(INFO) << "COH flush (node 0 write of kCohA): " << CohStr(d);
++        EXPECT(d.write_sections == 1 && d.wflush_cnt == 1);
++        EXPECT(d.wflush_bytes == kCohLen || d.wflush_bytes == 0);  // 0 only in the hwcc flavor (no flush)
++        EXPECT(tpos(d.wflush_ns) && tpos(d.wstart_ns));
++        EXPECT(d.read_sections == 0 && d.stale_cnt == 0 && d.concur_cnt == 0 && d.meta_cnt == 0);
++    }
++    Barrier("coh A rewritten");
++    if (node_id == 1) {
++        auto c0 = Coh();
++        EXPECT(read_gen(kCohA) == 2);
++        auto d = CohDiff(c0, Coh());
++        LOG(INFO) << "COH stale (node 1 read of kCohA after node 0's write): " << CohStr(d);
++        EXPECT(hwcc || (d.stale_cnt == 1 && tpos(d.stale_ns)));
++        EXPECT(d.read_sections == 1 && d.concur_cnt == 0 && d.meta_cnt == 0);
++    }
++    Barrier("coh A checked");
++
++    // (B) concurrent write between read_start and read_end (same node, helper thread writes)
++    {
++        auto c0 = Coh();
++        CHECK_EQ(rackobj::ObjectReadStart(CohX(node_id), &h), 0);
++        helper.Run([] { WriteGen(CohX(node_id), 3); });
++        const bool ok = rackobj::ObjectReadEnd(&h);
++        EXPECT(!ok);
++        auto d = CohDiff(c0, Coh());
++        LOG(INFO) << "COH concurrent (read of C(own) while the helper wrote it): " << CohStr(d);
++        EXPECT(d.concur_cnt == 1 && tpos(d.concur_ns) && d.meta_cnt == 0 && d.stale_cnt == 0);
++        EXPECT(read_gen(CohX(node_id)) == 3);
++    }
++    // (C) metadata notification: reading an RO object while the helper's write switches it RO -> RW (log event)
++    {
++        auto c0 = Coh();
++        rackobj::ObjectThreadCoh hd{};
++        CHECK_EQ(rackobj::ObjectReadStart(CohRO(node_id), &h), 0);
++        helper.Run([&hd] {
++            auto a = Coh();
++            WriteGen(CohRO(node_id), 1);
++            hd = CohDiff(a, Coh());
++        });
++        const bool ok = rackobj::ObjectReadEnd(&h);
++        EXPECT(!ok);
++        auto d = CohDiff(c0, Coh());
++        LOG(INFO) << "COH meta (read of RO(own) while the helper switched it RO->RW): " << CohStr(d);
++        LOG(INFO) << "COH switch_rw (helper write of RO(own)): " << CohStr(hd);
++        if (!hwcc) {
++            EXPECT(d.meta_cnt == 1 && tpos(d.meta_ns) && d.concur_cnt == 0);
++            EXPECT(hd.switch_rw_cnt >= 1 && tpos(hd.switch_rw_ns) && hd.wstart_ns >= hd.switch_rw_ns);
++        }
++        EXPECT(hd.reclaim_ns <= hd.switch_rw_ns && hd.wflush_cnt == 1 && hd.write_sections == 1);
++    }
++    // (D) contended spin: the helper holds a write section on C(own) for 20 ms while this thread starts a read
++    {
++        std::atomic<int> st{0};
++        auto c0 = Coh();
++        helper.Start([&st] {
++            rackobj::ObjectHandle wh;
++            CHECK_EQ(rackobj::ObjectWriteStart(CohX(node_id), &wh), 0);
++            st.store(1);
++            std::this_thread::sleep_for(std::chrono::milliseconds(20));
++            auto *p = reinterpret_cast<uint64_t *>(wh.ptr);
++            for (size_t i = 2; i < wh.size / 8; i++) p[i] = ConcWord(CohX(node_id), 5, i);
++            p[1] = node_id;
++            p[0] = 5;
++            rackobj::ObjectWriteEnd(&wh);
++        });
++        while (st.load() == 0) {
++        }
++        const uint64_t g = read_gen(CohX(node_id));
++        helper.Wait();
++        auto d = CohDiff(c0, Coh());
++        LOG(INFO) << "COH spin (read of C(own) while the helper held its write section 20 ms): " << CohStr(d);
++        EXPECT(g == 5);
++        EXPECT(d.spin_cnt >= 1 && (!timed || d.spin_ns >= 5000000));
++        EXPECT(d.check_ns_sampled < 5000000);  // the spin is not counted as section-check time
++    }
++    // section checks: 1 in check_sample read sections per thread is timed
++    {
++        auto c0 = Coh();
++        const uint64_t n = 4 * c0.check_sample;
++        for (uint64_t i = 0; i < n; i++) (void)read_gen(CohX(node_id));
++        auto d = CohDiff(c0, Coh());
++        LOG(INFO) << "COH checks (" << n << " uncontended read sections): " << CohStr(d);
++        EXPECT(d.read_sections == n && d.check_sampled == 4 && tpos(d.check_ns_sampled));
++        EXPECT(d.stale_cnt == 0 && d.concur_cnt == 0 && d.meta_cnt == 0);
++    }
++    Barrier("coh checked");
++}
++
++// Optional (OBJECT_TEST_OVERHEAD=<sections>, node 0 only, node 1 waits): ns per read / write section of a 64 B object
++// (one thread, no contention), timers on and off alternating in one process (rackobj::SetCohTimersForMeasurement).
++void OverheadPhase(uint64_t n) {
++    if (node_id == 0) {
++        const bool initial = rackobj::CohTimersOn();
++        EXPECT(rackobj::ObjectCreate(CohOv(0), 64) == 0);
++        WriteGen(CohOv(0), 1);
++        rackobj::ObjectHandle h;
++        for (int rep = 0; rep < 10; rep++) {
++            const bool on = rep % 2 == 0;
++            rackobj::SetCohTimersForMeasurement(on);
++            auto t0 = std::chrono::steady_clock::now();
++            uint64_t sink = 0;
++            for (uint64_t i = 0; i < n; i++) {
++                do {
++                    CHECK_EQ(rackobj::ObjectReadStart(CohOv(0), &h), 0);
++                    sink += h.ptr[0];
++                } while (!rackobj::ObjectReadEnd(&h));
++            }
++            auto t1 = std::chrono::steady_clock::now();
++            for (uint64_t i = 0; i < n; i++) {
++                CHECK_EQ(rackobj::ObjectWriteStart(CohOv(0), &h), 0);
++                reinterpret_cast<uint64_t *>(h.ptr)[0] = i;
++                rackobj::ObjectWriteEnd(&h);
++            }
++            auto t2 = std::chrono::steady_clock::now();
++            auto ns = [](auto a, auto b) { return std::chrono::duration<double, std::nano>(b - a).count(); };
++            LOG(INFO) << "COH-OVERHEAD rep " << rep << " timers " << on << " sample 1/" << Coh().check_sample
++                      << ": read section " << ns(t0, t1) / static_cast<double>(n) << " ns, write section "
++                      << ns(t1, t2) / static_cast<double>(n) << " ns (" << n << " each, sink " << (sink & 1) << ")";
++        }
++        rackobj::SetCohTimersForMeasurement(initial);
++    }
++    Barrier("overhead done");
++}
++
+ }  // namespace
+ 
+ int main(int argc, char **argv) {
+@@ -434,15 +694,22 @@ int main(int argc, char **argv) {
+         std::vector<uint64_t> last(ids.size(), 0);
+         uint64_t writes = 0;
+         std::vector<ReaderResult> cr(static_cast<size_t>(readers));
++        rackobj::ObjectThreadCoh wcoh{};
++        uint64_t wwall = 0, wmax = 0;
++        rackobj::ObjectStats win0{}, win1{};  // the writer window (the writer is the only object writer in it)
++        rackobj::GetObjectStats(&win0);
+         {
+             auto until = std::chrono::steady_clock::now() + std::chrono::seconds(conc_s);
+             std::vector<std::thread> th;
+             for (int i = 0; i < readers; i++)
+                 th.emplace_back(Reader, 2 + readers + i, std::cref(ids), until, &cr[static_cast<size_t>(i)]);
+-            std::thread w(ChurnWriter, 1 + 2 * readers + 1, std::cref(ids), until, &last, &writes);
++            std::thread w([&] {
++                ChurnWriter(1 + 2 * readers + 1, ids, until, &last, &writes, &wcoh, &wwall, &wmax);
++            });
+             w.join();
+             for (auto &t : th) t.join();
+         }
++        rackobj::GetObjectStats(&win1);
+         {
+             rackobj::ObjectHandle h;
+             CHECK_EQ(rackobj::ObjectWriteStart(kChurnFinal, &h), 0);
+@@ -479,6 +746,10 @@ int main(int argc, char **argv) {
+                   << after.read_retry_notify - before.read_retry_notify << " / incoherent "
+                   << after.read_retry_incoherent - before.read_retry_incoherent << ", replay flushes "
+                   << after.replay_flushes - before.replay_flushes;
++        LOG(INFO) << "COH churn writer: " << CohStr(wcoh) << " | wall " << wwall << " ns, max write " << wmax << " ns";
++        EXPECT(wcoh.wstart_ns + wcoh.wflush_ns <= wwall);  // sub-intervals of the writer's wall time
++        EXPECT(wcoh.switch_rw_cnt == win1.switch_rw - win0.switch_rw);
++        EXPECT(wcoh.write_sections == writes && wcoh.wflush_cnt == writes);
+         EXPECT(writes > 0 && tot.reads > 0);
+         EXPECT(tot.torn == 0);
+         EXPECT(tot.backwards == 0);
+@@ -486,10 +757,15 @@ int main(int argc, char **argv) {
+         Barrier("churn checked");
+     }
+ 
++    // ---- phase 7: per-thread coherence counters (build 71) ----
++    CohPhase(1 + 2 * readers + 2);
++    if (const char *ov = std::getenv("OBJECT_TEST_OVERHEAD")) OverheadPhase(std::strtoull(ov, nullptr, 10));
++
+     rackobj::ObjectStats st{};
+     rackobj::GetObjectStats(&st);
+     const uint64_t expect_created =
+-        4 /*mailbox, S, P(0), P(1)*/ + 2 /*C(0), C(1)*/ + 1 /*race*/ + 2 * kMany + (churn ? 2 * churn + 1 : 0);
++        4 /*mailbox, S, P(0), P(1)*/ + 2 /*C(0), C(1)*/ + 1 /*race*/ + 2 * kMany + (churn ? 2 * churn + 1 : 0) +
++        5 /*phase 7: kCohA, X(0), X(1), RO(0), RO(1)*/ + (std::getenv("OBJECT_TEST_OVERHEAD") ? 1 : 0);
+     EXPECT(st.created == expect_created);
+     EXPECT(st.lost_bytes <= 4096);  // only the losing race create (1000 or 1001 B rounded up to object_align)
+     LOG(INFO) << "OBJECT-STATS node " << node_id << ": arena " << st.used_bytes << "/" << st.arena_bytes << " B, created "
+diff --git a/include/rackobj.h b/include/rackobj.h
+index ef34a26..0c36978 100644
+--- a/include/rackobj.h
++++ b/include/rackobj.h
+@@ -78,6 +78,42 @@ struct ObjectStats {
+     uint64_t write_sections, write_retry, switch_rw;
+     uint64_t flushes, flush_bytes;                // read-side incoherent flushes + write_end flushes
+     uint64_t replay_flushes, replay_flush_bytes;  // NR replay of object events (own and other node's)
++    // build 71: read_retry_incoherent = read_retry_stale + read_retry_concurrent
++    uint64_t read_retry_stale;       // (A) read_start: stale copy (node's validated version != CXL version)
++    uint64_t read_retry_concurrent;  // (B) read_end: version changed during the read
++};
++
++/* Build 71 instrumentation (MOT1 v6 Fig 2/3a; observation only). Coherence time of the CALLING thread since its
++ * Register(): durations in ns (plain rdtsc without fences, converted with the TSC rate), counts in events. Field order
++ * = mshim::CohSnap (systems/megalon/shim/megalon_objapi.h, contract v2). Intervals (exact definitions:
++ * reports/M2-megalon-port-changes.md §13):
++ *   read_sections / write_sections    ObjectReadStart / ObjectWriteStart calls that returned 0 (this thread)
++ *   check_*        read sections only, 1 in check_sample per thread (the 1st, N+1th, ...): ReadStart entry .. return
++ *                  plus, if ReadEnd returns true, ReadEnd entry .. return; minus the (A) and (D) time inside them.
++ *                  check_sampled = sampled sections; estimate of all sections = check_ns_sampled * check_sample
++ *   stale (A)      read_start found a stale copy: from read_seq_start's PAGE_INCOHERENT until the restarted attempt
++ *                  succeeded (whole-object flush + the restart: GetAnchor, read_seq_start), minus (D) inside it
++ *   concur (B)     ReadEnd returned false on PAGE_INCOHERENT: ReadStart return .. ReadEnd return (the discarded
++ *                  section body, read_end's checks, the whole-object flush), minus (D) inside read_end
++ *   meta (C)       ReadEnd returned false on META_OUTDATE: ReadStart return .. ReadEnd return, minus (D)
++ *   spin (D)       contended waits inside ObjectReadStart/ObjectReadEnd: read_seqlock_begin while the version is
++ *                  odd (a writer holds it), NR combiner-lock waits in the read-side sync loops, NR replica RwLock
++ *                  read waits; one count per episode. Never overlaps check/stale/concur/meta
++ *   wstart         ObjectWriteStart entry .. return, everything (GetAnchor, switch_rw incl. reclaim, retries,
++ *                  write_seq_start, NR waits); switch_rw (each SwitchRW call) and reclaim (each critical-path
++ *                  reclaim attempt inside it) are sub-intervals of wstart
++ *   wflush         ObjectWriteEnd entry .. return (whole-object clflushopt + fence, write_seq_end); wflush_bytes =
++ *                  bytes flushed (0 in the hwcc flavor: no flush) */
++struct ObjectThreadCoh {
++    uint64_t read_sections, write_sections;
++    uint64_t check_sample, check_ns_sampled, check_sampled;
++    uint64_t stale_cnt, stale_ns;
++    uint64_t concur_cnt, concur_ns;
++    uint64_t meta_cnt, meta_ns;
++    uint64_t spin_cnt, spin_ns;
++    uint64_t wstart_ns, switch_rw_cnt, switch_rw_ns, reclaim_cnt, reclaim_ns;
++    uint64_t wflush_cnt, wflush_ns, wflush_bytes;
++    uint64_t reserved[8];  // reserved[0] = TSC rate in kHz used for the conversion; reserved[1] = timers on (1/0)
+ };
+ 
+ int ObjectCreate(uint64_t id, size_t size);
+@@ -94,6 +130,13 @@ void ObjectWriteEnd(ObjectHandle* h);
+ 
+ void GetObjectStats(ObjectStats* s);
+ 
++void GetObjectThreadCoh(ObjectThreadCoh* s);  // build 71: the calling thread (see ObjectThreadCoh)
++// build 71, overhead measurement only (object-test OBJECT_TEST_OVERHEAD): switch the instrumentation timers at run
++// time (initial value: MEGALON_COH_TIMERS). Call only while no thread of the process has an open section or a
++// wait in progress; durations recorded across a switch are meaningless.
++void SetCohTimersForMeasurement(bool on);
++bool CohTimersOn();
++
+ /* De Stijl port diagnostics (MEGALON_DIAG=1): this thread's last Get (path/entry/seq) and the process counters. */
+ std::string DiagLastGet();
+ std::string DiagSummary();
+diff --git a/lib/globals.cc b/lib/globals.cc
+index 5f62bce..507f869 100644
+--- a/lib/globals.cc
++++ b/lib/globals.cc
+@@ -1,3 +1,4 @@
++#include "common/coh_stats.h"
+ #include "common/diag.h"
+ #include "globals.h"
+ #include "object_store.h"
+@@ -75,6 +76,7 @@ void Register(int tid) {
+ 
+     lib::thread_local_meta.file_backed_ = false;
+     lib::thread_local_meta.logical_node_id_ = rid;
++    coh::ResetThread();  // build 71 instrumentation: per-thread coherence time since Register()
+ 
+     LOG(INFO) << "thread " << tid << " registered on node " << rid;
+ }
+@@ -131,6 +133,15 @@ void ObjectWriteEnd(ObjectHandle *h) { lib::page_cache.Objects()->WriteEnd(h, &l
+ 
+ void GetObjectStats(ObjectStats *s) { lib::page_cache.Objects()->Stats(s); }
+ 
++void GetObjectThreadCoh(ObjectThreadCoh *s) { lib::ObjectStore::ThreadCoh(s); }
++
++void SetCohTimersForMeasurement(bool on) {
++    coh::g_cfg.timers = on;
++    NrFfi::nr_coh_set_timers(on);
++}
++
++bool CohTimersOn() { return coh::g_cfg.timers; }
++
+ std::string DiagLastGet() {
+     const auto &g = diag::last_get;
+     if (!g.valid) return "no Get recorded (MEGALON_DIAG unset?)";
+diff --git a/lib/object_store.cc b/lib/object_store.cc
+index 308b808..14e5c73 100644
+--- a/lib/object_store.cc
++++ b/lib/object_store.cc
+@@ -4,6 +4,7 @@
+ 
+ #include "absl/log/check.h"
+ #include "absl/log/log.h"
++#include "common/coh_stats.h"
+ #include "index/nr_hashmap.h"
+ 
+ namespace rackobj::lib {
+@@ -177,19 +178,55 @@ int ObjectStore::ReadStart(uint64_t id, ObjectHandle *h, Tlm *tlm) {
+     CHECK(sec.kind == Section::kNone) << "nested object section (one open section per thread)";
+     const auto *nr_meta = tlm->nr_meta_per_thread_;
+     CHECK(nr_meta) << "Register() the thread before using objects";
++    // build 71 instrumentation (observation only; intervals: rackobj.h ObjectThreadCoh)
++    coh::Tls &ct = coh::tls;
++    const coh::Spin sp0 = coh::SpinNow(ct);
++    bool sampled = false;
++    if (ct.sample_left == 0) {
++        sampled = true;
++        ct.sample_left = coh::g_cfg.check_sample - 1;
++    } else {
++        ct.sample_left--;
++    }
++    const uint64_t t_in = sampled ? coh::Now() : 0;
++    uint64_t stale_wall = 0, stale_spin = 0;  // (A) inside this call
++    uint64_t stale_t = 0, stale_sp = 0;
++    bool stale_open = false;
++    auto close_stale = [&] {
++        if (!stale_open) return;
++        const uint64_t t = coh::Now(), sp = coh::SpinNow(ct).cyc;
++        stale_wall += t - stale_t;
++        stale_spin += sp - stale_sp;
++        ct.stale_cyc += (t - stale_t) - (sp - stale_sp);
++        stale_open = false;
++    };
+     const common::BlockId key = Key(id);
+     uint8_t *ptr;
+     size_t size;
+     for (;;) {
+         std::optional<common::GCDEntry> entry = c3po_->Gcd()->GetAnchor(key, nr_meta);
+-        if (!Decode(entry, &ptr, &size)) return -ENOENT;  // objects are created explicitly (no admit)
++        if (!Decode(entry, &ptr, &size)) {  // objects are created explicitly (no admit)
++            close_stale();
++            const coh::Spin sp = coh::SpinNow(ct);
++            ct.spin_cnt += sp.cnt - sp0.cnt;
++            ct.spin_cyc += sp.cyc - sp0.cyc;
++            return -ENOENT;
++        }
+         common::init_read_handle(sec.rh, key, entry, tlm->logical_node_id_);
+         sec.rh.from_cxl = true;
+         sec.rh.cn_index = entry->cn_array_[0].cn_idx_;
+-        if (c3po_->read_seq_start(sec.rh)) break;
++        const bool ok = c3po_->read_seq_start(sec.rh);
++        close_stale();
++        if (ok) break;
+         CHECK(sec.rh.rh_errno == ReadErrno::PAGE_INCOHERENT) << "read_seq_start: unexpected error";
++        // (A) stale copy: open until the restarted attempt has finished
++        stale_t = coh::Now();
++        stale_sp = coh::SpinNow(ct).cyc;
++        stale_open = true;
+         Flush(ptr, size);
++        ct.stale_cnt++;
+         local_.read_retry_incoherent.fetch_add(1, std::memory_order_relaxed);
++        local_.read_retry_stale.fetch_add(1, std::memory_order_relaxed);
+     }
+     sec.kind = Section::kRead;
+     sec.token = ++next_token;
+@@ -197,6 +234,18 @@ int ObjectStore::ReadStart(uint64_t id, ObjectHandle *h, Tlm *tlm) {
+     sec.size = size;
+     *h = ObjectHandle{ptr, size, id, sec.token};
+     local_.read_sections.fetch_add(1, std::memory_order_relaxed);
++    const uint64_t t_ret = coh::Now();
++    const coh::Spin sp1 = coh::SpinNow(ct);
++    ct.read_sections++;
++    ct.sec_ret = t_ret;
++    ct.sec_sp0_cnt = sp0.cnt;
++    ct.sec_sp0_cyc = sp0.cyc;
++    ct.sec_sp1_cyc = sp1.cyc;
++    ct.sec_sampled = sampled;
++    if (sampled) {
++        ct.check_sampled++;
++        ct.check_cyc += (t_ret - t_in) - stale_wall - ((sp1.cyc - sp0.cyc) - stale_spin);
++    }
+     return 0;
+ }
+ 
+@@ -205,17 +254,42 @@ int ObjectStore::ReadStart(uint64_t id, ObjectHandle *h, Tlm *tlm) {
+ bool ObjectStore::ReadEnd(ObjectHandle *h, Tlm *tlm) {
+     CHECK(sec.kind == Section::kRead && h && h->token == sec.token) << "ObjectReadEnd without its ObjectReadStart";
+     sec.kind = Section::kNone;
+-    if (c3po_->read_seq_end(sec.rh, tlm->nr_meta_per_thread_)) return true;
+-    switch (sec.rh.rh_errno) {
+-        case ReadErrno::META_OUTDATE:  // a log event on the object: the replay already flushed it (Get: retry)
+-            local_.read_retry_notify.fetch_add(1, std::memory_order_relaxed);
+-            return false;
+-        case ReadErrno::PAGE_INCOHERENT:  // counter changed during the read (Get: flush, retry)
+-            Flush(sec.ptr, sec.size);
+-            local_.read_retry_incoherent.fetch_add(1, std::memory_order_relaxed);
+-            return false;
+-        default:
+-            LOG(FATAL) << "read_seq_end: unexpected error";
++    coh::Tls &ct = coh::tls;
++    const bool sampled = ct.sec_sampled;
++    const uint64_t t_e = sampled ? coh::Now() : 0;
++    const uint64_t spe = sampled ? coh::SpinNow(ct).cyc : 0;
++    const bool ok = c3po_->read_seq_end(sec.rh, tlm->nr_meta_per_thread_);
++    bool concurrent = false;
++    if (!ok) {
++        switch (sec.rh.rh_errno) {
++            case ReadErrno::META_OUTDATE:  // a log event on the object: the replay already flushed it (Get: retry)
++                local_.read_retry_notify.fetch_add(1, std::memory_order_relaxed);
++                break;
++            case ReadErrno::PAGE_INCOHERENT:  // counter changed during the read (Get: flush, retry)
++                Flush(sec.ptr, sec.size);
++                local_.read_retry_incoherent.fetch_add(1, std::memory_order_relaxed);
++                local_.read_retry_concurrent.fetch_add(1, std::memory_order_relaxed);
++                concurrent = true;
++                break;
++            default:
++                LOG(FATAL) << "read_seq_end: unexpected error";
++        }
++    }
++    // build 71 instrumentation (observation only; intervals: rackobj.h ObjectThreadCoh)
++    const coh::Spin sp2 = coh::SpinNow(ct);
++    ct.spin_cnt += sp2.cnt - ct.sec_sp0_cnt;
++    ct.spin_cyc += sp2.cyc - ct.sec_sp0_cyc;
++    if (ok) {
++        if (sampled) ct.check_cyc += (coh::Now() - t_e) - (sp2.cyc - spe);
++        return true;
++    }
++    const uint64_t d = (coh::Now() - ct.sec_ret) - (sp2.cyc - ct.sec_sp1_cyc);
++    if (concurrent) {
++        ct.concur_cnt++;
++        ct.concur_cyc += d;
++    } else {
++        ct.meta_cnt++;
++        ct.meta_cyc += d;
+     }
+     return false;
+ }
+@@ -227,19 +301,29 @@ int ObjectStore::WriteStart(uint64_t id, ObjectHandle *h, Tlm *tlm) {
+     CHECK(sec.kind == Section::kNone) << "nested object section (one open section per thread)";
+     const auto *nr_meta = tlm->nr_meta_per_thread_;
+     CHECK(nr_meta) << "Register() the thread before using objects";
++    coh::Tls &ct = coh::tls;  // build 71 instrumentation: every write start timed, entry .. return
++    const uint64_t t_in = coh::Now();
+     const common::BlockId key = Key(id);
+     uint8_t *ptr;
+     size_t size;
+     for (;;) {
+         std::optional<common::GCDEntry> entry = c3po_->Gcd()->GetAnchor(key, nr_meta);
+-        if (!Decode(entry, &ptr, &size)) return -ENOENT;
++        if (!Decode(entry, &ptr, &size)) {
++            ct.wstart_cyc += coh::Now() - t_in;
++            return -ENOENT;
++        }
+         common::init_write_handle(sec.wh, key, entry, tlm->logical_node_id_);
+         sec.wh.cn_index = entry->cn_array_[0].cn_idx_;
+         if (c3po_->IsRO(entry)) {
+ #ifndef DYN_WMETA
+             LOG(FATAL) << "object " << id << " has no static record (hwcc objects are created RW)";
+ #endif
++            const uint64_t t_sw = coh::Now(), rc0 = ct.reclaim_cnt, ry0 = ct.reclaim_cyc;
+             std::error_code ec = switch_rw_(sec.wh, tlm);
++            ct.switch_rw_cnt++;
++            ct.switch_rw_cyc += coh::Now() - t_sw;
++            ct.reclaim_obj_cnt += ct.reclaim_cnt - rc0;
++            ct.reclaim_obj_cyc += ct.reclaim_cyc - ry0;
+             CHECK(ec != std::make_error_code(std::errc::operation_not_permitted)) << "object entry vanished";
+             local_.switch_rw.fetch_add(1, std::memory_order_relaxed);
+             continue;
+@@ -254,6 +338,8 @@ int ObjectStore::WriteStart(uint64_t id, ObjectHandle *h, Tlm *tlm) {
+     sec.size = size;
+     *h = ObjectHandle{ptr, size, id, sec.token};
+     local_.write_sections.fetch_add(1, std::memory_order_relaxed);
++    ct.write_sections++;
++    ct.wstart_cyc += coh::Now() - t_in;
+     return 0;
+ }
+ 
+@@ -261,9 +347,49 @@ int ObjectStore::WriteStart(uint64_t id, ObjectHandle *h, Tlm *tlm) {
+ // write_seq_end (counter even, wrap-around event, l = c, unlock).
+ void ObjectStore::WriteEnd(ObjectHandle *h, Tlm *tlm) {
+     CHECK(sec.kind == Section::kWrite && h && h->token == sec.token) << "ObjectWriteEnd without its ObjectWriteStart";
++    coh::Tls &ct = coh::tls;  // build 71 instrumentation: every write end timed, entry .. return
++    const uint64_t t_in = coh::Now();
+     Flush(sec.ptr, sec.size);
+     c3po_->write_seq_end(sec.wh, tlm->nr_meta_per_thread_);
+     sec.kind = Section::kNone;
++    ct.wflush_cnt++;
++#ifndef FULL_COHERENCE
++    ct.wflush_bytes += sec.size;
++#endif
++    ct.wflush_cyc += coh::Now() - t_in;
++}
++
++void ObjectStore::ThreadCoh(ObjectThreadCoh *s) {
++    const coh::Tls &t = coh::tls;
++    const bool on = coh::g_cfg.timers;
++    const double hz = on ? coh::TscHz() : 0.0;
++    auto ns = [&](uint64_t cyc) -> uint64_t {
++        return on && hz > 0 ? static_cast<uint64_t>(static_cast<double>(cyc) * 1e9 / hz + 0.5) : 0;
++    };
++    *s = ObjectThreadCoh{};
++    s->read_sections = t.read_sections;
++    s->write_sections = t.write_sections;
++    s->check_sample = coh::g_cfg.check_sample;
++    s->check_ns_sampled = ns(t.check_cyc);
++    s->check_sampled = t.check_sampled;
++    s->stale_cnt = t.stale_cnt;
++    s->stale_ns = ns(t.stale_cyc);
++    s->concur_cnt = t.concur_cnt;
++    s->concur_ns = ns(t.concur_cyc);
++    s->meta_cnt = t.meta_cnt;
++    s->meta_ns = ns(t.meta_cyc);
++    s->spin_cnt = t.spin_cnt;
++    s->spin_ns = ns(t.spin_cyc);
++    s->wstart_ns = ns(t.wstart_cyc);
++    s->switch_rw_cnt = t.switch_rw_cnt;
++    s->switch_rw_ns = ns(t.switch_rw_cyc);
++    s->reclaim_cnt = t.reclaim_obj_cnt;
++    s->reclaim_ns = ns(t.reclaim_obj_cyc);
++    s->wflush_cnt = t.wflush_cnt;
++    s->wflush_ns = ns(t.wflush_cyc);
++    s->wflush_bytes = t.wflush_bytes;
++    s->reserved[0] = static_cast<uint64_t>(hz / 1000.0 + 0.5);
++    s->reserved[1] = on ? 1 : 0;
+ }
+ 
+ void ObjectStore::Stats(ObjectStats *s) const {
+@@ -286,6 +412,8 @@ void ObjectStore::Stats(ObjectStats *s) const {
+     s->switch_rw = local_.switch_rw.load();
+     s->flushes = local_.flushes.load();
+     s->flush_bytes = local_.flush_bytes.load();
++    s->read_retry_stale = local_.read_retry_stale.load();
++    s->read_retry_concurrent = local_.read_retry_concurrent.load();
+     NrFfi::nr_obj_replay_flush_stats(&s->replay_flushes, &s->replay_flush_bytes);
+ }
+ 
+diff --git a/lib/object_store.h b/lib/object_store.h
+index 326dfbc..7440061 100644
+--- a/lib/object_store.h
++++ b/lib/object_store.h
+@@ -68,6 +68,9 @@ public:
+ 
+     void Stats(ObjectStats *s) const;
+ 
++    /* build 71 instrumentation: the calling thread's coherence time since Register() (rackobj.h ObjectThreadCoh) */
++    static void ThreadCoh(ObjectThreadCoh *s);
++
+ private:
+     static common::BlockId Key(uint64_t id);
+     bool Decode(const std::optional<common::GCDEntry> &e, uint8_t **ptr, size_t *size) const;
+@@ -87,6 +90,7 @@ private:
+     struct Local {
+         std::atomic<uint64_t> creates{0}, create_exists{0}, create_nomem{0};
+         std::atomic<uint64_t> read_sections{0}, read_retry_notify{0}, read_retry_incoherent{0};
++        std::atomic<uint64_t> read_retry_stale{0}, read_retry_concurrent{0};  // build 71: split of incoherent
+         std::atomic<uint64_t> write_sections{0}, write_retry{0}, switch_rw{0};
+         std::atomic<uint64_t> flushes{0}, flush_bytes{0};
+     };
+diff --git a/lib/shm_obj_handle.cc b/lib/shm_obj_handle.cc
+index 78d2b31..53806f6 100644
+--- a/lib/shm_obj_handle.cc
++++ b/lib/shm_obj_handle.cc
+@@ -8,6 +8,7 @@
+ #include "object_store.h"
+ #include "original_syscalls.h"
+ #include "shared_memory/cxl_port.h"
++#include "common/coh_stats.h"
+ #include "common/diag.h"
+ 
+ namespace rackobj::lib {
+@@ -693,8 +694,15 @@ std::error_code SharedMemoryObjectHandle<Policy>::SwitchRW(const common::WriteHa
+         if (new_wmeta_index_optional.has_value()) break;
+ 
+         // critical path reclamation
++        // De Stijl port instrumentation (build 71): every attempt timed, SampleVictim .. FinishReclaim (or the empty
++        // sample); observation only
++        const uint64_t reclaim_t0 = coh::Now();
+         new_wmeta_index_optional = c3po_->Scr_meta()->SampleVictim(MAX_WMETA_SAMPLING_SIZE);
+-        if (!new_wmeta_index_optional.has_value()) continue;
++        if (!new_wmeta_index_optional.has_value()) {
++            coh::tls.reclaim_cnt++;
++            coh::tls.reclaim_cyc += coh::Now() - reclaim_t0;
++            continue;
++        }
+ 
+         common::WriteMetadata *cur = c3po_->Scr_meta()->GetWmeta(new_wmeta_index_optional.value());
+         const size_t diag_victim = new_wmeta_index_optional.value();
+@@ -719,6 +727,8 @@ std::error_code SharedMemoryObjectHandle<Policy>::SwitchRW(const common::WriteHa
+         (void)cur;
+         // the answer stays the next reservation's scan hint, as upstream
+         c3po_->Scr_meta()->FinishReclaim(diag_victim, new_wmeta_index_optional);
++        coh::tls.reclaim_cnt++;
++        coh::tls.reclaim_cyc += coh::Now() - reclaim_t0;
+ 
+         cpu_relax();
+     } while (true);
+diff --git a/src/common/coh_stats.cc b/src/common/coh_stats.cc
+new file mode 100644
+index 0000000..00d7f64
+--- /dev/null
++++ b/src/common/coh_stats.cc
+@@ -0,0 +1,69 @@
++#include "coh_stats.h"
++
++#include <time.h>
++
++#include <atomic>
++#include <cstdlib>
++#include <cstring>
++
++#include "index/nr_hashmap.h"
++
++namespace rackobj::coh {
++
++Config g_cfg;
++thread_local Tls tls;
++
++namespace {
++
++uint64_t MonoNs() {
++    timespec ts;
++    clock_gettime(CLOCK_MONOTONIC, &ts);
++    return static_cast<uint64_t>(ts.tv_sec) * 1000000000ull + static_cast<uint64_t>(ts.tv_nsec);
++}
++
++uint64_t load_tsc, load_ns;
++std::atomic<double> cached_hz{0.0};
++
++__attribute__((constructor)) void Init() {
++    if (const char *v = std::getenv("MEGALON_COH_TIMERS")) g_cfg.timers = std::strcmp(v, "0") != 0;
++    if (const char *v = std::getenv("MEGALON_COH_CHECK_SAMPLE")) {
++        long n = std::strtol(v, nullptr, 10);
++        g_cfg.check_sample = n >= 1 ? static_cast<uint64_t>(n) : 64;
++    }
++    NrFfi::nr_coh_set_timers(g_cfg.timers);
++    load_ns = MonoNs();
++    load_tsc = __rdtsc();
++}
++
++}  // namespace
++
++const uint64_t *NrPtr() {
++    if (!tls.nr) tls.nr = NrFfi::nr_thread_wait_stat();
++    return tls.nr;
++}
++
++void ResetThread() {
++    Tls &t = tls;
++    const uint64_t rs_cnt = t.rseq_spin_cnt, rs_cyc = t.rseq_spin_cyc, rc_cnt = t.reclaim_cnt, rc_cyc = t.reclaim_cyc;
++    std::memset(static_cast<void *>(&t), 0, sizeof(t));
++    t.rseq_spin_cnt = rs_cnt;
++    t.rseq_spin_cyc = rs_cyc;
++    t.reclaim_cnt = rc_cnt;
++    t.reclaim_cyc = rc_cyc;
++    t.nr = NrFfi::nr_thread_wait_stat();
++}
++
++double TscHz() {
++    double hz = cached_hz.load(std::memory_order_relaxed);
++    if (hz > 0) return hz;
++    uint64_t ns = MonoNs(), tsc = __rdtsc();
++    while (ns - load_ns < 20000000ull) {  // at least 20 ms of reference interval
++        ns = MonoNs();
++        tsc = __rdtsc();
++    }
++    hz = static_cast<double>(tsc - load_tsc) * 1e9 / static_cast<double>(ns - load_ns);
++    if (ns - load_ns >= 200000000ull) cached_hz.store(hz, std::memory_order_relaxed);
++    return hz;
++}
++
++}  // namespace rackobj::coh
+diff --git a/src/common/coh_stats.h b/src/common/coh_stats.h
+new file mode 100644
+index 0000000..213a354
+--- /dev/null
++++ b/src/common/coh_stats.h
+@@ -0,0 +1,65 @@
++// De Stijl port instrumentation (MOT1 v6 Fig 2/3a, build 71): per-thread coherence time of the object API.
++// Observation only: no protocol change. Semantics of every field: rackobj.h ObjectThreadCoh and
++// reports/M2-megalon-port-changes.md §13 (De Stijl control repo).
++//
++// Timers: plain rdtsc without fences (accumulated in TSC cycles, converted to ns with the TSC rate when read).
++// Environment (read once at load):
++//   MEGALON_COH_TIMERS=0          no rdtsc at all (counts kept, durations 0); default 1
++//   MEGALON_COH_CHECK_SAMPLE=N    section checks timed in 1 of N read sections per thread; default 64, >= 1
++#pragma once
++
++#include <x86intrin.h>
++
++#include <cstdint>
++
++namespace rackobj::coh {
++
++struct Config {
++    bool timers = true;
++    uint64_t check_sample = 64;
++};
++extern Config g_cfg;
++
++inline uint64_t Now() { return g_cfg.timers ? __rdtsc() : 0; }
++
++// Thread-local accumulators, zero-initialised (no TLS constructor). Raw totals (any caller) and the object-API
++// attribution (CohSnap fields, in cycles).
++struct Tls {
++    // raw, recorded at the spin/reclaim sites for any caller (slot or object path)
++    uint64_t rseq_spin_cnt, rseq_spin_cyc;  // read_seqlock_begin while the sequence is odd (contended only)
++    uint64_t reclaim_cnt, reclaim_cyc;      // SwitchRW critical-path reclaim attempts (SampleVictim .. FinishReclaim)
++    const uint64_t *nr;                     // NR read-side wait totals [episodes, cycles] (nr_thread_wait_stat)
++    // object API attribution since Register()
++    uint64_t read_sections, write_sections;
++    uint64_t check_cyc, check_sampled;
++    uint64_t stale_cnt, stale_cyc;
++    uint64_t concur_cnt, concur_cyc;
++    uint64_t meta_cnt, meta_cyc;
++    uint64_t spin_cnt, spin_cyc;
++    uint64_t wstart_cyc, switch_rw_cnt, switch_rw_cyc, reclaim_obj_cnt, reclaim_obj_cyc;
++    uint64_t wflush_cnt, wflush_cyc, wflush_bytes;
++    // open read section
++    uint64_t sample_left;  // read sections until the next sampled one (0: the next one is sampled)
++    uint64_t sec_ret;      // Now() at ReadStart return
++    uint64_t sec_sp0_cnt, sec_sp0_cyc, sec_sp1_cyc;  // SpinNow at ReadStart entry (cnt, cyc) and return (cyc)
++    bool sec_sampled;      // this section's checks are timed
++};
++extern thread_local Tls tls;
++
++// Contended-wait totals of the calling thread (read_seqlock_begin spin + NR read-side waits).
++struct Spin {
++    uint64_t cnt, cyc;
++};
++const uint64_t *NrPtr();
++inline Spin SpinNow(Tls &t) {
++    const uint64_t *nr = t.nr ? t.nr : NrPtr();
++    return Spin{t.rseq_spin_cnt + nr[0], t.rseq_spin_cyc + nr[1]};
++}
++
++// Called at Register(): zero the attribution (the raw totals are monotonic) and bind the NR pointer.
++void ResetThread();
++
++// TSC rate (Hz), measured against CLOCK_MONOTONIC from library load to the first call that is >= 200 ms later.
++double TscHz();
++
++}  // namespace rackobj::coh
+diff --git a/src/core/seqcount.cc b/src/core/seqcount.cc
+index b619aa2..40182f9 100644
+--- a/src/core/seqcount.cc
++++ b/src/core/seqcount.cc
+@@ -1,5 +1,7 @@
+ #include "seqcount.h"
+ 
++#include "common/coh_stats.h"
++
+ namespace rackobj {
+ 
+ uint32_t read_seqcount_begin(struct seqcount* s) {
+@@ -318,6 +320,8 @@ uint32_t seqlock_full_relaxed(seqlock_t* s) { return s->sequence.load(std::memor
+ uint32_t read_seqlock_begin(seqlock_t* s) {
+ #if C3_RWLOCK == 0
+     uint32_t seq;
++    uint64_t spin_t0 = 0;  // De Stijl port instrumentation (build 71): contended spin only, observation only
++    bool spun = false;
+ 
+     do {
+ #ifdef NO_COHERENCE
+@@ -325,8 +329,17 @@ uint32_t read_seqlock_begin(seqlock_t* s) {
+ #endif
+         seq = s->sequence.load(std::memory_order_acquire);
+         if (!(seq & 1)) break;
++        if (!spun) {
++            spun = true;
++            spin_t0 = coh::Now();
++        }
+         cpu_relax();
+     } while (true);
++    if (spun) [[unlikely]] {
++        coh::Tls& t = coh::tls;
++        t.rseq_spin_cnt++;
++        t.rseq_spin_cyc += coh::Now() - spin_t0;
++    }
+ 
+     return seq & SEQ_MASK;
+ #else
+diff --git a/src/index/nr_hashmap.h b/src/index/nr_hashmap.h
+index 0857745..f15b48d 100644
+--- a/src/index/nr_hashmap.h
++++ b/src/index/nr_hashmap.h
+@@ -137,6 +137,10 @@ size_t ObjectCreate(const NrMeta* metadata, rackobj::common::BlockId key, ssize_
+                     ssize_t wmeta_idx);
+ /* replay flushes of object events (this node's own and the other node's), in this process */
+ void nr_obj_replay_flush_stats(uint64_t* count, uint64_t* bytes);
++/* De Stijl port instrumentation (build 71): the calling thread's NR read-side wait totals [episodes, TSC cycles]
++ * (nr/waitstat.rs; stable address per thread) and the timer switch (MEGALON_COH_TIMERS). */
++const uint64_t* nr_thread_wait_stat();
++void nr_coh_set_timers(bool on);
+ 
+ }  // extern "C"
+ }  // namespace NrFfi
+diff --git a/third-party/nr_rust/ffi/ffi_nr_hashmap.rs b/third-party/nr_rust/ffi/ffi_nr_hashmap.rs
+index 89b8b84..1e55cd7 100644
+--- a/third-party/nr_rust/ffi/ffi_nr_hashmap.rs
++++ b/third-party/nr_rust/ffi/ffi_nr_hashmap.rs
+@@ -1461,3 +1461,16 @@ pub extern "C" fn nr_obj_replay_flush_stats(count: *mut u64, bytes: *mut u64) {
+         *bytes = b as u64;
+     }
+ }
++
++/// De Stijl port instrumentation (MOT1 v6, build 71): address of the calling thread's NR read-side wait totals
++/// [episodes, TSC cycles] (node_replication::nr::waitstat); stable for the thread's lifetime.
++#[no_mangle]
++pub extern "C" fn nr_thread_wait_stat() -> *const u64 {
++    node_replication::nr::waitstat::thread_ptr()
++}
++
++/// Instrumentation timers on/off (counts are kept either way; durations are 0 when off).
++#[no_mangle]
++pub extern "C" fn nr_coh_set_timers(on: bool) {
++    node_replication::nr::waitstat::TIMERS.store(on, Ordering::Relaxed);
++}
+diff --git a/third-party/nr_rust/ffi/port_tests.rs b/third-party/nr_rust/ffi/port_tests.rs
+index 60c382f..0a02ccb 100644
+--- a/third-party/nr_rust/ffi/port_tests.rs
++++ b/third-party/nr_rust/ffi/port_tests.rs
+@@ -369,3 +369,34 @@ fn op_enqueued_during_sync_round_is_served() {
+     println!("op_enqueued_during_sync_round_is_served: max execute_mut {} us", max_ns / 1000);
+     assert!(max_ns < 100_000_000, "an op waited {} ms behind a sync round that did not combine", max_ns / 1_000_000);
+ }
++
++/// Build 71 instrumentation: a read that waits for a writer of the replica's RwLock records exactly one wait episode
++/// with a non-zero duration; an uncontended read records none.
++#[test]
++fn waitstat_records_contended_read_lock_only() {
++    use node_replication::nr::rwlock::RwLock;
++    use node_replication::nr::waitstat;
++    let ws = || unsafe {
++        let p = waitstat::thread_ptr();
++        (*p, *p.add(1))
++    };
++    let lock = Arc::new(RwLock::<usize>::default());
++    let (c0, _) = ws();
++    drop(lock.read(0));
++    assert_eq!(ws().0, c0, "uncontended read must not record a wait");
++    let held = Arc::new(AtomicBool::new(false));
++    let (l2, h2) = (lock.clone(), held.clone());
++    let w = std::thread::spawn(move || {
++        let g = l2.write(1);
++        h2.store(true, Ordering::SeqCst);
++        std::thread::sleep(std::time::Duration::from_millis(20));
++        drop(g);
++    });
++    while !held.load(Ordering::SeqCst) {}
++    let (c1, y1) = ws();
++    drop(lock.read(0));
++    let (c2, y2) = ws();
++    w.join().unwrap();
++    assert_eq!(c2 - c1, 1, "one wait episode");
++    assert!(y2 - y1 > 1_000_000, "waited ~20 ms, got {} cycles", y2 - y1);
++}
+diff --git a/third-party/nr_rust/node-replication/src/lib.rs b/third-party/nr_rust/node-replication/src/lib.rs
+index 862bacd..685f51e 100644
+--- a/third-party/nr_rust/node-replication/src/lib.rs
++++ b/third-party/nr_rust/node-replication/src/lib.rs
+@@ -15,7 +15,8 @@
+     allocator_api,
+     // box_syntax,
+     doc_auto_cfg,
+-    core_intrinsics
++    core_intrinsics,
++    thread_local // De Stijl port: nr::waitstat (instrumentation)
+ )]
+ #[cfg(test)]
+ extern crate std;
+diff --git a/third-party/nr_rust/node-replication/src/nr/mod.rs b/third-party/nr_rust/node-replication/src/nr/mod.rs
+index e5b8838..488b99c 100644
+--- a/third-party/nr_rust/node-replication/src/nr/mod.rs
++++ b/third-party/nr_rust/node-replication/src/nr/mod.rs
+@@ -84,6 +84,7 @@ use arrayvec::ArrayVec;
+ mod context;
+ pub mod log;
+ pub mod replica;
++pub mod waitstat;
+ #[cfg(feature = "async")]
+ pub mod reusable_box;
+ 
+diff --git a/third-party/nr_rust/node-replication/src/nr/replica.rs b/third-party/nr_rust/node-replication/src/nr/replica.rs
+index b846aa0..3baf8e6 100644
+--- a/third-party/nr_rust/node-replication/src/nr/replica.rs
++++ b/third-party/nr_rust/node-replication/src/nr/replica.rs
+@@ -781,11 +781,8 @@ where
+         // We can perform the read only if our replica is synced up against
+         // the shared log. If it isn't, then try to combine until it is synced up.
+         let ctail = slog.get_ctail();
+-        while !slog.is_replica_synced_for_reads(&self.log_tkn, ctail) {
+-            if let Err(e) = self.try_combine(slog) {
+-                return Err((e, op));
+-            }
+-            spin_loop();
++        if let Err(e) = self.combine_until_synced(slog, ctail) {
++            return Err((e, op));
+         }
+ 
+         return Ok(self.data.read(idx.tid() - 1).dispatch(op));
+@@ -801,11 +798,8 @@ where
+         // We can perform the read only if our replica is synced up against
+         // the shared log. If it isn't, then try to combine until it is synced up.
+         let ctail = slog.get_ctail();
+-        while !slog.is_replica_synced_for_reads(&self.log_tkn, ctail) {
+-            if let Err(e) = self.try_combine(slog) {
+-                return Err((e, op));
+-            }
+-            spin_loop();
++        if let Err(e) = self.combine_until_synced(slog, ctail) {
++            return Err((e, op));
+         }
+ 
+         // [C3] Store the notification while still holding the read guard, so a
+@@ -1081,10 +1075,38 @@ where
+         if let Some(combiner_lock) = cl {
+             self.combine(slog, combiner_lock)?;
+         }
++        self.combine_until_synced(slog, ctail)
++    }
++
++    /// De Stijl port instrumentation (waitstat, observation only): the read-side loop
++    /// `while !synced { try_combine()?; spin_loop() }` written out, so the time spent
++    /// while another thread holds the combiner lock is recorded as one wait episode.
++    #[inline(always)]
++    fn combine_until_synced<'r>(
++        &'r self,
++        slog: &Log<<D as Dispatch>::WriteOperation>,
++        ctail: usize,
++    ) -> Result<(), ReplicaError<'r, D>> {
++        let mut wait: Option<u64> = None;
+         while !slog.is_replica_synced_for_reads(&self.log_tkn, ctail) {
+-            self.try_combine(slog)?;
++            match self.acquire_combiner_lock() {
++                Some(combiner_lock) => {
++                    if let Some(t0) = wait.take() {
++                        super::waitstat::add(t0);
++                    }
++                    self.combine(slog, combiner_lock)?;
++                }
++                None => {
++                    if wait.is_none() {
++                        wait = Some(super::waitstat::now());
++                    }
++                }
++            }
+             spin_loop();
+         }
++        if let Some(t0) = wait {
++            super::waitstat::add(t0);
++        }
+         Ok(())
+     }
+ 
+diff --git a/third-party/nr_rust/node-replication/src/nr/rwlock.rs b/third-party/nr_rust/node-replication/src/nr/rwlock.rs
+index be0ff81..a4bd5b1 100644
+--- a/third-party/nr_rust/node-replication/src/nr/rwlock.rs
++++ b/third-party/nr_rust/node-replication/src/nr/rwlock.rs
+@@ -175,10 +175,16 @@ where
+                 as *const bool)
+         };
+ 
++        // De Stijl port instrumentation (waitstat, observation only): one wait episode from the
++        // first time a writer is seen until the read lock is held.
++        let mut wait: Option<u64> = None;
+         loop {
+             // First, wait until the write lock is free. This is the small
+             // optimization spoken of earlier.
+             unsafe {
++                if core::ptr::read_volatile(ptr) && wait.is_none() {
++                    wait = Some(super::waitstat::now());
++                }
+                 while core::ptr::read_volatile(ptr) {
+                     spin_loop();
+                 }
+@@ -194,6 +200,12 @@ where
+             }
+ 
+             self.rlock[tid].fetch_sub(1, Ordering::Release);
++            if wait.is_none() {
++                wait = Some(super::waitstat::now());
++            }
++        }
++        if let Some(t0) = wait {
++            super::waitstat::add(t0);
+         }
+ 
+         unsafe { ReadGuard::new(self, tid) }
+diff --git a/third-party/nr_rust/node-replication/src/nr/waitstat.rs b/third-party/nr_rust/node-replication/src/nr/waitstat.rs
+new file mode 100644
+index 0000000..022b723
+--- /dev/null
++++ b/third-party/nr_rust/node-replication/src/nr/waitstat.rs
+@@ -0,0 +1,44 @@
++// De Stijl port instrumentation (MOT1 v6, build 71): per-thread contended-wait accounting for the read side of NR.
++// Observation only; no behaviour change. Recorded episodes (each counted once, duration in TSC cycles, plain rdtsc
++// without fences):
++//   - a read-side sync loop (Replica::execute / execute_anchor / sync_combine) that found the combiner lock held by
++//     another thread: from the first failed acquisition until this thread acquires the lock or the replica is synced;
++//   - RwLock::read while a writer (combiner replay) holds the write lock: from the first observation until the read
++//     lock is held.
++// The C++ side (src/common/coh_stats.h) reads the calling thread's totals through nr_thread_wait_stat() and
++// attributes deltas to the object read sections.
++
++use core::sync::atomic::{AtomicBool, Ordering};
++
++/// Totals of the calling thread: [episodes, cycles].
++#[thread_local]
++static mut WAIT: [u64; 2] = [0, 0];
++
++/// Timers on (default) or off (MEGALON_COH_TIMERS=0): off keeps the counts, durations stay 0.
++pub static TIMERS: AtomicBool = AtomicBool::new(true);
++
++#[inline(always)]
++pub fn now() -> u64 {
++    if TIMERS.load(Ordering::Relaxed) {
++        unsafe { core::arch::x86_64::_rdtsc() }
++    } else {
++        0
++    }
++}
++
++/// Ends an episode that started at `t0` (a value of `now()`).
++#[cold]
++#[inline(never)]
++pub fn add(t0: u64) {
++    let t1 = now();
++    unsafe {
++        let w = &mut *core::ptr::addr_of_mut!(WAIT);
++        w[0] += 1;
++        w[1] += t1.wrapping_sub(t0);
++    }
++}
++
++/// Address of the calling thread's [episodes, cycles]; stable for the thread's lifetime.
++pub fn thread_ptr() -> *const u64 {
++    unsafe { core::ptr::addr_of!(WAIT) as *const u64 }
++}
+-- 
+2.34.1
+

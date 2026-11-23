@@ -1,0 +1,143 @@
+From 8d0ae1edac9b33e242aedee351bd9bb0e58e0d92 Mon Sep 17 00:00:00 2001
+From: Sungsu Ahn <sungsu_ahn@korea.ac.kr>
+Date: Wed, 14 Oct 2026 22:40:39 +0900
+Subject: [PATCH 09/51] kv-store: align nodes after warmup, cross-node
+ visibility, node0-writers mode
+
+- NodeBarrier(1) after every node's warmup (aligns measurement windows).
+- Counts valid values stamped by the other node and requires > 0 for
+  PASS (except node 0 in node0-writers mode).
+- KV_WRITERS=node0: only node 0 warms up and writes; node 1 only reads
+  and verifies.
+- No Gets or no content to check (write_ratio 0) => NO-CHECK, exit 4;
+  FAIL stays exit 3.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ benchmarks/kv_store.cc | 47 ++++++++++++++++++++++++++++++++++++------
+ 1 file changed, 41 insertions(+), 6 deletions(-)
+
+diff --git a/benchmarks/kv_store.cc b/benchmarks/kv_store.cc
+index f97c35f..d4b4dfc 100644
+--- a/benchmarks/kv_store.cc
++++ b/benchmarks/kv_store.cc
+@@ -39,6 +39,9 @@ static size_t node_id = 0;
+ // write_ratio == 0 keeps upstream's warmup (Put(nullptr): read-only entries without data), so
+ // there is no value to check; only misses are checked then.
+ static bool check_values = true;
++// KV_WRITERS=node0: only node 0 writes (warmup and workload); node 1 only reads and verifies.
++static bool only_node0_writes = false;
++static inline bool this_node_writes() { return !only_node0_writes || node_id == 0; }
+ 
+ #define FLUSH_THRESHOLD 5000
+ #define REPORT_INTERVAL 1
+@@ -121,6 +124,7 @@ struct ValueCheckStats {
+     std::atomic<uint64_t> misses{0};       // Get found no entry (all keys are warmed up first)
+     std::atomic<uint64_t> bad_values{0};   // Get returned a value that fails CheckValue
+     std::atomic<uint64_t> short_reads{0};  // Get returned fewer than ACCESS_SIZE bytes
++    std::atomic<uint64_t> remote{0};       // valid values whose stamp names the other node (cross-node visibility)
+ };
+ 
+ // helper to get current time in ns since epoch
+@@ -184,7 +188,7 @@ static void workload(AccessPattern* ap, const std::string& latency_filename, con
+ 
+     uint64_t local_ops = 0;
+     uint64_t put_seq = 0;
+-    uint64_t gets = 0, misses = 0, bad = 0, short_reads = 0;
++    uint64_t gets = 0, misses = 0, bad = 0, short_reads = 0, remote = 0;
+     bool warmup_done_local = false;
+     bool measure_local = false;
+     bool cooldown_local = false;
+@@ -203,7 +207,7 @@ static void workload(AccessPattern* ap, const std::string& latency_filename, con
+ 
+         // Generate access pattern
+         off_t offset = ap->GenerateNextOffset();
+-        bool is_read = (ap->GenerateRW() == 0);
++        bool is_read = (ap->GenerateRW() == 0) || !this_node_writes();
+         size_t buf_offset = ACCESS_SIZE * distrib(gen);
+ 
+         uint32_t tsc_aux;
+@@ -237,6 +241,8 @@ static void workload(AccessPattern* ap, const std::string& latency_filename, con
+                                << *reinterpret_cast<const uint64_t*>(vbuf) << " stamp 0x" << std::hex
+                                << *reinterpret_cast<const uint64_t*>(vbuf + 8) << std::dec;
+                 bad++;
++            } else if (check_values && (*reinterpret_cast<const uint64_t*>(vbuf + 8) >> 56) != node_id) {
++                remote++;
+             }
+         }
+ 
+@@ -290,6 +296,7 @@ static void workload(AccessPattern* ap, const std::string& latency_filename, con
+     vstats->misses.fetch_add(misses);
+     vstats->bad_values.fetch_add(bad);
+     vstats->short_reads.fetch_add(short_reads);
++    vstats->remote.fetch_add(remote);
+ 
+ #ifndef NONRACKOBJ
+     read_cnt->fetch_add(samples_read.size(), std::memory_order_seq_cst);
+@@ -342,6 +349,11 @@ int main(int argc, char** argv) {
+     CHECK(thread_cnt >= 1 && thread_cnt + (node_id == 0 ? 1 : 0) <= 32)
+         << "thread_cnt " << thread_cnt << " exceeds the 32 NR registrations of a node";
+     check_values = write_ratio > 0.0;
++    if (const char* w = getenv("KV_WRITERS")) {
++        CHECK(std::string(w) == "all" || std::string(w) == "node0") << "KV_WRITERS must be all or node0";
++        only_node0_writes = std::string(w) == "node0";
++    }
++    LOG(INFO) << "writers: " << (only_node0_writes ? "node 0 only (node 1 verifies)" : "all nodes");
+     LOG(INFO) << "node_id: " << node_id << ", value checks: " << (check_values ? "on" : "misses only (write_ratio 0)");
+ 
+     string dir = result_dir + pattern + "-" + write_ratio_str;
+@@ -428,7 +440,7 @@ int main(int argc, char** argv) {
+             {
+                 std::unique_ptr<uint8_t[]> wbuf = std::make_unique<uint8_t[]>(ACCESS_SIZE);
+                 uint64_t seq = 0;
+-                for (size_t k = i; k < operation_count; k += thread_cnt) {
++                for (size_t k = i; this_node_writes() && k < operation_count; k += thread_cnt) {
+                     uint8_t* b = nullptr;  // upstream: no data when write_ratio == 0 (read-only entries)
+                     if (check_values) {
+                         FillValue(wbuf.get(), warmup_sequence[k], MakeStamp(i, ++seq) | (1ULL << 39));
+@@ -463,6 +475,9 @@ int main(int argc, char** argv) {
+ 
+     while (warm_done.load() < thread_cnt) std::this_thread::sleep_for(std::chrono::milliseconds(10));
+     LOG(INFO) << "done loading...";
++    // every node has finished its warmup (in node0 mode: node 0's warmup created every key); this also
++    // aligns the start of the measurement windows across nodes
++    rackobj::NodeBarrier(1);
+     sleep(5);
+     go.store(true, std::memory_order_release);
+ 
+@@ -569,8 +584,28 @@ int main(int argc, char** argv) {
+         LOG(INFO) << "No reads recorded.";
+     }
+ 
++    // PASS: values checked, no failure, and at least one value written by the other node was seen (except
++    // node 0 in node0-writers mode). FAIL (exit 3): a failed check or no cross-node visibility. NO-CHECK
++    // (exit 4): nothing was verified (no Gets, or write_ratio 0 => no content to check).
+     uint64_t vb = vstats.bad_values.load(), vm = vstats.misses.load(), vs = vstats.short_reads.load();
+-    LOG(INFO) << "VALUE CHECK: gets=" << vstats.gets.load() << " bad_values=" << vb << " misses=" << vm
+-              << " short_reads=" << vs << (vb + vm + vs ? " FAIL" : " PASS");
+-    return (vb + vm + vs) ? 3 : 0;
++    uint64_t vg = vstats.gets.load(), vr = vstats.remote.load();
++    bool need_remote = !(only_node0_writes && node_id == 0);
++    const char* verdict;
++    int code;
++    if (vb + vm + vs) {
++        verdict = "FAIL";
++        code = 3;
++    } else if (vg == 0 || !check_values) {
++        verdict = "NO-CHECK";
++        code = 4;
++    } else if (need_remote && vr == 0) {
++        verdict = "FAIL (no value from the other node seen)";
++        code = 3;
++    } else {
++        verdict = "PASS";
++        code = 0;
++    }
++    LOG(INFO) << "VALUE CHECK: node=" << node_id << " gets=" << vg << " remote_values=" << vr << " bad_values=" << vb
++              << " misses=" << vm << " short_reads=" << vs << " " << verdict;
++    return code;
+ }
+\ No newline at end of file
+-- 
+2.34.1
+

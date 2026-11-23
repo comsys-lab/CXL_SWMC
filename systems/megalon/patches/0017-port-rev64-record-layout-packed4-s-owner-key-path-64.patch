@@ -1,0 +1,310 @@
+From bff7957b235300e8b3559d7d0dc442f6d87c5813 Mon Sep 17 00:00:00 2001
+From: Sungsu Ahn <sungsu_ahn@korea.ac.kr>
+Date: Thu, 15 Oct 2026 01:58:07 +0900
+Subject: [PATCH 17/51] port: rev64 record layout (packed4's owner-key path, 64
+ B per record) as a measurement control
+
+WMETA_OWNER_REV = no owner key in the record (reverse map in the NR replica, reclaim via
+SwitchToReadOnlyByWmeta); WMETA_PACKED4 = 4 B packing on top. packed4 = both, rev64 = OWNER_REV only,
+artifact64 = neither. artifact64 vs rev64 isolates the reverse-map/log-op cost, rev64 vs packed4 the
+false sharing of packed records. Layout defines go into the layout hash.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ CMakeLists.txt                | 13 ++++++++-----
+ lib/shm_obj_handle.cc         | 10 +++++-----
+ src/core/local_cache_node.h   |  2 +-
+ src/core/seqcount.cc          |  2 +-
+ src/core/seqcount.h           | 14 +++++++-------
+ src/core/write_meta.cc        |  2 +-
+ src/core/write_meta.h         | 23 ++++++++++++++++-------
+ src/index/gcd_nr.cc           |  2 +-
+ src/index/gcd_nr.h            |  2 +-
+ src/manager/wmeta_manager.cc  |  4 ++--
+ src/shared_memory/cxl_port.cc |  3 +++
+ 11 files changed, 46 insertions(+), 31 deletions(-)
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index ddd2cab..84ff8be 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -93,12 +93,15 @@ endif()
+ # De Stijl port: HWcc record layout. artifact64 = upstream (64 B line per record, owner BlockId in the record);
+ # packed4 = the paper's 4 B record (sequence only); with DYN_WMETA the owner key moves to the NR replica
+ # (nr feature wmeta-rev).
+-set(MEGALON_WMETA_LAYOUT "artifact64" CACHE STRING "artifact64 | packed4")
+-set_property(CACHE MEGALON_WMETA_LAYOUT PROPERTY STRINGS artifact64 packed4)
++# rev64 = packed4's owner-key path with one record per 64 B line (measurement control).
++set(MEGALON_WMETA_LAYOUT "artifact64" CACHE STRING "artifact64 | rev64 | packed4")
++set_property(CACHE MEGALON_WMETA_LAYOUT PROPERTY STRINGS artifact64 rev64 packed4)
+ if (MEGALON_WMETA_LAYOUT STREQUAL "packed4")
+-    add_definitions(-DWMETA_PACKED4=1)
++    add_definitions(-DWMETA_OWNER_REV=1 -DWMETA_PACKED4=1)
++elseif (MEGALON_WMETA_LAYOUT STREQUAL "rev64")
++    add_definitions(-DWMETA_OWNER_REV=1)
+ elseif (NOT MEGALON_WMETA_LAYOUT STREQUAL "artifact64")
+-    message(FATAL_ERROR "MEGALON_WMETA_LAYOUT must be artifact64 or packed4 (got '${MEGALON_WMETA_LAYOUT}')")
++    message(FATAL_ERROR "MEGALON_WMETA_LAYOUT must be artifact64, rev64 or packed4 (got '${MEGALON_WMETA_LAYOUT}')")
+ endif()
+ message(STATUS "MEGALON_WMETA_LAYOUT=${MEGALON_WMETA_LAYOUT}")
+ 
+@@ -176,7 +179,7 @@ elseif (NO_COHERENCE)
+ else()
+     set(MEGALON_NR_FEATURES "")
+ endif()
+-if (MEGALON_WMETA_LAYOUT STREQUAL "packed4" AND LIMITED_SCR)
++if (NOT MEGALON_WMETA_LAYOUT STREQUAL "artifact64" AND LIMITED_SCR)
+     # reverse map only where records are reclaimed (DYN_WMETA); static records never need the owner key
+     string(APPEND MEGALON_NR_FEATURES " wmeta-rev")
+ endif()
+diff --git a/lib/shm_obj_handle.cc b/lib/shm_obj_handle.cc
+index 3820a86..af5d64f 100644
+--- a/lib/shm_obj_handle.cc
++++ b/lib/shm_obj_handle.cc
+@@ -102,8 +102,8 @@ SharedMemoryObjectHandle<Policy>::~SharedMemoryObjectHandle() {
+     uint64_t reclaim_count = c3po_->Scr_meta()->GetRecycleCount();
+     uint64_t allocate_count = c3po_->Scr_meta()->GetAllocateCount();
+ 
+-#ifdef WMETA_PACKED4
+-    LOG(INFO) << "wmeta layout packed4: replays with one record held by two keys: " << NrFfi::NrWmetaRevShared();
++#ifdef WMETA_OWNER_REV
++    LOG(INFO) << "wmeta owner-rev layout: replays with one record held by two keys: " << NrFfi::NrWmetaRevShared();
+ #endif
+     LOG(INFO) << "seqlock alloc ratio: (" << write_page_count << "|" << c3po_->Scr_meta()->GetWmetaSlotLen() << ") = "
+               << static_cast<double>(write_page_count) * 100 / static_cast<double>(c3po_->Scr_meta()->GetWmetaSlotLen())
+@@ -402,7 +402,7 @@ expected<common::CacheNode *, std::error_code> SharedMemoryObjectHandle<Policy>:
+         if (!new_wmeta_index_optional.has_value()) continue;
+ 
+         common::WriteMetadata *cur = c3po_->Scr_meta()->GetWmeta(new_wmeta_index_optional.value());
+-#ifdef WMETA_PACKED4
++#ifdef WMETA_OWNER_REV
+         // packed4: the record holds no BlockId; the log op resolves the victim's key (replica reverse map)
+         new_wmeta_index_optional = c3po_->Gcd()->SwitchToReadOnlyByWmeta(new_wmeta_index_optional.value(), nr_meta);
+ #else
+@@ -537,7 +537,7 @@ expected<common::CacheNode *, std::error_code> SharedMemoryObjectHandle<Policy>:
+             if (!new_wmeta_index_optional.has_value()) continue;
+ 
+             common::WriteMetadata *cur = c3po_->Scr_meta()->GetWmeta(new_wmeta_index_optional.value());
+-#ifdef WMETA_PACKED4
++#ifdef WMETA_OWNER_REV
+             // packed4: the record holds no BlockId; the log op resolves the victim's key (replica reverse map)
+             new_wmeta_index_optional = c3po_->Gcd()->SwitchToReadOnlyByWmeta(new_wmeta_index_optional.value(), nr_meta);
+ #else
+@@ -638,7 +638,7 @@ std::error_code SharedMemoryObjectHandle<Policy>::SwitchRW(const common::WriteHa
+         if (!new_wmeta_index_optional.has_value()) continue;
+ 
+         common::WriteMetadata *cur = c3po_->Scr_meta()->GetWmeta(new_wmeta_index_optional.value());
+-#ifdef WMETA_PACKED4
++#ifdef WMETA_OWNER_REV
+         // packed4: the record holds no BlockId; the log op resolves the victim's key (replica reverse map)
+         new_wmeta_index_optional = c3po_->Gcd()->SwitchToReadOnlyByWmeta(new_wmeta_index_optional.value(), nr_meta);
+ #else
+diff --git a/src/core/local_cache_node.h b/src/core/local_cache_node.h
+index 8d75f14..43fa002 100644
+--- a/src/core/local_cache_node.h
++++ b/src/core/local_cache_node.h
+@@ -32,7 +32,7 @@ public:
+         pthread_rwlock_init(&evict_rw_lock_, NULL);
+         // Initialize seqlock to 0 (allocated, unlocked, no FREE_BIT)
+         seqlock_.sequence = 0;
+-#ifndef WMETA_PACKED4
++#ifndef WMETA_OWNER_REV
+         seqlock_.active_node = 0;
+ #endif
+     }
+diff --git a/src/core/seqcount.cc b/src/core/seqcount.cc
+index f41574b..b619aa2 100644
+--- a/src/core/seqcount.cc
++++ b/src/core/seqcount.cc
+@@ -17,7 +17,7 @@ uint32_t read_seqcount_begin(struct seqcount* s) {
+     return seq;
+ }
+ 
+-#ifndef WMETA_PACKED4
++#ifndef WMETA_OWNER_REV
+ uint8_t get_active_node(seqlock_t* s) { return s->active_node.load(std::memory_order_relaxed); }
+ 
+ void set_active_node(seqlock_t* s, uint8_t node) { s->active_node.store(node, std::memory_order_relaxed); }
+diff --git a/src/core/seqcount.h b/src/core/seqcount.h
+index eb15940..cbb09e5 100644
+--- a/src/core/seqcount.h
++++ b/src/core/seqcount.h
+@@ -83,17 +83,17 @@ constexpr uint32_t SEQ_MASK = ~(FREE_BIT | LOCK_BIT);
+  * data layout:
+  * | free bit | lock bit | ... sequence count ... |
+  */
+-// De Stijl port: WMETA_PACKED4 (paper layout) keeps only the 32-bit sequence (free and lock bits included). The
++// De Stijl port: WMETA_OWNER_REV (packed4/rev64 layouts) keeps only the 32-bit sequence (free and lock bits included). The
+ // active_node byte is not read anywhere in the artifact (active-node tracking lives in CacheNode).
+ typedef struct seqlock {
+ #ifdef __cplusplus
+     std::atomic<uint32_t> sequence;
+-#ifndef WMETA_PACKED4
++#ifndef WMETA_OWNER_REV
+     std::atomic<uint8_t> active_node;
+ #endif
+ #else
+     volatile uint32_t sequence;
+-#ifndef WMETA_PACKED4
++#ifndef WMETA_OWNER_REV
+     volatile uint8_t active_node;
+ #endif
+ #endif
+@@ -104,18 +104,18 @@ typedef struct seqlock {
+ #endif
+ } seqlock_t;
+ 
+-#if defined(WMETA_PACKED4) && C3_RWLOCK != 0
+-#error "WMETA_PACKED4 needs C3_RWLOCK == 0 (the record is the 32-bit sequence only)"
++#if defined(WMETA_OWNER_REV) && C3_RWLOCK != 0
++#error "WMETA_OWNER_REV needs C3_RWLOCK == 0 (the record is the 32-bit sequence only)"
+ #endif
+ 
+ static inline void seqlock_init(seqlock_t *s) {
+     s->sequence = FREE_BIT;
+-#ifndef WMETA_PACKED4
++#ifndef WMETA_OWNER_REV
+     s->active_node = 0;
+ #endif
+ }
+ 
+-#ifndef WMETA_PACKED4
++#ifndef WMETA_OWNER_REV
+ uint8_t get_active_node(seqlock_t *s);
+ void set_active_node(seqlock_t *s, uint8_t node);
+ #endif
+diff --git a/src/core/write_meta.cc b/src/core/write_meta.cc
+index edf702f..2d31cb8 100644
+--- a/src/core/write_meta.cc
++++ b/src/core/write_meta.cc
+@@ -28,7 +28,7 @@ uint32_t WriteMetadata::seqlock(bool relaxed) {
+ 
+ bool WriteMetadata::TryAllocateLock(const BlockId &block_id, bool with_lock) {
+     if (try_allocate_seqlock(&seqlock_, with_lock)) {
+-#ifndef WMETA_PACKED4
++#ifndef WMETA_OWNER_REV
+         block_id_ = block_id;
+ #else
+         (void)block_id;  // packed4: the owner key is recorded by the NR op that installs this record
+diff --git a/src/core/write_meta.h b/src/core/write_meta.h
+index d145773..a3d5d46 100644
+--- a/src/core/write_meta.h
++++ b/src/core/write_meta.h
+@@ -26,13 +26,20 @@ struct SpinLockWrapper {
+ // De Stijl port: two record layouts (MEGALON_WMETA_LAYOUT).
+ //   artifact64 (default): upstream, one 64 B cache line per record: seqlock (+ unused active_node) and the
+ //              owner BlockId, which reclaim reads to find the victim's key.
+-//   packed4 (WMETA_PACKED4): the paper's 4 B record, the sequence only, packed 16 per line. The owner key is
+-//              kept in each node's NR replica (reverse map, nr feature wmeta-rev) and resolved inside the
+-//              reclaim log op (GlobalCacheDirectoryHandleNr::SwitchToReadOnlyByWmeta).
+-#ifdef WMETA_PACKED4
++//   packed4 (WMETA_OWNER_REV + WMETA_PACKED4): the paper's 4 B record, the sequence only, packed 16 per line.
++//              The owner key is kept in each node's NR replica (reverse map, nr feature wmeta-rev) and resolved
++//              inside the reclaim log op (GlobalCacheDirectoryHandleNr::SwitchToReadOnlyByWmeta).
++//   rev64 (WMETA_OWNER_REV only): packed4's record contents and owner-key path, one record per 64 B line
++//              (measurement control: separates the reverse-map/log-op cost from false sharing).
++#ifdef WMETA_OWNER_REV
+ #ifndef NR
+-#error "WMETA_PACKED4 needs NR (the owner key lives in the NR replica)"
++#error "WMETA_OWNER_REV needs NR (the owner key lives in the NR replica)"
++#endif
+ #endif
++#if defined(WMETA_PACKED4) && !defined(WMETA_OWNER_REV)
++#error "WMETA_PACKED4 requires WMETA_OWNER_REV"
++#endif
++#ifdef WMETA_PACKED4
+ class WriteMetadata {
+ #else
+ class alignas(64) WriteMetadata {
+@@ -62,7 +69,7 @@ public:
+ 
+     [[nodiscard]] bool FreeLockReset(bool with_lock = true);
+ 
+-#ifndef WMETA_PACKED4
++#ifndef WMETA_OWNER_REV
+     uint8_t GetActiveNode() { return get_active_node(&seqlock_); }
+     void SetActiveNode(uint8_t node) { set_active_node(&seqlock_, node); }
+ 
+@@ -80,7 +87,7 @@ public:
+ private:
+     // seqcount_t seqcount_;
+     seqlock_t seqlock_;
+-#ifndef WMETA_PACKED4
++#ifndef WMETA_OWNER_REV
+     BlockId block_id_;
+ #endif
+ 
+@@ -92,6 +99,8 @@ private:
+ 
+ #ifdef WMETA_PACKED4
+ static_assert(sizeof(WriteMetadata) == 4 && alignof(WriteMetadata) == 4, "packed4 record must be 4 bytes");
++#elif defined(WMETA_OWNER_REV)
++static_assert(sizeof(WriteMetadata) == CACHE_LINE_SIZE, "rev64 record must be one cache line");
+ #elif !defined(C3_RWLOCK)
+ static_assert(sizeof(WriteMetadata) == CACHE_LINE_SIZE, "WriteMetadata must be exactly one cache line (64 bytes)");
+ #else
+diff --git a/src/index/gcd_nr.cc b/src/index/gcd_nr.cc
+index 6ffbaf4..b11576b 100644
+--- a/src/index/gcd_nr.cc
++++ b/src/index/gcd_nr.cc
+@@ -202,7 +202,7 @@ std::optional<size_t> GlobalCacheDirectoryHandleNr::SwitchToReadOnly(const Block
+     return static_cast<size_t>(result);
+ }
+ 
+-#ifdef WMETA_PACKED4
++#ifdef WMETA_OWNER_REV
+ std::optional<size_t> GlobalCacheDirectoryHandleNr::SwitchToReadOnlyByWmeta(size_t wmeta_idx,
+                                                                             const NrFfi::NrMeta* nr_meta) {
+     ssize_t result = NrFfi::SwitchToReadOnlyByWmeta(nr_meta, static_cast<ssize_t>(wmeta_idx));
+diff --git a/src/index/gcd_nr.h b/src/index/gcd_nr.h
+index fe6879d..ba11791 100644
+--- a/src/index/gcd_nr.h
++++ b/src/index/gcd_nr.h
+@@ -72,7 +72,7 @@ public:
+                                  const NrFfi::NrMeta* nr_meta);
+ 
+     std::optional<size_t> SwitchToReadOnly(const BlockId& to_modify, const NrFfi::NrMeta* nr_meta);
+-#ifdef WMETA_PACKED4
++#ifdef WMETA_OWNER_REV
+     // De Stijl port (packed4): RO-switch the key that holds record wmeta_idx; the key is resolved from the replica's
+     // reverse map inside the log op. Returns wmeta_idx, or nullopt if no live entry holds it.
+     std::optional<size_t> SwitchToReadOnlyByWmeta(size_t wmeta_idx, const NrFfi::NrMeta* nr_meta);
+diff --git a/src/manager/wmeta_manager.cc b/src/manager/wmeta_manager.cc
+index 2592653..4e873fa 100644
+--- a/src/manager/wmeta_manager.cc
++++ b/src/manager/wmeta_manager.cc
+@@ -76,7 +76,7 @@ size_t WriteMetadataManager::IterativeReclaim(size_t count
+         cur = c3po_->Scr_meta()->GetWmeta(wmeta_idx);
+         if (!cur->WLockOnly()) continue;
+ 
+-#ifdef WMETA_PACKED4
++#ifdef WMETA_OWNER_REV
+         // packed4: the record holds no BlockId; the log op resolves the victim's key (replica reverse map)
+         std::optional<size_t> wmeta_idx_optional = c3po_->Gcd()->SwitchToReadOnlyByWmeta(wmeta_idx, nr_meta);
+ #else
+@@ -121,7 +121,7 @@ size_t WriteMetadataManager::SampleReclaim(size_t count
+         if (!wmeta_idx.has_value()) continue;
+ 
+         cur = c3po_->Scr_meta()->GetWmeta(wmeta_idx.value());
+-#ifdef WMETA_PACKED4
++#ifdef WMETA_OWNER_REV
+         // packed4: the record holds no BlockId; the log op resolves the victim's key (replica reverse map)
+         std::optional<size_t> wmeta_idx_optional = c3po_->Gcd()->SwitchToReadOnlyByWmeta(wmeta_idx.value(), nr_meta);
+ #else
+diff --git a/src/shared_memory/cxl_port.cc b/src/shared_memory/cxl_port.cc
+index f900065..af91d5b 100644
+--- a/src/shared_memory/cxl_port.cc
++++ b/src/shared_memory/cxl_port.cc
+@@ -59,6 +59,9 @@ std::string FlavorDefines() {
+ #ifdef FILE_INTERFACE
+     d += "FILE_INTERFACE,";
+ #endif
++#ifdef WMETA_OWNER_REV
++    d += "WMETA_OWNER_REV,";
++#endif
+ #ifdef WMETA_PACKED4
+     d += "WMETA_PACKED4,";
+ #endif
+-- 
+2.34.1
+

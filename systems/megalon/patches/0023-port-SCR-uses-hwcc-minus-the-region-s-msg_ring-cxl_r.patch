@@ -1,0 +1,80 @@
+From 71e6e0ab2259458f80cb8ec71dad9ed1610eafa3 Mon Sep 17 00:00:00 2001
+From: Sungsu Ahn <sungsu_ahn@korea.ac.kr>
+Date: Thu, 15 Oct 2026 08:00:25 +0900
+Subject: [PATCH 23/51] port: SCR uses hwcc minus the region's msg_ring
+ (cxl_region hwcc_alloc)
+
+The kernel message ring (Popcorn cxl_shm) is carved from the tail of hwcc
+in config/cxl_region.yaml; Megalon never allocates, maps read-only or
+writes it. Layout hash includes the usable size.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/shared_memory/cxl_port.cc | 21 +++++++++++++--------
+ 1 file changed, 13 insertions(+), 8 deletions(-)
+
+diff --git a/src/shared_memory/cxl_port.cc b/src/shared_memory/cxl_port.cc
+index af91d5b..b599cbc 100644
+--- a/src/shared_memory/cxl_port.cc
++++ b/src/shared_memory/cxl_port.cc
+@@ -87,7 +87,8 @@ uint64_t PortContext::ComputeLayoutHash(const RackOBJConfig &cfg, size_t num_slo
+     NrFfi::NrLogLayout lay = NrFfi::nr_log_layout(nr_log_bytes_);
+     std::ostringstream o;
+     o << "v=" << kCtrlVersion << " dev_size=" << region_.device_size << " map_va=" << region_.map_va
+-      << " hwcc=" << region_.hwcc.offset << "+" << region_.hwcc.size << " swcc=" << region_.swcc.offset << "+"
++      << " hwcc=" << region_.hwcc.offset << "+" << region_.hwcc.size << " hwcc_alloc=" << region_.hwcc_alloc.size
++      << " swcc=" << region_.swcc.offset << "+"
+       << region_.swcc.size << " slots=" << num_slots << " logical_scr=" << cfg.GetLogicalSCRSize()
+       << " SLOT_SIZE=" << SLOT_SIZE << " KEY_SIZE=" << KEY_SIZE << " nodes=" << LOGICAL_NODE_NUM
+       << " flavor=" << MEGALON_FLAVOR_NAME << " defs=" << FlavorDefines() << " build=" << MEGALON_BUILD_ID
+@@ -116,12 +117,16 @@ void PortContext::Init(const RackOBJConfig &cfg, size_t num_slots, size_t scr_fo
+     if (!cxl::region_load(path, &region_, &err)) LOG(FATAL) << "CXL region config: " << err;
+     LOG(INFO) << "node " << node_id_ << " (" << (attach_ ? "attach" : "init") << "), "
+               << cxl::region_describe(region_);
+-    CHECK(region_.hwcc.size > kCtrlSize) << "hwcc_size too small";
++    // SCR uses hwcc minus the kernel message ring (msg_ring, if configured); the ring is never touched here
++    CHECK(region_.hwcc_alloc.offset == region_.hwcc.offset && region_.hwcc_alloc.size > kCtrlSize)
++        << "hwcc_size (minus msg_ring) too small";
+ 
+     // [V9] refuse runs whose SCR structures do not fit into the HW-coherent range
+-    LOG(INFO) << "SCR footprint (upper bound): " << scr_footprint << " bytes of hwcc_size " << region_.hwcc.size;
+-    if (scr_footprint > region_.hwcc.size)
+-        LOG(FATAL) << "SCR footprint " << scr_footprint << " exceeds hwcc_size " << region_.hwcc.size
++    LOG(INFO) << "SCR footprint (upper bound): " << scr_footprint << " bytes of usable hwcc "
++              << region_.hwcc_alloc.size << " (hwcc_size " << region_.hwcc.size << " minus msg_ring "
++              << region_.msg_ring.size << ")";
++    if (scr_footprint > region_.hwcc_alloc.size)
++        LOG(FATAL) << "SCR footprint " << scr_footprint << " exceeds usable hwcc " << region_.hwcc_alloc.size
+                    << " (reduce slots/logical_scr_size or enlarge hwcc_size); refusing to run";
+ 
+     // raw syscalls: libmegalon interposes open()/close() (lib/glibc) for its file interface, and that
+@@ -207,7 +212,7 @@ void PortContext::Init(const RackOBJConfig &cfg, size_t num_slots, size_t scr_fo
+ 
+     scr_ = std::make_shared<common::AllocatableLocalMemoryRegion>(
+         common::AllocatableLocalMemoryRegion::ArenaTag{}, "scr", map_ + region_.hwcc.offset + kCtrlSize,
+-        region_.hwcc.size - kCtrlSize);
++        region_.hwcc_alloc.size - kCtrlSize);
+     lnr_ = std::make_shared<common::AllocatableLocalMemoryRegion>(common::AllocatableLocalMemoryRegion::ArenaTag{},
+                                                                    "lnr", map_ + region_.swcc.offset,
+                                                                    region_.swcc.size);
+@@ -229,7 +234,7 @@ void PortContext::Init(const RackOBJConfig &cfg, size_t num_slots, size_t scr_fo
+ 
+ void PortContext::SetProtect(bool read_only) {
+     int prot = read_only ? PROT_READ : (PROT_READ | PROT_WRITE);
+-    PCHECK(mprotect(map_ + region_.hwcc.offset, region_.hwcc.size, prot) == 0) << "mprotect hwcc";
++    PCHECK(mprotect(map_ + region_.hwcc.offset, region_.hwcc_alloc.size, prot) == 0) << "mprotect hwcc";
+     PCHECK(mprotect(map_ + region_.swcc.offset, region_.swcc.size, prot) == 0) << "mprotect swcc";
+     protected_ = read_only;
+     LOG(INFO) << "shared ranges " << (read_only ? "write-protected for attach" : "writable");
+@@ -256,7 +261,7 @@ void PortContext::Finish(uint64_t log_root) {
+     }
+     scr_->Seal();
+     lnr_->Seal();
+-    LOG(INFO) << "SCR used: " << kCtrlSize + scr_->Cursor() << " of hwcc_size " << region_.hwcc.size
++    LOG(INFO) << "SCR used: " << kCtrlSize + scr_->Cursor() << " of usable hwcc " << region_.hwcc_alloc.size
+               << " bytes; LNR used: " << lnr_->Cursor() << " of swcc_size " << region_.swcc.size
+               << " bytes; log_root " << std::hex << log_root;
+ }
+-- 
+2.34.1
+

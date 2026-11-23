@@ -1,0 +1,166 @@
+From ad9718e6a795f09010b1f560faa8b1f17102f982 Mon Sep 17 00:00:00 2001
+From: Sungsu Ahn <sungsu_ahn@korea.ac.kr>
+Date: Sat, 17 Oct 2026 19:05:38 +0900
+Subject: [PATCH 46/51] object-test: timed-event counts (A), (B)+(C), (D) per
+ case vs the exact counts (verifier MED-2; test only)
+
+AncDiff also differences AnchorSnap.reserved[3..5]. Every event case of the object
+and KV phases checks: 0 with timers off, equal when every section is timed (N = 1 or
+MEGALON_COH_EVENTS=always), at most the exact count otherwise. libmegalon unchanged.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ benchmarks/object_test.cc | 37 +++++++++++++++++++++++++++++++++++++
+ 1 file changed, 37 insertions(+)
+
+diff --git a/benchmarks/object_test.cc b/benchmarks/object_test.cc
+index d1c8457..1cd0570 100644
+--- a/benchmarks/object_test.cc
++++ b/benchmarks/object_test.cc
+@@ -303,6 +303,7 @@ rackobj::ThreadAnchor AncDiff(const rackobj::ThreadAnchor &a, const rackobj::Thr
+     uint64_t *pd = reinterpret_cast<uint64_t *>(&d);
+     for (size_t i = 0; i < offsetof(rackobj::ThreadAnchor, reserved) / 8; i++) pd[i] -= pa[i];
+     d.reserved[0] -= a.reserved[0];  // build 76: write_sampled
++    for (size_t i = 3; i < 6; i++) d.reserved[i] -= a.reserved[i];  // build 77: timed (A), (B)+(C), (D) counts; [1..2] absolute
+     return d;
+ }
+ 
+@@ -418,6 +419,16 @@ void CohPhase(HelperThread &helper) {
+         if (N == 1) return got == n;
+         return got + 1 >= n / (3 * N / 2) && got <= 2 * n / N + 1;
+     };
++    // build 77 (verifier MED-2): timed-event counts (AnchorSnap.reserved[3..5]) vs the exact event counts of a case:
++    // 0 with timers off, equal when every section is timed (N = 1 or EVENTS=always), at most the count otherwise
++    auto tev = [&](uint64_t tc, uint64_t c) { return !timed ? tc == 0 : every ? tc == c : tc <= c; };
++    auto ev_ok = [&](const char *what, const rackobj::ThreadAnchor &e0, const rackobj::ObjectThreadCoh &d) {
++        const auto e = AncDiff(e0, Anc());
++        LOG(INFO) << "TIMED-EVENTS " << what << ": (A) " << e.reserved[3] << "/" << d.stale_cnt << " (B)+(C) "
++                  << e.reserved[4] << "/" << d.concur_cnt + d.meta_cnt << " (D) " << e.reserved[5] << "/" << d.spin_cnt;
++        return tev(e.reserved[3], d.stale_cnt) && tev(e.reserved[4], d.concur_cnt + d.meta_cnt) &&
++               tev(e.reserved[5], d.spin_cnt);
++    };
+     (void)spos;
+     (void)in_range;
+     EXPECT(rackobj::ObjectCreate(CohX(node_id), kConcLen) == 0);
+@@ -453,8 +464,10 @@ void CohPhase(HelperThread &helper) {
+     Barrier("coh A rewritten");
+     if (node_id == 1) {
+         auto c0 = Coh();
++        auto e0 = Anc();
+         EXPECT(read_gen(kCohA) == 2);
+         auto d = CohDiff(c0, Coh());
++        EXPECT(ev_ok("object stale", e0, d));
+         LOG(INFO) << "COH stale (node 1 read of kCohA after node 0's write): " << CohStr(d);
+         EXPECT(hwcc || (d.stale_cnt == 1 && tpos(d.stale_ns)));
+         EXPECT(d.read_sections == 1 && d.concur_cnt == 0 && d.meta_cnt == 0);
+@@ -464,11 +477,13 @@ void CohPhase(HelperThread &helper) {
+     // (B) concurrent write between read_start and read_end (same node, helper thread writes)
+     {
+         auto c0 = Coh();
++        auto e0 = Anc();
+         CHECK_EQ(rackobj::ObjectReadStart(CohX(node_id), &h), 0);
+         helper.Run([] { WriteGen(CohX(node_id), 3); });
+         const bool ok = rackobj::ObjectReadEnd(&h);
+         EXPECT(!ok);
+         auto d = CohDiff(c0, Coh());
++        EXPECT(ev_ok("object concurrent", e0, d));
+         LOG(INFO) << "COH concurrent (read of C(own) while the helper wrote it): " << CohStr(d);
+         // with a tiny record pool (reclaim config) the record of C(own) can be reclaimed meanwhile: the helper's write
+         // then switches it RO -> RW (a log event) and the section ends in (C) instead of (B); either is one event
+@@ -479,6 +494,7 @@ void CohPhase(HelperThread &helper) {
+     // (C) metadata notification: reading an RO object while the helper's write switches it RO -> RW (log event)
+     {
+         auto c0 = Coh();
++        auto e0 = Anc();
+         rackobj::ObjectThreadCoh hd{};
+         CHECK_EQ(rackobj::ObjectReadStart(CohRO(node_id), &h), 0);
+         helper.Run([&hd] {
+@@ -489,6 +505,7 @@ void CohPhase(HelperThread &helper) {
+         const bool ok = rackobj::ObjectReadEnd(&h);
+         EXPECT(!ok);
+         auto d = CohDiff(c0, Coh());
++        EXPECT(ev_ok("object meta", e0, d));
+         LOG(INFO) << "COH meta (read of RO(own) while the helper switched it RO->RW): " << CohStr(d);
+         LOG(INFO) << "COH switch_rw (helper write of RO(own)): " << CohStr(hd);
+         if (!hwcc) {
+@@ -502,6 +519,7 @@ void CohPhase(HelperThread &helper) {
+     {
+         std::atomic<int> st{0};
+         auto c0 = Coh();
++        auto e0 = Anc();
+         helper.Start([&st] {
+             rackobj::ObjectHandle wh;
+             CHECK_EQ(rackobj::ObjectWriteStart(CohX(node_id), &wh), 0);
+@@ -518,6 +536,7 @@ void CohPhase(HelperThread &helper) {
+         const uint64_t g = read_gen(CohX(node_id));
+         helper.Wait();
+         auto d = CohDiff(c0, Coh());
++        EXPECT(ev_ok("object spin", e0, d));
+         LOG(INFO) << "COH spin (read of C(own) while the helper held its write section 20 ms): " << CohStr(d);
+         EXPECT(g == 5);
+         EXPECT(d.spin_cnt >= 1 && (!every || d.spin_ns >= 5000000));
+@@ -592,6 +611,16 @@ void KvCohPhase(HelperThread &helper, bool churn) {
+         if (N == 1) return got == n;
+         return got + 1 >= n / (3 * N / 2) && got <= 2 * n / N + 1;
+     };
++    // build 77 (verifier MED-2): timed-event counts (AnchorSnap.reserved[3..5]) vs the exact event counts of a case:
++    // 0 with timers off, equal when every section is timed (N = 1 or EVENTS=always), at most the count otherwise
++    auto tev = [&](uint64_t tc, uint64_t c) { return !timed ? tc == 0 : every ? tc == c : tc <= c; };
++    auto ev_ok = [&](const char *what, const rackobj::ThreadAnchor &e0, const rackobj::ObjectThreadCoh &d) {
++        const auto e = AncDiff(e0, Anc());
++        LOG(INFO) << "TIMED-EVENTS " << what << ": (A) " << e.reserved[3] << "/" << d.stale_cnt << " (B)+(C) "
++                  << e.reserved[4] << "/" << d.concur_cnt + d.meta_cnt << " (D) " << e.reserved[5] << "/" << d.spin_cnt;
++        return tev(e.reserved[3], d.stale_cnt) && tev(e.reserved[4], d.concur_cnt + d.meta_cnt) &&
++               tev(e.reserved[5], d.spin_cnt);
++    };
+     (void)spos;
+     (void)in_range;
+     const off_t own = KvKey(node_id, 0);
+@@ -624,8 +653,10 @@ void KvCohPhase(HelperThread &helper, bool churn) {
+     Barrier("kv A rewritten");
+     if (node_id == 1) {
+         auto c0 = Coh();
++        auto e0 = Anc();
+         EXPECT(KvGetGen(KvKey(0, 1)) == 2);
+         auto d = CohDiff(c0, Coh());
++        EXPECT(ev_ok("KV stale", e0, d));
+         LOG(INFO) << "KVCOH stale (node 1 Get after node 0's Put): " << CohStr(d);
+         EXPECT(hwcc || (d.stale_cnt == 1 && tpos(d.stale_ns)));
+         EXPECT(d.read_sections == 1 && (!det || d.reserved[5] == 1) && d.concur_cnt == 0 && d.meta_cnt == 0);
+@@ -638,6 +669,7 @@ void KvCohPhase(HelperThread &helper, bool churn) {
+             for (uint64_t g = 3; !stop.load(std::memory_order_relaxed); g++) KvPut(own, g);
+         });
+         auto c0 = Coh();
++        auto e0 = Anc();
+         rackobj::ObjectThreadCoh d{};
+         uint64_t gets = 0, torn = 0;
+         const auto until = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+@@ -648,6 +680,8 @@ void KvCohPhase(HelperThread &helper, bool churn) {
+         }
+         stop.store(true);
+         helper.Wait();
++        d = CohDiff(c0, Coh());  // build 77: final counts, compared with the timed-event counts
++        EXPECT(ev_ok("KV concurrent+spin", e0, d));
+         LOG(INFO) << "KVCOH concurrent+spin (" << gets << " Gets while the helper rewrote the key): " << CohStr(d);
+         EXPECT(torn == 0 && d.read_sections == gets);
+         EXPECT(hwcc || (d.concur_cnt >= 1 && tpos(d.concur_ns)));
+@@ -702,6 +736,7 @@ void KvCohPhase(HelperThread &helper, bool churn) {
+             hd = CohDiff(a, Coh());
+         });
+         auto c0 = Coh();
++        auto e0 = Anc();
+         rackobj::ObjectThreadCoh d{};
+         uint64_t gets = 0, torn = 0;
+         const auto until = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+@@ -712,6 +747,8 @@ void KvCohPhase(HelperThread &helper, bool churn) {
+         }
+         stop.store(true);
+         helper.Wait();
++        d = CohDiff(c0, Coh());  // build 77: final counts, compared with the timed-event counts
++        EXPECT(ev_ok("KV meta", e0, d));
+         LOG(INFO) << "KVCOH meta (" << gets << " Gets of the key the helper is writing, reclaim config): " << CohStr(d);
+         LOG(INFO) << "KVCOH churn writer: " << CohStr(hd) << " | admit " << hd.reserved[3];
+         EXPECT(torn == 0);
+-- 
+2.34.1
+

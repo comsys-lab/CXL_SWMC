@@ -1,0 +1,197 @@
+From 5acf08628269da1ae53490bc3d2b9a7b500bf6e7 Mon Sep 17 00:00:00 2001
+From: Sungsu Ahn <sungsu_ahn@korea.ac.kr>
+Date: Thu, 15 Oct 2026 04:25:43 +0900
+Subject: [PATCH 20/51] fix: post-read / pre-write checks do the paper's tail
+ check; RO switch (record deallocation) notifies
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The artifact tested the change notification without bringing the replica up to the shared log tail, so an
+event another host had appended but this host had not replayed was missed. Paper §3.3/§3.4.5: the post-read
+check 'checks if there were any log updates concerning A', and the writer, after taking the lock bit, 'checks
+if there were any log updates since it initially got the index entry'. With DYN_WMETA both checks now sync to
+the completed tail first (CheckNotificationResetSynced). The RO switch (CheckSwitchWmetaArray(-1) and
+SwitchToReadOnlyByWmeta) now answers with the entry (old wmeta + the key's cn) instead of an empty one, so the
+replay notifies and flushes the object as the paper's deallocation event requires (was cn -1: neither).
+
+Evidence: G-B attempts 9-11 (torn reads: an RO-path read overlapped a remote RO->RW promotion + write that the
+reader's replica had not replayed; stale-record writes after a remote RO switch).
+NR tests: scr wmeta-rev 12/12, wmeta-rev 12/12, scr 9/9, none 9/9 (new: ro_switch_notifies_on_replay_...).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/core/c3.cc                            | 13 ++++++++++-
+ src/index/gcd_nr.cc                       |  4 ++++
+ src/index/gcd_nr.h                        |  1 +
+ src/index/nr_hashmap.h                    |  4 ++++
+ third-party/nr_rust/ffi/ffi_nr_hashmap.rs | 27 +++++++++++++++++------
+ third-party/nr_rust/ffi/port_tests.rs     | 24 ++++++++++++++++++++
+ 6 files changed, 65 insertions(+), 8 deletions(-)
+
+diff --git a/src/core/c3.cc b/src/core/c3.cc
+index de02ee5..b4ded21 100644
+--- a/src/core/c3.cc
++++ b/src/core/c3.cc
+@@ -296,7 +296,10 @@ bool C3POHandle::CheckNotification(
+ ) {
+ #if defined(SCR) && defined(DYN_WMETA)
+     // our system
+-    return Gcd()->CheckNotificationReset(
++    // De Stijl port: post-read check per the paper (§3.4.5 "checks if there were any log updates concerning A",
++    // §3.3 tail check): sync to the log tail first, so an event another host appended during the read is seen
++    // even if this host has not replayed it yet (G-B attempts 9-11, torn reads on the RO path).
++    return Gcd()->CheckNotificationResetSynced(
+ #ifdef NR
+         nr_meta
+ #endif
+@@ -315,7 +318,15 @@ bool C3POHandle::CheckNotificationWrite(
+ #endif
+ ) {
+     // our system
++#ifdef DYN_WMETA
++    // De Stijl port: pre-write check per the paper (§3.4.5 "acquires the lock bit, and checks if there were any
++    // log updates since it initially got the index entry"): tail check first, so a record deallocation (RO switch)
++    // appended by another host is seen before writing (G-B attempts 10-11: writes through a reclaimed record).
++    return Gcd()->CheckNotificationResetSynced(
++#else
++    // static records (hwcc flavor): a key's record never changes after install; upstream check kept
+     return Gcd()->CheckNotificationReset(
++#endif
+ #ifdef NR
+         nr_meta
+ #endif
+diff --git a/src/index/gcd_nr.cc b/src/index/gcd_nr.cc
+index b11576b..7cf5cbd 100644
+--- a/src/index/gcd_nr.cc
++++ b/src/index/gcd_nr.cc
+@@ -273,6 +273,10 @@ bool GlobalCacheDirectoryHandleNr::CheckNotificationReset(const NrFfi::NrMeta* n
+     return NrFfi::CheckNotificationReset(nr_meta);
+ }
+ 
++bool GlobalCacheDirectoryHandleNr::CheckNotificationResetSynced(const NrFfi::NrMeta* nr_meta) {
++    return NrFfi::CheckNotificationResetSynced(nr_meta);
++}
++
+ void GlobalCacheDirectoryHandleNr::SeqCountWrapAround(const BlockId& key, const NrFfi::NrMeta* nr_meta) {
+     return NrFfi::DummyEvent(nr_meta, key);
+ }
+diff --git a/src/index/gcd_nr.h b/src/index/gcd_nr.h
+index ba11791..674479d 100644
+--- a/src/index/gcd_nr.h
++++ b/src/index/gcd_nr.h
+@@ -95,6 +95,7 @@ public:
+     bool CheckCoherenceReset(const BlockId& to_check, const NrFfi::NrMeta* nr_meta);
+ 
+     bool CheckNotificationReset(const NrFfi::NrMeta* nr_meta);
++    bool CheckNotificationResetSynced(const NrFfi::NrMeta* nr_meta);
+ 
+     void SeqCountWrapAround(const BlockId& key, const NrFfi::NrMeta* nr_meta);
+ 
+diff --git a/src/index/nr_hashmap.h b/src/index/nr_hashmap.h
+index 15f4c77..285dd7b 100644
+--- a/src/index/nr_hashmap.h
++++ b/src/index/nr_hashmap.h
+@@ -121,6 +121,10 @@ bool CheckCoherenceReset(const NrMeta* metadata, rackobj::common::BlockId key);
+ 
+ bool CheckNotificationReset(const NrMeta* metadata);
+ 
++/* De Stijl port (paper tail check before the post-read / pre-write check): sync the local replica to the shared
++ * log's completed tail, then test the notification. */
++bool CheckNotificationResetSynced(const NrMeta* metadata);
++
+ /**
+  * not modifying the replicas, just adding a log entry for notification invalidation
+  */
+diff --git a/third-party/nr_rust/ffi/ffi_nr_hashmap.rs b/third-party/nr_rust/ffi/ffi_nr_hashmap.rs
+index f5c0f9f..70deacd 100644
+--- a/third-party/nr_rust/ffi/ffi_nr_hashmap.rs
++++ b/third-party/nr_rust/ffi/ffi_nr_hashmap.rs
+@@ -279,12 +279,10 @@ impl NrHashMapFFi {
+         };
+         match self.storage.get_mut(&k) {
+             Some(entry) if entry.wmeta_idx_ == w => {
++                let resp = *entry;  // old wmeta + the key's cn: replay notifies and flushes (see CheckSwitchWmetaArray)
+                 entry.wmeta_idx_ = -1;
+                 self.rev.remove(&w);
+-                OptionGCDReponse(Some(GCDReponse {
+-                    key: k,
+-                    value: init_empty_gcd_entry_with_wmeta_idx(w),
+-                }))
++                OptionGCDReponse(Some(GCDReponse { key: k, value: resp }))
+             }
+             _ => OptionGCDReponse(None),
+         }
+@@ -450,12 +448,15 @@ impl NrHashMapFFi {
+                     let entry = self.storage.get_mut(&key).unwrap();
+                     if wmeta_idx == -1 {
+                         // switching to ro, idempotent
+-                        let mut dummy = init_empty_gcd_entry();
+-                        dummy.wmeta_idx_ = entry.wmeta_idx_;
++                        // De Stijl port (paper §3.4.3: coherence-record deallocation is a log event that every
++                        // host detects on replay): respond with the entry itself (old wmeta, the key's cn) so the
++                        // replay clears notifications on this object and flushes its slot. Upstream answered with
++                        // an empty entry (cn -1): no notification, no flush.
++                        let resp = *entry;
+                         entry.wmeta_idx_ = wmeta_idx;
+                         return OptionGCDReponse(Some(GCDReponse {
+                             key: key,
+-                            value: dummy,
++                            value: resp,
+                         }));
+                     } else if entry.wmeta_idx_ == -1 {
+                         // only update wmeta_idx_ if it is not already set
+@@ -1394,6 +1395,18 @@ pub extern "C" fn CheckNotificationReset(metadata: *mut NrMeta) -> bool {
+     }
+ }
+ 
++/// De Stijl port (paper §3.3 tail check, §3.4.5 post-read / pre-write checks): bring the local replica up to
++/// the shared log's completed tail (replay through exec_notify) and only then test the change notification.
++/// Upstream tested the notification without the tail check, so an event appended by another host but not yet
++/// replayed here was missed (G-B attempts 9-11: torn reads on the RO path).
++#[no_mangle]
++pub extern "C" fn CheckNotificationResetSynced(metadata: *mut NrMeta) -> bool {
++    unsafe {
++        (*metadata).nrht.sync((*metadata).ttkn);
++        (*metadata).nrht.check_notification_reset((*metadata).ttkn)
++    }
++}
++
+ #[no_mangle]
+ pub extern "C" fn DummyEvent(metadata: *mut NrMeta, key: BlockId) {
+     unsafe {
+diff --git a/third-party/nr_rust/ffi/port_tests.rs b/third-party/nr_rust/ffi/port_tests.rs
+index b888745..528e936 100644
+--- a/third-party/nr_rust/ffi/port_tests.rs
++++ b/third-party/nr_rust/ffi/port_tests.rs
+@@ -237,3 +237,27 @@ fn stuck_remote_replica_times_out() {
+         n0.execute_mut(Modify::PutArrayWmeta(key(k % 16), (k as usize % SLOTS) as isize, 0, -1), t0);
+     }
+ }
++
++#[test]
++fn ro_switch_notifies_on_replay_and_synced_check_sees_remote_events() {
++    // Paper §3.4.3/§3.4.5: a coherence-record deallocation (RO switch) is an event on the object, and the
++    // post-read check must see events another host appended even if no replay has happened here yet.
++    let m = shared_mem(min_entries());
++    let n0 = node(&m, 0, true, 2000);
++    let n1 = node(&m, 1, false, 2000);
++    let t0 = n0.register(0).unwrap();
++    let t1 = n1.register(1).unwrap();
++    n0.execute_mut(Modify::PutArrayWmeta(key(1), 11, 0, 5), t0);
++
++    // RO switch response carries the key's cn (upstream: -1).
++    let _ = n1.execute_anchor(Access::Get(key(1)), t1);
++    let r = n0.execute_mut(Modify::CheckSwitchWmetaArray(key(1), -1), t0).0.unwrap();
++    assert_eq!((r.value.wmeta_idx_, r.value.cn_array_[0].cn_idx_), (5, 11));
++
++    // Node 1 has not replayed: the plain check misses the event, the synced check does not.
++    assert!(n1.check_notification_reset(t1), "without a tail check the remote event is invisible");
++    let _ = n1.execute_anchor(Access::Get(key(1)), t1);
++    n0.execute_mut(Modify::CheckSwitchWmetaArray(key(1), 6), t0); // RO -> RW on node 0
++    n1.sync(t1);
++    assert!(!n1.check_notification_reset(t1), "tail check + replay must clear the notification");
++}
+-- 
+2.34.1
+

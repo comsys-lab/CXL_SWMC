@@ -1,0 +1,414 @@
+From f6f8aac317cac72a785f9147954fc47600eeb38a Mon Sep 17 00:00:00 2001
+From: Sungsu Ahn <sungsu_ahn@korea.ac.kr>
+Date: Wed, 14 Oct 2026 22:40:39 +0900
+Subject: [PATCH 07/51] port: run_id-tagged control block, pristine-log attach
+ check, closed-run reinit
+
+- Harness passes the same 64-bit run id to both nodes (MEGALON_RUN_ID or
+  config run_id; required, low 32 bits non-zero). It replaces
+  init_epoch_ns in the control block and is written before READY.
+- Node 1 waits for state==READY && run_id==expected (a stale READY of
+  another run is never attached to) and re-checks run id and READY in
+  Finish, at the start barrier and after it.
+- node_alive[i] holds the low 32 bits of run_id instead of 1.
+- ffi nr_log_counters: read-only snapshot of head/tail/ltails; node 1
+  refuses to attach unless all are 0 (gcd_nr.cc).
+- Node 0 may re-initialize without the reinit flag only when the previous
+  run closed cleanly (state CLOSED, no node alive); EMPTY still means an
+  all-zero control page.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ config/destijl-2vm.yaml                   |  2 +
+ src/common/config.cc                      | 18 +++++-
+ src/common/config.h                       |  3 +
+ src/index/gcd_nr.cc                       | 11 ++++
+ src/index/nr_hashmap.h                    |  7 ++
+ src/shared_memory/cxl_port.cc             | 79 ++++++++++++++++++-----
+ src/shared_memory/cxl_port.h              | 14 +++-
+ third-party/nr_rust/ffi/ffi_nr_hashmap.rs | 25 +++++++
+ third-party/nr_rust/ffi/port_tests.rs     | 16 +++++
+ 9 files changed, 155 insertions(+), 20 deletions(-)
+
+diff --git a/config/destijl-2vm.yaml b/config/destijl-2vm.yaml
+index d7de9ca..2a8571e 100644
+--- a/config/destijl-2vm.yaml
++++ b/config/destijl-2vm.yaml
+@@ -8,6 +8,8 @@ key_space: 1000000
+ slots: 1001000                  # same value for every flavor [V9]
+ logical_scr_size: 200MB         # required; same value for every flavor [V9]
+ node_id: 0                      # 0 = init (VM0), 1 = attach (VM1)
++# run_id: required, same non-zero 64-bit id on both nodes of a run (low 32 bits != 0);
++#         normally passed as MEGALON_RUN_ID by the harness
+ region_config: ""               # empty: $CXL_REGION_CONFIG
+ reinit: false                   # node 0: allow re-initializing a non-empty control block (or MEGALON_REINIT=1)
+ attach_mprotect: true           # node 1: write-protect HWcc/SWcc while attaching
+diff --git a/src/common/config.cc b/src/common/config.cc
+index 65bbe67..7c33202 100644
+--- a/src/common/config.cc
++++ b/src/common/config.cc
+@@ -1,6 +1,8 @@
+ #include "config.h"
+ 
+ #include <algorithm>
++#include <cerrno>
++#include <cstdlib>
+ #include <iomanip>
+ 
+ #include "absl/log/check.h"
+@@ -153,7 +155,21 @@ RackOBJConfig::RackOBJConfig() {
+     barrier_timeout_s_ = config["start_barrier_timeout_s"] ? config["start_barrier_timeout_s"].as<uint64_t>() : 600;
+     nr_log_bytes_ = config["nr_log_size"] ? convert_mem_size(config["nr_log_size"].as<string>()) : 64UL << 20;
+ 
+-    LOG(INFO) << "port config: node_id=" << node_id_ << " region_config="
++    // Every node of one run gets the same run id from the harness; it tags the control block, node_alive
++    // and the phase barriers so a node never attaches to (or synchronizes with) another run's state.
++    {
++        std::string rid;
++        if (const char *env = std::getenv("MEGALON_RUN_ID")) rid = env;
++        else if (config["run_id"]) rid = config["run_id"].as<string>();
++        if (rid.empty()) LOG(FATAL) << "MEGALON_RUN_ID (or config run_id) is required: same 64-bit id on every node";
++        char *end = nullptr;
++        errno = 0;
++        run_id_ = std::strtoull(rid.c_str(), &end, 0);
++        if (errno || !end || *end) LOG(FATAL) << "bad run_id '" << rid << "'";
++        if ((run_id_ & 0xffffffffull) == 0) LOG(FATAL) << "run_id must have non-zero low 32 bits";
++    }
++
++    LOG(INFO) << "port config: run_id=0x" << std::hex << run_id_ << std::dec << " node_id=" << node_id_ << " region_config="
+               << (region_config_.empty() ? std::string("$CXL_REGION_CONFIG") : region_config_)
+               << " reinit=" << reinit_ << " attach_mprotect=" << attach_mprotect_
+               << " stuck_timeout_ms=" << stuck_timeout_ms_ << " log_sync_interval_us=" << log_sync_interval_us_
+diff --git a/src/common/config.h b/src/common/config.h
+index fcda26f..561d072 100644
+--- a/src/common/config.h
++++ b/src/common/config.h
+@@ -63,6 +63,8 @@ public:
+ 
+     size_t GetNrLogBytes() const { return nr_log_bytes_; }
+ 
++    uint64_t RunId() const { return run_id_; }  // same non-zero id on every node of one run (MEGALON_RUN_ID)
++
+ private:
+     uint64_t shm_numa_node_;
+     uint64_t exec_numa_node_;
+@@ -90,6 +92,7 @@ private:
+     uint64_t attach_timeout_s_;
+     uint64_t barrier_timeout_s_;
+     size_t nr_log_bytes_;
++    uint64_t run_id_;
+ 
+     std::filesystem::path mount_directory_;
+     std::vector<std::filesystem::path> excluded_files_;
+diff --git a/src/index/gcd_nr.cc b/src/index/gcd_nr.cc
+index c626575..3d10ced 100644
+--- a/src/index/gcd_nr.cc
++++ b/src/index/gcd_nr.cc
+@@ -28,6 +28,17 @@ GlobalCacheDirectoryNr::GlobalCacheDirectoryNr(size_t num_entries, size_t num_re
+     LOG(INFO) << "NR log: header " << lay.header_size << " B at " << (void*)hdr << " (SCR), " << lay.entries
+               << " entries x " << lay.entry_size << " B at " << (void*)body << " (LNR), node " << ctx.node_id()
+               << (ctx.attach() ? " attach" : " init");
++    if (ctx.attach()) {
++        // A node may only attach to a log nobody has used yet (node 0 is held at the start barrier, so a
++        // used log means a stale or foreign run).
++        NrFfi::NrLogCounters c;
++        CHECK(NrFfi::nr_log_counters(hdr, &c)) << "cannot read NR log header";
++        bool pristine = c.head == 0 && c.tail == 0;
++        for (int i = 0; i < LOGICAL_NODE_NUM; i++) pristine = pristine && c.ltail[i] == 0;
++        if (!pristine)
++            LOG(FATAL) << "refusing to attach: shared NR log already used (head=" << c.head << " tail=" << c.tail
++                       << " ltail0=" << c.ltail[0] << " ltail1=" << c.ltail[1] << ")";
++    }
+     nrht_wrapper = NrFfi::create_node_replicated_shared(num_entries, num_replicas, static_cast<size_t>(ctx.node_id()),
+                                                         base_addr, SLOT_SIZE, hdr, body, lay.entries, !ctx.attach(),
+                                                         ctx.stuck_timeout_ms(), ctx.log_sync_interval_us());
+diff --git a/src/index/nr_hashmap.h b/src/index/nr_hashmap.h
+index 1777de5..a8ae0ff 100644
+--- a/src/index/nr_hashmap.h
++++ b/src/index/nr_hashmap.h
+@@ -41,6 +41,13 @@ NrRapper* create_node_replicated_shared(uint64_t cap, uint64_t num_replica, size
+                                         size_t slot_size, uint8_t* log_hdr, uint8_t* log_body, size_t log_entries,
+                                         bool init, uint64_t stuck_timeout_ms, uint64_t sync_interval_us);
+ void stop_log_sync(NrRapper* nrht_wrapper);
++struct NrLogCounters {
++    size_t head;
++    size_t tail;
++    size_t ltail[LOGICAL_NODE_NUM];
++};
++/* read-only snapshot of the shared log's head/tail/ltails */
++bool nr_log_counters(const uint8_t* log_hdr, NrLogCounters* out);
+ const NrMeta* register_node_replicated(NrRapper* nrht_wrapper, size_t idx);
+ void unregister_node_replicated(const NrMeta* metadata);
+ void Put(const NrMeta* metadata, rackobj::common::BlockId key, rackobj::common::GCDEntry val);
+diff --git a/src/shared_memory/cxl_port.cc b/src/shared_memory/cxl_port.cc
+index 9d61297..b7bfcec 100644
+--- a/src/shared_memory/cxl_port.cc
++++ b/src/shared_memory/cxl_port.cc
+@@ -38,12 +38,6 @@ uint64_t Fnv1a(const std::string &s) {
+     return h;
+ }
+ 
+-uint64_t NowNs() {
+-    return static_cast<uint64_t>(
+-        std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch())
+-            .count());
+-}
+-
+ std::string FlavorDefines() {
+     std::string d;
+ #ifdef SCR
+@@ -108,6 +102,7 @@ void PortContext::Init(const RackOBJConfig &cfg, size_t num_slots, size_t scr_fo
+     stuck_timeout_ms_ = cfg.StuckTimeoutMs();
+     log_sync_interval_us_ = cfg.LogSyncIntervalUs();
+     nr_log_bytes_ = cfg.GetNrLogBytes();
++    run_id_ = cfg.RunId();
+ 
+     std::string err;
+     const char *path = cfg.GetRegionConfig().empty() ? nullptr : cfg.GetRegionConfig().c_str();
+@@ -147,33 +142,45 @@ void PortContext::Init(const RackOBJConfig &cfg, size_t num_slots, size_t scr_fo
+         }
+         if (!empty) {
+             uint32_t st = ctrl_->state.load(std::memory_order_acquire);
+-            if (!cfg.Reinit())
++            // a cleanly closed previous run (node 0 exited, nobody alive) may be re-initialized without the flag
++            bool closed = ctrl_->magic == kCtrlMagic && st == kStateClosed;
++            for (int i = 0; i < kMaxNodes; i++) closed = closed && ctrl_->node_alive[i].load() == 0;
++            if (!cfg.Reinit() && !closed)
+                 LOG(FATAL) << "control block is not EMPTY (magic=0x" << std::hex << ctrl_->magic << std::dec
+                            << " state=" << st << "); set reinit: true (or MEGALON_REINIT=1) on node 0 to "
+                            << "re-initialize the shared region";
+             LOG(WARNING) << "re-initializing shared region (previous state " << st << ")";
+         }
+         ctrl_->state.store(kStateInitializing, std::memory_order_release);
+-        for (int i = 0; i < kMaxNodes; i++) ctrl_->node_alive[i].store(0, std::memory_order_relaxed);
++        for (int i = 0; i < kMaxNodes; i++) {
++            ctrl_->node_alive[i].store(0, std::memory_order_relaxed);
++            ctrl_->phase[i].store(0, std::memory_order_relaxed);
++        }
+         ctrl_->version = kCtrlVersion;
+         ctrl_->init_node = static_cast<uint32_t>(node_id_);
+         ctrl_->layout_hash = layout_hash_;
+         ctrl_->scr_cursor_end = 0;
+         ctrl_->lnr_cursor_end = 0;
+         ctrl_->log_root = 0;
+-        ctrl_->init_epoch_ns = NowNs();
++        ctrl_->run_id.store(run_id_, std::memory_order_relaxed);
+         ctrl_->magic = kCtrlMagic;
+         std::atomic_thread_fence(std::memory_order_release);
+     } else {
+         auto start = std::chrono::steady_clock::now();
+         auto last_log = start;
+-        while (!(ctrl_->magic == kCtrlMagic && ctrl_->state.load(std::memory_order_acquire) == kStateReady)) {
++        // wait for READY of *this* run: a READY left behind by another run (other run_id) is never attached to
++        while (!(ctrl_->magic == kCtrlMagic && ctrl_->state.load(std::memory_order_acquire) == kStateReady &&
++                 ctrl_->run_id.load(std::memory_order_acquire) == run_id_)) {
+             auto now = std::chrono::steady_clock::now();
+             if (now - start > std::chrono::seconds(cfg.AttachTimeoutS()))
+-                LOG(FATAL) << "node 0 did not publish READY within " << cfg.AttachTimeoutS() << " s";
++                LOG(FATAL) << "node 0 did not publish READY for run 0x" << std::hex << run_id_ << " within " << std::dec
++                           << cfg.AttachTimeoutS() << " s (control block: state "
++                           << ctrl_->state.load(std::memory_order_relaxed) << ", run_id 0x" << std::hex
++                           << ctrl_->run_id.load(std::memory_order_relaxed) << ")";
+             if (now - last_log > std::chrono::seconds(10)) {
+-                LOG(INFO) << "waiting for node 0 to publish READY (state "
+-                          << ctrl_->state.load(std::memory_order_relaxed) << ")";
++                LOG(INFO) << "waiting for node 0 to publish READY for run 0x" << std::hex << run_id_ << std::dec
++                          << " (state " << ctrl_->state.load(std::memory_order_relaxed) << ", run_id 0x" << std::hex
++                          << ctrl_->run_id.load(std::memory_order_relaxed) << std::dec << ")";
+                 last_log = now;
+             }
+             std::this_thread::sleep_for(std::chrono::milliseconds(5));
+@@ -185,8 +192,7 @@ void PortContext::Init(const RackOBJConfig &cfg, size_t num_slots, size_t scr_fo
+             LOG(FATAL) << "layout_hash mismatch: node 0 0x" << std::hex << ctrl_->layout_hash << ", node "
+                        << std::dec << node_id_ << " 0x" << std::hex << layout_hash_
+                        << " (same binaries, region config, slots and logical_scr_size required)";
+-        LOG(INFO) << "attaching to layout 0x" << std::hex << layout_hash_ << std::dec << " (init epoch "
+-                  << ctrl_->init_epoch_ns << ")";
++        LOG(INFO) << "attaching to layout 0x" << std::hex << layout_hash_ << " run 0x" << run_id_ << std::dec;
+         if (mprotect_) SetProtect(true);
+     }
+ 
+@@ -235,6 +241,7 @@ void PortContext::Finish(uint64_t log_root) {
+                        << ctrl_->scr_cursor_end << ", lnr cursor " << lnr_->Cursor() << " vs "
+                        << ctrl_->lnr_cursor_end << ", log_root 0x" << std::hex << log_root << " vs 0x"
+                        << ctrl_->log_root;
++        CheckRun("attach finish");
+         if (protected_) SetProtect(false);
+         LOG(INFO) << "attach complete, layout matches node 0";
+     }
+@@ -245,15 +252,52 @@ void PortContext::Finish(uint64_t log_root) {
+               << " bytes; log_root 0x" << std::hex << log_root;
+ }
+ 
++void PortContext::CheckRun(const char *where) const {
++    uint64_t rid = ctrl_->run_id.load(std::memory_order_acquire);
++    uint32_t st = ctrl_->state.load(std::memory_order_acquire);
++    if (rid != run_id_ || st != kStateReady)
++        LOG(FATAL) << where << ": control block belongs to another run or is not READY (run_id 0x" << std::hex << rid
++                   << ", expected 0x" << run_id_ << std::dec << ", state " << st << ")";
++}
++
++void PortContext::NodeBarrier(uint32_t phase) {
++    CHECK(initialized_);
++    CheckRun("barrier entry");
++    const uint64_t mine = (static_cast<uint64_t>(run_tag()) << 32) | phase;
++    ctrl_->phase[node_id_].store(mine, std::memory_order_release);
++    auto start = std::chrono::steady_clock::now();
++    auto last_log = start;
++    for (;;) {
++        bool all = true;
++        for (int i = 0; i < LOGICAL_NODE_NUM; i++) {
++            uint64_t w = ctrl_->phase[i].load(std::memory_order_acquire);
++            if ((w >> 32) != run_tag() || static_cast<uint32_t>(w) < phase) all = false;
++        }
++        if (all) break;
++        auto now = std::chrono::steady_clock::now();
++        if (now - start > std::chrono::seconds(barrier_timeout_s_))
++            LOG(FATAL) << "node barrier phase " << phase << ": the other node did not arrive within "
++                       << barrier_timeout_s_ << " s";
++        if (now - last_log > std::chrono::seconds(10)) {
++            LOG(INFO) << "node barrier phase " << phase << ": waiting for the other node";
++            last_log = now;
++        }
++        std::this_thread::sleep_for(std::chrono::milliseconds(1));
++    }
++    CheckRun("barrier exit");
++    LOG(INFO) << "node barrier phase " << phase << " passed";
++}
++
+ void PortContext::StartBarrier() {
+     CHECK(initialized_);
+-    ctrl_->node_alive[node_id_].store(1, std::memory_order_release);
++    CheckRun("start barrier");
++    ctrl_->node_alive[node_id_].store(run_tag(), std::memory_order_release);
+     auto start = std::chrono::steady_clock::now();
+     auto last_log = start;
+     for (;;) {
+         bool all = true;
+         for (int i = 0; i < LOGICAL_NODE_NUM; i++)
+-            if (ctrl_->node_alive[i].load(std::memory_order_acquire) != 1) all = false;
++            if (ctrl_->node_alive[i].load(std::memory_order_acquire) != run_tag()) all = false;
+         if (all) break;
+         auto now = std::chrono::steady_clock::now();
+         if (now - start > std::chrono::seconds(barrier_timeout_s_))
+@@ -264,6 +308,7 @@ void PortContext::StartBarrier() {
+         }
+         std::this_thread::sleep_for(std::chrono::milliseconds(1));
+     }
++    CheckRun("after start barrier");
+     LOG(INFO) << "start barrier passed: all " << LOGICAL_NODE_NUM << " nodes alive";
+ }
+ 
+diff --git a/src/shared_memory/cxl_port.h b/src/shared_memory/cxl_port.h
+index 56aeec5..24933c8 100644
+--- a/src/shared_memory/cxl_port.h
++++ b/src/shared_memory/cxl_port.h
+@@ -60,9 +60,10 @@ struct ControlBlock {
+     uint64_t scr_cursor_end;
+     uint64_t lnr_cursor_end;
+     uint64_t log_root;  // VA of the NR log header (same on every node)
+-    uint64_t init_epoch_ns;
++    std::atomic<uint64_t> run_id;  // harness-provided id of the current run, written before READY
+     alignas(64) std::atomic<uint32_t> state;
+-    alignas(64) std::atomic<uint32_t> node_alive[kMaxNodes];
++    alignas(64) std::atomic<uint32_t> node_alive[kMaxNodes];  // low 32 bits of run_id when alive, else 0
++    alignas(64) std::atomic<uint64_t> phase[kMaxNodes];       // (low32(run_id) << 32) | last phase reached
+ };
+ static_assert(sizeof(ControlBlock) <= kCtrlSize, "control block must fit in one page");
+ static_assert(std::atomic<uint32_t>::is_always_lock_free && std::atomic<uint64_t>::is_always_lock_free);
+@@ -98,6 +99,12 @@ public:
+      * happen before this returns. */
+     void StartBarrier();
+ 
++    /* Phase barrier across nodes, tagged with the run id. Phases must increase per node; a node that is
++     * already past `phase` counts as arrived. Only the calling thread waits (the NR log-sync thread keeps
++     * replaying). Aborts after the barrier timeout. */
++    void NodeBarrier(uint32_t phase);
++    static constexpr uint32_t kPhaseTeardown = 0xfffffff0u;
++
+     void Shutdown();
+ 
+     const cxl::region &region() const { return region_; }
+@@ -112,6 +119,8 @@ private:
+     PortContext() = default;
+ 
+     void SetProtect(bool read_only);
++    void CheckRun(const char *where) const;
++    uint32_t run_tag() const { return static_cast<uint32_t>(run_id_ & 0xffffffffull); }
+     uint64_t ComputeLayoutHash(const RackOBJConfig &cfg, size_t num_slots) const;
+ 
+     bool initialized_ = false;
+@@ -124,6 +133,7 @@ private:
+     uint64_t log_sync_interval_us_ = 100;
+     size_t nr_log_bytes_ = 64UL << 20;
+     uint64_t layout_hash_ = 0;
++    uint64_t run_id_ = 0;
+ 
+     cxl::region region_;
+     uint8_t *map_ = nullptr;
+diff --git a/third-party/nr_rust/ffi/ffi_nr_hashmap.rs b/third-party/nr_rust/ffi/ffi_nr_hashmap.rs
+index de7d4e5..4fb352a 100644
+--- a/third-party/nr_rust/ffi/ffi_nr_hashmap.rs
++++ b/third-party/nr_rust/ffi/ffi_nr_hashmap.rs
+@@ -771,6 +771,31 @@ pub extern "C" fn create_node_replicated_shared(
+     })))
+ }
+ 
++/// Read-only snapshot of a shared log's progress counters (no writes).
++#[repr(C)]
++pub struct NrLogCounters {
++    pub head: usize,
++    pub tail: usize,
++    pub ltail: [usize; LOGICAL_NODE_NUM],
++}
++
++/// Reads head, tail and every ltail of the shared log at `log_hdr` without
++/// writing. Used by an attaching node to refuse a log that has already been
++/// used (it must be pristine: everything 0). Returns false for a null header.
++#[no_mangle]
++pub extern "C" fn nr_log_counters(log_hdr: *const u8, out: *mut NrLogCounters) -> bool {
++    if log_hdr.is_null() || out.is_null() {
++        return false;
++    }
++    let log: &Log<Modify> = unsafe { &*(log_hdr as *const Log<Modify>) };
++    let mut c = NrLogCounters { head: log.head_now(), tail: log.tail_now(), ltail: [0; LOGICAL_NODE_NUM] };
++    for i in 0..LOGICAL_NODE_NUM {
++        c.ltail[i] = log.ltail_at(i);
++    }
++    unsafe { core::ptr::write(out, c) };
++    true
++}
++
+ /// Stops the background log-sync thread (if any); the instance stays usable.
+ #[no_mangle]
+ pub extern "C" fn stop_log_sync(nrht_wrapper: *mut Mutex<NrRapper>) {
+diff --git a/third-party/nr_rust/ffi/port_tests.rs b/third-party/nr_rust/ffi/port_tests.rs
+index ddc17ab..c8d5d48 100644
+--- a/third-party/nr_rust/ffi/port_tests.rs
++++ b/third-party/nr_rust/ffi/port_tests.rs
+@@ -111,6 +111,22 @@ fn in_place_init_then_attach_without_writes() {
+     assert!(bad_n.is_err());
+ }
+ 
++#[test]
++fn log_counters_read_only_snapshot() {
++    let m = shared_mem(min_entries());
++    let n0 = node(&m, 0, true, 2000);
++    let mut c = NrLogCounters { head: 9, tail: 9, ltail: [9; LOGICAL_NODE_NUM] };
++    assert!(nr_log_counters(m.hdr, &mut c));
++    assert_eq!((c.head, c.tail, c.ltail), (0, 0, [0; LOGICAL_NODE_NUM]), "fresh log is pristine");
++    let t0 = n0.register(0).unwrap();
++    n0.execute_mut(Modify::PutArrayWmeta(key(1), 1, 0, -1), t0);
++    assert!(nr_log_counters(m.hdr, &mut c));
++    assert_eq!(c.tail, 1);
++    assert_eq!(c.ltail[0], 1);
++    assert_eq!(c.ltail[1], 0);
++    assert!(!nr_log_counters(std::ptr::null(), &mut c));
++}
++
+ #[test]
+ fn register_at_tokens_are_fixed() {
+     let m = shared_mem(min_entries());
+-- 
+2.34.1
+

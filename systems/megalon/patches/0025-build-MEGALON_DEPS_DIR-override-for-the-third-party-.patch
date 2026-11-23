@@ -1,0 +1,77 @@
+From 37ee087c04a777042e3fb0932ca6e3e5a92c747c Mon Sep 17 00:00:00 2001
+From: Sungsu Ahn <sungsu_ahn@korea.ac.kr>
+Date: Thu, 15 Oct 2026 08:56:33 +0900
+Subject: [PATCH 25/51] build: MEGALON_DEPS_DIR override for the third-party
+ submodules (worktree builds)
+
+A git worktree of this repo has no initialized submodules. The cache variable
+defaults to this checkout's third-party/ (behaviour unchanged); a worktree build
+can point it at another checkout of the same submodule commits. nr_rust is always
+taken from this checkout.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ CMakeLists.txt | 20 ++++++++++++--------
+ 1 file changed, 12 insertions(+), 8 deletions(-)
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 84ff8be..ca096d3 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -21,13 +21,17 @@ set(ABSL_PROPAGATE_CXX_STD ON)
+ set(ABSL_ENABLE_INSTALL ON)
+ set(BUILD_TESTING OFF)
+ set(NR_DIR ${MEGALON_SOURCE_DIR}/third-party/nr_rust)
++# De Stijl port: directory of the git-submodule dependencies (yaml-cpp, abseil-cpp, oneTBB, gtl, ...). Default: this
++# checkout. A git worktree of this repo has no initialized submodules; it may point here at another checkout of the
++# same submodule commits (nr_rust is always taken from this checkout).
++set(MEGALON_DEPS_DIR "${MEGALON_SOURCE_DIR}/third-party" CACHE PATH "directory with the third-party git submodules")
+ # message(STATUS "Using server implementation: ${MEGALON_SERVER_IMPL}")
+ 
+ set(YAML_CPP_BUILD_TESTS OFF CACHE BOOL "Disable yaml-cpp tests" FORCE)
+ set(YAML_CPP_BUILD_TOOLS OFF CACHE BOOL "Disable yaml-cpp tools" FORCE)
+ set(YAML_CPP_INSTALL OFF CACHE BOOL "Disable yaml-cpp install" FORCE)
+ 
+-add_subdirectory(${MEGALON_SOURCE_DIR}/third-party/yaml-cpp)
++add_subdirectory(${MEGALON_DEPS_DIR}/yaml-cpp ${CMAKE_CURRENT_BINARY_DIR}/third-party/yaml-cpp)
+ 
+ # Clang compile options
+ # set(MEGALON_COMPILE_OPTIONS "-Wall -Werror -Wpedantic -Wextra -Wshadow -Wunused-parameter -Wpointer-arith -Wcast-align -Wwrite-strings -Wredundant-decls -Wmissing-prototypes -Wmissing-declarations -Wnested-externs -Winline -Wuninitialized -Wconversion -Wstrict-prototypes -felide-constructors -Wno-gcc-compat -Wno-deprecated-volatile -Wno-cast-align -Wno-error=shadow -Wno-error=sign-conversion -Wno-error=c11-extensions")
+@@ -153,11 +157,11 @@ add_dependencies(megalon fmt) # for auto formatting
+ 
+ set_source_files_properties(${MEGALON_SOURCES} PROPERTIES COMPILE_FLAGS ${MEGALON_COMPILE_OPTIONS})
+ target_include_directories(megalon PRIVATE ${MEGALON_SOURCE_DIR}/lib/ ${MEGALON_SOURCE_DIR}/src/)
+-target_include_directories(megalon PRIVATE ${MEGALON_SOURCE_DIR}/third-party/robin-map/include/)
+-target_include_directories(megalon PRIVATE ${MEGALON_SOURCE_DIR}/third-party/unordered_dense/include/)
+-target_include_directories(megalon PRIVATE ${MEGALON_SOURCE_DIR}/third-party/hostrpc/)
+-target_include_directories(megalon SYSTEM PRIVATE ${MEGALON_SOURCE_DIR}/third-party/oneTBB/include/)
+-target_include_directories(megalon SYSTEM PUBLIC ${MEGALON_SOURCE_DIR}/third-party/gtl/include/)
++target_include_directories(megalon PRIVATE ${MEGALON_DEPS_DIR}/robin-map/include/)
++target_include_directories(megalon PRIVATE ${MEGALON_DEPS_DIR}/unordered_dense/include/)
++target_include_directories(megalon PRIVATE ${MEGALON_DEPS_DIR}/hostrpc/)
++target_include_directories(megalon SYSTEM PRIVATE ${MEGALON_DEPS_DIR}/oneTBB/include/)
++target_include_directories(megalon SYSTEM PUBLIC ${MEGALON_DEPS_DIR}/gtl/include/)
+ target_include_directories(megalon SYSTEM PUBLIC ${MEGALON_SOURCE_DIR}/include/)
+ # set_property(TARGET megalon PROPERTY POSITION_INDEPENDENT_CODE ON)
+ 
+@@ -165,7 +169,7 @@ target_include_directories(megalon SYSTEM PUBLIC ${MEGALON_SOURCE_DIR}/include/)
+ get_target_property(YAML_CPP_INCLUDE_DIR yaml-cpp::yaml-cpp INTERFACE_INCLUDE_DIRECTORIES)
+ target_include_directories(megalon SYSTEM PRIVATE ${YAML_CPP_INCLUDE_DIR})
+ 
+-add_subdirectory(${MEGALON_SOURCE_DIR}/third-party/abseil-cpp)
++add_subdirectory(${MEGALON_DEPS_DIR}/abseil-cpp ${CMAKE_CURRENT_BINARY_DIR}/third-party/abseil-cpp)
+ 
+ target_link_libraries(megalon absl::log absl::check absl::flat_hash_map absl::status absl::failure_signal_handler absl::symbolize yaml-cpp::yaml-cpp numa atomic)
+ 
+@@ -216,7 +220,7 @@ set(TBB_CPF ON CACHE INTERNAL "" FORCE)
+ set_directory_properties(PROPERTIES
+     COMPILE_OPTIONS "-w"
+ )
+-add_subdirectory(${MEGALON_SOURCE_DIR}/third-party/oneTBB)
++add_subdirectory(${MEGALON_DEPS_DIR}/oneTBB ${CMAKE_CURRENT_BINARY_DIR}/third-party/oneTBB)
+ 
+ target_link_libraries(megalon TBB::tbb TBB::tbbmalloc)
+ 
+-- 
+2.34.1
+

@@ -1,0 +1,80 @@
+From 7692c0bedec10447ecf48175431eae1599d8dda2 Mon Sep 17 00:00:00 2001
+From: Sungsu Ahn <sungsu_ahn@korea.ac.kr>
+Date: Wed, 14 Oct 2026 23:18:41 +0900
+Subject: [PATCH 13/51] port: no glibc interposition without FILE_INTERFACE;
+ kv-store progress watchdog
+
+The open()/close()/read()/write() wrappers only serve the file interface; they
+CHECKed SLOT_SIZE for every non-excluded path, which also broke the absl
+symbolizer during G-B run 2. KV_WATCHDOG_S aborts a hung run with the stack of
+a stuck worker (run 2: all workers spinning after warmup, both nodes writing).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ CMakeLists.txt         | 10 ++++++++--
+ benchmarks/kv_store.cc | 21 +++++++++++++++++++++
+ 2 files changed, 29 insertions(+), 2 deletions(-)
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 1b7cee3..fcf0dea 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -112,8 +112,14 @@ file(GLOB MEGALON_SOURCES CONFIGURE_DEPENDS
+      "${MEGALON_SOURCE_DIR}/src/index/*.cc"
+      "${MEGALON_SOURCE_DIR}/src/manager/*.cc"
+      "${MEGALON_SOURCE_DIR}/src/shared_memory/*.cc"
+-     "${MEGALON_SOURCE_DIR}/lib/*.cc"
+-     "${MEGALON_SOURCE_DIR}/lib/glibc/*.cc")
++     "${MEGALON_SOURCE_DIR}/lib/*.cc")
++# De Stijl port: the glibc open()/close()/read()/write() interposition only serves the file interface.
++# Without it, it must not be linked: it CHECKs SLOT_SIZE == 4096 for any non-excluded path, which broke
++# the device open and the absl symbolizer (G-B runs).
++if (FILE_INTERFACE)
++    file(GLOB MEGALON_GLIBC_SOURCES CONFIGURE_DEPENDS "${MEGALON_SOURCE_DIR}/lib/glibc/*.cc")
++    list(APPEND MEGALON_SOURCES ${MEGALON_GLIBC_SOURCES})
++endif()
+ add_library(megalon SHARED ${MEGALON_SOURCES})
+ message(STATUS "Using sources: ${MEGALON_SOURCES}")
+ target_compile_features(megalon PUBLIC cxx_std_23)
+diff --git a/benchmarks/kv_store.cc b/benchmarks/kv_store.cc
+index d4b4dfc..8dfee48 100644
+--- a/benchmarks/kv_store.cc
++++ b/benchmarks/kv_store.cc
+@@ -515,6 +515,11 @@ int main(int argc, char** argv) {
+     });
+ 
+     // Reporter thread: periodically aggregate per-thread counters and print throughput
++    // De Stijl port diagnostics: KV_WATCHDOG_S > 0 aborts the run with the stack of a stuck worker when a
++    // worker's op counter has not moved for that many seconds after the workers started (G-B run 2 hung
++    // with all workers spinning and no message).
++    const uint64_t watchdog_s = getenv("KV_WATCHDOG_S") ? std::stoull(getenv("KV_WATCHDOG_S")) : 0;
++    std::vector<uint64_t> wd_last(thread_cnt, 0), wd_still(thread_cnt, 0);
+     std::jthread reporter([&] {
+         using namespace std::chrono;
+         uint64_t last_total = 0;
+@@ -529,6 +534,22 @@ int main(int argc, char** argv) {
+                 // and each counter is padded to its own cache line (no false sharing).
+                 total += thread_counters[i].ops.load(std::memory_order_relaxed);
+             }
++            if (watchdog_s > 0 && control.warmup_done.load(std::memory_order_acquire)) {
++                for (size_t i = 0; i < thread_cnt; ++i) {
++                    uint64_t ops = thread_counters[i].ops.load(std::memory_order_relaxed);
++                    wd_still[i] = (ops == wd_last[i]) ? wd_still[i] + interval : 0;
++                    wd_last[i] = ops;
++                }
++                for (size_t i = 0; i < thread_cnt; ++i) {
++                    if (wd_still[i] < watchdog_s) continue;
++                    std::ostringstream os;
++                    for (size_t j = 0; j < thread_cnt; ++j) os << " t" << j << "=" << wd_last[j] << "/" << wd_still[j] << "s";
++                    LOG(ERROR) << "WATCHDOG: worker " << i << " made no progress for " << wd_still[i]
++                               << "s (ops/still:" << os.str() << "); aborting with its stack";
++                    pthread_kill(workers[i].native_handle(), SIGABRT);
++                    std::this_thread::sleep_for(seconds(10));
++                }
++            }
+ 
+             uint64_t delta = total - last_total;
+             last_total = total;
+-- 
+2.34.1
+

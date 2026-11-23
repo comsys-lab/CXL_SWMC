@@ -1,0 +1,80 @@
+From 14b6c7bc76dc02fabeb00bbc253ad04901b0d10b Mon Sep 17 00:00:00 2001
+From: Sungsu Ahn <sungsu_ahn@korea.ac.kr>
+Date: Wed, 14 Oct 2026 23:48:34 +0900
+Subject: [PATCH 14/51] port: teardown barrier exit accepts CLOSED of the same
+ run; drop doubled 0x
+
+Node 0 can pass the teardown barrier, finish and set state CLOSED before node 1
+re-checks the control block at barrier exit (G-B v2.5 run 2: node 1 rc 134).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/shared_memory/cxl_port.cc | 14 ++++++++------
+ src/shared_memory/cxl_port.h  |  2 +-
+ 2 files changed, 9 insertions(+), 7 deletions(-)
+
+diff --git a/src/shared_memory/cxl_port.cc b/src/shared_memory/cxl_port.cc
+index 4344dee..962df27 100644
+--- a/src/shared_memory/cxl_port.cc
++++ b/src/shared_memory/cxl_port.cc
+@@ -195,7 +195,7 @@ void PortContext::Init(const RackOBJConfig &cfg, size_t num_slots, size_t scr_fo
+             LOG(FATAL) << "layout_hash mismatch: node 0 " << std::hex << ctrl_->layout_hash << ", node "
+                        << std::dec << node_id_ << " " << std::hex << layout_hash_
+                        << " (same binaries, region config, slots and logical_scr_size required)";
+-        LOG(INFO) << "attaching to layout " << std::hex << layout_hash_ << " run 0x" << run_id_ << std::dec;
++        LOG(INFO) << "attaching to layout " << std::hex << layout_hash_ << " run " << run_id_ << std::dec;
+         if (mprotect_) SetProtect(true);
+     }
+ 
+@@ -242,7 +242,7 @@ void PortContext::Finish(uint64_t log_root) {
+             log_root != ctrl_->log_root)
+             LOG(FATAL) << "attach layout diverged from node 0: scr cursor " << scr_->Cursor() << " vs "
+                        << ctrl_->scr_cursor_end << ", lnr cursor " << lnr_->Cursor() << " vs "
+-                       << ctrl_->lnr_cursor_end << ", log_root " << std::hex << log_root << " vs 0x"
++                       << ctrl_->lnr_cursor_end << ", log_root " << std::hex << log_root << " vs "
+                        << ctrl_->log_root;
+         CheckRun("attach finish");
+         if (protected_) SetProtect(false);
+@@ -255,12 +255,12 @@ void PortContext::Finish(uint64_t log_root) {
+               << " bytes; log_root " << std::hex << log_root;
+ }
+ 
+-void PortContext::CheckRun(const char *where) const {
++void PortContext::CheckRun(const char *where, bool allow_closed) const {
+     uint64_t rid = ctrl_->run_id.load(std::memory_order_acquire);
+     uint32_t st = ctrl_->state.load(std::memory_order_acquire);
+-    if (rid != run_id_ || st != kStateReady)
++    if (rid != run_id_ || !(st == kStateReady || (allow_closed && st == kStateClosed)))
+         LOG(FATAL) << where << ": control block belongs to another run or is not READY (run_id " << std::hex << rid
+-                   << ", expected 0x" << run_id_ << std::dec << ", state " << st << ")";
++                   << ", expected " << run_id_ << std::dec << ", state " << st << ")";
+ }
+ 
+ void PortContext::NodeBarrier(uint32_t phase) {
+@@ -287,7 +287,9 @@ void PortContext::NodeBarrier(uint32_t phase) {
+         }
+         std::this_thread::sleep_for(std::chrono::milliseconds(1));
+     }
+-    CheckRun("barrier exit");
++    // node 0 may pass the teardown barrier first and Shutdown() (state CLOSED) before we re-check here; CLOSED is
++    // only ever set after node 0 passed that barrier, so it is valid there (same run_id still required)
++    CheckRun("barrier exit", phase == kPhaseTeardown);
+     LOG(INFO) << "node barrier phase " << phase << " passed";
+ }
+ 
+diff --git a/src/shared_memory/cxl_port.h b/src/shared_memory/cxl_port.h
+index 24933c8..1c68d3b 100644
+--- a/src/shared_memory/cxl_port.h
++++ b/src/shared_memory/cxl_port.h
+@@ -119,7 +119,7 @@ private:
+     PortContext() = default;
+ 
+     void SetProtect(bool read_only);
+-    void CheckRun(const char *where) const;
++    void CheckRun(const char *where, bool allow_closed = false) const;
+     uint32_t run_tag() const { return static_cast<uint32_t>(run_id_ & 0xffffffffull); }
+     uint64_t ComputeLayoutHash(const RackOBJConfig &cfg, size_t num_slots) const;
+ 
+-- 
+2.34.1
+

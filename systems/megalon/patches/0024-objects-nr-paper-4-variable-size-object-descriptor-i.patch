@@ -1,0 +1,464 @@
+From 7b25cff27b8b074c0797b93d80acbf0d3c8ef2e6 Mon Sep 17 00:00:00 2001
+From: Sungsu Ahn <sungsu_ahn@korea.ac.kr>
+Date: Thu, 15 Oct 2026 08:48:38 +0900
+Subject: [PATCH 24/51] =?UTF-8?q?objects=20nr:=20paper=20=C2=A74=20variabl?=
+ =?UTF-8?q?e-size=20object=20descriptor=20in=20the=20index=20entry;=20repl?=
+ =?UTF-8?q?ay=20flushes=20the=20object's=20range?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+One object = one index entry = one coherence record. The entry holds the object's
+LNR location (cn_array_[0], flag bit 62 | offset/64 from the replica flush base)
+and its size (cn_array_[1], invalidate_ set so it never counts as a local copy).
+IdxGetter::obj_span lets exec_notify flush [base, base+size) where it flushes a
+slot; slots keep upstream's range. New FFI ObjectCreate (CheckPut, no new log op,
+entry size stays 128 B) and object replay flush counters. Tests: object_tests.rs.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ third-party/nr_rust/ffi/ffi_nr_hashmap.rs     |  39 +++
+ third-party/nr_rust/ffi/object_tests.rs       | 235 ++++++++++++++++++
+ third-party/nr_rust/ffi/types.rs              |  46 ++++
+ .../nr_rust/node-replication/src/nr/mod.rs    |   9 +-
+ .../node-replication/src/nr/replica.rs        |  23 +-
+ 5 files changed, 349 insertions(+), 3 deletions(-)
+ create mode 100644 third-party/nr_rust/ffi/object_tests.rs
+
+diff --git a/third-party/nr_rust/ffi/ffi_nr_hashmap.rs b/third-party/nr_rust/ffi/ffi_nr_hashmap.rs
+index 785a372..6293f14 100644
+--- a/third-party/nr_rust/ffi/ffi_nr_hashmap.rs
++++ b/third-party/nr_rust/ffi/ffi_nr_hashmap.rs
+@@ -13,6 +13,8 @@ mod types;
+ mod port_tests;
+ #[cfg(all(test, feature = "wmeta-rev"))]
+ mod wmeta_rev_tests;
++#[cfg(test)]
++mod object_tests;
+ 
+ use topology::*;
+ use constants::*;
+@@ -1422,3 +1424,40 @@ pub extern "C" fn DummyEvent(metadata: *mut NrMeta, key: BlockId) {
+         );
+     }
+ }
++
++// ---------------------------------------------------------------------------------------------------
++// De Stijl port, phase B: variable-size objects as the paper proposes (§4). The object's descriptor
++// (location, size) and its coherence record live in its own index entry (types.rs obj_entry); every
++// other op on an object is an existing op (InvalidateExceptArrayUpdateWmeta, CheckSwitchWmetaArray,
++// SwitchToReadOnlyByWmeta, DummyLog) used exactly as for slots.
++// ---------------------------------------------------------------------------------------------------
++
++/// create(id, size): publish the object's entry through the log if the key has none (Modify::CheckPut,
++/// same log entry size as before). `off_units` = byte offset of the object from the flush base / 64,
++/// `wmeta_idx` = -1 (read-shared, paper §3.4.2: no coherence record at create) or a static record (hwcc).
++///   0: created; 1: the key already has an entry (nothing changed)
++#[no_mangle]
++pub extern "C" fn ObjectCreate(metadata: *mut NrMeta, key: BlockId, off_units: isize, size: isize, wmeta_idx: isize) -> usize {
++    unsafe {
++        let wrapper = (*metadata)
++            .nrht
++            .execute_mut(Modify::CheckPut(key, obj_entry(off_units, size, wmeta_idx)), (*metadata).ttkn);
++        match wrapper.0 {
++            Some(_) => 0,
++            None => 1,
++        }
++    }
++}
++
++/// Replay flushes of variable-size objects issued by the other node, in this process: count and bytes.
++#[no_mangle]
++pub extern "C" fn nr_obj_replay_flush_stats(count: *mut u64, bytes: *mut u64) {
++    if count.is_null() || bytes.is_null() {
++        return;
++    }
++    let (c, b) = node_replication::nr::obj_replay_flush_stats();
++    unsafe {
++        *count = c as u64;
++        *bytes = b as u64;
++    }
++}
+diff --git a/third-party/nr_rust/ffi/object_tests.rs b/third-party/nr_rust/ffi/object_tests.rs
+new file mode 100644
+index 0000000..3fc677b
+--- /dev/null
++++ b/third-party/nr_rust/ffi/object_tests.rs
+@@ -0,0 +1,235 @@
++//! De Stijl port, phase B: variable-size objects as the paper proposes (§4). Pure-Rust tests of the NR side:
++//! two nodes share one in-place log in heap memory (port_tests helpers, no devdax). The "object arena" is the
++//! upper half of the test's slot buffer, so replay flushes touch mapped memory.
++//!
++//! What is checked: the descriptor encoding, create through the log (first create wins), that every existing
++//! coherence event on an object (create, RO->RW switch, RO switch / record deallocation, seq wrap-around) clears
++//! the other node's notification on that object and flushes exactly the object's byte range on replay, that
++//! object and slot notifications never alias, and (wmeta-rev) that reclaim resolves an object's record.
++
++use std::sync::Arc;
++
++use node_replication::nr::{obj_replay_flush_stats, IdxGetter, NodeReplicated, ThreadToken};
++
++use super::port_tests::{key, min_entries, node, shared_mem};
++use super::*;
++
++/// Test arena: byte offset 128 KiB into port_tests' 256 KiB slot buffer (the replica's flush base).
++const ARENA_OFF: usize = 128 << 10;
++/// Same namespace value as lib/object_store.h kObjectInode ("MOBJ").
++const OBJ_INODE: u64 = 0x4d4f_424a;
++
++fn okey(id: u64) -> BlockId {
++    #[allow(unused_mut)]
++    let mut b = key(id);
++    #[cfg(key_size_24)]
++    {
++        b.inode_ = OBJ_INODE;
++    }
++    b
++}
++
++fn units(off: usize) -> isize {
++    assert_eq!(off % OBJ_GRANULE, 0);
++    (off / OBJ_GRANULE) as isize
++}
++
++fn meta(n: &Arc<NodeReplicated<NrHashMapFFi>>, t: ThreadToken) -> *mut NrMeta {
++    Box::into_raw(Box::new(NrMeta { nrht: Arc::clone(n), ttkn: t }))
++}
++
++type Node = Arc<NodeReplicated<NrHashMapFFi>>;
++
++fn two_nodes() -> (Node, Node, ThreadToken, ThreadToken) {
++    let m = Box::leak(Box::new(shared_mem(min_entries())));
++    let n0 = node(m, 0, true, 2000);
++    let n1 = node(m, 1, false, 2000);
++    let t0 = n0.register(0).unwrap();
++    let t1 = n1.register(1).unwrap();
++    (n0, n1, t0, t1)
++}
++
++fn entry(n: &Node, t: ThreadToken, k: BlockId) -> Option<GCDEntry> {
++    n.execute(Access::Get(k), t).0.map(|r| r.value)
++}
++
++/// Object replay flushes expected per remote event: one per event, `size` bytes each, only with `scr`.
++fn flush_delta(before: (usize, usize)) -> (usize, usize) {
++    let now = obj_replay_flush_stats();
++    (now.0 - before.0, now.1 - before.1)
++}
++
++fn expect_flushes(before: (usize, usize), events: usize, size: usize) {
++    let d = flush_delta(before);
++    if cfg!(any(feature = "scr", feature = "no-coherence")) {
++        assert_eq!(d, (events, events * size), "replay must flush the whole object once per remote event");
++    } else {
++        assert_eq!(d, (0, 0), "hwcc build: no replay flushes");
++    }
++}
++
++#[test]
++fn object_entry_encoding_roundtrip() {
++    let e = obj_entry(units(ARENA_OFF), 3000, -1);
++    assert_eq!(obj_decode(&e), Some((ARENA_OFF, 3000)));
++    assert_eq!(e.wmeta_idx_, -1);
++    assert!(e.cn_array_[0].cn_idx_ & OBJ_CN_FLAG != 0);
++    assert!(!e.cn_array_[0].invalidate_, "location must count as a live CXL copy");
++    assert!(e.cn_array_[1].invalidate_, "the size must never count as a local copy");
++    let r = GCDReponse { key: okey(1), value: e };
++    assert_eq!(r.obj_span(), Some((ARENA_OFF, 3000)));
++    assert_eq!(r.cn_idx(), OBJ_CN_FLAG | units(ARENA_OFF));
++    // slot entries keep upstream's behaviour: no object span, cn index unchanged
++    let s = GCDReponse { key: key(1), value: init_gcd_entry(17, NUMA_MEM) };
++    assert_eq!((s.obj_span(), s.cn_idx()), (None, 17));
++    assert_eq!(OptionGCDReponse(None).obj_span(), None);
++    // static record (hwcc) travels in wmeta_idx_ as for slots
++    assert_eq!(obj_entry(0, 64, 42).wmeta_idx_, 42);
++}
++
++#[test]
++fn create_is_published_through_the_log_and_first_create_wins() {
++    let (n0, n1, t0, t1) = two_nodes();
++    let (m0, m1) = (meta(&n0, t0), meta(&n1, t1));
++    assert_eq!(ObjectCreate(m0, okey(7), units(ARENA_OFF), 5000, -1), 0);
++    // node 1 finds the object by id with the same descriptor
++    let e = entry(&n1, t1, okey(7)).expect("node 1 sees the create");
++    assert_eq!((obj_decode(&e), e.wmeta_idx_), (Some((ARENA_OFF, 5000)), -1));
++    // a racing create of the same id (other location) loses and changes nothing
++    assert_eq!(ObjectCreate(m1, okey(7), units(ARENA_OFF + 8192), 64, -1), 1);
++    for (n, t) in [(&n0, t0), (&n1, t1)] {
++        assert_eq!(obj_decode(&entry(n, t, okey(7)).unwrap()), Some((ARENA_OFF, 5000)));
++    }
++    // the object namespace is separate from slot keys with the same number
++    if cfg!(key_size_24) {
++        assert!(entry(&n1, t1, key(7)).is_none());
++    }
++}
++
++#[test]
++fn every_coherence_event_on_an_object_notifies_and_flushes_its_range() {
++    // Paper §3.4.3: creations and coherence-record (de)allocations are log events; replaying one flushes the
++    // object's cache lines and clears notifications on it. Same ops as for slots, object-sized range.
++    let (n0, n1, t0, t1) = two_nodes();
++    let m0 = meta(&n0, t0);
++    let size = 3000usize; // not a multiple of 64: the flush covers the last partial line too
++    let k = okey(1);
++
++    let f = obj_replay_flush_stats();
++    assert_eq!(ObjectCreate(m0, k, units(ARENA_OFF), size as isize, -1), 0);
++    n1.sync(t1);
++    expect_flushes(f, 1, size); // create
++
++    // RO -> RW (record 5), as the slot SwitchRW does (InvalidateExceptArrayUpdateWmeta, CXL index 0)
++    let _ = n1.execute_anchor(Access::Get(k), t1);
++    assert!(n1.check_notification_reset(t1), "armed, nothing replayed yet");
++    let _ = n1.execute_anchor(Access::Get(k), t1);
++    let f = obj_replay_flush_stats();
++    assert_eq!(InvalidateExceptArrayUpdateWmeta(m0, k, 0, 5), 0);
++    n1.sync(t1);
++    assert!(!n1.check_notification_reset(t1), "RW switch must notify a reader of the object");
++    expect_flushes(f, 1, size);
++    let e = entry(&n1, t1, k).unwrap();
++    assert_eq!((e.wmeta_idx_, obj_decode(&e)), (5, Some((ARENA_OFF, size))), "descriptor survives the switch");
++    // a second RW switch fails (already RW) and is no event
++    let _ = n1.execute_anchor(Access::Get(k), t1);
++    let f = obj_replay_flush_stats();
++    assert_eq!(InvalidateExceptArrayUpdateWmeta(m0, k, 0, 6), 2);
++    n1.sync(t1);
++    assert!(n1.check_notification_reset(t1));
++    expect_flushes(f, 0, size);
++
++    // seq wrap-around event (write_seq_end -> SeqCountWrapAround -> DummyLog)
++    let _ = n1.execute_anchor(Access::Get(k), t1);
++    let f = obj_replay_flush_stats();
++    DummyEvent(m0, k);
++    n1.sync(t1);
++    assert!(!n1.check_notification_reset(t1), "wrap-around must notify");
++    expect_flushes(f, 1, size);
++
++    // RO switch = record deallocation (reclaim), answered with the entry (fix e806494)
++    let _ = n1.execute_anchor(Access::Get(k), t1);
++    let f = obj_replay_flush_stats();
++    assert_eq!(CheckSwitchWmetaArray(m0, k, -1), 5);
++    n1.sync(t1);
++    assert!(!n1.check_notification_reset(t1), "deallocation must notify");
++    expect_flushes(f, 1, size);
++    let e = entry(&n1, t1, k).unwrap();
++    assert_eq!((e.wmeta_idx_, obj_decode(&e)), (-1, Some((ARENA_OFF, size))));
++    // RO switch of an RO object: no event
++    let _ = n1.execute_anchor(Access::Get(k), t1);
++    let f = obj_replay_flush_stats();
++    let _ = CheckSwitchWmetaArray(m0, k, -1);
++    n1.sync(t1);
++    assert!(n1.check_notification_reset(t1));
++    expect_flushes(f, 0, size);
++
++    // own ops are not flushed by the issuing node (upstream rule, same as slots)
++    let f = obj_replay_flush_stats();
++    let _ = n0.execute_anchor(Access::Get(k), t0);
++    n0.sync(t0);
++    expect_flushes(f, 0, size);
++}
++
++#[test]
++fn object_and_slot_notifications_never_alias() {
++    let (n0, n1, t0, t1) = two_nodes();
++    let m0 = meta(&n0, t0);
++    // slot whose cn index equals the object's offset in units (would alias without the flag bit); small offset so
++    // that the slot's own replay flush (cn * 1 KiB) stays inside the test buffer
++    let off = 4096;
++    let slot_cn = units(off);
++    n0.execute_mut(Modify::PutArrayWmeta(key(3), slot_cn, NUMA_MEM, -1), t0);
++    assert_eq!(ObjectCreate(m0, okey(3), units(off), 128, -1), 0);
++    n1.sync(t1);
++
++    // reader of the slot: object events leave it armed
++    let _ = n1.execute_anchor(Access::Get(key(3)), t1);
++    assert_eq!(InvalidateExceptArrayUpdateWmeta(m0, okey(3), 0, 9), 0);
++    DummyEvent(m0, okey(3));
++    n1.sync(t1);
++    assert!(n1.check_notification_reset(t1), "object events must not clear a slot reader's notification");
++
++    // reader of the object: slot events leave it armed
++    let _ = n1.execute_anchor(Access::Get(okey(3)), t1);
++    DummyEvent(m0, key(3));
++    n0.execute_mut(Modify::CheckSwitchWmetaArray(key(3), 4), t0);
++    n1.sync(t1);
++    assert!(n1.check_notification_reset(t1), "slot events must not clear an object reader's notification");
++
++    // two objects: events on one do not clear the other
++    assert_eq!(ObjectCreate(m0, okey(4), units(off + 128), 64, -1), 0);
++    let _ = n1.execute_anchor(Access::Get(okey(4)), t1);
++    DummyEvent(m0, okey(3));
++    n1.sync(t1);
++    assert!(n1.check_notification_reset(t1));
++}
++
++#[test]
++fn create_and_switch_keep_the_log_entry_size() {
++    // no new Modify variant: the log entry size (recorded in every build manifest) is unchanged
++    assert_eq!(NR_LOG_ENTRY_SIZE, 128);
++}
++
++#[cfg(feature = "wmeta-rev")]
++#[test]
++fn object_records_resolve_through_the_reverse_map() {
++    // packed4/rev64 reclaim: record -> owner key from the replica's reverse map; objects are ordinary owners.
++    let (n0, n1, t0, t1) = two_nodes();
++    let (m0, m1) = (meta(&n0, t0), meta(&n1, t1));
++    let size = 4096usize;
++    assert_eq!(ObjectCreate(m0, okey(9), units(ARENA_OFF), size as isize, -1), 0);
++    assert_eq!(InvalidateExceptArrayUpdateWmeta(m0, okey(9), 0, 11), 0);
++    n1.sync(t1);
++    // node 1 reclaims record 11 without knowing the key
++    let _ = n0.execute_anchor(Access::Get(okey(9)), t0);
++    let f = obj_replay_flush_stats();
++    assert_eq!(SwitchToReadOnlyByWmeta(m1, 11), 11);
++    n0.sync(t0);
++    assert!(!n0.check_notification_reset(t0), "reclaim of an object's record must notify the other node");
++    expect_flushes(f, 1, size);
++    let e = entry(&n0, t0, okey(9)).unwrap();
++    assert_eq!((e.wmeta_idx_, obj_decode(&e)), (-1, Some((ARENA_OFF, size))));
++    // the record is no longer owned
++    assert_eq!(SwitchToReadOnlyByWmeta(m1, 11), -1);
++}
+diff --git a/third-party/nr_rust/ffi/types.rs b/third-party/nr_rust/ffi/types.rs
+index af936a1..c043020 100644
+--- a/third-party/nr_rust/ffi/types.rs
++++ b/third-party/nr_rust/ffi/types.rs
+@@ -68,6 +68,44 @@ pub fn init_empty_gcd_entry_with_wmeta_idx(wmeta_idx: isize) -> GCDEntry {
+     }
+ }
+ 
++// De Stijl port, phase B: variable-size objects as the paper proposes (§4: "keeping the object size as a field in
++// the logically shared metadata", size fixed at create). One object = one index entry = one coherence record
++// (dynamic: none while read-shared). The descriptor lives in the object's own entry of the replicated map, so it
++// reaches every node only through the NR log, like a slot's cn index. Encoding in the fixed GCDEntry ABI
++// (lib/object_store.h mirrors it):
++//   cn_array_[0] = (OBJ_CN_FLAG | base offset / OBJ_GRANULE, false)
++//       the object's location in LNR: byte offset from the replica's flush base (the slot data base, `base_addr`),
++//       in 64 B units. It is the object's "cn index": unique per object (objects never overlap) and disjoint from
++//       slot indexes (bit 62), so change notifications of objects and slots never alias.
++//   cn_array_[1] = (size in bytes, invalidate_ = true)
++//       invalidate_ is set so that no "local copy on logical node 0" check can ever treat the size as a copy.
++//   wmeta_idx_    = the coherence record, as for slots (-1: read-shared).
++// Replaying any response that carries such an entry flushes [base, base + size) (IdxGetter::obj_span), where a
++// slot response flushes its slot.
++pub const OBJ_CN_FLAG: isize = 1 << 62;
++pub const OBJ_GRANULE: usize = 64;
++const _: () = assert!(LOGICAL_NODE_NUM >= 1, "object encoding needs cn_array_[1]");
++
++pub fn obj_entry(off_units: isize, size: isize, wmeta_idx: isize) -> GCDEntry {
++    assert!(off_units >= 0 && off_units < OBJ_CN_FLAG && size > 0);
++    let mut e = init_empty_gcd_entry();
++    e.wmeta_idx_ = wmeta_idx;
++    e.cn_array_[0] = CNStatus { cn_idx_: OBJ_CN_FLAG | off_units, invalidate_: false };
++    e.cn_array_[1] = CNStatus { cn_idx_: size, invalidate_: true };
++    e
++}
++
++/// (byte offset from the flush base, size) if `e` is an object entry.
++pub fn obj_decode(e: &GCDEntry) -> Option<(usize, usize)> {
++    let cn = e.cn_array_[0].cn_idx_;
++    if cn < 0 || cn & OBJ_CN_FLAG == 0 {
++        return None;
++    }
++    let size = e.cn_array_[1].cn_idx_;
++    assert!(size > 0, "object entry without a size");
++    Some(((cn & !OBJ_CN_FLAG) as usize * OBJ_GRANULE, size as usize))
++}
++
+ // BlockId definition that toggles based on KEY_SIZE constant
+ // When KEY_SIZE == 24: matches blockid_file.h (server_id, inode, offset)
+ // When KEY_SIZE != 24: matches blockid_variable.h (offset + padding)
+@@ -196,6 +234,10 @@ impl IdxGetter for GCDReponse {
+     fn cn_idx(&self) -> isize {
+         self.value.cn_array_[0].cn_idx_
+     }
++
++    fn obj_span(&self) -> Option<(usize, usize)> {
++        obj_decode(&self.value)
++    }
+ }
+ 
+ // OptionGCDReponse struct
+@@ -220,6 +262,10 @@ impl IdxGetter for OptionGCDReponse {
+     fn cn_idx(&self) -> isize {
+         self.as_ref().map_or(-1, |r| r.cn_idx())
+     }
++
++    fn obj_span(&self) -> Option<(usize, usize)> {
++        self.as_ref().and_then(|r| r.obj_span())
++    }
+ }
+ 
+ // Debug function for GCDEntry initialization
+diff --git a/third-party/nr_rust/node-replication/src/nr/mod.rs b/third-party/nr_rust/node-replication/src/nr/mod.rs
+index 216dfe8..b1b20b6 100644
+--- a/third-party/nr_rust/node-replication/src/nr/mod.rs
++++ b/third-party/nr_rust/node-replication/src/nr/mod.rs
+@@ -95,7 +95,7 @@ pub mod rwlock;
+ pub mod rwlock;
+ 
+ pub use log::{Log, MAX_REPLICAS_PER_LOG};
+-pub use replica::{CombinerLock, Replica, ReplicaError, ReplicaId, ReplicaToken};
++pub use replica::{obj_replay_flush_stats, CombinerLock, Replica, ReplicaError, ReplicaId, ReplicaToken};
+ 
+ //pub use std::io::{stdout, Write};
+ 
+@@ -141,6 +141,13 @@ pub trait Dispatch {
+ 
+ pub trait IdxGetter {
+     fn cn_idx(&self) -> isize;
++
++    /// De Stijl port (paper §4 variable-size objects): for a response that names a variable-size object, the
++    /// object's byte range `(offset, len)` relative to the replica's flush base (`base_addr`); replaying such a
++    /// response flushes that range instead of the fixed-size slot `cn_idx * slot_size`. `None` (default): slot.
++    fn obj_span(&self) -> Option<(usize, usize)> {
++        None
++    }
+ }
+ 
+ /// A token handed out to threads registered with replicas.
+diff --git a/third-party/nr_rust/node-replication/src/nr/replica.rs b/third-party/nr_rust/node-replication/src/nr/replica.rs
+index 1126e83..d10796c 100644
+--- a/third-party/nr_rust/node-replication/src/nr/replica.rs
++++ b/third-party/nr_rust/node-replication/src/nr/replica.rs
+@@ -39,6 +39,16 @@ pub use crate::replica::MAX_THREADS_PER_REPLICA;
+ 
+ type DefaultHasher = BuildHasherDefault<core::hash::SipHasher>;
+ 
++/// De Stijl port (paper §4 variable-size objects): replay flushes of objects issued by another node, per process
++/// (cost counters; slots are not counted).
++static OBJ_REPLAY_FLUSHES: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
++static OBJ_REPLAY_FLUSH_BYTES: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
++
++/// (count, bytes) of object replay flushes in this process (0 without the `scr`/`no-coherence` features).
++pub fn obj_replay_flush_stats() -> (usize, usize) {
++    (OBJ_REPLAY_FLUSHES.load(Ordering::Relaxed), OBJ_REPLAY_FLUSH_BYTES.load(Ordering::Relaxed))
++}
++
+ #[cfg(any(feature = "scr", feature = "no-coherence"))]
+ fn flush_mem_region(ptr: *const u8, size: usize) {
+     const CACHE_LINE_SIZE: usize = 64;
+@@ -1158,8 +1168,17 @@ where
+         if !mine {
+             #[cfg(any(feature = "scr", feature = "no-coherence"))]
+             {
+-                let region_ptr = unsafe { self.base_addr.add(idx as usize * self.slot_size) };
+-                flush_mem_region(region_ptr, self.slot_size);
++                // De Stijl port (paper §4): a variable-size object is flushed over its whole byte range, exactly
++                // where upstream flushes a slot; slots keep upstream's range.
++                if let Some((off, len)) = resp.obj_span() {
++                    let region_ptr = unsafe { self.base_addr.add(off) };
++                    flush_mem_region(region_ptr, len);
++                    OBJ_REPLAY_FLUSHES.fetch_add(1, Ordering::Relaxed);
++                    OBJ_REPLAY_FLUSH_BYTES.fetch_add(len, Ordering::Relaxed);
++                } else {
++                    let region_ptr = unsafe { self.base_addr.add(idx as usize * self.slot_size) };
++                    flush_mem_region(region_ptr, self.slot_size);
++                }
+             }
+         }
+     }
+-- 
+2.34.1
+

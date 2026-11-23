@@ -1,0 +1,306 @@
+From 92374cfd602d56fa697a6c7813668ee59bfd7605 Mon Sep 17 00:00:00 2001
+From: Sungsu Ahn <sungsu_ahn@korea.ac.kr>
+Date: Wed, 14 Oct 2026 22:20:32 +0900
+Subject: [PATCH 03/51] port: node identity from config instead of NUMA logical
+ nodes
+
+- Megalon yaml gains node_id (MEGALON_NODE_ID overrides), region_config,
+  reinit, attach_mprotect, stuck_timeout_ms, log_sync_interval_us (<=100),
+  attach/start-barrier timeouts and nr_log_size; logical_scr_size is now
+  required (its default differs per flavor) [V9].
+- TidToRid/RidToNumaNode return node_id; Register maps every thread of the
+  process to node_id and does not pin; wmeta manager does not pin.
+- NUMA checks removed (helper.cc pinThreadtoNumaNode CHECK).
+- config/destijl-2vm.yaml: sample per-node config.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ config/destijl-2vm.yaml      | 29 +++++++++++++++++++++++++++
+ lib/globals.cc               | 11 ++++++-----
+ src/common/config.cc         | 38 ++++++++++++++++++++++++++++++++++--
+ src/common/config.h          | 29 +++++++++++++++++++++++++++
+ src/common/helper.cc         | 28 ++++++++++++++++----------
+ src/common/helper.h          |  5 +++++
+ src/manager/wmeta_manager.cc |  6 +++---
+ 7 files changed, 126 insertions(+), 20 deletions(-)
+ create mode 100644 config/destijl-2vm.yaml
+
+diff --git a/config/destijl-2vm.yaml b/config/destijl-2vm.yaml
+new file mode 100644
+index 0000000..d7de9ca
+--- /dev/null
++++ b/config/destijl-2vm.yaml
+@@ -0,0 +1,29 @@
++# De Stijl 2-VM port: one Megalon process per VM, one node per process.
++# Use the same file on both VMs except node_id (or set MEGALON_NODE_ID).
++# The shared layout (device, map_va, HWcc/SWcc ranges) comes only from the
++# region config (CXL_SWMC/config/cxl_region.yaml); scr_size/ncr_size/local_size
++# are not used by the port.
++mount_directory: /mydata        # required by the config parser; unused by kv-store
++key_space: 1000000
++slots: 1001000                  # same value for every flavor [V9]
++logical_scr_size: 200MB         # required; same value for every flavor [V9]
++node_id: 0                      # 0 = init (VM0), 1 = attach (VM1)
++region_config: ""               # empty: $CXL_REGION_CONFIG
++reinit: false                   # node 0: allow re-initializing a non-empty control block (or MEGALON_REINIT=1)
++attach_mprotect: true           # node 1: write-protect HWcc/SWcc while attaching
++stuck_timeout_ms: 10000         # abort if the other node holds back the NR log this long
++log_sync_interval_us: 100       # background NR log replay period (<= 100)
++nr_log_size: 64MB
++attach_timeout_s: 600
++start_barrier_timeout_s: 600
++replicate: false
++flush: false
++evict: false
++partition_ratio: 0.0
++excluded_files:
++excluded_directories:
++  - /usr
++  - /proc
++  - /etc
++  - /dev
++  - /sys
+diff --git a/lib/globals.cc b/lib/globals.cc
+index adb7baf..1ffd446 100644
+--- a/lib/globals.cc
++++ b/lib/globals.cc
+@@ -53,11 +53,10 @@ ssize_t Put(const uint8_t* buf, uint64_t count, off_t key) { return lib::RackOBJ
+ ssize_t Get(uint8_t* buf, uint64_t count, off_t key) { return lib::RackOBJKV::Get(buf, count, key); }
+ 
+ void Register(int tid) {
++    // De Stijl port: every thread of this process belongs to this process's node; no NUMA pinning (the
++    // harness sets affinity inside each VM). At most 32 NR registrations per node (never freed).
+     int rid = rackobj::TidToRid(tid);
+ 
+-    int physical_numa_node = rackobj::RidToNumaNode(rid);
+-    rackobj::pinThreadtoNumaNode(physical_numa_node);
+-
+ #ifdef NR
+     RegisterNRThread(rid);
+ #endif
+@@ -65,7 +64,7 @@ void Register(int tid) {
+     lib::thread_local_meta.file_backed_ = false;
+     lib::thread_local_meta.logical_node_id_ = rid;
+ 
+-    LOG(INFO) << "logical thread " << tid << " mapped to (" << rid << ", " << physical_numa_node << ")";
++    LOG(INFO) << "thread " << tid << " registered on node " << rid;
+ }
+ 
+ void UnRegister() {
+@@ -86,7 +85,9 @@ size_t GetConfigSize_t(std::string c_name) {
+     } else if (c_name == "num_logical_node") {
+         return LOGICAL_NODE_NUM;
+     } else if (c_name == "logical_nid") {
+-        return static_cast<size_t>(lib::thread_local_meta.logical_node_id_);
++        return static_cast<size_t>(rackobj::GetNodeId());
++    } else if (c_name == "node_id") {
++        return static_cast<size_t>(rackobj::GetNodeId());
+     }
+ 
+     LOG(FATAL) << "GetConfigSize_t: " << c_name << " unrecognized";
+diff --git a/src/common/config.cc b/src/common/config.cc
+index d5a628c..65bbe67 100644
+--- a/src/common/config.cc
++++ b/src/common/config.cc
+@@ -76,8 +76,9 @@ RackOBJConfig::RackOBJConfig() {
+     if (config["logical_scr_size"]) {
+         logical_scr_size_ = convert_mem_size(config["logical_scr_size"].as<string>());
+     } else {
+-        logical_scr_size_ = DEFAULT_LOGICAL_SCR_SIZE;
+-        LOG(WARNING) << "logical_scr_size_ not specified, default to " << DEFAULT_LOGICAL_SCR_SIZE;
++        // De Stijl port [V9]: the default differs per flavor (DYN_WMETA), so both flavors must be given the
++        // same explicit value
++        LOG(FATAL) << "config must specify \"logical_scr_size\" (same value for every flavor)";
+     }
+ 
+     if (config["ncr_size"]) {
+@@ -124,6 +125,39 @@ RackOBJConfig::RackOBJConfig() {
+ 
+     CHECK(config["key_space"]);
+     key_space_ = config["key_space"].as<size_t>();
++
++    /* De Stijl 2-VM port: one node per process. scr_size/ncr_size/local_size are not used for placement
++     * any more (the shared layout comes from the region config, cxl_region.yaml). */
++    if (const char *env = std::getenv("MEGALON_NODE_ID")) {
++        node_id_ = std::stoi(env);
++        LOG(INFO) << "node_id " << node_id_ << " from MEGALON_NODE_ID";
++    } else if (config["node_id"]) {
++        node_id_ = config["node_id"].as<int>();
++    } else {
++        LOG(FATAL) << "config must specify \"node_id\" (or set MEGALON_NODE_ID)";
++    }
++    CHECK(node_id_ >= 0 && node_id_ < LOGICAL_NODE_NUM) << "node_id " << node_id_ << " out of range [0, "
++                                                        << LOGICAL_NODE_NUM << ")";
++
++    region_config_ = config["region_config"] ? config["region_config"].as<string>() : "";
++
++    reinit_ = config["reinit"] ? config["reinit"].as<bool>() : false;
++    if (const char *env = std::getenv("MEGALON_REINIT")) reinit_ = std::string(env) == "1";
++
++    attach_mprotect_ = config["attach_mprotect"] ? config["attach_mprotect"].as<bool>() : true;
++    stuck_timeout_ms_ = config["stuck_timeout_ms"] ? config["stuck_timeout_ms"].as<uint64_t>() : 10000;
++    log_sync_interval_us_ = config["log_sync_interval_us"] ? config["log_sync_interval_us"].as<uint64_t>() : 100;
++    CHECK(log_sync_interval_us_ >= 1 && log_sync_interval_us_ <= 100)
++        << "log_sync_interval_us must be in [1, 100] (design: sync every <= 100 us)";
++    attach_timeout_s_ = config["attach_timeout_s"] ? config["attach_timeout_s"].as<uint64_t>() : 600;
++    barrier_timeout_s_ = config["start_barrier_timeout_s"] ? config["start_barrier_timeout_s"].as<uint64_t>() : 600;
++    nr_log_bytes_ = config["nr_log_size"] ? convert_mem_size(config["nr_log_size"].as<string>()) : 64UL << 20;
++
++    LOG(INFO) << "port config: node_id=" << node_id_ << " region_config="
++              << (region_config_.empty() ? std::string("$CXL_REGION_CONFIG") : region_config_)
++              << " reinit=" << reinit_ << " attach_mprotect=" << attach_mprotect_
++              << " stuck_timeout_ms=" << stuck_timeout_ms_ << " log_sync_interval_us=" << log_sync_interval_us_
++              << " nr_log_bytes=" << nr_log_bytes_;
+ }
+ 
+ bool RackOBJConfig::IsPathExcluded(const std::filesystem::path &path) const {
+diff --git a/src/common/config.h b/src/common/config.h
+index c958f70..fcda26f 100644
+--- a/src/common/config.h
++++ b/src/common/config.h
+@@ -44,6 +44,25 @@ public:
+ 
+     double GetPartitionRatio() const { return partition_ratio_; }
+ 
++    /* De Stijl 2-VM port */
++    int GetNodeId() const { return node_id_; }  // this process is node node_id_ (0 = init, 1 = attach)
++
++    const std::string& GetRegionConfig() const { return region_config_; }  // empty: $CXL_REGION_CONFIG
++
++    bool Reinit() const { return reinit_; }  // node 0 may re-initialize a non-empty control block
++
++    bool AttachMprotect() const { return attach_mprotect_; }  // write-protect shared ranges during attach
++
++    uint64_t StuckTimeoutMs() const { return stuck_timeout_ms_; }
++
++    uint64_t LogSyncIntervalUs() const { return log_sync_interval_us_; }
++
++    uint64_t AttachTimeoutS() const { return attach_timeout_s_; }
++
++    uint64_t BarrierTimeoutS() const { return barrier_timeout_s_; }
++
++    size_t GetNrLogBytes() const { return nr_log_bytes_; }
++
+ private:
+     uint64_t shm_numa_node_;
+     uint64_t exec_numa_node_;
+@@ -62,6 +81,16 @@ private:
+ 
+     double partition_ratio_;
+ 
++    int node_id_;
++    std::string region_config_;
++    bool reinit_;
++    bool attach_mprotect_;
++    uint64_t stuck_timeout_ms_;
++    uint64_t log_sync_interval_us_;
++    uint64_t attach_timeout_s_;
++    uint64_t barrier_timeout_s_;
++    size_t nr_log_bytes_;
++
+     std::filesystem::path mount_directory_;
+     std::vector<std::filesystem::path> excluded_files_;
+     std::vector<std::string> excluded_directories_;
+diff --git a/src/common/helper.cc b/src/common/helper.cc
+index 8df0f5a..741109f 100644
+--- a/src/common/helper.cc
++++ b/src/common/helper.cc
+@@ -7,6 +7,7 @@
+ #include <sched.h>
+ 
+ #include <array>
++#include <atomic>
+ #include <iostream>
+ #include <limits>
+ #include <vector>
+@@ -37,10 +38,7 @@ void pinThreadtoNumaNode(int target_node) {
+ 
+     pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), &cpuset);
+ 
+-    uint32_t numa_node = UINT32_MAX;
+-    int rc_getcpu = getcpu(nullptr, &numa_node);
+-    CHECK(rc_getcpu != -1) << "getcpu() failed";
+-    CHECK(numa_node == (uint32_t)target_node) << "not running on target node: " << numa_node;
++    // De Stijl port: no NUMA placement check (guests have one NUMA node; affinity is set by the harness).
+ }
+ 
+ bool verifyThreadNuma(int numa_node) {
+@@ -165,11 +163,20 @@ static const std::vector<int>& GetExecNodes() {
+     return exec_nodes;
+ }
+ 
++static std::atomic<int> g_node_id{-1};
++
++void SetNodeId(int node_id) { g_node_id.store(node_id, std::memory_order_release); }
++
++int GetNodeId() {
++    int n = g_node_id.load(std::memory_order_acquire);
++    CHECK(n >= 0) << "node id not set (Megalon not initialized)";
++    return n;
++}
++
++// De Stijl port: a replica id is a node id; there is no NUMA mapping any more.
+ int RidToNumaNode(int rid) {
+-    const std::vector<int>& exec_nodes = GetExecNodes();
+-    const int kNumExec = static_cast<int>(exec_nodes.size());
+-    int exec_idx = rid % kNumExec;
+-    return exec_nodes[static_cast<size_t>(exec_idx)];
++    (void)rid;
++    return GetNodeId();
+ }
+ 
+ std::vector<int> NumaNodeRids(int numa_node) {
+@@ -192,9 +199,10 @@ std::vector<int> NumaNodeRids(int numa_node) {
+     return result;
+ }
+ 
++// De Stijl port: every thread of this process maps to this process's node.
+ int TidToRid(int tid) {
+-    // simple round-robin assignment of thread to logical nodes
+-    return tid % LOGICAL_NODE_NUM;
++    (void)tid;
++    return GetNodeId();
+ }
+ 
+ }  // namespace rackobj
+\ No newline at end of file
+diff --git a/src/common/helper.h b/src/common/helper.h
+index 3c69dc0..fe9bb34 100644
+--- a/src/common/helper.h
++++ b/src/common/helper.h
+@@ -24,4 +24,9 @@ std::vector<int> NumaNodeRids(int numa_node);
+ 
+ int TidToRid(int tid);
+ 
++/* De Stijl port: the logical node of this process (Megalon config node_id).
++ * Every thread of the process belongs to it; there are no NUMA logical nodes. */
++void SetNodeId(int node_id);
++int GetNodeId();
++
+ }  // namespace rackobj
+\ No newline at end of file
+diff --git a/src/manager/wmeta_manager.cc b/src/manager/wmeta_manager.cc
+index 5658e7f..fdb4103 100644
+--- a/src/manager/wmeta_manager.cc
++++ b/src/manager/wmeta_manager.cc
+@@ -33,14 +33,14 @@ void WriteMetadataManager::Shutdown() {
+ }
+ 
+ void WriteMetadataManager::work_fn(std::stop_token stoken) {
+-    pinThreadtoNumaNode(RidToNumaNode(exec_node_));
++    // De Stijl port: no NUMA pinning (affinity is set by the harness inside each VM)
+     std::chrono::nanoseconds sleep_duration(WMETA_MGR_SLEEP_INTERVAL_NS);
+ 
+ #ifdef NR
+     const NrFfi::NrMeta *nr_meta = c3po_->Gcd()->GetNrMetaTid(exec_node_, true);
+     if (!nr_meta) {
+-        LOG(FATAL) << "RO switching thread for cxl node on logical node " << exec_node_ << ", physical numa "
+-                   << RidToNumaNode(exec_node_) << " registration failed!!";
++        LOG(FATAL) << "RO switching thread for cxl node on logical node " << exec_node_
++                   << " registration failed!!";
+         return;
+     }
+ #endif
+-- 
+2.34.1
+

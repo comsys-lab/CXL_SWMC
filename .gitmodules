@@ -1,17 +1,19 @@
 [submodule "third_party/famfs"]
 	path = third_party/famfs
 	url = https://github.com/cxl-micron-reskit/famfs.git
+# knowhere and systems/megalon/src are pinned to unmodified upstream commits; our changes are
+# patch series in this repo, applied by scripts/deploy/apply-third-party-patches.sh.
 [submodule "workloads/rag/vectordb/vectorDB/external/knowhere"]
 	path = workloads/rag/vectordb/vectorDB/external/knowhere
 	url = https://github.com/zilliztech/knowhere.git
 [submodule "kernels/destijl"]
 	path = kernels/destijl
 	url = https://github.com/youkioh/CXLSHMSWcoherence.git
-	branch = DE_STIJL_DAMON
+	branch = destijl
 [submodule "kernels/popcorn_new"]
 	path = kernels/popcorn_new
 	url = https://github.com/youkioh/CXLSHMSWcoherence.git
-	branch = popcorn_new
+	branch = popcorn
 [submodule "kernels/linux-6.14"]
 	path = kernels/linux-6.14
 	url = https://github.com/torvalds/linux.git

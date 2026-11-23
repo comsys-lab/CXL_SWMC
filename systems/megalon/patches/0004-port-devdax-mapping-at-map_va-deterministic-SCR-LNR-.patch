@@ -1,0 +1,1476 @@
+From 33ea90931049312a8ca6115f2387d1024a3e8896 Mon Sep 17 00:00:00 2001
+From: Sungsu Ahn <sungsu_ahn@korea.ac.kr>
+Date: Wed, 14 Oct 2026 22:20:32 +0900
+Subject: [PATCH 04/51] port: devdax mapping at map_va, deterministic SCR/LNR
+ arenas, init/attach
+
+- PortContext (src/shared_memory/cxl_port.*): loads systems/common
+  cxl_region.h, maps the whole device MAP_SHARED|MAP_FIXED_NOREPLACE at
+  map_va, control block in HWcc page 0 (magic, version, layout_hash,
+  state EMPTY->INITIALIZING->READY, cursors, log_root, node_alive[2]).
+  Node 0 requires EMPTY or reinit; node 1 waits for READY, checks
+  version/layout_hash, write-protects HWcc/SWcc while attaching (default
+  on), then checks its cursors and log_root against node 0's.
+  Start barrier on node_alive before any NR write [C4].
+  SCR footprint is checked against hwcc_size before mapping [V9].
+- AllocatableLocalMemoryRegion: arena mode (bump allocator over the
+  mapping, sealed after init/attach) and private-heap mode; memkind is no
+  longer used.
+- scr arena = HWcc minus the control page: shared counter block [V1],
+  four SCR bitmaps, NR log header, WriteMetadata records. lnr arena =
+  SWcc: CacheNode array, slot data, NR log entries.
+- Attach skips every write of initial shared contents (bitmap memsets,
+  WriteMetadata construct loop, CacheNode init loop, log construction).
+- Handles (SharedMemoryObject and members, SharedMetadata, wmeta manager)
+  are process-local; local seqcount maps on the private heap, for this
+  node only. Shared arrays are never destroyed.
+- [V1] allocated_slot_num_/reclaim_count_/allocate_count_ and
+  SharedBitmap count_/dirty_count_ live in the shared counter block.
+- Without DYN_WMETA every slot needs a record; refuse otherwise.
+- One wmeta manager, on node 0 only; critical-path reclaim everywhere.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ lib/shm_obj_handle.cc         |  90 ++++-------
+ lib/shm_obj_handle.h          |   2 +-
+ src/core/c3.cc                |  28 +++-
+ src/core/c3.h                 |   5 +-
+ src/core/cache_slot.h         |  15 +-
+ src/core/object_slot.cc       |  14 +-
+ src/core/scr_bitmap.cc        |  32 ++--
+ src/core/scr_bitmap.h         |  22 +--
+ src/core/write_meta.cc        |  37 ++---
+ src/core/write_meta.h         |  63 +++++---
+ src/index/gcd_nr.cc           |  36 +++--
+ src/index/gcd_nr.h            |   6 +
+ src/index/nr_hashmap.h        |  14 ++
+ src/manager/wmeta_manager.h   |   5 +-
+ src/shared_memory/cxl_port.cc | 276 ++++++++++++++++++++++++++++++++++
+ src/shared_memory/cxl_port.h  | 138 +++++++++++++++++
+ src/shared_memory/region.h    |  40 ++++-
+ src/shared_memory/region.hpp  |  96 +++++++-----
+ 18 files changed, 707 insertions(+), 212 deletions(-)
+ create mode 100644 src/shared_memory/cxl_port.cc
+ create mode 100644 src/shared_memory/cxl_port.h
+
+diff --git a/lib/shm_obj_handle.cc b/lib/shm_obj_handle.cc
+index 4eb33d1..075f848 100644
+--- a/lib/shm_obj_handle.cc
++++ b/lib/shm_obj_handle.cc
+@@ -6,6 +6,7 @@
+ #include "manager/flush_manager.h"
+ #include "manager/replicate_manager.h"
+ #include "original_syscalls.h"
++#include "shared_memory/cxl_port.h"
+ 
+ namespace rackobj::lib {
+ 
+@@ -26,15 +27,29 @@ SharedMemoryObjectHandle<Policy>::SharedMemoryObjectHandle(const int node, const
+       read_coherence_retry_count_{0} {
+     // round up num_pages to the nearest multiple of 64
+     size_t shared_num_slots = static_cast<size_t>((static_cast<size_t>(cfg.GetNumSlots()) + 63) & ~63ULL);
+-    CHECK(numa_available() != -1) << "libnuma not available";
+-
+-    CHECK(NUM_NUMA > 1) << "There is only 1 NUMA node";
+     size_t num_slots = shared_num_slots / static_cast<size_t>(LOGICAL_NODE_NUM);
++    (void)num_slots;
++
++    // De Stijl port: map the shared device, take the init/attach role. All shared allocations below come from
++    // deterministic arenas, in the same order with the same sizes on every node, so they land at the same
++    // addresses; on attach every write of initial shared contents is skipped.
++    auto &ctx = port::PortContext::Get();
++    {
++        NrFfi::NrLogLayout lay = NrFfi::nr_log_layout(cfg.GetNrLogBytes());
++        size_t wmeta_slots = C3POHandle::WmetaSlots(shared_num_slots, cfg.GetLogicalSCRSize());
++        size_t footprint = port::PortContext::ScrFootprint(shared_num_slots, wmeta_slots, lay.header_size);
++        LOG(INFO) << "slots " << shared_num_slots << ", wmeta records " << wmeta_slots << ", NR log "
++                  << lay.entries << " x " << lay.entry_size << " B";
++        ctx.Init(cfg, shared_num_slots, footprint);
++    }
++    shared_cache_node_ = NUMA_MEM;  // index of the CXL copy in GCDEntry::cn_array_
++    const int node_id = ctx.node_id();
+ 
+-    LOG(INFO) << "Initializing cache with num element " << shared_num_slots << " on node " << node;
++    LOG(INFO) << "Initializing cache with num element " << shared_num_slots << " as node " << node_id;
+ 
+-    sc_shm_region_ = std::make_shared<common::AllocatableLocalMemoryRegion>(node, cfg.GetSCRSize());
+-    nc_shm_region_ = std::make_shared<common::AllocatableLocalMemoryRegion>(node, cfg.GetNCRSize());
++    sc_shm_region_ = ctx.scr();  // SCR <-> HWcc
++    nc_shm_region_ = ctx.lnr();  // LNR <-> SWcc
++    local_region_ = ctx.priv();  // process-local
+     cache_shrd_ptr_ =
+         common::SharedMemoryObject::CreateSharedMemoryObject(shared_num_slots, sc_shm_region_, nc_shm_region_);
+     cache_ = cache_shrd_ptr_.get();
+@@ -43,60 +58,21 @@ SharedMemoryObjectHandle<Policy>::SharedMemoryObjectHandle(const int node, const
+     c3po_->InitSharedMetadata(shared_num_slots, sc_shm_region_, &cache_shrd_ptr_->scr_bitmap_);
+     c3po_->SetPartitionRatio(cfg.GetKeySpace(), cfg.GetPartitionRatio());
+ 
+-    // allocate local memory on each physical numa node except node 0 (memory node)
+-    for (int i = 0; i < NUM_NUMA; i++) {
+-        if (i == node) continue;
+-        local_region_[i] = std::make_shared<common::AllocatableLocalMemoryRegion>(i, cfg.GetLocalSize());
+-    }
+-
+-    for (int i = 0; i < LOGICAL_NODE_NUM; i++) {
+-        // Allocate local cache for each logical node
+-        int physical_nid = RidToNumaNode(i);
+-        c3po_->CreateLocalSeqMap(i, local_region_[physical_nid]);
++    // per-node local state: only this process's node
++    c3po_->CreateLocalSeqMap(node_id);
+ #ifdef PARTITIONED_NODE
+-        cache_lcl_ptr_[i] =
+-            common::LocalMemoryObject<Policy>::CreateLocalMemoryObject(num_slots, local_region_[physical_nid]);
++    cache_lcl_ptr_[node_id] = common::LocalMemoryObject<Policy>::CreateLocalMemoryObject(num_slots, local_region_);
+ #endif
+-
+-        /* disabled for logical nodes - managers don't support logical node abstraction yet */
+-        // if (i == node) {
+-        //     int exec_nid = (node + 1 == NUM_NUMA) ? 0 : node + 1;
+-        //     flush_mgr_[i] =
+-        //         std::make_unique<common::FlushManagerHandle>(exec_nid, i, shared_cache_node_,
+-        //         local_region_[exec_nid]);
+-        //     continue;
+-        // }
+-        // evict_mgr_[i] = std::make_unique<common::EvictManager<Policy>>(i, shared_cache_node_,
+-        // local_region_[exec_nid]); repl_mgr_[i] = std::make_unique<common::ReplicateManager<Policy>>(i,
+-        // cache_shrd_ptr_, local_region_[exec_nid]);
+-    }
+-    c3po_->CreateWmetaMgr(0, local_region_[RidToNumaNode(0)]);  // just hardcode wmeta manager to logical node 0
++    // one background wmeta manager, on node 0 only; critical-path reclamation runs on every node [V2]
++    if (node_id == 0) c3po_->CreateWmetaMgr(node_id, local_region_);
+     c3po_->SetSharedPageCache(cache_shrd_ptr_);
+ #ifdef PARTITIONED_NODE
+     c3po_->SetCaches(cache_shrd_ptr_, cache_lcl_ptr_);
+ #endif
+ 
+-    /* disabled for logical nodes */
+-    // for (int i = 0; i < NUM_NUMA; i++) {
+-    //     if (i == node && cfg.DoFlush()) {
+-    //         (*flush_mgr_[i])->SetPageCache(cache_shrd_ptr_);
+-    //         (*flush_mgr_[i])->SetC3PO(c3po_.get());
+-    //         (*flush_mgr_[i])->Run();
+-    //     }
+-
+-    //     if (i == node) continue;
+-
+-    //     repl_mgr_[i]->SetC3PO(c3po_.get());
+-    //     repl_mgr_[i]->SetLocalObj(cache_lcl_ptr_[i]);
+-    //     repl_mgr_[i]->SetEvictManager(evict_mgr_[i].get());
+-    //     if (cfg.DoReplication()) repl_mgr_[i]->Run();
+-
+-    //     evict_mgr_[i]->SetC3PO(c3po_.get());
+-    //     evict_mgr_[i]->SetSharedMemoryObject(cache_shrd_ptr_);
+-    //     evict_mgr_[i]->SetLocalMemoryObject(cache_lcl_ptr_[i]);
+-    //     evict_mgr_[i]->SetReplicateManager(repl_mgr_[i].get());
+-    //     if (cfg.DoEviction()) evict_mgr_[i]->Run();
+-    // }
++    ctx.Finish(c3po_->Gcd()->LogRoot());
++    // [C4] no NR write before every node is alive (node 1's ltail pins the log head until it attaches)
++    ctx.StartBarrier();
+ 
+     c3po_->StartManager();
+ }
+@@ -110,6 +86,7 @@ SharedMemoryObjectHandle<Policy>::~SharedMemoryObjectHandle() {
+     //     if (flush_mgr_[i] && cfg_.DoFlush()) (*flush_mgr_[i])->Shutdown();
+     // }
+     c3po_->StopManager();
++    c3po_->Gcd()->StopLogSync();
+ 
+ #ifdef DYN_WMETA
+     size_t write_page_count = c3po_->Scr_meta()->GetWmetaCount();
+@@ -148,15 +125,12 @@ SharedMemoryObjectHandle<Policy>::~SharedMemoryObjectHandle() {
+     // }
+ 
+     LOG(INFO) << "===========================================================================\n";
++    port::PortContext::Get().Shutdown();
+ }
+ 
+ template <typename Policy>
+ void SharedMemoryObjectHandle<Policy>::StartReplMgr() {
+-    LOG(ERROR) << "StartReplMgr not implemented";
+-    for (int i = 0; i < NUM_NUMA; i++) {
+-        if (i == shared_cache_node_) continue;
+-        repl_mgr_[i]->Run();
+-    }
++    LOG(ERROR) << "StartReplMgr not implemented (replication manager disabled)";
+ }
+ 
+ template <typename Policy>
+diff --git a/lib/shm_obj_handle.h b/lib/shm_obj_handle.h
+index 1ce58d2..f92bc07 100644
+--- a/lib/shm_obj_handle.h
++++ b/lib/shm_obj_handle.h
+@@ -95,7 +95,7 @@ private:
+     std::shared_ptr<common::AllocatableLocalMemoryRegion> nc_shm_region_;  // Non-coherent Region
+     std::shared_ptr<common::SharedMemoryObject> cache_shrd_ptr_;
+ 
+-    std::shared_ptr<common::AllocatableLocalMemoryRegion> local_region_[NUM_NUMA];
++    std::shared_ptr<common::AllocatableLocalMemoryRegion> local_region_;  // process-local (private heap)
+     std::shared_ptr<common::LocalMemoryObject<Policy>> cache_lcl_ptr_[LOGICAL_NODE_NUM];
+ 
+     common::SharedMemoryObject* cache_;  // shared cache
+diff --git a/src/core/c3.cc b/src/core/c3.cc
+index 6cc1756..53617b9 100644
+--- a/src/core/c3.cc
++++ b/src/core/c3.cc
+@@ -3,6 +3,7 @@
+ #include "local_cache_node.h"
+ #include "lru_policy.h"
+ #include "object_slot.h"
++#include "shared_memory/cxl_port.h"
+ 
+ namespace rackobj::common {
+ using std::make_unique;
+@@ -53,14 +54,29 @@ unique_ptr<C3POHandle> C3POHandle::CreateOrMap(
+     return make_unique<C3POHandle>(c3po, cxl_nid);
+ }
+ 
++size_t C3POHandle::WmetaSlots(size_t num_slots, size_t logical_scr_size) {
++    size_t perobjmetasize = CEIL_DIV(SEQLOCK_BITS, 8);  // sizeof(seqlock_t);
++    size_t wmeta_slots = logical_scr_size / perobjmetasize;
++    size_t max_wmeta_slots = static_cast<size_t>((static_cast<uint64_t>(num_slots) * 100) / WMETA_WATERMARK);
++    return std::min(wmeta_slots, max_wmeta_slots);
++}
++
+ void C3POHandle::InitSharedMetadata(size_t num_slots,
+                                     const std::shared_ptr<common::AllocatableLocalMemoryRegion> &sc_shm_region,
+                                     SharedBitmap *bitmap) {
+     size_t perobjmetasize = CEIL_DIV(SEQLOCK_BITS, 8);  // sizeof(seqlock_t);
+-    size_t wmeta_slots = c3po_->logical_scr_size_ / perobjmetasize;
+-    size_t max_wmeta_slots = static_cast<size_t>((static_cast<uint64_t>(num_slots) * 100) / WMETA_WATERMARK);
+-    wmeta_slots = std::min(wmeta_slots, max_wmeta_slots);
+-    c3po_->scr_meta_ = make_unique<SharedMetadata>(cxl_nid_, num_slots, wmeta_slots, sc_shm_region);
++    size_t wmeta_slots = WmetaSlots(num_slots, c3po_->logical_scr_size_);
++#ifndef DYN_WMETA
++    // static records: wmeta index == cn index, so every slot needs a record
++    CHECK(wmeta_slots >= num_slots) << "without DYN_WMETA every slot needs a WriteMetadata record: " << wmeta_slots
++                                    << " records < " << num_slots << " slots (raise logical_scr_size)";
++#endif
++    auto &ctx = port::PortContext::Get();
++    port::SharedCounters *ctr = ctx.counters();
++    // [V1] allocation/reclaim counters shared by every node
++    c3po_->scr_meta_ = make_unique<SharedMetadata>(cxl_nid_, num_slots, wmeta_slots, sc_shm_region, ctx.attach(),
++                                                   &ctr->wmeta_allocated.v, &ctr->wmeta_reclaim.v,
++                                                   &ctr->wmeta_allocate.v);
+     c3po_->scr_bitmap_ptr_ = bitmap;
+ 
+     size_t threshold = wmeta_slots * WMETA_WATERMARK / 100;
+@@ -69,9 +85,7 @@ void C3POHandle::InitSharedMetadata(size_t num_slots,
+               << ", per object metadata size: " << perobjmetasize;
+ }
+ 
+-void C3POHandle::CreateLocalSeqMap(int nid, const std::shared_ptr<common::AllocatableLocalMemoryRegion> &local_region) {
+-    c3po_->scr_meta_->CreateLocalSeqMap(nid, local_region);
+-}
++void C3POHandle::CreateLocalSeqMap(int nid) { c3po_->scr_meta_->CreateLocalSeqMap(nid); }
+ 
+ void C3POHandle::CreateWmetaMgr(int nid, const std::shared_ptr<common::AllocatableLocalMemoryRegion> &local_region) {
+     if (!wmeta_mgr_)
+diff --git a/src/core/c3.h b/src/core/c3.h
+index 855209f..4233ee6 100644
+--- a/src/core/c3.h
++++ b/src/core/c3.h
+@@ -118,7 +118,10 @@ public:
+         partition_ratio_ = partition_ratio;
+     }
+ 
+-    void CreateLocalSeqMap(int nid, const std::shared_ptr<common::AllocatableLocalMemoryRegion> &local_region);
++    void CreateLocalSeqMap(int nid);
++
++    /* Number of WriteMetadata records: min(logical_scr_size / 4, num_slots * 100 / WMETA_WATERMARK). */
++    static size_t WmetaSlots(size_t num_slots, size_t logical_scr_size);
+ 
+     void CreateWmetaMgr(int nid, const std::shared_ptr<common::AllocatableLocalMemoryRegion> &local_region);
+ 
+diff --git a/src/core/cache_slot.h b/src/core/cache_slot.h
+index 1c65565..74f2c1a 100644
+--- a/src/core/cache_slot.h
++++ b/src/core/cache_slot.h
+@@ -16,19 +16,22 @@ public:
+         DLOG(INFO) << "Non-Coherent Region CacheSlot constructed, &slot_=@" << (void *)slots_;
+     }
+ 
+-    ~CacheSlot() {
+-        for (size_t i = 0; i < max_elements_; ++i) std::destroy_at(&slots_[i]);
+-    }
++    // De Stijl port: the CacheNode array is shared with the other node and is never destroyed (its vptr is
++    // only used by destroy_at; nothing dispatches virtually on shared CacheNodes).
++    ~CacheSlot() = default;
+ 
+     void Reinitialize(size_t cn_index, const BlockId &new_block_id) {
+         CacheNode *cn = &slots_[cn_index];
+         cn->Reinitialize(new_block_id);
+     }
+ 
+-    void Initialize(size_t max_elements) {
++    /* attach == true: the init node already constructed the shared array; write nothing. */
++    void Initialize(size_t max_elements, bool attach = false) {
+         DLOG(INFO) << "init cachenodes";
+-        for (size_t i = 0; i < max_elements; ++i) {
+-            std::construct_at(&slots_[i]);
++        if (!attach) {
++            for (size_t i = 0; i < max_elements; ++i) {
++                std::construct_at(&slots_[i]);
++            }
+         }
+ 
+         //    size_t total_elements = max_elements + ReserveNodeCount(max_elements);
+diff --git a/src/core/object_slot.cc b/src/core/object_slot.cc
+index 60ecc73..0cd364b 100644
+--- a/src/core/object_slot.cc
++++ b/src/core/object_slot.cc
+@@ -6,6 +6,7 @@
+ #include "absl/log/log.h"
+ #include "common/debug.h"
+ #include "globals.h"
++#include "shared_memory/cxl_port.h"
+ #include "shared_memory/region.h"
+ 
+ namespace rackobj::common {
+@@ -17,14 +18,9 @@ using std::string;
+ std::shared_ptr<SharedMemoryObject> SharedMemoryObject::CreateSharedMemoryObject(
+     size_t num_pages, const std::shared_ptr<AllocatableLocalMemoryRegion> &sc_shm_region,
+     const std::shared_ptr<AllocatableLocalMemoryRegion> &nc_shm_region) {
+-    LocalMemoryAllocator<SharedMemoryObject> cache_alloc(nc_shm_region);
+-    auto cache = cache_alloc.AllocateAligned<MemoryAlignment::kCacheAlign>();
+-    std::construct_at(cache, num_pages, sc_shm_region, nc_shm_region);
+-
+-    return shared_ptr<SharedMemoryObject>(cache, [cache](auto ptr) {
+-        DLOG(INFO) << "Deallocating " << TypeToString(cache) << " at " << (void *)ptr;
+-        std::destroy_at(ptr);
+-    });
++    // De Stijl port: the handle (vptr, allocators, pointers to the shared arrays) is process-local; only the
++    // arrays it points to live in CXL.
++    return std::make_shared<SharedMemoryObject>(num_pages, sc_shm_region, nc_shm_region);
+ }
+ 
+ SharedMemoryObject::SharedMemoryObject(size_t num_pages,
+@@ -35,7 +31,7 @@ SharedMemoryObject::SharedMemoryObject(size_t num_pages,
+       cache_slot_(num_pages, nc_shm_region),
+       page_data_(num_pages, nc_shm_region) {
+     // TODO: we are currently temporarily sticking pages at end of allocation
+-    cache_slot_.Initialize(num_pages);
++    cache_slot_.Initialize(num_pages, port::PortContext::Get().attach());
+ }
+ 
+ template <typename Policy>
+diff --git a/src/core/scr_bitmap.cc b/src/core/scr_bitmap.cc
+index 7c00903..3034887 100644
+--- a/src/core/scr_bitmap.cc
++++ b/src/core/scr_bitmap.cc
+@@ -1,5 +1,7 @@
+ #include "scr_bitmap.h"
+ 
++#include "shared_memory/cxl_port.h"
++
+ namespace rackobj::common {
+ 
+ SharedBitmap::SharedBitmap(size_t num_pages, size_t wmeta_threshold,
+@@ -10,9 +12,9 @@ SharedBitmap::SharedBitmap(size_t num_pages, size_t wmeta_threshold,
+       free_bitmap_start_addr_(nullptr),
+       wmeta_bitmap_start_addr_(nullptr),
+       num_pages_(num_pages),
+-      count_(0),
++      count_(&port::PortContext::Get().counters()->bitmap_count.v),
+       wmeta_count_(0),
+-      dirty_count_(0)
++      dirty_count_(&port::PortContext::Get().counters()->bitmap_dirty.v)
+ /*wmeta_count_threshold_(0)*/
+ {
+     (void)wmeta_threshold;
+@@ -26,10 +28,13 @@ SharedBitmap::SharedBitmap(size_t num_pages, size_t wmeta_threshold,
+     wmeta_bitmap_start_addr_ =
+         bitmap_allocator_->AllocateAligned<MemoryAlignment::kCacheAlign>(BITS_TO_LONGS(num_pages));
+ 
+-    memset(wlock_bitmap_start_addr_, 0, BITS_TO_LONGS(num_pages) * sizeof(uint64_t));
+-    memset(dirty_bitmap_start_addr_, 0, BITS_TO_LONGS(num_pages) * sizeof(uint64_t));
+-    memset(free_bitmap_start_addr_, UCHAR_MAX, BITS_TO_LONGS(num_pages) * sizeof(uint64_t));
+-    memset(wmeta_bitmap_start_addr_, UCHAR_MAX, BITS_TO_LONGS(num_pages) * sizeof(uint64_t));
++    // De Stijl port: the bitmaps live in SCR; only the init node writes their initial contents.
++    if (!port::PortContext::Get().attach()) {
++        memset(wlock_bitmap_start_addr_, 0, BITS_TO_LONGS(num_pages) * sizeof(uint64_t));
++        memset(dirty_bitmap_start_addr_, 0, BITS_TO_LONGS(num_pages) * sizeof(uint64_t));
++        memset(free_bitmap_start_addr_, UCHAR_MAX, BITS_TO_LONGS(num_pages) * sizeof(uint64_t));
++        memset(wmeta_bitmap_start_addr_, UCHAR_MAX, BITS_TO_LONGS(num_pages) * sizeof(uint64_t));
++    }
+ 
+     LOG(INFO) << "&wlock_bitmap_=@" << (void *)&wlock_bitmap_start_addr_ << ", &dirty_bitmap_=@"
+               << (void *)&dirty_bitmap_start_addr_ << ", &free_bitmap_=@" << (void *)&free_bitmap_start_addr_
+@@ -43,9 +48,9 @@ SharedBitmap::SharedBitmap(size_t num_pages, const std::shared_ptr<AllocatableLo
+       free_bitmap_start_addr_(nullptr),
+       wmeta_bitmap_start_addr_(nullptr),
+       num_pages_(num_pages),
+-      count_(0),
++      count_(&port::PortContext::Get().counters()->bitmap_count.v),
+       wmeta_count_(0),
+-      dirty_count_(0)
++      dirty_count_(&port::PortContext::Get().counters()->bitmap_dirty.v)
+ /*wmeta_count_threshold_(0)*/
+ {
+     bitmap_allocator_ = std::make_unique<BitmapAllocator>(sc_shm_region);
+@@ -58,10 +63,13 @@ SharedBitmap::SharedBitmap(size_t num_pages, const std::shared_ptr<AllocatableLo
+     wmeta_bitmap_start_addr_ =
+         bitmap_allocator_->AllocateAligned<MemoryAlignment::kCacheAlign>(BITS_TO_LONGS(num_pages));
+ 
+-    memset(wlock_bitmap_start_addr_, 0, BITS_TO_LONGS(num_pages) * sizeof(uint64_t));
+-    memset(dirty_bitmap_start_addr_, 0, BITS_TO_LONGS(num_pages) * sizeof(uint64_t));
+-    memset(free_bitmap_start_addr_, UCHAR_MAX, BITS_TO_LONGS(num_pages) * sizeof(uint64_t));
+-    memset(wmeta_bitmap_start_addr_, UCHAR_MAX, BITS_TO_LONGS(num_pages) * sizeof(uint64_t));
++    // De Stijl port: the bitmaps live in SCR; only the init node writes their initial contents.
++    if (!port::PortContext::Get().attach()) {
++        memset(wlock_bitmap_start_addr_, 0, BITS_TO_LONGS(num_pages) * sizeof(uint64_t));
++        memset(dirty_bitmap_start_addr_, 0, BITS_TO_LONGS(num_pages) * sizeof(uint64_t));
++        memset(free_bitmap_start_addr_, UCHAR_MAX, BITS_TO_LONGS(num_pages) * sizeof(uint64_t));
++        memset(wmeta_bitmap_start_addr_, UCHAR_MAX, BITS_TO_LONGS(num_pages) * sizeof(uint64_t));
++    }
+ 
+     DLOG(INFO) << "&wlock_bitmap_=@" << (void *)&wlock_bitmap_start_addr_ << ", &dirty_bitmap_=@"
+                << (void *)&dirty_bitmap_start_addr_ << ", &free_bitmap_=@" << (void *)&free_bitmap_start_addr_
+diff --git a/src/core/scr_bitmap.h b/src/core/scr_bitmap.h
+index d00f908..05bd876 100644
+--- a/src/core/scr_bitmap.h
++++ b/src/core/scr_bitmap.h
+@@ -39,10 +39,10 @@ public:
+     void SetDirty(size_t cn_index, bool dirty) {
+         if (dirty) {
+             bitmap_setbit(dirty_bitmap_start_addr_, cn_index);
+-            dirty_count_.fetch_add(1, std::memory_order_relaxed);
++            dirty_count_->fetch_add(1, std::memory_order_relaxed);
+         } else {
+             bitmap_clearbit(dirty_bitmap_start_addr_, cn_index);
+-            dirty_count_.fetch_sub(1, std::memory_order_relaxed);
++            dirty_count_->fetch_sub(1, std::memory_order_relaxed);
+         }
+     }
+ 
+@@ -55,7 +55,7 @@ public:
+         uint32_t offset = bitmap_offset(cn_index);
+ 
+         succeed = try_clearbit_exclusive(free_bitmap_start_addr_, index, offset);
+-        if (succeed) count_.fetch_add(1, std::memory_order_release);
++        if (succeed) count_->fetch_add(1, std::memory_order_release);
+         return succeed;
+     }
+ 
+@@ -71,14 +71,14 @@ public:
+ #ifdef RANDSLOTALLOC
+             uint32_t start_point = static_cast<uint32_t>(static_cast<size_t>(std::rand()) % bitmap_len);
+ #else
+-            uint32_t start_point = static_cast<uint32_t>(count_.load(std::memory_order_relaxed));
++            uint32_t start_point = static_cast<uint32_t>(count_->load(std::memory_order_relaxed));
+ #endif
+             if (!bitmap_find_setbit(free_bitmap_start_addr_, bitmap_len, index, offset, start_point))
+                 return std::nullopt;
+             succeed = try_clearbit_exclusive(free_bitmap_start_addr_, index, offset);
+         } while (!succeed);
+ 
+-        count_.fetch_add(1, std::memory_order_release);
++        count_->fetch_add(1, std::memory_order_release);
+         return bitmap_cn_index(index, offset);
+     }
+ 
+@@ -89,15 +89,15 @@ public:
+         uint32_t offset = bitmap_offset(static_cast<size_t>(cn_index));
+ 
+         succeed = try_setbit(free_bitmap_start_addr_, index, offset);
+-        if (succeed) count_.fetch_sub(1, std::memory_order_release);
++        if (succeed) count_->fetch_sub(1, std::memory_order_release);
+         return succeed;
+     }
+ 
+     bool IsFull() const { return GetCount() >= num_pages_; }
+ 
+-    size_t GetCount() const { return count_.load(std::memory_order_acquire); }
++    size_t GetCount() const { return count_->load(std::memory_order_acquire); }
+ 
+-    size_t GetDirtyCount() const { return dirty_count_.load(std::memory_order_acquire); }
++    size_t GetDirtyCount() const { return dirty_count_->load(std::memory_order_acquire); }
+ 
+ private:
+     // size_t page_count_; --> use page_count in shm_obj class
+@@ -119,9 +119,11 @@ private:
+     const size_t num_pages_;
+     // size_t wmeta_slots_;
+ 
+-    std::atomic<size_t> count_;
++    // [V1] count_/dirty_count_ point into the shared counter block (SCR) so the
++    // numbers are global across nodes; wmeta_count_ is unused.
++    std::atomic<uint64_t> *count_;
+     std::atomic<size_t> wmeta_count_;
+-    std::atomic<size_t> dirty_count_;
++    std::atomic<uint64_t> *dirty_count_;
+     // int64_t wmeta_count_threshold_;
+ 
+     static thread_local std::minstd_rand rng;
+diff --git a/src/core/write_meta.cc b/src/core/write_meta.cc
+index 079e7d3..bf8c390 100644
+--- a/src/core/write_meta.cc
++++ b/src/core/write_meta.cc
+@@ -104,8 +104,8 @@ std::optional<size_t> SharedMetadata::ReserveWmeta(const BlockId &block_id, bool
+         wm_index = (i + start_line) % b_meta_.wmeta_slot_len_;
+         WriteMetadata *wmeta = &b_meta_.wmeta_start_addr_[wm_index];
+         if (wmeta->TryAllocateLock(block_id, with_lock)) {
+-            b_meta_.allocated_slot_num_.fetch_add(1, std::memory_order_relaxed);
+-            b_meta_.allocate_count_.fetch_add(1, std::memory_order_relaxed);
++            b_meta_.allocated_slot_num_->fetch_add(1, std::memory_order_relaxed);
++            b_meta_.allocate_count_->fetch_add(1, std::memory_order_relaxed);
+             return wm_index;
+         }
+         cpu_relax();
+@@ -128,8 +128,8 @@ std::optional<size_t> SharedMetadata::ReserveWmetaEarlyTerm(const BlockId &block
+         wm_index = (i + start_line) % b_meta_.wmeta_slot_len_;
+         WriteMetadata *wmeta = &b_meta_.wmeta_start_addr_[wm_index];
+         if (wmeta->TryAllocateLock(block_id, with_lock)) {
+-            b_meta_.allocated_slot_num_.fetch_add(1, std::memory_order_relaxed);
+-            b_meta_.allocate_count_.fetch_add(1, std::memory_order_relaxed);
++            b_meta_.allocated_slot_num_->fetch_add(1, std::memory_order_relaxed);
++            b_meta_.allocate_count_->fetch_add(1, std::memory_order_relaxed);
+             return wm_index;
+         }
+         cpu_relax();
+@@ -160,8 +160,8 @@ std::optional<size_t> SharedMetadata::CheckReserveWmeta(const BlockId &block_id,
+         wm_index = (i + start_line) % b_meta_.wmeta_slot_len_;
+         WriteMetadata *wmeta = &b_meta_.wmeta_start_addr_[wm_index];
+         if (wmeta->TryAllocateLock(block_id, with_lock)) {
+-            b_meta_.allocated_slot_num_.fetch_add(1, std::memory_order_relaxed);
+-            b_meta_.allocate_count_.fetch_add(1, std::memory_order_relaxed);
++            b_meta_.allocated_slot_num_->fetch_add(1, std::memory_order_relaxed);
++            b_meta_.allocate_count_->fetch_add(1, std::memory_order_relaxed);
+             return wm_index;
+         }
+         cpu_relax();
+@@ -174,36 +174,27 @@ bool SharedMetadata::RecycleWmeta(size_t wm_index, bool with_lock) {
+     WriteMetadata *wmeta = &b_meta_.wmeta_start_addr_[wm_index];
+     if (with_lock) {
+         if (wmeta->FreeLock()) {
+-            b_meta_.allocated_slot_num_.fetch_sub(1, std::memory_order_relaxed);
+-            b_meta_.reclaim_count_.fetch_add(1, std::memory_order_relaxed);
++            b_meta_.allocated_slot_num_->fetch_sub(1, std::memory_order_relaxed);
++            b_meta_.reclaim_count_->fetch_add(1, std::memory_order_relaxed);
+             return true;
+         } else
+             return false;
+     } else {
+         (void)wmeta->FreeLock(false);  // explicitly ignore the return value
+-        b_meta_.allocated_slot_num_.fetch_sub(1, std::memory_order_relaxed);
+-        b_meta_.reclaim_count_.fetch_add(1, std::memory_order_relaxed);
++        b_meta_.allocated_slot_num_->fetch_sub(1, std::memory_order_relaxed);
++        b_meta_.reclaim_count_->fetch_add(1, std::memory_order_relaxed);
+         return true;
+     }
+ }
+ 
+-void SharedMetadata::CreateLocalSeqMap(int nid,
+-                                       const std::shared_ptr<common::AllocatableLocalMemoryRegion> &local_region) {
+-    LocalMemoryAllocator<std::vector<VectorElement, VecEntryAllocator>> vector_alloc(local_region);
+-    auto vector = vector_alloc.allocate();
+-    std::construct_at(vector, b_meta_.wmeta_slot_len_, VecEntryAllocator(local_region));
+-    local_seqcount_vec_[nid] = std::unique_ptr<std::vector<VectorElement, VecEntryAllocator>>(vector);
++void SharedMetadata::CreateLocalSeqMap(int nid) {
++    // De Stijl port: process-local, private heap (was local_region_ memkind memory)
++    local_seqcount_vec_[nid] = std::make_unique<std::vector<VectorElement>>(b_meta_.wmeta_slot_len_);
+     std::for_each(local_seqcount_vec_[nid]->begin(), local_seqcount_vec_[nid]->end(), [](VectorElement &entry) {
+         entry.first = std::nullopt;
+         entry.second = 0;
+     });
+-
+-    LocalMemoryAllocator<std::vector<SpinLockWrapper, LockVecEntryAllocator>> lock_alloc(local_region);
+-    auto lock_vec = lock_alloc.allocate();
+-    std::construct_at(lock_vec, b_meta_.wmeta_slot_len_, LockVecEntryAllocator(local_region));
+-    local_map_lock_[nid] = std::unique_ptr<std::vector<SpinLockWrapper, LockVecEntryAllocator>>(lock_vec);
+-    // std::for_each(local_map_lock_[nid]->begin(), local_map_lock_[nid]->end(),
+-    //               [](SpinLockWrapper &entry) { pthread_spin_init(&entry, PTHREAD_PROCESS_SHARED); });
++    local_map_lock_[nid] = std::make_unique<std::vector<SpinLockWrapper>>(b_meta_.wmeta_slot_len_);
+ }
+ 
+ thread_local std::minstd_rand SharedMetadata::rng;
+diff --git a/src/core/write_meta.h b/src/core/write_meta.h
+index 6de0984..244a02f 100644
+--- a/src/core/write_meta.h
++++ b/src/core/write_meta.h
+@@ -84,11 +84,19 @@ class BaseMetadata {
+ public:
+     BaseMetadata(const size_t wmeta_slot_len) : wmeta_slot_len_(wmeta_slot_len) {
+         wmeta_start_addr_ = nullptr;
+-        allocated_slot_num_ = 0;
+-        reclaim_count_ = 0;
+-        allocate_count_ = 0;
++        allocated_slot_num_ = &local_allocated_slot_num_;
++        reclaim_count_ = &local_reclaim_count_;
++        allocate_count_ = &local_allocate_count_;
+     };
+ 
++    /* [V1] Use counters shared by every node (SCR counter block) instead of the process-local ones. */
++    void UseSharedCounters(std::atomic<uint64_t> *allocated, std::atomic<uint64_t> *reclaim,
++                           std::atomic<uint64_t> *allocate) {
++        allocated_slot_num_ = allocated;
++        reclaim_count_ = reclaim;
++        allocate_count_ = allocate;
++    }
++
+     MetaT *GetWmeta(size_t wm_index) {
+         // sanity check
+         if (wm_index < 0) return nullptr;
+@@ -101,31 +109,39 @@ public:
+     std::unique_ptr<LocalMemoryAllocator<MetaT>> wmeta_allocator_;
+ 
+     const size_t wmeta_slot_len_;
+-    std::atomic<size_t> allocated_slot_num_;
+-    std::atomic<uint64_t> reclaim_count_;
+-    std::atomic<uint64_t> allocate_count_;
++    std::atomic<uint64_t> *allocated_slot_num_;
++    std::atomic<uint64_t> *reclaim_count_;
++    std::atomic<uint64_t> *allocate_count_;
++
++private:
++    std::atomic<uint64_t> local_allocated_slot_num_{0};
++    std::atomic<uint64_t> local_reclaim_count_{0};
++    std::atomic<uint64_t> local_allocate_count_{0};
+ };
+ 
+ class SharedMetadata {
+ public:
+     using LocalSeqcountT = int64_t;
+     using VectorElement = std::pair<std::atomic<std::optional<LocalSeqcountT>>, std::atomic<uint8_t>>;
+-    using VecEntryAllocator = RebindLocalMemoryByteAllocatorT<VectorElement>;
+-    using LockVecEntryAllocator = RebindLocalMemoryByteAllocatorT<SpinLockWrapper>;
+     explicit SharedMetadata(int shared_cache_nid, size_t num_slots, size_t wmeta_slot_len,
+-                            const std::shared_ptr<AllocatableLocalMemoryRegion> &sc_shm_region) noexcept
++                            const std::shared_ptr<AllocatableLocalMemoryRegion> &sc_shm_region, bool attach,
++                            std::atomic<uint64_t> *allocated, std::atomic<uint64_t> *reclaim,
++                            std::atomic<uint64_t> *allocate) noexcept
+         : b_meta_(wmeta_slot_len), shared_cache_nid_(shared_cache_nid), num_slots_(num_slots) {
+         CHECK(wmeta_slot_len) << "write metadata slot length should not be zero!";
++        b_meta_.UseSharedCounters(allocated, reclaim, allocate);
+         b_meta_.wmeta_allocator_ = std::make_unique<LocalMemoryAllocator<WriteMetadata>>(sc_shm_region);
+-        b_meta_.wmeta_start_addr_ = b_meta_.wmeta_allocator_->allocate(wmeta_slot_len);
++        // records in SCR, 64 B each; same address on every node (deterministic arena)
++        b_meta_.wmeta_start_addr_ = b_meta_.wmeta_allocator_->AllocateAligned<MemoryAlignment::kCacheAlign>(wmeta_slot_len);
+         CHECK(b_meta_.wmeta_start_addr_) << "write metadata allocation failed!";
+ 
+-        for (size_t i = 0; i < wmeta_slot_len; i++) std::construct_at(&b_meta_.wmeta_start_addr_[i]);
++        // only the init node writes the initial records
++        if (!attach)
++            for (size_t i = 0; i < wmeta_slot_len; i++) std::construct_at(&b_meta_.wmeta_start_addr_[i]);
+     }
+ 
+-    ~SharedMetadata() {
+-        for (size_t i = 0; i < b_meta_.wmeta_slot_len_; i++) std::destroy_at(&b_meta_.wmeta_start_addr_[i]);
+-    }
++    // De Stijl port: the records are shared with the other node and are never destroyed.
++    ~SharedMetadata() = default;
+ 
+     /**
+      * randomly sample {sample_size} sequence locks, return the one with smallest sequence number that is not free
+@@ -145,10 +161,10 @@ public:
+ 
+     bool RecycleWmeta(size_t wm_index, bool with_lock = true);
+ 
+-    size_t GetWmetaCount() { return b_meta_.allocated_slot_num_.load(std::memory_order_relaxed); }
++    size_t GetWmetaCount() { return b_meta_.allocated_slot_num_->load(std::memory_order_relaxed); }
+ 
+     size_t WmetaOverThreshold() {
+-        int64_t count = static_cast<int64_t>(b_meta_.allocated_slot_num_.load(std::memory_order_relaxed));
++        int64_t count = static_cast<int64_t>(b_meta_.allocated_slot_num_->load(std::memory_order_relaxed));
+ 
+         LOG_IF(WARNING, b_meta_.wmeta_slot_len_ < static_cast<size_t>(count))
+             << "allocated over wmeta_slot_len_ (" << b_meta_.wmeta_slot_len_ << ":" << count << ")";
+@@ -186,7 +202,8 @@ public:
+ 
+     WriteMetadata *GetWmeta(size_t wm_index) { return b_meta_.GetWmeta(wm_index); }
+ 
+-    void CreateLocalSeqMap(int nid, const std::shared_ptr<common::AllocatableLocalMemoryRegion> &local_region);
++    /* Process-local seqcount map of node nid (private heap; never shared). */
++    void CreateLocalSeqMap(int nid);
+ 
+     void LockLocalMap(const int nid, const size_t idx) { (*local_map_lock_[nid])[idx].lock(); }
+ 
+@@ -194,20 +211,20 @@ public:
+ 
+     size_t GetWmetaSlotLen() const { return b_meta_.wmeta_slot_len_; }
+ 
+-    size_t GetRecycleCount() const { return b_meta_.reclaim_count_; }
+-    size_t GetAllocateCount() const { return b_meta_.allocate_count_; }
++    size_t GetRecycleCount() const { return b_meta_.reclaim_count_->load(); }
++    size_t GetAllocateCount() const { return b_meta_.allocate_count_->load(); }
+ 
+     void ResetReclaimCount() {
+-        b_meta_.reclaim_count_ = 0;
+-        b_meta_.allocate_count_ = 0;
++        b_meta_.reclaim_count_->store(0);
++        b_meta_.allocate_count_->store(0);
+     }
+ 
+ private:
+     // per-NUMA node seqcount vector <cn_index, local_seqcount>
+     BaseMetadata<WriteMetadata> b_meta_;
+ 
+-    std::unique_ptr<std::vector<VectorElement, VecEntryAllocator>> local_seqcount_vec_[LOGICAL_NODE_NUM];
+-    std::unique_ptr<std::vector<SpinLockWrapper, LockVecEntryAllocator>> local_map_lock_[LOGICAL_NODE_NUM];
++    std::unique_ptr<std::vector<VectorElement>> local_seqcount_vec_[LOGICAL_NODE_NUM];
++    std::unique_ptr<std::vector<SpinLockWrapper>> local_map_lock_[LOGICAL_NODE_NUM];
+ 
+     int shared_cache_nid_;
+ 
+diff --git a/src/index/gcd_nr.cc b/src/index/gcd_nr.cc
+index 3de81a1..c626575 100644
+--- a/src/index/gcd_nr.cc
++++ b/src/index/gcd_nr.cc
+@@ -1,10 +1,13 @@
+ #include "gcd_nr.h"
+ 
++#include <algorithm>
+ #include <array>
+ #include <limits>
+ 
++#include "absl/log/check.h"
+ #include "common/helper.h"
+ #include "nr_hashmap.h"
++#include "shared_memory/cxl_port.h"
+ 
+ namespace rackobj::common {
+ using std::construct_at;
+@@ -16,8 +19,20 @@ using std::unique_ptr;
+ 
+ GlobalCacheDirectoryNr::GlobalCacheDirectoryNr(size_t num_entries, size_t num_replicas, const uint8_t* base_addr) {
+     DLOG(INFO) << "Constructing GCD";
+-    nrht_wrapper =
+-        NrFfi::create_node_replicated_numa(num_entries, num_replicas, base_addr, SLOT_SIZE, NUMA_MEM, NUM_NUMA);
++    // De Stijl port: the NR log is shared by all nodes. Header in SCR, entries in LNR; node 0 constructs it in
++    // place, node 1 attaches without writing. This process holds only replica node_id.
++    auto& ctx = port::PortContext::Get();
++    NrFfi::NrLogLayout lay = NrFfi::nr_log_layout(ctx.nr_log_bytes());
++    uint8_t* hdr = ctx.scr()->AllocateBytes(lay.header_size, std::max<size_t>(lay.header_align, 64));
++    uint8_t* body = ctx.lnr()->AllocateBytes(lay.entries * lay.entry_size, std::max<size_t>(lay.entry_align, 4096));
++    LOG(INFO) << "NR log: header " << lay.header_size << " B at " << (void*)hdr << " (SCR), " << lay.entries
++              << " entries x " << lay.entry_size << " B at " << (void*)body << " (LNR), node " << ctx.node_id()
++              << (ctx.attach() ? " attach" : " init");
++    nrht_wrapper = NrFfi::create_node_replicated_shared(num_entries, num_replicas, static_cast<size_t>(ctx.node_id()),
++                                                        base_addr, SLOT_SIZE, hdr, body, lay.entries, !ctx.attach(),
++                                                        ctx.stuck_timeout_ms(), ctx.log_sync_interval_us());
++    CHECK(nrht_wrapper) << "NR shared log " << (ctx.attach() ? "attach" : "init") << " failed";
++    log_root_ = hdr;
+ 
+     memset(register_count, 0, sizeof(register_count));
+ 
+@@ -53,20 +68,9 @@ const NrFfi::NrMeta* GlobalCacheDirectoryHandleNr::GetNrMetaTid(int rid, bool lo
+     (void)lock;
+     const NrFfi::NrMeta* nr_meta_per_thread = nullptr;
+     std::thread::id tid = std::this_thread::get_id();
+-    uint32_t numa_node = UINT32_MAX;
+-    int rc = getcpu(nullptr, &numa_node);
+-    if (rc == -1 || numa_node == NUMA_MEM) {
+-        LOG(ERROR) << "getcpu() failed || numa node is " << NUMA_MEM;
+-        return nullptr;
+-    }
+-
+-    // Check that the passed rid is actually on the physical NUMA node the current thread is running on
+-    int rid_numa_node = rackobj::RidToNumaNode(rid);
+-    if (rid_numa_node != static_cast<int>(numa_node)) {
+-        LOG(ERROR) << "rid " << rid << " maps to NUMA node " << rid_numa_node << " but current thread is on NUMA node "
+-                   << numa_node;
+-        return nullptr;
+-    }
++    // De Stijl port: no NUMA placement checks; every thread of this process registers with replica node_id.
++    CHECK(rid == rackobj::GetNodeId()) << "thread registers with replica " << rid << " but this is node "
++                                       << rackobj::GetNodeId();
+ 
+     gcd_->WriteLock();
+     nr_meta_per_thread = register_node_replicated(gcd_->nrht_wrapper, static_cast<size_t>(rid));
+diff --git a/src/index/gcd_nr.h b/src/index/gcd_nr.h
+index 3bfd3bd..078e39d 100644
+--- a/src/index/gcd_nr.h
++++ b/src/index/gcd_nr.h
+@@ -25,6 +25,7 @@ private:
+     alignas(64) NrFfi::NrRapper* nrht_wrapper;
+     alignas(64) std::unordered_map<std::thread::id, NrFfi::NrMeta*> nr_thread_map;  // bookkeep thread register for nr
+     alignas(64) int register_count[LOGICAL_NODE_NUM];  // bookkeep nr replica id registered thread count
++    uint8_t* log_root_ = nullptr;                       // NR log header in SCR (De Stijl port)
+ 
+     void ReadLock() { pthread_rwlock_rdlock(&lock_); }
+ 
+@@ -102,6 +103,11 @@ public:
+ 
+     const NrFfi::NrMeta* GetNrMetaTid(int rid, bool lock = false);
+ 
++    /* De Stijl port */
++    uint64_t LogRoot() const { return reinterpret_cast<uint64_t>(gcd_->log_root_); }
++
++    void StopLogSync() { NrFfi::stop_log_sync(gcd_->nrht_wrapper); }
++
+ private:
+     GlobalCacheDirectoryNr* gcd_;
+ };
+diff --git a/src/index/nr_hashmap.h b/src/index/nr_hashmap.h
+index 715c988..1777de5 100644
+--- a/src/index/nr_hashmap.h
++++ b/src/index/nr_hashmap.h
+@@ -27,6 +27,20 @@ NrRapper* create_node_replicated_numa(uint64_t cap, uint64_t num_replica, const
+ // bground_sync_period in us
+ // NrRapper* create_node_replicated_numa_async(uint64_t cap, uint64_t bground_sync_period, uint64_t num_replica);
+ void free_node_replicated(NrRapper* nrht_wrapper);
++
++/* De Stijl port: NR log shared between processes (header in SCR, entries in LNR). */
++struct NrLogLayout {
++    size_t header_size;
++    size_t header_align;
++    size_t entry_size;
++    size_t entry_align;
++    size_t entries;
++};
++NrLogLayout nr_log_layout(size_t log_bytes);
++NrRapper* create_node_replicated_shared(uint64_t cap, uint64_t num_replica, size_t node_id, const uint8_t* base_addr,
++                                        size_t slot_size, uint8_t* log_hdr, uint8_t* log_body, size_t log_entries,
++                                        bool init, uint64_t stuck_timeout_ms, uint64_t sync_interval_us);
++void stop_log_sync(NrRapper* nrht_wrapper);
+ const NrMeta* register_node_replicated(NrRapper* nrht_wrapper, size_t idx);
+ void unregister_node_replicated(const NrMeta* metadata);
+ void Put(const NrMeta* metadata, rackobj::common::BlockId key, rackobj::common::GCDEntry val);
+diff --git a/src/manager/wmeta_manager.h b/src/manager/wmeta_manager.h
+index 18c8f1c..4f00842 100644
+--- a/src/manager/wmeta_manager.h
++++ b/src/manager/wmeta_manager.h
+@@ -79,9 +79,8 @@ class WriteMetadataManagerHandle {
+ public:
+     WriteMetadataManagerHandle(C3POHandle *c3po, int run_node, int shared_cache_nid,
+                                const std::shared_ptr<AllocatableLocalMemoryRegion> &region) {
+-        LocalMemoryAllocator<WriteMetadataManager> wmeta_mgr_alloc(region);
+-        wmeta_mgr = wmeta_mgr_alloc.allocate();
+-        std::construct_at(wmeta_mgr, c3po, run_node, shared_cache_nid);
++        (void)region;  // De Stijl port: process-local object on the private heap
++        wmeta_mgr = new WriteMetadataManager(c3po, run_node, shared_cache_nid);
+     }
+ 
+     WriteMetadataManager *operator->() { return wmeta_mgr; }
+diff --git a/src/shared_memory/cxl_port.cc b/src/shared_memory/cxl_port.cc
+new file mode 100644
+index 0000000..9d61297
+--- /dev/null
++++ b/src/shared_memory/cxl_port.cc
+@@ -0,0 +1,276 @@
++#include "shared_memory/cxl_port.h"
++
++#include <fcntl.h>
++#include <sys/mman.h>
++#include <unistd.h>
++
++#include <chrono>
++#include <cstring>
++#include <sstream>
++#include <thread>
++
++#include "absl/log/check.h"
++#include "absl/log/log.h"
++#include "common/config.h"
++#include "common/constants.h"
++#include "common/helper.h"
++#include "core/cache_node.h"
++#include "core/write_meta.h"
++#include "index/nr_hashmap.h"
++
++#ifndef MEGALON_BUILD_ID
++#define MEGALON_BUILD_ID "unknown"
++#endif
++#ifndef MEGALON_FLAVOR_NAME
++#define MEGALON_FLAVOR_NAME "custom"
++#endif
++
++namespace rackobj::port {
++
++namespace {
++
++uint64_t Fnv1a(const std::string &s) {
++    uint64_t h = 0xcbf29ce484222325ull;
++    for (char c : s) {
++        h ^= static_cast<uint8_t>(c);
++        h *= 0x100000001b3ull;
++    }
++    return h;
++}
++
++uint64_t NowNs() {
++    return static_cast<uint64_t>(
++        std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch())
++            .count());
++}
++
++std::string FlavorDefines() {
++    std::string d;
++#ifdef SCR
++    d += "SCR,";
++#endif
++#ifdef DYN_WMETA
++    d += "DYN_WMETA,";
++#endif
++#ifdef NO_COHERENCE
++    d += "NO_COHERENCE,";
++#endif
++#ifdef FULL_COHERENCE
++    d += "FULL_COHERENCE,";
++#endif
++#ifdef PARTITIONED_NODE
++    d += "PARTITIONED_NODE,";
++#endif
++#ifdef FILE_INTERFACE
++    d += "FILE_INTERFACE,";
++#endif
++    return d;
++}
++
++constexpr size_t A64(size_t x) { return (x + 63) & ~static_cast<size_t>(63); }
++
++}  // namespace
++
++PortContext &PortContext::Get() {
++    static PortContext ctx;
++    return ctx;
++}
++
++size_t PortContext::ScrFootprint(size_t num_slots, size_t wmeta_slots, size_t log_header_size) {
++    size_t bitmap = A64(((num_slots + 63) / 64) * sizeof(uint64_t));
++    return kCtrlSize + A64(sizeof(SharedCounters)) + 4 * bitmap + 128 + A64(log_header_size) + 64 +
++           wmeta_slots * sizeof(common::WriteMetadata);
++}
++
++uint64_t PortContext::ComputeLayoutHash(const RackOBJConfig &cfg, size_t num_slots) const {
++    NrFfi::NrLogLayout lay = NrFfi::nr_log_layout(nr_log_bytes_);
++    std::ostringstream o;
++    o << "v=" << kCtrlVersion << " dev_size=" << region_.device_size << " map_va=" << region_.map_va
++      << " hwcc=" << region_.hwcc.offset << "+" << region_.hwcc.size << " swcc=" << region_.swcc.offset << "+"
++      << region_.swcc.size << " slots=" << num_slots << " logical_scr=" << cfg.GetLogicalSCRSize()
++      << " SLOT_SIZE=" << SLOT_SIZE << " KEY_SIZE=" << KEY_SIZE << " nodes=" << LOGICAL_NODE_NUM
++      << " flavor=" << MEGALON_FLAVOR_NAME << " defs=" << FlavorDefines() << " build=" << MEGALON_BUILD_ID
++      << " sz(CacheNode)=" << sizeof(common::CacheNode) << " sz(WriteMetadata)=" << sizeof(common::WriteMetadata)
++      << " sz(SharedCounters)=" << sizeof(SharedCounters) << " sz(ControlBlock)=" << sizeof(ControlBlock)
++      << " sz(GCDEntry)=" << sizeof(NrFfi::GCDEntry) << " nrlog_hdr=" << lay.header_size
++      << " nrlog_entry=" << lay.entry_size << " nrlog_entries=" << lay.entries;
++    LOG(INFO) << "layout: " << o.str();
++    return Fnv1a(o.str());
++}
++
++void PortContext::Init(const RackOBJConfig &cfg, size_t num_slots, size_t scr_footprint) {
++    CHECK(!initialized_) << "PortContext initialized twice";
++    node_id_ = cfg.GetNodeId();
++    SetNodeId(node_id_);
++    attach_ = node_id_ != 0;
++    mprotect_ = cfg.AttachMprotect();
++    barrier_timeout_s_ = cfg.BarrierTimeoutS();
++    stuck_timeout_ms_ = cfg.StuckTimeoutMs();
++    log_sync_interval_us_ = cfg.LogSyncIntervalUs();
++    nr_log_bytes_ = cfg.GetNrLogBytes();
++
++    std::string err;
++    const char *path = cfg.GetRegionConfig().empty() ? nullptr : cfg.GetRegionConfig().c_str();
++    if (!cxl::region_load(path, &region_, &err)) LOG(FATAL) << "CXL region config: " << err;
++    LOG(INFO) << "node " << node_id_ << " (" << (attach_ ? "attach" : "init") << "), "
++              << cxl::region_describe(region_);
++    CHECK(region_.hwcc.size > kCtrlSize) << "hwcc_size too small";
++
++    // [V9] refuse runs whose SCR structures do not fit into the HW-coherent range
++    LOG(INFO) << "SCR footprint (upper bound): " << scr_footprint << " bytes of hwcc_size " << region_.hwcc.size;
++    if (scr_footprint > region_.hwcc.size)
++        LOG(FATAL) << "SCR footprint " << scr_footprint << " exceeds hwcc_size " << region_.hwcc.size
++                   << " (reduce slots/logical_scr_size or enlarge hwcc_size); refusing to run";
++
++    int fd = open(region_.device.c_str(), O_RDWR | O_CLOEXEC);
++    PCHECK(fd >= 0) << "open " << region_.device;
++    void *want = reinterpret_cast<void *>(region_.map_va);
++    void *p = mmap(want, region_.device_size, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED_NOREPLACE, fd, 0);
++    PCHECK(p != MAP_FAILED) << "mmap " << region_.device << " at " << want << " length " << region_.device_size;
++    if (p != want) {
++        munmap(p, region_.device_size);
++        LOG(FATAL) << "mapping landed at " << p << " instead of map_va " << want;
++    }
++    close(fd);
++    map_ = static_cast<uint8_t *>(p);
++    ctrl_ = reinterpret_cast<ControlBlock *>(map_ + region_.hwcc.offset);
++    layout_hash_ = ComputeLayoutHash(cfg, num_slots);
++
++    if (!attach_) {
++        bool empty = true;
++        const uint8_t *c = reinterpret_cast<const uint8_t *>(ctrl_);
++        for (size_t i = 0; i < kCtrlSize; i++) {
++            if (c[i]) {
++                empty = false;
++                break;
++            }
++        }
++        if (!empty) {
++            uint32_t st = ctrl_->state.load(std::memory_order_acquire);
++            if (!cfg.Reinit())
++                LOG(FATAL) << "control block is not EMPTY (magic=0x" << std::hex << ctrl_->magic << std::dec
++                           << " state=" << st << "); set reinit: true (or MEGALON_REINIT=1) on node 0 to "
++                           << "re-initialize the shared region";
++            LOG(WARNING) << "re-initializing shared region (previous state " << st << ")";
++        }
++        ctrl_->state.store(kStateInitializing, std::memory_order_release);
++        for (int i = 0; i < kMaxNodes; i++) ctrl_->node_alive[i].store(0, std::memory_order_relaxed);
++        ctrl_->version = kCtrlVersion;
++        ctrl_->init_node = static_cast<uint32_t>(node_id_);
++        ctrl_->layout_hash = layout_hash_;
++        ctrl_->scr_cursor_end = 0;
++        ctrl_->lnr_cursor_end = 0;
++        ctrl_->log_root = 0;
++        ctrl_->init_epoch_ns = NowNs();
++        ctrl_->magic = kCtrlMagic;
++        std::atomic_thread_fence(std::memory_order_release);
++    } else {
++        auto start = std::chrono::steady_clock::now();
++        auto last_log = start;
++        while (!(ctrl_->magic == kCtrlMagic && ctrl_->state.load(std::memory_order_acquire) == kStateReady)) {
++            auto now = std::chrono::steady_clock::now();
++            if (now - start > std::chrono::seconds(cfg.AttachTimeoutS()))
++                LOG(FATAL) << "node 0 did not publish READY within " << cfg.AttachTimeoutS() << " s";
++            if (now - last_log > std::chrono::seconds(10)) {
++                LOG(INFO) << "waiting for node 0 to publish READY (state "
++                          << ctrl_->state.load(std::memory_order_relaxed) << ")";
++                last_log = now;
++            }
++            std::this_thread::sleep_for(std::chrono::milliseconds(5));
++        }
++        std::atomic_thread_fence(std::memory_order_acquire);
++        if (ctrl_->version != kCtrlVersion)
++            LOG(FATAL) << "control block version " << ctrl_->version << " != " << kCtrlVersion;
++        if (ctrl_->layout_hash != layout_hash_)
++            LOG(FATAL) << "layout_hash mismatch: node 0 0x" << std::hex << ctrl_->layout_hash << ", node "
++                       << std::dec << node_id_ << " 0x" << std::hex << layout_hash_
++                       << " (same binaries, region config, slots and logical_scr_size required)";
++        LOG(INFO) << "attaching to layout 0x" << std::hex << layout_hash_ << std::dec << " (init epoch "
++                  << ctrl_->init_epoch_ns << ")";
++        if (mprotect_) SetProtect(true);
++    }
++
++    scr_ = std::make_shared<common::AllocatableLocalMemoryRegion>(
++        common::AllocatableLocalMemoryRegion::ArenaTag{}, "scr", map_ + region_.hwcc.offset + kCtrlSize,
++        region_.hwcc.size - kCtrlSize);
++    lnr_ = std::make_shared<common::AllocatableLocalMemoryRegion>(common::AllocatableLocalMemoryRegion::ArenaTag{},
++                                                                   "lnr", map_ + region_.swcc.offset,
++                                                                   region_.swcc.size);
++    priv_ = std::make_shared<common::AllocatableLocalMemoryRegion>(common::AllocatableLocalMemoryRegion::HeapTag{},
++                                                                    "private");
++
++    // [V1] shared counter block: the first SCR allocation
++    counters_ = reinterpret_cast<SharedCounters *>(scr_->AllocateBytes(sizeof(SharedCounters), 64));
++    if (!attach_) {
++        std::construct_at(counters_);
++        counters_->wmeta_allocated.v.store(0);
++        counters_->wmeta_reclaim.v.store(0);
++        counters_->wmeta_allocate.v.store(0);
++        counters_->bitmap_count.v.store(0);
++        counters_->bitmap_dirty.v.store(0);
++    }
++    initialized_ = true;
++}
++
++void PortContext::SetProtect(bool read_only) {
++    int prot = read_only ? PROT_READ : (PROT_READ | PROT_WRITE);
++    PCHECK(mprotect(map_ + region_.hwcc.offset, region_.hwcc.size, prot) == 0) << "mprotect hwcc";
++    PCHECK(mprotect(map_ + region_.swcc.offset, region_.swcc.size, prot) == 0) << "mprotect swcc";
++    protected_ = read_only;
++    LOG(INFO) << "shared ranges " << (read_only ? "write-protected for attach" : "writable");
++}
++
++void PortContext::Finish(uint64_t log_root) {
++    CHECK(initialized_);
++    if (!attach_) {
++        ctrl_->scr_cursor_end = scr_->Cursor();
++        ctrl_->lnr_cursor_end = lnr_->Cursor();
++        ctrl_->log_root = log_root;
++        ctrl_->state.store(kStateReady, std::memory_order_release);
++        LOG(INFO) << "init complete, READY published";
++    } else {
++        if (scr_->Cursor() != ctrl_->scr_cursor_end || lnr_->Cursor() != ctrl_->lnr_cursor_end ||
++            log_root != ctrl_->log_root)
++            LOG(FATAL) << "attach layout diverged from node 0: scr cursor " << scr_->Cursor() << " vs "
++                       << ctrl_->scr_cursor_end << ", lnr cursor " << lnr_->Cursor() << " vs "
++                       << ctrl_->lnr_cursor_end << ", log_root 0x" << std::hex << log_root << " vs 0x"
++                       << ctrl_->log_root;
++        if (protected_) SetProtect(false);
++        LOG(INFO) << "attach complete, layout matches node 0";
++    }
++    scr_->Seal();
++    lnr_->Seal();
++    LOG(INFO) << "SCR used: " << kCtrlSize + scr_->Cursor() << " of hwcc_size " << region_.hwcc.size
++              << " bytes; LNR used: " << lnr_->Cursor() << " of swcc_size " << region_.swcc.size
++              << " bytes; log_root 0x" << std::hex << log_root;
++}
++
++void PortContext::StartBarrier() {
++    CHECK(initialized_);
++    ctrl_->node_alive[node_id_].store(1, std::memory_order_release);
++    auto start = std::chrono::steady_clock::now();
++    auto last_log = start;
++    for (;;) {
++        bool all = true;
++        for (int i = 0; i < LOGICAL_NODE_NUM; i++)
++            if (ctrl_->node_alive[i].load(std::memory_order_acquire) != 1) all = false;
++        if (all) break;
++        auto now = std::chrono::steady_clock::now();
++        if (now - start > std::chrono::seconds(barrier_timeout_s_))
++            LOG(FATAL) << "start barrier: not every node became alive within " << barrier_timeout_s_ << " s";
++        if (now - last_log > std::chrono::seconds(10)) {
++            LOG(INFO) << "start barrier: waiting for the other node";
++            last_log = now;
++        }
++        std::this_thread::sleep_for(std::chrono::milliseconds(1));
++    }
++    LOG(INFO) << "start barrier passed: all " << LOGICAL_NODE_NUM << " nodes alive";
++}
++
++void PortContext::Shutdown() {
++    if (!initialized_ || !ctrl_) return;
++    ctrl_->node_alive[node_id_].store(0, std::memory_order_release);
++    if (!attach_) ctrl_->state.store(kStateClosed, std::memory_order_release);
++}
++
++}  // namespace rackobj::port
+diff --git a/src/shared_memory/cxl_port.h b/src/shared_memory/cxl_port.h
+new file mode 100644
+index 0000000..56aeec5
+--- /dev/null
++++ b/src/shared_memory/cxl_port.h
+@@ -0,0 +1,138 @@
++// De Stijl 2-VM port of Megalon: one process per VM acts as one node; both map
++// the whole shared device at the same virtual address (cxl_region map_va).
++//
++// Layout (from cxl_region.yaml only; HWcc <-> SCR, SWcc <-> LNR):
++//   HWcc page 0                 control block
++//   HWcc [4 KiB, end)           scr arena: shared counters, SCR bitmaps,
++//                               NR log header, WriteMetadata records
++//   SWcc                        lnr arena: CacheNode array, slot data,
++//                               NR log entries
++// Process-local state (handles, local seqcount maps, NR replicas) lives in
++// private memory.
++#pragma once
++
++#include <atomic>
++#include <cstddef>
++#include <cstdint>
++#include <memory>
++#include <string>
++
++#include "cxl_region.h"
++#include "shared_memory/region.h"
++
++namespace rackobj {
++class RackOBJConfig;
++}
++
++namespace rackobj::port {
++
++constexpr uint64_t kCtrlMagic = 0x4d45474c4e325643ull;  // "CV2NLGEM"
++constexpr uint32_t kCtrlVersion = 1;
++constexpr size_t kCtrlSize = 4096;
++constexpr int kMaxNodes = 2;
++
++enum CtrlState : uint32_t {
++    kStateEmpty = 0,
++    kStateInitializing = 1,
++    kStateReady = 2,
++    kStateClosed = 3,  // node 0 exited cleanly; attach must wait for a new init
++};
++
++struct alignas(64) PaddedCounter {
++    std::atomic<uint64_t> v;
++};
++
++/* [V1] Counters that every node must see: they used to be process-local members
++ * of BaseMetadata / SharedBitmap. Lives in SCR, accessed as atomics. */
++struct SharedCounters {
++    PaddedCounter wmeta_allocated;  // BaseMetadata::allocated_slot_num_ (gates CheckReserveWmeta, DYN_WMETA reclaim)
++    PaddedCounter wmeta_reclaim;    // BaseMetadata::reclaim_count_
++    PaddedCounter wmeta_allocate;   // BaseMetadata::allocate_count_
++    PaddedCounter bitmap_count;     // SharedBitmap::count_ (stats only, RANDSLOTALLOC)
++    PaddedCounter bitmap_dirty;     // SharedBitmap::dirty_count_ (stats only)
++};
++
++struct ControlBlock {
++    uint64_t magic;
++    uint32_t version;
++    uint32_t init_node;
++    uint64_t layout_hash;
++    uint64_t scr_cursor_end;
++    uint64_t lnr_cursor_end;
++    uint64_t log_root;  // VA of the NR log header (same on every node)
++    uint64_t init_epoch_ns;
++    alignas(64) std::atomic<uint32_t> state;
++    alignas(64) std::atomic<uint32_t> node_alive[kMaxNodes];
++};
++static_assert(sizeof(ControlBlock) <= kCtrlSize, "control block must fit in one page");
++static_assert(std::atomic<uint32_t>::is_always_lock_free && std::atomic<uint64_t>::is_always_lock_free);
++
++class PortContext {
++public:
++    static PortContext &Get();
++
++    /* Map the device, take the init (node 0) or attach (node 1) role, set up the
++     * arenas and the shared counter block. On attach this waits for READY and,
++     * if configured, write-protects both shared ranges until Finish(). */
++    void Init(const RackOBJConfig &cfg, size_t num_slots, size_t scr_footprint);
++
++    bool attach() const { return attach_; }
++    int node_id() const { return node_id_; }
++
++    const std::shared_ptr<common::AllocatableLocalMemoryRegion> &scr() const { return scr_; }
++    const std::shared_ptr<common::AllocatableLocalMemoryRegion> &lnr() const { return lnr_; }
++    const std::shared_ptr<common::AllocatableLocalMemoryRegion> &priv() const { return priv_; }
++
++    SharedCounters *counters() const { return counters_; }
++
++    uint64_t stuck_timeout_ms() const { return stuck_timeout_ms_; }
++    uint64_t log_sync_interval_us() const { return log_sync_interval_us_; }
++    size_t nr_log_bytes() const { return nr_log_bytes_; }
++
++    /* Init: record cursors and log_root, publish READY. Attach: check that the
++     * own construction ended at the recorded cursors and log_root (abort on a
++     * mismatch), then lift the write protection. Both: seal the arenas. */
++    void Finish(uint64_t log_root);
++
++    /* [C4] Mark this node alive and wait until every node is; no NR write may
++     * happen before this returns. */
++    void StartBarrier();
++
++    void Shutdown();
++
++    const cxl::region &region() const { return region_; }
++
++    uint64_t layout_hash() const { return layout_hash_; }
++
++    /* Upper bound of the SCR bytes used by the shared structures, used to refuse
++     * runs that would not fit into hwcc_size [V9]. */
++    static size_t ScrFootprint(size_t num_slots, size_t wmeta_slots, size_t log_header_size);
++
++private:
++    PortContext() = default;
++
++    void SetProtect(bool read_only);
++    uint64_t ComputeLayoutHash(const RackOBJConfig &cfg, size_t num_slots) const;
++
++    bool initialized_ = false;
++    bool attach_ = false;
++    bool protected_ = false;
++    bool mprotect_ = true;
++    int node_id_ = -1;
++    uint64_t barrier_timeout_s_ = 600;
++    uint64_t stuck_timeout_ms_ = 10000;
++    uint64_t log_sync_interval_us_ = 100;
++    size_t nr_log_bytes_ = 64UL << 20;
++    uint64_t layout_hash_ = 0;
++
++    cxl::region region_;
++    uint8_t *map_ = nullptr;
++    ControlBlock *ctrl_ = nullptr;
++    SharedCounters *counters_ = nullptr;
++
++    std::shared_ptr<common::AllocatableLocalMemoryRegion> scr_;
++    std::shared_ptr<common::AllocatableLocalMemoryRegion> lnr_;
++    std::shared_ptr<common::AllocatableLocalMemoryRegion> priv_;
++};
++
++}  // namespace rackobj::port
+diff --git a/src/shared_memory/region.h b/src/shared_memory/region.h
+index 9b70967..551d7e8 100644
+--- a/src/shared_memory/region.h
++++ b/src/shared_memory/region.h
+@@ -1,7 +1,7 @@
+ #ifndef RACKOBJ_SHARED_MEMORY_REGION_H
+ #define RACKOBJ_SHARED_MEMORY_REGION_H
+ 
+-#include <memkind.h>
++#include <stdint.h>
+ 
+ #include <string>
+ #include <vector>
+@@ -92,10 +92,25 @@ private:
+     bool exclusive_;
+ };
+ 
++/**
++ * De Stijl port: memkind is no longer used. A region is
++ *  - an arena: a deterministic bump allocator over a fixed range of the shared
++ *    CXL mapping. Every node runs the same allocation sequence with the same
++ *    sizes, so every allocation lands at the same address on every node.
++ *    Nothing is ever freed; Seal() makes later allocations fatal.
++ *  - private heap: process-local memory (aligned_alloc/free), never shared.
++ */
+ class AllocatableLocalMemoryRegion : public SharedMemoryRegion {
+ public:
++    struct ArenaTag {};
++    struct HeapTag {};
++
+     AllocatableLocalMemoryRegion(int node, size_t length, bool exclusive = true) noexcept;
+ 
++    AllocatableLocalMemoryRegion(ArenaTag, const std::string& name, uint8_t* base, size_t length) noexcept;
++
++    AllocatableLocalMemoryRegion(HeapTag, const std::string& name) noexcept;
++
+     ~AllocatableLocalMemoryRegion();
+ 
+     AllocatableLocalMemoryRegion(const AllocatableLocalMemoryRegion&) = delete;
+@@ -108,11 +123,33 @@ public:
+ 
+     void Deallocate(uint8_t* ptr);
+ 
++    /** Arena/heap allocation with an explicit power-of-two alignment. */
++    uint8_t* AllocateBytes(size_t nbytes, size_t alignment);
++
+     void SetTargetNode(int node);
+ 
+     int GetTargetNode() { return target_node_; }
+ 
++    bool IsArena() const { return kind_mode_ == Mode::kArena; }
++
++    /** Arena: offset of the next free byte from the arena base. */
++    size_t Cursor() const { return cursor_; }
++
++    uint8_t* Base() const { return arena_base_; }
++
++    /** Arena: any allocation after Seal() is fatal (layout must be fixed after init/attach). */
++    void Seal() { sealed_ = true; }
++
++    const std::string& Name() const { return name_; }
++
+ private:
++    enum class Mode { kArena, kHeap };
++    Mode kind_mode_ = Mode::kHeap;
++    std::string name_;
++    uint8_t* arena_base_ = nullptr;
++    size_t cursor_ = 0;
++    bool sealed_ = false;
++
+     int target_node_ = -1;
+ 
+     // This determines whether or not to remove the shared memory segment upon
+@@ -123,7 +160,6 @@ private:
+     // std::vector<size_t> region_seglen_;
+ 
+     void* region_;
+-    memkind_t kind_;
+ };
+ 
+ }  // namespace rackobj::common
+diff --git a/src/shared_memory/region.hpp b/src/shared_memory/region.hpp
+index bf8e82a..87a0cd7 100644
+--- a/src/shared_memory/region.hpp
++++ b/src/shared_memory/region.hpp
+@@ -254,42 +254,62 @@ inline void AllocatableSharedMemoryRegion::SetTargetNode(int node) { target_node
+ 
+ // local memory region
+ inline AllocatableLocalMemoryRegion::AllocatableLocalMemoryRegion(int node, size_t length, bool exclusive) noexcept
+-    : SharedMemoryRegion(nullptr, length) {
+-    is_local_ = true;
++    : SharedMemoryRegion(nullptr, length, /*require_free=*/false) {
++    // De Stijl port: the NUMA-bound memkind region is gone (memkind is replaced by the shared arenas and the
++    // private heap); a "local region" is process-private heap memory.
++    kind_mode_ = Mode::kHeap;
++    name_ = "local-node" + std::to_string(node);
+     target_node_ = node;
+     exclusive_ = exclusive;
+-    CHECK(numa_available() != -1) << "libnuma not available";
+-    LOG(INFO) << "init memkind region of size " << length << " on node " << node;
+-
+-    size_t alignment = (size_t)sysconf(_SC_PAGESIZE);
+-    if (posix_memalign(&region_, alignment, length) != 0) {
+-        perror("posix_memalign fail");
+-        exit(1);
+-    }
+-
+-    unsigned long nodemask = 1UL << target_node_;
+-    if (mbind(region_, length, MPOL_BIND, &nodemask, sizeof(nodemask), MPOL_MF_STRICT | MPOL_MF_MOVE_ALL) != 0) {
+-        perror("mbind fail");
+-        free(region_);
+-        exit(1);
+-    }
+-
+-    int ret = memkind_create_fixed(region_, length, &kind_);
+-    CHECK(ret == 0) << "memkind_create_fixed failed";
++    region_ = nullptr;
++}
+ 
+-    // fault the page
+-    size_t page_size = static_cast<size_t>(sysconf(_SC_PAGESIZE));
+-    char *base = static_cast<char *>(region_);
+-    for (size_t offset = 0; offset < length; offset += page_size) {
+-        *(volatile char *)(base + offset) = 0;
+-    }
++inline AllocatableLocalMemoryRegion::AllocatableLocalMemoryRegion(ArenaTag, const std::string &name, uint8_t *base,
++                                                                  size_t length) noexcept
++    : SharedMemoryRegion(base, length, /*require_free=*/false) {
++    kind_mode_ = Mode::kArena;
++    name_ = name;
++    arena_base_ = base;
++    cursor_ = 0;
++    exclusive_ = false;
++    region_ = base;
++    LOG(INFO) << "arena " << name_ << " at " << (void *)base << " length " << length;
++}
+ 
+-    LOG(INFO) << "memkind created with size " << length;
++inline AllocatableLocalMemoryRegion::AllocatableLocalMemoryRegion(HeapTag, const std::string &name) noexcept
++    : SharedMemoryRegion(nullptr, 0, /*require_free=*/false) {
++    kind_mode_ = Mode::kHeap;
++    name_ = name;
++    exclusive_ = false;
++    region_ = nullptr;
+ }
+ 
+-inline AllocatableLocalMemoryRegion::~AllocatableLocalMemoryRegion() {
+-    memkind_destroy_kind(kind_);
+-    numa_free(region_, segment_length_);
++// arena memory is shared and never freed; heap blocks are freed individually
++inline AllocatableLocalMemoryRegion::~AllocatableLocalMemoryRegion() {}
++
++inline uint8_t *AllocatableLocalMemoryRegion::AllocateBytes(size_t nbytes, size_t alignment) {
++    CHECK(nbytes != 0) << "Cannot allocate 0 bytes from " << name_;
++    if (alignment < 16) alignment = 16;
++    CHECK((alignment & (alignment - 1)) == 0) << "alignment must be a power of two";
++    if (kind_mode_ == Mode::kArena) {
++        CHECK(!sealed_) << "allocation of " << nbytes << " bytes from sealed arena " << name_
++                        << " (shared layout is fixed after init/attach)";
++        size_t off = (cursor_ + alignment - 1) & ~(alignment - 1);
++        if (off + nbytes > segment_length_ || off + nbytes < off) {
++            LOG(FATAL) << "arena " << name_ << " exhausted: need " << nbytes << " bytes at offset " << off
++                       << ", arena length " << segment_length_ << " (increase the region in cxl_region.yaml)";
++        }
++        cursor_ = off + nbytes;
++        return arena_base_ + off;
++    }
++    if (kind_mode_ == Mode::kHeap) {
++        size_t rounded = (nbytes + alignment - 1) & ~(alignment - 1);
++        void *p = aligned_alloc(alignment, rounded);
++        CHECK(p != nullptr) << "private heap allocation of " << nbytes << " bytes failed";
++        return static_cast<uint8_t *>(p);
++    }
++    LOG(FATAL) << "bad region mode";
++    return nullptr;
+ }
+ 
+ template <MemoryAlignment Alignment>
+@@ -308,19 +328,13 @@ inline uint8_t *AllocatableLocalMemoryRegion::Allocate(size_t nbytes) {
+     DLOG(INFO) << "Allocating " << nbytes << " to node " << target_node_ << " with seglength " << segment_length_
+                << " alignment " << alignment;
+ 
+-    void *region;
+-    if (alignment > 0) {
+-        int ret = memkind_posix_memalign(kind_, &region, alignment, nbytes);
+-        CHECK(ret == 0) << "memkind_posix_memalign failed " << ret;
+-    } else {
+-        region = memkind_malloc(kind_, nbytes);
+-        CHECK(region != NULL) << "memkind_malloc failed";
+-    }
+-
+-    return static_cast<uint8_t *>(region);
++    return AllocateBytes(nbytes, alignment);
+ }
+ 
+-inline void AllocatableLocalMemoryRegion::Deallocate(uint8_t *ptr) { memkind_free(kind_, ptr); }
++inline void AllocatableLocalMemoryRegion::Deallocate(uint8_t *ptr) {
++    if (kind_mode_ == Mode::kArena) return;  // bump arena: shared arrays are never freed
++    free(ptr);  // private heap
++}
+ 
+ inline void AllocatableLocalMemoryRegion::SetTargetNode(int node) { target_node_ = node; }
+ 
+-- 
+2.34.1
+

@@ -1,0 +1,145 @@
+From 96c57690ee6c6b4b58e52c9d70a414db83626e02 Mon Sep 17 00:00:00 2001
+From: Sungsu Ahn <sungsu_ahn@korea.ac.kr>
+Date: Wed, 14 Oct 2026 22:20:41 +0900
+Subject: [PATCH 05/51] build: MEGALON_FLAVOR, per-flavor out-of-tree NR lib,
+ RUNPATH $ORIGIN/../lib
+
+- The FORCE'd cache lines become plain options with the same defaults.
+  MEGALON_FLAVOR=megalon (SCR+LIMITED_SCR) | hwcc (FULL_COHERENCE) |
+  custom.
+- MEGALON_NR_LIB (absolute path of libnr_hashmap.a built with its own
+  CARGO_TARGET_DIR) replaces ${NR_DIR}/ffi/target; configure fails if the
+  lib's .features tag does not match the flavor [V6].
+- RUNPATH $ORIGIN/../lib (MEGALON_RUNPATH) instead of Host paths.
+- cxl_region.h include dir (CXL_COMMON_DIR); MEGALON_BUILD_ID and the
+  flavor are compiled into cxl_port.cc only (layout hash).
+- memkind dropped from the link.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ CMakeLists.txt | 90 ++++++++++++++++++++++++++++++++++++--------------
+ 1 file changed, 66 insertions(+), 24 deletions(-)
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index fa8abd6..7f36f49 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -4,8 +4,14 @@ set(CMAKE_POLICY_VERSION_MINIMUM 3.5)
+ 
+ project(MEGALON VERSION 1.0 LANGUAGES CXX)
+ 
+-list(APPEND CMAKE_BUILD_RPATH "${CMAKE_BINARY_DIR}")
+-list(APPEND CMAKE_INSTALL_RPATH "${CMAKE_BINARY_DIR}")
++# De Stijl port: binaries run from a ship dir (bin/, lib/) inside the VMs, so the
++# RUNPATH is relative ($ORIGIN/../lib) instead of Host build paths. This
++# overrides the toolchain file's GCC install dir RPATH.
++set(MEGALON_RUNPATH "$ORIGIN/../lib" CACHE STRING "RUNPATH of libmegalon and the benchmark binaries")
++set(CMAKE_SKIP_BUILD_RPATH FALSE)
++set(CMAKE_BUILD_WITH_INSTALL_RPATH TRUE)
++set(CMAKE_BUILD_RPATH "")
++set(CMAKE_INSTALL_RPATH "${MEGALON_RUNPATH}")
+ 
+ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+ set(CMAKE_CXX_EXTENSIONS ON)
+@@ -30,19 +36,32 @@ set(MEGALON_COMPILE_OPTIONS "-Wall -Wpedantic -Wextra -Wshadow -Wunused-paramete
+ # set(MEGALON_COMPILE_OPTIONS "-Wall -Werror -Wextra -Wcast-qual -Wconversion-null -Wmissing-declarations -Woverlength-strings -Wpointer-arith -Wunused-local-typedefs -Wunused-result -Wvarargs -Wvla -Wwrite-strings")
+ 
+ # cmake options (refer to compile flags for detailed explanation)
+-option(SCR "Enable SCR memory handling")
+-option(NO_COHERENCE "Enable non-coherent memory handling")
+-option(FULL_COHERENCE "assumes the entire cxl cache is coherent")
+-option(LIMITED_SCR "limited SCR")
+-option(PARTITIONED_NODE "enable partitioned node")
+-option(FILE_INTERFACE "Enable file-interface benchmark/code paths" ON)
+-
+-set(SCR ON CACHE BOOL "Enable SCR memory handling" FORCE)
+-set(NO_COHERENCE OFF CACHE BOOL "Enable non-coherent memory handling" FORCE)
+-set(LIMITED_SCR ON CACHE BOOL "limited SCR" FORCE)
+-set(FULL_COHERENCE OFF CACHE BOOL "assumes the entire cxl cache is coherent" FORCE)
+-set(PARTITIONED_NODE OFF CACHE BOOL "enable partitioned node" FORCE)
+-set(FILE_INTERFACE OFF CACHE BOOL "Enable file-interface benchmark/code paths" FORCE)
++# Plain options (same defaults the FORCE lines used to impose) plus a flavor
++# selector. A named flavor sets the coherence options; "custom" uses them as given.
++#   megalon = SCR + LIMITED_SCR (Megalon)      hwcc = FULL_COHERENCE (all-HWcc baseline)
++option(SCR "Enable SCR memory handling" ON)
++option(NO_COHERENCE "Enable non-coherent memory handling" OFF)
++option(FULL_COHERENCE "assumes the entire cxl cache is coherent" OFF)
++option(LIMITED_SCR "limited SCR" ON)
++option(PARTITIONED_NODE "enable partitioned node" OFF)
++option(FILE_INTERFACE "Enable file-interface benchmark/code paths" OFF)
++
++set(MEGALON_FLAVOR "megalon" CACHE STRING "megalon | hwcc | custom")
++set_property(CACHE MEGALON_FLAVOR PROPERTY STRINGS megalon hwcc custom)
++if (MEGALON_FLAVOR STREQUAL "megalon")
++    set(SCR ON)
++    set(LIMITED_SCR ON)
++    set(NO_COHERENCE OFF)
++    set(FULL_COHERENCE OFF)
++elseif (MEGALON_FLAVOR STREQUAL "hwcc")
++    set(SCR OFF)
++    set(LIMITED_SCR OFF)
++    set(NO_COHERENCE OFF)
++    set(FULL_COHERENCE ON)
++elseif (NOT MEGALON_FLAVOR STREQUAL "custom")
++    message(FATAL_ERROR "MEGALON_FLAVOR must be megalon, hwcc or custom (got '${MEGALON_FLAVOR}')")
++endif()
++message(STATUS "MEGALON_FLAVOR=${MEGALON_FLAVOR}: SCR=${SCR} LIMITED_SCR=${LIMITED_SCR} NO_COHERENCE=${NO_COHERENCE} FULL_COHERENCE=${FULL_COHERENCE} PARTITIONED_NODE=${PARTITIONED_NODE} FILE_INTERFACE=${FILE_INTERFACE}")
+ 
+ if (NOT SCR AND LIMITED_SCR)
+     message(FATAL_ERROR "LIMITED_SCR can not be ON without SCR!")
+@@ -127,20 +146,43 @@ target_include_directories(megalon SYSTEM PRIVATE ${YAML_CPP_INCLUDE_DIR})
+ 
+ add_subdirectory(${MEGALON_SOURCE_DIR}/third-party/abseil-cpp)
+ 
+-target_link_libraries(megalon memkind absl::log absl::check absl::flat_hash_map absl::status yaml-cpp::yaml-cpp numa atomic)
++target_link_libraries(megalon absl::log absl::check absl::flat_hash_map absl::status yaml-cpp::yaml-cpp numa atomic)
+ 
+-# linking nr
+-target_link_directories(megalon PUBLIC "${NR_DIR}/ffi/target/release")
++# linking nr: the per-flavor libnr_hashmap.a is built out of tree (absolute
++# CARGO_TARGET_DIR, systems/megalon/build.sh) and passed in. Its feature tag
++# (written next to it as <lib>.features) must match this flavor.
+ if (LIMITED_SCR)
+-    message("linking limited scr nr variant")
+-    target_link_libraries(megalon nr_hashmap hwloc)
++    set(MEGALON_NR_FEATURES "scr")
+ elseif (NO_COHERENCE)
+-    message("linking no-coherence nr variant")
+-    target_link_libraries(megalon nr_hashmap_noco hwloc)
++    set(MEGALON_NR_FEATURES "scr no-coherence")
+ else()
+-    message("linking original nr variant")
+-    target_link_libraries(megalon nr_hashmap_orig hwloc)
++    set(MEGALON_NR_FEATURES "")
++endif()
++set(MEGALON_NR_LIB "" CACHE FILEPATH "absolute path of the per-flavor libnr_hashmap.a")
++if (NOT MEGALON_NR_LIB OR NOT IS_ABSOLUTE "${MEGALON_NR_LIB}" OR NOT EXISTS "${MEGALON_NR_LIB}")
++    message(FATAL_ERROR "MEGALON_NR_LIB must be the absolute path of an existing libnr_hashmap.a (got '${MEGALON_NR_LIB}')")
++endif()
++if (NOT EXISTS "${MEGALON_NR_LIB}.features")
++    message(FATAL_ERROR "missing feature tag ${MEGALON_NR_LIB}.features")
++endif()
++file(STRINGS "${MEGALON_NR_LIB}.features" _nr_tag REGEX "^features=")
++if (NOT _nr_tag STREQUAL "features=${MEGALON_NR_FEATURES}")
++    message(FATAL_ERROR "nr lib ${MEGALON_NR_LIB} was built with '${_nr_tag}', flavor ${MEGALON_FLAVOR} needs 'features=${MEGALON_NR_FEATURES}'")
+ endif()
++message(STATUS "linking nr lib ${MEGALON_NR_LIB} (features='${MEGALON_NR_FEATURES}')")
++target_link_libraries(megalon ${MEGALON_NR_LIB} hwloc)
++
++# shared CXL region loader (systems/common/cxl_region.h)
++set(CXL_COMMON_DIR "${MEGALON_SOURCE_DIR}/../../common" CACHE PATH "directory with cxl_region.h")
++if (NOT EXISTS "${CXL_COMMON_DIR}/cxl_region.h")
++    message(FATAL_ERROR "cxl_region.h not found in CXL_COMMON_DIR=${CXL_COMMON_DIR}")
++endif()
++target_include_directories(megalon PRIVATE ${CXL_COMMON_DIR})
++
++# build id and flavor go into the shared-layout hash (only cxl_port.cc, keeps rebuilds incremental)
++set(MEGALON_BUILD_ID "unknown" CACHE STRING "source commit (+dirty hash) recorded in the layout hash")
++set_property(SOURCE ${MEGALON_SOURCE_DIR}/src/shared_memory/cxl_port.cc APPEND PROPERTY COMPILE_DEFINITIONS
++             MEGALON_BUILD_ID="${MEGALON_BUILD_ID}" MEGALON_FLAVOR_NAME="${MEGALON_FLAVOR}")
+ 
+ # find_library(oneTBB megalon ${CMAKE_CURRENT_BINARY_DIR})
+ 
+-- 
+2.34.1
+

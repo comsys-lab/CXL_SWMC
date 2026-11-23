@@ -1,0 +1,54 @@
+From fd59207d2b68388cd0896d02619fcad689bac7d9 Mon Sep 17 00:00:00 2001
+From: Sungsu Ahn <sungsu_ahn@korea.ac.kr>
+Date: Thu, 15 Oct 2026 16:33:06 +0900
+Subject: [PATCH 31/51] objects: document the write-section contract (whole
+ cache lines, never read prior contents)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+User decision D3 (2026-10-15): no code change to the write path; the writer's
+own cached copy is not validated (paper §3.4.5), so the API comment states the
+contract. object-test already writes whole objects; the churn final-generation
+object now requires whole-line halves (churn % 4 == 0).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ benchmarks/object_test.cc | 2 ++
+ include/rackobj.h         | 7 ++++++-
+ 2 files changed, 8 insertions(+), 1 deletion(-)
+
+diff --git a/benchmarks/object_test.cc b/benchmarks/object_test.cc
+index 602ac92..a399719 100644
+--- a/benchmarks/object_test.cc
++++ b/benchmarks/object_test.cc
+@@ -266,6 +266,8 @@ int main(int argc, char **argv) {
+     const int readers = argc > 2 ? std::atoi(argv[2]) : 2;
+     const size_t churn = argc > 3 ? static_cast<size_t>(std::atoll(argv[3])) : 0;
+     CHECK(conc_s > 0 && readers > 0 && readers <= 14 && churn <= 0x80000);  // <= 32 NR registrations per node
++    // write-section contract (rackobj.h, D3): whole lines only; each node's half of kChurnFinal is churn*2*8 bytes
++    CHECK(churn % 4 == 0) << "churn objects per node must be a multiple of 4 (whole-line halves of kChurnFinal)";
+     node_id = rackobj::GetConfigSize_t("node_id");
+     const size_t other = 1 - node_id;
+     rackobj::Register(0);
+diff --git a/include/rackobj.h b/include/rackobj.h
+index 245cbff..ef34a26 100644
+--- a/include/rackobj.h
++++ b/include/rackobj.h
+@@ -56,7 +56,12 @@ void NodeBarrier(uint32_t phase);
+  *   ObjectWriteEnd(&h)              publishes the write (flushes the whole object, unlocks)
+  * Read pattern:  do { ObjectReadStart(id, &h); use(h.ptr, h.size); } while (!ObjectReadEnd(&h));
+  * Contract: Register(tid) first; at most one open section per thread; no Put/Get/Create inside a section; data read
+- * inside a section is only valid after ObjectReadEnd returned true. No delete (bump allocation, no reclamation). */
++ * inside a section is only valid after ObjectReadEnd returned true. No delete (bump allocation, no reclamation).
++ * Write sections (user decision D3, 2026-10-15): a write section writes whole cache lines (64 B, aligned to h.ptr;
++ * the object's last line may end at h.ptr + h.size) and never reads prior contents of the object. The writer's own
++ * cached copy is not validated (paper §3.4.5 write steps have no counter check), so a read-modify-write inside a write
++ * section, or a partial-line write, could use or write back stale bytes on non-coherent memory. To update part of an
++ * object, read it in a read section first, then write whole lines. */
+ struct ObjectHandle {
+     uint8_t* ptr = nullptr;
+     size_t size = 0;
+-- 
+2.34.1
+

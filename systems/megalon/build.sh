@@ -49,6 +49,10 @@ grep -q 'MEGALON_NODES' "$SRC/CMakeLists.txt" && grep -q 'MEGALON_NODES' "$SRC/t
 if [ "$NODES_PARAM" = 0 ] && [ "$NODES" != 2 ]; then
     echo "source $SRC has no build-time node count (MEGALON_NODES); --nodes $NODES refused" >&2; exit 1
 fi
+# the submodule is pinned to unmodified upstream (cr-v2); our port is a patch series in systems/megalon/patches
+if [ "$(git -C "$SRC" rev-parse HEAD 2>/dev/null)" = 3be2fa78c51d136df2ffcf8609e3e4868e7f74c7 ]; then
+    echo "source $SRC is unpatched upstream cr-v2; run scripts/deploy/apply-third-party-patches.sh megalon first" >&2; exit 1
+fi
 case $FLAVOR in
     megalon) NR_FEATURES="scr"; NR_RUSTFLAGS="-C target-feature=+clflushopt" ;;
     hwcc)    NR_FEATURES="";    NR_RUSTFLAGS="" ;;

@@ -1,0 +1,600 @@
+From bc8074977d884e8d13eea9c3a8d979a6a6f78402 Mon Sep 17 00:00:00 2001
+From: Sungsu Ahn <sungsu_ahn@korea.ac.kr>
+Date: Fri, 16 Oct 2026 22:56:55 +0900
+Subject: [PATCH 38/51] coh: exclude GetAnchor work all-HWcc also does from
+ check/wstart (build 74)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+User decision (MOT1 v6 §3.1): C = only work all-HWcc does not do. The
+hwcc flavor runs the same NR GetAnchor (NR=1 in every flavor: replica
+sync to the log tail, replay, combining, index dispatch), so for one
+anchor per section (read: the first attempt outside (A), sampled sections;
+write: the final attempt, every section) the anchor is split with a
+thread-local flag in nr waitstat:
+- (i) index lookup = the hash-map dispatch -> ObjectThreadCoh.reserved[7]
+  (lookup_ns_sampled, same sampled read sections as check_ns_sampled);
+- (ii) the rest of the anchor minus Megalon-only flushes (replay flushes in
+  exec_notify, log-entry clflush; scr only) minus (D) -> excluded too,
+  reported outside CohSnap by rackobj::GetThreadAnchorSplit.
+Megalon-only flushes inside the anchor stay in check. Observation only, no
+protocol change. NR test for the flag; object-test checks the split.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ benchmarks/object_test.cc                     | 34 +++++++++++++++----
+ include/rackobj.h                             | 15 ++++++--
+ lib/globals.cc                                |  2 ++
+ lib/object_store.cc                           | 33 +++++++++++++++---
+ lib/object_store.h                            |  3 ++
+ lib/shm_obj_handle.cc                         | 32 +++++++++--------
+ src/common/coh_stats.h                        | 30 +++++++++++++++-
+ third-party/nr_rust/ffi/port_tests.rs         | 32 +++++++++++++++++
+ .../nr_rust/node-replication/src/nr/log.rs    | 20 +++++++----
+ .../node-replication/src/nr/replica.rs        | 18 ++++++++++
+ .../node-replication/src/nr/waitstat.rs       | 32 +++++++++++++++--
+ 11 files changed, 213 insertions(+), 38 deletions(-)
+
+diff --git a/benchmarks/object_test.cc b/benchmarks/object_test.cc
+index 3fbd667..b7a62cc 100644
+--- a/benchmarks/object_test.cc
++++ b/benchmarks/object_test.cc
+@@ -284,21 +284,32 @@ rackobj::ObjectThreadCoh CohDiff(const rackobj::ObjectThreadCoh &a, const rackob
+     const uint64_t *pa = reinterpret_cast<const uint64_t *>(&a);
+     uint64_t *pd = reinterpret_cast<uint64_t *>(&d);
+     for (size_t i = 0; i < offsetof(rackobj::ObjectThreadCoh, reserved) / 8; i++) pd[i] -= pa[i];
+-    for (size_t i = 3; i < 7; i++) d.reserved[i] -= a.reserved[i];  // [3..6] are totals (build 73); [0..2] absolute
++    for (size_t i = 3; i < 8; i++) d.reserved[i] -= a.reserved[i];  // [3..7] are totals (builds 73-74); [0..2] absolute
+     d.check_sample = b.check_sample;
+     return d;
+ }
+ 
++std::array<uint64_t, 4> Split() {
++    std::array<uint64_t, 4> a{};
++    rackobj::GetThreadAnchorSplit(a.data());
++    return a;
++}
++
++std::string SplitStr(const std::array<uint64_t, 4> &a, const std::array<uint64_t, 4> &b) {
++    return "anchor split: read lookup " + std::to_string(b[0] - a[0]) + " ns, read NR " + std::to_string(b[1] - a[1]) +
++           " ns, write lookup " + std::to_string(b[2] - a[2]) + " ns, write NR " + std::to_string(b[3] - a[3]) + " ns";
++}
++
+ std::string CohStr(const rackobj::ObjectThreadCoh &c) {
+-    char b[832];
++    char b[896];
+     std::snprintf(b, sizeof(b),
+                   "rs=%lu ws=%lu check(sample 1/%lu)=%lu ns over %lu | stale %lu/%lu ns | concur %lu/%lu ns | meta %lu/%lu "
+                   "ns | spin %lu/%lu ns | wstart %lu ns, switch_rw %lu/%lu ns, reclaim %lu/%lu ns | wflush %lu/%lu ns/%lu B "
+-                  "| tsc %lu kHz timers %lu tsc_backwards %lu",
++                  "| tsc %lu kHz timers %lu tsc_backwards %lu lookup_sampled %lu ns",
+                   c.read_sections, c.write_sections, c.check_sample, c.check_ns_sampled, c.check_sampled, c.stale_cnt,
+                   c.stale_ns, c.concur_cnt, c.concur_ns, c.meta_cnt, c.meta_ns, c.spin_cnt, c.spin_ns, c.wstart_ns,
+                   c.switch_rw_cnt, c.switch_rw_ns, c.reclaim_cnt, c.reclaim_ns, c.wflush_cnt, c.wflush_ns,
+-                  c.wflush_bytes, c.reserved[0], c.reserved[1], c.reserved[2]);
++                  c.wflush_bytes, c.reserved[0], c.reserved[1], c.reserved[2], c.reserved[7]);
+     return b;
+ }
+ 
+@@ -466,10 +477,13 @@ void CohPhase(HelperThread &helper) {
+     // section checks: 1 in check_sample read sections per thread is timed
+     {
+         auto c0 = Coh();
++        auto a0 = Split();
+         const uint64_t n = 4 * c0.check_sample;
+         for (uint64_t i = 0; i < n; i++) (void)read_gen(CohX(node_id));
+         auto d = CohDiff(c0, Coh());
+-        LOG(INFO) << "COH checks (" << n << " uncontended read sections): " << CohStr(d);
++        auto a1 = Split();
++        LOG(INFO) << "COH checks (" << n << " uncontended read sections): " << CohStr(d) << " | " << SplitStr(a0, a1);
++        EXPECT(tpos(d.reserved[7]) && d.reserved[7] == a1[0] - a0[0] && tpos(a1[1] - a0[1]));
+         EXPECT(d.read_sections == n && d.check_sampled == 4 && tpos(d.check_ns_sampled));
+         EXPECT(d.stale_cnt == 0 && d.concur_cnt == 0 && d.meta_cnt == 0);
+     }
+@@ -513,8 +527,12 @@ void KvCohPhase(HelperThread &helper, bool churn) {
+         EXPECT(d.wflush_cnt == 1 && (d.wflush_bytes == kKvLen || hwcc) && tpos(d.wstart_ns));
+         EXPECT(d.reserved[4] <= d.wstart_ns && d.read_sections == 0);
+         c0 = Coh();
++        auto a0 = Split();
+         KvPut(own, 2);
+         d = CohDiff(c0, Coh());
++        auto a1 = Split();
++        LOG(INFO) << "KVCOH update " << SplitStr(a0, a1);
++        EXPECT(tpos(a1[2] - a0[2]) && a1[0] == a0[0] && d.reserved[7] == 0);
+         LOG(INFO) << "KVCOH update (Put of an existing key): " << CohStr(d) << " | admit " << d.reserved[3];
+         EXPECT(d.write_sections == 1 && d.reserved[3] == 0 && d.wflush_cnt == 1);
+         EXPECT((d.wflush_bytes == kKvLen || hwcc) && tpos(d.wflush_ns) && tpos(d.wstart_ns));
+@@ -559,10 +577,14 @@ void KvCohPhase(HelperThread &helper, bool churn) {
+     }
+     {  // section checks: 1 in check_sample Gets is timed
+         auto c0 = Coh();
++        auto a0 = Split();
+         const uint64_t n = 4 * c0.check_sample;
+         for (uint64_t i = 0; i < n; i++) (void)KvGetGen(own);
+         auto d = CohDiff(c0, Coh());
+-        LOG(INFO) << "KVCOH checks (" << n << " uncontended Gets): " << CohStr(d);
++        auto a1 = Split();
++        LOG(INFO) << "KVCOH checks (" << n << " uncontended Gets): " << CohStr(d) << " | " << SplitStr(a0, a1);
++        EXPECT(tpos(d.reserved[7]) && d.reserved[7] == a1[0] - a0[0] && tpos(a1[1] - a0[1]));
++        EXPECT(a1[2] == a0[2] && a1[3] == a0[3]);  // no write sections
+         EXPECT(d.read_sections == n && d.reserved[5] == n && d.check_sampled == 4 && tpos(d.check_ns_sampled));
+         EXPECT(d.stale_cnt == 0 && d.concur_cnt == 0 && d.meta_cnt == 0);
+     }
+diff --git a/include/rackobj.h b/include/rackobj.h
+index d697687..74ae660 100644
+--- a/include/rackobj.h
++++ b/include/rackobj.h
+@@ -91,7 +91,9 @@ struct ObjectStats {
+  *   read_sections / write_sections    ObjectReadStart / ObjectWriteStart calls that returned 0, plus KV Gets that
+  *                                     found the key and KV Puts that wrote (this thread)
+  *   check_*        read sections only, 1 in check_sample per thread (the 1st, N+1th, ...): ReadStart entry .. return
+- *                  plus, if ReadEnd returns true, ReadEnd entry .. return; minus the (A) and (D) time inside them.
++ *                  plus, if ReadEnd returns true, ReadEnd entry .. return; minus the (A) and (D) time inside them;
++ *                  since build 74 also minus the first attempt's GetAnchor except its Megalon-only flushes (index
++ *                  lookup -> reserved[7], NR sync/replay -> GetThreadAnchorSplit; all-HWcc does both, §15).
+  *                  check_sampled = sampled read sections; estimate for all read sections = check_ns_sampled *
+  *                  read_sections / check_sampled (ratio estimator; the thread's first section is always sampled)
+  *   stale (A)      read_start found a stale copy: from read_seq_start's PAGE_INCOHERENT until the restarted attempt
+@@ -103,7 +105,7 @@ struct ObjectStats {
+  *                  odd (a writer holds it), NR combiner-lock waits in the read-side sync loops, NR replica RwLock
+  *                  read waits; one count per episode. Never overlaps check/stale/concur/meta
+  *   wstart         ObjectWriteStart entry .. return, everything (GetAnchor, switch_rw incl. reclaim, retries,
+- *                  write_seq_start, NR waits); switch_rw (each SwitchRW call) and reclaim (each critical-path
++ *                  write_seq_start, NR waits) except (build 74) the final attempt's GetAnchor lookup + NR work; switch_rw (each SwitchRW call) and reclaim (each critical-path
+  *                  reclaim attempt inside it, or inside a KV create) are sub-intervals of wstart
+  *   wflush         ObjectWriteEnd entry .. return (whole-object clflushopt + fence, write_seq_end); wflush_bytes =
+  *                  bytes flushed (0 in the hwcc flavor: no flush) */
+@@ -119,7 +121,8 @@ struct ObjectThreadCoh {
+     uint64_t reserved[8];  // [0] TSC rate in kHz used for the conversion; [1] timers on (1/0); [2] (build 72)
+                            // negative TSC intervals clamped to 0 in this thread (should stay 0); (build 73)
+                            // [3] KV creates (Put on a missing key), [4] their ns (inside wstart, copy and data
+-                           // flush excluded), [5] KV Gets and [6] KV Puts among read_/write_sections
++                           // flush excluded), [5] KV Gets and [6] KV Puts among read_/write_sections; (build 74)
++                           // [7] lookup_ns_sampled: index lookup of the same sampled read sections as check
+ };
+ 
+ int ObjectCreate(uint64_t id, size_t size);
+@@ -137,6 +140,12 @@ void ObjectWriteEnd(ObjectHandle* h);
+ void GetObjectStats(ObjectStats* s);
+ 
+ void GetObjectThreadCoh(ObjectThreadCoh* s);  // build 71: the calling thread (see ObjectThreadCoh)
++// build 74, not in CohSnap: GetAnchor work that all-HWcc does too and that check / wstart exclude, calling thread
++// since Register(), ns: [0] index lookup of the sampled read sections (= ObjectThreadCoh.reserved[7]), [1] NR anchor
++// work (sync to the log tail, replay, combining, FFI) of the same sampled sections, [2] index lookup and [3] NR anchor
++// work of every write section's final attempt. Estimate for all read sections: [0] or [1] * read_sections /
++// check_sampled.
++void GetThreadAnchorSplit(uint64_t out[4]);
+ // build 71, overhead measurement only (object-test OBJECT_TEST_OVERHEAD): switch the instrumentation timers at run
+ // time (initial value: MEGALON_COH_TIMERS). Call only while no thread of the process has an open section or a
+ // wait in progress; durations recorded across a switch are meaningless.
+diff --git a/lib/globals.cc b/lib/globals.cc
+index 507f869..f25a031 100644
+--- a/lib/globals.cc
++++ b/lib/globals.cc
+@@ -135,6 +135,8 @@ void GetObjectStats(ObjectStats *s) { lib::page_cache.Objects()->Stats(s); }
+ 
+ void GetObjectThreadCoh(ObjectThreadCoh *s) { lib::ObjectStore::ThreadCoh(s); }
+ 
++void GetThreadAnchorSplit(uint64_t out[4]) { lib::ObjectStore::ThreadAnchorSplit(out); }
++
+ void SetCohTimersForMeasurement(bool on) {
+     coh::g_cfg.timers = on;
+     NrFfi::nr_coh_set_timers(on);
+diff --git a/lib/object_store.cc b/lib/object_store.cc
+index 41f0173..2bc8242 100644
+--- a/lib/object_store.cc
++++ b/lib/object_store.cc
+@@ -186,6 +186,7 @@ int ObjectStore::ReadStart(uint64_t id, ObjectHandle *h, Tlm *tlm) {
+     uint64_t stale_wall = 0, stale_spin = 0;  // (A) inside this call
+     uint64_t stale_t = 0, stale_sp = 0;
+     bool stale_open = false;
++    coh::AnchorSplit anchor;  // build 74: first attempt's GetAnchor of a sampled section
+     auto close_stale = [&] {
+         if (!stale_open) return;
+         const uint64_t t = coh::Now(), sp = coh::SpinNow(ct).cyc;
+@@ -199,7 +200,10 @@ int ObjectStore::ReadStart(uint64_t id, ObjectHandle *h, Tlm *tlm) {
+     uint8_t *ptr;
+     size_t size;
+     for (;;) {
+-        std::optional<common::GCDEntry> entry = c3po_->Gcd()->GetAnchor(key, nr_meta);
++        std::optional<common::GCDEntry> entry =
++            sampled && !stale_open
++                ? coh::TimedAnchor(ct, &anchor, [&] { return c3po_->Gcd()->GetAnchor(key, nr_meta); })
++                : c3po_->Gcd()->GetAnchor(key, nr_meta);
+         if (!Decode(entry, &ptr, &size)) {  // objects are created explicitly (no admit)
+             close_stale();
+             const coh::Spin sp = coh::SpinNow(ct);
+@@ -239,7 +243,10 @@ int ObjectStore::ReadStart(uint64_t id, ObjectHandle *h, Tlm *tlm) {
+     ct.sec_sampled = sampled;
+     if (sampled) {
+         ct.check_sampled++;
+-        ct.check_cyc += coh::Sub(ct, coh::Sub(ct, t_ret, t_in), stale_wall + ((sp1.cyc - sp0.cyc) - stale_spin));
++        ct.check_cyc += coh::Sub(ct, coh::Sub(ct, t_ret, t_in),
++                                 stale_wall + ((sp1.cyc - sp0.cyc) - stale_spin) + anchor.lookup + anchor.nr);
++        ct.lookup_cyc += anchor.lookup;
++        ct.rnr_cyc += anchor.nr;
+     }
+     return 0;
+ }
+@@ -298,11 +305,14 @@ int ObjectStore::WriteStart(uint64_t id, ObjectHandle *h, Tlm *tlm) {
+     CHECK(nr_meta) << "Register() the thread before using objects";
+     coh::Tls &ct = coh::tls;  // build 71 instrumentation: every write start timed, entry .. return
+     const uint64_t t_in = coh::Now();
++    coh::AnchorSplit anchor;
+     const common::BlockId key = Key(id);
+     uint8_t *ptr;
+     size_t size;
+     for (;;) {
+-        std::optional<common::GCDEntry> entry = c3po_->Gcd()->GetAnchor(key, nr_meta);
++        anchor = coh::AnchorSplit{};  // build 74: only the final attempt's anchor is excluded from wstart
++        std::optional<common::GCDEntry> entry =
++            coh::TimedAnchor(ct, &anchor, [&] { return c3po_->Gcd()->GetAnchor(key, nr_meta); });
+         if (!Decode(entry, &ptr, &size)) {
+             ct.wstart_cyc += coh::Sub(ct, coh::Now(), t_in);
+             return -ENOENT;
+@@ -334,7 +344,9 @@ int ObjectStore::WriteStart(uint64_t id, ObjectHandle *h, Tlm *tlm) {
+     *h = ObjectHandle{ptr, size, id, sec.token};
+     local_.write_sections.fetch_add(1, std::memory_order_relaxed);
+     ct.write_sections++;
+-    ct.wstart_cyc += coh::Sub(ct, coh::Now(), t_in);
++    ct.wstart_cyc += coh::Sub(ct, coh::Sub(ct, coh::Now(), t_in), anchor.lookup + anchor.nr);
++    ct.wlookup_cyc += anchor.lookup;
++    ct.wnr_cyc += anchor.nr;
+     return 0;
+ }
+ 
+@@ -354,6 +366,18 @@ void ObjectStore::WriteEnd(ObjectHandle *h, Tlm *tlm) {
+     ct.wflush_cyc += coh::Sub(ct, coh::Now(), t_in);
+ }
+ 
++void ObjectStore::ThreadAnchorSplit(uint64_t out[4]) {
++    const coh::Tls &t = coh::tls;
++    const double hz = coh::g_cfg.timers ? coh::TscHz() : 0.0;
++    auto ns = [&](uint64_t cyc) -> uint64_t {
++        return hz > 0 ? static_cast<uint64_t>(static_cast<double>(cyc) * 1e9 / hz + 0.5) : 0;
++    };
++    out[0] = ns(t.lookup_cyc);
++    out[1] = ns(t.rnr_cyc);
++    out[2] = ns(t.wlookup_cyc);
++    out[3] = ns(t.wnr_cyc);
++}
++
+ void ObjectStore::ThreadCoh(ObjectThreadCoh *s) {
+     const coh::Tls &t = coh::tls;
+     const bool on = coh::g_cfg.timers;
+@@ -390,6 +414,7 @@ void ObjectStore::ThreadCoh(ObjectThreadCoh *s) {
+     s->reserved[4] = ns(t.admit_cyc);
+     s->reserved[5] = t.kv_reads;                          // build 73: KV Gets / Puts among read/write_sections
+     s->reserved[6] = t.kv_writes;
++    s->reserved[7] = ns(t.lookup_cyc);  // build 74: (i) index lookup of the sampled read sections (like check)
+ }
+ 
+ void ObjectStore::Stats(ObjectStats *s) const {
+diff --git a/lib/object_store.h b/lib/object_store.h
+index 7440061..d428f52 100644
+--- a/lib/object_store.h
++++ b/lib/object_store.h
+@@ -70,6 +70,9 @@ public:
+ 
+     /* build 71 instrumentation: the calling thread's coherence time since Register() (rackobj.h ObjectThreadCoh) */
+     static void ThreadCoh(ObjectThreadCoh *s);
++    /* build 74: [read lookup (= reserved[7]), read NR anchor work (sampled sections), write lookup, write NR anchor
++     * work] in ns, calling thread since Register() */
++    static void ThreadAnchorSplit(uint64_t out[4]);
+ 
+ private:
+     static common::BlockId Key(uint64_t id);
+diff --git a/lib/shm_obj_handle.cc b/lib/shm_obj_handle.cc
+index 5d33cff..ff3b206 100644
+--- a/lib/shm_obj_handle.cc
++++ b/lib/shm_obj_handle.cc
+@@ -1164,6 +1164,7 @@ size_t SharedMemoryObjectHandle<Policy>::Get(const common::BlockId &block_id, ui
+     ct.kvr_sampled = coh_sampled;
+     uint64_t coh_ev_wall = 0, coh_ev_spin = 0;  // (A)(B)(C) wall time and the spin inside them, this Get
+     bool coh_stale_open = false;
++    coh::AnchorSplit coh_anchor;  // build 74: GetAnchor split of the attempts outside (A), sampled Gets only
+     uint64_t coh_stale_t = 0, coh_stale_sp = 0;
+     auto coh_close_stale = [&](uint64_t end_t, uint64_t end_sp) {
+         if (!coh_stale_open) return;
+@@ -1185,12 +1186,9 @@ retry:
+     ct.kvr_stage = 0;
+     ct.kvr_copy0 = ct.kvr_copy1 = 0;
+ 
+-    entry_optional = c3po_->Gcd()->GetAnchor(block_id
+-#ifdef NR
+-                                             ,
+-                                             nr_meta
+-#endif
+-    );
++    entry_optional = coh_sampled && !coh_stale_open
++                         ? coh::TimedAnchor(ct, &coh_anchor, [&] { return c3po_->Gcd()->GetAnchor(block_id, nr_meta); })
++                         : c3po_->Gcd()->GetAnchor(block_id, nr_meta);
+ 
+     init_read_handle(rh, block_id, entry_optional, local_meta->logical_node_id_);
+ 
+@@ -1275,7 +1273,9 @@ retry:
+             const uint64_t copy = ct.kvr_copy0 ? coh::Sub(ct, ct.kvr_copy1, ct.kvr_copy0) : 0;
+             ct.check_sampled++;
+             ct.check_cyc += coh::Sub(ct, coh::Sub(ct, coh::Sub(ct, t_ret, coh_t_in), copy),
+-                                     coh_ev_wall + (spin - coh_ev_spin));
++                                     coh_ev_wall + (spin - coh_ev_spin) + coh_anchor.lookup + coh_anchor.nr);
++            ct.lookup_cyc += coh_anchor.lookup;
++            ct.rnr_cyc += coh_anchor.nr;
+         }
+     }
+ 
+@@ -1421,16 +1421,14 @@ size_t SharedMemoryObjectHandle<Policy>::Put(const common::BlockId &block_id, co
+     coh::Tls &ct = coh::tls;
+     const uint64_t coh_t_in = coh::Now();
+     ct.kvw_copy0 = ct.kvw_copy1 = ct.kvw_flush_end = 0;
++    coh::AnchorSplit coh_anchor;  // build 74: the final attempt's GetAnchor is excluded from wstart
+ 
+ retry:
+     size_t bytes_write = 0;
+ 
+-    entry_optional = c3po_->Gcd()->GetAnchor(block_id
+-#ifdef NR
+-                                             ,
+-                                             nr_meta
+-#endif
+-    );
++    coh_anchor = coh::AnchorSplit{};
++    entry_optional =
++        coh::TimedAnchor(ct, &coh_anchor, [&] { return c3po_->Gcd()->GetAnchor(block_id, nr_meta); });
+ 
+     init_write_handle(wh, block_id, entry_optional, local_meta->logical_node_id_);
+ 
+@@ -1453,7 +1451,9 @@ retry:
+                 const uint64_t fl = copied ? coh::Sub(ct, ct.kvw_flush_end, ct.kvw_copy1) : 0;
+                 ct.admit_cnt++;
+                 ct.admit_cyc += coh::Sub(ct, coh::Sub(ct, t_b, t_a), copy + fl);
+-                ct.wstart_cyc += coh::Sub(ct, coh::Sub(ct, t_b, coh_t_in), copy + fl);
++                ct.wstart_cyc += coh::Sub(ct, coh::Sub(ct, t_b, coh_t_in), copy + fl + coh_anchor.lookup + coh_anchor.nr);
++                ct.wlookup_cyc += coh_anchor.lookup;
++                ct.wnr_cyc += coh_anchor.nr;
+                 if (copied) {
+                     ct.write_sections++;
+                     ct.kv_writes++;
+@@ -1513,7 +1513,9 @@ retry:
+         const uint64_t t_ret = coh::Now();
+         ct.write_sections++;
+         ct.kv_writes++;
+-        ct.wstart_cyc += coh::Sub(ct, ct.kvw_copy0, coh_t_in);
++        ct.wstart_cyc += coh::Sub(ct, coh::Sub(ct, ct.kvw_copy0, coh_t_in), coh_anchor.lookup + coh_anchor.nr);
++        ct.wlookup_cyc += coh_anchor.lookup;
++        ct.wnr_cyc += coh_anchor.nr;
+         ct.wflush_cnt++;
+         ct.wflush_cyc += coh::Sub(ct, t_ret, ct.kvw_copy1);
+ #ifndef FULL_COHERENCE
+diff --git a/src/common/coh_stats.h b/src/common/coh_stats.h
+index c7775f8..3ff5a16 100644
+--- a/src/common/coh_stats.h
++++ b/src/common/coh_stats.h
+@@ -50,6 +50,18 @@ struct Tls {
+     uint64_t kvr_copy0, kvr_copy1, kvr_sp_copy0;  // Now() before/after the slot copy (copy1 only if sampled), spin
+     uint64_t kvw_copy0, kvw_copy1, kvw_flush_end;  // Put: Now() before/after the data copy, after the data flush
+     uint64_t kv_reads, kv_writes, admit_cnt, admit_cyc;
++    // build 74: GetAnchor split (work all-HWcc does too, excluded from check / wstart). Read side: the sampled
++    // sections' first-attempt anchor; write side: the final attempt's anchor of every write section.
++    uint64_t lookup_cyc;            // (i) index lookup, sampled read sections -> reserved[7]
++    uint64_t rnr_cyc;               // (ii) NR sync/replay/combine, sampled read sections (not in CohSnap)
++    uint64_t wlookup_cyc, wnr_cyc;  // (i), (ii) of write sections (not in CohSnap)
++};
++
++// One GetAnchor split into (i) the index lookup and (ii) the rest of the NR anchor (sync to the log tail, replay,
++// combining, FFI), each in cycles. Megalon-only coherence flushes inside the anchor (replay flushes, log-entry
++// invalidation) and contended waits (D) are in neither: they stay in check / (D).
++struct AnchorSplit {
++    uint64_t lookup = 0, nr = 0;
+ };
+ 
+ // Sampling decision for one read section (object or KV): the 1st, (N+1)th, ... of the thread.
+@@ -76,12 +88,28 @@ inline uint64_t Sub(Tls &t, uint64_t end, uint64_t start) {
+ struct Spin {
+     uint64_t cnt, cyc;
+ };
+-const uint64_t *NrPtr();  // [episodes, cycles, clamped negative intervals]
++const uint64_t *NrPtr();  // NR waitstat [episodes, cycles, clamped, anchor flag, lookup cyc, coh flush cyc]
+ inline Spin SpinNow(Tls &t) {
+     const uint64_t *nr = t.nr ? t.nr : NrPtr();
+     return Spin{t.rseq_spin_cnt + nr[0], t.rseq_spin_cyc + nr[1]};
+ }
+ 
++// Runs fn() (one GetAnchor) with the NR anchor flag set and returns its result; adds the split to *out.
++template <class F>
++inline auto TimedAnchor(Tls &t, AnchorSplit *out, F &&fn) {
++    uint64_t *w = const_cast<uint64_t *>(t.nr ? t.nr : NrPtr());
++    const uint64_t l0 = w[4], f0 = w[5], s0 = SpinNow(t).cyc;
++    w[3] = 1;
++    const uint64_t t0 = Now();
++    auto r = fn();
++    const uint64_t t1 = Now();
++    w[3] = 0;
++    const uint64_t lookup = w[4] - l0, fl = w[5] - f0, spin = SpinNow(t).cyc - s0;
++    out->lookup += lookup;
++    out->nr += Sub(t, Sub(t, t1, t0), lookup + fl + spin);
++    return r;
++}
++
+ // Called at Register(): zero the attribution (the raw totals are monotonic) and bind the NR pointer.
+ void ResetThread();
+ 
+diff --git a/third-party/nr_rust/ffi/port_tests.rs b/third-party/nr_rust/ffi/port_tests.rs
+index 0a02ccb..6a08c88 100644
+--- a/third-party/nr_rust/ffi/port_tests.rs
++++ b/third-party/nr_rust/ffi/port_tests.rs
+@@ -400,3 +400,35 @@ fn waitstat_records_contended_read_lock_only() {
+     assert_eq!(c2 - c1, 1, "one wait episode");
+     assert!(y2 - y1 > 1_000_000, "waited ~20 ms, got {} cycles", y2 - y1);
+ }
++
++/// Build 74 instrumentation: a flagged anchor records its index-lookup cycles (slot 4); an unflagged one records
++/// nothing; replaying another node's ops inside a flagged anchor records Megalon-only flush cycles (slot 5) only with
++/// the `scr` feature.
++#[test]
++fn waitstat_flagged_anchor_records_lookup_only_when_flagged() {
++    use node_replication::nr::waitstat;
++    let w = || waitstat::thread_ptr() as *mut u64;
++    let rd = |i: usize| unsafe { *w().add(i) };
++    let m = shared_mem(min_entries());
++    let n0 = node(&m, 0, true, 2000);
++    let n1 = node(&m, 1, false, 2000);
++    let t0 = n0.register(0).unwrap();
++    let t1 = n1.register(1).unwrap();
++    n0.execute_mut(Modify::PutArrayWmeta(key(1), 11, 0, -1), t0);
++    let (l0, f0) = (rd(4), rd(5));
++    let _ = n1.execute_anchor(Access::Get(key(1)), t1);
++    assert_eq!((rd(4), rd(5)), (l0, f0), "unflagged anchor must not record");
++    for k in 0..50u64 {
++        n0.execute_mut(Modify::PutArrayWmeta(key(100 + k), 100 + k as isize, 0, -1), t0);
++    }
++    unsafe { *w().add(3) = 1 };
++    let r = n1.execute_anchor(Access::Get(key(1)), t1);
++    unsafe { *w().add(3) = 0 };
++    assert_eq!(r.0.unwrap().value.cn_array_[0].cn_idx_, 11);
++    assert!(rd(4) > l0, "flagged anchor records the lookup");
++    if cfg!(feature = "scr") {
++        assert!(rd(5) > f0, "replaying 50 remote ops in a flagged anchor records coherence flushes (scr)");
++    } else {
++        assert_eq!(rd(5), f0);
++    }
++}
+diff --git a/third-party/nr_rust/node-replication/src/nr/log.rs b/third-party/nr_rust/node-replication/src/nr/log.rs
+index b7f2d9e..c834589 100644
+--- a/third-party/nr_rust/node-replication/src/nr/log.rs
++++ b/third-party/nr_rust/node-replication/src/nr/log.rs
+@@ -440,13 +440,21 @@ where
+             // then polled without a re-flush (harmless on HW-coherent VMs; kept
+             // as upstream).
+             #[cfg(any(feature = "scr", feature = "no-coherence"))]
+-            unsafe {
+-                let mut off = 0;
+-                while off < Self::entry_size() {
+-                    _mm_clflush((e as *const u8).add(off));
+-                    off += CACHE_LINE;
++            {
++                // build 74 instrumentation: Megalon-only coherence work inside a flagged anchor
++                let flagged = super::waitstat::anchor_flagged();
++                let t_fl = if flagged { super::waitstat::now() } else { 0 };
++                unsafe {
++                    let mut off = 0;
++                    while off < Self::entry_size() {
++                        _mm_clflush((e as *const u8).add(off));
++                        off += CACHE_LINE;
++                    }
++                    _mm_mfence();
++                }
++                if flagged {
++                    super::waitstat::acc(super::waitstat::SLOT_COH_FLUSH, t_fl);
+                 }
+-                _mm_mfence();
+             }
+ 
+             while unsafe { (*e).alivef.load(Ordering::Acquire) != self.lmasks[idx.0 - 1].get() } {
+diff --git a/third-party/nr_rust/node-replication/src/nr/replica.rs b/third-party/nr_rust/node-replication/src/nr/replica.rs
+index 3baf8e6..491433a 100644
+--- a/third-party/nr_rust/node-replication/src/nr/replica.rs
++++ b/third-party/nr_rust/node-replication/src/nr/replica.rs
+@@ -806,7 +806,13 @@ where
+         // concurrent replay (exec_notify holds the write guard) cannot run
+         // between the dispatch and the store and miss clearing it.
+         let guard = self.data.read(idx.tid() - 1);
++        // build 74 instrumentation: the index lookup itself (work all-HWcc does too), flagged anchors only
++        let flagged = super::waitstat::anchor_flagged();
++        let t_lookup = if flagged { super::waitstat::now() } else { 0 };
+         let response = guard.dispatch(op);
++        if flagged {
++            super::waitstat::acc(super::waitstat::SLOT_LOOKUP, t_lookup);
++        }
+         self.change_notif[idx.tid() - 1].store(response.cn_idx(), Ordering::Release);
+         drop(guard);
+         return Ok(response);
+@@ -904,7 +910,13 @@ where
+ 
+         // [C3] see execute_anchor.
+         let guard = self.data.read(idx.tid() - 1);
++        // build 74 instrumentation: the index lookup itself (work all-HWcc does too), flagged anchors only
++        let flagged = super::waitstat::anchor_flagged();
++        let t_lookup = if flagged { super::waitstat::now() } else { 0 };
+         let response = guard.dispatch(op);
++        if flagged {
++            super::waitstat::acc(super::waitstat::SLOT_LOOKUP, t_lookup);
++        }
+         self.change_notif[idx.tid() - 1].store(response.cn_idx(), Ordering::Release);
+         drop(guard);
+ 
+@@ -1221,6 +1233,9 @@ where
+             {
+                 // De Stijl port (paper §4): a variable-size object is flushed over its whole byte range, exactly
+                 // where upstream flushes a slot; slots keep upstream's range.
++                // build 74 instrumentation: Megalon-only coherence work inside a flagged anchor
++                let flagged = super::waitstat::anchor_flagged();
++                let t_fl = if flagged { super::waitstat::now() } else { 0 };
+                 if let Some((off, len)) = resp.obj_span() {
+                     let region_ptr = unsafe { self.base_addr.add(off) };
+                     flush_mem_region(region_ptr, len);
+@@ -1230,6 +1245,9 @@ where
+                     let region_ptr = unsafe { self.base_addr.add(idx as usize * self.slot_size) };
+                     flush_mem_region(region_ptr, self.slot_size);
+                 }
++                if flagged {
++                    super::waitstat::acc(super::waitstat::SLOT_COH_FLUSH, t_fl);
++                }
+             }
+         }
+     }
+diff --git a/third-party/nr_rust/node-replication/src/nr/waitstat.rs b/third-party/nr_rust/node-replication/src/nr/waitstat.rs
+index bc73b33..4b752a5 100644
+--- a/third-party/nr_rust/node-replication/src/nr/waitstat.rs
++++ b/third-party/nr_rust/node-replication/src/nr/waitstat.rs
+@@ -10,9 +10,35 @@
+ 
+ use core::sync::atomic::{AtomicBool, Ordering};
+ 
+-/// Totals of the calling thread: [episodes, cycles, negative intervals clamped to 0 (build 72)].
++/// Totals of the calling thread: [episodes, cycles, negative intervals clamped to 0 (build 72),
++/// (build 74) anchor-timing flag (set by C++ around a sampled GetAnchor), index lookup cycles of flagged anchors
++/// (the hash-map dispatch), Megalon-only coherence flush cycles inside flagged anchors (replay flushes of slots /
++/// objects in exec_notify and the clflush of log entries before reading them; `scr` / `no-coherence` only)].
+ #[thread_local]
+-static mut WAIT: [u64; 3] = [0, 0, 0];
++static mut WAIT: [u64; 6] = [0, 0, 0, 0, 0, 0];
++
++pub const SLOT_LOOKUP: usize = 4;
++pub const SLOT_COH_FLUSH: usize = 5;
++
++/// True while the calling thread runs a flagged (sampled) GetAnchor.
++#[inline(always)]
++pub fn anchor_flagged() -> bool {
++    unsafe { (*core::ptr::addr_of!(WAIT))[3] != 0 }
++}
++
++/// Adds now() - t0 to slot `s` (clamped at 0, counted in [2]).
++#[inline(always)]
++pub fn acc(s: usize, t0: u64) {
++    let t1 = now();
++    unsafe {
++        let w = &mut *core::ptr::addr_of_mut!(WAIT);
++        if t1 >= t0 {
++            w[s] += t1 - t0;
++        } else {
++            w[2] += 1;
++        }
++    }
++}
+ 
+ /// Timers on (default) or off (MEGALON_COH_TIMERS=0): off keeps the counts, durations stay 0.
+ pub static TIMERS: AtomicBool = AtomicBool::new(true);
+@@ -42,7 +68,7 @@ pub fn add(t0: u64) {
+     }
+ }
+ 
+-/// Address of the calling thread's [episodes, cycles, clamped]; stable for the thread's lifetime.
++/// Address of the calling thread's WAIT array (6 slots, see above); stable for the thread's lifetime.
+ pub fn thread_ptr() -> *const u64 {
+     unsafe { core::ptr::addr_of!(WAIT) as *const u64 }
+ }
+-- 
+2.34.1
+

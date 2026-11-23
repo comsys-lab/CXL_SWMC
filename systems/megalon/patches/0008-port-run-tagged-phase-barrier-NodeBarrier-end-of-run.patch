@@ -1,0 +1,85 @@
+From a747b5e437cb84205a9c6a54247e5b1220c8d624 Mon Sep 17 00:00:00 2001
+From: Sungsu Ahn <sungsu_ahn@korea.ac.kr>
+Date: Wed, 14 Oct 2026 22:40:39 +0900
+Subject: [PATCH 08/51] port: run-tagged phase barrier (NodeBarrier),
+ end-of-run barrier, node-0 counter reset
+
+- PortContext::NodeBarrier(phase): per-node phase words in the control
+  block tagged with the run id; only the caller waits, the NR log-sync
+  thread keeps replaying. Exposed as rackobj::NodeBarrier.
+- Teardown waits at a barrier before stopping the wmeta manager and the
+  log-sync thread.
+- ClearMovementCounter resets the shared counters on node 0 only.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ include/rackobj.h     | 4 ++++
+ lib/globals.cc        | 6 ++++++
+ lib/shm_obj_handle.cc | 6 +++++-
+ 3 files changed, 15 insertions(+), 1 deletion(-)
+
+diff --git a/include/rackobj.h b/include/rackobj.h
+index 7561b6b..88a07da 100644
+--- a/include/rackobj.h
++++ b/include/rackobj.h
+@@ -39,4 +39,8 @@ size_t GetConfigSize_t(std::string c_name);
+ void ClearMovementCounter();
+ 
+ double GetPartitionRatio();
++
++/* De Stijl port: barrier across all nodes of the run (phase must increase per call, < 0xfffffff0).
++ * Only the calling thread waits. */
++void NodeBarrier(uint32_t phase);
+ }  // namespace rackobj
+\ No newline at end of file
+diff --git a/lib/globals.cc b/lib/globals.cc
+index 1ffd446..83e0ef2 100644
+--- a/lib/globals.cc
++++ b/lib/globals.cc
+@@ -9,6 +9,7 @@
+ #include "common/constants.h"
+ #include "common/helper.h"
+ #include "original_syscalls.h"
++#include "shared_memory/cxl_port.h"
+ 
+ using rackobj::RackOBJPath;
+ using rackobj::lib::RackOBJFile;
+@@ -96,6 +97,11 @@ size_t GetConfigSize_t(std::string c_name) {
+ 
+ double GetPartitionRatio() { return lib::client_cfg.GetPartitionRatio(); }
+ 
++void NodeBarrier(uint32_t phase) {
++    CHECK(phase < port::PortContext::kPhaseTeardown) << "phase " << phase << " is reserved";
++    port::PortContext::Get().NodeBarrier(phase);
++}
++
+ }  // namespace rackobj
+ 
+ static struct InitializeIndicator {
+diff --git a/lib/shm_obj_handle.cc b/lib/shm_obj_handle.cc
+index 075f848..0d5d118 100644
+--- a/lib/shm_obj_handle.cc
++++ b/lib/shm_obj_handle.cc
+@@ -85,6 +85,9 @@ SharedMemoryObjectHandle<Policy>::~SharedMemoryObjectHandle() {
+     //     if (evict_mgr_[i] && cfg_.DoEviction()) evict_mgr_[i]->Shutdown();
+     //     if (flush_mgr_[i] && cfg_.DoFlush()) (*flush_mgr_[i])->Shutdown();
+     // }
++    // End-of-run barrier: neither node stops its wmeta manager / log-sync thread while the other may still
++    // append (its GC would wait on our ltail). The log-sync thread keeps replaying while we wait here.
++    port::PortContext::Get().NodeBarrier(port::PortContext::kPhaseTeardown);
+     c3po_->StopManager();
+     c3po_->Gcd()->StopLogSync();
+ 
+@@ -135,7 +138,8 @@ void SharedMemoryObjectHandle<Policy>::StartReplMgr() {
+ 
+ template <typename Policy>
+ void SharedMemoryObjectHandle<Policy>::ClearReclaimCount() {
+-    c3po_->Scr_meta()->ResetReclaimCount();
++    // the counters are shared by every node; only node 0 resets them
++    if (port::PortContext::Get().node_id() == 0) c3po_->Scr_meta()->ResetReclaimCount();
+ }
+ 
+ template <typename Policy>
+-- 
+2.34.1
+

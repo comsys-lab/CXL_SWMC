@@ -51,9 +51,9 @@
   sudo virsh destroy cxl_vmx
 
   sudo virt-customize -a /var/lib/libvirt/images/cxl_vmx.qcow2 \
-    --root-password password:comsyslab \
+    --root-password password:<ROOT_PASSWORD> \
     --run-command "useradd -m -s /bin/bash comsys" \
-    --run-command "echo 'comsys:comsyslab' | chpasswd" \
+    --run-command "echo 'comsys:<USER_PASSWORD>' | chpasswd" \
     --run-command "usermod -aG sudo comsys" \
     --run-command "sed -i 's/^PasswordAuthentication no/PasswordAuthentication yes/' /etc/ssh/sshd_config" \
     --run-command "sed -i 's/^#PermitRootLogin.*/PermitRootLogin yes/' /etc/ssh/sshd_config" \

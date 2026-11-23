@@ -1,0 +1,1385 @@
+From d675e4a1164de676f3a64f1b041340260bd32a8e Mon Sep 17 00:00:00 2001
+From: Sungsu Ahn <sungsu_ahn@korea.ac.kr>
+Date: Wed, 14 Oct 2026 22:08:28 +0900
+Subject: [PATCH 02/51] nr: shared log across processes (header in SCR, entries
+ in LNR)
+
+- Log::new_in_place builds or attaches to a log whose header and entries
+  live in caller memory; init registers all replicas up front
+  (next = n+1), attach writes nothing and checks the header.
+  register_at(tkn) hands out the fixed token rid+1.
+- NodeReplicated: log is &'static (never dropped), replicas is
+  Vec<Option<Box<Replica>>> with only node_id local in shared mode;
+  every indexing site goes through local(rid) [V3]. A stuck remote
+  replica is waited for (ltail no longer pins head, or caught up) with a
+  timeout that aborts; GcFailed returns the response only after that
+  [V3]. log_sync_numa skips remote replicas; log_sync_local added.
+- Replica::exec_notify factored out of combine; exec (try_sync/sync)
+  uses it, so log-sync replays clear change_notif and flush slots [V4].
+- execute_anchor/execute_locked_anchor store change_notif while holding
+  the read guard [C3].
+- Log entries span 128 B: writer flushes all lines, sfence, publishes
+  alivef, flushes its line; reader invalidates all lines [V8].
+- ffi: create_node_replicated_shared (no-op affinity, background log-sync
+  thread, stuck timeout), nr_log_layout, stop_log_sync,
+  NR_LOG_ENTRY_SIZE with a compile-time check; NUMA asserts removed.
+- ffi/port_tests.rs: two in-process nodes over one in-place log.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ third-party/nr_rust/ffi/ffi_nr_hashmap.rs     | 174 +++++++++++-
+ third-party/nr_rust/ffi/port_tests.rs         | 223 ++++++++++++++++
+ .../nr_rust/node-replication/src/log.rs       | 162 +++++++++++
+ .../nr_rust/node-replication/src/nr/log.rs    |  40 ++-
+ .../nr_rust/node-replication/src/nr/mod.rs    | 252 ++++++++++++++----
+ .../node-replication/src/nr/replica.rs        | 110 ++++----
+ 6 files changed, 839 insertions(+), 122 deletions(-)
+ create mode 100644 third-party/nr_rust/ffi/port_tests.rs
+
+diff --git a/third-party/nr_rust/ffi/ffi_nr_hashmap.rs b/third-party/nr_rust/ffi/ffi_nr_hashmap.rs
+index 73f1afd..de7d4e5 100644
+--- a/third-party/nr_rust/ffi/ffi_nr_hashmap.rs
++++ b/third-party/nr_rust/ffi/ffi_nr_hashmap.rs
+@@ -4,11 +4,13 @@ use std::num::NonZeroUsize;
+ use std::sync::atomic::{AtomicBool, Ordering};
+ use std::sync::{Arc, Mutex};
+ 
+-use node_replication::nr::{AffinityChange, Dispatch, NodeReplicated};
++use node_replication::nr::{AffinityChange, Dispatch, Log, NodeReplicated, RemoteWait};
+ 
+ mod topology;
+ mod constants;
+ mod types;
++#[cfg(test)]
++mod port_tests;
+ 
+ use topology::*;
+ use constants::*;
+@@ -64,6 +66,41 @@ pub enum Access {
+     Get(BlockId),
+ }
+ 
++/// Size of one NR log entry (`Entry<Modify>`), recorded in the build manifest
++/// and in the layout hash. Writers/readers flush every line of it [V8].
++pub const NR_LOG_ENTRY_SIZE: usize = Log::<Modify>::entry_size();
++const _: () = assert!(NR_LOG_ENTRY_SIZE % 64 == 0 && NR_LOG_ENTRY_SIZE >= 128);
++
++/// Number of log entries for a log of (about) `bytes` bytes; same rounding as
++/// `Log::new_with_bytes`.
++fn log_entries_for_bytes(bytes: usize) -> usize {
++    let min = 2 * node_replication::nr::log::GC_FROM_HEAD;
++    core::cmp::max(min, bytes / NR_LOG_ENTRY_SIZE).next_power_of_two()
++}
++
++/// De Stijl port: affinity is set by the harness inside each VM.
++fn noop_chg_affinity(_af: AffinityChange) -> usize {
++    0
++}
++
++fn port_now_ns() -> u64 {
++    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
++    START.get_or_init(std::time::Instant::now).elapsed().as_nanos() as u64
++}
++
++fn port_on_stuck(rid: usize, ltail: usize, head: usize, tail: usize, waited_ns: u64) -> ! {
++    eprintln!(
++        "megalon-nr: FATAL: replica {} (other node) holds back the shared log: ltail={} head={} tail={} \
++         after waiting {} ms; a stuck peer is a run failure, aborting",
++        rid,
++        ltail,
++        head,
++        tail,
++        waited_ns / 1_000_000
++    );
++    std::process::abort();
++}
++
+ fn linux_chg_affinity(af: AffinityChange) -> usize {
+     match af {
+         AffinityChange::Replica(rid) => {
+@@ -565,12 +602,9 @@ pub extern "C" fn create_node_replicated_numa(
+ ) -> *mut Mutex<NrRapper> {
+     let a = NrHashMapFFi::new(usize::from(cap));
+ 
+-    // sanity checks
++    // sanity checks (NUMA checks removed for the De Stijl port)
+     assert!(usize::from(num_replica) == LOGICAL_NODE_NUM);
+-
+-    assert!(numa_mem == NUMA_MEM);
+-
+-    assert!(numa_num == NUM_EXEC + 1);
++    let _ = (numa_mem, numa_num);
+ 
+     let nrht = Arc::new(
+         NodeReplicated::<NrHashMapFFi>::new_with_data_and_base_addr_numa(
+@@ -624,6 +658,134 @@ pub extern "C" fn create_node_replicated_numa(
+ //     Box::into_raw(boxed_nrht)
+ // }
+ 
++/// NR log layout for placing the log in shared memory (De Stijl port).
++#[repr(C)]
++pub struct NrLogLayout {
++    pub header_size: usize,
++    pub header_align: usize,
++    pub entry_size: usize,
++    pub entry_align: usize,
++    pub entries: usize,
++}
++
++#[no_mangle]
++pub extern "C" fn nr_log_layout(log_bytes: usize) -> NrLogLayout {
++    NrLogLayout {
++        header_size: std::mem::size_of::<Log<Modify>>(),
++        header_align: std::mem::align_of::<Log<Modify>>(),
++        entry_size: NR_LOG_ENTRY_SIZE,
++        entry_align: Log::<Modify>::entry_align(),
++        entries: log_entries_for_bytes(log_bytes),
++    }
++}
++
++/// Creates this process's NR instance on a log shared with the other nodes.
++///
++/// `init`: construct the log header (`log_hdr`, HWcc) and its `log_entries`
++/// entries (`log_body`, SWcc) and register all `num_replica` tokens. Otherwise
++/// attach without writing. The local replica is `node_id` (log token
++/// `node_id + 1`). Returns null if the log in memory does not match.
++/// A background thread replays the log on the local replica every
++/// `sync_interval_us` (0 disables it). A remote replica that holds back GC for
++/// longer than `stuck_timeout_ms` aborts the process.
++#[no_mangle]
++pub extern "C" fn create_node_replicated_shared(
++    cap: NonZeroUsize,
++    num_replica: NonZeroUsize,
++    node_id: usize,
++    base_addr: *const u8,
++    slot_size: usize,
++    log_hdr: *mut u8,
++    log_body: *mut u8,
++    log_entries: usize,
++    init: bool,
++    stuck_timeout_ms: u64,
++    sync_interval_us: u64,
++) -> *mut Mutex<NrRapper> {
++    assert!(usize::from(num_replica) == LOGICAL_NODE_NUM);
++    assert!(node_id < LOGICAL_NODE_NUM);
++
++    let log: &'static Log<Modify> = match unsafe {
++        Log::<Modify>::new_in_place(
++            log_hdr as *mut Log<Modify>,
++            log_body,
++            log_entries,
++            usize::from(num_replica),
++            (),
++            init,
++        )
++    } {
++        Ok(l) => l,
++        Err(e) => {
++            eprintln!("megalon-nr: shared log {} failed: {}", if init { "init" } else { "attach" }, e);
++            return std::ptr::null_mut();
++        }
++    };
++
++    let remote_wait = RemoteWait {
++        now_ns: port_now_ns,
++        timeout_ns: stuck_timeout_ms.saturating_mul(1_000_000),
++        on_stuck: port_on_stuck,
++    };
++    let _ = port_now_ns(); // start the clock
++
++    let a = NrHashMapFFi::new(usize::from(cap));
++    let nrht = Arc::new(
++        NodeReplicated::<NrHashMapFFi>::new_shared_node(
++            node_id,
++            num_replica,
++            noop_chg_affinity,
++            a,
++            log,
++            base_addr,
++            slot_size,
++            remote_wait,
++        )
++        .unwrap(),
++    );
++
++    let stop_signal = Arc::new(AtomicBool::new(false));
++    let thread_handle = if sync_interval_us > 0 {
++        let nr = Arc::clone(&nrht);
++        let stop = Arc::clone(&stop_signal);
++        Some(
++            std::thread::Builder::new()
++                .name("nr-log-sync".into())
++                .spawn(move || {
++                    let period = std::time::Duration::from_micros(sync_interval_us);
++                    while !stop.load(Ordering::Acquire) {
++                        nr.log_sync_local();
++                        std::thread::sleep(period);
++                    }
++                })
++                .expect("cannot spawn NR log-sync thread"),
++        )
++    } else {
++        None
++    };
++
++    Box::into_raw(Box::new(Mutex::new(NrRapper {
++        nrht,
++        thread_handle,
++        stop_signal,
++    })))
++}
++
++/// Stops the background log-sync thread (if any); the instance stays usable.
++#[no_mangle]
++pub extern "C" fn stop_log_sync(nrht_wrapper: *mut Mutex<NrRapper>) {
++    if nrht_wrapper.is_null() {
++        return;
++    }
++    unsafe {
++        let mut nrht = (*nrht_wrapper).lock().unwrap();
++        if let Some(handle) = nrht.thread_handle.take() {
++            nrht.stop_signal.store(true, Ordering::SeqCst);
++            handle.join().unwrap();
++        }
++    }
++}
++
+ #[no_mangle]
+ pub extern "C" fn free_node_replicated(nrht_wrapper: *mut Mutex<NrRapper>) {
+     if nrht_wrapper.is_null() {
+diff --git a/third-party/nr_rust/ffi/port_tests.rs b/third-party/nr_rust/ffi/port_tests.rs
+new file mode 100644
+index 0000000..ddc17ab
+--- /dev/null
++++ b/third-party/nr_rust/ffi/port_tests.rs
+@@ -0,0 +1,223 @@
++//! Pure-Rust tests for the De Stijl 2-node port of the NR shared log.
++//! Two "nodes" are two NodeReplicated instances in one process that share one
++//! log placed in a heap buffer (standing in for the CXL mapping): node 0
++//! initializes it in place, node 1 attaches. No devdax, no shared memory.
++
++use std::alloc::{alloc_zeroed, Layout};
++use std::num::NonZeroUsize;
++use std::sync::atomic::{AtomicBool, Ordering};
++use std::sync::Arc;
++
++use node_replication::nr::{Log, NodeReplicated, RemoteWait};
++
++use super::*;
++
++const SLOTS: usize = 256;
++const SLOT_SIZE: usize = 1024;
++
++struct SharedMem {
++    hdr: *mut u8,
++    body: *mut u8,
++    entries: usize,
++    pages: *mut u8,
++}
++unsafe impl Send for SharedMem {}
++unsafe impl Sync for SharedMem {}
++
++fn shared_mem(entries: usize) -> SharedMem {
++    let l = nr_log_layout(0);
++    assert_eq!(l.entry_size, NR_LOG_ENTRY_SIZE);
++    unsafe {
++        let hdr = alloc_zeroed(Layout::from_size_align(l.header_size, l.header_align).unwrap());
++        let body = alloc_zeroed(Layout::from_size_align(entries * l.entry_size, l.entry_align.max(64)).unwrap());
++        let pages = alloc_zeroed(Layout::from_size_align(SLOTS * SLOT_SIZE, 4096).unwrap());
++        SharedMem { hdr, body, entries, pages }
++    }
++}
++
++fn log_of(m: &SharedMem, init: bool) -> Result<&'static Log<Modify>, &'static str> {
++    unsafe {
++        Log::<Modify>::new_in_place(m.hdr as *mut Log<Modify>, m.body, m.entries, LOGICAL_NODE_NUM, (), init)
++    }
++}
++
++fn test_now_ns() -> u64 {
++    port_now_ns()
++}
++
++fn test_on_stuck(rid: usize, ltail: usize, head: usize, tail: usize, _w: u64) -> ! {
++    panic!("remote replica {} stuck: ltail={} head={} tail={}", rid, ltail, head, tail);
++}
++
++fn node(m: &SharedMem, id: usize, init: bool, timeout_ms: u64) -> Arc<NodeReplicated<NrHashMapFFi>> {
++    let log = log_of(m, init).expect("in-place log");
++    let rw = RemoteWait { now_ns: test_now_ns, timeout_ns: timeout_ms * 1_000_000, on_stuck: test_on_stuck };
++    Arc::new(
++        NodeReplicated::<NrHashMapFFi>::new_shared_node(
++            id,
++            NonZeroUsize::new(LOGICAL_NODE_NUM).unwrap(),
++            noop_chg_affinity,
++            NrHashMapFFi::new(1024),
++            log,
++            m.pages,
++            SLOT_SIZE,
++            rw,
++        )
++        .unwrap(),
++    )
++}
++
++fn key(k: u64) -> BlockId {
++    let mut b = null_BlockId();
++    b.offset_ = k as _;
++    b
++}
++
++fn min_entries() -> usize {
++    2 * node_replication::nr::log::GC_FROM_HEAD
++}
++
++#[test]
++fn entry_size_covers_whole_lines() {
++    // [V8] Entry<Modify> is larger than one cache line; record it.
++    println!("NR_LOG_ENTRY_SIZE={}", NR_LOG_ENTRY_SIZE);
++    assert!(NR_LOG_ENTRY_SIZE >= 128);
++    assert_eq!(NR_LOG_ENTRY_SIZE % 64, 0);
++    assert_eq!(Log::<Modify>::entry_align() % 64, 0);
++    assert!(nr_log_layout(64 << 20).entries.is_power_of_two());
++}
++
++#[test]
++fn in_place_init_then_attach_without_writes() {
++    let m = shared_mem(min_entries());
++    let a = log_of(&m, true).unwrap();
++    // Attach must see the same header and must not write it.
++    let snapshot: Vec<u8> = unsafe {
++        std::slice::from_raw_parts(m.hdr, std::mem::size_of::<Log<Modify>>()).to_vec()
++    };
++    let b = log_of(&m, false).unwrap();
++    assert!(std::ptr::eq(a, b));
++    let after: &[u8] = unsafe { std::slice::from_raw_parts(m.hdr, std::mem::size_of::<Log<Modify>>()) };
++    assert_eq!(&snapshot[..], after);
++    assert_eq!(b.len(), min_entries());
++    // A mismatching attach is refused.
++    let bad = unsafe {
++        Log::<Modify>::new_in_place(m.hdr as *mut Log<Modify>, m.body, min_entries() * 2, LOGICAL_NODE_NUM, (), false)
++    };
++    assert!(bad.is_err());
++    let bad_n = unsafe {
++        Log::<Modify>::new_in_place(m.hdr as *mut Log<Modify>, m.body, min_entries() + 1, LOGICAL_NODE_NUM, (), true)
++    };
++    assert!(bad_n.is_err());
++}
++
++#[test]
++fn register_at_tokens_are_fixed() {
++    let m = shared_mem(min_entries());
++    let l = log_of(&m, true).unwrap();
++    assert!(l.register_at(0).is_none());
++    assert!(l.register_at(1).is_some());
++    assert!(l.register_at(2).is_some());
++    assert!(l.register_at(LOGICAL_NODE_NUM + 1).is_none());
++    // GC accounts for both replicas from the start: nobody has executed.
++    assert_eq!(l.ltail_at(0), 0);
++    assert_eq!(l.ltail_at(1), 0);
++}
++
++#[test]
++fn ops_cross_nodes_through_shared_log() {
++    let m = shared_mem(min_entries());
++    let n0 = node(&m, 0, true, 2000);
++    let n1 = node(&m, 1, false, 2000);
++    let t0 = n0.register(0).unwrap();
++    let t1 = n1.register(1).unwrap();
++    // Only the local replica can be registered.
++    assert!(n0.register(1).is_none());
++    assert!(n1.register(0).is_none());
++
++    for k in 0..100u64 {
++        n0.execute_mut(Modify::PutArrayWmeta(key(k), k as isize, 0, -1), t0);
++    }
++    for k in 0..100u64 {
++        let r = n1.execute(Access::Get(key(k)), t1);
++        let e = r.0.expect("node 1 sees node 0's insert");
++        assert_eq!(e.value.cn_array_[0].cn_idx_, k as isize);
++    }
++    // And back.
++    n1.execute_mut(Modify::PutArrayWmeta(key(500), 7, 0, 3), t1);
++    let r = n0.execute(Access::Get(key(500)), t0);
++    assert_eq!(r.0.unwrap().value.wmeta_idx_, 3);
++}
++
++#[test]
++fn sync_replay_clears_change_notification() {
++    // [V4] A replay by the log-sync path (try_sync -> exec) clears matching
++    // change notifications exactly like combine does.
++    let m = shared_mem(min_entries());
++    let n0 = node(&m, 0, true, 2000);
++    let n1 = node(&m, 1, false, 2000);
++    let t0 = n0.register(0).unwrap();
++    let t1 = n1.register(1).unwrap();
++    n0.execute_mut(Modify::PutArrayWmeta(key(1), 11, 0, -1), t0);
++
++    // Node 1 anchors on the entry (stores change_notif = 11).
++    let r = n1.execute_anchor(Access::Get(key(1)), t1);
++    assert_eq!(r.0.unwrap().value.cn_array_[0].cn_idx_, 11);
++    // No change yet: notification still valid.
++    let _ = n1.execute_anchor(Access::Get(key(1)), t1);
++
++    // Node 0 changes the entry; node 1 replays via the sync path only.
++    n0.execute_mut(Modify::DummyLog(key(1)), t0);
++    n1.log_sync_local();
++    assert!(!n1.check_notification_reset(t1), "replay must clear the notification");
++
++    // An unrelated replay leaves a fresh anchor intact.
++    let _ = n1.execute_anchor(Access::Get(key(1)), t1);
++    n0.execute_mut(Modify::PutArrayWmeta(key(2), 12, 0, -1), t0);
++    n1.log_sync_local();
++    assert!(n1.check_notification_reset(t1));
++}
++
++#[test]
++fn remote_progress_unblocks_gc_and_log_wraps() {
++    // Node 1 only replays from a background sync thread; node 0 appends
++    // several log lengths of ops, so GC must wait on the remote ltail.
++    let m = shared_mem(min_entries());
++    let n0 = node(&m, 0, true, 10_000);
++    let n1 = node(&m, 1, false, 10_000);
++    let stop = Arc::new(AtomicBool::new(false));
++    let (n1c, stopc) = (Arc::clone(&n1), Arc::clone(&stop));
++    let syncer = std::thread::spawn(move || {
++        while !stopc.load(Ordering::Acquire) {
++            n1c.log_sync_local();
++            std::thread::sleep(std::time::Duration::from_micros(50));
++        }
++    });
++    let t0 = n0.register(0).unwrap();
++    let total = 5 * min_entries() as u64;
++    for k in 0..total {
++        // cn index must stay inside the slot buffer (replay flushes that slot)
++        n0.execute_mut(Modify::PutArrayWmeta(key(k % 64), (k as usize % SLOTS) as isize, 0, -1), t0);
++    }
++    stop.store(true, Ordering::Release);
++    syncer.join().unwrap();
++    let l = n0.log();
++    assert!(l.tail_now() >= total as usize);
++    assert!(l.head_now() > 0, "GC advanced past the first wrap");
++    let t1 = n1.register(1).unwrap();
++    let e = n1.execute(Access::Get(key(5)), t1).0.unwrap();
++    assert_eq!(e.value.cn_array_[0].cn_idx_, ((total - 64 + 5) as usize % SLOTS) as isize);
++}
++
++#[test]
++#[should_panic(expected = "stuck")]
++fn stuck_remote_replica_times_out() {
++    // Node 1 attaches but never replays: node 0 must not proceed silently.
++    let m = shared_mem(min_entries());
++    let n0 = node(&m, 0, true, 200);
++    let _n1 = node(&m, 1, false, 200);
++    let t0 = n0.register(0).unwrap();
++    for k in 0..(4 * min_entries() as u64) {
++        n0.execute_mut(Modify::PutArrayWmeta(key(k % 16), (k as usize % SLOTS) as isize, 0, -1), t0);
++    }
++}
+diff --git a/third-party/nr_rust/node-replication/src/log.rs b/third-party/nr_rust/node-replication/src/log.rs
+index 05a4b03..1590021 100644
+--- a/third-party/nr_rust/node-replication/src/log.rs
++++ b/third-party/nr_rust/node-replication/src/log.rs
+@@ -421,6 +421,168 @@ where
+         size_of::<Cell<Entry<T, M>>>()
+     }
+ 
++    /// Returns the alignment a log entry requires.
++    pub const fn entry_align() -> usize {
++        core::mem::align_of::<Cell<Entry<T, M>>>()
++    }
++
++    /// Constructs (or attaches to) a log whose header and entries live in
++    /// caller-provided memory shared by several processes (De Stijl port: header
++    /// in the HW-coherent region, entries in the SW-coherent region, both mapped
++    /// at the same virtual address in every process).
++    ///
++    /// - `hdr` must point to `size_of::<Self>()` bytes aligned to
++    ///   `align_of::<Self>()`.
++    /// - `slog` must point to `n * entry_size()` bytes aligned to
++    ///   `entry_align()`; `n` must be a power of two and at least
++    ///   `2 * GC_FROM_HEAD`.
++    /// - `nreplicas` replicas are registered up front (tokens `1..=nreplicas`,
++    ///   see [`Log::register_at`]); their ltails start at 0.
++    /// - `init == true` writes the header and every entry. `init == false`
++    ///   writes nothing and only checks that the header describes `slog`/`n`.
++    ///
++    /// The returned log must never be dropped: `slog` is a `Box` over memory
++    /// that was not allocated by the global allocator.
++    ///
++    /// # Safety
++    /// The memory must stay mapped for the rest of the process and must not be
++    /// used for anything else.
++    #[cfg(not(loom))]
++    pub unsafe fn new_in_place(
++        hdr: *mut Self,
++        slog: *mut u8,
++        n: usize,
++        nreplicas: usize,
++        metadata: LM,
++        init: bool,
++    ) -> Result<&'static Self, &'static str> {
++        if hdr.is_null() || slog.is_null() {
++            return Err("null log memory");
++        }
++        if (hdr as usize) % core::mem::align_of::<Self>() != 0 {
++            return Err("log header misaligned");
++        }
++        if (slog as usize) % Self::entry_align() != 0 {
++            return Err("log entries misaligned");
++        }
++        if !n.is_power_of_two() || n < 2 * GC_FROM_HEAD {
++            return Err("log entry count must be a power of two >= 2*GC_FROM_HEAD");
++        }
++        if nreplicas == 0 || nreplicas >= MAX_REPLICAS_PER_LOG {
++            return Err("bad replica count");
++        }
++        let entries = slog as *mut Cell<Entry<T, M>>;
++
++        if init {
++            for i in 0..n {
++                core::ptr::write(entries.add(i), Cell::new(Entry::default()));
++            }
++
++            #[allow(clippy::declare_interior_mutable_const)]
++            const LMASK_DEFAULT: CachePadded<Cell<bool>> = CachePadded::new(Cell::new(true));
++            #[allow(clippy::declare_interior_mutable_const)]
++            const LTAIL_DEFAULT: CachePadded<AtomicUsize> = CachePadded::new(AtomicUsize::new(0));
++
++            core::ptr::write(
++                hdr,
++                Log {
++                    slog: Box::from_raw(core::ptr::slice_from_raw_parts_mut(entries, n)),
++                    head: CachePadded::new(AtomicUsize::new(0usize)),
++                    tail: CachePadded::new(AtomicUsize::new(0usize)),
++                    ctail: CachePadded::new(AtomicUsize::new(0usize)),
++                    ltails: [LTAIL_DEFAULT; MAX_REPLICAS_PER_LOG],
++                    // Every replica is registered at init, so GC accounts for
++                    // replicas that have not attached yet.
++                    next: CachePadded::new(AtomicUsize::new(nreplicas + 1)),
++                    lmasks: [LMASK_DEFAULT; MAX_REPLICAS_PER_LOG],
++                    metadata,
++                },
++            );
++
++            #[cfg(any(feature = "scr", feature = "no-coherence"))]
++            {
++                let bytes = n * Self::entry_size();
++                let mut off = 0;
++                while off < bytes {
++                    flush_cache_line(slog.add(off));
++                    off += 64;
++                }
++                let hbytes = size_of::<Self>();
++                let mut off = 0;
++                while off < hbytes {
++                    flush_cache_line((hdr as *const u8).add(off));
++                    off += 64;
++                }
++                core::arch::x86_64::_mm_sfence();
++            }
++        } else {
++            core::mem::drop(metadata);
++        }
++
++        let log: &'static Self = &*hdr;
++        if log.slog.as_ptr() as *const u8 != slog as *const u8 || log.slog.len() != n {
++            return Err("log header does not describe the given entries");
++        }
++        if log.next.load(Ordering::Acquire) != nreplicas + 1 {
++            return Err("log replica count mismatch");
++        }
++        Ok(log)
++    }
++
++    /// Returns the token of an already registered replica (`1 <= tkn < next`).
++    /// Used by replicas in other processes, which must not bump `next`.
++    pub fn register_at(&self, tkn: usize) -> Option<LogToken> {
++        #[cfg(not(feature = "no-coherence"))]
++        let n = self.next.load(Ordering::Acquire);
++        #[cfg(feature = "no-coherence")]
++        let n = load_with_flush(&self.next);
++        if tkn == 0 || tkn >= n || tkn > MAX_REPLICAS_PER_LOG {
++            return None;
++        }
++        Some(LogToken(tkn))
++    }
++
++    /// Current local tail of the replica at ltails index `idx` (token - 1).
++    pub fn ltail_at(&self, idx: usize) -> usize {
++        #[cfg(not(feature = "no-coherence"))]
++        {
++            self.ltails[idx].load(Ordering::Acquire)
++        }
++        #[cfg(feature = "no-coherence")]
++        {
++            load_with_flush(&self.ltails[idx])
++        }
++    }
++
++    /// Current head of the log.
++    pub fn head_now(&self) -> usize {
++        #[cfg(not(feature = "no-coherence"))]
++        {
++            self.head.load(Ordering::Acquire)
++        }
++        #[cfg(feature = "no-coherence")]
++        {
++            load_with_flush(&self.head)
++        }
++    }
++
++    /// Current tail of the log.
++    pub fn tail_now(&self) -> usize {
++        #[cfg(not(feature = "no-coherence"))]
++        {
++            self.tail.load(Ordering::Acquire)
++        }
++        #[cfg(feature = "no-coherence")]
++        {
++            load_with_flush(&self.tail)
++        }
++    }
++
++    /// Number of entries in the log.
++    pub fn len(&self) -> usize {
++        self.slog.len()
++    }
++
+     /// Registers a replica with the log. Returns an identifier that the replica
+     /// can use to execute operations on the log.
+     ///
+diff --git a/third-party/nr_rust/node-replication/src/nr/log.rs b/third-party/nr_rust/node-replication/src/nr/log.rs
+index 656bc6a..b7f2d9e 100644
+--- a/third-party/nr_rust/node-replication/src/nr/log.rs
++++ b/third-party/nr_rust/node-replication/src/nr/log.rs
+@@ -122,6 +122,20 @@ pub use crate::log::WARN_THRESHOLD;
+ 
+ pub type Log<T> = crate::log::Log<T, (), ()>;
+ 
++#[cfg(any(feature = "scr", feature = "no-coherence"))]
++const CACHE_LINE: usize = 64;
++
++/// Writes back every cache line of a log entry (clflushopt, unordered).
++#[cfg(any(feature = "scr", feature = "no-coherence"))]
++#[inline(always)]
++unsafe fn flush_entry_lines(e: *const u8, size: usize) {
++    let mut off = 0;
++    while off < size {
++        flush_cache_line(e.add(off));
++        off += CACHE_LINE;
++    }
++}
++
+ impl<T> Log<T>
+ where
+     T: Sized + Clone,
+@@ -291,12 +305,24 @@ where
+                 unsafe {
+                     (*e).operation = Some(op.clone());
+                     (*e).replica = idx.0;
++                }
++
++                // [V8] An entry spans several lines (Entry<Modify> >= 128 B).
++                // Write back every op line and fence before publishing alivef,
++                // then write back the alivef line.
++                #[cfg(any(feature = "scr", feature = "no-coherence"))]
++                unsafe {
++                    flush_entry_lines(e as *const u8, Self::entry_size());
++                    _mm_sfence();
++                }
++
++                unsafe {
+                     (*e).alivef.store(m, Ordering::Release);
+                 }
+-                
++
+                 #[cfg(any(feature = "scr", feature = "no-coherence"))]
+                 unsafe {
+-                    flush_cache_line(e as *const _);
++                    flush_cache_line(&(*e).alivef as *const AtomicBool as *const u8);
+                 }
+             }
+ 
+@@ -410,9 +436,17 @@ where
+             let mut iteration = 1;
+             let e = self.slog[self.index(i)].as_ptr();
+ 
++            // [V8] Invalidate every line of the entry before reading it. alivef is
++            // then polled without a re-flush (harmless on HW-coherent VMs; kept
++            // as upstream).
+             #[cfg(any(feature = "scr", feature = "no-coherence"))]
+             unsafe {
+-                _mm_clflush(e as *const _);
++                let mut off = 0;
++                while off < Self::entry_size() {
++                    _mm_clflush((e as *const u8).add(off));
++                    off += CACHE_LINE;
++                }
++                _mm_mfence();
+             }
+ 
+             while unsafe { (*e).alivef.load(Ordering::Acquire) != self.lmasks[idx.0 - 1].get() } {
+diff --git a/third-party/nr_rust/node-replication/src/nr/mod.rs b/third-party/nr_rust/node-replication/src/nr/mod.rs
+index 19ca52f..216dfe8 100644
+--- a/third-party/nr_rust/node-replication/src/nr/mod.rs
++++ b/third-party/nr_rust/node-replication/src/nr/mod.rs
+@@ -124,7 +124,7 @@ pub trait Dispatch {
+     /// A write operation. When executed against the data structure, an
+     /// operation of this type is allowed to mutate state. The library ensures
+     /// that this is done so in a thread-safe manner.
+-    type WriteOperation: Sized + Clone + PartialEq + Send;
++    type WriteOperation: Sized + Clone + PartialEq + Send + 'static;
+ 
+     /// The type on the value returned by the data structure when a
+     /// `ReadOperation` or a `WriteOperation` successfully executes against it.
+@@ -311,13 +311,31 @@ impl From<alloc::collections::TryReserveError> for NodeReplicatedError {
+ /// [`NodeReplicated`] instance. Finally, it routes threads to the correct
+ /// replica and handles liveness of replicas by making sure to advance replicas
+ /// which are behind automatically.
++/// How a replica in another process is waited for when it holds back log GC
++/// (De Stijl port). `now_ns` is a monotonic clock; `on_stuck` must not return
++/// (it reports and aborts the process). A stuck peer is a run failure.
++#[derive(Clone, Copy)]
++pub struct RemoteWait {
++    pub now_ns: fn() -> u64,
++    pub timeout_ns: u64,
++    /// (rid, ltail, head, tail, waited_ns)
++    pub on_stuck: fn(usize, usize, usize, usize, u64) -> !,
++}
++
+ pub struct NodeReplicated<D> 
+ where
+     D: Dispatch + Sync,
+     <D as Dispatch>::Response: PartialEq + Eq + Hash + Sync + IdxGetter,
+ {
+-    log: Box<Log<D::WriteOperation>>,
+-    replicas: Vec<Box<Replica<D>>>,
++    /// The shared log. Heap-allocated (and leaked) for in-process use, or
++    /// placed in shared memory by [`Log::new_in_place`]; never dropped.
++    log: &'static Log<D::WriteOperation>,
++    /// One slot per replica id. In-process: all `Some`. Cross-process (port):
++    /// only `replicas[node_id]` is `Some`; the others live in other processes.
++    replicas: Vec<Option<Box<Replica<D>>>>,
++    /// `Some(rid)` when this instance owns only replica `rid` of a shared log.
++    node_id: Option<ReplicaId>,
++    remote_wait: Option<RemoteWait>,
+     affinity_mngr: AffinityManager,
+ }
+ 
+@@ -434,7 +452,7 @@ where
+     ) -> Result<Self, NodeReplicatedError> {
+         assert!(num_replicas.get() < MAX_REPLICAS_PER_LOG);
+         let affinity_mngr = AffinityManager::new(Box::try_new(chg_mem_affinity)?);
+-        let log = Box::try_new(Log::new_with_bytes(log_size, ()))?;
++        let log: &'static Log<D::WriteOperation> = Box::leak(Box::try_new(Log::new_with_bytes(log_size, ()))?);
+ 
+         let mut replicas = Vec::new();
+         replicas.try_reserve(num_replicas.get())?;
+@@ -453,12 +471,14 @@ where
+ 
+             // This succeeds, we did `try_reserve` earlier so no `try_push` is
+             // necessary.
+-            replicas.push(r);
++            replicas.push(Some(r));
+         }
+ 
+         Ok(NodeReplicated {
+             replicas,
+             log,
++            node_id: None,
++            remote_wait: None,
+             affinity_mngr,
+         })
+     }
+@@ -471,7 +491,7 @@ where
+     ) -> Result<Self, NodeReplicatedError> {
+         assert!(num_replicas.get() < MAX_REPLICAS_PER_LOG);
+         let affinity_mngr = AffinityManager::new(Box::try_new(chg_mem_affinity)?);
+-        let log = Box::try_new(Log::new_with_bytes(log_size, ()))?;
++        let log: &'static Log<D::WriteOperation> = Box::leak(Box::try_new(Log::new_with_bytes(log_size, ()))?);
+ 
+         let mut replicas = Vec::new();
+         replicas.try_reserve(num_replicas.get())?;
+@@ -489,12 +509,14 @@ where
+ 
+             // This succeeds, we did `try_reserve` earlier so no `try_push` is
+             // necessary.
+-            replicas.push(r);
++            replicas.push(Some(r));
+         }
+ 
+         Ok(NodeReplicated {
+             replicas,
+             log,
++            node_id: None,
++            remote_wait: None,
+             affinity_mngr,
+         })
+     }
+@@ -513,7 +535,7 @@ where
+         let log = {
+             // allocate log on numa node 0
+             let _aff_tkn = affinity_mngr.switch(usize::MAX);
+-            Box::try_new(Log::new_with_bytes(log_size, ()))?
++            Box::leak(Box::try_new(Log::new_with_bytes(log_size, ()))?)
+         };
+ 
+         let mut replicas = Vec::new();
+@@ -532,12 +554,14 @@ where
+ 
+             // This succeeds, we did `try_reserve` earlier so no `try_push` is
+             // necessary.
+-            replicas.push(r);
++            replicas.push(Some(r));
+         }
+ 
+         Ok(NodeReplicated {
+             replicas,
+             log,
++            node_id: None,
++            remote_wait: None,
+             affinity_mngr,
+         })
+     }
+@@ -553,7 +577,7 @@ where
+         let log = {
+             // allocate log on numa node 0
+             let _aff_tkn = affinity_mngr.switch(usize::MAX);
+-            Box::try_new(Log::new_with_bytes(log_size, ()))?
++            Box::leak(Box::try_new(Log::new_with_bytes(log_size, ()))?)
+         };
+ 
+         let mut replicas = Vec::new();
+@@ -573,12 +597,14 @@ where
+ 
+             // This succeeds, we did `try_reserve` earlier so no `try_push` is
+             // necessary.
+-            replicas.push(r);
++            replicas.push(Some(r));
+         }
+ 
+         Ok(NodeReplicated {
+             replicas,
+             log,
++            node_id: None,
++            remote_wait: None,
+             affinity_mngr,
+         })
+     }
+@@ -594,7 +620,7 @@ where
+         let log = {
+             // allocate log on numa node 0
+             let _aff_tkn = affinity_mngr.switch(usize::MAX);
+-            Box::try_new(Log::new_with_bytes(log_size, ()))?
++            Box::leak(Box::try_new(Log::new_with_bytes(log_size, ()))?)
+         };
+ 
+         let mut replicas = Vec::new();
+@@ -614,12 +640,60 @@ where
+ 
+             // This succeeds, we did `try_reserve` earlier so no `try_push` is
+             // necessary.
+-            replicas.push(r);
++            replicas.push(Some(r));
+         }
+ 
+         Ok(NodeReplicated {
+             replicas,
+             log,
++            node_id: None,
++            remote_wait: None,
++            affinity_mngr,
++        })
++    }
++}
++
++impl<D> NodeReplicated<D>
++where
++    D: Default + Dispatch + Sized + Sync + Clone,
++    <D as Dispatch>::Response: PartialEq + Eq + Hash + Sync + IdxGetter,
++{
++    /// De Stijl port: this process is node `node_id` of `num_replicas` nodes
++    /// sharing `log` (built with [`Log::new_in_place`] by the init node).
++    /// Only the local replica is created; it uses log token `node_id + 1`
++    /// (registered by the init node, see [`Log::register_at`]), so
++    /// `rid == node_id == token - 1` everywhere.
++    pub fn new_shared_node(
++        node_id: ReplicaId,
++        num_replicas: NonZeroUsize,
++        chg_mem_affinity: impl Fn(AffinityChange) -> usize + Send + Sync + 'static,
++        data: D,
++        log: &'static Log<D::WriteOperation>,
++        addr: *const u8,
++        slot_size: usize,
++        remote_wait: RemoteWait,
++    ) -> Result<Self, NodeReplicatedError> {
++        assert!(num_replicas.get() < MAX_REPLICAS_PER_LOG);
++        assert!(node_id < num_replicas.get());
++        let affinity_mngr = AffinityManager::new(Box::try_new(chg_mem_affinity)?);
++        let log_token = log
++            .register_at(node_id + 1)
++            .expect("log token node_id+1 must have been registered by the init node");
++
++        let mut replicas = Vec::new();
++        replicas.try_reserve(num_replicas.get())?;
++        for _ in 0..num_replicas.get() {
++            replicas.push(None);
++        }
++        replicas[node_id] = Some(Box::try_new(Replica::new_with_data_base_addr(
++            log_token, data, addr, slot_size,
++        ))?);
++
++        Ok(NodeReplicated {
++            replicas,
++            log,
++            node_id: Some(node_id),
++            remote_wait: Some(remote_wait),
+             affinity_mngr,
+         })
+     }
+@@ -688,14 +762,86 @@ where
+     /// assert!(nrht.register(replicas.get()).is_none());
+     /// ```
+     pub fn register(&self, replica_id: ReplicaId) -> Option<ThreadToken> {
+-        if replica_id < self.replicas.len() {
+-            let rtkn = self.replicas[replica_id].register()?;
++        if replica_id < self.replicas.len() && self.is_local(replica_id) {
++            let rtkn = self.local(replica_id).register()?;
+             Some(ThreadToken::new(replica_id, rtkn))
+         } else {
+             None
+         }
+     }
+ 
++    /// True if replica `rid` lives in this process.
++    #[inline(always)]
++    fn is_local(&self, rid: ReplicaId) -> bool {
++        self.replicas[rid].is_some()
++    }
++
++    /// The replica `rid`, which must be local [V3]. With a shared log
++    /// (`node_id` set) only `rid == node_id` is local.
++    #[inline(always)]
++    fn local(&self, rid: ReplicaId) -> &Replica<D> {
++        if let Some(n) = self.node_id {
++            assert_eq!(rid, n, "replica {} is not local (node {})", rid, n);
++        }
++        match &self.replicas[rid] {
++            Some(r) => r,
++            None => panic!("replica {} is not local", rid),
++        }
++    }
++
++    /// The shared log.
++    pub fn log(&self) -> &'static Log<D::WriteOperation> {
++        self.log
++    }
++
++    /// Makes a replica that holds back log GC progress. `ridx` is the ltails
++    /// index returned by `find_min_tail`; since tokens are `rid + 1`
++    /// (register / register_at), `rid == ridx`. A local replica is synced as
++    /// upstream does; a replica in another process cannot be synced from here,
++    /// so we wait until its ltail no longer pins the head (or it is caught up).
++    /// The wait never proceeds silently: after `timeout_ns` it aborts.
++    fn resolve_stuck(&self, ridx: usize, blocking: bool) {
++        let rid: ReplicaId = ridx; // ltails index == token - 1 == rid
++        if self.is_local(rid) {
++            let _aftkn = self.affinity_mngr.switch(rid);
++            if blocking {
++                self.local(rid).sync(self.log);
++            } else {
++                self.local(rid).try_sync(self.log);
++            }
++            // _aftkn is dropped here, reverting affinity change
++        } else {
++            self.wait_remote(rid);
++        }
++    }
++
++    /// Spin/backoff until remote replica `rid` stops pinning the log head.
++    fn wait_remote(&self, rid: ReplicaId) {
++        let cfg = self
++            .remote_wait
++            .expect("remote replica stuck but no RemoteWait configured");
++        let start = (cfg.now_ns)();
++        let mut backoff: usize = 1;
++        loop {
++            let lt = self.log.ltail_at(rid);
++            let h = self.log.head_now();
++            let t = self.log.tail_now();
++            if lt > h || lt >= t {
++                return;
++            }
++            let waited = (cfg.now_ns)().saturating_sub(start);
++            if waited > cfg.timeout_ns {
++                (cfg.on_stuck)(rid, lt, h, t, waited);
++            }
++            for _ in 0..backoff {
++                core::hint::spin_loop();
++            }
++            if backoff < 4096 {
++                backoff <<= 1;
++            }
++        }
++    }
++
+     // pub fn set_base_addr(&mut self, base_addr: *mut u8) {
+     //     for replica in &mut self.replicas {
+     //         replica.set_base_addr(base_addr);
+@@ -711,9 +857,9 @@ where
+         if let Some(combiner_lock) = cl {
+             // We expect to have already enqueued the op (it's a re-try since have the combiner lock),
+             // so technically its not needed to supply it again (but we currently do it anyways...)
+-            self.replicas[tkn.rid].execute_mut_locked(&self.log, op, tkn.rtkn, combiner_lock)
++            self.local(tkn.rid).execute_mut_locked(self.log, op, tkn.rtkn, combiner_lock)
+         } else {
+-            self.replicas[tkn.rid].execute_mut(&self.log, op, tkn.rtkn)
++            self.local(tkn.rid).execute_mut(self.log, op, tkn.rtkn)
+         }
+     }
+ 
+@@ -722,7 +868,7 @@ where
+         resp: <D as Dispatch>::Response,
+         tkn: ThreadToken,
+     ) -> bool {
+-        self.replicas[tkn.rid].check_coherence(&self.log, resp, tkn.rtkn)
++        self.local(tkn.rid).check_coherence(self.log, resp, tkn.rtkn)
+     }
+ 
+     pub fn reset_coherence(
+@@ -730,7 +876,7 @@ where
+         resp: <D as Dispatch>::Response,
+         tkn: ThreadToken,
+     ) {
+-        self.replicas[tkn.rid].reset_coherence(resp)
++        self.local(tkn.rid).reset_coherence(resp)
+     }
+ 
+     pub fn check_coherence_reset(
+@@ -738,14 +884,14 @@ where
+         resp: <D as Dispatch>::Response,
+         tkn: ThreadToken,
+     ) -> bool {
+-        self.replicas[tkn.rid].check_coherence_reset(&self.log, resp)
++        self.local(tkn.rid).check_coherence_reset(self.log, resp)
+     }
+ 
+     pub fn check_notification_reset(
+         &self,
+         tkn: ThreadToken,
+     ) -> bool {
+-        self.replicas[tkn.rid].check_notification_reset(tkn.rtkn)
++        self.local(tkn.rid).check_notification_reset(tkn.rtkn)
+     }
+ 
+     /// Executes a mutable operation against the data-structure.
+@@ -832,26 +978,21 @@ where
+                         q.push(ResolveOp::Sync(stuck_ridx));
+                     }
+                     Err(ReplicaError::GcFailed(stuck_ridx)) => {
+-                        {
+-                            assert_ne!(stuck_ridx, tkn.rid);
+-                            let _aftkn = self.affinity_mngr.switch(stuck_ridx);
+-                            self.replicas[stuck_ridx].sync(&self.log);
+-                            // Affinity is reverted here, _aftkn is dropped.
+-                        }
+-                        //let mut lock = stdout().lock();
+-                        //writeln!(lock, "rust_NR::execute_mut failed").unwrap();
+-                        return self.replicas[tkn.rid]
+-                            .get_response(&self.log, tkn.rtkn.tid())
++                        // Our ops are in the log; make the stuck replica advance
++                        // (local: sync; remote: wait until its ltail advances)
++                        // before returning the response, as upstream does.
++                        assert_ne!(stuck_ridx, tkn.rid);
++                        self.resolve_stuck(stuck_ridx, true);
++                        return self
++                            .local(tkn.rid)
++                            .get_response(self.log, tkn.rtkn.tid())
+                             .expect("GcFailed has to produced a response");
+                     }
+                 },
+                 ResolveOp::Sync(ridx) => {
+                     // Holds trivially because of all the other asserts in this function
+                     debug_assert_ne!(ridx, tkn.rid);
+-                    //warn!("execute_mut ResolveOp::Sync {}", ridx);
+-                    let _aftkn = self.affinity_mngr.switch(ridx);
+-                    self.replicas[ridx].try_sync(&self.log);
+-                    // _aftkn is dropped here, reverting affinity change
++                    self.resolve_stuck(ridx, false);
+                 }
+             }
+         }
+@@ -865,9 +1006,9 @@ where
+     ) -> Result<<D as Dispatch>::Response, (ReplicaError<D>, <D as Dispatch>::ReadOperation<'rop>)>
+     {
+         if let Some(combiner_lock) = cl {
+-            self.replicas[tkn.rid].execute_locked(&self.log, op, tkn.rtkn, combiner_lock)
++            self.local(tkn.rid).execute_locked(self.log, op, tkn.rtkn, combiner_lock)
+         } else {
+-            self.replicas[tkn.rid].execute(&self.log, op, tkn.rtkn)
++            self.local(tkn.rid).execute(self.log, op, tkn.rtkn)
+         }
+     }
+ 
+@@ -879,9 +1020,9 @@ where
+     ) -> Result<<D as Dispatch>::Response, (ReplicaError<D>, <D as Dispatch>::ReadOperation<'rop>)>
+     {
+         if let Some(combiner_lock) = cl {
+-            self.replicas[tkn.rid].execute_locked_anchor(&self.log, op, tkn.rtkn, combiner_lock)
++            self.local(tkn.rid).execute_locked_anchor(self.log, op, tkn.rtkn, combiner_lock)
+         } else {
+-            self.replicas[tkn.rid].execute_anchor(&self.log, op, tkn.rtkn)
++            self.local(tkn.rid).execute_anchor(self.log, op, tkn.rtkn)
+         }
+     }
+ 
+@@ -893,9 +1034,9 @@ where
+     ) -> Result<<D as Dispatch>::Response, (ReplicaError<D>, <D as Dispatch>::ReadOperation<'rop>)>
+     {
+         if let Some(combiner_lock) = cl {
+-            self.replicas[tkn.rid].execute_locked(&self.log, op, tkn.rtkn, combiner_lock)
++            self.local(tkn.rid).execute_locked(self.log, op, tkn.rtkn, combiner_lock)
+         } else {
+-            self.replicas[tkn.rid].execute_loose(op, tkn.rtkn)
++            self.local(tkn.rid).execute_loose(op, tkn.rtkn)
+         }
+     }
+ 
+@@ -988,9 +1129,7 @@ where
+                 ResolveOp::Sync(ridx) => {
+                     // Holds trivially because of all the other asserts in this function
+                     debug_assert_ne!(ridx, tkn.rid);
+-                    let _aftkn = self.affinity_mngr.switch(ridx);
+-                    self.replicas[ridx].try_sync(&self.log);
+-                    // _aftkn is dropped here, reverting affinity change
++                    self.resolve_stuck(ridx, false);
+                 }
+             }
+         }
+@@ -1035,9 +1174,7 @@ where
+                 ResolveOp::Sync(ridx) => {
+                     // Holds trivially because of all the other asserts in this function
+                     debug_assert_ne!(ridx, tkn.rid);
+-                    let _aftkn = self.affinity_mngr.switch(ridx);
+-                    self.replicas[ridx].try_sync(&self.log);
+-                    // _aftkn is dropped here, reverting affinity change
++                    self.resolve_stuck(ridx, false);
+                 }
+             }
+         }
+@@ -1087,9 +1224,7 @@ where
+                 ResolveOp::Sync(ridx) => {
+                     // Holds trivially because of all the other asserts in this function
+                     debug_assert_ne!(ridx, tkn.rid);
+-                    let _aftkn = self.affinity_mngr.switch(ridx);
+-                    self.replicas[ridx].try_sync(&self.log);
+-                    // _aftkn is dropped here, reverting affinity change
++                    self.resolve_stuck(ridx, false);
+                 }
+             }
+         }
+@@ -1129,12 +1264,23 @@ where
+ 
+     #[doc(hidden)]
+     pub fn sync(&self, tkn: ThreadToken) {
+-        self.replicas[tkn.rid].sync(&self.log)
++        self.local(tkn.rid).sync(self.log)
+     }
+ 
++    /// Syncs every local replica for reads; replicas of other processes are
++    /// skipped.
+     pub fn log_sync_numa(&self) {
+-        for rid in 0..self.replicas.len() {
+-            self.replicas[rid].sync_for_read(&self.log);
++        for r in self.replicas.iter().flatten() {
++            r.sync_for_read(self.log);
++        }
++    }
++
++    /// One non-blocking replay round on every local replica (background
++    /// log-sync thread): uses `Replica::try_sync`, which replays through
++    /// `exec_notify` [V4].
++    pub fn log_sync_local(&self) {
++        for r in self.replicas.iter().flatten() {
++            r.try_sync(self.log);
+         }
+     }
+ }
+diff --git a/third-party/nr_rust/node-replication/src/nr/replica.rs b/third-party/nr_rust/node-replication/src/nr/replica.rs
+index ccc6fae..1126e83 100644
+--- a/third-party/nr_rust/node-replication/src/nr/replica.rs
++++ b/third-party/nr_rust/node-replication/src/nr/replica.rs
+@@ -269,6 +269,13 @@ where
+ unsafe impl<D> Sync for Replica<D>
+ where D: Sized + Sync + Dispatch, <D as Dispatch>::Response: PartialEq + Eq + Hash + Sync + IdxGetter {}
+ 
++/// The Replica is [`Send`] if its data is: the only non-Send field is
++/// `base_addr`, a pointer into the process-wide slot mapping that is only used
++/// to flush cache lines (De Stijl port: shared by the background log-sync
++/// thread).
++unsafe impl<D> Send for Replica<D>
++where D: Sized + Sync + Send + Dispatch, <D as Dispatch>::Response: PartialEq + Eq + Hash + Sync + Send + IdxGetter {}
++
+ impl<D> core::fmt::Debug for Replica<D>
+ where
+     D: Sized + Sync + Dispatch,
+@@ -791,8 +798,13 @@ where
+             spin_loop();
+         }
+ 
+-        let response = self.data.read(idx.tid() - 1).dispatch(op);
+-        self.change_notif[idx.tid() - 1].store(response.cn_idx(), Ordering::Relaxed);
++        // [C3] Store the notification while still holding the read guard, so a
++        // concurrent replay (exec_notify holds the write guard) cannot run
++        // between the dispatch and the store and miss clearing it.
++        let guard = self.data.read(idx.tid() - 1);
++        let response = guard.dispatch(op);
++        self.change_notif[idx.tid() - 1].store(response.cn_idx(), Ordering::Release);
++        drop(guard);
+         return Ok(response);
+     }
+ 
+@@ -886,8 +898,11 @@ where
+             spin_loop();
+         }
+ 
+-        let response = self.data.read(idx.tid() - 1).dispatch(op);
+-        self.change_notif[idx.tid() - 1].store(response.cn_idx(), Ordering::Relaxed);
++        // [C3] see execute_anchor.
++        let guard = self.data.read(idx.tid() - 1);
++        let response = guard.dispatch(op);
++        self.change_notif[idx.tid() - 1].store(response.cn_idx(), Ordering::Release);
++        drop(guard);
+ 
+         Ok(response)
+     }
+@@ -1107,28 +1122,48 @@ where
+         }
+     }
+ 
+-    fn exec(&self, slog: &Log<<D as Dispatch>::WriteOperation>) { 
++    fn exec(&self, slog: &Log<<D as Dispatch>::WriteOperation>) {
+         // Execute any operations on the shared log against this replica.
++        // [V4] Replays like combine: clears matching change notifications and
++        // flushes the slot of non-local ops (exec_notify), so the sync thread
++        // and stuck-replica syncs keep CheckNotification correct.
+         let next = self.next.load(Ordering::Relaxed);
+         {
+             let mut data = self.data.write(next);
+-            // let mut responses = self.response_set.write(next);
+             let mut f = |o: <D as Dispatch>::WriteOperation, mine: bool| {
+-                let _resp = data.dispatch_mut(o);
+-                // responses.insert(_resp.clone());
+-                // for entry in self.change_notif.iter().take(next) {
+-                //     if entry.load(Ordering::Relaxed) == _resp.cn_idx() {
+-                //         entry.store(-1, Ordering::Relaxed);
+-                //     }
+-                // }
++                let resp = data.dispatch_mut(o);
+                 if mine {
+                     panic!("Ups -- we just lost a result?");
+                 }
++                self.exec_notify(&resp, mine, next);
+             };
+             slog.exec(&self.log_tkn, &mut f);
+         }
+     }
+ 
++    /// Post-replay hook shared by combine and exec [V4]: clears every thread's
++    /// change notification that matches the replayed slot and, for ops issued
++    /// by another replica, writes back/invalidates that slot.
++    #[inline(always)]
++    fn exec_notify(&self, resp: &<D as Dispatch>::Response, mine: bool, num_registered_threads: usize) {
++        let idx = resp.cn_idx();
++        if idx == -1 {
++            return;
++        }
++        for entry in self.change_notif.iter().take(num_registered_threads) {
++            if entry.load(Ordering::Relaxed) == idx {
++                entry.store(-1, Ordering::Release);
++            }
++        }
++        if !mine {
++            #[cfg(any(feature = "scr", feature = "no-coherence"))]
++            {
++                let region_ptr = unsafe { self.base_addr.add(idx as usize * self.slot_size) };
++                flush_mem_region(region_ptr, self.slot_size);
++            }
++        }
++    }
++
+     #[inline(always)]
+     fn collect_thread_ops(&self, buffer: &mut Vec<D::WriteOperation>, operations: &mut [usize]) {
+         let num_registered_threads = self.next.load(Ordering::Relaxed);
+@@ -1163,31 +1198,10 @@ where
+             let mut data = self.data.write(num_registered_threads);
+             // let mut responses = self.response_set.write(num_registered_threads);
+             let f = |o: <D as Dispatch>::WriteOperation, mine: bool| {
+-                #[cfg(not(loom))]
+-                let resp = data.dispatch_mut(o);
+-                #[cfg(loom)]
+                 let resp = data.dispatch_mut(o);
+-
+-                let idx = resp.cn_idx();
+-                for entry in self.change_notif.iter().take(num_registered_threads) {
+-                    if entry.load(Ordering::Relaxed) == idx && idx != -1{
+-                        entry.store(-1, Ordering::Release);
+-                    }
+-                }
++                self.exec_notify(&resp, mine, num_registered_threads);
+                 if mine {
+                     results.push(resp);
+-                } else {
+-                    // TODO: add cache flush at all similar places
+-                    // responses.insert(resp.clone());
+-
+-                    // do cache flushing
+-                    #[cfg(any(feature = "scr", feature = "no-coherence"))]
+-                    {
+-                        if idx != -1 {
+-                            let region_ptr = unsafe { self.base_addr.add(idx as usize * self.slot_size) };
+-                            flush_mem_region(region_ptr, self.slot_size);
+-                        }
+-                    }
+                 }
+             };
+             match slog.append(&buffer, &self.log_tkn, f) {
+@@ -1212,33 +1226,9 @@ where
+             // let mut responses = self.response_set.write(num_registered_threads);
+             let mut f = |o: <D as Dispatch>::WriteOperation, mine: bool| {
+                 let resp = data.dispatch_mut(o);
+-
+-                let idx = resp.cn_idx();
+-                for entry in self.change_notif.iter().take(num_registered_threads) {
+-                    if entry.load(Ordering::Relaxed) == idx && idx != -1{
+-                        entry.store(-1, Ordering::Release);
+-                    }
+-                }
+-
++                self.exec_notify(&resp, mine, num_registered_threads);
+                 if mine {
+                     results.push(resp)
+-                } else {
+-                    // responses.insert(resp.clone());
+-                    // for entry in self.change_notif.iter().take(num_registered_threads) {
+-                    //     if entry.load(Ordering::Relaxed) == resp.cn_idx() {
+-                    //         entry.store(-1, Ordering::Relaxed);
+-                    //     }
+-                    // }
+-                    
+-                    // do cache flushing
+-                    #[cfg(any(feature = "scr", feature = "no-coherence"))]
+-                    {
+-                        if idx != -1 {
+-                            let region_ptr = unsafe { self.base_addr.add(idx as usize * self.slot_size) };
+-                            flush_mem_region(region_ptr, self.slot_size);
+-                        }
+-                    }
+-
+                 }
+             };
+             slog.exec(&self.log_tkn, &mut f);
+-- 
+2.34.1
+

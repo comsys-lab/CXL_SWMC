@@ -1,0 +1,80 @@
+From 36d7754b94ef3c35432deb9c7c24fdbe1dce5f75 Mon Sep 17 00:00:00 2001
+From: Sungsu Ahn <sungsu_ahn@korea.ac.kr>
+Date: Wed, 14 Oct 2026 22:08:28 +0900
+Subject: [PATCH 01/51] port: LOGICAL_NODE_NUM 3 -> 2 (one node per VM),
+ print_entry loops over cn_array_
+
+LOGICAL_NODE_NUM sizes GCDEntry::cn_array_ on both the C++ (constants.h)
+and Rust (ffi/constants.rs) side, so both change together [V7].
+print_entry hard-coded cn_array_[0..3]; it now loops over
+LOGICAL_NODE_NUM+1 entries.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/common/constants.h               |  2 +-
+ src/core/cache_node.h                | 22 ++++++++++++----------
+ third-party/nr_rust/ffi/constants.rs |  2 +-
+ 3 files changed, 14 insertions(+), 12 deletions(-)
+
+diff --git a/src/common/constants.h b/src/common/constants.h
+index 8aaba9a..9a0128f 100644
+--- a/src/common/constants.h
++++ b/src/common/constants.h
+@@ -30,7 +30,7 @@
+ #endif
+ 
+ // gcd_nr.h
+-#define LOGICAL_NODE_NUM 3  // this should match the rust library
++#define LOGICAL_NODE_NUM 2  // this should match the rust library (ffi/constants.rs); De Stijl port: one node per VM
+ #define NR_DEFAULT_NUM_ENTRIES 12000000
+ 
+ // local_work_allocator.h
+diff --git a/src/core/cache_node.h b/src/core/cache_node.h
+index 8cb8b6b..0fcada4 100644
+--- a/src/core/cache_node.h
++++ b/src/core/cache_node.h
+@@ -174,16 +174,18 @@ static inline bool isEqual(const std::optional<GCDEntry>& lhs, const std::option
+ }
+ 
+ static inline void print_entry(common::GCDEntry* entry) {
+-    LOG(INFO)
+-        << "{("
+-        << (entry->cn_array_[0].cn_idx_.has_value() ? std::to_string(entry->cn_array_[0].cn_idx_.value()) : "null")
+-        << ", " << entry->cn_array_[0].invalidate_ << "), ("
+-        << (entry->cn_array_[1].cn_idx_.has_value() ? std::to_string(entry->cn_array_[1].cn_idx_.value()) : "null")
+-        << ", " << entry->cn_array_[1].invalidate_ << "), ("
+-        << (entry->cn_array_[2].cn_idx_.has_value() ? std::to_string(entry->cn_array_[2].cn_idx_.value()) : "null")
+-        << ", " << entry->cn_array_[2].invalidate_ << "), ("
+-        << (entry->cn_array_[3].cn_idx_.has_value() ? std::to_string(entry->cn_array_[3].cn_idx_.value()) : "null")
+-        << ", " << entry->cn_array_[3].invalidate_ << ")}" << std::endl;
++    // [V7] one (cn_idx, invalidate) pair per cn_array_ element (CXL + LOGICAL_NODE_NUM nodes)
++    std::string out = "{";
++    for (size_t i = 0; i < LOGICAL_NODE_NUM + 1; ++i) {
++        if (i) out += ", ";
++        out += "(";
++        out += entry->cn_array_[i].cn_idx_.has_value() ? std::to_string(entry->cn_array_[i].cn_idx_.value()) : "null";
++        out += ", ";
++        out += std::to_string(entry->cn_array_[i].invalidate_);
++        out += ")";
++    }
++    out += "}";
++    LOG(INFO) << out << std::endl;
+ }
+ 
+ }  // namespace rackobj::common
+diff --git a/third-party/nr_rust/ffi/constants.rs b/third-party/nr_rust/ffi/constants.rs
+index e156858..977ea91 100644
+--- a/third-party/nr_rust/ffi/constants.rs
++++ b/third-party/nr_rust/ffi/constants.rs
+@@ -10,7 +10,7 @@ pub const NUM_EXEC: usize = 3;
+  * number of logical node (replicas) that shares the cxl memory
+  * there is a round robin assignment of replicas to hardware numa execution node
+  */
+-pub const LOGICAL_NODE_NUM: usize = 3;
++pub const LOGICAL_NODE_NUM: usize = 2;
+ 
+ // KEY_SIZE determines which BlockId definition to use
+ // KEY_SIZE == 24: use BlockId with server_id, inode, offset (blockid_file.h)
+-- 
+2.34.1
+

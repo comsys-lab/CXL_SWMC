@@ -1,10 +1,10 @@
 # CXL_SWMC
 
-## Repository layout (g1-restructure)
+## Repository layout
 
 | Path | Contents |
 | --- | --- |
-| kernels/ | submodules: destijl, popcorn_new (same repo, separate branches), linux-6.14 (vanilla, shallow) |
+| kernels/ | submodules: destijl, popcorn_new (youkioh/CXLSHMSWcoherence, branches `destijl` and `popcorn`; build tags `rel/*`), linux-6.14 (vanilla, shallow) |
 | systems/ | per-system definitions, setup and adapters: destijl, popcorn_new, megalon |
 | workloads/ | rag, lmdb, microbench (recommendation, pagerank planned) |
 | scripts/ | ctl (Host controller, planned), host, guest, gpu, deploy |
@@ -13,7 +13,17 @@
 | experiments/ | experiment specs and result manifests |
 | docs/ | setup notes (host, guest, workloads) |
 
-Clone: `git clone --recurse-submodules --shallow-submodules https://github.com/comsys-lab/CXL_SWMC.git`
+Clone:
+
+```bash
+git clone --recurse-submodules --shallow-submodules https://github.com/comsys-lab/CXL_SWMC.git
+cd CXL_SWMC && bash scripts/deploy/apply-third-party-patches.sh
+```
+
+`systems/megalon/src` (MEGALON-artifact) and `workloads/rag/vectordb/vectorDB/external/knowhere` point at
+unmodified upstream commits. Our changes are `git format-patch` series in `systems/megalon/patches/` and
+`workloads/rag/vectordb/vectorDB/patches/knowhere/`. The script applies them on a local branch `destijl` and
+checks that the resulting tree hash equals the tree of the commit our builds used.
 
 
 <img width="1417" height="814" alt="image" src="https://github.com/user-attachments/assets/ba275589-8b2a-4e92-af4c-90c913b05d3e" />

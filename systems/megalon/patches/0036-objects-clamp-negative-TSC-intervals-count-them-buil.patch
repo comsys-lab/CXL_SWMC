@@ -1,0 +1,276 @@
+From cc012f63d089bd28cd59a5dc5ec795bf9b90e46a Mon Sep 17 00:00:00 2001
+From: Sungsu Ahn <sungsu_ahn@korea.ac.kr>
+Date: Fri, 16 Oct 2026 22:22:09 +0900
+Subject: [PATCH 36/51] objects: clamp negative TSC intervals, count them
+ (build 72; verifier LOW)
+
+Every TSC interval of the build-71 instrumentation (object sections, write
+start/end, switch_rw, reclaim, read_seqlock_begin spin, NR waits) goes
+through coh::Sub / waitstat::add: a negative delta (TSC skew across CPUs or
+between nested timestamps) is clamped to 0 and counted per thread;
+ObjectThreadCoh.reserved[2] = C++ + NR count. Observation only, no protocol
+change. object-test logs the count.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ benchmarks/object_test.cc                     |  6 ++---
+ include/rackobj.h                             |  3 ++-
+ lib/object_store.cc                           | 22 ++++++++++---------
+ lib/shm_obj_handle.cc                         |  4 ++--
+ src/common/coh_stats.h                        | 12 +++++++++-
+ src/core/seqcount.cc                          |  2 +-
+ src/index/nr_hashmap.h                        |  3 ++-
+ third-party/nr_rust/ffi/ffi_nr_hashmap.rs     |  2 +-
+ .../node-replication/src/nr/waitstat.rs       | 12 ++++++----
+ 9 files changed, 42 insertions(+), 24 deletions(-)
+
+diff --git a/benchmarks/object_test.cc b/benchmarks/object_test.cc
+index 56df91a..9178454 100644
+--- a/benchmarks/object_test.cc
++++ b/benchmarks/object_test.cc
+@@ -289,15 +289,15 @@ rackobj::ObjectThreadCoh CohDiff(const rackobj::ObjectThreadCoh &a, const rackob
+ }
+ 
+ std::string CohStr(const rackobj::ObjectThreadCoh &c) {
+-    char b[768];
++    char b[832];
+     std::snprintf(b, sizeof(b),
+                   "rs=%lu ws=%lu check(sample 1/%lu)=%lu ns over %lu | stale %lu/%lu ns | concur %lu/%lu ns | meta %lu/%lu "
+                   "ns | spin %lu/%lu ns | wstart %lu ns, switch_rw %lu/%lu ns, reclaim %lu/%lu ns | wflush %lu/%lu ns/%lu B "
+-                  "| tsc %lu kHz timers %lu",
++                  "| tsc %lu kHz timers %lu tsc_backwards %lu",
+                   c.read_sections, c.write_sections, c.check_sample, c.check_ns_sampled, c.check_sampled, c.stale_cnt,
+                   c.stale_ns, c.concur_cnt, c.concur_ns, c.meta_cnt, c.meta_ns, c.spin_cnt, c.spin_ns, c.wstart_ns,
+                   c.switch_rw_cnt, c.switch_rw_ns, c.reclaim_cnt, c.reclaim_ns, c.wflush_cnt, c.wflush_ns,
+-                  c.wflush_bytes, c.reserved[0], c.reserved[1]);
++                  c.wflush_bytes, c.reserved[0], c.reserved[1], c.reserved[2]);
+     return b;
+ }
+ 
+diff --git a/include/rackobj.h b/include/rackobj.h
+index 0c36978..8d7a16b 100644
+--- a/include/rackobj.h
++++ b/include/rackobj.h
+@@ -113,7 +113,8 @@ struct ObjectThreadCoh {
+     uint64_t spin_cnt, spin_ns;
+     uint64_t wstart_ns, switch_rw_cnt, switch_rw_ns, reclaim_cnt, reclaim_ns;
+     uint64_t wflush_cnt, wflush_ns, wflush_bytes;
+-    uint64_t reserved[8];  // reserved[0] = TSC rate in kHz used for the conversion; reserved[1] = timers on (1/0)
++    uint64_t reserved[8];  // [0] TSC rate in kHz used for the conversion; [1] timers on (1/0); [2] (build 72)
++                           // negative TSC intervals clamped to 0 in this thread (should stay 0)
+ };
+ 
+ int ObjectCreate(uint64_t id, size_t size);
+diff --git a/lib/object_store.cc b/lib/object_store.cc
+index 14e5c73..bde0696 100644
+--- a/lib/object_store.cc
++++ b/lib/object_store.cc
+@@ -195,9 +195,10 @@ int ObjectStore::ReadStart(uint64_t id, ObjectHandle *h, Tlm *tlm) {
+     auto close_stale = [&] {
+         if (!stale_open) return;
+         const uint64_t t = coh::Now(), sp = coh::SpinNow(ct).cyc;
+-        stale_wall += t - stale_t;
+-        stale_spin += sp - stale_sp;
+-        ct.stale_cyc += (t - stale_t) - (sp - stale_sp);
++        const uint64_t wall = coh::Sub(ct, t, stale_t), spin = sp - stale_sp;  // spin: monotonic totals
++        stale_wall += wall;
++        stale_spin += spin;
++        ct.stale_cyc += coh::Sub(ct, wall, spin);
+         stale_open = false;
+     };
+     const common::BlockId key = Key(id);
+@@ -244,7 +245,7 @@ int ObjectStore::ReadStart(uint64_t id, ObjectHandle *h, Tlm *tlm) {
+     ct.sec_sampled = sampled;
+     if (sampled) {
+         ct.check_sampled++;
+-        ct.check_cyc += (t_ret - t_in) - stale_wall - ((sp1.cyc - sp0.cyc) - stale_spin);
++        ct.check_cyc += coh::Sub(ct, coh::Sub(ct, t_ret, t_in), stale_wall + ((sp1.cyc - sp0.cyc) - stale_spin));
+     }
+     return 0;
+ }
+@@ -280,10 +281,10 @@ bool ObjectStore::ReadEnd(ObjectHandle *h, Tlm *tlm) {
+     ct.spin_cnt += sp2.cnt - ct.sec_sp0_cnt;
+     ct.spin_cyc += sp2.cyc - ct.sec_sp0_cyc;
+     if (ok) {
+-        if (sampled) ct.check_cyc += (coh::Now() - t_e) - (sp2.cyc - spe);
++        if (sampled) ct.check_cyc += coh::Sub(ct, coh::Sub(ct, coh::Now(), t_e), sp2.cyc - spe);
+         return true;
+     }
+-    const uint64_t d = (coh::Now() - ct.sec_ret) - (sp2.cyc - ct.sec_sp1_cyc);
++    const uint64_t d = coh::Sub(ct, coh::Sub(ct, coh::Now(), ct.sec_ret), sp2.cyc - ct.sec_sp1_cyc);
+     if (concurrent) {
+         ct.concur_cnt++;
+         ct.concur_cyc += d;
+@@ -309,7 +310,7 @@ int ObjectStore::WriteStart(uint64_t id, ObjectHandle *h, Tlm *tlm) {
+     for (;;) {
+         std::optional<common::GCDEntry> entry = c3po_->Gcd()->GetAnchor(key, nr_meta);
+         if (!Decode(entry, &ptr, &size)) {
+-            ct.wstart_cyc += coh::Now() - t_in;
++            ct.wstart_cyc += coh::Sub(ct, coh::Now(), t_in);
+             return -ENOENT;
+         }
+         common::init_write_handle(sec.wh, key, entry, tlm->logical_node_id_);
+@@ -321,7 +322,7 @@ int ObjectStore::WriteStart(uint64_t id, ObjectHandle *h, Tlm *tlm) {
+             const uint64_t t_sw = coh::Now(), rc0 = ct.reclaim_cnt, ry0 = ct.reclaim_cyc;
+             std::error_code ec = switch_rw_(sec.wh, tlm);
+             ct.switch_rw_cnt++;
+-            ct.switch_rw_cyc += coh::Now() - t_sw;
++            ct.switch_rw_cyc += coh::Sub(ct, coh::Now(), t_sw);
+             ct.reclaim_obj_cnt += ct.reclaim_cnt - rc0;
+             ct.reclaim_obj_cyc += ct.reclaim_cyc - ry0;
+             CHECK(ec != std::make_error_code(std::errc::operation_not_permitted)) << "object entry vanished";
+@@ -339,7 +340,7 @@ int ObjectStore::WriteStart(uint64_t id, ObjectHandle *h, Tlm *tlm) {
+     *h = ObjectHandle{ptr, size, id, sec.token};
+     local_.write_sections.fetch_add(1, std::memory_order_relaxed);
+     ct.write_sections++;
+-    ct.wstart_cyc += coh::Now() - t_in;
++    ct.wstart_cyc += coh::Sub(ct, coh::Now(), t_in);
+     return 0;
+ }
+ 
+@@ -356,7 +357,7 @@ void ObjectStore::WriteEnd(ObjectHandle *h, Tlm *tlm) {
+ #ifndef FULL_COHERENCE
+     ct.wflush_bytes += sec.size;
+ #endif
+-    ct.wflush_cyc += coh::Now() - t_in;
++    ct.wflush_cyc += coh::Sub(ct, coh::Now(), t_in);
+ }
+ 
+ void ObjectStore::ThreadCoh(ObjectThreadCoh *s) {
+@@ -390,6 +391,7 @@ void ObjectStore::ThreadCoh(ObjectThreadCoh *s) {
+     s->wflush_bytes = t.wflush_bytes;
+     s->reserved[0] = static_cast<uint64_t>(hz / 1000.0 + 0.5);
+     s->reserved[1] = on ? 1 : 0;
++    s->reserved[2] = t.tsc_backwards + coh::NrPtr()[2];  // build 72: clamped negative intervals (this thread)
+ }
+ 
+ void ObjectStore::Stats(ObjectStats *s) const {
+diff --git a/lib/shm_obj_handle.cc b/lib/shm_obj_handle.cc
+index 53806f6..3211076 100644
+--- a/lib/shm_obj_handle.cc
++++ b/lib/shm_obj_handle.cc
+@@ -700,7 +700,7 @@ std::error_code SharedMemoryObjectHandle<Policy>::SwitchRW(const common::WriteHa
+         new_wmeta_index_optional = c3po_->Scr_meta()->SampleVictim(MAX_WMETA_SAMPLING_SIZE);
+         if (!new_wmeta_index_optional.has_value()) {
+             coh::tls.reclaim_cnt++;
+-            coh::tls.reclaim_cyc += coh::Now() - reclaim_t0;
++            coh::tls.reclaim_cyc += coh::Sub(coh::tls, coh::Now(), reclaim_t0);
+             continue;
+         }
+ 
+@@ -728,7 +728,7 @@ std::error_code SharedMemoryObjectHandle<Policy>::SwitchRW(const common::WriteHa
+         // the answer stays the next reservation's scan hint, as upstream
+         c3po_->Scr_meta()->FinishReclaim(diag_victim, new_wmeta_index_optional);
+         coh::tls.reclaim_cnt++;
+-        coh::tls.reclaim_cyc += coh::Now() - reclaim_t0;
++        coh::tls.reclaim_cyc += coh::Sub(coh::tls, coh::Now(), reclaim_t0);
+ 
+         cpu_relax();
+     } while (true);
+diff --git a/src/common/coh_stats.h b/src/common/coh_stats.h
+index 213a354..8698899 100644
+--- a/src/common/coh_stats.h
++++ b/src/common/coh_stats.h
+@@ -43,14 +43,24 @@ struct Tls {
+     uint64_t sec_ret;      // Now() at ReadStart return
+     uint64_t sec_sp0_cnt, sec_sp0_cyc, sec_sp1_cyc;  // SpinNow at ReadStart entry (cnt, cyc) and return (cyc)
+     bool sec_sampled;      // this section's checks are timed
++    uint64_t tsc_backwards;  // build 72: negative TSC intervals clamped to 0 (CPU migration / TSC skew guard)
+ };
+ extern thread_local Tls tls;
+ 
++// end - start of two TSC values (or of an interval and its nested part); a negative result (TSC not monotonic
++// across CPUs, or skew between nested timestamps) is clamped to 0 and counted in tls.tsc_backwards.
++inline uint64_t Sub(Tls &t, uint64_t end, uint64_t start) {
++    if (end >= start) [[likely]]
++        return end - start;
++    t.tsc_backwards++;
++    return 0;
++}
++
+ // Contended-wait totals of the calling thread (read_seqlock_begin spin + NR read-side waits).
+ struct Spin {
+     uint64_t cnt, cyc;
+ };
+-const uint64_t *NrPtr();
++const uint64_t *NrPtr();  // [episodes, cycles, clamped negative intervals]
+ inline Spin SpinNow(Tls &t) {
+     const uint64_t *nr = t.nr ? t.nr : NrPtr();
+     return Spin{t.rseq_spin_cnt + nr[0], t.rseq_spin_cyc + nr[1]};
+diff --git a/src/core/seqcount.cc b/src/core/seqcount.cc
+index 40182f9..b1d6de9 100644
+--- a/src/core/seqcount.cc
++++ b/src/core/seqcount.cc
+@@ -338,7 +338,7 @@ uint32_t read_seqlock_begin(seqlock_t* s) {
+     if (spun) [[unlikely]] {
+         coh::Tls& t = coh::tls;
+         t.rseq_spin_cnt++;
+-        t.rseq_spin_cyc += coh::Now() - spin_t0;
++        t.rseq_spin_cyc += coh::Sub(t, coh::Now(), spin_t0);
+     }
+ 
+     return seq & SEQ_MASK;
+diff --git a/src/index/nr_hashmap.h b/src/index/nr_hashmap.h
+index f15b48d..b954377 100644
+--- a/src/index/nr_hashmap.h
++++ b/src/index/nr_hashmap.h
+@@ -137,7 +137,8 @@ size_t ObjectCreate(const NrMeta* metadata, rackobj::common::BlockId key, ssize_
+                     ssize_t wmeta_idx);
+ /* replay flushes of object events (this node's own and the other node's), in this process */
+ void nr_obj_replay_flush_stats(uint64_t* count, uint64_t* bytes);
+-/* De Stijl port instrumentation (build 71): the calling thread's NR read-side wait totals [episodes, TSC cycles]
++/* De Stijl port instrumentation (build 71): the calling thread's NR read-side wait totals [episodes, TSC cycles,
++ * clamped negative intervals (build 72)]
+  * (nr/waitstat.rs; stable address per thread) and the timer switch (MEGALON_COH_TIMERS). */
+ const uint64_t* nr_thread_wait_stat();
+ void nr_coh_set_timers(bool on);
+diff --git a/third-party/nr_rust/ffi/ffi_nr_hashmap.rs b/third-party/nr_rust/ffi/ffi_nr_hashmap.rs
+index 1e55cd7..0f5983d 100644
+--- a/third-party/nr_rust/ffi/ffi_nr_hashmap.rs
++++ b/third-party/nr_rust/ffi/ffi_nr_hashmap.rs
+@@ -1463,7 +1463,7 @@ pub extern "C" fn nr_obj_replay_flush_stats(count: *mut u64, bytes: *mut u64) {
+ }
+ 
+ /// De Stijl port instrumentation (MOT1 v6, build 71): address of the calling thread's NR read-side wait totals
+-/// [episodes, TSC cycles] (node_replication::nr::waitstat); stable for the thread's lifetime.
++/// [episodes, TSC cycles, clamped negative intervals] (node_replication::nr::waitstat); stable for the thread's lifetime.
+ #[no_mangle]
+ pub extern "C" fn nr_thread_wait_stat() -> *const u64 {
+     node_replication::nr::waitstat::thread_ptr()
+diff --git a/third-party/nr_rust/node-replication/src/nr/waitstat.rs b/third-party/nr_rust/node-replication/src/nr/waitstat.rs
+index 022b723..bc73b33 100644
+--- a/third-party/nr_rust/node-replication/src/nr/waitstat.rs
++++ b/third-party/nr_rust/node-replication/src/nr/waitstat.rs
+@@ -10,9 +10,9 @@
+ 
+ use core::sync::atomic::{AtomicBool, Ordering};
+ 
+-/// Totals of the calling thread: [episodes, cycles].
++/// Totals of the calling thread: [episodes, cycles, negative intervals clamped to 0 (build 72)].
+ #[thread_local]
+-static mut WAIT: [u64; 2] = [0, 0];
++static mut WAIT: [u64; 3] = [0, 0, 0];
+ 
+ /// Timers on (default) or off (MEGALON_COH_TIMERS=0): off keeps the counts, durations stay 0.
+ pub static TIMERS: AtomicBool = AtomicBool::new(true);
+@@ -34,11 +34,15 @@ pub fn add(t0: u64) {
+     unsafe {
+         let w = &mut *core::ptr::addr_of_mut!(WAIT);
+         w[0] += 1;
+-        w[1] += t1.wrapping_sub(t0);
++        if t1 >= t0 {
++            w[1] += t1 - t0;
++        } else {
++            w[2] += 1; // TSC went backwards (CPU migration / skew): clamp to 0
++        }
+     }
+ }
+ 
+-/// Address of the calling thread's [episodes, cycles]; stable for the thread's lifetime.
++/// Address of the calling thread's [episodes, cycles, clamped]; stable for the thread's lifetime.
+ pub fn thread_ptr() -> *const u64 {
+     unsafe { core::ptr::addr_of!(WAIT) as *const u64 }
+ }
+-- 
+2.34.1
+

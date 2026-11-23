@@ -1,0 +1,308 @@
+From 18ba703107f5ca3c73c87deb0d3d063b384a3369 Mon Sep 17 00:00:00 2001
+From: Sungsu Ahn <sungsu_ahn@korea.ac.kr>
+Date: Tue, 20 Oct 2026 22:51:43 +0900
+Subject: [PATCH 48/51] Build-time node count (MEGALON_NODES, default 2) for
+ N-VM runs
+
+LOGICAL_NODE_NUM becomes a build parameter instead of a constant:
+- C++: constants.h keeps 2 as the default; CMake MEGALON_NODES (2..15) adds
+  -DLOGICAL_NODE_NUM=N only for N != 2, so a 2-node build compiles as before.
+- Rust: build.rs reads env MEGALON_NODES (default 2) and passes it to
+  constants.rs (const-parsed); rerun-if lines list every build input.
+- cxl_port.h: kMaxNodes = LOGICAL_NODE_NUM (control block node_alive/phase).
+- Mismatch guards: nr lib .features "nodes=N" checked by CMake (missing = 2),
+  nr_logical_node_num() checked in PortContext::Init.
+- Port tests: idle replaying extra nodes 2..N-1 in the two tests that wrap
+  the log; the 128 B log entry size assertion applies to N = 2 only (GCDEntry
+  holds N + 1 CNStatus, so the entry grows to 192 B at N = 4, 256 B at N = 8).
+- object-test refuses a build with N != 2 (two-node test).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ CMakeLists.txt                            | 20 ++++++++++++++++++++
+ benchmarks/object_test.cc                 |  2 ++
+ src/common/constants.h                    |  9 ++++++++-
+ src/index/nr_hashmap.h                    |  2 ++
+ src/shared_memory/cxl_port.cc             |  2 ++
+ src/shared_memory/cxl_port.h              |  3 ++-
+ third-party/nr_rust/ffi/build.rs          | 16 ++++++++++++++++
+ third-party/nr_rust/ffi/constants.rs      | 16 +++++++++++++++-
+ third-party/nr_rust/ffi/ffi_nr_hashmap.rs |  7 +++++++
+ third-party/nr_rust/ffi/object_tests.rs   |  9 +++++++--
+ third-party/nr_rust/ffi/port_tests.rs     | 21 +++++++++++++++++++++
+ 11 files changed, 102 insertions(+), 5 deletions(-)
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index ca096d3..4db2b74 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -109,6 +109,18 @@ elseif (NOT MEGALON_WMETA_LAYOUT STREQUAL "artifact64")
+ endif()
+ message(STATUS "MEGALON_WMETA_LAYOUT=${MEGALON_WMETA_LAYOUT}")
+ 
++# De Stijl port: node count (one node per VM) = LOGICAL_NODE_NUM (src/common/constants.h, default 2). The nr lib must be
++# built with the same count (env MEGALON_NODES for cargo; checked below through <lib>.features "nodes=" and at run time
++# by PortContext::Init). The definition is only added for N != 2, so a 2-node build compiles exactly as before.
++set(MEGALON_NODES "2" CACHE STRING "number of Megalon nodes (VMs), 2..15")
++if (NOT MEGALON_NODES MATCHES "^[0-9]+$" OR MEGALON_NODES LESS 2 OR MEGALON_NODES GREATER 15)
++    message(FATAL_ERROR "MEGALON_NODES must be in [2, 15] (got '${MEGALON_NODES}')")
++endif()
++if (NOT MEGALON_NODES EQUAL 2)
++    add_definitions(-DLOGICAL_NODE_NUM=${MEGALON_NODES})
++endif()
++message(STATUS "MEGALON_NODES=${MEGALON_NODES}")
++
+ if (FULL_COHERENCE)
+     add_definitions(-DFULL_COHERENCE=1)
+ endif()
+@@ -198,6 +210,14 @@ file(STRINGS "${MEGALON_NR_LIB}.features" _nr_tag REGEX "^features=")
+ if (NOT _nr_tag STREQUAL "features=${MEGALON_NR_FEATURES}")
+     message(FATAL_ERROR "nr lib ${MEGALON_NR_LIB} was built with '${_nr_tag}', flavor ${MEGALON_FLAVOR} needs 'features=${MEGALON_NR_FEATURES}'")
+ endif()
++# node count of the nr lib: "nodes=N" line of the tag; tags without it (2-node builds before megalon-n) mean 2
++file(STRINGS "${MEGALON_NR_LIB}.features" _nr_nodes REGEX "^nodes=")
++if (NOT _nr_nodes)
++    set(_nr_nodes "nodes=2")
++endif()
++if (NOT _nr_nodes STREQUAL "nodes=${MEGALON_NODES}")
++    message(FATAL_ERROR "nr lib ${MEGALON_NR_LIB} was built with '${_nr_nodes}', this build needs 'nodes=${MEGALON_NODES}'")
++endif()
+ message(STATUS "linking nr lib ${MEGALON_NR_LIB} (features='${MEGALON_NR_FEATURES}')")
+ target_link_libraries(megalon ${MEGALON_NR_LIB} hwloc)
+ 
+diff --git a/benchmarks/object_test.cc b/benchmarks/object_test.cc
+index 1cd0570..7e3293f 100644
+--- a/benchmarks/object_test.cc
++++ b/benchmarks/object_test.cc
+@@ -812,6 +812,8 @@ int main(int argc, char **argv) {
+     // write-section contract (rackobj.h, D3): whole lines only; each node's half of kChurnFinal is churn*2*8 bytes
+     CHECK(churn % 4 == 0) << "churn objects per node must be a multiple of 4 (whole-line halves of kChurnFinal)";
+     node_id = rackobj::GetConfigSize_t("node_id");
++    // two-node test (node 0 / node 1 roles, "other" node); a build for more nodes must not run it
++    CHECK(rackobj::GetConfigSize_t("num_logical_node") == 2) << "object-test needs a 2-node build (LOGICAL_NODE_NUM 2)";
+     const size_t other = 1 - node_id;
+     rackobj::Register(0);
+ 
+diff --git a/src/common/constants.h b/src/common/constants.h
+index 9a0128f..65c486d 100644
+--- a/src/common/constants.h
++++ b/src/common/constants.h
+@@ -30,7 +30,14 @@
+ #endif
+ 
+ // gcd_nr.h
+-#define LOGICAL_NODE_NUM 2  // this should match the rust library (ffi/constants.rs); De Stijl port: one node per VM
++// De Stijl port: one node per VM. Build-time parameter (CMake -DMEGALON_NODES=N defines it for N != 2); must match
++// the rust library (ffi/constants.rs, env MEGALON_NODES), checked at cmake time and in PortContext::Init.
++#ifndef LOGICAL_NODE_NUM
++#define LOGICAL_NODE_NUM 2
++#endif
++#if LOGICAL_NODE_NUM < 2 || LOGICAL_NODE_NUM > 15
++#error "LOGICAL_NODE_NUM must be in [2, 15] (node-replication MAX_REPLICAS_PER_LOG = 16; port code reads ltail[1])"
++#endif
+ #define NR_DEFAULT_NUM_ENTRIES 12000000
+ 
+ // local_work_allocator.h
+diff --git a/src/index/nr_hashmap.h b/src/index/nr_hashmap.h
+index 550db98..64f2611 100644
+--- a/src/index/nr_hashmap.h
++++ b/src/index/nr_hashmap.h
+@@ -37,6 +37,8 @@ struct NrLogLayout {
+     size_t entries;
+ };
+ NrLogLayout nr_log_layout(size_t log_bytes);
++/* node count the nr lib was built with (must equal LOGICAL_NODE_NUM) */
++size_t nr_logical_node_num();
+ NrRapper* create_node_replicated_shared(uint64_t cap, uint64_t num_replica, size_t node_id, const uint8_t* base_addr,
+                                         size_t slot_size, uint8_t* log_hdr, uint8_t* log_body, size_t log_entries,
+                                         bool init, uint64_t stuck_timeout_ms, uint64_t sync_interval_us);
+diff --git a/src/shared_memory/cxl_port.cc b/src/shared_memory/cxl_port.cc
+index b10aa26..8dd191b 100644
+--- a/src/shared_memory/cxl_port.cc
++++ b/src/shared_memory/cxl_port.cc
+@@ -106,6 +106,8 @@ uint64_t PortContext::ComputeLayoutHash(const RackOBJConfig &cfg, size_t num_slo
+ 
+ void PortContext::Init(const RackOBJConfig &cfg, size_t num_slots, size_t scr_footprint) {
+     CHECK(!initialized_) << "PortContext initialized twice";
++    CHECK(NrFfi::nr_logical_node_num() == static_cast<size_t>(LOGICAL_NODE_NUM))
++        << "nr lib built for " << NrFfi::nr_logical_node_num() << " nodes, libmegalon for " << LOGICAL_NODE_NUM;
+     node_id_ = cfg.GetNodeId();
+     SetNodeId(node_id_);
+     attach_ = node_id_ != 0;
+diff --git a/src/shared_memory/cxl_port.h b/src/shared_memory/cxl_port.h
+index ad4b874..de372da 100644
+--- a/src/shared_memory/cxl_port.h
++++ b/src/shared_memory/cxl_port.h
+@@ -17,6 +17,7 @@
+ #include <memory>
+ #include <string>
+ 
++#include "common/constants.h"
+ #include "cxl_region.h"
+ #include "shared_memory/region.h"
+ 
+@@ -29,7 +30,7 @@ namespace rackobj::port {
+ constexpr uint64_t kCtrlMagic = 0x4d45474c4e325643ull;  // "CV2NLGEM"
+ constexpr uint32_t kCtrlVersion = 1;
+ constexpr size_t kCtrlSize = 4096;
+-constexpr int kMaxNodes = 2;
++constexpr int kMaxNodes = LOGICAL_NODE_NUM;  // node_alive / phase slots in the control block, one per node
+ 
+ enum CtrlState : uint32_t {
+     kStateEmpty = 0,
+diff --git a/third-party/nr_rust/ffi/build.rs b/third-party/nr_rust/ffi/build.rs
+index 70fff36..23c68dd 100644
+--- a/third-party/nr_rust/ffi/build.rs
++++ b/third-party/nr_rust/ffi/build.rs
+@@ -4,6 +4,22 @@ fn main() {
+     // Declare expected cfg keys (prevents warnings)
+     println!("cargo:rustc-check-cfg=cfg(key_size_24)");
+ 
++    // De Stijl port: node count (LOGICAL_NODE_NUM, constants.rs) is a build-time parameter, env MEGALON_NODES
++    // (default 2, the 2-VM build). Must equal the C++ side (-DMEGALON_NODES=N -> LOGICAL_NODE_NUM, constants.h).
++    // Declaring rerun-if lines disables cargo's "rerun on any package file change", so list every input.
++    println!("cargo:rerun-if-env-changed=MEGALON_NODES");
++    println!("cargo:rerun-if-env-changed=KEY_SIZE");
++    println!("cargo:rerun-if-changed=build.rs");
++    println!("cargo:rerun-if-changed=constants.rs");
++    let nodes = match env::var("MEGALON_NODES") {
++        Ok(s) => s.trim().parse::<usize>().unwrap_or_else(|_| panic!("MEGALON_NODES={:?} is not a number", s)),
++        Err(_) => 2,
++    };
++    // node-replication: num_replicas < MAX_REPLICAS_PER_LOG (16); the port tests use nodes 0 and 1
++    assert!((2..=15).contains(&nodes), "MEGALON_NODES={} out of range [2, 15]", nodes);
++    println!("cargo:rustc-env=MEGALON_NODES={}", nodes);
++    eprintln!("Build script: MEGALON_NODES = {}", nodes);
++
+     // First: check the environment override
+     let key_size_env = env::var("KEY_SIZE").ok()
+         .and_then(|s| s.parse::<usize>().ok());
+diff --git a/third-party/nr_rust/ffi/constants.rs b/third-party/nr_rust/ffi/constants.rs
+index 977ea91..efb2529 100644
+--- a/third-party/nr_rust/ffi/constants.rs
++++ b/third-party/nr_rust/ffi/constants.rs
+@@ -9,8 +9,22 @@ pub const NUM_EXEC: usize = 3;
+ /**
+  * number of logical node (replicas) that shares the cxl memory
+  * there is a round robin assignment of replicas to hardware numa execution node
++ * De Stijl port: build-time parameter, env MEGALON_NODES (build.rs; default 2); must match the C++ LOGICAL_NODE_NUM
+  */
+-pub const LOGICAL_NODE_NUM: usize = 2;
++pub const LOGICAL_NODE_NUM: usize = parse_nodes(env!("MEGALON_NODES"));
++
++const fn parse_nodes(s: &str) -> usize {
++    let b = s.as_bytes();
++    assert!(!b.is_empty(), "MEGALON_NODES is empty");
++    let mut n = 0usize;
++    let mut i = 0;
++    while i < b.len() {
++        assert!(b[i] >= b'0' && b[i] <= b'9', "MEGALON_NODES is not a decimal number");
++        n = n * 10 + (b[i] - b'0') as usize;
++        i += 1;
++    }
++    n
++}
+ 
+ // KEY_SIZE determines which BlockId definition to use
+ // KEY_SIZE == 24: use BlockId with server_id, inode, offset (blockid_file.h)
+diff --git a/third-party/nr_rust/ffi/ffi_nr_hashmap.rs b/third-party/nr_rust/ffi/ffi_nr_hashmap.rs
+index bb58329..b3351c7 100644
+--- a/third-party/nr_rust/ffi/ffi_nr_hashmap.rs
++++ b/third-party/nr_rust/ffi/ffi_nr_hashmap.rs
+@@ -787,6 +787,13 @@ pub struct NrLogLayout {
+     pub entries: usize,
+ }
+ 
++/// De Stijl port: node count this library was built with (env MEGALON_NODES); the C++ side checks it equals its
++/// LOGICAL_NODE_NUM before mapping anything (GCDEntry and NrLogCounters are sized by it on both sides).
++#[no_mangle]
++pub extern "C" fn nr_logical_node_num() -> usize {
++    LOGICAL_NODE_NUM
++}
++
+ #[no_mangle]
+ pub extern "C" fn nr_log_layout(log_bytes: usize) -> NrLogLayout {
+     NrLogLayout {
+diff --git a/third-party/nr_rust/ffi/object_tests.rs b/third-party/nr_rust/ffi/object_tests.rs
+index e6bec76..0a2e2dc 100644
+--- a/third-party/nr_rust/ffi/object_tests.rs
++++ b/third-party/nr_rust/ffi/object_tests.rs
+@@ -221,8 +221,13 @@ fn object_and_slot_notifications_never_alias() {
+ 
+ #[test]
+ fn create_and_switch_keep_the_log_entry_size() {
+-    // no new Modify variant: the log entry size (recorded in every build manifest) is unchanged
+-    assert_eq!(NR_LOG_ENTRY_SIZE, 128);
++    // no new Modify variant: the log entry size (recorded in every build manifest) is unchanged. Swap(BlockId, BlockId,
++    // GCDEntry) is the largest op and GCDEntry holds LOGICAL_NODE_NUM + 1 CNStatus (16 B each), so the entry grows
++    // with the node count; 128 B is the 2-node value.
++    println!("LOGICAL_NODE_NUM={} NR_LOG_ENTRY_SIZE={}", LOGICAL_NODE_NUM, NR_LOG_ENTRY_SIZE);
++    if LOGICAL_NODE_NUM == 2 {
++        assert_eq!(NR_LOG_ENTRY_SIZE, 128);
++    }
+ }
+ 
+ #[cfg(feature = "wmeta-rev")]
+diff --git a/third-party/nr_rust/ffi/port_tests.rs b/third-party/nr_rust/ffi/port_tests.rs
+index 5f61826..c1d68dc 100644
+--- a/third-party/nr_rust/ffi/port_tests.rs
++++ b/third-party/nr_rust/ffi/port_tests.rs
+@@ -67,6 +67,23 @@ pub(crate) fn node(m: &SharedMem, id: usize, init: bool, timeout_ms: u64) -> Arc
+     )
+ }
+ 
++/// Builds with more than two nodes: nodes 2..LOGICAL_NODE_NUM attach and only replay (log_sync_local) until `stop`,
++/// so tests that wrap the log are not held back by replicas that never execute. None for a 2-node build.
++pub(crate) fn idle_extra_nodes(m: &SharedMem, timeout_ms: u64, stop: &Arc<AtomicBool>) -> Vec<std::thread::JoinHandle<()>> {
++    (2..LOGICAL_NODE_NUM)
++        .map(|id| {
++            let n = node(m, id, false, timeout_ms);
++            let s = Arc::clone(stop);
++            std::thread::spawn(move || {
++                while !s.load(Ordering::Acquire) {
++                    n.log_sync_local();
++                    std::thread::sleep(std::time::Duration::from_micros(50));
++                }
++            })
++        })
++        .collect()
++}
++
+ pub(crate) fn key(k: u64) -> BlockId {
+     let mut b = null_BlockId();
+     b.offset_ = k as _;
+@@ -202,6 +219,7 @@ fn remote_progress_unblocks_gc_and_log_wraps() {
+     let n0 = node(&m, 0, true, 10_000);
+     let n1 = node(&m, 1, false, 10_000);
+     let stop = Arc::new(AtomicBool::new(false));
++    let extra = idle_extra_nodes(&m, 10_000, &stop);
+     let (n1c, stopc) = (Arc::clone(&n1), Arc::clone(&stop));
+     let syncer = std::thread::spawn(move || {
+         while !stopc.load(Ordering::Acquire) {
+@@ -217,6 +235,7 @@ fn remote_progress_unblocks_gc_and_log_wraps() {
+     }
+     stop.store(true, Ordering::Release);
+     syncer.join().unwrap();
++    extra.into_iter().for_each(|h| h.join().unwrap());
+     let l = n0.log();
+     assert!(l.tail_now() >= total as usize);
+     assert!(l.head_now() > 0, "GC advanced past the first wrap");
+@@ -334,6 +353,7 @@ fn op_enqueued_during_sync_round_is_served() {
+     let n0 = node(&m, 0, true, 10_000);
+     let n1 = node(&m, 1, false, 10_000);
+     let stop = Arc::new(AtomicBool::new(false));
++    let extra = idle_extra_nodes(&m, 10_000, &stop);
+     let tw = n0.register(0).unwrap();
+     let ts = n0.register(0).unwrap();
+     let t1 = n1.register(1).unwrap();
+@@ -366,6 +386,7 @@ fn op_enqueued_during_sync_round_is_served() {
+     stop.store(true, Ordering::Release);
+     syncer.join().unwrap();
+     appender.join().unwrap();
++    extra.into_iter().for_each(|h| h.join().unwrap());
+     println!("op_enqueued_during_sync_round_is_served: max execute_mut {} us", max_ns / 1000);
+     assert!(max_ns < 100_000_000, "an op waited {} ms behind a sync round that did not combine", max_ns / 1_000_000);
+ }
+-- 
+2.34.1
+

@@ -1,0 +1,34 @@
+From f9837d7c81e968fa19b47799339c1909a5028e82 Mon Sep 17 00:00:00 2001
+From: Sungsu Ahn <sungsu_ahn@korea.ac.kr>
+Date: Sat, 17 Oct 2026 19:18:33 +0900
+Subject: [PATCH 47/51] rackobj.h: probe comment = values reported raw, no
+ correction (user decision 2026-10-17); comment only, no rebuild
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ include/rackobj.h | 9 ++++-----
+ 1 file changed, 4 insertions(+), 5 deletions(-)
+
+diff --git a/include/rackobj.h b/include/rackobj.h
+index b302a18..8123bda 100644
+--- a/include/rackobj.h
++++ b/include/rackobj.h
+@@ -173,11 +173,10 @@ struct ThreadAnchor {
+     uint64_t reserved[6];  // [0] (build 76) write_sampled: timed write sections; (build 77) [1] probe_ns, [2] probe_ps,
+                            // [3] timed (A) events, [4] timed (B)+(C) events, [5] timed (D) episodes
+ };
+-// Probe correction (build >= 77; reports/M2-megalon-port-changes.md §19): every timed interval also measures
+-// the TSC reads inside it. p = AnchorSnap.reserved[2] / 1000 ns (per-thread median of back-to-back TSC pairs at reg()).
+-// Subtract p x k from each sum before scaling: per sampled read section (check_sampled): check 7, read_lookup 1,
+-// read_nr 2, rseq 2; per timed write section (write_sampled): wstart 4, wflush 3, write_lookup 1, write_nr 2, wseq 1,
+-// wseq_end 1; per timed event: stale 1 x reserved[3], concur+meta 4 x reserved[4], spin 1 x reserved[5].
++// Probe values (build >= 77; reports/M2-megalon-port-changes.md §19): p = reserved[2] / 1000 ns, the per-thread median
++// of back-to-back TSC pairs at reg(); reserved[3..5] = timed (A), (B)+(C), (D) counts. Reported raw; no probe correction
++// is applied (user decision 2026-10-17). The base-case TSC-read counts per interval and where they do not hold are in
++// shim/megalon_objapi.h (CXL_SWMC) and M2 §19.
+ 
+ void GetThreadAnchor(ThreadAnchor* s);
+ // build 71, overhead measurement only (object-test OBJECT_TEST_OVERHEAD): switch the instrumentation timers at run
+-- 
+2.34.1
+

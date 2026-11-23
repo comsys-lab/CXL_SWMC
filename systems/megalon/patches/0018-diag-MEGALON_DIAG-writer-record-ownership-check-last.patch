@@ -1,0 +1,263 @@
+From fcc80cce99d7bdc01e5d6201e5f5012a2ab9767c Mon Sep 17 00:00:00 2001
+From: Sungsu Ahn <sungsu_ahn@korea.ac.kr>
+Date: Thu, 15 Oct 2026 02:35:44 +0900
+Subject: [PATCH 18/51] diag: MEGALON_DIAG writer record-ownership check,
+ last-Get path on value-check failure, post-stop watchdog
+
+G-B v2.9 r1-P-rev64 (reclaim pressure): torn reads that passed validation, then a hang after stop.
+Hypothesis: a writer locks a record that reclaim has meanwhile switched away from its key and reused
+(RO switch emits no change notification), then writes a key that readers now read on the RO path.
+With MEGALON_DIAG=1 the writer re-reads the GCD entry after locking (and, in artifact64, compares the
+record's BlockId) and counts mismatches without changing behaviour; a failed value check prints the
+Get's path/record/seq; KV_WATCHDOG_S also covers workers stuck after stop. Off by default.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ benchmarks/kv_store.cc | 34 ++++++++++++++++++++++++++++++++--
+ include/rackobj.h      |  4 ++++
+ lib/globals.cc         | 16 ++++++++++++++++
+ lib/shm_obj_handle.cc  | 14 ++++++++++++++
+ src/common/diag.h      | 37 +++++++++++++++++++++++++++++++++++++
+ src/core/c3.cc         | 21 +++++++++++++++++++++
+ 6 files changed, 124 insertions(+), 2 deletions(-)
+ create mode 100644 src/common/diag.h
+
+diff --git a/benchmarks/kv_store.cc b/benchmarks/kv_store.cc
+index 7eaef57..40bdb80 100644
+--- a/benchmarks/kv_store.cc
++++ b/benchmarks/kv_store.cc
+@@ -238,8 +238,9 @@ static void workload(AccessPattern* ap, const std::string& latency_filename, con
+             } else if (check_values && !CheckValue(vbuf, offset)) {
+                 if (bad < 5)
+                     LOG(ERROR) << "value check failed: key " << offset << " got key "
+-                               << *reinterpret_cast<const uint64_t*>(vbuf) << " stamp 0x" << std::hex
+-                               << *reinterpret_cast<const uint64_t*>(vbuf + 8) << std::dec;
++                               << *reinterpret_cast<const uint64_t*>(vbuf) << " stamp " << std::hex
++                               << *reinterpret_cast<const uint64_t*>(vbuf + 8) << std::dec << "; "
++                               << rackobj::DiagLastGet();
+                 bad++;
+             } else if (check_values && (*reinterpret_cast<const uint64_t*>(vbuf + 8) >> 56) != node_id) {
+                 remote++;
+@@ -423,6 +424,8 @@ int main(int argc, char** argv) {
+     // warmup Puts per worker for the warmup watchdog (kWarmFinished once the worker's warmup share is done)
+     constexpr uint64_t kWarmFinished = UINT64_MAX;
+     std::vector<PaddedCounter> warm_counters(thread_cnt);
++    // 1 once a worker has returned from its measured loop (post-stop watchdog)
++    std::vector<PaddedCounter> worker_left(thread_cnt);
+ 
+     std::atomic<uint64_t> read_cnt{0};
+     std::atomic<uint64_t> read_retry_cnt{0};
+@@ -472,6 +475,7 @@ int main(int argc, char** argv) {
+             // pass pointer to this thread's counter
+             workload(ap_local.get(), latency_filename, write_latency_filename, tput_filename, &read_retry_cnt,
+                      &read_cnt, &read_retry_invoc, &control, &thread_counters[i], i, &vstats);
++            worker_left[i].ops.store(1, std::memory_order_release);
+ 
+             barrier.Wait();  // optional: wait for all to finish
+             rackobj::UnRegister();
+@@ -612,10 +616,35 @@ int main(int argc, char** argv) {
+         }
+     });
+ 
++    // De Stijl port diagnostics: after stop, a worker still inside an op for KV_WATCHDOG_S seconds is aborted
++    // with its stack (G-B v2.9 r1-P-rev64 hung here until timeout 900 with no message).
++    std::jthread stop_watchdog;
++    if (watchdog_s > 0)
++        stop_watchdog = std::jthread([&](std::stop_token st) {
++            while (!st.stop_requested() && !control.stop.load(std::memory_order_acquire))
++                std::this_thread::sleep_for(std::chrono::milliseconds(100));
++            for (uint64_t waited = 0; !st.stop_requested(); waited++) {
++                std::this_thread::sleep_for(std::chrono::seconds(1));
++                if (waited + 1 < watchdog_s) continue;
++                for (size_t i = 0; i < thread_cnt; ++i) {
++                    if (worker_left[i].ops.load(std::memory_order_acquire)) continue;
++                    LOG(ERROR) << "WATCHDOG: worker " << i << " still inside an op " << watchdog_s
++                               << "s after stop; " << rackobj::DiagSummary() << "; aborting with its stack";
++                    pthread_kill(workers[i].native_handle(), SIGABRT);
++                    std::this_thread::sleep_for(std::chrono::seconds(10));
++                }
++                return;
++            }
++        });
++
+     // join workers
+     for (auto& th : workers) {
+         if (th.joinable()) th.join();
+     }
++    if (stop_watchdog.joinable()) {
++        stop_watchdog.request_stop();
++        stop_watchdog.join();
++    }
+ 
+     // join controller + reporter (they should exit after stop)
+     if (controller.joinable()) controller.join();
+@@ -658,6 +687,7 @@ int main(int argc, char** argv) {
+         verdict = "PASS";
+         code = 0;
+     }
++    LOG(INFO) << rackobj::DiagSummary();
+     LOG(INFO) << "VALUE CHECK: node=" << node_id << " gets=" << vg << " remote_values=" << vr << " bad_values=" << vb
+               << " misses=" << vm << " short_reads=" << vs << " " << verdict;
+     return code;
+diff --git a/include/rackobj.h b/include/rackobj.h
+index 88a07da..0a8f773 100644
+--- a/include/rackobj.h
++++ b/include/rackobj.h
+@@ -43,4 +43,8 @@ double GetPartitionRatio();
+ /* De Stijl port: barrier across all nodes of the run (phase must increase per call, < 0xfffffff0).
+  * Only the calling thread waits. */
+ void NodeBarrier(uint32_t phase);
++
++/* De Stijl port diagnostics (MEGALON_DIAG=1): this thread's last Get (path/entry/seq) and the process counters. */
++std::string DiagLastGet();
++std::string DiagSummary();
+ }  // namespace rackobj
+\ No newline at end of file
+diff --git a/lib/globals.cc b/lib/globals.cc
+index 83e0ef2..00ceef0 100644
+--- a/lib/globals.cc
++++ b/lib/globals.cc
+@@ -1,3 +1,4 @@
++#include "common/diag.h"
+ #include "globals.h"
+ 
+ #include <rackobj.h>
+@@ -102,6 +103,21 @@ void NodeBarrier(uint32_t phase) {
+     port::PortContext::Get().NodeBarrier(phase);
+ }
+ 
++std::string DiagLastGet() {
++    const auto &g = diag::last_get;
++    if (!g.valid) return "no Get recorded (MEGALON_DIAG unset?)";
++    return "last Get: cn=" + std::to_string(g.cn) + (g.wmeta < 0 ? " path=RO" : " path=RW wmeta=" + std::to_string(g.wmeta)) +
++           " seq=" + std::to_string(g.seq) + " coherence_retries=" + std::to_string(g.retries);
++}
++
++std::string DiagSummary() {
++    if (!diag::Enabled()) return "diag off";
++    return "DIAG gets_ro=" + std::to_string(diag::gets_ro_path.load()) + " gets_rw=" + std::to_string(diag::gets_rw_path.load()) +
++           " writer_checks=" + std::to_string(diag::writer_checks.load()) +
++           " writer_stale_entry=" + std::to_string(diag::writer_stale_entry.load()) +
++           " writer_owner_mismatch=" + std::to_string(diag::writer_owner_mismatch.load());
++}
++
+ }  // namespace rackobj
+ 
+ static struct InitializeIndicator {
+diff --git a/lib/shm_obj_handle.cc b/lib/shm_obj_handle.cc
+index af5d64f..acb1ea4 100644
+--- a/lib/shm_obj_handle.cc
++++ b/lib/shm_obj_handle.cc
+@@ -7,6 +7,7 @@
+ #include "manager/replicate_manager.h"
+ #include "original_syscalls.h"
+ #include "shared_memory/cxl_port.h"
++#include "common/diag.h"
+ 
+ namespace rackobj::lib {
+ 
+@@ -1119,6 +1120,19 @@ retry:
+     bytes_read = result.value();
+     (void)admit_retry_cnt;
+ 
++    if (diag::Enabled()) {
++        auto &lg = diag::last_get;
++        lg.valid = true;
++        lg.cn = rh.entry_optional.has_value() && rh.entry_optional->cn_array_[0].cn_idx_.has_value()
++                    ? static_cast<int64_t>(*rh.entry_optional->cn_array_[0].cn_idx_)
++                    : -1;
++        lg.wmeta = rh.entry_optional.has_value() && rh.entry_optional->wmeta_idx_.has_value()
++                       ? static_cast<int64_t>(*rh.entry_optional->wmeta_idx_)
++                       : -1;
++        lg.seq = static_cast<uint32_t>(rh.seqcount);
++        lg.retries = static_cast<uint32_t>(coherence_retry_cnt[0]);
++        (lg.wmeta < 0 ? diag::gets_ro_path : diag::gets_rw_path).fetch_add(1, std::memory_order_relaxed);
++    }
+     return bytes_read;
+ }
+ 
+diff --git a/src/common/diag.h b/src/common/diag.h
+new file mode 100644
+index 0000000..42443d9
+--- /dev/null
++++ b/src/common/diag.h
+@@ -0,0 +1,37 @@
++#pragma once
++// De Stijl port diagnostics (G-B v2.9 torn reads under reclaim pressure). Active only with MEGALON_DIAG=1;
++// otherwise every hook is a single predictable branch on a cached flag and behaviour is unchanged.
++#include <atomic>
++#include <cstdint>
++#include <cstdlib>
++
++namespace rackobj::diag {
++
++inline bool Enabled() {
++    static const bool on = [] {
++        const char *v = std::getenv("MEGALON_DIAG");
++        return v && std::atoi(v) != 0;
++    }();
++    return on;
++}
++
++// Last successful Get on this thread: which path it took and what it validated against.
++struct LastGet {
++    bool valid = false;
++    int64_t cn = -1;     // CXL cache node index of the entry used
++    int64_t wmeta = -1;  // -1: RO path (no seqlock validation)
++    uint32_t seq = 0;    // sequence observed at read start (RW path)
++    uint32_t retries = 0;
++};
++inline thread_local LastGet last_get;
++
++// Writer, after taking the record lock and passing the change-notification check (NR path):
++//   stale_entry:     a synced GCD re-read shows the key no longer holds this record (or is gone)
++//   owner_mismatch:  artifact64 only, the locked record's BlockId names another key
++inline std::atomic<uint64_t> writer_checks{0};
++inline std::atomic<uint64_t> writer_stale_entry{0};
++inline std::atomic<uint64_t> writer_owner_mismatch{0};
++inline std::atomic<uint64_t> gets_ro_path{0};
++inline std::atomic<uint64_t> gets_rw_path{0};
++
++}  // namespace rackobj::diag
+diff --git a/src/core/c3.cc b/src/core/c3.cc
+index 53617b9..456f673 100644
+--- a/src/core/c3.cc
++++ b/src/core/c3.cc
+@@ -4,6 +4,7 @@
+ #include "lru_policy.h"
+ #include "object_slot.h"
+ #include "shared_memory/cxl_port.h"
++#include "common/diag.h"
+ 
+ namespace rackobj::common {
+ using std::make_unique;
+@@ -627,6 +628,26 @@ bool C3POHandle::write_seq_start(WriteHandle &wh
+         set_write_handle_errno(wh, WriteErrno::META_OUTDATE);
+         return false;
+     }
++    if (diag::Enabled()) {
++        // observe only (behaviour unchanged): does the key still hold the record we just locked?
++        diag::writer_checks.fetch_add(1, std::memory_order_relaxed);
++#ifndef WMETA_OWNER_REV
++        if (!(wmeta->GetBlockID() == wh.key)) {
++            uint64_t n = diag::writer_owner_mismatch.fetch_add(1, std::memory_order_relaxed);
++            LOG_IF(WARNING, n < 10) << "DIAG writer: locked record " << wmeta_index.value() << " for key " << wh.key
++                                    << " but its BlockId is " << wmeta->GetBlockID();
++        }
++#endif
++        std::optional<common::GCDEntry> re = Gcd()->Get(wh.key, nr_meta);
++        if (!re.has_value() || re->wmeta_idx_ != wmeta_index) {
++            uint64_t n = diag::writer_stale_entry.fetch_add(1, std::memory_order_relaxed);
++            LOG_IF(WARNING, n < 10) << "DIAG writer: key " << wh.key << " locked record " << wmeta_index.value()
++                                    << " but a synced re-read shows "
++                                    << (!re.has_value() ? std::string("no entry")
++                                        : re->wmeta_idx_.has_value() ? "record " + std::to_string(*re->wmeta_idx_)
++                                                                     : std::string("RO (no record)"));
++        }
++    }
+ #else
+     // recheck metadata update, prevent time-to-check and time-to-modify problem, use gcd_get again
+     std::optional<common::GCDEntry> recheck_optional = Gcd()->Get(wh.key);
+-- 
+2.34.1
+

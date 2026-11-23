@@ -1,0 +1,316 @@
+From c803c64a10af9b3bdd46498520cbfd4e739b905f Mon Sep 17 00:00:00 2001
+From: Sungsu Ahn <sungsu_ahn@korea.ac.kr>
+Date: Fri, 6 Nov 2026 02:58:13 +0900
+Subject: [PATCH 49/51] Lookup log2 histogram per timed GetAnchor (read/write),
+ GetObjectLookupHist API (build 79)
+
+coh::TimedAnchor adds the index-lookup cycles of each call to a per-thread log2
+histogram (bins in TSC cycles: bin 0 = 0, bin i = [2^(i-1), 2^i), last open);
+read side at the object ReadStart / KV Get sites, write side at the object
+WriteStart / KV Put sites. Only already-timed (sampled) sections record.
+New API rackobj::GetObjectLookupHist(ObjectLookupHist*) exports counts, sums
+and bin lower edges in ns (TSC rate); existing structs and counters unchanged.
+object-test checks the histogram in the uncontended section-check case
+(read samples == check_sampled, totals match read_lookup_ns_sampled).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ benchmarks/object_test.cc | 70 +++++++++++++++++++++++++++++++++++++++
+ include/rackobj.h         | 20 +++++++++++
+ lib/globals.cc            |  2 ++
+ lib/object_store.cc       | 24 ++++++++++++--
+ lib/object_store.h        |  2 ++
+ lib/shm_obj_handle.cc     |  4 +--
+ src/common/coh_stats.h    | 24 ++++++++++++--
+ 7 files changed, 140 insertions(+), 6 deletions(-)
+
+diff --git a/benchmarks/object_test.cc b/benchmarks/object_test.cc
+index 7e3293f..f175a6c 100644
+--- a/benchmarks/object_test.cc
++++ b/benchmarks/object_test.cc
+@@ -321,6 +321,58 @@ std::string AncPerSection(const char *what, const rackobj::ThreadAnchor &d) {
+     return b;
+ }
+ 
++// build 79: per-call index-lookup histogram (rackobj.h ObjectLookupHist), b - a (counts and sums; tsc_khz, lo_ns of b)
++rackobj::ObjectLookupHist Lh() {
++    rackobj::ObjectLookupHist h{};
++    rackobj::GetObjectLookupHist(&h);
++    return h;
++}
++
++rackobj::ObjectLookupHist LhDiff(const rackobj::ObjectLookupHist &a, const rackobj::ObjectLookupHist &b) {
++    rackobj::ObjectLookupHist d = b;
++    d.read_samples -= a.read_samples;
++    d.write_samples -= a.write_samples;
++    d.read_sum_ns -= a.read_sum_ns;
++    d.write_sum_ns -= a.write_sum_ns;
++    for (int i = 0; i < rackobj::ObjectLookupHist::kBins; i++) {
++        d.read[i] -= a.read[i];
++        d.write[i] -= a.write[i];
++    }
++    return d;
++}
++
++// bins and sums consistent: sum of bins == samples; the sum lies inside [sum of lower edges, sum of upper edges]
++bool LhConsistent(const rackobj::ObjectLookupHist &h) {
++    constexpr int K = rackobj::ObjectLookupHist::kBins;
++    uint64_t rs = 0, ws = 0;
++    double rlo = 0, rhi = 0, wlo = 0, whi = 0;
++    for (int i = 0; i < K; i++) {
++        rs += h.read[i];
++        ws += h.write[i];
++        const double lo = static_cast<double>(h.lo_ns[i]);
++        const double hi = i + 1 < K ? static_cast<double>(h.lo_ns[i + 1]) : 1e18;
++        rlo += lo * h.read[i];
++        rhi += hi * h.read[i];
++        wlo += lo * h.write[i];
++        whi += hi * h.write[i];
++    }
++    // +-1 ns per sample: edges and sums are rounded separately
++    auto in = [](double s, double lo, double hi, uint64_t n) { return s + n + 2 >= lo && s <= hi + n + 2; };
++    return rs == h.read_samples && ws == h.write_samples && in(h.read_sum_ns, rlo, rhi, rs) &&
++           in(h.write_sum_ns, wlo, whi, ws);
++}
++
++std::string LhStr(const char *what, const rackobj::ObjectLookupHist &h) {
++    std::string s = std::string("LOOKUP-HIST ") + what + ": tsc " + std::to_string(h.tsc_khz) + " kHz | read " +
++                    std::to_string(h.read_samples) + " samples " + std::to_string(h.read_sum_ns) + " ns | write " +
++                    std::to_string(h.write_samples) + " samples " + std::to_string(h.write_sum_ns) +
++                    " ns | bins [lo_ns]=read/write:";
++    for (int i = 0; i < rackobj::ObjectLookupHist::kBins; i++)
++        if (h.read[i] || h.write[i])
++            s += " [" + std::to_string(h.lo_ns[i]) + "]=" + std::to_string(h.read[i]) + "/" + std::to_string(h.write[i]);
++    return s;
++}
++
+ std::array<uint64_t, 4> Split() {
+     std::array<uint64_t, 4> a{};
+     rackobj::GetThreadAnchorSplit(a.data());
+@@ -547,20 +599,38 @@ void CohPhase(HelperThread &helper) {
+         auto c0 = Coh();
+         auto a0 = Split();
+         auto z0 = Anc();
++        auto h0 = Lh();
+         const uint64_t n = 16 * c0.check_sample;  // build 75: 16 sampled sections per comparison line
+         for (uint64_t i = 0; i < n; i++) (void)read_gen(CohX(node_id));
+         auto z = AncDiff(z0, Anc());
+         LOG(INFO) << AncPerSection("object read", z) << " | probe " << Anc().reserved[2] << " ps";
++        {
++            // build 79: uncontended reads = one timed GetAnchor per sampled section (no (A) restart, no ENOENT), so
++            // the read histogram has exactly check_sampled samples and the same lookup total (+-2 ns rounding)
++            auto hd = LhDiff(h0, Lh());
++            LOG(INFO) << LhStr("object read", hd);
++            EXPECT(hd.read_samples == z.check_sampled && hd.write_samples == 0 && LhConsistent(hd));
++            EXPECT(hd.read_sum_ns + 2 >= z.read_lookup_ns_sampled && hd.read_sum_ns <= z.read_lookup_ns_sampled + 2);
++            EXPECT(!timed || (hd.read_samples > 0 && hd.read_sum_ns > 0 && hd.tsc_khz > 0));
++            EXPECT(timed || (hd.read_samples == 0 && hd.tsc_khz == 0));
++        }
+         EXPECT(!timed || (Anc().reserved[2] >= 1000 && Anc().reserved[2] <= 200000));  // build 77: 1-200 ns
+         EXPECT(in_range(z.check_sampled, n) && z.read_lookup_ns_sampled == Split()[0] - a0[0]);
+         EXPECT(spos(z.rseq_ns_sampled) && spos(z.read_nr_ns_sampled));  // C(own) is RW: version reads
+         {
+             auto w0 = Anc();
++            auto hw0 = Lh();
+             for (uint64_t i = 0; i < n; i++) WriteGen(CohX(node_id), 100 + i);
+             auto wd = AncDiff(w0, Anc());
+             LOG(INFO) << AncPerSection("object write", wd);
+             EXPECT(wd.write_sections == n && (evall ? wd.reserved[0] == n : in_range(wd.reserved[0], n)));
+             EXPECT(spos(wd.wseq_ns) && spos(wd.wseq_end_ns) && spos(wd.write_lookup_ns));
++            // build 79: one sample per timed attempt; retries (write_retry / RW switch) add samples, never remove
++            auto hwd = LhDiff(hw0, Lh());
++            LOG(INFO) << LhStr("object write", hwd);
++            EXPECT(hwd.write_samples >= wd.reserved[0] && hwd.read_samples == 0 && LhConsistent(hwd));
++            EXPECT(hwd.write_sum_ns + 2 >= wd.write_lookup_ns);
++            EXPECT(!timed || (hwd.write_samples > 0 && hwd.write_sum_ns > 0));
+         }
+         auto d = CohDiff(c0, Coh());
+         auto a1 = Split();
+diff --git a/include/rackobj.h b/include/rackobj.h
+index 8123bda..8c0a63f 100644
+--- a/include/rackobj.h
++++ b/include/rackobj.h
+@@ -179,6 +179,26 @@ struct ThreadAnchor {
+ // shim/megalon_objapi.h (CXL_SWMC) and M2 §19.
+ 
+ void GetThreadAnchor(ThreadAnchor* s);
++
++/* Build 79 (megalon-page): distribution of the index lookup of ONE timed GetAnchor, calling thread since Register().
++ * The lookup is the same quantity as ThreadAnchor.read_lookup_ns_sampled / write_lookup_ns (the index dispatch timed
++ * by NR inside GetAnchorTimed), but one sample per timed GetAnchor CALL: read = ObjectReadStart's first attempt of a
++ * timed read section and KV Get attempts outside (A) of a timed Get; write = every attempt of a timed write section
++ * (ObjectWriteStart / KV Put; retries included, so write totals can exceed ThreadAnchor's final-attempt sums). Only
++ * already-timed (sampled) sections record; unsampled sections add no work. Recorded in TSC cycles, log2 bins:
++ * bin 0 = 0 cycles, bin i in [1, kBins-2] = [2^(i-1), 2^i) cycles, bin kBins-1 = >= 2^(kBins-2) cycles. Exported in
++ * ns: lo_ns[i] = lower bin edge (cycles * 1e6 / tsc_khz, rounded), sums converted the same way. Mean per call =
++ * *_sum_ns / *_samples. All zero with timers off (MEGALON_COH_TIMERS=0). */
++struct ObjectLookupHist {
++    static constexpr int kBins = 32;
++    uint64_t tsc_khz;                         // TSC rate used for the conversion (0: timers off / not yet known)
++    uint64_t read_samples, write_samples;     // = sum of read[] / write[]
++    uint64_t read_sum_ns, write_sum_ns;       // total lookup time of the samples
++    uint64_t read[kBins], write[kBins];       // per-bin sample counts
++    uint64_t lo_ns[kBins];                    // lower edge of bin i in ns (bin 0: 0)
++};
++void GetObjectLookupHist(ObjectLookupHist* s);
++
+ // build 71, overhead measurement only (object-test OBJECT_TEST_OVERHEAD): switch the instrumentation timers at run
+ // time (initial value: MEGALON_COH_TIMERS). Call only while no thread of the process has an open section or a
+ // wait in progress; durations recorded across a switch are meaningless.
+diff --git a/lib/globals.cc b/lib/globals.cc
+index 2cf8977..dacf686 100644
+--- a/lib/globals.cc
++++ b/lib/globals.cc
+@@ -140,6 +140,8 @@ void GetThreadAnchorSplit(uint64_t out[4]) { lib::ObjectStore::ThreadAnchorSplit
+ 
+ void GetThreadAnchor(ThreadAnchor *s) { lib::ObjectStore::ThreadAnchorSnap(s); }
+ 
++void GetObjectLookupHist(ObjectLookupHist *s) { lib::ObjectStore::ThreadLookupHist(s); }
++
+ void SetCohTimersForMeasurement(bool on) {
+     coh::g_cfg.timers = on;
+     NrFfi::nr_coh_set_timers(on);
+diff --git a/lib/object_store.cc b/lib/object_store.cc
+index 61a127c..946f812 100644
+--- a/lib/object_store.cc
++++ b/lib/object_store.cc
+@@ -250,7 +250,7 @@ int ObjectStore::ReadStart(uint64_t id, ObjectHandle *h, Tlm *tlm) {
+         const bool first = !stale_open;  // attempts inside (A) are Megalon-only work
+         std::optional<common::GCDEntry> entry =
+             timed && first
+-                ? coh::TimedAnchor(ct, &anchor, [&](uint64_t *lk) { return c3po_->Gcd()->GetAnchorTimed(key, nr_meta, lk); })
++                ? coh::TimedAnchor(ct, &anchor, &ct.rlk_hist, [&](uint64_t *lk) { return c3po_->Gcd()->GetAnchorTimed(key, nr_meta, lk); })
+                 : c3po_->Gcd()->GetAnchor(key, nr_meta);
+         if (!Decode(entry, &ptr, &size)) {  // objects are created explicitly (no admit)
+             close_stale();
+@@ -383,7 +383,7 @@ int ObjectStore::WriteStart(uint64_t id, ObjectHandle *h, Tlm *tlm) {
+     for (;;) {
+         anchor = coh::AnchorSplit{};  // build 74: only the final attempt's anchor is excluded from wstart
+         std::optional<common::GCDEntry> entry =
+-            wt ? coh::TimedAnchor(ct, &anchor, [&](uint64_t *lk) { return c3po_->Gcd()->GetAnchorTimed(key, nr_meta, lk); })
++            wt ? coh::TimedAnchor(ct, &anchor, &ct.wlk_hist, [&](uint64_t *lk) { return c3po_->Gcd()->GetAnchorTimed(key, nr_meta, lk); })
+                : c3po_->Gcd()->GetAnchor(key, nr_meta);
+         if (!Decode(entry, &ptr, &size)) {
+             if (wt) {
+@@ -492,6 +492,26 @@ void ObjectStore::ThreadAnchorSnap(rackobj::ThreadAnchor *s) {
+     s->reserved[5] = t.td_cnt;   // (D) episodes whose durations are in spin_ns
+ }
+ 
++void ObjectStore::ThreadLookupHist(rackobj::ObjectLookupHist *s) {
++    static_assert(rackobj::ObjectLookupHist::kBins == coh::kLookupHistBins, "lookup histogram bin count");
++    const coh::Tls &t = coh::tls;
++    const double hz = coh::g_cfg.timers ? coh::TscHz() : 0.0;
++    auto ns = [&](uint64_t cyc) -> uint64_t {
++        return hz > 0 ? static_cast<uint64_t>(static_cast<double>(cyc) * 1e9 / hz + 0.5) : 0;
++    };
++    *s = rackobj::ObjectLookupHist{};
++    s->tsc_khz = static_cast<uint64_t>(hz / 1000.0 + 0.5);
++    for (int i = 0; i < coh::kLookupHistBins; i++) {
++        s->read[i] = t.rlk_hist.cnt[i];
++        s->write[i] = t.wlk_hist.cnt[i];
++        s->read_samples += t.rlk_hist.cnt[i];
++        s->write_samples += t.wlk_hist.cnt[i];
++        s->lo_ns[i] = i == 0 ? 0 : ns(1ull << (i - 1));
++    }
++    s->read_sum_ns = ns(t.rlk_hist.sum_cyc);
++    s->write_sum_ns = ns(t.wlk_hist.sum_cyc);
++}
++
+ void ObjectStore::ThreadAnchorSplit(uint64_t out[4]) {
+     const coh::Tls &t = coh::tls;
+     const double hz = coh::g_cfg.timers ? coh::TscHz() : 0.0;
+diff --git a/lib/object_store.h b/lib/object_store.h
+index 6417ab9..948db8d 100644
+--- a/lib/object_store.h
++++ b/lib/object_store.h
+@@ -76,6 +76,8 @@ public:
+     static void ThreadAnchorSplit(uint64_t out[4]);
+     /* build 75: rackobj.h ThreadAnchor of the calling thread */
+     static void ThreadAnchorSnap(rackobj::ThreadAnchor *s);
++    /* build 79: rackobj.h ObjectLookupHist of the calling thread */
++    static void ThreadLookupHist(rackobj::ObjectLookupHist *s);
+ 
+ private:
+     static common::BlockId Key(uint64_t id);
+diff --git a/lib/shm_obj_handle.cc b/lib/shm_obj_handle.cc
+index b0915d5..2813a54 100644
+--- a/lib/shm_obj_handle.cc
++++ b/lib/shm_obj_handle.cc
+@@ -1366,7 +1366,7 @@ retry:
+ 
+     entry_optional =
+         coh_timed && coh_first
+-            ? coh::TimedAnchor(ct, &coh_anchor, [&](uint64_t *lk) { return c3po_->Gcd()->GetAnchorTimed(block_id, nr_meta, lk); })
++            ? coh::TimedAnchor(ct, &coh_anchor, &ct.rlk_hist, [&](uint64_t *lk) { return c3po_->Gcd()->GetAnchorTimed(block_id, nr_meta, lk); })
+             : c3po_->Gcd()->GetAnchor(block_id, nr_meta);
+ 
+     init_read_handle(rh, block_id, entry_optional, local_meta->logical_node_id_);
+@@ -1629,7 +1629,7 @@ retry:
+ 
+     coh_anchor = coh::AnchorSplit{};
+     entry_optional =
+-        coh_wt ? coh::TimedAnchor(ct, &coh_anchor, [&](uint64_t *lk) { return c3po_->Gcd()->GetAnchorTimed(block_id, nr_meta, lk); })
++        coh_wt ? coh::TimedAnchor(ct, &coh_anchor, &ct.wlk_hist, [&](uint64_t *lk) { return c3po_->Gcd()->GetAnchorTimed(block_id, nr_meta, lk); })
+                : c3po_->Gcd()->GetAnchor(block_id, nr_meta);
+ 
+     init_write_handle(wh, block_id, entry_optional, local_meta->logical_node_id_);
+diff --git a/src/common/coh_stats.h b/src/common/coh_stats.h
+index 92d5fdf..037cc0e 100644
+--- a/src/common/coh_stats.h
++++ b/src/common/coh_stats.h
+@@ -31,6 +31,22 @@ extern Config g_cfg;
+ 
+ inline uint64_t Now() { return g_cfg.timers ? __rdtsc() : 0; }
+ 
++// build 79 (megalon-page): log2 histogram of the index-lookup cycles of ONE timed GetAnchor (the lookup part that
++// TimedAnchor already measures). Bin 0: 0 cycles; bin i (1..kLookupHistBins-2): [2^(i-1), 2^i) TSC cycles; the last
++// bin is open-ended (>= 2^(kLookupHistBins-2)). Bins are in TSC cycles (no division on the hot path); the export
++// (rackobj.h ObjectLookupHist) converts sums and bin edges to ns with the TSC rate.
++inline constexpr int kLookupHistBins = 32;
++struct LookupHist {
++    uint64_t cnt[kLookupHistBins];
++    uint64_t sum_cyc;
++};
++inline void HistAdd(LookupHist &h, uint64_t cyc) {
++    int b = cyc ? 64 - __builtin_clzll(cyc) : 0;
++    if (b > kLookupHistBins - 1) b = kLookupHistBins - 1;
++    h.cnt[b]++;
++    h.sum_cyc += cyc;
++}
++
+ // Thread-local accumulators, zero-initialised (no TLS constructor). Raw totals (any caller) and the object-API
+ // attribution (CohSnap fields, in cycles).
+ struct Tls {
+@@ -76,6 +92,9 @@ struct Tls {
+     void *obj_ctr;                         // this thread's ObjectStore counter block (object_store.cc; kept at Register)
+     uint64_t probe_cyc;                    // build 77: median delta of back-to-back TSC pairs, measured at Register
+     uint64_t ta_cnt, tbc_cnt, td_cnt;      // build 77: (A), (B)+(C) events and (D) episodes whose durations were timed
++    // build 79: per-call lookup histograms of the timed GetAnchors (read: object ReadStart / KV Get sites; write:
++    // object WriteStart / KV Put sites); every TimedAnchor call is one sample (incl. retried attempts)
++    LookupHist rlk_hist, wlk_hist;
+ };
+ 
+ // The thread's Tls through ThreadLocalMeta (set at Register; no thread-local lookup), or coh::tls.
+@@ -158,9 +177,9 @@ inline Spin SpinNow(Tls &t) {
+ }
+ 
+ // Runs fn() (one GetAnchorTimed: the NR side sets its anchor flag and times the dispatch) and returns its result;
+-// adds the split to *out. Timed sections only.
++// adds the split to *out and (build 79) the lookup cycles of this call to *hist. Timed sections only.
+ template <class F>
+-inline auto TimedAnchor(Tls &t, AnchorSplit *out, F &&fn) {
++inline auto TimedAnchor(Tls &t, AnchorSplit *out, LookupHist *hist, F &&fn) {
+     uint64_t *w = const_cast<uint64_t *>(t.nr ? t.nr : NrPtr());
+     const uint64_t l0 = w[4], f0 = w[5], s0 = SpinNow(t).cyc;
+     w[3] = 1;  // anchor flag: the NR replay times its Megalon-only flushes into w[5]
+@@ -171,6 +190,7 @@ inline auto TimedAnchor(Tls &t, AnchorSplit *out, F &&fn) {
+     const uint64_t lookup = w[4] - l0, fl = w[5] - f0, spin = SpinNow(t).cyc - s0;
+     out->lookup += lookup;
+     out->nr += Sub(t, Sub(t, t1, t0), lookup + fl + spin);
++    HistAdd(*hist, lookup);
+     return r;
+ }
+ 
+-- 
+2.34.1
+

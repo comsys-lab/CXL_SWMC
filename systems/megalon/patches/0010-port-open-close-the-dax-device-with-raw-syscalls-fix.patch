@@ -1,0 +1,131 @@
+From 853acbe42ec38b8017db276b8e4027ca1a23907e Mon Sep 17 00:00:00 2001
+From: Sungsu Ahn <sungsu_ahn@korea.ac.kr>
+Date: Wed, 14 Oct 2026 22:55:00 +0900
+Subject: [PATCH 10/51] port: open/close the dax device with raw syscalls; fix
+ doubled 0x in logs
+
+libmegalon interposes open()/close() for its file interface (lib/glibc); the
+wrapper CHECKs SLOT_SIZE == 4096 and aborted the first VM run (G-B run 1,
+recovery/M2-gb-runs-v1/run1). absl log streams already set showbase.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/common/config.cc          |  2 +-
+ src/shared_memory/cxl_port.cc | 29 ++++++++++++++++-------------
+ 2 files changed, 17 insertions(+), 14 deletions(-)
+
+diff --git a/src/common/config.cc b/src/common/config.cc
+index 7c33202..46f2072 100644
+--- a/src/common/config.cc
++++ b/src/common/config.cc
+@@ -169,7 +169,7 @@ RackOBJConfig::RackOBJConfig() {
+         if ((run_id_ & 0xffffffffull) == 0) LOG(FATAL) << "run_id must have non-zero low 32 bits";
+     }
+ 
+-    LOG(INFO) << "port config: run_id=0x" << std::hex << run_id_ << std::dec << " node_id=" << node_id_ << " region_config="
++    LOG(INFO) << "port config: run_id=" << std::hex << run_id_ << std::dec << " node_id=" << node_id_ << " region_config="
+               << (region_config_.empty() ? std::string("$CXL_REGION_CONFIG") : region_config_)
+               << " reinit=" << reinit_ << " attach_mprotect=" << attach_mprotect_
+               << " stuck_timeout_ms=" << stuck_timeout_ms_ << " log_sync_interval_us=" << log_sync_interval_us_
+diff --git a/src/shared_memory/cxl_port.cc b/src/shared_memory/cxl_port.cc
+index b7bfcec..4344dee 100644
+--- a/src/shared_memory/cxl_port.cc
++++ b/src/shared_memory/cxl_port.cc
+@@ -2,6 +2,7 @@
+ 
+ #include <fcntl.h>
+ #include <sys/mman.h>
++#include <sys/syscall.h>
+ #include <unistd.h>
+ 
+ #include <chrono>
+@@ -117,7 +118,9 @@ void PortContext::Init(const RackOBJConfig &cfg, size_t num_slots, size_t scr_fo
+         LOG(FATAL) << "SCR footprint " << scr_footprint << " exceeds hwcc_size " << region_.hwcc.size
+                    << " (reduce slots/logical_scr_size or enlarge hwcc_size); refusing to run";
+ 
+-    int fd = open(region_.device.c_str(), O_RDWR | O_CLOEXEC);
++    // raw syscalls: libmegalon interposes open()/close() (lib/glibc) for its file interface, and that
++    // wrapper must not see the device (it CHECKs SLOT_SIZE == 4096 and would track a virtual fd)
++    int fd = static_cast<int>(syscall(SYS_openat, AT_FDCWD, region_.device.c_str(), O_RDWR | O_CLOEXEC));
+     PCHECK(fd >= 0) << "open " << region_.device;
+     void *want = reinterpret_cast<void *>(region_.map_va);
+     void *p = mmap(want, region_.device_size, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED_NOREPLACE, fd, 0);
+@@ -126,7 +129,7 @@ void PortContext::Init(const RackOBJConfig &cfg, size_t num_slots, size_t scr_fo
+         munmap(p, region_.device_size);
+         LOG(FATAL) << "mapping landed at " << p << " instead of map_va " << want;
+     }
+-    close(fd);
++    syscall(SYS_close, fd);
+     map_ = static_cast<uint8_t *>(p);
+     ctrl_ = reinterpret_cast<ControlBlock *>(map_ + region_.hwcc.offset);
+     layout_hash_ = ComputeLayoutHash(cfg, num_slots);
+@@ -146,7 +149,7 @@ void PortContext::Init(const RackOBJConfig &cfg, size_t num_slots, size_t scr_fo
+             bool closed = ctrl_->magic == kCtrlMagic && st == kStateClosed;
+             for (int i = 0; i < kMaxNodes; i++) closed = closed && ctrl_->node_alive[i].load() == 0;
+             if (!cfg.Reinit() && !closed)
+-                LOG(FATAL) << "control block is not EMPTY (magic=0x" << std::hex << ctrl_->magic << std::dec
++                LOG(FATAL) << "control block is not EMPTY (magic=" << std::hex << ctrl_->magic << std::dec
+                            << " state=" << st << "); set reinit: true (or MEGALON_REINIT=1) on node 0 to "
+                            << "re-initialize the shared region";
+             LOG(WARNING) << "re-initializing shared region (previous state " << st << ")";
+@@ -173,13 +176,13 @@ void PortContext::Init(const RackOBJConfig &cfg, size_t num_slots, size_t scr_fo
+                  ctrl_->run_id.load(std::memory_order_acquire) == run_id_)) {
+             auto now = std::chrono::steady_clock::now();
+             if (now - start > std::chrono::seconds(cfg.AttachTimeoutS()))
+-                LOG(FATAL) << "node 0 did not publish READY for run 0x" << std::hex << run_id_ << " within " << std::dec
++                LOG(FATAL) << "node 0 did not publish READY for run " << std::hex << run_id_ << " within " << std::dec
+                            << cfg.AttachTimeoutS() << " s (control block: state "
+-                           << ctrl_->state.load(std::memory_order_relaxed) << ", run_id 0x" << std::hex
++                           << ctrl_->state.load(std::memory_order_relaxed) << ", run_id " << std::hex
+                            << ctrl_->run_id.load(std::memory_order_relaxed) << ")";
+             if (now - last_log > std::chrono::seconds(10)) {
+-                LOG(INFO) << "waiting for node 0 to publish READY for run 0x" << std::hex << run_id_ << std::dec
+-                          << " (state " << ctrl_->state.load(std::memory_order_relaxed) << ", run_id 0x" << std::hex
++                LOG(INFO) << "waiting for node 0 to publish READY for run " << std::hex << run_id_ << std::dec
++                          << " (state " << ctrl_->state.load(std::memory_order_relaxed) << ", run_id " << std::hex
+                           << ctrl_->run_id.load(std::memory_order_relaxed) << std::dec << ")";
+                 last_log = now;
+             }
+@@ -189,10 +192,10 @@ void PortContext::Init(const RackOBJConfig &cfg, size_t num_slots, size_t scr_fo
+         if (ctrl_->version != kCtrlVersion)
+             LOG(FATAL) << "control block version " << ctrl_->version << " != " << kCtrlVersion;
+         if (ctrl_->layout_hash != layout_hash_)
+-            LOG(FATAL) << "layout_hash mismatch: node 0 0x" << std::hex << ctrl_->layout_hash << ", node "
+-                       << std::dec << node_id_ << " 0x" << std::hex << layout_hash_
++            LOG(FATAL) << "layout_hash mismatch: node 0 " << std::hex << ctrl_->layout_hash << ", node "
++                       << std::dec << node_id_ << " " << std::hex << layout_hash_
+                        << " (same binaries, region config, slots and logical_scr_size required)";
+-        LOG(INFO) << "attaching to layout 0x" << std::hex << layout_hash_ << " run 0x" << run_id_ << std::dec;
++        LOG(INFO) << "attaching to layout " << std::hex << layout_hash_ << " run 0x" << run_id_ << std::dec;
+         if (mprotect_) SetProtect(true);
+     }
+ 
+@@ -239,7 +242,7 @@ void PortContext::Finish(uint64_t log_root) {
+             log_root != ctrl_->log_root)
+             LOG(FATAL) << "attach layout diverged from node 0: scr cursor " << scr_->Cursor() << " vs "
+                        << ctrl_->scr_cursor_end << ", lnr cursor " << lnr_->Cursor() << " vs "
+-                       << ctrl_->lnr_cursor_end << ", log_root 0x" << std::hex << log_root << " vs 0x"
++                       << ctrl_->lnr_cursor_end << ", log_root " << std::hex << log_root << " vs 0x"
+                        << ctrl_->log_root;
+         CheckRun("attach finish");
+         if (protected_) SetProtect(false);
+@@ -249,14 +252,14 @@ void PortContext::Finish(uint64_t log_root) {
+     lnr_->Seal();
+     LOG(INFO) << "SCR used: " << kCtrlSize + scr_->Cursor() << " of hwcc_size " << region_.hwcc.size
+               << " bytes; LNR used: " << lnr_->Cursor() << " of swcc_size " << region_.swcc.size
+-              << " bytes; log_root 0x" << std::hex << log_root;
++              << " bytes; log_root " << std::hex << log_root;
+ }
+ 
+ void PortContext::CheckRun(const char *where) const {
+     uint64_t rid = ctrl_->run_id.load(std::memory_order_acquire);
+     uint32_t st = ctrl_->state.load(std::memory_order_acquire);
+     if (rid != run_id_ || st != kStateReady)
+-        LOG(FATAL) << where << ": control block belongs to another run or is not READY (run_id 0x" << std::hex << rid
++        LOG(FATAL) << where << ": control block belongs to another run or is not READY (run_id " << std::hex << rid
+                    << ", expected 0x" << run_id_ << std::dec << ", state " << st << ")";
+ }
+ 
+-- 
+2.34.1
+

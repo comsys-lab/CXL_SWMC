@@ -1,0 +1,144 @@
+From 71dbd5c18deda2bc8367498120c1816ccee598b9 Mon Sep 17 00:00:00 2001
+From: Sungsu Ahn <sungsu_ahn@korea.ac.kr>
+Date: Thu, 15 Oct 2026 00:16:09 +0900
+Subject: [PATCH 15/51] port: static-wmeta (hwcc) seqlock release on failed
+ insert; SwitchRW locks; warmup watchdog
+
+Without DYN_WMETA, free_seqlock_with_lock was a no-op, so AdmitWrite/CreateEntry kept the LOCK_BIT of a
+cache node they recycled after a failed CheckAndInsert, and its next writer spun forever (G-B v2.6 run 4:
+hwcc flavor, both nodes warming the same keys). Release it exactly once; SwitchRW (static) now locks
+before its WSeqEnd/Recycle. kv-store: KV_WATCHDOG_S also covers the warmup Puts.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ benchmarks/kv_store.cc | 36 ++++++++++++++++++++++++++++++++++--
+ lib/shm_obj_handle.cc  |  8 ++++++++
+ src/core/seqcount.cc   |  7 +++++++
+ 3 files changed, 49 insertions(+), 2 deletions(-)
+
+diff --git a/benchmarks/kv_store.cc b/benchmarks/kv_store.cc
+index 8dfee48..7eaef57 100644
+--- a/benchmarks/kv_store.cc
++++ b/benchmarks/kv_store.cc
+@@ -420,6 +420,9 @@ int main(int argc, char** argv) {
+     TimingControl control;
+     std::vector<PaddedCounter> thread_counters;
+     thread_counters.resize(thread_cnt);
++    // warmup Puts per worker for the warmup watchdog (kWarmFinished once the worker's warmup share is done)
++    constexpr uint64_t kWarmFinished = UINT64_MAX;
++    std::vector<PaddedCounter> warm_counters(thread_cnt);
+ 
+     std::atomic<uint64_t> read_cnt{0};
+     std::atomic<uint64_t> read_retry_cnt{0};
+@@ -448,7 +451,9 @@ int main(int argc, char** argv) {
+                     }
+                     ssize_t rc = rackobj::Put(b, ACCESS_SIZE, warmup_sequence[k]);
+                     PCHECK(rc != -1) << "warmup put failed";
++                    warm_counters[i].ops.fetch_add(1, std::memory_order_relaxed);
+                 }
++                warm_counters[i].ops.store(kWarmFinished, std::memory_order_relaxed);
+             }
+             warm_done.fetch_add(1);
+             while (!go.load(std::memory_order_acquire)) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+@@ -473,7 +478,35 @@ int main(int argc, char** argv) {
+         });
+     }
+ 
+-    while (warm_done.load() < thread_cnt) std::this_thread::sleep_for(std::chrono::milliseconds(10));
++    // De Stijl port diagnostics: KV_WATCHDOG_S > 0 aborts the run with the stack of a stuck worker when a
++    // worker's progress counter has not moved for that many seconds: here its warmup Puts, until the worker
++    // finished its share (G-B v2.6 run 4 hung inside warmup); the reporter below covers the measured ops.
++    const uint64_t watchdog_s = getenv("KV_WATCHDOG_S") ? std::stoull(getenv("KV_WATCHDOG_S")) : 0;
++    {
++        std::jthread warm_watchdog;
++        if (watchdog_s > 0)
++            warm_watchdog = std::jthread([&] {
++                std::vector<uint64_t> last(thread_cnt, 0), still(thread_cnt, 0);
++                while (warm_done.load() < thread_cnt) {
++                    std::this_thread::sleep_for(std::chrono::seconds(1));
++                    for (size_t i = 0; i < thread_cnt; ++i) {
++                        uint64_t ops = warm_counters[i].ops.load(std::memory_order_relaxed);
++                        still[i] = (ops != kWarmFinished && ops == last[i]) ? still[i] + 1 : 0;
++                        last[i] = ops;
++                    }
++                    for (size_t i = 0; i < thread_cnt; ++i) {
++                        if (still[i] < watchdog_s) continue;
++                        std::ostringstream os;
++                        for (size_t j = 0; j < thread_cnt; ++j) os << " t" << j << "=" << last[j] << "/" << still[j] << "s";
++                        LOG(ERROR) << "WATCHDOG: worker " << i << " made no warmup progress for " << still[i]
++                                   << "s (puts/still:" << os.str() << "); aborting with its stack";
++                        pthread_kill(workers[i].native_handle(), SIGABRT);
++                        std::this_thread::sleep_for(std::chrono::seconds(10));
++                    }
++                }
++            });
++        while (warm_done.load() < thread_cnt) std::this_thread::sleep_for(std::chrono::milliseconds(10));
++    }
+     LOG(INFO) << "done loading...";
+     // every node has finished its warmup (in node0 mode: node 0's warmup created every key); this also
+     // aligns the start of the measurement windows across nodes
+@@ -518,7 +551,6 @@ int main(int argc, char** argv) {
+     // De Stijl port diagnostics: KV_WATCHDOG_S > 0 aborts the run with the stack of a stuck worker when a
+     // worker's op counter has not moved for that many seconds after the workers started (G-B run 2 hung
+     // with all workers spinning and no message).
+-    const uint64_t watchdog_s = getenv("KV_WATCHDOG_S") ? std::stoull(getenv("KV_WATCHDOG_S")) : 0;
+     std::vector<uint64_t> wd_last(thread_cnt, 0), wd_still(thread_cnt, 0);
+     std::jthread reporter([&] {
+         using namespace std::chrono;
+diff --git a/lib/shm_obj_handle.cc b/lib/shm_obj_handle.cc
+index a0b091c..3a00b47 100644
+--- a/lib/shm_obj_handle.cc
++++ b/lib/shm_obj_handle.cc
+@@ -466,7 +466,9 @@ expected<common::CacheNode *, std::error_code> SharedMemoryObjectHandle<Policy>:
+         case common::NrGcdError::GCD_NO_ERROR:
+             break;
+         case common::NrGcdError::GCD_SLOT_WMETA_UPDATE_FAILED:
++#ifdef DYN_WMETA
+             c3po_->Scr_meta()->RecycleWmeta(new_wmeta_index_optional.value(), true);
++#endif  // static wmeta: release the lock exactly once (below); a second release could drop another writer's lock
+         case common::NrGcdError::GCD_SLOT_UPDATE_FAILED:
+             DLOG(WARNING) << "Admit: GCD page @" << new_node << " checkinsert failed: concurrent insertion to node "
+                           << shared_cache_node_ << " ,block_id: " << block_id;
+@@ -580,7 +582,9 @@ expected<common::CacheNode *, std::error_code> SharedMemoryObjectHandle<Policy>:
+         case common::NrGcdError::GCD_NO_ERROR:
+             break;
+         case common::NrGcdError::GCD_SLOT_WMETA_UPDATE_FAILED:
++#ifdef DYN_WMETA
+             c3po_->Scr_meta()->RecycleWmeta(new_wmeta_index_optional.value(), true);
++#endif  // static wmeta: release the lock exactly once (below); a second release could drop another writer's lock
+         case common::NrGcdError::GCD_SLOT_UPDATE_FAILED:
+             DLOG(WARNING) << "Admit: GCD page @" << new_node << " checkinsert failed: concurrent insertion to node "
+                           << shared_cache_node_ << " ,block_id: " << block_id;
+@@ -638,7 +642,11 @@ std::error_code SharedMemoryObjectHandle<Policy>::SwitchRW(const common::WriteHa
+         cpu_relax();
+     } while (true);
+ #else
++    // De Stijl port: static wmeta has no reservation that locks the record; lock it here so the WSeqEnd /
++    // RecycleWmeta(.., true) below release a lock we hold (upstream ended an unlocked seqlock: odd sequence,
++    // readers of the key spin in read_seqlock_begin)
+     new_wmeta_index_optional = wh.cn_index;
++    CHECK(c3po_->Scr_meta()->GetWmeta(new_wmeta_index_optional.value())->WSeqBegin());
+ #endif
+ 
+ #ifdef NR
+diff --git a/src/core/seqcount.cc b/src/core/seqcount.cc
+index f178ad2..fa04777 100644
+--- a/src/core/seqcount.cc
++++ b/src/core/seqcount.cc
+@@ -257,6 +257,13 @@ bool free_seqlock_with_lock(seqlock_t* s) {
+     return true;
+ #endif /* C3_RWLOCK */
+ #else
++    // De Stijl port: static wmeta (no DYN_WMETA, e.g. the hwcc flavor) keeps the record bound to its cache node,
++    // so there is nothing to free, but callers use this to give up a record they locked (failed CheckAndInsert in
++    // AdmitWrite/CreateEntry, SwitchRW). Upstream returned with the lock still held; the recycled cache node's next
++    // writer then spun forever in WSeqBegin (G-B v2.6 run 4: hwcc, both nodes warming the same keys).
++#if C3_RWLOCK == 0
++    if (s->sequence.load(std::memory_order_acquire) & LOCK_BIT) (void)write_seqlock_end(s);
++#endif /* C3_RWLOCK */
+     return true;
+ #endif /* DYN_WMETA */
+ }
+-- 
+2.34.1
+
